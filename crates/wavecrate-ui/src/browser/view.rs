@@ -166,12 +166,18 @@ impl Browser {
 
     fn render_theme_settings(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let reload_pending = self.theme_load.pending_path.is_some();
-        let reload_fill = if reload_pending {
+        let settings_editable = self.preferences_editable();
+        let reset_label = if settings_editable {
+            "Default"
+        } else {
+            "Reset saved settings"
+        };
+        let reload_fill = if reload_pending || !settings_editable {
             color(theme.colors.control_disabled_fill)
         } else {
             transparent()
         };
-        let reload_text = if reload_pending {
+        let reload_text = if reload_pending || !settings_editable {
             color(theme.colors.text_disabled)
         } else {
             color(theme.colors.text_primary)
@@ -186,7 +192,7 @@ impl Browser {
             .border_color(color(theme.colors.border_emphasis))
             .bg(reload_fill)
             .text_color(reload_text)
-            .when(!reload_pending, |element| {
+            .when(!reload_pending && settings_editable, |element| {
                 element
                     .cursor_pointer()
                     .on_click(cx.listener(Self::reload_theme))
@@ -214,10 +220,18 @@ impl Browser {
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
-                    .cursor_pointer()
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
-                    .on_click(cx.listener(Self::choose_theme))
+                    .when(settings_editable, |element| {
+                        element
+                            .cursor_pointer()
+                            .on_click(cx.listener(Self::choose_theme))
+                    })
+                    .text_color(if settings_editable {
+                        color(theme.colors.text_primary)
+                    } else {
+                        color(theme.colors.text_disabled)
+                    })
                     .child("Open"),
             )
             .child(reload)
@@ -232,7 +246,7 @@ impl Browser {
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
                     .on_click(cx.listener(Self::reset_theme))
-                    .child("Default"),
+                    .child(reset_label),
             )
             .child(
                 div()
@@ -241,15 +255,22 @@ impl Browser {
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
-                    .cursor_pointer()
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
-                    .text_color(color(if theme.motion.enabled {
-                        theme.colors.accent
+                    .when(settings_editable, |element| {
+                        element
+                            .cursor_pointer()
+                            .on_click(cx.listener(Self::toggle_motion))
+                    })
+                    .text_color(if settings_editable {
+                        color(if theme.motion.enabled {
+                            theme.colors.accent
+                        } else {
+                            theme.colors.text_muted
+                        })
                     } else {
-                        theme.colors.text_muted
-                    }))
-                    .on_click(cx.listener(Self::toggle_motion))
+                        color(theme.colors.text_disabled)
+                    })
                     .child(if theme.motion.enabled {
                         "Animations On"
                     } else {
@@ -263,15 +284,22 @@ impl Browser {
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
-                    .cursor_pointer()
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
-                    .text_color(color(if self.autoplay_selection {
-                        theme.colors.accent
+                    .text_color(if settings_editable {
+                        color(if self.autoplay_selection {
+                            theme.colors.accent
+                        } else {
+                            theme.colors.text_muted
+                        })
                     } else {
-                        theme.colors.text_muted
-                    }))
-                    .on_click(cx.listener(Self::toggle_autoplay))
+                        color(theme.colors.text_disabled)
+                    })
+                    .when(settings_editable, |element| {
+                        element
+                            .cursor_pointer()
+                            .on_click(cx.listener(Self::toggle_autoplay))
+                    })
                     .child(if self.autoplay_selection {
                         "Autoplay On"
                     } else {
@@ -279,7 +307,11 @@ impl Browser {
                     }),
             )
             .child(div().flex_1())
-            .child(self.theme_status.clone())
+            .child(format!(
+                "{} · {}",
+                self.theme_status,
+                self.preference_status()
+            ))
     }
 }
 

@@ -5,7 +5,8 @@ use std::sync::mpsc::TryRecvError;
 use gpui::{BorrowAppContext, Global, Subscription};
 use wavecrate_library::sample_sources::SampleSource;
 use wavecrate_session::{
-    CanonicalSourceRoot, RegistryEvent, RequestId, SourceRegistryService, SubmitError,
+    CanonicalSourceRoot, PreferenceEvent, PreferencePatch, PreferenceRequestId, RegistryEvent,
+    RequestId, SourceRegistryService, SubmitError,
 };
 
 /// The app-owned source registry service.
@@ -58,6 +59,25 @@ impl SourceRegistryGlobal {
             .remove_root(root)
     }
 
+    /// Submit one typed preference patch to the profile-owned session service.
+    pub(crate) fn patch_preferences(
+        &self,
+        patch: PreferencePatch,
+    ) -> Result<PreferenceRequestId, SubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(SubmitError::Closed)?
+            .patch_preferences(patch)
+    }
+
+    /// Submit the explicit preference reset command.
+    pub(crate) fn reset_preferences(&self) -> Result<PreferenceRequestId, SubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(SubmitError::Closed)?
+            .reset_preferences()
+    }
+
     /// Drain all currently available worker events without waiting.
     pub(crate) fn drain_events(&self, events: &mut Vec<RegistryEvent>) {
         let Some(service) = self.service.as_ref() else {
@@ -65,6 +85,19 @@ impl SourceRegistryGlobal {
         };
         loop {
             match service.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Drain all currently available preference events without waiting.
+    pub(crate) fn drain_preference_events(&self, events: &mut Vec<PreferenceEvent>) {
+        let Some(service) = self.service.as_ref() else {
+            return;
+        };
+        loop {
+            match service.try_recv_preference() {
                 Ok(event) => events.push(event),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }

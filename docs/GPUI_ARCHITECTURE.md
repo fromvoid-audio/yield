@@ -19,7 +19,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
-| `wavecrate-session` | App-owned source-registry commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
+| `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
 | `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
@@ -103,8 +103,10 @@ window, the fixed sample columns, and a short visible browser list.
 Copy the canonical JSON to create a theme. Colors accept `#RRGGBB` or
 `#RRGGBBAA`; dimensions use logical points. Imports must be regular UTF-8 files
 no larger than 128 KiB. Font families fall back through the platform font system
-when unavailable. Theme selection is session-only until isolated application
-profiles are implemented; reopening the app restores the built-in theme.
+when unavailable. The complete validated theme is restored from the isolated
+application profile; the optional source path is reread only when the user
+explicitly chooses Reload. A missing source file therefore does not erase the
+restored theme.
 
 Motion timing and deterministic envelopes belong to `wavecrate-design`; GPUI
 frame requests and drawing belong to `wavecrate-ui`. Loading indicators must
@@ -140,8 +142,10 @@ move DSP into the UI.
 New persistent workflows must acquire the existing profile/source authorities
 before admitting durable work. Development defaults must remain separate from
 the live Wavecrate profile. The current source registry uses only the isolated
-`gpui-development` profile and writes no source-local metadata or audio files;
-theme, autoplay, selection, and scan projections remain session-only.
+`gpui-development` profile and writes no source-local metadata or audio files.
+Theme, motion, autoplay, and loop preferences use the session's separate typed
+preference stream in that profile; sample selection and scan projections remain
+session-only.
 
 The source-registry service is application-owned and separate from view lifetime.
 GPUI 0.2.2 allows only 100 ms for quit-observer futures, which is not a durable

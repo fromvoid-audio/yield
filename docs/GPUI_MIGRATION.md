@@ -447,6 +447,40 @@ source removal, another graceful quit, and an empty registry on reopen. Source
 audio files remained unchanged and the database was confined to the
 `gpui-development` profile. Windows lifecycle execution remains unverified.
 
+### Persisted preference controls and recovery, 2026-09-08
+
+The browser now projects the profile-owned UI preference stream into the GPUI
+settings controls. Motion, selection autoplay, loop preference, and complete
+theme imports are submitted as ordered typed patches. A late full snapshot is
+installed as the new baseline and all still-pending patches are replayed in
+submission order, so an early toggle or theme import cannot be overwritten by
+an older asynchronous load. Request-applied and durable-persisted revisions
+are fenced separately; the settings panel reports Saving, Settings saved, and
+save or load failures without exposing internal revision numbers.
+
+The persisted theme contains the complete validated theme and its optional
+source path. Reopening the app restores that theme directly from the snapshot;
+the source file is read only when the user explicitly chooses Open or Reload.
+An invalid stored payload disables ordinary edits while leaving Reset saved settings
+available as the explicit recovery action; the normal Default control restores
+only the theme. A preference-only write
+failure keeps that recovery action available and does not close the source
+registry lane; a shared owner failure remains terminal. Passive preference
+snapshots update controls and theme projection without replaying transport
+actions or retargeting current playback.
+
+Validation: `cargo check -p wavecrate-ui` passed; the focused preference state
+run passed 4 tests; and `cargo test -p wavecrate-ui` passed 53 tests with one
+manual waveform benchmark ignored. `cargo fmt -p wavecrate-ui` completed
+successfully and `git diff --check` passed. The locked full-workspace suite and
+signed macOS build passed. Live disposable-profile checks confirmed custom
+theme, motion, autoplay, and loop restoration after restart with the source
+theme JSON moved away; failed Reload preserved the saved appearance. Default
+reset only the theme while preserving autoplay and loop choices. A malformed
+payload remained untouched on startup, and Reset saved settings persisted valid
+defaults and allowed a clean quit. Backend regressions cover write-failure
+isolation, lookup fairness, load-failure shutdown, and rapid revision reversions.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

@@ -27,13 +27,14 @@ use wavecrate_library::sample_sources::{SampleSource, SourceId};
 use wavecrate_media::{
     WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
 };
-use wavecrate_session::{RegistryRevision, RequestId};
+use wavecrate_session::{PreferencePatch, RegistryRevision, RequestId};
 
 use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
 
 mod handoff;
 mod motion;
+mod preferences;
 mod sidebar;
 mod source_registry;
 mod transport;
@@ -235,6 +236,7 @@ pub(crate) struct Browser {
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     source_registry_task: Option<Task<()>>,
+    preferences_task: Option<Task<()>>,
     source_registry_loaded: bool,
     source_registry_revision: RegistryRevision,
     source_registry_persisted_revision: RegistryRevision,
@@ -243,6 +245,7 @@ pub(crate) struct Browser {
     source_registry_pending_removes: HashMap<RequestId, PendingRegistryMutation>,
     source_registry_removed_roots: BTreeSet<PathBuf>,
     source_registry_status: String,
+    preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
     waveform_pending: bool,
@@ -328,6 +331,7 @@ impl Browser {
             scan_cancel: None,
             scan_task: None,
             source_registry_task: None,
+            preferences_task: None,
             source_registry_loaded: false,
             source_registry_revision: RegistryRevision::default(),
             source_registry_persisted_revision: RegistryRevision::default(),
@@ -336,6 +340,7 @@ impl Browser {
             source_registry_pending_removes: HashMap::new(),
             source_registry_removed_roots: BTreeSet::new(),
             source_registry_status: "Loading sources…".to_string(),
+            preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
             waveform_task: None,
             waveform_pending: false,
@@ -372,6 +377,7 @@ impl Browser {
             folder_scroll_handle: UniformListScrollHandle::new(),
         };
         browser.start_source_registry_poll(cx);
+        browser.start_preferences_poll(cx);
         browser
     }
 
@@ -1161,6 +1167,10 @@ impl Browser {
     }
 
     fn choose_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1201,15 +1211,32 @@ impl Browser {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
         let mut theme = crate::theme::active(cx).clone();
         theme.motion.enabled = !theme.motion.enabled;
+        if !self.persist_motion_preference(theme.motion.enabled, cx) {
+            return;
+        }
         cx.set_global(ActiveTheme(Arc::new(theme)));
+        self.search_input
+            .update(cx, |input, cx| input.theme_changed(cx));
         cx.notify();
     }
 
     fn toggle_autoplay(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.autoplay_selection = !self.autoplay_selection;
-        if !self.autoplay_selection {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let enabled = !self.autoplay_selection;
+        if !self.persist_autoplay_preference(enabled, cx) {
+            return;
+        }
+        self.autoplay_selection = enabled;
+        if !enabled {
             self.cancel_pending_selection_autoplay();
         }
         self.playback_status = if self.autoplay_selection {
@@ -1249,6 +1276,10 @@ impl Browser {
     }
 
     fn reload_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
         if self.theme_load.pending_path.is_some() {
             return;
         }
@@ -1261,16 +1292,52 @@ impl Browser {
     }
 
     fn reset_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.reset_preferences(cx);
+            return;
+        }
+        let theme = Theme::default();
+        if !self.submit_preference_patch(
+            PreferencePatch::ReplaceTheme {
+                theme: theme.clone(),
+                source_path: None,
+            },
+            cx,
+        ) {
+            return;
+        }
         self.theme_load.invalidate();
         self.theme_task.take();
-        cx.set_global(ActiveTheme::default());
+        cx.set_global(ActiveTheme(Arc::new(theme)));
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));
         cx.notify();
     }
 
+    fn reset_preferences(&mut self, cx: &mut Context<Self>) {
+        if !self.submit_preference_patch(PreferencePatch::Reset, cx) {
+            return;
+        }
+        self.theme_load.invalidate();
+        self.theme_task.take();
+        cx.set_global(ActiveTheme::default());
+        self.theme_status = "Wavecrate Editorial Terminal".to_string();
+        self.autoplay_selection = true;
+        self.loop_enabled = false;
+        if let Some(intent) = self.playback_init_intent.as_mut() {
+            intent.looped = false;
+        }
+        self.search_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+        cx.notify();
+    }
+
     fn load_theme(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
         let generation = self.theme_load.begin(path.clone());
         self.theme_task.take();
         self.theme_status = format!("Loading {}…", path.display());
@@ -1306,6 +1373,22 @@ impl Browser {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
+        if !self.theme_load.is_current(generation) {
+            return;
+        }
+        if !self.preferences_editable() {
+            self.theme_load.reject(generation);
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let patch = PreferencePatch::ReplaceTheme {
+            theme: theme.clone(),
+            source_path: Some(path.clone()),
+        };
+        if !self.submit_preference_patch(patch, cx) {
+            self.theme_load.reject(generation);
+            return;
+        }
         if !self.theme_load.accept(generation, path) {
             return;
         }

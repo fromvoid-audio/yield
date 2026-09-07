@@ -235,7 +235,15 @@ impl Browser {
     }
 
     pub(super) fn toggle_loop(&mut self, cx: &mut Context<Self>) {
-        self.loop_enabled = !self.loop_enabled;
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let enabled = !self.loop_enabled;
+        if !self.persist_loop_preference(enabled, cx) {
+            return;
+        }
+        self.loop_enabled = enabled;
         if let Some(intent) = self.playback_init_intent.as_mut() {
             intent.looped = self.loop_enabled;
         }
