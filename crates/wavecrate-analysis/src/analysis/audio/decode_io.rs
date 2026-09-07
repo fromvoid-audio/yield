@@ -36,14 +36,13 @@ pub fn probe_metadata(path: &Path) -> Result<AudioProbe, String> {
             .map_err(|err| format!("WAV probe failed for {}: {err}", path.display()))?;
         let spec = reader.spec();
         let sample_rate = spec.sample_rate.max(1);
-        let channels = spec.channels.max(1);
-        let duration_seconds =
-            (reader.duration() as f32 / channels as f32 / sample_rate as f32).max(0.0);
+        // Hound reports duration in frames, already divided by channel count.
+        let duration_seconds = (reader.duration() as f32 / sample_rate as f32).max(0.0);
         return Ok(AudioProbe {
             duration_seconds: Some(duration_seconds),
             sample_rate: Some(sample_rate),
             #[cfg(test)]
-            channels: Some(channels),
+            channels: Some(spec.channels.max(1)),
         });
     }
 
@@ -178,6 +177,28 @@ mod tests {
         assert!((duration - 1.0).abs() < 1e-3);
         assert_eq!(probe.sample_rate, Some(48_000));
         assert_eq!(probe.channels, Some(1));
+    }
+
+    #[test]
+    fn wav_probe_duration_is_independent_of_channel_count() {
+        let dir = TempDir::new().unwrap();
+        for channels in [1, 2, 4] {
+            let path = dir.path().join(format!("probe-{channels}.wav"));
+            let spec = WavSpec {
+                channels,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: SampleFormat::Int,
+            };
+            let mut writer = WavWriter::create(&path, spec).unwrap();
+            for _ in 0..(16_000 * u32::from(channels)) {
+                writer.write_sample::<i16>(0).unwrap();
+            }
+            writer.finalize().unwrap();
+            let probe = probe_metadata(&path).unwrap();
+            assert_eq!(probe.duration_seconds, Some(1.0));
+            assert_eq!(probe.channels, Some(channels));
+        }
     }
 
     #[test]
