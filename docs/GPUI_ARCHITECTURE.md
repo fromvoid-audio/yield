@@ -42,6 +42,13 @@ path identities; canonicalization happens once during background scanning.
 Filtering and sorting must not probe the filesystem. UI selection follows
 sample identity, not the position of a row in the filtered list.
 
+`BrowserSelection` owns explicit batch membership and the range anchor in the
+core crate. The focused sample remains a separate UI concern and alone drives
+waveform loading and audition. Sorting preserves selected identities; filtering
+and refresh discard identities no longer visible. Plain pointer focus clears
+explicit membership, while plain arrow focus preserves it. Source and folder
+navigation clear batch membership. These choices remain session-only.
+
 The current media scanner is a read-only browsing service. It returns a canonical
 root and every traversed relative directory, including empty directories, so the
 UI can project a complete session-only folder tree without doing filesystem work

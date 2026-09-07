@@ -268,6 +268,26 @@ full waveform/seek/loop parity. A separate metadata fix removes a duplicate WAV
 channel-count division; two targeted probe tests passed, including mono,
 stereo, and four-channel duration coverage.
 
+### Browser multiselect, 2026-09-07
+
+An identity-based core selection model now supports replacement and additive
+ranges, toggling, Select All, and projection reconciliation. Pointer modifiers
+and Shift+arrows drive ranges; Cmd/Ctrl+A selects visible rows while browser
+focus is active, and the reference X shortcut toggles the focused file. Plain
+arrows retain batch membership while moving preview focus; a plain click clears
+it. Source/folder navigation clears membership, and filtering removes hidden
+identities. Selected count, batch highlighting, and focused-sample feedback are
+separate. Range navigation borrows projection identities rather than cloning the
+whole list, and ordinary arrow navigation does not allocate that list.
+
+Validation: 19 core tests and 22 UI tests passed (one manual benchmark ignored),
+formatting and diff checks passed, and a signed macOS bundle was built. Live
+fixture checks covered keyboard ranges, focus movement preserving membership,
+Select All without scrolling, query reconciliation from 80 to 10 to 1 selected,
+search-field Select All routing, plain-click reset, and focused toggle. Modified
+pointer routing has code/core coverage; manual modifier-click acceptance remains
+unrecorded. Batch file mutations and persisted selection remain outside this slice.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

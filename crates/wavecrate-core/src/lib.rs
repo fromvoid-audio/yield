@@ -6,10 +6,12 @@
 use std::path::{Path, PathBuf};
 
 mod folder_tree;
+mod selection;
 
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
 };
+pub use selection::BrowserSelection;
 
 /// A source audio file discovered by a folder scan.
 #[derive(Clone, Debug, PartialEq)]

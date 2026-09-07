@@ -67,13 +67,19 @@ or Up/Down; Space plays/stops and Escape stops playback. While searching, Space
 enters text and Escape returns browser focus. Filtering and sorting preserve the
 focused sample when it remains visible.
 
+Shift-click or Shift+Up/Down selects a range. Cmd/Ctrl-click toggles a row;
+Cmd/Ctrl+Shift adds a range. Cmd/Ctrl+A selects visible files while the browser
+has focus, and X toggles the focused file. Plain arrows move preview focus while
+preserving a batch selection; a plain click starts fresh. The status bar shows
+the explicit selected count.
+
 Audition and waveform previews currently support WAV. Other recognized audio
 formats are listed. Waveforms show a bounded initial segment; files over 256 MiB
 are not previewed. The application does not persist library state or modify
 sample files.
 
 See the [parity register](docs/GPUI_MIGRATION.md) for remaining workflows and
-validation evidence. Editing, persistent curation, recovery, multiselect,
+validation evidence. Editing, persistent curation, recovery,
 full-length waveforms, and DAW handoff remain outstanding. Inherited release
 workflows are disabled.
 

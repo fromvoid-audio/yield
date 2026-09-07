@@ -2,8 +2,6 @@
 #![deny(warnings)]
 
 //! Browser state, scan lifecycle, selection, and keyboard navigation.
-//!
-//! Selection is currently a single focused row; shift-based multiselect remains future work.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -21,7 +19,8 @@ use gpui::{
 };
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
-    AudioFile, AudioFileId, BrowserViewModel, FolderScope, FolderTree, FolderTreeRow, SortColumn,
+    AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
+    FolderTreeRow, SortColumn,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_media::{WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview};
@@ -66,6 +65,23 @@ impl SourceSession {
             selected_audio_id: None,
             last_error: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleClickIntent {
+    Focus,
+    ReplaceRange,
+    AddRange,
+    Toggle,
+}
+
+fn sample_click_intent(shift: bool, secondary: bool) -> SampleClickIntent {
+    match (shift, secondary) {
+        (true, true) => SampleClickIntent::AddRange,
+        (true, false) => SampleClickIntent::ReplaceRange,
+        (false, true) => SampleClickIntent::Toggle,
+        (false, false) => SampleClickIntent::Focus,
     }
 }
 
@@ -130,6 +146,7 @@ pub(crate) struct Browser {
     restore_selection_position: Option<usize>,
     view_model: BrowserViewModel,
     selected: Option<usize>,
+    selection: BrowserSelection,
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
@@ -181,6 +198,7 @@ impl Browser {
                 let previous_position = view.selected_visible_position();
                 let query = input.read(cx).content().to_owned();
                 view.view_model.set_query(&view.entries, query);
+                view.reconcile_selection();
                 view.restore_projection_focus(previous_id, previous_position, cx);
             });
         let motion_settings = Motion::default();
@@ -203,6 +221,7 @@ impl Browser {
             restore_selection_position: None,
             view_model: BrowserViewModel::new(&[]),
             selected: None,
+            selection: BrowserSelection::new(),
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
@@ -258,10 +277,64 @@ impl Browser {
             .map(AudioFile::stable_id)
     }
 
+    fn visible_selection_ids(&self) -> Vec<AudioFileId> {
+        self.view_model
+            .rows()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    fn reconcile_selection(&mut self) {
+        let visible_ids = self.visible_selection_ids();
+        self.selection.reconcile(&visible_ids);
+    }
+
+    /// Highlight batch members, falling back to the focused sample for ordinary navigation.
+    fn sample_row_is_selected(&self, entry_index: usize, id: &AudioFileId) -> bool {
+        self.selection.contains(id)
+            || (self.selection.is_empty() && self.selected == Some(entry_index))
+    }
+
+    fn selected_count_label(&self) -> Option<String> {
+        (!self.selection.is_empty()).then(|| format!("{} selected", self.selection.len()))
+    }
+
     fn selected_visible_position(&self) -> Option<usize> {
         self.selected_id()
             .as_ref()
             .and_then(|id| self.view_model.visible_position_for(id))
+    }
+
+    fn select_entry_from_click(
+        &mut self,
+        index: usize,
+        event: &ClickEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        let target_id = entry.stable_id();
+        let focused_id = self.selected_id();
+        let modifiers = event.modifiers();
+        let intent = sample_click_intent(modifiers.shift, modifiers.platform || modifiers.control);
+        match intent {
+            SampleClickIntent::Focus => self.selection.focus_pointer(&target_id),
+            SampleClickIntent::ReplaceRange | SampleClickIntent::AddRange => {
+                let additive = matches!(intent, SampleClickIntent::AddRange);
+                self.selection.extend_range(
+                    self.view_model.rows().iter().map(|row| &row.id),
+                    focused_id.as_ref(),
+                    &target_id,
+                    additive,
+                );
+            }
+            SampleClickIntent::Toggle => {
+                self.selection.toggle(&target_id, focused_id.as_ref());
+            }
+        }
+        self.select_entry(index, Some(motion::FocusTrigger::Pointer), cx);
     }
 
     fn restore_projection_focus(
@@ -305,6 +378,9 @@ impl Browser {
         source_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        if source_index != self.active_source {
+            self.selection.clear();
+        }
         self.reset_focus();
         self.reset_scroll_edges();
         if let Some(cancellation) = self.scan_cancel.take() {
@@ -427,6 +503,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.reconcile_selection();
         self.scan_status = format!(
             "{count} audio file{} · {} skipped",
             if count == 1 { "" } else { "s" },
@@ -480,6 +557,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.reconcile_selection();
         self.scan_status = if is_refresh {
             format!(
                 "Could not refresh {}: {error}",
@@ -670,12 +748,18 @@ impl Browser {
         self.reset_focus();
         self.reset_scroll_edges();
         let was_active = self.active_source == Some(index);
+        if was_active {
+            self.selection.clear();
+        }
         let had_pending_scan = if let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
             true
         } else {
             false
         };
+        if had_pending_scan {
+            self.selection.clear();
+        }
         if had_pending_scan || was_active {
             self.scan_generation = self.scan_generation.wrapping_add(1);
             self.waveform_generation = self.waveform_generation.wrapping_add(1);
@@ -750,6 +834,7 @@ impl Browser {
             return;
         }
         window.focus(&self.focus_handle);
+        self.selection.clear();
         self.selected_folder = path.clone();
         self.update_active_folder_projection(cx);
         self.start_focus(
@@ -782,6 +867,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.reconcile_selection();
         if let Some(index) = self.active_source
             && let Some(session) = self.source_sessions.get_mut(index)
         {
@@ -1040,7 +1126,13 @@ impl Browser {
         cx.notify();
     }
 
-    fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
+    fn move_selection(
+        &mut self,
+        direction: isize,
+        extend: bool,
+        additive: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.view_model.rows().is_empty() {
             return;
         }
@@ -1051,9 +1143,24 @@ impl Browser {
             .unwrap_or(0) as isize;
         let next_position =
             (current + direction).clamp(0, self.view_model.rows().len() as isize - 1) as usize;
-        let next = self.view_model.rows()[next_position].entry_index;
+        let next_row = self.view_model.rows()[next_position].clone();
+        let next = next_row.entry_index;
+        let next_id = next_row.id;
+        let focused_id = self.selected_id();
+        if extend {
+            self.selection.extend_range(
+                self.view_model.rows().iter().map(|row| &row.id),
+                focused_id.as_ref(),
+                &next_id,
+                additive,
+            );
+        } else {
+            self.selection.move_anchor_to(&next_id);
+        }
         if Some(next) != self.selected {
             self.select_entry(next, Some(motion::FocusTrigger::Keyboard), cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -1061,7 +1168,24 @@ impl Browser {
         let previous_id = self.selected_id();
         let previous_position = self.selected_visible_position();
         self.view_model.toggle_sort(&self.entries, column);
+        self.reconcile_selection();
         self.restore_projection_focus(previous_id, previous_position, cx);
+    }
+
+    fn select_all_visible(&mut self, cx: &mut Context<Self>) {
+        let visible_ids = self.visible_selection_ids();
+        self.selection.select_all(&visible_ids);
+        cx.notify();
+    }
+
+    /// Toggle explicit membership for the focused row. This is the reference browser's `X`
+    /// action; focused-row fallback still makes an empty explicit set auditionable as one item.
+    fn toggle_focused_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(focused_id) = self.selected_id() else {
+            return;
+        };
+        self.selection.toggle(&focused_id, Some(&focused_id));
+        cx.notify();
     }
 
     fn handle_key_down(
@@ -1071,9 +1195,9 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
-        if key.eq_ignore_ascii_case("f")
-            && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
-        {
+        let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+        let shift = event.keystroke.modifiers.shift;
+        if key.eq_ignore_ascii_case("f") && secondary {
             window.focus(&self.search_input.read(cx).focus_handle());
             return;
         }
@@ -1086,10 +1210,15 @@ impl Browser {
         if event.is_held && key == "space" {
             return;
         }
+        if secondary && !shift && key.eq_ignore_ascii_case("a") {
+            self.select_all_visible(cx);
+            return;
+        }
         match key {
             "space" => self.toggle_playback(cx),
-            "up" | "arrowup" => self.move_selection(-1, cx),
-            "down" | "arrowdown" => self.move_selection(1, cx),
+            "x" if !shift && !secondary => self.toggle_focused_selection(cx),
+            "up" | "arrowup" => self.move_selection(-1, shift, secondary && shift, cx),
+            "down" | "arrowdown" => self.move_selection(1, shift, secondary && shift, cx),
             "escape" => {
                 self.stop_playback();
                 cx.notify();
@@ -1170,7 +1299,8 @@ fn source_label(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceSession, ThemeLoadState, next_source_index_after_removal, resolve_scan_source_index,
+        SampleClickIntent, SourceSession, ThemeLoadState, next_source_index_after_removal,
+        resolve_scan_source_index, sample_click_intent,
     };
     use std::path::PathBuf;
 
@@ -1229,5 +1359,16 @@ mod tests {
         assert_eq!(next_source_index_after_removal(Some(2), 0, 2), Some(1));
         assert_eq!(next_source_index_after_removal(Some(0), 1, 2), Some(0));
         assert_eq!(next_source_index_after_removal(None, 0, 0), None);
+    }
+
+    #[test]
+    fn sample_click_modifiers_route_to_core_selection_intents() {
+        assert_eq!(sample_click_intent(false, false), SampleClickIntent::Focus);
+        assert_eq!(
+            sample_click_intent(true, false),
+            SampleClickIntent::ReplaceRange
+        );
+        assert_eq!(sample_click_intent(false, true), SampleClickIntent::Toggle);
+        assert_eq!(sample_click_intent(true, true), SampleClickIntent::AddRange);
     }
 }

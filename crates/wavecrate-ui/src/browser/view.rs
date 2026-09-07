@@ -282,6 +282,7 @@ impl Render for Browser {
             } else {
                 self.scan_status.clone()
             };
+        let selected_count = self.selected_count_label();
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
@@ -318,7 +319,8 @@ impl Render for Browser {
                                         let row = view.view_model.rows()[visible_index].clone();
                                         let index = row.entry_index;
                                         let entry = view.entries[index].clone();
-                                        let selected = view.selected == Some(index);
+                                        let selected = view.sample_row_is_selected(index, &row.id);
+                                        let current_sample = view.selected == Some(index);
                                         let focused = motion_frame.focus_alpha > 0
                                             && view.focus_matches_sample(&entry.path);
                                         let extension = entry
@@ -354,12 +356,8 @@ impl Render for Browser {
                                             .hover(move |style| style.bg(hover_fill))
                                             .active(move |style| style.bg(pressed_fill))
                                             .on_click(cx.listener(
-                                                move |view, _: &ClickEvent, _, cx| {
-                                                    view.select_entry(
-                                                        index,
-                                                        Some(motion::FocusTrigger::Pointer),
-                                                        cx,
-                                                    );
+                                                move |view, event: &ClickEvent, _, cx| {
+                                                    view.select_entry_from_click(index, event, cx);
                                                 },
                                             ))
                                             .child(
@@ -367,7 +365,7 @@ impl Render for Browser {
                                                     .flex_none()
                                                     .w(px(list_theme.spacing.selected_marker_width))
                                                     .h_full()
-                                                    .bg(if selected {
+                                                    .bg(if selected || current_sample {
                                                         color(list_theme.colors.accent)
                                                     } else {
                                                         transparent()
@@ -689,6 +687,9 @@ impl Render for Browser {
                     .text_color(color(theme.colors.text_muted))
                     .child(self.playback_status.clone())
                     .child(list_status)
+                    .when(selected_count.is_some(), move |element| {
+                        element.child(selected_count.unwrap_or_default())
+                    })
                     .child(div().flex_1())
                     .child(self.theme_status.clone())
                     .when(self.motion_pending().any(), |element| {
