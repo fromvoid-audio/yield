@@ -10,10 +10,12 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
-    blue, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::theme::{active, color};
 
 actions!(
     search_input,
@@ -107,6 +109,12 @@ impl SearchInput {
         self.last_bounds = None;
         self.is_selecting = false;
         cx.emit(SearchChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn theme_changed(&mut self, cx: &mut Context<Self>) {
+        self.last_layout = None;
+        self.last_bounds = None;
         cx.notify();
     }
 
@@ -480,12 +488,13 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
+        let theme = active(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), style.color)
+            (input.placeholder.clone(), color(theme.colors.text_muted))
         } else {
             (content, style.color)
         };
@@ -516,7 +525,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    blue(),
+                    color(theme.colors.accent),
                 )),
             )
         } else {
@@ -532,7 +541,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    color(theme.colors.selection_hover_fill),
                 )),
                 None,
             )
@@ -580,6 +589,7 @@ impl Element for TextElement {
 
 impl Render for SearchInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active(cx);
         div()
             .flex()
             .key_context("SearchInput")
@@ -602,18 +612,24 @@ impl Render for SearchInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(rgb(0x0d1118))
-            .line_height(px(22.))
-            .text_size(px(15.))
-            .text_color(rgb(0xe6edf5))
-            .border_1()
-            .border_color(rgb(0x242e3d))
-            .rounded_sm()
+            .bg(color(theme.colors.surface_overlay))
+            .line_height(px(theme.typography.line_height))
+            .text_size(px(theme.typography.body_size))
+            .text_color(color(theme.colors.text_primary))
+            .border(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .focus({
+                let focus_color = color(theme.interaction.focus_outline);
+                let focus_width = theme.interaction.focus_outline_width;
+                move |style| style.border(px(focus_width)).border_color(focus_color)
+            })
             .child(
                 div()
-                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
                     .w_full()
-                    .p(px(5.))
+                    .px(px(theme.spacing.control_gap))
                     .child(TextElement { input: cx.entity() }),
             )
     }

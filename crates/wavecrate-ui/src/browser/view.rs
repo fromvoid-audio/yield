@@ -1,112 +1,206 @@
 #![deny(missing_docs)]
 #![deny(warnings)]
 
-//! Browser list, details, waveform, and sorting controls.
+//! Browser rendering and the compact Wavecrate application shell.
 
-use gpui::{ClickEvent, Context, Render, Window, div, prelude::*, px, rgb, uniform_list};
+use gpui::{
+    ClickEvent, Context, Div, MouseButton, Render, Window, div, font, prelude::*, px, uniform_list,
+};
 use wavecrate_core::{SortColumn, SortDirection, format_duration};
+use wavecrate_design::Theme;
+
+use crate::theme::{active, color, transparent};
 
 use super::Browser;
+use super::waveform;
 
-const ROW_HEIGHT: f32 = 44.0;
+fn format_file_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes as f32 / MIB as f32)
+    } else if bytes >= KIB {
+        format!("{} KB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 impl Browser {
-    fn render_waveform(&self) -> impl IntoElement {
-        let mut bars = div()
-            .flex()
-            .items_center()
-            .gap(px(1.0))
-            .h(px(112.0))
-            .w_full()
-            .overflow_hidden()
-            .px_2()
-            .bg(rgb(0x0d1118));
-        if let Some(preview) = self.waveform.as_ref() {
-            for peak in &preview.peaks {
-                bars = bars.child(
-                    div()
-                        .flex_1()
-                        .h(px((peak * 92.0).max(3.0)))
-                        .bg(rgb(0x67d9a2)),
-                );
-            }
-        }
-        bars
-    }
-
-    fn render_details(&self) -> impl IntoElement {
-        let mut details = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .flex_none()
-            .w(px(350.0))
-            .p_4()
-            .bg(rgb(0x171d28));
-        if let Some(index) = self.selected {
+    fn render_waveform_panel(&self, theme: Theme) -> impl IntoElement {
+        let (title, metadata) = if let Some(index) = self.selected {
             if let Some(entry) = self.entries.get(index) {
-                details = details
-                    .child(
-                        div()
-                            .text_lg()
-                            .child(entry.relative_path.display().to_string()),
-                    )
-                    .child(div().text_sm().text_color(rgb(0x9ba7b8)).child(format!(
-                                "{} · {} bytes · {} Hz",
-                                format_duration(entry.duration_seconds),
-                                entry.byte_len,
-                                entry.sample_rate
-                                    .map(|rate| rate.to_string())
-                                    .unwrap_or_else(|| "unknown".to_string())
-                    )))
-                    .child(self.render_waveform());
-                if let Some(preview) = self.waveform.as_ref() {
-                    details =
-                        details.child(div().text_sm().text_color(rgb(0x9ba7b8)).child(format!(
-                            "Waveform preview: {}",
-                            format_duration(Some(preview.duration_seconds))
-                        )));
-                }
-                if let Some(error) = self.waveform_error.as_ref() {
-                    details = details.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xf0a6a6))
-                            .child(error.clone()),
-                    );
-                } else if self.waveform.is_none() {
-                    details = details.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x9ba7b8))
-                            .child("Loading bounded waveform preview…"),
-                    );
-                }
-                details = details.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x9ba7b8))
-                        .child("Space: play or stop · Up/Down: select · Esc: stop"),
-                );
+                (
+                    entry.relative_path.display().to_string(),
+                    format!(
+                        "{}  ·  {} bytes  ·  {} Hz",
+                        format_duration(entry.duration_seconds),
+                        entry.byte_len,
+                        entry
+                            .sample_rate
+                            .map(|rate| rate.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ),
+                )
+            } else {
+                ("No sample selected".to_string(), String::new())
             }
         } else {
-            details = details.justify_center().items_center().child(
+            ("No sample selected".to_string(), String::new())
+        };
+        let message = if let Some(error) = self.waveform_error.as_ref() {
+            (error.clone(), theme.colors.danger)
+        } else if let Some(preview) = self.waveform.as_ref() {
+            (
+                format!(
+                    "Preview loaded: {}  ·  Space plays or stops  ·  Esc stops",
+                    format_duration(Some(preview.duration_seconds))
+                ),
+                theme.colors.text_muted,
+            )
+        } else if self.selected.is_some() {
+            (
+                "Loading bounded waveform preview…".to_string(),
+                theme.colors.warning,
+            )
+        } else {
+            (
+                "Select a sample to inspect its waveform".to_string(),
+                theme.colors.text_muted,
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .h(px(theme.spacing.waveform_height))
+            .bg(color(theme.colors.surface))
+            .border_b(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .child(
                 div()
-                    .text_sm()
-                    .child("Select a sample to inspect its waveform"),
-            );
-        }
-        details
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(theme.waveform.title_height))
+                    .px(px(theme.spacing.panel_padding))
+                    .bg(color(theme.colors.waveform_label))
+                    .text_size(px(theme.typography.waveform_title_size))
+                    .child(title),
+            )
+            .child(waveform::render_waveform(self, theme.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(theme.waveform.metadata_height))
+                    .gap(px(theme.spacing.control_gap))
+                    .px(px(theme.spacing.panel_padding))
+                    .text_size(px(theme.typography.small_size))
+                    .text_color(color(theme.colors.text_muted))
+                    .child(metadata)
+                    .child(div().flex_1())
+                    .child(div().text_color(color(message.1)).child(message.0)),
+            )
     }
 
-    fn render_sort_button(
+    fn render_sidebar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let root_label = self
+            .root
+            .as_ref()
+            .map(|root| {
+                root.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.display().to_string())
+            })
+            .unwrap_or_else(|| "No source folder selected".to_string());
+        let source_label = "Sources";
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(theme.spacing.sidebar_width))
+            .h_full()
+            .bg(color(theme.colors.surface_raised))
+            .border_r(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(theme.spacing.panel_padding))
+                    .pt(px(theme.spacing.panel_padding))
+                    .pb(px(theme.spacing.control_gap))
+                    .text_size(px(theme.typography.small_size))
+                    .text_color(color(theme.colors.text_muted))
+                    .child(source_label),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(theme.spacing.control_gap))
+                    .min_h(px(theme.spacing.row_height))
+                    .px(px(theme.spacing.row_padding_x))
+                    .bg(if self.root.is_some() {
+                        color(theme.colors.selection_fill)
+                    } else {
+                        transparent()
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(theme.spacing.selected_marker_width))
+                            .h_full()
+                            .bg(if self.root.is_some() {
+                                color(theme.colors.accent)
+                            } else {
+                                transparent()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(theme.typography.small_size))
+                            .child(root_label),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                div().flex_none().p(px(theme.spacing.panel_padding)).child(
+                    div()
+                        .id("choose-folder-sidebar")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(px(theme.spacing.control_height))
+                        .cursor_pointer()
+                        .bg(color(theme.colors.surface_overlay))
+                        .border(px(theme.spacing.border_width))
+                        .border_color(color(theme.colors.border_emphasis))
+                        .text_size(px(theme.typography.small_size))
+                        .on_click(cx.listener(Self::choose_folder))
+                        .child("Choose folder"),
+                ),
+            )
+    }
+
+    fn render_column_header(
         &self,
         label: &'static str,
         column: SortColumn,
+        theme: Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+        width: Option<f32>,
+        padding_left: f32,
+    ) -> impl IntoElement + 'static {
         let sort = self.view_model.sort();
-        let marker = if sort.column == column {
+        let selected = sort.column == column;
+        let marker = if selected {
             match sort.direction {
                 SortDirection::Ascending => " ↑",
                 SortDirection::Descending => " ↓",
@@ -114,31 +208,121 @@ impl Browser {
         } else {
             ""
         };
-        div()
+        let hover_fill = color(theme.interaction.hover_fill);
+        let pressed_fill = color(theme.interaction.pressed_fill);
+        let mut header = div()
             .id(label)
+            .flex()
+            .items_center()
+            .h(px(theme.spacing.row_height))
+            .pl(px(padding_left))
+            .pr(px(theme.spacing.control_gap))
             .cursor_pointer()
-            .rounded_sm()
-            .px_2()
-            .py_1()
-            .bg(if sort.column == column {
-                rgb(0x294d4b)
+            .bg(color(theme.colors.surface_overlay))
+            .border_b(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .hover(move |style| style.bg(hover_fill))
+            .active(move |style| style.bg(pressed_fill))
+            .text_size(px(theme.typography.small_size))
+            .text_color(if selected {
+                color(theme.colors.text_primary)
             } else {
-                rgb(0x202936)
+                color(theme.colors.text_muted)
             })
-            .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                view.toggle_sort(column, cx);
-            }))
-            .child(format!("{label}{marker}"))
+            .child(format!("{label}{marker}"));
+        if let Some(width) = width {
+            header = header.flex_none().w(px(width));
+        } else {
+            header = header.flex_1();
+        }
+        header.on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+            view.toggle_sort(column, cx);
+        }))
+    }
+
+    fn render_theme_settings(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let reload_pending = self.theme_load.pending_path.is_some();
+        let reload_fill = if reload_pending {
+            color(theme.colors.control_disabled_fill)
+        } else {
+            transparent()
+        };
+        let reload_text = if reload_pending {
+            color(theme.colors.text_disabled)
+        } else {
+            color(theme.colors.text_primary)
+        };
+        let reload = div()
+            .id("reload-theme")
+            .flex()
+            .items_center()
+            .h(px(theme.spacing.control_height))
+            .px(px(theme.spacing.control_gap))
+            .border(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border_emphasis))
+            .bg(reload_fill)
+            .text_color(reload_text)
+            .when(!reload_pending, |element| {
+                element
+                    .cursor_pointer()
+                    .on_click(cx.listener(Self::reload_theme))
+            })
+            .child("Reload");
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(theme.spacing.control_gap))
+            .h(px(
+                theme.spacing.control_height + theme.spacing.panel_padding * 2.0
+            ))
+            .px(px(theme.spacing.panel_padding))
+            .bg(color(theme.colors.surface_overlay))
+            .border_b(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(theme.colors.text_muted))
+            .child("THEME")
+            .child(
+                div()
+                    .id("choose-theme")
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
+                    .px(px(theme.spacing.control_gap))
+                    .cursor_pointer()
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .on_click(cx.listener(Self::choose_theme))
+                    .child("Open"),
+            )
+            .child(reload)
+            .child(
+                div()
+                    .id("reset-theme")
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
+                    .px(px(theme.spacing.control_gap))
+                    .cursor_pointer()
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .on_click(cx.listener(Self::reset_theme))
+                    .child("Default"),
+            )
+            .child(div().flex_1())
+            .child(self.theme_status.clone())
     }
 }
 
 impl Render for Browser {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active(cx).clone();
         let root_label = self
             .root
             .as_ref()
             .map(|root| root.display().to_string())
-            .unwrap_or_else(|| "No folder selected".to_string());
+            .unwrap_or_else(|| "No source folder".to_string());
         let list_status =
             if !self.entries.is_empty() && self.view_model.rows().len() != self.entries.len() {
                 format!(
@@ -149,13 +333,19 @@ impl Render for Browser {
             } else {
                 self.scan_status.clone()
             };
+        let extension_width = theme.spacing.extension_column_width;
+        let size_width = theme.spacing.size_column_width;
+        let duration_width = theme.spacing.duration_column_width;
+        let toolbar_hover = theme.interaction.hover_fill;
+        let toolbar_pressed = theme.interaction.pressed_fill;
         let list = if self.view_model.rows().is_empty() {
             div()
                 .flex()
                 .flex_1()
                 .justify_center()
                 .items_center()
-                .text_color(rgb(0x9ba7b8))
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.text_muted))
                 .child(if self.entries.is_empty() {
                     list_status.clone()
                 } else {
@@ -166,51 +356,101 @@ impl Render for Browser {
                 uniform_list(
                     "sample-list",
                     self.view_model.rows().len(),
-                    cx.processor(|view, range: std::ops::Range<usize>, _window, cx| {
-                        range
-                            .map(|visible_index| {
-                                let row = view.view_model.rows()[visible_index].clone();
-                                let index = row.entry_index;
-                                let entry = view.entries[index].clone();
-                                let selected = view.selected == Some(index);
-                                let background = if selected {
-                                    rgb(0x294d4b)
-                                } else {
-                                    rgb(0x171d28)
-                                };
-                                div()
-                                    .id(index)
-                                    .flex()
-                                    .flex_none()
-                                    .w_full()
-                                    .items_center()
-                                    .gap_2()
-                                    .h(px(ROW_HEIGHT))
-                                    .px_3()
-                                    .cursor_pointer()
-                                    .bg(background)
-                                    .border_1()
-                                    .border_color(rgb(0x242e3d))
-                                    .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                                        view.select_entry(index, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .child(entry.relative_path.display().to_string()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_sm()
-                                            .text_color(rgb(0x9ba7b8))
-                                            .child(format_duration(entry.duration_seconds)),
-                                    )
-                            })
-                            .collect::<Vec<_>>()
+                    cx.processor({
+                        let list_theme = theme.clone();
+                        move |view, range: std::ops::Range<usize>, _window, cx| {
+                            range
+                                .map(|visible_index| {
+                                    let row = view.view_model.rows()[visible_index].clone();
+                                    let index = row.entry_index;
+                                    let entry = view.entries[index].clone();
+                                    let selected = view.selected == Some(index);
+                                    let extension = entry
+                                        .path
+                                        .extension()
+                                        .map(|extension| extension.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let size = format_file_size(entry.byte_len);
+                                    let duration = format_duration(entry.duration_seconds);
+                                    let hover_fill = color(list_theme.colors.selection_hover_fill);
+                                    let pressed_fill = color(list_theme.interaction.pressed_fill);
+                                    div()
+                                        .id(index)
+                                        .flex()
+                                        .flex_none()
+                                        .w_full()
+                                        .items_center()
+                                        .h(px(list_theme.spacing.row_height))
+                                        .cursor_pointer()
+                                        .bg(if selected {
+                                            color(list_theme.colors.selection_fill)
+                                        } else {
+                                            color(list_theme.colors.surface)
+                                        })
+                                        .hover(move |style| style.bg(hover_fill))
+                                        .active(move |style| style.bg(pressed_fill))
+                                        .on_click(cx.listener(
+                                            move |view, _: &ClickEvent, _, cx| {
+                                                view.select_entry(index, cx);
+                                            },
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(list_theme.spacing.selected_marker_width))
+                                                .h_full()
+                                                .bg(if selected {
+                                                    color(list_theme.colors.accent)
+                                                } else {
+                                                    transparent()
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .pl(px(list_theme.spacing.row_padding_x))
+                                                .pr(px(list_theme.spacing.control_gap))
+                                                .text_size(px(list_theme.typography.body_size))
+                                                .text_color(if selected {
+                                                    color(list_theme.colors.accent)
+                                                } else {
+                                                    color(list_theme.colors.text_primary)
+                                                })
+                                                .child(entry.relative_path.display().to_string()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(extension_width))
+                                                .px(px(list_theme.spacing.control_gap))
+                                                .text_size(px(list_theme.typography.small_size))
+                                                .text_color(color(list_theme.colors.text_muted))
+                                                .child(extension),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(size_width))
+                                                .px(px(list_theme.spacing.control_gap))
+                                                .text_size(px(list_theme.typography.small_size))
+                                                .text_color(color(list_theme.colors.text_muted))
+                                                .child(size),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(duration_width))
+                                                .px(px(list_theme.spacing.control_gap))
+                                                .text_size(px(list_theme.typography.small_size))
+                                                .text_color(color(list_theme.colors.text_muted))
+                                                .child(duration),
+                                        )
+                                })
+                                .collect::<Vec<_>>()
+                        }
                     }),
                 )
                 .h_full()
@@ -222,8 +462,11 @@ impl Render for Browser {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x10141c))
-            .text_color(rgb(0xe6edf5))
+            .bg(color(theme.colors.background))
+            .text_color(color(theme.colors.text_primary))
+            .font(font(theme.typography.font_family.clone()))
+            .line_height(px(theme.typography.line_height))
+            .text_size(px(theme.typography.body_size))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(
@@ -231,17 +474,67 @@ impl Render for Browser {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_3()
-                    .bg(rgb(0x171d28))
-                    .border_1()
-                    .border_color(rgb(0x242e3d))
-                    .child(div().text_xl().child("Wavecrate GPUI"))
+                    .h(px(theme.spacing.toolbar_height))
+                    .gap(px(theme.spacing.control_gap))
+                    .px(px(theme.spacing.panel_padding))
+                    .bg(color(theme.colors.surface_raised))
+                    .border_b(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border))
                     .child(
                         div()
                             .flex_none()
-                            .w(px(240.0))
+                            .w(px((theme.spacing.toolbar_leading_inset
+                                - theme.spacing.panel_padding)
+                                .max(0.0)))
+                            .h_full()
+                            .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
+                                window.start_window_move();
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("play-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(theme.spacing.control_height))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .on_click(cx.listener(Self::toggle_playback_from_toolbar))
+                            .text_size(px(theme.typography.title_size))
+                            .text_color(color(theme.colors.accent))
+                            .child("▶"),
+                    )
+                    .child(
+                        div()
+                            .id("stop-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(theme.spacing.control_height))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .on_click(cx.listener(Self::stop_playback_from_toolbar))
+                            .text_size(px(theme.typography.title_size))
+                            .text_color(color(theme.colors.danger))
+                            .child("■"),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(220.0))
                             .child(self.search_input.clone()),
                     )
                     .child(
@@ -250,77 +543,140 @@ impl Render for Browser {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_color(rgb(0x9ba7b8))
+                            .text_size(px(theme.typography.small_size))
+                            .text_color(color(theme.colors.text_muted))
                             .child(root_label),
                     )
                     .child(
                         div()
-                            .id("choose-folder")
+                            .id("choose-folder-toolbar")
                             .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(theme.spacing.control_height))
+                            .px(px(theme.spacing.control_gap))
                             .cursor_pointer()
-                            .rounded_sm()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x2c8f79))
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .text_size(px(theme.typography.small_size))
                             .on_click(cx.listener(Self::choose_folder))
-                            .child("Choose folder"),
+                            .child("+"),
+                    )
+                    .child(
+                        div()
+                            .id("theme-settings")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(theme.spacing.control_height))
+                            .px(px(theme.spacing.control_gap))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .text_size(px(theme.typography.small_size))
+                            .on_click(cx.listener(Self::toggle_theme_settings))
+                            .child("⚙"),
                     ),
             )
+            .when(self.theme_settings_open, |element| {
+                element.child(self.render_theme_settings(theme.clone(), cx))
+            })
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .h_full()
-                    .gap_3()
-                    .p_3()
+                    .child(self.render_sidebar(theme.clone(), cx))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
                             .h_full()
-                            .gap_2()
-                            .bg(rgb(0x171d28))
-                            .border_1()
-                            .border_color(rgb(0x242e3d))
+                            .child(self.render_waveform_panel(theme.clone()))
                             .child(
                                 div()
-                                    .flex_none()
-                                    .px_3()
-                                    .py_2()
-                                    .text_sm()
-                                    .text_color(rgb(0x9ba7b8))
-                                    .child(list_status),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
                                     .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_3()
-                                    .pb_2()
-                                    .text_sm()
-                                    .child(self.render_sort_button("Name", SortColumn::Name, cx))
-                                    .child(self.render_sort_button("Size", SortColumn::Size, cx))
-                                    .child(self.render_sort_button(
-                                        "Extension",
-                                        SortColumn::Extension,
-                                        cx,
-                                    )),
-                            )
-                            .child(list),
-                    )
-                    .child(self.render_details()),
+                                    .flex_col()
+                                    .flex_1()
+                                    .h_full()
+                                    .bg(color(theme.colors.surface))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .h(px(theme.spacing.row_height))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(theme.spacing.selected_marker_width))
+                                                    .h_full()
+                                                    .bg(transparent()),
+                                            )
+                                            .child(self.render_column_header(
+                                                "Name",
+                                                SortColumn::Name,
+                                                theme.clone(),
+                                                cx,
+                                                None,
+                                                theme.spacing.row_padding_x,
+                                            ))
+                                            .child(self.render_column_header(
+                                                "Ext",
+                                                SortColumn::Extension,
+                                                theme.clone(),
+                                                cx,
+                                                Some(extension_width),
+                                                theme.spacing.control_gap,
+                                            ))
+                                            .child(self.render_column_header(
+                                                "Size",
+                                                SortColumn::Size,
+                                                theme.clone(),
+                                                cx,
+                                                Some(size_width),
+                                                theme.spacing.control_gap,
+                                            ))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .flex_none()
+                                                    .w(px(duration_width))
+                                                    .h(px(theme.spacing.row_height))
+                                                    .pl(px(theme.spacing.control_gap))
+                                                    .pr(px(theme.spacing.control_gap))
+                                                    .border_b(px(theme.spacing.border_width))
+                                                    .border_color(color(theme.colors.border))
+                                                    .text_size(px(theme.typography.small_size))
+                                                    .text_color(color(theme.colors.text_muted))
+                                                    .child("Duration"),
+                                            ),
+                                    )
+                                    .child(list),
+                            ),
+                    ),
             )
             .child(
                 div()
+                    .flex()
                     .flex_none()
-                    .px_4()
-                    .py_2()
-                    .text_sm()
-                    .text_color(rgb(0x9ba7b8))
-                    .child(self.playback_status.clone()),
+                    .items_center()
+                    .h(px(theme.spacing.status_height))
+                    .gap(px(theme.spacing.control_gap))
+                    .px(px(theme.spacing.panel_padding))
+                    .bg(color(theme.colors.surface_raised))
+                    .border_t(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border))
+                    .text_size(px(theme.typography.small_size))
+                    .text_color(color(theme.colors.text_muted))
+                    .child(self.playback_status.clone())
+                    .child(list_status)
+                    .child(div().flex_1())
+                    .child(self.theme_status.clone()),
             )
     }
 }

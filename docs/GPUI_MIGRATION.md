@@ -128,6 +128,37 @@ injection did not establish GUI acceptance. Clipboard/IME/Unicode interaction,
 manual audible/DAW acceptance, and Windows behavior remain unverified. This
 slice does not complete full feature parity.
 
+### Theme foundation and reference appearance, 2026-09-07
+
+`wavecrate-design` owns the versioned, renderer-independent theme contract.
+The default follows Wavecrate's charcoal/coral palette and embedded Ioskeley
+Mono font. The GPUI shell uses a compact toolbar, leading source sidebar,
+waveform above the sample table, and bottom status bar. Theme loading, reloading,
+and reset are available from the toolbar settings control.
+
+The media projection now includes up to 2,048 low/mid/high/raw waveform columns,
+using the reference frequency filters, envelope followers, and normalization.
+The projection retains the existing six-second and source-size decode limits;
+it does not provide full-length zoom, editing, or shader-rendering parity.
+Source and library data remain untouched. Sidebar collections, tags, ratings,
+and the other unported controls in the reference screenshot remain parity work.
+
+Validation: 26 targeted tests passed (core 4, design 8, media 9, UI 5), along
+with the locked GPUI build/check, scoped Rust formatting, diff checks, and
+macOS development-bundle signing/verification. Independent theme-contract
+review led to composite layout limits, removal of unused required tokens,
+pending-reload protection, and lifecycle regression tests. Full workspace
+formatting still encounters pre-existing archived test-module paths in the
+inherited engine crates; this pass formats the changed frontend/media/design
+modules directly.
+
+GUI checks confirmed default startup with and without a folder, layered preview,
+live custom colors/font size/row height, native search selection, edited-file
+reload, invalid-file rejection preserving the current theme/sample, default
+reset, and the 960×560 minimum layout. The Play button invokes the existing
+transport and the stopped state remains visible. Audible quality and DAW
+acceptance remain manual checks. Theme choice is currently session-only.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

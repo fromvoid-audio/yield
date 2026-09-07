@@ -11,8 +11,13 @@ use wavecrate_analysis::{decode_for_analysis_with_rate_limit, probe_metadata};
 use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
+mod visual_bands;
+
 /// Maximum number of bars generated for a selected sample's preview.
 pub const MAX_WAVEFORM_POINTS: usize = 180;
+
+/// Maximum number of frequency-layer columns generated for a selected sample's preview.
+pub const MAX_WAVEFORM_BAND_POINTS: usize = 2_048;
 
 /// Maximum analysis window requested for a waveform preview.
 pub const MAX_PREVIEW_SECONDS: f32 = 6.0;
@@ -36,6 +41,13 @@ pub struct AudioScan {
 pub struct WaveformPreview {
     /// Peak magnitude for each display bar, normalized to the range `0.0..=1.0`.
     pub peaks: Vec<f32>,
+    /// Layered frequency magnitudes for each display column, in low/mid/high/raw order.
+    ///
+    /// The first three lanes are nonnegative low, mid, and high envelope magnitudes. The final
+    /// lane is the raw peak magnitude. A renderer should paint the lanes in this order so low
+    /// frequency content is the back layer, high frequency content remains visible above it, and
+    /// the raw lane is the front detail layer.
+    pub bands: Vec<[f32; 4]>,
     /// Duration represented by the decoded preview buffer.
     pub duration_seconds: f32,
     /// Sample rate used for the preview buffer.
@@ -156,11 +168,17 @@ pub fn load_waveform_preview(path: &Path) -> Result<WaveformPreview, String> {
     let decoded =
         decode_for_analysis_with_rate_limit(path, PREVIEW_SAMPLE_RATE, Some(decode_seconds))?;
     let peaks = peak_envelope(&decoded.mono, MAX_WAVEFORM_POINTS);
+    let bands = visual_bands::project(
+        &decoded.mono,
+        decoded.sample_rate_used,
+        MAX_WAVEFORM_BAND_POINTS,
+    );
     if peaks.is_empty() {
         return Err(format!("{} contains no decodable samples", path.display()));
     }
     Ok(WaveformPreview {
         peaks,
+        bands,
         duration_seconds: decoded.duration_seconds,
         sample_rate: decoded.sample_rate_used,
     })
@@ -218,7 +236,13 @@ fn peak_envelope(samples: &[f32], point_count: usize) -> Vec<f32> {
             samples[start..end.min(samples.len())]
                 .iter()
                 .copied()
-                .map(f32::abs)
+                .map(|sample| {
+                    if sample.is_finite() {
+                        sample.abs()
+                    } else {
+                        0.0
+                    }
+                })
                 .fold(0.0, f32::max)
                 .clamp(0.0, 1.0)
         })
@@ -276,6 +300,14 @@ mod tests {
         let preview = load_waveform_preview(&path).expect("preview");
         assert!(preview.peaks.len() <= MAX_WAVEFORM_POINTS);
         assert!(preview.peaks.iter().any(|peak| *peak > 0.1));
+        assert!(preview.bands.len() <= MAX_WAVEFORM_BAND_POINTS);
+        assert!(
+            preview
+                .bands
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        );
         assert_eq!(preview.sample_rate, PREVIEW_SAMPLE_RATE);
         assert!((preview.duration_seconds - 1.0).abs() < 0.02);
     }

@@ -7,5 +7,11 @@ is distributed under Apache License 2.0; the license text is preserved in
 
 Upstream source: https://github.com/zed-industries/zed/tree/main/crates/gpui/examples
 
+The bundled `assets/fonts/IoskeleyMono-Regular.ttf` font is used by the
+Wavecrate theme. It is © 2025 Ahmed Hatem ([source](https://github.com/ahatem))
+and licensed under the [SIL Open Font License 1.1](http://scripts.sil.org/OFL).
+The complete attribution and license are preserved in
+`assets/fonts/IoskeleyMono-LICENSE.txt`.
+
 Rox informed the workspace architecture. No Rox source code is incorporated.
 All other dependency licenses remain those of their respective packages.

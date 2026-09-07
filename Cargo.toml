@@ -3,6 +3,7 @@ members = [
     "crates/wavecrate-gpui",
     "crates/wavecrate-core",
     "crates/wavecrate-media",
+    "crates/wavecrate-design",
     "crates/wavecrate-ui",
     "crates/reson",
     "crates/wavecrate-analysis",
@@ -32,6 +33,7 @@ wavecrate-analysis = { path = "crates/wavecrate-analysis" }
 wavecrate-library = { path = "crates/wavecrate-library" }
 wavecrate-core = { path = "crates/wavecrate-core" }
 wavecrate-media = { path = "crates/wavecrate-media" }
+wavecrate-design = { path = "crates/wavecrate-design" }
 wavecrate-ui = { path = "crates/wavecrate-ui" }
 tempfile = "3.23.0"
 

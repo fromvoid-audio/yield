@@ -12,17 +12,62 @@ use std::sync::{
 };
 
 use gpui::{
-    App, AppContext, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent, PathPromptOptions,
-    ScrollStrategy, Task, UniformListScrollHandle, Window,
+    App, AppContext, BorrowAppContext, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent,
+    PathPromptOptions, ScrollStrategy, Task, UniformListScrollHandle, Window,
 };
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{AudioFile, AudioFileId, BrowserViewModel, SortColumn};
+use wavecrate_design::{Theme, load_theme_file};
 use wavecrate_media::{WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview};
 
 use crate::search_input::{SearchChanged, SearchInput};
+use crate::theme::ActiveTheme;
 
 mod transport;
 mod view;
+mod waveform;
+
+#[derive(Default)]
+struct ThemeLoadState {
+    generation: u64,
+    active_path: Option<PathBuf>,
+    pending_path: Option<PathBuf>,
+}
+
+impl ThemeLoadState {
+    fn begin(&mut self, path: PathBuf) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending_path = Some(path);
+        self.generation
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.active_path = None;
+        self.pending_path = None;
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    fn accept(&mut self, generation: u64, path: PathBuf) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        self.active_path = Some(path);
+        self.pending_path = None;
+        true
+    }
+
+    fn reject(&mut self, generation: u64) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        self.pending_path = None;
+        true
+    }
+}
 
 pub(crate) struct Browser {
     focus_handle: FocusHandle,
@@ -45,6 +90,10 @@ pub(crate) struct Browser {
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     waveform_task: Option<Task<()>>,
+    theme_status: String,
+    theme_load: ThemeLoadState,
+    theme_task: Option<Task<()>>,
+    theme_settings_open: bool,
     playback_init_task: Option<Task<()>>,
     playback_init_entry: Option<AudioFile>,
     playback_init_epoch: u64,
@@ -86,6 +135,10 @@ impl Browser {
             scan_cancel: None,
             scan_task: None,
             waveform_task: None,
+            theme_status: "Wavecrate Editorial Terminal".to_string(),
+            theme_load: ThemeLoadState::default(),
+            theme_task: None,
+            theme_settings_open: false,
             playback_init_task: None,
             playback_init_entry: None,
             playback_init_epoch: 0,
@@ -267,6 +320,129 @@ impl Browser {
         .detach();
     }
 
+    fn choose_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a Wavecrate theme JSON file".into()),
+        });
+        cx.spawn(async move |this, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |view, cx| view.load_theme(path, cx));
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |view, cx| {
+                    view.theme_status = format!("Theme picker error: {error}");
+                    cx.notify();
+                });
+            }
+            Err(_) => {}
+        })
+        .detach();
+    }
+
+    fn toggle_theme_settings(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme_settings_open = !self.theme_settings_open;
+        cx.notify();
+    }
+
+    fn toggle_playback_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_playback(cx);
+    }
+
+    fn stop_playback_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_playback();
+        cx.notify();
+    }
+
+    fn reload_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_load.pending_path.is_some() {
+            return;
+        }
+        if let Some(path) = self.theme_load.active_path.clone() {
+            self.load_theme(path, cx);
+        } else {
+            self.theme_status = "Choose a theme file before reloading".to_string();
+            cx.notify();
+        }
+    }
+
+    fn reset_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_load.invalidate();
+        self.theme_task.take();
+        cx.set_global(ActiveTheme::default());
+        self.theme_status = "Wavecrate Editorial Terminal".to_string();
+        self.search_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+        cx.notify();
+    }
+
+    fn load_theme(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let generation = self.theme_load.begin(path.clone());
+        self.theme_task.take();
+        self.theme_status = format!("Loading {}…", path.display());
+        cx.notify();
+        let read_path = path.clone();
+        self.theme_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { load_theme_file(&read_path) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if !view.theme_load.is_current(generation) {
+                    return;
+                }
+                view.theme_task = None;
+                match result {
+                    Ok(theme) => view.apply_theme(theme, path, generation, cx),
+                    Err(error) => {
+                        if view.theme_load.reject(generation) {
+                            view.theme_status = format!("Theme rejected: {error}");
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        }));
+    }
+
+    fn apply_theme(
+        &mut self,
+        theme: Theme,
+        path: PathBuf,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.theme_load.accept(generation, path) {
+            return;
+        }
+        let theme_name = theme.name.clone();
+        cx.set_global(ActiveTheme(Arc::new(theme)));
+        self.theme_status = theme_name;
+        self.search_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+        cx.notify();
+    }
+
     fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
         if self.view_model.rows().is_empty() {
             return;
@@ -340,5 +516,50 @@ impl Drop for Browser {
 impl Focusable for Browser {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThemeLoadState;
+    use std::path::PathBuf;
+
+    #[test]
+    fn invalid_theme_keeps_the_last_good_path() {
+        let good = PathBuf::from("good.json");
+        let invalid = PathBuf::from("invalid.json");
+        let mut state = ThemeLoadState::default();
+        let good_generation = state.begin(good.clone());
+        assert!(state.accept(good_generation, good.clone()));
+
+        let invalid_generation = state.begin(invalid);
+        assert!(state.reject(invalid_generation));
+        assert_eq!(state.active_path, Some(good));
+        assert!(state.pending_path.is_none());
+    }
+
+    #[test]
+    fn late_theme_completion_after_reset_is_discarded() {
+        let pending = PathBuf::from("pending.json");
+        let mut state = ThemeLoadState::default();
+        let generation = state.begin(pending.clone());
+        state.invalidate();
+
+        assert!(!state.accept(generation, pending));
+        assert!(state.active_path.is_none());
+        assert!(state.pending_path.is_none());
+    }
+
+    #[test]
+    fn replacing_a_pending_theme_makes_the_older_completion_stale() {
+        let first = PathBuf::from("first.json");
+        let second = PathBuf::from("second.json");
+        let mut state = ThemeLoadState::default();
+        let first_generation = state.begin(first.clone());
+        let second_generation = state.begin(second.clone());
+
+        assert!(!state.accept(first_generation, first));
+        assert!(state.accept(second_generation, second.clone()));
+        assert_eq!(state.active_path, Some(second));
     }
 }

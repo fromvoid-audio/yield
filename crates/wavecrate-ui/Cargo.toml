@@ -13,4 +13,5 @@ gpui.workspace = true
 reson.workspace = true
 unicode-segmentation.workspace = true
 wavecrate-core.workspace = true
+wavecrate-design.workspace = true
 wavecrate-media.workspace = true

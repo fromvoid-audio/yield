@@ -29,11 +29,19 @@ contents = bundle / 'Contents'
 executable = contents / 'MacOS' / 'wavecrate-gpui'
 executable.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(target / 'debug' / 'wavecrate-gpui', executable)
+resources = contents / 'Resources'
+resources.mkdir(parents=True, exist_ok=True)
+shutil.copy2(Path(sys.argv[1]).parent / 'assets' / 'logo3.icns', resources / 'Wavecrate.icns')
+shutil.copy2(
+    Path(sys.argv[1]).parent / 'assets' / 'fonts' / 'IoskeleyMono-LICENSE.txt',
+    resources / 'IoskeleyMono-LICENSE.txt',
+)
 (contents / 'Info.plist').write_bytes(plistlib.dumps({
     'CFBundleExecutable': 'wavecrate-gpui',
     'CFBundleIdentifier': 'org.portalsurfer.wavecrate.gpui.dev',
     'CFBundleName': 'Wavecrate GPUI',
     'CFBundleDisplayName': 'Wavecrate GPUI',
+    'CFBundleIconFile': 'Wavecrate.icns',
     'CFBundlePackageType': 'APPL',
     'CFBundleShortVersionString': '0.1.0',
     'CFBundleVersion': '1',

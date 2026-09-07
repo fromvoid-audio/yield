@@ -6966,6 +6966,15 @@ name = "wavecrate-core"
 version = "0.1.0"
 
 [[package]]
+name = "wavecrate-design"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "wavecrate-gpui"
 version = "0.1.0"
 dependencies = [
@@ -7029,6 +7038,7 @@ dependencies = [
  "reson",
  "unicode-segmentation",
  "wavecrate-core",
+ "wavecrate-design",
  "wavecrate-media",
 ]
 

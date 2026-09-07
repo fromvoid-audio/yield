@@ -17,6 +17,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | `wavecrate-gpui` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
 | `wavecrate-core` | Sample identities and metadata, filtering/sorting projection, focus reconciliation, display formatting | GPUI types, filesystem calls, audio devices, databases |
 | `wavecrate-media` | Read-only folder enumeration and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
+| `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
@@ -32,6 +33,7 @@ flowchart TD
     Media --> Core
     Media --> Library[wavecrate-library]
     Media --> Analysis[wavecrate-analysis]
+    UI --> Design[wavecrate-design]
     Scan[wavecrate-scan] --> Library
 ```
 
@@ -56,6 +58,29 @@ has focus. Browser focus owns sample navigation and transport keys. Escape from
 search returns focus to browsing. Rendering must give virtual lists definite
 viewport bounds and constrain waveform drawing to its panel.
 
+Theme ownership follows the same boundary. `wavecrate-design` defines a complete
+versioned JSON document and validates every color, font metric, and density
+value without depending on GPUI. `wavecrate-ui` stores the active theme in a
+GPUI global and converts tokens at the rendering edge. Import, reload, and
+reset actions run through bounded background reads; an invalid or stale result
+cannot replace the last valid theme.
+
+The canonical theme is [themes/wavecrate.json](../themes/wavecrate.json). A
+custom theme must contain every field in that document and use schema version
+`1`. Open a JSON file from the gear settings panel, use `Reload` after editing
+it, and use `Default` to restore the built-in palette. Unknown fields,
+malformed colors, unsupported versions, oversized files, and incoherent
+dimensions are rejected with an error shown in the status bar. The embedded
+Ioskeley Mono font remains the default display family and is registered during
+GPUI startup. Density values must also leave room for the 960×560 minimum
+window, the fixed sample columns, and a short visible browser list.
+
+Copy the canonical JSON to create a theme. Colors accept `#RRGGBB` or
+`#RRGGBBAA`; dimensions use logical points. Imports must be regular UTF-8 files
+no larger than 128 KiB. Font families fall back through the platform font system
+when unavailable. Theme selection is session-only until isolated application
+profiles are implemented; reopening the app restores the built-in theme.
+
 ## Work and lifecycle
 
 The UI schedules filesystem and decoding work off its event thread and consumes
@@ -73,7 +98,7 @@ the live Wavecrate profile. The current GPUI browser writes no library data.
 ```sh
 cargo run -- /path/to/samples
 cargo check --locked -p wavecrate-gpui
-cargo test --locked -p wavecrate-core -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
+cargo test --locked -p wavecrate-core -p wavecrate-design -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
 ./scripts/build-gpui-macos.sh
 ```
 

@@ -13,6 +13,7 @@ separate crates with defined ownership:
 | `wavecrate-gpui` | Thin executable and launch arguments |
 | `wavecrate-core` | Pure sample types, filtering, sorting, selection projection |
 | `wavecrate-media` | Background file discovery and waveform preparation |
+| `wavecrate-design` | Validated semantic theme schema and canonical design tokens |
 | `wavecrate-ui` | GPUI views, input components, UI and transport coordination |
 | `reson` | Existing audio engine |
 | `wavecrate-library` | Existing persistence and source-ownership primitives |
@@ -22,6 +23,12 @@ separate crates with defined ownership:
 See [crate boundaries and dependency direction](docs/GPUI_ARCHITECTURE.md).
 The original frontend is preserved in [reference/radiant](reference/radiant/README.md)
 and excluded from the active build.
+
+The current GPUI frontend uses the original Wavecrate editorial-terminal
+palette and compact layout. Theme tokens are defined independently in
+`wavecrate-design`; the complete schema and a copyable default document are in
+[themes/wavecrate.json](themes/wavecrate.json). Open the gear settings control
+to import, reload, or reset a theme while the app is running.
 
 ## Run
 
@@ -61,7 +68,7 @@ workflows are disabled.
 
 ```sh
 cargo check --locked -p wavecrate-gpui
-cargo test --locked -p wavecrate-core -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
+cargo test --locked -p wavecrate-core -p wavecrate-design -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
 ```
 
 Third-party component attribution is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
