@@ -57,6 +57,22 @@ pub enum LibraryError {
         /// Underlying JSON error.
         source: serde_json::Error,
     },
+    /// A bounded metadata payload exceeded the owner limit before it was read into memory.
+    #[error("Library metadata key '{key}' exceeds the {limit}-byte limit ({actual} bytes)")]
+    MetadataTooLarge {
+        /// Metadata key whose payload was too large.
+        key: &'static str,
+        /// Maximum accepted UTF-8 byte length.
+        limit: usize,
+        /// Stored payload byte length.
+        actual: usize,
+    },
+    /// A bounded metadata payload was not valid UTF-8.
+    #[error("Library metadata key '{key}' is not valid UTF-8")]
+    MetadataInvalidUtf8 {
+        /// Metadata key containing invalid bytes.
+        key: &'static str,
+    },
     /// A retained source descriptor contained a present but unsupported enum value.
     #[error("Retained source '{root}' has invalid {field} value '{value}'")]
     InvalidRetainedSourceDescriptor {

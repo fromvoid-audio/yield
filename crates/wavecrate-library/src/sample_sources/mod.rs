@@ -32,6 +32,7 @@ pub use library::{
     HarvestDerivationOperation, HarvestDerivationRecord, HarvestFileIdentity, HarvestFileKey,
     HarvestFileRecord, HarvestMetadataSnapshot, HarvestSourceRange, HarvestState,
     LIBRARY_DB_FILE_NAME, LibraryError, LibraryState, NewHarvestDerivation, SourceRegistrySnapshot,
+    UI_PREFERENCES_KEY, UI_PREFERENCES_MAX_BYTES,
 };
 pub use source_entry::{
     HiddenDirectoryPolicy, SOURCE_FORMAT_POLICY_VERSION, SourceEntryClassification,

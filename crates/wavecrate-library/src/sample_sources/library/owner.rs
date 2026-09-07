@@ -10,7 +10,7 @@ use thiserror::Error;
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
-use crate::sample_sources::SampleSource;
+use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
 
 /// Maximum number of global-library commands waiting for the owner thread.
 pub const GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY: usize = 32;
@@ -119,6 +119,14 @@ pub enum GlobalLibraryWriterQueueError {
     /// Initialization failed or the owner is otherwise unavailable.
     #[error("global library writer is unavailable: {0}")]
     Unavailable(GlobalLibraryWriterUnavailable),
+    /// A bounded UI-preferences payload was rejected before queue admission.
+    #[error("UI preferences payload exceeds the {limit}-byte limit ({actual} bytes)")]
+    PayloadTooLarge {
+        /// Maximum accepted payload size.
+        limit: usize,
+        /// Supplied payload size.
+        actual: usize,
+    },
     /// The owner is closing or has already closed.
     #[error("global library writer is closed")]
     Closed,
@@ -147,6 +155,13 @@ enum WriterCommand {
         snapshot: SourceRegistrySnapshot,
         result: SyncSender<Result<(), LibraryError>>,
     },
+    LoadUiPreferences {
+        result: SyncSender<Result<Option<String>, LibraryError>>,
+    },
+    ReplaceUiPreferences {
+        payload: String,
+        result: SyncSender<Result<(), LibraryError>>,
+    },
 }
 
 enum WriterReply {
@@ -159,6 +174,14 @@ enum WriterReply {
         value: Result<Option<SampleSource>, LibraryError>,
     },
     Replace {
+        result: SyncSender<Result<(), LibraryError>>,
+        value: Result<(), LibraryError>,
+    },
+    LoadUiPreferences {
+        result: SyncSender<Result<Option<String>, LibraryError>>,
+        value: Result<Option<String>, LibraryError>,
+    },
+    ReplaceUiPreferences {
         result: SyncSender<Result<(), LibraryError>>,
         value: Result<(), LibraryError>,
     },
@@ -176,6 +199,12 @@ impl WriterReply {
             Self::Replace { result, value } => {
                 let _ = result.send(value);
             }
+            Self::LoadUiPreferences { result, value } => {
+                let _ = result.send(value);
+            }
+            Self::ReplaceUiPreferences { result, value } => {
+                let _ = result.send(value);
+            }
         }
     }
 
@@ -188,6 +217,12 @@ impl WriterReply {
                 let _ = result.send(Err(error));
             }
             Self::Replace { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::LoadUiPreferences { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::ReplaceUiPreferences { result, .. } => {
                 let _ = result.send(Err(error));
             }
         }
@@ -402,6 +437,36 @@ impl GlobalLibraryWriter {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.send(WriterCommand::ReplaceSourceRegistry {
             snapshot,
+            result: result_tx,
+        })?;
+        Ok(result_rx)
+    }
+
+    /// Queue a bounded load of the versioned GPUI preferences payload.
+    pub fn load_ui_preferences_payload(
+        &self,
+    ) -> Result<Receiver<Result<Option<String>, LibraryError>>, GlobalLibraryWriterQueueError> {
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::LoadUiPreferences { result: result_tx })?;
+        Ok(result_rx)
+    }
+
+    /// Queue an atomic replacement of the bounded GPUI preferences payload.
+    pub fn replace_ui_preferences_payload(
+        &self,
+        payload: String,
+    ) -> Result<Receiver<Result<(), LibraryError>>, GlobalLibraryWriterQueueError> {
+        if payload.len() > UI_PREFERENCES_MAX_BYTES {
+            return Err(GlobalLibraryWriterQueueError::PayloadTooLarge {
+                limit: UI_PREFERENCES_MAX_BYTES,
+                actual: payload.len(),
+            });
+        }
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ReplaceUiPreferences {
+            payload,
             result: result_tx,
         })?;
         Ok(result_rx)
@@ -628,6 +693,16 @@ fn execute_command(command: WriterCommand, database: &mut LibraryDatabase) -> Wr
             value: database.replace_source_registry(&snapshot),
             result,
         },
+        WriterCommand::LoadUiPreferences { result } => WriterReply::LoadUiPreferences {
+            value: database.load_ui_preferences_payload(),
+            result,
+        },
+        WriterCommand::ReplaceUiPreferences { payload, result } => {
+            WriterReply::ReplaceUiPreferences {
+                value: database.replace_ui_preferences_payload(&payload),
+                result,
+            }
+        }
     }
 }
 
@@ -674,6 +749,12 @@ fn send_command_error(command: WriterCommand, error: LibraryError) {
             let _ = result.send(Err(error));
         }
         WriterCommand::ReplaceSourceRegistry { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::LoadUiPreferences { result } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::ReplaceUiPreferences { result, .. } => {
             let _ = result.send(Err(error));
         }
     }
@@ -735,7 +816,7 @@ mod tests {
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::sample_sources::{SourceId, SourceRole};
     use crate::test_runtime::TestRuntimeGuard;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use std::fs;
     use std::path::Path;
     use std::thread;
@@ -898,6 +979,124 @@ mod tests {
         );
         assert!(writer.shutdown());
         assert!(matches!(writer.status(), GlobalLibraryWriterStatus::Closed));
+    }
+
+    #[test]
+    fn ui_preferences_payload_is_bounded_and_reopens_through_same_owner() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let (base_guard, profile_guard, _writable_guard, mut writer) =
+            start_writer(&temp, "ui-preferences");
+        let _ = (&base_guard, &profile_guard);
+        wait_until_available(&writer);
+
+        let oversized = "x".repeat(super::super::UI_PREFERENCES_MAX_BYTES + 1);
+        assert!(matches!(
+            writer.replace_ui_preferences_payload(oversized),
+            Err(GlobalLibraryWriterQueueError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            writer.status(),
+            GlobalLibraryWriterStatus::Available
+        ));
+
+        let payload = String::from("{\"schema_version\":1,\"theme\":{}}");
+        writer
+            .replace_ui_preferences_payload(payload.clone())
+            .expect("payload admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("payload result")
+            .expect("payload replacement");
+        let loaded = writer
+            .load_ui_preferences_payload()
+            .expect("payload load admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("payload load result")
+            .expect("payload load");
+        assert_eq!(loaded.as_deref(), Some(payload.as_str()));
+        assert!(writer.shutdown());
+    }
+
+    #[test]
+    fn ui_preferences_replacement_is_atomic_on_metadata_failure() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let (base_guard, profile_guard, _writable_guard, mut writer) =
+            start_writer(&temp, "ui-preferences-rollback");
+        let _ = (&base_guard, &profile_guard);
+        wait_until_available(&writer);
+
+        let original = String::from("original");
+        writer
+            .replace_ui_preferences_payload(original.clone())
+            .expect("initial payload admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initial payload result")
+            .expect("initial payload replacement");
+
+        let connection = crate::sample_sources::library::open_connection().expect("open fixture");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_ui_preferences_update
+                 BEFORE UPDATE OF value ON metadata
+                 WHEN OLD.key = 'ui_preferences_v1'
+                 BEGIN SELECT RAISE(FAIL, 'UI preferences rollback fixture'); END;",
+            )
+            .expect("rollback trigger");
+        drop(connection);
+
+        let result = writer
+            .replace_ui_preferences_payload(String::from("replacement"))
+            .expect("replacement admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement result");
+        assert!(matches!(result, Err(LibraryError::Sql(_))));
+        let loaded = writer
+            .load_ui_preferences_payload()
+            .expect("load admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("load result")
+            .expect("load payload");
+        assert_eq!(loaded.as_deref(), Some(original.as_str()));
+        assert!(writer.shutdown());
+    }
+
+    #[test]
+    fn invalid_utf8_preferences_are_reported_without_replacing_the_row() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let base_path = std::fs::canonicalize(temp.path()).expect("canonical test base");
+        let base_guard = ConfigBaseGuard::set(base_path);
+        let profile_guard = PersistenceProfileGuard::named("ui-preferences-invalid");
+        let connection = crate::sample_sources::library::open_connection().expect("fixture DB");
+        connection
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, CAST(?2 AS BLOB))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![super::super::UI_PREFERENCES_KEY, vec![0xff_u8]],
+            )
+            .expect("invalid payload fixture");
+        drop(connection);
+        let writable_guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let mut writer = GlobalLibraryWriter::start(&writable_guard).expect("writer start");
+        wait_until_available(&writer);
+        let result = writer
+            .load_ui_preferences_payload()
+            .expect("payload load admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("payload load result");
+        assert!(matches!(
+            result,
+            Err(LibraryError::MetadataInvalidUtf8 { .. })
+        ));
+        assert!(matches!(
+            writer.status(),
+            GlobalLibraryWriterStatus::Available
+        ));
+        assert!(writer.shutdown());
+        drop(writable_guard);
+        drop(profile_guard);
+        drop(base_guard);
     }
 
     #[test]

@@ -24,12 +24,23 @@ use wavecrate_library::sample_sources::{
     GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceRegistrySnapshot,
 };
 
+mod preferences;
+
+use preferences::{PreferenceCoordinator, PreferenceOutcome};
+pub use preferences::{
+    PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
+    UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
+};
+
 /// The non-live profile used by the GPUI application session.
 pub const GPUI_DEVELOPMENT_PROFILE: &str = "gpui-development";
 
 const SESSION_COMMAND_CAPACITY: usize = 32;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IDLE_STATUS_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+// Keep retained-source lookups bounded so source mutations and preference commands always have
+// room in the shared profile-owner queue.
+const MAX_RETAINED_LOOKUPS_IN_FLIGHT: usize = 8;
 
 /// A root resolved by the scanner and safe to use as a stable source identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -116,6 +127,9 @@ pub enum SessionError {
     /// A queued library operation failed.
     #[error("session library operation failed: {0}")]
     Library(String),
+    /// A preference document or preference patch was invalid.
+    #[error("session preference error: {0}")]
+    Preference(String),
     /// The service was already closed.
     #[error("session service is closed")]
     Closed,
@@ -204,7 +218,9 @@ pub struct SourceRegistryService {
     commands: Mutex<Option<SyncSender<Command>>>,
     closed: AtomicBool,
     next_request: AtomicU64,
+    next_preference_request: AtomicU64,
     events: Receiver<RegistryEvent>,
+    preference_events: Receiver<PreferenceEvent>,
     worker: Option<JoinHandle<Result<(), SessionError>>>,
 }
 
@@ -228,9 +244,31 @@ impl SourceRegistryService {
         self.submit(|request| Command::RemoveRoot { request, root })
     }
 
+    /// Submit a typed preference patch to the shared session owner.
+    pub fn patch_preferences(
+        &self,
+        patch: PreferencePatch,
+    ) -> Result<PreferenceRequestId, SubmitError> {
+        let request = PreferenceRequestId::from_raw(
+            self.next_preference_request.fetch_add(1, Ordering::Relaxed),
+        );
+        self.submit_command(Command::PatchPreferences { request, patch })?;
+        Ok(request)
+    }
+
+    /// Submit an explicit reset of the persisted preference document.
+    pub fn reset_preferences(&self) -> Result<PreferenceRequestId, SubmitError> {
+        self.patch_preferences(PreferencePatch::Reset)
+    }
+
     /// Poll one session event without blocking the caller.
     pub fn try_recv(&self) -> Result<RegistryEvent, TryRecvError> {
         self.events.try_recv()
+    }
+
+    /// Poll one preference event without blocking the caller.
+    pub fn try_recv_preference(&self) -> Result<PreferenceEvent, TryRecvError> {
+        self.preference_events.try_recv()
     }
 
     /// Close command admission, drain the final baseline/lookups/save, and synchronously join.
@@ -273,21 +311,29 @@ impl SourceRegistryService {
     fn start_inner(app_root_override: Option<PathBuf>) -> Result<Self, StartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(SESSION_COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
+        let (preference_event_tx, preference_event_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-source-session"))
-            .spawn(move || run_worker(command_rx, event_tx, app_root_override))
+            .spawn(move || run_worker(command_rx, event_tx, preference_event_tx, app_root_override))
             .map_err(StartError::ThreadSpawn)?;
         Ok(Self {
             commands: Mutex::new(Some(command_tx)),
             closed: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
+            next_preference_request: AtomicU64::new(1),
             events: event_rx,
+            preference_events: preference_event_rx,
             worker: Some(worker),
         })
     }
 
     fn submit(&self, command: impl FnOnce(RequestId) -> Command) -> Result<RequestId, SubmitError> {
         let request = RequestId(self.next_request.fetch_add(1, Ordering::Relaxed));
+        self.submit_command(command(request))?;
+        Ok(request)
+    }
+
+    fn submit_command(&self, command: Command) -> Result<(), SubmitError> {
         let commands = self
             .commands
             .lock()
@@ -296,13 +342,11 @@ impl SourceRegistryService {
             return Err(SubmitError::Closed);
         }
         let sender = commands.as_ref().ok_or(SubmitError::Closed)?;
-        sender
-            .try_send(command(request))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SubmitError::Full,
-                TrySendError::Disconnected(_) => SubmitError::Closed,
-            })?;
-        Ok(request)
+        sender.try_send(command).map_err(|error| match error {
+            TrySendError::Full(_) => SubmitError::Full,
+            TrySendError::Disconnected(_) => SubmitError::Closed,
+        })?;
+        Ok(())
     }
 }
 
@@ -320,6 +364,10 @@ enum Command {
     RemoveRoot {
         request: RequestId,
         root: CanonicalSourceRoot,
+    },
+    PatchPreferences {
+        request: PreferenceRequestId,
+        patch: PreferencePatch,
     },
     Shutdown {
         acknowledgement: SyncSender<Result<(), SessionError>>,
@@ -346,6 +394,11 @@ enum Edit {
 
 struct SaveInFlight {
     revision: RegistryRevision,
+    receiver: Receiver<Result<(), LibraryError>>,
+}
+
+struct PreferenceSaveInFlight {
+    revision: PreferenceRevision,
     receiver: Receiver<Result<(), LibraryError>>,
 }
 
@@ -554,10 +607,13 @@ struct Persistence {
     writable: Option<WritableProfileGuard>,
     writer: Option<GlobalLibraryWriter>,
     load: Option<Receiver<Result<SourceRegistrySnapshot, LibraryError>>>,
+    preference_load: Option<Receiver<Result<Option<String>, LibraryError>>>,
     pending_adds: HashMap<RequestId, PendingAdd>,
     save: Option<SaveInFlight>,
+    preference_save: Option<PreferenceSaveInFlight>,
     force_save: bool,
     unavailable: Option<SessionError>,
+    preference_unavailable: Option<SessionError>,
 }
 
 impl Persistence {
@@ -569,10 +625,13 @@ impl Persistence {
             writable: None,
             writer: None,
             load: None,
+            preference_load: None,
             pending_adds: HashMap::new(),
             save: None,
+            preference_save: None,
             force_save: false,
             unavailable: None,
+            preference_unavailable: None,
         };
         let root_guard = match app_root_override {
             Some(root) => match AppRootGuard::set(root) {
@@ -626,8 +685,11 @@ impl Persistence {
             let _ = writer.shutdown();
         }
         self.save = None;
+        self.preference_load = None;
+        self.preference_save = None;
         self.load = None;
         self.pending_adds.clear();
+        self.preference_unavailable = None;
         self.writable.take();
     }
 }
@@ -647,26 +709,43 @@ fn session_from_queue_error(error: GlobalLibraryWriterQueueError) -> SessionErro
 fn run_worker(
     command_rx: Receiver<Command>,
     event_tx: mpsc::Sender<RegistryEvent>,
+    preference_event_tx: mpsc::Sender<PreferenceEvent>,
     app_root_override: Option<PathBuf>,
 ) -> Result<(), SessionError> {
     let (mut persistence, _root_guard, _profile_guard) = Persistence::start(app_root_override);
     let mut coordinator = Coordinator::new();
+    let mut preference_coordinator = PreferenceCoordinator::new();
     let mut applied_requests = HashSet::new();
     let mut unfinalized_requests = HashSet::new();
+    let mut applied_preference_requests = HashSet::new();
+    let mut unfinalized_preference_requests = HashSet::new();
     let _ = event_tx.send(RegistryEvent::Loading {
         revision: coordinator.revision(),
     });
+    let _ = preference_event_tx.send(PreferenceEvent::Loading {
+        revision: preference_coordinator.revision(),
+    });
     let mut reported_unavailable = false;
+    let mut preference_reported_unavailable = false;
     if let Some(error) = persistence.status_error() {
         let revision = coordinator.revision();
+        let preference_revision = preference_coordinator.revision();
         report_unavailable(
             &mut persistence,
             &mut coordinator,
             &event_tx,
             revision,
-            error,
+            error.clone(),
             &mut reported_unavailable,
             &mut unfinalized_requests,
+        );
+        report_preference_unavailable(
+            &mut preference_coordinator,
+            &preference_event_tx,
+            preference_revision,
+            error,
+            &mut preference_reported_unavailable,
+            &mut unfinalized_preference_requests,
         );
     }
 
@@ -679,7 +758,15 @@ fn run_worker(
             &mut applied_requests,
             &mut unfinalized_requests,
         );
-        let command = if can_block_on_command(&persistence, &coordinator) {
+        drive_preferences(
+            &mut persistence,
+            &mut preference_coordinator,
+            &preference_event_tx,
+            &mut preference_reported_unavailable,
+            &mut applied_preference_requests,
+            &mut unfinalized_preference_requests,
+        );
+        let command = if can_block_on_command(&persistence, &coordinator, &preference_coordinator) {
             match command_rx.recv_timeout(IDLE_STATUS_CHECK_INTERVAL) {
                 Ok(command) => Some(command),
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -696,13 +783,19 @@ fn run_worker(
             let result = drain_shutdown(
                 &mut persistence,
                 &mut coordinator,
+                &mut preference_coordinator,
                 &event_tx,
+                &preference_event_tx,
                 &mut reported_unavailable,
+                &mut preference_reported_unavailable,
                 &mut applied_requests,
                 &mut unfinalized_requests,
+                &mut applied_preference_requests,
+                &mut unfinalized_preference_requests,
             );
             persistence.shutdown();
             let _ = event_tx.send(RegistryEvent::Closed);
+            let _ = preference_event_tx.send(PreferenceEvent::Closed);
             return result;
         };
         if let Some(request) = command_request(&command) {
@@ -719,6 +812,51 @@ fn run_worker(
                     &mut unfinalized_requests,
                 );
                 continue;
+            }
+        }
+        if let Some(request) = preference_command_request(&command) {
+            unfinalized_preference_requests.insert(request);
+            if let Some(error) = persistence.status_error() {
+                let revision = preference_coordinator.revision();
+                let source_revision = coordinator.revision();
+                report_unavailable(
+                    &mut persistence,
+                    &mut coordinator,
+                    &event_tx,
+                    source_revision,
+                    error.clone(),
+                    &mut reported_unavailable,
+                    &mut unfinalized_requests,
+                );
+                report_preference_unavailable(
+                    &mut preference_coordinator,
+                    &preference_event_tx,
+                    revision,
+                    error,
+                    &mut preference_reported_unavailable,
+                    &mut unfinalized_preference_requests,
+                );
+                continue;
+            }
+            let is_reset = matches!(
+                &command,
+                Command::PatchPreferences {
+                    patch: PreferencePatch::Reset,
+                    ..
+                }
+            );
+            if let Some(error) = persistence.preference_unavailable.clone() {
+                if !is_reset {
+                    fail_preference_request(
+                        &preference_event_tx,
+                        &mut unfinalized_preference_requests,
+                        request,
+                        error,
+                    );
+                    continue;
+                }
+                persistence.preference_unavailable = None;
+                preference_reported_unavailable = false;
             }
         }
         match command {
@@ -759,17 +897,49 @@ fn run_worker(
                 }
                 coordinator.compact_if_resolved(!persistence.pending_adds.is_empty());
             }
+            Command::PatchPreferences { request, patch } => {
+                match preference_coordinator.apply_loaded_patch(request, patch) {
+                    Ok(changed) if preference_coordinator.loaded() => {
+                        if changed {
+                            let _ = preference_event_tx.send(PreferenceEvent::Snapshot {
+                                revision: preference_coordinator.revision(),
+                                preferences: preference_coordinator.snapshot(),
+                            });
+                        }
+                        announce_preference_request(
+                            &preference_event_tx,
+                            &mut applied_preference_requests,
+                            &mut unfinalized_preference_requests,
+                            request,
+                            preference_coordinator.revision(),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => fail_preference_request(
+                        &preference_event_tx,
+                        &mut unfinalized_preference_requests,
+                        request,
+                        SessionError::Preference(error.to_string()),
+                    ),
+                }
+            }
             Command::Shutdown { acknowledgement } => {
                 let result = drain_shutdown(
                     &mut persistence,
                     &mut coordinator,
+                    &mut preference_coordinator,
                     &event_tx,
+                    &preference_event_tx,
                     &mut reported_unavailable,
+                    &mut preference_reported_unavailable,
                     &mut applied_requests,
                     &mut unfinalized_requests,
+                    &mut applied_preference_requests,
+                    &mut unfinalized_preference_requests,
                 );
                 persistence.shutdown();
                 let _ = event_tx.send(RegistryEvent::Closed);
+                let _ = preference_event_tx.send(PreferenceEvent::Closed);
                 let _ = acknowledgement.send(result.clone().map_err(|error| error.clone()));
                 return result;
             }
@@ -777,21 +947,36 @@ fn run_worker(
     }
 }
 
-fn can_block_on_command(persistence: &Persistence, coordinator: &Coordinator) -> bool {
+fn can_block_on_command(
+    persistence: &Persistence,
+    coordinator: &Coordinator,
+    preference_coordinator: &PreferenceCoordinator,
+) -> bool {
     persistence.unavailable.is_some()
         || (coordinator.loaded
             && persistence.load.is_none()
             && persistence.pending_adds.is_empty()
             && persistence.save.is_none()
+            && (preference_coordinator.loaded() || persistence.preference_unavailable.is_some())
+            && persistence.preference_load.is_none()
+            && persistence.preference_save.is_none()
             && !persistence.force_save
             && !coordinator.is_dirty()
+            && (persistence.preference_unavailable.is_some() || !preference_coordinator.is_dirty())
             && persistence.unavailable.is_none())
 }
 
 fn command_request(command: &Command) -> Option<RequestId> {
     match command {
         Command::AddRoot { request, .. } | Command::RemoveRoot { request, .. } => Some(*request),
-        Command::Shutdown { .. } => None,
+        Command::PatchPreferences { .. } | Command::Shutdown { .. } => None,
+    }
+}
+
+fn preference_command_request(command: &Command) -> Option<PreferenceRequestId> {
+    match command {
+        Command::PatchPreferences { request, .. } => Some(*request),
+        Command::AddRoot { .. } | Command::RemoveRoot { .. } | Command::Shutdown { .. } => None,
     }
 }
 
@@ -867,6 +1052,352 @@ fn drive(
             reported_unavailable,
             unfinalized_requests,
         );
+    }
+}
+
+fn drive_preferences(
+    persistence: &mut Persistence,
+    coordinator: &mut PreferenceCoordinator,
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    reported_unavailable: &mut bool,
+    applied_requests: &mut HashSet<PreferenceRequestId>,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+) {
+    if let Some(error) = persistence.unavailable.clone() {
+        report_preference_unavailable(
+            coordinator,
+            event_tx,
+            coordinator.revision(),
+            error,
+            reported_unavailable,
+            unfinalized_requests,
+        );
+        return;
+    }
+    if let Some(error) = persistence.status_error() {
+        report_preference_unavailable(
+            coordinator,
+            event_tx,
+            coordinator.revision(),
+            error,
+            reported_unavailable,
+            unfinalized_requests,
+        );
+        return;
+    }
+    if let Some(error) = persistence.preference_unavailable.clone() {
+        report_preference_unavailable(
+            coordinator,
+            event_tx,
+            coordinator.revision(),
+            error,
+            reported_unavailable,
+            unfinalized_requests,
+        );
+        return;
+    }
+    queue_preference_load(persistence, coordinator);
+    poll_preference_load(
+        persistence,
+        coordinator,
+        event_tx,
+        applied_requests,
+        unfinalized_requests,
+    );
+    queue_preference_save(persistence, coordinator);
+    poll_preference_save(
+        persistence,
+        coordinator,
+        event_tx,
+        reported_unavailable,
+        unfinalized_requests,
+    );
+    queue_preference_save(persistence, coordinator);
+    if let Some(error) = persistence.unavailable.clone() {
+        report_preference_unavailable(
+            coordinator,
+            event_tx,
+            coordinator.revision(),
+            error,
+            reported_unavailable,
+            unfinalized_requests,
+        );
+    } else if let Some(error) = persistence.preference_unavailable.clone() {
+        report_preference_unavailable(
+            coordinator,
+            event_tx,
+            coordinator.revision(),
+            error,
+            reported_unavailable,
+            unfinalized_requests,
+        );
+    }
+}
+
+fn queue_preference_load(persistence: &mut Persistence, coordinator: &PreferenceCoordinator) {
+    if coordinator.loaded() || persistence.preference_load.is_some() || !persistence.available() {
+        return;
+    }
+    let Some(writer) = persistence.writer.as_ref() else {
+        return;
+    };
+    match writer.load_ui_preferences_payload() {
+        Ok(receiver) => persistence.preference_load = Some(receiver),
+        Err(GlobalLibraryWriterQueueError::Initializing | GlobalLibraryWriterQueueError::Full) => {}
+        Err(error) => persistence.unavailable = Some(session_from_queue_error(error)),
+    }
+}
+
+fn poll_preference_load(
+    persistence: &mut Persistence,
+    coordinator: &mut PreferenceCoordinator,
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    applied_requests: &mut HashSet<PreferenceRequestId>,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+) {
+    let Some(receiver) = persistence.preference_load.as_ref() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(Ok(None)) => {
+            persistence.preference_load = None;
+            let outcomes = coordinator.load_missing();
+            emit_preference_snapshot_and_outcomes(
+                coordinator,
+                event_tx,
+                applied_requests,
+                unfinalized_requests,
+                outcomes,
+                true,
+            );
+        }
+        Ok(Ok(Some(payload))) => {
+            persistence.preference_load = None;
+            match UiPreferences::from_payload(&payload) {
+                Ok(preferences) => {
+                    let outcomes = coordinator.load_valid(preferences);
+                    emit_preference_snapshot_and_outcomes(
+                        coordinator,
+                        event_tx,
+                        applied_requests,
+                        unfinalized_requests,
+                        outcomes,
+                        true,
+                    );
+                }
+                Err(error) => {
+                    let outcomes = coordinator.load_invalid();
+                    let _ = event_tx.send(PreferenceEvent::LoadFailed {
+                        error: SessionError::Preference(error.to_string()),
+                    });
+                    emit_preference_outcomes(
+                        coordinator,
+                        event_tx,
+                        applied_requests,
+                        unfinalized_requests,
+                        outcomes,
+                    );
+                    if coordinator.valid() {
+                        let _ = event_tx.send(PreferenceEvent::Snapshot {
+                            revision: coordinator.revision(),
+                            preferences: coordinator.snapshot(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Err(error)) if is_invalid_preference_payload_error(&error) => {
+            persistence.preference_load = None;
+            let outcomes = coordinator.load_invalid();
+            let _ = event_tx.send(PreferenceEvent::LoadFailed {
+                error: SessionError::Preference(error.to_string()),
+            });
+            emit_preference_outcomes(
+                coordinator,
+                event_tx,
+                applied_requests,
+                unfinalized_requests,
+                outcomes,
+            );
+            if coordinator.valid() {
+                let _ = event_tx.send(PreferenceEvent::Snapshot {
+                    revision: coordinator.revision(),
+                    preferences: coordinator.snapshot(),
+                });
+            }
+        }
+        Ok(Err(error)) => {
+            persistence.preference_load = None;
+            record_preference_operation_failure(persistence, error);
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            persistence.preference_load = None;
+            persistence.unavailable = Some(SessionError::Persistence(String::from(
+                "UI preferences load receiver disconnected",
+            )));
+        }
+    }
+}
+
+fn queue_preference_save(persistence: &mut Persistence, coordinator: &PreferenceCoordinator) {
+    if !coordinator.loaded()
+        || !coordinator.valid()
+        || persistence.preference_load.is_some()
+        || persistence.preference_save.is_some()
+        || persistence.preference_unavailable.is_some()
+        || !persistence.available()
+        || !coordinator.is_dirty()
+    {
+        return;
+    }
+    let Some(writer) = persistence.writer.as_ref() else {
+        return;
+    };
+    let payload = match coordinator.snapshot().to_payload() {
+        Ok(payload) => payload,
+        Err(error) => {
+            persistence.preference_unavailable = Some(SessionError::Preference(error.to_string()));
+            return;
+        }
+    };
+    match writer.replace_ui_preferences_payload(payload) {
+        Ok(receiver) => {
+            persistence.preference_save = Some(PreferenceSaveInFlight {
+                revision: coordinator.revision(),
+                receiver,
+            });
+        }
+        Err(GlobalLibraryWriterQueueError::Initializing | GlobalLibraryWriterQueueError::Full) => {}
+        Err(error @ GlobalLibraryWriterQueueError::PayloadTooLarge { .. }) => {
+            persistence.preference_unavailable = Some(SessionError::Preference(error.to_string()));
+        }
+        Err(error) => persistence.unavailable = Some(session_from_queue_error(error)),
+    }
+}
+
+fn poll_preference_save(
+    persistence: &mut Persistence,
+    coordinator: &mut PreferenceCoordinator,
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    reported_unavailable: &mut bool,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+) {
+    let Some(save) = persistence.preference_save.as_ref() else {
+        return;
+    };
+    match save.receiver.try_recv() {
+        Ok(Ok(())) => {
+            let revision = save.revision;
+            persistence.preference_save = None;
+            if coordinator.accept_save_ack(revision) {
+                let _ = event_tx.send(PreferenceEvent::Persisted { revision });
+            }
+        }
+        Ok(Err(error)) => {
+            persistence.preference_save = None;
+            record_preference_operation_failure(persistence, error);
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            persistence.preference_save = None;
+            persistence.unavailable = Some(SessionError::Persistence(String::from(
+                "UI preferences save receiver disconnected",
+            )));
+        }
+    }
+    if let Some(error) = persistence.unavailable.clone() {
+        report_preference_unavailable(
+            coordinator,
+            event_tx,
+            coordinator.revision(),
+            error,
+            reported_unavailable,
+            unfinalized_requests,
+        );
+    }
+}
+
+fn is_invalid_preference_payload_error(error: &LibraryError) -> bool {
+    matches!(
+        error,
+        LibraryError::MetadataTooLarge { .. } | LibraryError::MetadataInvalidUtf8 { .. }
+    )
+}
+
+fn record_preference_operation_failure(persistence: &mut Persistence, error: LibraryError) {
+    if let Some(shared_error) = shared_preference_failure(persistence, &error) {
+        persistence.unavailable = Some(shared_error);
+    } else {
+        persistence.preference_unavailable = Some(SessionError::Preference(error.to_string()));
+    }
+}
+
+fn shared_preference_failure(
+    persistence: &Persistence,
+    error: &LibraryError,
+) -> Option<SessionError> {
+    persistence.status_error().or_else(|| {
+        matches!(
+            error,
+            LibraryError::ProfileOwnership(_) | LibraryError::ProfileOwnershipChanged { .. }
+        )
+        .then(|| SessionError::Persistence(error.to_string()))
+    })
+}
+
+fn emit_preference_snapshot_and_outcomes(
+    coordinator: &PreferenceCoordinator,
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    applied_requests: &mut HashSet<PreferenceRequestId>,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+    outcomes: Vec<PreferenceOutcome>,
+    emit_persisted_baseline: bool,
+) {
+    let _ = event_tx.send(PreferenceEvent::Snapshot {
+        revision: coordinator.revision(),
+        preferences: coordinator.snapshot(),
+    });
+    if emit_persisted_baseline {
+        let _ = event_tx.send(PreferenceEvent::Persisted {
+            revision: PreferenceRevision::default(),
+        });
+    }
+    emit_preference_outcomes(
+        coordinator,
+        event_tx,
+        applied_requests,
+        unfinalized_requests,
+        outcomes,
+    );
+}
+
+fn emit_preference_outcomes(
+    coordinator: &PreferenceCoordinator,
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    applied_requests: &mut HashSet<PreferenceRequestId>,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+    outcomes: Vec<PreferenceOutcome>,
+) {
+    for outcome in outcomes {
+        match outcome.result {
+            Ok(changed) => {
+                let _ = changed;
+                announce_preference_request(
+                    event_tx,
+                    applied_requests,
+                    unfinalized_requests,
+                    outcome.request,
+                    coordinator.revision(),
+                );
+            }
+            Err(error) => fail_preference_request(
+                event_tx,
+                unfinalized_requests,
+                outcome.request,
+                SessionError::Preference(error.to_string()),
+            ),
+        }
     }
 }
 
@@ -963,13 +1494,28 @@ fn queue_lookups(persistence: &mut Persistence) {
     let Some(writer) = persistence.writer.as_ref() else {
         return;
     };
+    let in_flight = persistence
+        .pending_adds
+        .values()
+        .filter(|pending| pending.receiver.is_some())
+        .count();
+    let mut available = MAX_RETAINED_LOOKUPS_IN_FLIGHT.saturating_sub(in_flight);
+    if available == 0 {
+        return;
+    }
     let mut fatal_error = None;
     for pending in persistence.pending_adds.values_mut() {
         if pending.receiver.is_some() {
             continue;
         }
+        if available == 0 {
+            break;
+        }
         match writer.lookup_retained_source_for_root(pending.root.clone().into_path_buf()) {
-            Ok(receiver) => pending.receiver = Some(receiver),
+            Ok(receiver) => {
+                pending.receiver = Some(receiver);
+                available -= 1;
+            }
             Err(
                 GlobalLibraryWriterQueueError::Initializing | GlobalLibraryWriterQueueError::Full,
             ) => {
@@ -1198,6 +1744,29 @@ fn report_unavailable(
     }
 }
 
+fn report_preference_unavailable(
+    coordinator: &mut PreferenceCoordinator,
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    revision: PreferenceRevision,
+    error: SessionError,
+    reported: &mut bool,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+) {
+    let mut failed_requests: Vec<_> = unfinalized_requests.drain().collect();
+    failed_requests.sort_by_key(|request| request.get());
+    for request in failed_requests {
+        let _ = event_tx.send(PreferenceEvent::RequestFailed {
+            request,
+            error: error.clone(),
+        });
+    }
+    if !*reported {
+        let _ = event_tx.send(PreferenceEvent::PersistenceUnavailable { revision, error });
+        *reported = true;
+    }
+    coordinator.clear_pending();
+}
+
 fn fail_request(
     event_tx: &mpsc::Sender<RegistryEvent>,
     unfinalized_requests: &mut HashSet<RequestId>,
@@ -1206,6 +1775,17 @@ fn fail_request(
 ) {
     if unfinalized_requests.remove(&request) {
         let _ = event_tx.send(RegistryEvent::RequestFailed { request, error });
+    }
+}
+
+fn fail_preference_request(
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+    request: PreferenceRequestId,
+    error: SessionError,
+) {
+    if unfinalized_requests.remove(&request) {
+        let _ = event_tx.send(PreferenceEvent::RequestFailed { request, error });
     }
 }
 
@@ -1219,6 +1799,19 @@ fn announce_request(
     unfinalized_requests.remove(&request);
     if applied_requests.insert(request) {
         let _ = event_tx.send(RegistryEvent::RequestApplied { request, revision });
+    }
+}
+
+fn announce_preference_request(
+    event_tx: &mpsc::Sender<PreferenceEvent>,
+    applied_requests: &mut HashSet<PreferenceRequestId>,
+    unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+    request: PreferenceRequestId,
+    revision: PreferenceRevision,
+) {
+    unfinalized_requests.remove(&request);
+    if applied_requests.insert(request) {
+        let _ = event_tx.send(PreferenceEvent::RequestApplied { request, revision });
     }
 }
 
@@ -1246,13 +1839,19 @@ fn announce_resolved_requests(
 fn drain_shutdown(
     persistence: &mut Persistence,
     coordinator: &mut Coordinator,
+    preference_coordinator: &mut PreferenceCoordinator,
     event_tx: &mpsc::Sender<RegistryEvent>,
+    preference_event_tx: &mpsc::Sender<PreferenceEvent>,
     reported_unavailable: &mut bool,
+    preference_reported_unavailable: &mut bool,
     applied_requests: &mut HashSet<RequestId>,
     unfinalized_requests: &mut HashSet<RequestId>,
+    applied_preference_requests: &mut HashSet<PreferenceRequestId>,
+    unfinalized_preference_requests: &mut HashSet<PreferenceRequestId>,
 ) -> Result<(), SessionError> {
     loop {
         if let Some(error) = persistence.status_error() {
+            let preference_revision = preference_coordinator.revision();
             report_unavailable(
                 persistence,
                 coordinator,
@@ -1261,6 +1860,14 @@ fn drain_shutdown(
                 error.clone(),
                 reported_unavailable,
                 unfinalized_requests,
+            );
+            report_preference_unavailable(
+                preference_coordinator,
+                preference_event_tx,
+                preference_revision,
+                error.clone(),
+                preference_reported_unavailable,
+                unfinalized_preference_requests,
             );
             return Err(error);
         }
@@ -1272,6 +1879,14 @@ fn drain_shutdown(
             applied_requests,
             unfinalized_requests,
         );
+        drive_preferences(
+            persistence,
+            preference_coordinator,
+            preference_event_tx,
+            preference_reported_unavailable,
+            applied_preference_requests,
+            unfinalized_preference_requests,
+        );
         if persistence.unavailable.is_some() {
             return Err(persistence
                 .unavailable
@@ -1279,13 +1894,20 @@ fn drain_shutdown(
                 .expect("unavailable state retained"));
         }
         if coordinator.loaded
+            && (preference_coordinator.loaded() || persistence.preference_unavailable.is_some())
             && persistence.load.is_none()
+            && persistence.preference_load.is_none()
             && persistence.pending_adds.is_empty()
             && persistence.save.is_none()
+            && persistence.preference_save.is_none()
             && !persistence.force_save
             && !coordinator.is_dirty()
+            && (persistence.preference_unavailable.is_some() || !preference_coordinator.is_dirty())
         {
-            return Ok(());
+            return persistence
+                .preference_unavailable
+                .clone()
+                .map_or(Ok(()), Err);
         }
         thread::sleep(WORKER_POLL_INTERVAL);
     }
@@ -1297,7 +1919,7 @@ mod tests {
     use std::fs;
     use std::time::Instant;
     use tempfile::TempDir;
-    use wavecrate_library::app_dirs::{ConfigBaseGuard, PROFILE_DIR_NAME};
+    use wavecrate_library::app_dirs::{AppRootGuard, ConfigBaseGuard, PROFILE_DIR_NAME};
     use wavecrate_library::sample_sources::{SourceId, SourceMetadataStorage};
 
     fn root(temp: &TempDir, name: &str) -> CanonicalSourceRoot {
@@ -1339,6 +1961,42 @@ mod tests {
                 }
                 Err(TryRecvError::Disconnected) => panic!("session event channel disconnected"),
             }
+        }
+    }
+
+    fn wait_for_preference_event(
+        service: &SourceRegistryService,
+        predicate: impl Fn(&PreferenceEvent) -> bool,
+    ) -> PreferenceEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match service.try_recv_preference() {
+                Ok(event) if predicate(&event) => return event,
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for preference event"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("preference event channel disconnected")
+                }
+            }
+        }
+    }
+
+    fn wait_for_preference_snapshot(
+        service: &SourceRegistryService,
+        predicate: impl Fn(&UiPreferences) -> bool,
+    ) -> UiPreferences {
+        match wait_for_preference_event(
+            service,
+            |event| matches!(event, PreferenceEvent::Snapshot { preferences, .. } if predicate(preferences)),
+        ) {
+            PreferenceEvent::Snapshot { preferences, .. } => preferences,
+            _ => unreachable!("snapshot predicate returned a non-snapshot event"),
         }
     }
 
@@ -1442,6 +2100,330 @@ mod tests {
     }
 
     #[test]
+    fn preferences_round_trip_with_missing_theme_source_path() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+
+        let mut theme = wavecrate_design::Theme::default();
+        theme.name = String::from("Persisted theme");
+        theme.motion.enabled = false;
+        let source_path = temp.path().join("missing custom theme.json");
+        let replace_request = service
+            .patch_preferences(PreferencePatch::ReplaceTheme {
+                theme: theme.clone(),
+                source_path: Some(source_path.clone()),
+            })
+            .expect("replace theme");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == replace_request
+            )
+        });
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+
+        let motion_request = service
+            .patch_preferences(PreferencePatch::SetMotionEnabled(true))
+            .expect("motion patch");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == motion_request
+            )
+        });
+        let autoplay_request = service
+            .patch_preferences(PreferencePatch::SetAutoplaySelection(false))
+            .expect("autoplay patch");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == autoplay_request
+            )
+        });
+        let loop_request = service
+            .patch_preferences(PreferencePatch::SetLoopEnabled(true))
+            .expect("loop patch");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == loop_request
+            )
+        });
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 2),
+        );
+        service.shutdown().expect("preference shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences.theme.name == "Persisted theme"
+                && preferences.theme.motion.enabled
+                && preferences.theme_source_path.as_deref() == Some(source_path.as_path())
+                && !preferences.autoplay_selection
+                && preferences.loop_enabled
+        });
+        let mut expected_theme = theme;
+        expected_theme.motion.enabled = true;
+        assert_eq!(
+            restored.theme,
+            wavecrate_design::validate_theme(expected_theme).expect("theme valid")
+        );
+        assert_eq!(restored.theme_source_path, Some(source_path));
+        reopened.shutdown().expect("reopen preference shutdown");
+    }
+
+    #[test]
+    fn preference_reversion_persists_latest_revision() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        let disable_motion = service
+            .patch_preferences(PreferencePatch::SetMotionEnabled(false))
+            .expect("disable motion");
+        let restore_motion = service
+            .patch_preferences(PreferencePatch::SetMotionEnabled(true))
+            .expect("restore motion");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == disable_motion
+            )
+        });
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == restore_motion
+            )
+        });
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 1),
+        );
+        service.shutdown().expect("reversion shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
+    fn malformed_preferences_remain_untouched_until_explicit_reset() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        service.shutdown().expect("initial shutdown");
+
+        let app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
+        let connection = wavecrate_library::sample_sources::library::open_connection()
+            .expect("open preference fixture");
+        connection
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES ('ui_preferences_v1', 'malformed')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .expect("write malformed preference");
+        drop(connection);
+        drop(app_root_guard);
+
+        let mut malformed = SourceRegistryService::start_inner(Some(profile_root.clone()))
+            .expect("reopen malformed service");
+        wait_for_preference_event(&malformed, |event| {
+            matches!(event, PreferenceEvent::LoadFailed { .. })
+        });
+        let rejected = malformed
+            .patch_preferences(PreferencePatch::SetLoopEnabled(true))
+            .expect("submit rejected preference");
+        wait_for_preference_event(&malformed, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestFailed { request, error }
+                    if *request == rejected && matches!(error, SessionError::Preference(_))
+            )
+        });
+        let reset = malformed.reset_preferences().expect("reset preference");
+        wait_for_preference_snapshot(&malformed, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        wait_for_preference_event(&malformed, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == reset
+            )
+        });
+        wait_for_preference_event(
+            &malformed,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+        malformed.shutdown().expect("reset shutdown");
+
+        let app_root_guard = AppRootGuard::set(profile_root).expect("app root reopen");
+        let connection = wavecrate_library::sample_sources::library::open_connection()
+            .expect("open reset preference");
+        let value: String = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'ui_preferences_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preference row");
+        assert_ne!(value, "malformed");
+        drop(connection);
+        drop(app_root_guard);
+    }
+
+    #[test]
+    fn preference_save_failure_keeps_source_registry_available() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut initial =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_event(&initial, |event| {
+            matches!(event, RegistryEvent::Snapshot { .. })
+        });
+        wait_for_preference_snapshot(&initial, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        initial.shutdown().expect("initial shutdown");
+
+        let app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
+        let connection = wavecrate_library::sample_sources::library::open_connection()
+            .expect("open preference fixture");
+        let payload = UiPreferences::default()
+            .to_payload()
+            .expect("default preference payload");
+        connection
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES ('ui_preferences_v1', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [payload.as_str()],
+            )
+            .expect("write preference fixture");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_ui_preferences_session_update
+                 BEFORE UPDATE OF value ON metadata
+                 WHEN OLD.key = 'ui_preferences_v1'
+                 BEGIN SELECT RAISE(FAIL, 'session preference failure fixture'); END;",
+            )
+            .expect("preference failure trigger");
+        drop(connection);
+        drop(app_root_guard);
+
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        wait_for_event(&service, |event| {
+            matches!(event, RegistryEvent::Snapshot { .. })
+        });
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        let preference_request = service
+            .patch_preferences(PreferencePatch::SetLoopEnabled(true))
+            .expect("preference patch");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == preference_request
+            )
+        });
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::PersistenceUnavailable { error, .. } if matches!(error, SessionError::Preference(_))),
+        );
+
+        let source_root = root(&temp, "source-after-preference-failure");
+        let add_request = service.add_root(source_root.clone()).expect("source add");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::RequestApplied { request, .. } if *request == add_request
+            )
+        });
+        let remove_request = service.remove_root(source_root).expect("source remove");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::RequestApplied { request, .. } if *request == remove_request
+            )
+        });
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::Preference(_)))
+        ));
+    }
+
+    #[test]
+    fn preference_save_is_not_starved_by_retained_lookup_backlog() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        wait_for_event(&service, |event| {
+            matches!(event, RegistryEvent::Snapshot { .. })
+        });
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+
+        for index in 0..128 {
+            let source_root = root(&temp, &format!("lookup-backlog-{index}"));
+            loop {
+                match service.add_root(source_root.clone()) {
+                    Ok(_) => break,
+                    Err(SubmitError::Full) => thread::sleep(Duration::from_millis(1)),
+                    Err(SubmitError::Closed) => panic!("session closed while queueing lookups"),
+                }
+            }
+        }
+
+        let preference_request = loop {
+            match service.patch_preferences(PreferencePatch::SetLoopEnabled(true)) {
+                Ok(request) => break request,
+                Err(SubmitError::Full) => thread::sleep(Duration::from_millis(1)),
+                Err(SubmitError::Closed) => panic!("session closed while queueing preference"),
+            }
+        };
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == preference_request
+            )
+        });
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+        service.shutdown().expect("lookup backlog shutdown");
+    }
+
+    #[test]
     fn existing_remove_is_durable_across_reopen() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -1493,6 +2475,9 @@ mod tests {
             SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
         let source_root = root(&temp, "undrained");
         service.add_root(source_root).expect("add");
+        service
+            .patch_preferences(PreferencePatch::SetLoopEnabled(true))
+            .expect("preference patch");
         service.shutdown().expect("synchronous shutdown");
         assert!(profile_root.join("library.db").is_file());
     }
@@ -1635,10 +2620,13 @@ mod tests {
             writable: None,
             writer: None,
             load: None,
+            preference_load: None,
             pending_adds: HashMap::new(),
             save: None,
+            preference_save: None,
             force_save: false,
             unavailable: None,
+            preference_unavailable: None,
         };
         let (event_tx, event_rx) = mpsc::channel();
         let mut reported = false;
@@ -1682,6 +2670,64 @@ mod tests {
         assert!(unfinalized.is_empty());
         assert!(persistence.pending_adds.is_empty());
         assert!(coordinator.edits.is_empty());
+    }
+
+    #[test]
+    fn unloaded_preference_failure_is_quiescent_for_shutdown() {
+        let mut coordinator = Coordinator::new();
+        coordinator
+            .load(SourceRegistrySnapshot::new(Vec::new()))
+            .expect("load source coordinator");
+        let mut preference_coordinator = PreferenceCoordinator::new();
+        let mut persistence = Persistence {
+            writable: None,
+            writer: None,
+            load: None,
+            preference_load: None,
+            pending_adds: HashMap::new(),
+            save: None,
+            preference_save: None,
+            force_save: false,
+            unavailable: None,
+            preference_unavailable: Some(SessionError::Preference(String::from(
+                "preference load query failed",
+            ))),
+        };
+        assert!(can_block_on_command(
+            &persistence,
+            &coordinator,
+            &preference_coordinator
+        ));
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (preference_event_tx, preference_event_rx) = mpsc::channel();
+        let mut reported = false;
+        let mut preference_reported = false;
+        let mut applied = HashSet::new();
+        let mut unfinalized = HashSet::new();
+        let mut applied_preferences = HashSet::new();
+        let mut unfinalized_preferences = HashSet::new();
+        let result = drain_shutdown(
+            &mut persistence,
+            &mut coordinator,
+            &mut preference_coordinator,
+            &event_tx,
+            &preference_event_tx,
+            &mut reported,
+            &mut preference_reported,
+            &mut applied,
+            &mut unfinalized,
+            &mut applied_preferences,
+            &mut unfinalized_preferences,
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::Preference(message)) if message == "preference load query failed"
+        ));
+        assert!(matches!(
+            preference_event_rx.try_recv(),
+            Ok(PreferenceEvent::PersistenceUnavailable { error: SessionError::Preference(message), .. })
+                if message == "preference load query failed"
+        ));
     }
 
     #[test]

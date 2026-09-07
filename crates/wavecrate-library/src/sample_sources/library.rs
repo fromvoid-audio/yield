@@ -46,6 +46,12 @@ use crate::sample_sources::normalize_path;
 /// Filename for the global library database stored under the user app directory.
 pub const LIBRARY_DB_FILE_NAME: &str = "library.db";
 
+/// Metadata key used by the GPUI session for its versioned preferences payload.
+pub const UI_PREFERENCES_KEY: &str = "ui_preferences_v1";
+
+/// Maximum UTF-8 byte length accepted for the UI preferences payload.
+pub const UI_PREFERENCES_MAX_BYTES: usize = 128 * 1024;
+
 /// Aggregate state loaded from or written to the library database.
 #[derive(Debug, Clone, Default)]
 pub struct LibraryState {

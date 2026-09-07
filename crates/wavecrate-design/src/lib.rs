@@ -456,7 +456,8 @@ pub fn load_theme_file(path: &Path) -> Result<Theme, ThemeError> {
     parse_theme_json(&json)
 }
 
-fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
+/// Validate a complete theme value before publishing or persisting it.
+pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
     if theme.schema_version != THEME_SCHEMA_VERSION {
         return Err(ThemeError::Invalid(format!(
             "schema_version {} is unsupported; expected {}",

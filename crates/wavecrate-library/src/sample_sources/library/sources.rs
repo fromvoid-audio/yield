@@ -8,7 +8,9 @@ use super::connection::LibraryDatabase;
 use super::error::map_sql_error;
 use super::owner::SourceRegistrySnapshot;
 use super::telemetry::record_library_db_event;
-use super::{KNOWN_SOURCES_KEY, LibraryError, LibraryState};
+use super::{
+    KNOWN_SOURCES_KEY, LibraryError, LibraryState, UI_PREFERENCES_KEY, UI_PREFERENCES_MAX_BYTES,
+};
 use crate::sample_sources::normalize_path;
 use crate::sample_sources::{
     SampleSource, SourceId, SourceMetadataStorage, SourceRole, default_primary_import_folder,
@@ -32,6 +34,40 @@ impl LibraryDatabase {
 
     pub(super) fn load_source_registry(&self) -> Result<SourceRegistrySnapshot, LibraryError> {
         Ok(SourceRegistrySnapshot::from_sources(self.load_sources()?))
+    }
+
+    pub(super) fn load_ui_preferences_payload(&self) -> Result<Option<String>, LibraryError> {
+        let started_at = Instant::now();
+        let result = load_bounded_metadata(
+            &self.connection,
+            UI_PREFERENCES_KEY,
+            UI_PREFERENCES_MAX_BYTES,
+        );
+        record_library_db_event(
+            "library.load_ui_preferences_payload",
+            started_at,
+            result.as_ref().map(|_| ()),
+        );
+        result
+    }
+
+    pub(super) fn replace_ui_preferences_payload(
+        &mut self,
+        payload: &str,
+    ) -> Result<(), LibraryError> {
+        if payload.len() > UI_PREFERENCES_MAX_BYTES {
+            return Err(LibraryError::MetadataTooLarge {
+                key: UI_PREFERENCES_KEY,
+                limit: UI_PREFERENCES_MAX_BYTES,
+                actual: payload.len(),
+            });
+        }
+        let started_at = Instant::now();
+        let tx = self.connection.transaction().map_err(map_sql_error)?;
+        Self::set_metadata_in_tx(&tx, UI_PREFERENCES_KEY, payload)?;
+        tx.commit().map_err(map_sql_error)?;
+        record_library_db_event("library.replace_ui_preferences_payload", started_at, Ok(()));
+        Ok(())
     }
 
     pub(super) fn replace_source_registry(
@@ -215,6 +251,44 @@ impl LibraryDatabase {
         .map_err(map_sql_error)?;
         Ok(())
     }
+}
+
+fn load_bounded_metadata(
+    conn: &Connection,
+    key: &'static str,
+    limit: usize,
+) -> Result<Option<String>, LibraryError> {
+    let Some((actual, bytes)) = conn
+        .query_row(
+            "SELECT length(CAST(value AS BLOB)),
+                    CASE
+                        WHEN length(CAST(value AS BLOB)) <= ?2
+                        THEN CAST(value AS BLOB)
+                    END
+             FROM metadata
+             WHERE key = ?1",
+            params![key, limit as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )
+        .optional()
+        .map_err(map_sql_error)?
+    else {
+        return Ok(None);
+    };
+    let actual = usize::try_from(actual).map_err(|_| LibraryError::MetadataTooLarge {
+        key,
+        limit,
+        actual: usize::MAX,
+    })?;
+    if actual > limit {
+        return Err(LibraryError::MetadataTooLarge { key, limit, actual });
+    }
+    let Some(bytes) = bytes else {
+        return Err(LibraryError::MetadataInvalidUtf8 { key });
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| LibraryError::MetadataInvalidUtf8 { key })
 }
 
 fn normalized_source(mut source: SampleSource) -> SampleSource {
