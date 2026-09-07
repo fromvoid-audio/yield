@@ -37,6 +37,18 @@ wavecrate-design = { path = "crates/wavecrate-design" }
 wavecrate-ui = { path = "crates/wavecrate-ui" }
 tempfile = "3.23.0"
 
+# Keep GPUI layout/tessellation and audio decoding optimized in development.
+# These dependencies rarely rebuild; unoptimized rendering is not a useful
+# interactive development baseline.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.wavecrate-ui]
+opt-level = 2
+
+[profile.dev.package.wavecrate-media]
+opt-level = 2
+
 [profile.release-local]
 inherits = "release"
 incremental = true

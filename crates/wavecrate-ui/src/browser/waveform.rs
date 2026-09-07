@@ -3,7 +3,9 @@
 
 //! Waveform shaping and canvas rendering for the browser preview panel.
 
-use gpui::{PathBuilder, canvas, div, point, prelude::*, px};
+use std::{cell::RefCell, rc::Rc};
+
+use gpui::{Bounds, Path, PathBuilder, Pixels, canvas, div, point, prelude::*, px};
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -11,37 +13,138 @@ use crate::theme::color;
 use super::Browser;
 
 fn build_waveform_path(
-    bands: &[[f32; 4]],
+    extents: &[[f32; 4]],
     lane: usize,
-    peak_scale: f32,
     left: gpui::Pixels,
     center: gpui::Pixels,
     width: gpui::Pixels,
     half_height: gpui::Pixels,
 ) -> Option<PathBuilder> {
-    if bands.len() < 2 {
+    if extents.len() < 2 {
         return None;
     }
     let mut builder = PathBuilder::fill();
     builder.move_to(point(left, center));
-    for (index, column) in bands.iter().enumerate() {
-        let progress = index as f32 / (bands.len() - 1) as f32;
-        let amplitude = waveform_extent(*column, lane, peak_scale);
+    for (index, extent) in extents.iter().enumerate() {
+        let progress = index as f32 / (extents.len() - 1) as f32;
         builder.line_to(point(
             left + width * progress,
-            center - half_height * amplitude,
+            center - half_height * extent[lane],
         ));
     }
-    for (index, column) in bands.iter().enumerate().rev() {
-        let progress = index as f32 / (bands.len() - 1) as f32;
-        let amplitude = waveform_extent(*column, lane, peak_scale);
+    for (index, extent) in extents.iter().enumerate().rev() {
+        let progress = index as f32 / (extents.len() - 1) as f32;
         builder.line_to(point(
             left + width * progress,
-            center + half_height * amplitude,
+            center + half_height * extent[lane],
         ));
     }
     builder.close();
     Some(builder)
+}
+
+/// Retained CPU geometry for the static selected-sample waveform.
+///
+/// GPUI canvas closures are recreated with the surrounding view, so this cache owns the paths
+/// independently of an individual canvas element. The key includes every input that changes the
+/// path coordinates or shaped envelope.
+#[derive(Clone, Default)]
+pub(super) struct WaveformRenderCache {
+    state: Rc<RefCell<WaveformRenderCacheState>>,
+}
+
+#[derive(Default)]
+struct WaveformRenderCacheState {
+    key: Option<WaveformCacheKey>,
+    paths: Vec<(usize, Path<Pixels>)>,
+    #[cfg(test)]
+    rebuild_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaveformCacheKey {
+    generation: u64,
+    bounds: Bounds<Pixels>,
+    peak_scale_bits: u32,
+}
+
+impl WaveformRenderCache {
+    /// Return paths for this exact preview generation and layout, rebuilding only on a key miss.
+    fn paths_for(
+        &self,
+        generation: u64,
+        bands: &[[f32; 4]],
+        peak_scale: f32,
+        bounds: Bounds<Pixels>,
+    ) -> Vec<(usize, Path<Pixels>)> {
+        let key = WaveformCacheKey {
+            generation,
+            bounds,
+            peak_scale_bits: peak_scale.to_bits(),
+        };
+        let mut state = self.state.borrow_mut();
+        if state.key != Some(key) {
+            state.paths = build_waveform_paths(bands, peak_scale, bounds);
+            state.key = Some(key);
+            #[cfg(test)]
+            {
+                state.rebuild_count += 1;
+            }
+        }
+        state.paths.clone()
+    }
+
+    #[cfg(test)]
+    fn rebuild_count(&self) -> usize {
+        self.state.borrow().rebuild_count
+    }
+}
+
+fn build_waveform_paths(
+    bands: &[[f32; 4]],
+    peak_scale: f32,
+    bounds: Bounds<Pixels>,
+) -> Vec<(usize, Path<Pixels>)> {
+    let point_count = drawable_point_count(bounds.size.width, bands.len());
+    let extents = resample_extents(bands, point_count, peak_scale);
+    let center = bounds.origin.y + bounds.size.height / 2.0;
+    let half_height = (bounds.size.height / 2.0 - px(2.0)).max(px(1.0));
+    let width = bounds.size.width;
+    (0..4)
+        .filter_map(|lane| {
+            build_waveform_path(&extents, lane, bounds.origin.x, center, width, half_height)
+                .and_then(|builder| builder.build().ok())
+                .map(|path| (lane, path))
+        })
+        .collect()
+}
+
+fn drawable_point_count(width: Pixels, available_points: usize) -> usize {
+    if available_points < 2 {
+        return available_points;
+    }
+    let width = f32::from(width).ceil().max(2.0) as usize;
+    width.min(available_points)
+}
+
+/// Downsample to drawable columns after shaping each original column.
+///
+/// Taking each lane's maximum shaped extent preserves every bucket's visual peak while avoiding
+/// sub-pixel path segments the panel cannot display.
+fn resample_extents(bands: &[[f32; 4]], point_count: usize, peak_scale: f32) -> Vec<[f32; 4]> {
+    if bands.is_empty() || point_count == 0 {
+        return Vec::new();
+    }
+    let point_count = point_count.min(bands.len());
+    let mut extents = vec![[0.0_f32; 4]; point_count];
+    for (index, column) in bands.iter().copied().enumerate() {
+        let bucket = index * point_count / bands.len();
+        for lane in 0..4 {
+            extents[bucket][lane] =
+                extents[bucket][lane].max(waveform_extent(column, lane, peak_scale));
+        }
+    }
+    extents
 }
 
 fn waveform_extent(column: [f32; 4], lane: usize, peak_scale: f32) -> f32 {
@@ -137,27 +240,16 @@ pub(super) fn render_waveform(browser: &Browser, theme: Theme) -> impl IntoEleme
                 color(theme.colors.waveform_raw),
             ];
             let peak_scale = theme.waveform.peak_scale;
+            let generation = browser.waveform_generation;
+            let cache = browser.waveform_render_cache.clone();
             let waveform = canvas(
                 move |_, _, _| (),
                 move |bounds, _, window, _| {
-                    let center = bounds.origin.y + bounds.size.height / 2.0;
-                    let half_height = (bounds.size.height / 2.0 - px(2.0)).max(px(1.0));
-                    let width = bounds.size.width;
-                    for lane in 0..4 {
-                        let Some(path) = build_waveform_path(
-                            &bands,
-                            lane,
-                            peak_scale,
-                            bounds.origin.x,
-                            center,
-                            width,
-                            half_height,
-                        ) else {
-                            continue;
-                        };
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, lane_colors[lane]);
-                        }
+                    for (lane, path) in cache
+                        .paths_for(generation, &bands, peak_scale, bounds)
+                        .into_iter()
+                    {
+                        window.paint_path(path, lane_colors[lane]);
                     }
                 },
             )
@@ -192,4 +284,95 @@ pub(super) fn render_waveform(browser: &Browser, theme: Theme) -> impl IntoEleme
         );
     }
     bars
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_bounds(width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(width), px(height)))
+    }
+
+    #[test]
+    fn resampling_is_limited_to_drawable_columns_and_preserves_lane_extrema() {
+        let bands = (0..2_048)
+            .map(|index| {
+                let peak = if index == 1_023 {
+                    1.0
+                } else {
+                    index as f32 / 4_096.0
+                };
+                [peak, peak * 0.8, peak * 0.6, peak]
+            })
+            .collect::<Vec<_>>();
+
+        let extents = resample_extents(&bands, drawable_point_count(px(320.0), bands.len()), 1.0);
+
+        assert_eq!(extents.len(), 320);
+        for lane in 0..4 {
+            let source_peak = bands
+                .iter()
+                .map(|column| waveform_extent(*column, lane, 1.0))
+                .fold(0.0, f32::max);
+            let rendered_peak = extents
+                .iter()
+                .map(|column| column[lane])
+                .fold(0.0, f32::max);
+            assert_eq!(rendered_peak, source_peak);
+        }
+    }
+
+    #[test]
+    fn render_cache_reuses_an_exact_key_and_invalidates_layout_or_preview_changes() {
+        let cache = WaveformRenderCache::default();
+        let first = WaveformCacheKey {
+            generation: 7,
+            bounds: test_bounds(320.0, 180.0),
+            peak_scale_bits: 1.0_f32.to_bits(),
+        };
+        let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
+        let initial_paths = cache.paths_for(7, &bands, 1.0, first.bounds);
+        assert_eq!(initial_paths.len(), 4);
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.paths_for(7, &bands, 1.0, first.bounds).len(), 4);
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.paths_for(8, &bands, 1.0, first.bounds).len(), 4);
+        assert_eq!(cache.rebuild_count(), 2);
+        assert_eq!(
+            cache
+                .paths_for(8, &bands, 1.0, test_bounds(321.0, 180.0))
+                .len(),
+            4
+        );
+        assert_eq!(cache.rebuild_count(), 3);
+        assert_eq!(
+            cache
+                .paths_for(8, &bands, 1.1, test_bounds(321.0, 180.0))
+                .len(),
+            4
+        );
+        assert_eq!(cache.rebuild_count(), 4);
+    }
+
+    #[test]
+    #[ignore = "manual waveform geometry cache benchmark"]
+    fn waveform_geometry_cache_benchmark() {
+        use std::time::Instant;
+
+        let cache = WaveformRenderCache::default();
+        let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
+        let bounds = test_bounds(640.0, 180.0);
+        let cold_start = Instant::now();
+        for generation in 0..100 {
+            let _ = cache.paths_for(generation, &bands, 1.0, bounds);
+        }
+        let cold = cold_start.elapsed();
+        let warm_start = Instant::now();
+        for _ in 0..100 {
+            let _ = cache.paths_for(99, &bands, 1.0, bounds);
+        }
+        let warm = warm_start.elapsed();
+        eprintln!("waveform geometry: 100 misses {cold:?}; 100 hits {warm:?}");
+    }
 }

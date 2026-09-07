@@ -105,90 +105,6 @@ impl Browser {
             )
     }
 
-    fn render_sidebar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let root_label = self
-            .root
-            .as_ref()
-            .map(|root| {
-                root.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| root.display().to_string())
-            })
-            .unwrap_or_else(|| "No source folder selected".to_string());
-        let source_label = "Sources";
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(theme.spacing.sidebar_width))
-            .h_full()
-            .bg(color(theme.colors.surface_raised))
-            .border_r(px(theme.spacing.border_width))
-            .border_color(color(theme.colors.border))
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(theme.spacing.panel_padding))
-                    .pt(px(theme.spacing.panel_padding))
-                    .pb(px(theme.spacing.control_gap))
-                    .text_size(px(theme.typography.small_size))
-                    .text_color(color(theme.colors.text_muted))
-                    .child(source_label),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(theme.spacing.control_gap))
-                    .min_h(px(theme.spacing.row_height))
-                    .px(px(theme.spacing.row_padding_x))
-                    .bg(if self.root.is_some() {
-                        color(theme.colors.selection_fill)
-                    } else {
-                        transparent()
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(theme.spacing.selected_marker_width))
-                            .h_full()
-                            .bg(if self.root.is_some() {
-                                color(theme.colors.accent)
-                            } else {
-                                transparent()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(theme.typography.small_size))
-                            .child(root_label),
-                    ),
-            )
-            .child(div().flex_1())
-            .child(
-                div().flex_none().p(px(theme.spacing.panel_padding)).child(
-                    div()
-                        .id("choose-folder-sidebar")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(theme.spacing.control_height))
-                        .cursor_pointer()
-                        .bg(color(theme.colors.surface_overlay))
-                        .border(px(theme.spacing.border_width))
-                        .border_color(color(theme.colors.border_emphasis))
-                        .text_size(px(theme.typography.small_size))
-                        .on_click(cx.listener(Self::choose_folder))
-                        .child("Choose folder"),
-                ),
-            )
-    }
-
     fn render_column_header(
         &self,
         label: &'static str,
@@ -588,7 +504,7 @@ impl Render for Browser {
                     .flex()
                     .flex_1()
                     .h_full()
-                    .child(self.render_sidebar(theme.clone(), cx))
+                    .child(super::sidebar::render(self, theme.clone(), cx))
                     .child(
                         div()
                             .flex()

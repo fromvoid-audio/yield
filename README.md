@@ -46,13 +46,21 @@ On macOS, build a development application bundle with:
 
 The script prints the `.app` path under the ignored Cargo target directory.
 Rust and the platform's native audio/graphics build tools are required.
+Development builds optimize dependencies and the UI/media crates so rendering
+and decoding remain responsive. The first build after this profile change
+recompiles those crates; subsequent edits reuse the optimized dependencies.
 
 ## Current behavior
 
-Browse a folder, search filenames with Cmd/Ctrl+F, and sort by name, size, or
-extension. Select a row with the pointer or Up/Down; Space plays/stops and Escape
-stops playback. While searching, Space enters text and Escape returns browser
-focus. Filtering and sorting preserve the focused sample when it remains visible.
+Add one or more source folders from the Sources sidebar or toolbar, switch or
+forget them for the current session, expand the relative folder tree, and choose
+direct-only or descendant scope. Refresh keeps valid folder, search, sort, and
+sample focus state; an unavailable source reports the failed refresh and leaves
+its last successful session view available for retry. Search filenames with
+Cmd/Ctrl+F and sort by name, size, or extension. Select a row with the pointer
+or Up/Down; Space plays/stops and Escape stops playback. While searching, Space
+enters text and Escape returns browser focus. Filtering and sorting preserve the
+focused sample when it remains visible.
 
 Audition and waveform previews currently support WAV. Other recognized audio
 formats are listed. Waveforms show a bounded initial segment; files over 256 MiB

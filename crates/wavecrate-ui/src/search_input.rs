@@ -100,18 +100,6 @@ impl SearchInput {
         &self.content
     }
 
-    pub(crate) fn reset(&mut self, cx: &mut Context<Self>) {
-        self.content = "".into();
-        self.selected_range = 0..0;
-        self.selection_reversed = false;
-        self.marked_range = None;
-        self.last_layout = None;
-        self.last_bounds = None;
-        self.is_selecting = false;
-        cx.emit(SearchChanged);
-        cx.notify();
-    }
-
     pub(crate) fn theme_changed(&mut self, cx: &mut Context<Self>) {
         self.last_layout = None;
         self.last_bounds = None;

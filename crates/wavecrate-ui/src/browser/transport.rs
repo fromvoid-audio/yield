@@ -18,25 +18,45 @@ use super::Browser;
 
 impl Browser {
     fn ensure_playback_monitor(&mut self, cx: &mut Context<Self>) {
-        if self.playback_monitor_task.is_some() {
+        if self.playback_monitor_running {
             return;
         }
+        self.playback_monitor_generation = self.playback_monitor_generation.wrapping_add(1);
+        let generation = self.playback_monitor_generation;
+        self.playback_monitor_running = true;
         self.playback_monitor_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(80))
                     .await;
-                if this
+                let keep_running = this
                     .update(cx, |view, cx| {
+                        if view.playback_monitor_generation != generation {
+                            return false;
+                        }
+                        let before = (view.playing_path.clone(), view.playback_status.clone());
                         view.poll_playback_events();
-                        cx.notify();
+                        let changed =
+                            before != (view.playing_path.clone(), view.playback_status.clone());
+                        if changed {
+                            cx.notify();
+                        }
+                        let keep_running = view.playback_monitor_has_work();
+                        if !keep_running {
+                            view.playback_monitor_running = false;
+                        }
+                        keep_running
                     })
-                    .is_err()
-                {
+                    .unwrap_or(false);
+                if !keep_running {
                     break;
                 }
             }
         }));
+    }
+
+    fn playback_monitor_has_work(&self) -> bool {
+        self.playing_path.is_some() || self.pending_progress_poll.is_some()
     }
 
     pub(super) fn toggle_playback(&mut self, cx: &mut Context<Self>) {
@@ -98,7 +118,6 @@ impl Browser {
                 match result {
                     Ok(runtime) => {
                         view.playback = Some(runtime);
-                        view.ensure_playback_monitor(cx);
                         let should_queue = pending_entry.as_ref().is_some_and(|entry| {
                             let selected_path = view
                                 .selected
@@ -168,6 +187,8 @@ impl Browser {
 
     pub(super) fn stop_playback(&mut self) {
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
+        self.playback_monitor_generation = self.playback_monitor_generation.wrapping_add(1);
+        self.playback_monitor_running = false;
         self.pending_progress_poll = None;
         self.playback_init_entry = None;
         if let Some(runtime) = self.playback.as_ref() {
@@ -223,6 +244,7 @@ impl Browser {
                 PlaybackRuntimeEvent::Stopped { id }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
+                    self.pending_progress_poll = None;
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.playback_status = "Stopped".to_string();
@@ -230,6 +252,7 @@ impl Browser {
                 PlaybackRuntimeEvent::Failed { id, error }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
+                    self.pending_progress_poll = None;
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.playback_status = format!("Playback failed: {error}");
@@ -237,6 +260,7 @@ impl Browser {
                 PlaybackRuntimeEvent::Cancelled { id, .. }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
+                    self.pending_progress_poll = None;
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.playback_status = "Playback cancelled".to_string();

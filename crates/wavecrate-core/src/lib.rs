@@ -5,6 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
+mod folder_tree;
+
+pub use folder_tree::{
+    FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
+};
+
 /// A source audio file discovered by a folder scan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioFile {
@@ -98,6 +104,8 @@ pub struct BrowserRow {
 pub struct BrowserViewModel {
     query: String,
     sort: SortSpec,
+    folder: Option<PathBuf>,
+    folder_scope: FolderScope,
     rows: Vec<BrowserRow>,
 }
 
@@ -107,6 +115,8 @@ impl BrowserViewModel {
         let mut model = Self {
             query: String::new(),
             sort: SortSpec::default(),
+            folder: None,
+            folder_scope: FolderScope::DirectOnly,
             rows: Vec::new(),
         };
         model.rebuild(entries);
@@ -123,6 +133,16 @@ impl BrowserViewModel {
         self.sort
     }
 
+    /// Return the selected relative folder, if folder filtering is active.
+    pub fn folder(&self) -> Option<&Path> {
+        self.folder.as_deref()
+    }
+
+    /// Return the direct or recursive folder filtering mode.
+    pub fn folder_scope(&self) -> FolderScope {
+        self.folder_scope
+    }
+
     /// Return visible rows in display order.
     pub fn rows(&self) -> &[BrowserRow] {
         &self.rows
@@ -136,6 +156,18 @@ impl BrowserViewModel {
 
     /// Replace the scan while preserving the current query and sort choice.
     pub fn set_entries(&mut self, entries: &[AudioFile]) {
+        self.rebuild(entries);
+    }
+
+    /// Set the selected folder and whether descendants are included, preserving search and sort.
+    pub fn set_folder_scope(
+        &mut self,
+        entries: &[AudioFile],
+        folder: Option<PathBuf>,
+        scope: FolderScope,
+    ) {
+        self.folder = folder;
+        self.folder_scope = scope;
         self.rebuild(entries);
     }
 
@@ -186,7 +218,11 @@ impl BrowserViewModel {
         let mut projected = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| audio_file_matches_name_query(entry, &query))
+            .filter(|(_, entry)| {
+                self.folder.as_deref().is_none_or(|folder| {
+                    folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
+                }) && audio_file_matches_name_query(entry, &query)
+            })
             .map(|(entry_index, entry)| {
                 (
                     entry_index,
@@ -349,6 +385,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 0]
         );
+    }
+
+    #[test]
+    fn browser_folder_scope_combines_with_name_filter_and_sort() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kitchen/alpha.wav"),
+                relative_path: PathBuf::from("kitchen/alpha.wav"),
+                byte_len: 30,
+                duration_seconds: None,
+                sample_rate: None,
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/bravo.wav"),
+                relative_path: PathBuf::from("kit/bravo.wav"),
+                byte_len: 10,
+                duration_seconds: None,
+                sample_rate: None,
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/charlie.wav"),
+                relative_path: PathBuf::from("kit/charlie.wav"),
+                byte_len: 20,
+                duration_seconds: None,
+                sample_rate: None,
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "wav");
+        model.toggle_sort(&entries, SortColumn::Size);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from(".")),
+            FolderScope::AllDescendants,
+        );
+        assert_eq!(model.rows().len(), 3);
     }
 
     #[test]

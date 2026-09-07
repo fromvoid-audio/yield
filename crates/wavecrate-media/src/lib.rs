@@ -30,8 +30,12 @@ const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Result of an in-memory folder scan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioScan {
+    /// Canonical root used for this scan, resolved on the background worker.
+    pub root: PathBuf,
     /// Audio files found in deterministic relative-path order.
     pub files: Vec<AudioFile>,
+    /// Relative directories discovered during traversal, including empty directories and `.`.
+    pub directories: Vec<PathBuf>,
     /// Number of directory entries skipped because they were links, unreadable, or invalid.
     pub skipped_entries: usize,
 }
@@ -81,6 +85,7 @@ pub fn enumerate_audio_files_with_cancel(
     }
 
     let mut pending = vec![root.clone()];
+    let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut skipped_entries = 0;
 
@@ -88,8 +93,20 @@ pub fn enumerate_audio_files_with_cancel(
         if cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
             return Err("scan canceled".to_string());
         }
+        let relative_directory = directory
+            .strip_prefix(&root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        directories.push(if relative_directory.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative_directory
+        });
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
+            Err(error) if directory == root => {
+                return Err(format!("Could not read folder {}: {error}", root.display()));
+            }
             Err(_) => {
                 skipped_entries += 1;
                 continue;
@@ -155,9 +172,16 @@ pub fn enumerate_audio_files_with_cancel(
             .cmp(&right_key)
             .then_with(|| left.relative_path.cmp(&right.relative_path))
     });
+    directories.sort_by(|left, right| {
+        let left_key = left.to_string_lossy().to_ascii_lowercase();
+        let right_key = right.to_string_lossy().to_ascii_lowercase();
+        left_key.cmp(&right_key).then_with(|| left.cmp(right))
+    });
 
     Ok(AudioScan {
+        root,
         files,
+        directories,
         skipped_entries,
     })
 }
@@ -289,6 +313,24 @@ mod tests {
         );
         assert_eq!(scan.files[1].relative_path, PathBuf::from("root.wav"));
         assert_eq!(scan.files[1].duration_seconds, Some(1.0));
+        assert!(scan.directories.contains(&PathBuf::from(".")));
+        assert!(scan.directories.contains(&PathBuf::from("nested")));
+    }
+
+    #[test]
+    fn scan_retains_empty_directories_and_canonical_root() {
+        let directory = TempDir::new().expect("temporary directory");
+        std::fs::create_dir(directory.path().join("empty")).expect("empty directory");
+
+        let scan = enumerate_audio_files(directory.path()).expect("scan");
+        assert_eq!(
+            scan.root,
+            std::fs::canonicalize(directory.path()).expect("canonical root")
+        );
+        assert_eq!(
+            scan.directories,
+            vec![PathBuf::from("."), PathBuf::from("empty")]
+        );
     }
 
     #[test]

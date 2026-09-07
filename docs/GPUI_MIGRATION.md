@@ -159,6 +159,48 @@ reset, and the 960×560 minimum layout. The Play button invokes the existing
 transport and the stopped state remains visible. Audible quality and DAW
 acceptance remain manual checks. Theme choice is currently session-only.
 
+### Session folder browser, motion tokens, and responsiveness, 2026-09-07
+
+Implemented session-only source add/switch/forget with canonical alias
+deduplication, an expandable virtual folder tree including empty directories,
+direct/descendant scope, and refresh reconciliation. Each source retains its
+folder, expansion, and scope; failed refreshes retain the last successful scan.
+Cancelled scans cannot restore a forgotten source. No database is opened.
+
+Motion timing is now part of the validated theme contract, with backwards
+compatibility for themes that omit the new group. Pure focus envelopes, overflow
+transitions, worker pulse, and source sweep primitives cover the reference
+timings and an explicit motion-disable setting. UI animation integration is
+pending: performance feedback paused the rollout before adding frame cadence.
+Hover/focus rails, loading motion, scroll fades, and playback cursor remain to
+be connected; mark flashes and waveform gesture effects depend on those future
+workflows. These tokens alone do not establish animation parity.
+
+The responsiveness pass follows the development-profile and width-bounded
+waveform approach inspected in
+[Rox at 332b257](https://github.com/zealsprince/rox/tree/332b2579b0d72ed4b9e1ca76163e789be7c9732e).
+GPUI dependencies and the UI/media crates now compile with optimization in
+development. Waveform paths retain tessellated geometry, invalidate on preview,
+layout, or peak-scale changes, and preserve per-lane extrema when reducing to
+the visible logical width. Folder rows are projected only when their tree or
+expansion changes. Playback polling stops when idle and only notifies the UI
+when visible playback state changes.
+
+Validation: 45 targeted tests passed (core 10, design 16, media 10, UI 9),
+plus the manual waveform cache benchmark. On this machine, 100 geometry misses
+took 89.302 ms and 100 hits took 1.606 ms; this measures geometry preparation,
+not complete frame latency. Workspace formatting and diff checks passed.
+Archived engine test references were restored under their owning crates;
+66 targeted Reson/library tests passed.
+
+Disposable-fixture GUI checks confirmed direct scope, descendant scope excluding
+similarly prefixed sibling folders, empty-folder preview clearing, independent
+disclosure/selection, and per-source state restoration. Full application frame
+latency and audible acceptance remain distinct from these tests. The final
+optimized macOS bundle was rebuilt and signature-verified; the user tested it
+and confirmed responsiveness was "much better". The cached layered waveform
+remained visible after changing folders.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

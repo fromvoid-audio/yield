@@ -60,6 +60,14 @@
     "focus_outline": "#E7E5DFFF",
     "focus_outline_width": 1.0
   },
+  "motion": {
+    "enabled": true,
+    "keyboard_hold_ms": 800,
+    "focus_fade_ms": 250,
+    "overflow_fade_ms": 260,
+    "worker_pulse_hz": 1.15,
+    "source_sweep_hz": 0.45
+  },
   "waveform": {
     "peak_scale": 0.78,
     "title_height": 24.0,

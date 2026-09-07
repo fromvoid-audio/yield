@@ -15,8 +15,8 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `wavecrate-gpui` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
-| `wavecrate-core` | Sample identities and metadata, filtering/sorting projection, focus reconciliation, display formatting | GPUI types, filesystem calls, audio devices, databases |
-| `wavecrate-media` | Read-only folder enumeration and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
+| `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, display formatting | GPUI types, filesystem calls, audio devices, databases |
+| `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
@@ -42,7 +42,10 @@ path identities; canonicalization happens once during background scanning.
 Filtering and sorting must not probe the filesystem. UI selection follows
 sample identity, not the position of a row in the filtered list.
 
-The current media scanner is a read-only browsing service. It does not replace
+The current media scanner is a read-only browsing service. It returns a canonical
+root and every traversed relative directory, including empty directories, so the
+UI can project a complete session-only folder tree without doing filesystem work
+while rendering. It does not replace
 the persistent scanner's ownership, watcher, readiness, journal, or recovery
 contracts. Those services will be integrated when persistent sources are ported.
 
@@ -83,7 +86,10 @@ profiles are implemented; reopening the app restores the built-in theme.
 
 ## Work and lifecycle
 
-The UI schedules filesystem and decoding work off its event thread and consumes
+The UI keeps source roots, selected relative folders, expansion sets, and direct
+or descendant scope in an in-memory session registry. Forgetting a source removes
+that record only; no source database or source folder is opened or changed. The
+UI schedules filesystem and decoding work off its event thread and consumes
 results only if their request identity is still current. Replacing a scan
 cancels the prior traversal. Playback initialization and progress events retain
 their intent/request fences through module moves. Audio processing remains in

@@ -11,6 +11,10 @@ use std::{fmt, fs, io::Read, path::Path};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+pub mod motion;
+
+pub use motion::Motion;
+
 /// The only schema currently understood by Wavecrate.
 pub const THEME_SCHEMA_VERSION: u32 = 1;
 
@@ -279,6 +283,9 @@ pub struct Theme {
     pub spacing: Spacing,
     /// Interaction state tokens.
     pub interaction: Interaction,
+    /// Timings and frequencies for presentation motion.
+    #[serde(default)]
+    pub motion: Motion,
     /// Waveform rendering tokens.
     pub waveform: Waveform,
 }
@@ -347,6 +354,7 @@ impl Default for Theme {
                 focus_outline: Color::rgb(231, 229, 223),
                 focus_outline_width: 1.0,
             },
+            motion: Motion::default(),
             waveform: Waveform {
                 peak_scale: 0.78,
                 title_height: 24.0,
@@ -588,6 +596,7 @@ fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         0.0,
         8.0,
     )?;
+    theme.motion.validate().map_err(ThemeError::Invalid)?;
     finite_range("waveform.peak_scale", theme.waveform.peak_scale, 0.1, 2.0)?;
     finite_range(
         "waveform.title_height",
@@ -730,6 +739,34 @@ mod tests {
         let unsupported = valid_json().replace("\"schema_version\": 1", "\"schema_version\": 2");
         let error = parse_theme_json(&unsupported).expect_err("unsupported schema");
         assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn legacy_theme_without_motion_uses_motion_defaults() {
+        let legacy = valid_json()
+            .replace(
+                "  \"motion\": {\n    \"enabled\": true,\n    \"keyboard_hold_ms\": 800,\n    \"focus_fade_ms\": 250,\n    \"overflow_fade_ms\": 260,\n    \"worker_pulse_hz\": 1.15,\n    \"source_sweep_hz\": 0.45\n  },\n",
+                "",
+            );
+        let parsed = parse_theme_json(&legacy).expect("legacy theme remains accepted");
+        assert_eq!(parsed.motion, Motion::default());
+    }
+
+    #[test]
+    fn rejects_unknown_motion_fields_and_invalid_motion_values() {
+        let unknown = valid_json().replace(
+            "    \"enabled\": true,",
+            "    \"unexpected\": true,\n    \"enabled\": true,",
+        );
+        assert!(parse_theme_json(&unknown).is_err());
+
+        let invalid_duration =
+            valid_json().replace("\"overflow_fade_ms\": 260", "\"overflow_fade_ms\": 0");
+        assert!(parse_theme_json(&invalid_duration).is_err());
+
+        let invalid_frequency =
+            valid_json().replace("\"source_sweep_hz\": 0.45", "\"source_sweep_hz\": 0.0");
+        assert!(parse_theme_json(&invalid_frequency).is_err());
     }
 
     #[test]
