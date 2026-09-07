@@ -307,14 +307,30 @@ switching from that pending load to a one-second file. Sampled process RSS was
 104,560/104,608/104,624 KiB before/during/after the large-file load; these are
 samples rather than a peak-memory benchmark. CPU returned to idle after loading.
 
-A broader workspace test run reported 439 passes and six library profile
-ownership failures involving temporary paths (`Not a directory`). Those failures
+A broader workspace test run reached the library test binary, which reported
+439 passes and six profile ownership failures involving temporary paths
+(`Not a directory`). Those failures
 also reproduced in the baseline. The profile test fixtures now resolve the
 ambient macOS temporary-directory alias before exercising the no-follow root
 capability. All seven ownership tests pass, including replaced-root, replaced-lock,
 and symlink rejection coverage. Production ownership rules are unchanged. The
 broader workspace suite has not been rerun after this targeted fixture repair.
-Non-WAV preview, zoom/edit gestures, and seek/loop transport remain outstanding.
+Non-WAV preview and zoom/edit gestures remain outstanding.
+
+### Waveform seek and loop audition, 2026-09-07
+
+Clicking the waveform auditions from its normalized position, including when
+search previously held keyboard focus. Pending audio initialization retains the
+latest fenced playback intent. The cursor follows normalized engine progress
+and snaps on loop wrap. The L shortcut and toolbar toggle select looping for the
+next audition; changing this preference does not retarget the active stream.
+Live cycle-end loop disabling remains outstanding.
+
+Validation: 27 UI tests passed (one manual benchmark ignored), 17 design and 19
+core tests passed, plus UI check, formatting, diff check, and signed macOS build.
+Live fixture checks confirmed seeking near 75%, repeated two-second loop playback,
+and one-shot completion with looping disabled. These are transport/UI checks,
+not manual audible acceptance.
 
 ### Required final evidence
 

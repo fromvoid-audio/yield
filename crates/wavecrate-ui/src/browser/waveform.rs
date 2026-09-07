@@ -5,7 +5,10 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use gpui::{Bounds, Path, PathBuilder, Pixels, canvas, div, fill, point, prelude::*, px};
+use gpui::{
+    Bounds, ClickEvent, Context, Path, PathBuilder, Pixels, Point, canvas, div, fill, point,
+    prelude::*, px,
+};
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -225,8 +228,11 @@ pub(super) fn render_waveform(
     browser: &Browser,
     theme: Theme,
     playback_cursor_ratio: Option<f32>,
+    cx: &mut Context<Browser>,
 ) -> impl IntoElement {
+    let click_bounds = Rc::new(RefCell::new(None));
     let mut bars = div()
+        .id("waveform")
         .flex()
         .items_center()
         .gap(px(theme.spacing.waveform_bar_gap))
@@ -288,13 +294,48 @@ pub(super) fn render_waveform(
                 .bg(color(theme.colors.waveform_grid)),
         );
     }
+    let click_bounds_for_surface = Rc::clone(&click_bounds);
+    bars = bars.child(
+        canvas(
+            move |bounds, _, _| {
+                *click_bounds_for_surface.borrow_mut() = Some(bounds);
+            },
+            move |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0(),
+    );
     if let Some(ratio) = playback_cursor_ratio {
         bars = bars.child(playback_cursor_overlay(
             ratio,
             color(theme.colors.waveform_playhead),
         ));
     }
-    bars
+    bars.on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+        window.focus(&view.focus_handle);
+        if view.waveform.is_none() {
+            return;
+        }
+        let Some(bounds) = click_bounds.borrow().as_ref().copied() else {
+            return;
+        };
+        if let Some(ratio) = waveform_click_ratio(event.position(), bounds) {
+            view.start_playback_from_position(ratio, cx);
+        }
+    }))
+}
+
+fn waveform_click_ratio(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<f64> {
+    let width = f32::from(bounds.size.width);
+    let left = f32::from(bounds.origin.x);
+    let x = f32::from(position.x);
+    if !width.is_finite() || width <= 0.0 || !left.is_finite() || !x.is_finite() {
+        return None;
+    }
+    Some(((x - left) / width).clamp(0.0, 1.0) as f64)
 }
 
 const PLAYBACK_CURSOR_WIDTH: f32 = 2.0;
@@ -392,6 +433,30 @@ mod tests {
             4
         );
         assert_eq!(cache.rebuild_count(), 4);
+    }
+
+    #[test]
+    fn waveform_click_position_clamps_to_normalized_edges() {
+        let bounds = test_bounds(100.0, 20.0);
+
+        assert_eq!(
+            waveform_click_ratio(point(px(-10.0), px(5.0)), bounds),
+            Some(0.0)
+        );
+        assert_eq!(
+            waveform_click_ratio(point(px(50.0), px(5.0)), bounds),
+            Some(0.5)
+        );
+        assert_eq!(
+            waveform_click_ratio(point(px(110.0), px(5.0)), bounds),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn waveform_click_position_rejects_empty_bounds() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(0.0), px(20.0)));
+        assert_eq!(waveform_click_ratio(point(px(5.0), px(5.0)), bounds), None);
     }
 
     #[test]

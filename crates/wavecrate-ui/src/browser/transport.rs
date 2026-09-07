@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::Browser;
 use gpui::Context;
 use reson::{
     AudioPlayer, PlaybackRequestId, PlaybackRuntime, PlaybackRuntimeConfig, PlaybackRuntimeEvent,
@@ -13,17 +14,21 @@ use reson::{
     PlaybackRuntimeRequest, PlaybackRuntimeSource, PlaybackRuntimeStarted,
     PlaybackRuntimeStreamPolicy,
 };
-use wavecrate_core::AudioFile;
-
-use super::Browser;
 
 const PLAYBACK_MONITOR_INTERVAL: Duration = Duration::from_millis(80);
 const PLAYBACK_CURSOR_MAX_INTERPOLATION: Duration = PLAYBACK_MONITOR_INTERVAL;
 
-/// One authoritative one-shot elapsed sample retained by the browser cursor.
+/// One authoritative normalized playback sample retained by the browser cursor.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PlaybackCursorSample {
-    pub(super) elapsed: Duration,
+    pub(super) ratio: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PlaybackIntent {
+    pub(super) start: f64,
+    pub(super) looped: bool,
+    pub(super) path: std::path::PathBuf,
 }
 
 /// Bounded motion between two authoritative playback samples.
@@ -71,14 +76,14 @@ impl Browser {
                         let before = (
                             view.playing_path.clone(),
                             view.playback_status.clone(),
-                            view.playback_cursor_sample.map(|sample| sample.elapsed),
+                            view.playback_cursor_sample.map(|sample| sample.ratio),
                         );
                         view.poll_playback_events();
                         let changed = before
                             != (
                                 view.playing_path.clone(),
                                 view.playback_status.clone(),
-                                view.playback_cursor_sample.map(|sample| sample.elapsed),
+                                view.playback_cursor_sample.map(|sample| sample.ratio),
                             );
                         if changed {
                             cx.notify();
@@ -103,6 +108,9 @@ impl Browser {
 
     /// Return the preview-relative cursor ratio for the current playback sample.
     pub(super) fn playback_cursor_ratio(&self, animations_enabled: bool) -> Option<f32> {
+        if let Some(pending) = self.playback_cursor_pending {
+            return preview_cursor_ratio_for_browser(self, pending);
+        }
         self.playback_cursor_ratio_at(Instant::now(), animations_enabled)
     }
 
@@ -115,7 +123,7 @@ impl Browser {
             return false;
         };
         if !interpolation.needs_sample_at(now)
-            || preview_cursor_ratio_for_browser(self, sample.elapsed.as_secs_f32()).is_none()
+            || preview_cursor_ratio_for_browser(self, sample.ratio).is_none()
         {
             return false;
         }
@@ -124,65 +132,45 @@ impl Browser {
 
     fn playback_cursor_ratio_at(&self, now: Instant, animations_enabled: bool) -> Option<f32> {
         let sample = self.playback_cursor_sample?;
-        preview_cursor_ratio_for_browser(self, sample.elapsed.as_secs_f32())?;
-        let elapsed_seconds = if animations_enabled {
+        preview_cursor_ratio_for_browser(self, sample.ratio)?;
+        let ratio = if animations_enabled {
             self.playback_cursor_interpolation
                 .map(|interpolation| interpolation.value_at(now))
-                .unwrap_or_else(|| sample.elapsed.as_secs_f32())
+                .unwrap_or(sample.ratio)
         } else {
-            sample.elapsed.as_secs_f32()
+            sample.ratio
         };
-        preview_cursor_ratio_for_browser(self, elapsed_seconds)
+        preview_cursor_ratio_for_browser(self, ratio)
     }
 
     fn set_playback_cursor_start(&mut self, started: &PlaybackRuntimeStarted) {
-        // The browser currently queues only a one-shot span from zero. A future
-        // seek/loop start needs an explicit offset-aware mapping before the
-        // elapsed-time cursor can be shown safely.
-        if !started.playback_start.is_finite() || started.playback_start.abs() > f32::EPSILON {
+        if !started.playback_start.is_finite() || !(0.0..=1.0).contains(&started.playback_start) {
             self.clear_playback_cursor();
             return;
         }
+        self.playback_cursor_pending = None;
         self.playback_cursor_sample = Some(PlaybackCursorSample {
-            elapsed: Duration::ZERO,
+            ratio: started.playback_start,
         });
         self.playback_cursor_interpolation = None;
     }
 
     fn record_playback_progress(&mut self, progress: &PlaybackRuntimeProgress) {
-        if self.playback_cursor_sample.is_none() {
-            self.clear_playback_cursor();
-            return;
-        }
-        let Some(elapsed) = authoritative_cursor_elapsed(progress) else {
+        let Some(ratio) = authoritative_cursor_progress(progress) else {
             self.clear_playback_cursor();
             return;
         };
         let sampled_at = Instant::now();
-        let interpolation = self.playback_cursor_sample.and_then(|previous| {
-            let from = self
-                .playback_cursor_interpolation
-                .map(|interpolation| interpolation.value_at(sampled_at))
-                .unwrap_or_else(|| previous.elapsed.as_secs_f32());
-            let to = elapsed.as_secs_f32();
-            let duration = elapsed
-                .checked_sub(previous.elapsed)
-                .map(|duration| duration.min(PLAYBACK_CURSOR_MAX_INTERPOLATION))
-                .filter(|duration| !duration.is_zero());
-            duration
-                .filter(|_| (from - to).abs() > f32::EPSILON)
-                .map(|duration| PlaybackCursorInterpolation {
-                    from,
-                    to,
-                    started_at: sampled_at,
-                    duration,
-                })
-        });
-        self.playback_cursor_sample = Some(PlaybackCursorSample { elapsed });
+        let interpolation = self
+            .playback_cursor_sample
+            .and_then(|previous| cursor_interpolation(previous.ratio, ratio, sampled_at));
+        self.playback_cursor_pending = None;
+        self.playback_cursor_sample = Some(PlaybackCursorSample { ratio });
         self.playback_cursor_interpolation = interpolation;
     }
 
     pub(super) fn clear_playback_cursor(&mut self) {
+        self.playback_cursor_pending = None;
         self.playback_cursor_sample = None;
         self.playback_cursor_interpolation = None;
     }
@@ -193,26 +181,87 @@ impl Browser {
             cx.notify();
             return;
         }
-        let Some(index) = self.selected else {
-            self.playback_status = "Select a sample first".to_string();
+        let Some(intent) = self.selected_playback_intent(0.0) else {
             cx.notify();
             return;
         };
-        let Some(entry) = self.entries.get(index).cloned() else {
+        self.request_playback_intent(intent, cx);
+    }
+
+    pub(super) fn start_playback_from_position(&mut self, start: f64, cx: &mut Context<Self>) {
+        let Some(intent) = self.selected_playback_intent(start) else {
+            cx.notify();
             return;
         };
-        if !entry
-            .path
+        self.request_playback_intent(intent, cx);
+    }
+
+    pub(super) fn toggle_loop(&mut self, cx: &mut Context<Self>) {
+        self.loop_enabled = !self.loop_enabled;
+        if let Some(intent) = self.playback_init_intent.as_mut() {
+            intent.looped = self.loop_enabled;
+        }
+        self.playback_status = if self.playing_path.is_some() {
+            format!(
+                "Loop {} — applies on next play",
+                if self.loop_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )
+        } else {
+            format!(
+                "Loop {}",
+                if self.loop_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )
+        };
+        cx.notify();
+    }
+
+    fn selected_playback_intent(&mut self, start: f64) -> Option<PlaybackIntent> {
+        let Some(index) = self.selected else {
+            self.playback_status = "Select a sample first".to_string();
+            return None;
+        };
+        let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
+            return None;
+        };
+        if !path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
         {
             self.playback_status = "Audition currently supports WAV files".to_string();
+            return None;
+        }
+        let Some(start) = normalized_playback_start(start) else {
+            self.playback_status = "Invalid playback position".to_string();
+            return None;
+        };
+        Some(PlaybackIntent {
+            start,
+            looped: self.loop_enabled,
+            path,
+        })
+    }
+
+    fn request_playback_intent(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
+        let Some(start) = normalized_playback_start(intent.start) else {
+            self.clear_playback_cursor();
+            self.playback_status = "Invalid playback position".to_string();
             cx.notify();
             return;
-        }
+        };
+        let intent = PlaybackIntent { start, ..intent };
+        self.clear_playback_cursor();
+        self.playback_cursor_pending = Some(start as f32);
         if self.playback_init_task.is_some() {
-            self.playback_init_entry = Some(entry);
+            self.playback_init_intent = Some(intent);
             self.playback_init_epoch = self.playback_epoch;
             self.playback_init_generation = self.waveform_generation;
             self.playback_status = "Starting audio…".to_string();
@@ -220,14 +269,14 @@ impl Browser {
             return;
         }
         if self.playback.is_none() {
-            self.start_playback_runtime(entry, cx);
+            self.start_playback_runtime(intent, cx);
         } else {
-            self.queue_playback(entry, cx);
+            self.queue_playback_intent(intent, cx);
         }
     }
 
-    fn start_playback_runtime(&mut self, entry: AudioFile, cx: &mut Context<Self>) {
-        self.playback_init_entry = Some(entry);
+    fn start_playback_runtime(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
+        self.playback_init_intent = Some(intent);
         self.playback_init_epoch = self.playback_epoch;
         self.playback_init_generation = self.waveform_generation;
         self.playback_status = "Starting audio…".to_string();
@@ -242,11 +291,11 @@ impl Browser {
                 .await;
             let _ = this.update(cx, |view, cx| {
                 view.playback_init_task = None;
-                let pending_entry = view.playback_init_entry.take();
+                let pending_intent = view.playback_init_intent.take();
                 match result {
                     Ok(runtime) => {
                         view.playback = Some(runtime);
-                        let should_queue = pending_entry.as_ref().is_some_and(|entry| {
+                        let should_queue = pending_intent.as_ref().is_some_and(|intent| {
                             let selected_path = view
                                 .selected
                                 .and_then(|index| view.entries.get(index))
@@ -257,16 +306,21 @@ impl Browser {
                                 view.waveform_generation,
                                 view.playback_epoch,
                                 selected_path,
-                                entry.path.as_path(),
+                                intent.path.as_path(),
                             )
                         });
                         if should_queue {
-                            view.queue_playback(pending_entry.expect("pending playback entry"), cx);
+                            view.queue_playback_intent(
+                                pending_intent.expect("pending playback intent"),
+                                cx,
+                            );
                         } else {
+                            view.clear_playback_cursor();
                             view.playback_status = "Ready".to_string();
                         }
                     }
                     Err(error) => {
+                        view.clear_playback_cursor();
                         view.playback_status = error;
                     }
                 }
@@ -275,18 +329,22 @@ impl Browser {
         }));
     }
 
-    fn queue_playback(&mut self, entry: AudioFile, cx: &mut Context<Self>) {
+    fn queue_playback_intent(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
         let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
+            self.clear_playback_cursor();
             return;
         };
+        let Some(start) = normalized_playback_start(intent.start) else {
+            self.clear_playback_cursor();
+            self.playback_status = "Invalid playback position".to_string();
+            return;
+        };
+        let mode = playback_mode_for_intent(&intent);
         let request = PlaybackRuntimeRequest {
             source: PlaybackRuntimeSource::WavFile {
-                path: entry.path.clone(),
+                path: intent.path.clone(),
             },
-            mode: PlaybackRuntimeMode::OneShot {
-                start: 0.0,
-                end: 1.0,
-            },
+            mode,
             stream_policy: PlaybackRuntimeStreamPolicy::transient_navigation(),
             volume: 1.0,
             playback_gain: 1.0,
@@ -297,17 +355,20 @@ impl Browser {
         };
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.pending_progress_poll = None;
-        self.clear_playback_cursor();
+        self.playback_cursor_sample = None;
+        self.playback_cursor_interpolation = None;
         match handle.try_play(request) {
             Ok(request_id) => {
                 self.latest_playback_request_id = Some(request_id);
-                self.playing_path = Some(entry.path);
+                self.playing_path = Some(intent.path);
+                self.playback_cursor_pending = Some(start as f32);
                 self.playback_status = "Starting…".to_string();
                 self.ensure_playback_monitor(cx);
             }
             Err(error) => {
                 self.latest_playback_request_id = None;
                 self.playing_path = None;
+                self.clear_playback_cursor();
                 self.playback_status = format!("Could not queue playback: {error:?}");
             }
         }
@@ -319,7 +380,7 @@ impl Browser {
         self.playback_monitor_generation = self.playback_monitor_generation.wrapping_add(1);
         self.playback_monitor_running = false;
         self.pending_progress_poll = None;
-        self.playback_init_entry = None;
+        self.playback_init_intent = None;
         self.clear_playback_cursor();
         if let Some(runtime) = self.playback.as_ref() {
             if let Ok(request_id) = runtime.handle.try_stop() {
@@ -433,31 +494,61 @@ fn should_queue_initialized_playback(
         && selected_path == Some(requested_path)
 }
 
-fn preview_cursor_ratio_for_browser(browser: &Browser, elapsed_seconds: f32) -> Option<f32> {
-    let preview_duration = browser.waveform.as_ref()?.duration_seconds;
-    preview_cursor_ratio(preview_duration, elapsed_seconds)
+fn playback_mode_for_intent(intent: &PlaybackIntent) -> PlaybackRuntimeMode {
+    let start = normalized_playback_start(intent.start).unwrap_or(0.0);
+    if intent.looped {
+        PlaybackRuntimeMode::Looped {
+            start: 0.0,
+            end: 1.0,
+            offset: start,
+        }
+    } else {
+        PlaybackRuntimeMode::OneShot { start, end: 1.0 }
+    }
 }
 
-/// Map a one-shot elapsed playback position into the bounded preview.
-fn preview_cursor_ratio(preview_duration_seconds: f32, elapsed_seconds: f32) -> Option<f32> {
-    if !preview_duration_seconds.is_finite()
-        || preview_duration_seconds <= 0.0
-        || !elapsed_seconds.is_finite()
-        || elapsed_seconds < 0.0
+fn normalized_playback_start(start: f64) -> Option<f64> {
+    start.is_finite().then(|| start.clamp(0.0, 1.0))
+}
+
+fn preview_cursor_ratio_for_browser(browser: &Browser, ratio: f32) -> Option<f32> {
+    browser.waveform.as_ref()?;
+    preview_cursor_ratio(ratio)
+}
+
+/// Validate and clamp one normalized playback position for the bounded preview.
+fn preview_cursor_ratio(ratio: f32) -> Option<f32> {
+    if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+        return None;
+    }
+    Some(ratio.clamp(0.0, 1.0))
+}
+
+fn authoritative_cursor_progress(progress: &PlaybackRuntimeProgress) -> Option<f32> {
+    if !progress.active || progress.error.is_some() {
+        return None;
+    }
+    preview_cursor_ratio(progress.progress?)
+}
+
+fn cursor_interpolation(
+    from: f32,
+    to: f32,
+    started_at: Instant,
+) -> Option<PlaybackCursorInterpolation> {
+    if preview_cursor_ratio(from).is_none()
+        || preview_cursor_ratio(to).is_none()
+        || to + f32::EPSILON < from
+        || (from - to).abs() <= f32::EPSILON
     {
         return None;
     }
-    if elapsed_seconds > preview_duration_seconds + f32::EPSILON {
-        return None;
-    }
-    Some((elapsed_seconds / preview_duration_seconds).clamp(0.0, 1.0))
-}
-
-fn authoritative_cursor_elapsed(progress: &PlaybackRuntimeProgress) -> Option<Duration> {
-    if !progress.active || progress.looping || progress.error.is_some() {
-        return None;
-    }
-    progress.elapsed
+    Some(PlaybackCursorInterpolation {
+        from,
+        to,
+        started_at,
+        duration: PLAYBACK_CURSOR_MAX_INTERPOLATION,
+    })
 }
 
 fn playback_request_is_current(
@@ -482,12 +573,13 @@ fn progress_poll_is_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaybackCursorInterpolation, authoritative_cursor_elapsed,
+        PlaybackCursorInterpolation, PlaybackIntent, authoritative_cursor_progress,
+        cursor_interpolation, normalized_playback_start, playback_mode_for_intent,
         playback_request_number_is_current, preview_cursor_ratio,
         should_queue_initialized_playback,
     };
-    use reson::PlaybackRuntimeProgress;
-    use std::path::Path;
+    use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -533,19 +625,54 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_elapsed_maps_into_the_bounded_preview_and_hides_after_it() {
-        assert_eq!(preview_cursor_ratio(2.0, 0.5), Some(0.25));
-        assert_eq!(preview_cursor_ratio(6.0, 3.0), Some(0.5));
-        assert_eq!(preview_cursor_ratio(6.0, 6.0), Some(1.0));
-        assert_eq!(preview_cursor_ratio(6.0, 6.000_1), None);
+    fn playback_mode_preserves_click_offset_and_loop_preference() {
+        let path = PathBuf::from("sample.wav");
+        assert_eq!(
+            playback_mode_for_intent(&PlaybackIntent {
+                start: 1.2,
+                looped: false,
+                path: path.clone(),
+            }),
+            PlaybackRuntimeMode::OneShot {
+                start: 1.0,
+                end: 1.0,
+            }
+        );
+        assert_eq!(
+            playback_mode_for_intent(&PlaybackIntent {
+                start: 0.35,
+                looped: true,
+                path,
+            }),
+            PlaybackRuntimeMode::Looped {
+                start: 0.0,
+                end: 1.0,
+                offset: 0.35,
+            }
+        );
+    }
+
+    #[test]
+    fn playback_start_clamps_finite_positions_and_rejects_non_finite_input() {
+        assert_eq!(normalized_playback_start(-0.2), Some(0.0));
+        assert_eq!(normalized_playback_start(1.2), Some(1.0));
+        assert_eq!(normalized_playback_start(f64::NAN), None);
+        assert_eq!(normalized_playback_start(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn normalized_progress_maps_to_the_bounded_preview_with_edge_clamp() {
+        assert_eq!(preview_cursor_ratio(0.0), Some(0.0));
+        assert_eq!(preview_cursor_ratio(0.5), Some(0.5));
+        assert_eq!(preview_cursor_ratio(1.0), Some(1.0));
     }
 
     #[test]
     fn invalid_cursor_mapping_inputs_are_hidden_instead_of_clamped() {
-        assert_eq!(preview_cursor_ratio(0.0, 0.5), None);
-        assert_eq!(preview_cursor_ratio(6.0, -0.5), None);
-        assert_eq!(preview_cursor_ratio(6.0, f32::NAN), None);
-        assert_eq!(preview_cursor_ratio(f32::NAN, 1.0), None);
+        assert_eq!(preview_cursor_ratio(-0.5), None);
+        assert_eq!(preview_cursor_ratio(1.000_1), None);
+        assert_eq!(preview_cursor_ratio(f32::NAN), None);
+        assert_eq!(preview_cursor_ratio(f32::INFINITY), None);
     }
 
     #[test]
@@ -569,42 +696,47 @@ mod tests {
     }
 
     #[test]
-    fn cursor_lifecycle_requires_active_error_free_one_shot_elapsed() {
+    fn cursor_lifecycle_requires_active_error_free_normalized_progress() {
         let active = PlaybackRuntimeProgress {
             active: true,
-            elapsed: Some(Duration::from_millis(250)),
+            progress: Some(0.25),
             ..PlaybackRuntimeProgress::default()
         };
-        assert_eq!(
-            authoritative_cursor_elapsed(&active),
-            Some(Duration::from_millis(250))
-        );
+        assert_eq!(authoritative_cursor_progress(&active), Some(0.25));
 
         let completed = PlaybackRuntimeProgress {
             ..PlaybackRuntimeProgress::default()
         };
-        assert_eq!(authoritative_cursor_elapsed(&completed), None);
+        assert_eq!(authoritative_cursor_progress(&completed), None);
 
-        let missing_elapsed = PlaybackRuntimeProgress {
+        let missing_progress = PlaybackRuntimeProgress {
             active: true,
             ..PlaybackRuntimeProgress::default()
         };
-        assert_eq!(authoritative_cursor_elapsed(&missing_elapsed), None);
+        assert_eq!(authoritative_cursor_progress(&missing_progress), None);
 
         let looping = PlaybackRuntimeProgress {
             active: true,
             looping: true,
-            elapsed: Some(Duration::from_millis(250)),
+            progress: Some(0.25),
             ..PlaybackRuntimeProgress::default()
         };
-        assert_eq!(authoritative_cursor_elapsed(&looping), None);
+        assert_eq!(authoritative_cursor_progress(&looping), Some(0.25));
 
         let errored = PlaybackRuntimeProgress {
             active: true,
-            elapsed: Some(Duration::from_millis(250)),
+            progress: Some(0.25),
             error: Some("output failed".to_string()),
             ..PlaybackRuntimeProgress::default()
         };
-        assert_eq!(authoritative_cursor_elapsed(&errored), None);
+        assert_eq!(authoritative_cursor_progress(&errored), None);
+    }
+
+    #[test]
+    fn loop_wrap_snaps_without_a_backwards_cursor_sweep() {
+        let started_at = Instant::now();
+
+        assert!(cursor_interpolation(0.9, 0.1, started_at).is_none());
+        assert!(cursor_interpolation(0.2, 0.4, started_at).is_some());
     }
 }

@@ -32,6 +32,7 @@ impl Browser {
         &self,
         theme: Theme,
         playback_cursor_ratio: Option<f32>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (title, metadata) = if let Some(index) = self.selected {
             if let Some(entry) = self.entries.get(index) {
@@ -64,10 +65,7 @@ impl Browser {
                 theme.colors.text_muted,
             )
         } else if self.selected.is_some() {
-            (
-                "Loading waveform…".to_string(),
-                theme.colors.warning,
-            )
+            ("Loading waveform…".to_string(), theme.colors.warning)
         } else {
             (
                 "Select a sample to inspect its waveform".to_string(),
@@ -97,6 +95,7 @@ impl Browser {
                 self,
                 theme.clone(),
                 playback_cursor_ratio,
+                cx,
             ))
             .child(
                 div()
@@ -540,6 +539,40 @@ impl Render for Browser {
                     )
                     .child(
                         div()
+                            .id("loop-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(theme.spacing.control_height))
+                            .px(px(theme.spacing.control_gap))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .on_click(cx.listener(Self::toggle_loop_from_toolbar))
+                            .text_size(px(theme.typography.small_size))
+                            .text_color(color(if self.loop_enabled {
+                                theme.colors.accent
+                            } else {
+                                theme.colors.text_muted
+                            }))
+                            .child(if self.playing_path.is_some() {
+                                if self.loop_enabled {
+                                    "Loop next: On"
+                                } else {
+                                    "Loop next: Off"
+                                }
+                            } else if self.loop_enabled {
+                                "Loop On"
+                            } else {
+                                "Loop Off"
+                            }),
+                    )
+                    .child(
+                        div()
                             .flex_none()
                             .w(px(220.0))
                             .child(self.search_input.clone()),
@@ -607,7 +640,11 @@ impl Render for Browser {
                             .flex_col()
                             .flex_1()
                             .h_full()
-                            .child(self.render_waveform_panel(theme.clone(), playback_cursor_ratio))
+                            .child(self.render_waveform_panel(
+                                theme.clone(),
+                                playback_cursor_ratio,
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .flex()

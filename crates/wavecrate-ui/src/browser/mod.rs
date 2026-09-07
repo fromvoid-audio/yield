@@ -158,8 +158,10 @@ pub(crate) struct Browser {
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
+    loop_enabled: bool,
     latest_playback_request_id: Option<PlaybackRequestId>,
     pending_progress_poll: Option<(PlaybackRequestId, u64)>,
+    playback_cursor_pending: Option<f32>,
     playback_cursor_sample: Option<transport::PlaybackCursorSample>,
     playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
     scan_cancel: Option<Arc<AtomicBool>>,
@@ -180,7 +182,7 @@ pub(crate) struct Browser {
     theme_task: Option<Task<()>>,
     theme_settings_open: bool,
     playback_init_task: Option<Task<()>>,
-    playback_init_entry: Option<AudioFile>,
+    playback_init_intent: Option<transport::PlaybackIntent>,
     playback_init_epoch: u64,
     playback_init_generation: u64,
     playback_monitor_task: Option<Task<()>>,
@@ -234,8 +236,10 @@ impl Browser {
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
+            loop_enabled: false,
             latest_playback_request_id: None,
             pending_progress_poll: None,
+            playback_cursor_pending: None,
             playback_cursor_sample: None,
             playback_cursor_interpolation: None,
             scan_cancel: None,
@@ -262,7 +266,7 @@ impl Browser {
             theme_task: None,
             theme_settings_open: false,
             playback_init_task: None,
-            playback_init_entry: None,
+            playback_init_intent: None,
             playback_init_epoch: 0,
             playback_init_generation: 0,
             playback_monitor_task: None,
@@ -618,7 +622,7 @@ impl Browser {
             self.scan_cancel.is_some(),
             self.waveform_pending,
             self.playback_init_task.is_some(),
-            self.playback_init_entry.is_some(),
+            self.playback_init_intent.is_some(),
         )
     }
 
@@ -1074,6 +1078,15 @@ impl Browser {
         cx.notify();
     }
 
+    fn toggle_loop_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_loop(cx);
+    }
+
     fn reload_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.theme_load.pending_path.is_some() {
             return;
@@ -1233,6 +1246,7 @@ impl Browser {
         }
         match key {
             "space" => self.toggle_playback(cx),
+            "l" | "L" => self.toggle_loop(cx),
             "x" if !shift && !secondary => self.toggle_focused_selection(cx),
             "up" | "arrowup" => self.move_selection(-1, shift, secondary && shift, cx),
             "down" | "arrowdown" => self.move_selection(1, shift, secondary && shift, cx),
