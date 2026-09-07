@@ -309,7 +309,11 @@ samples rather than a peak-memory benchmark. CPU returned to idle after loading.
 
 A broader workspace test run reported 439 passes and six library profile
 ownership failures involving temporary paths (`Not a directory`). Those failures
-are being investigated separately; the workspace suite is not claimed green.
+also reproduced in the baseline. The profile test fixtures now resolve the
+ambient macOS temporary-directory alias before exercising the no-follow root
+capability. All seven ownership tests pass, including replaced-root, replaced-lock,
+and symlink rejection coverage. Production ownership rules are unchanged. The
+broader workspace suite has not been rerun after this targeted fixture repair.
 Non-WAV preview, zoom/edit gestures, and seek/loop transport remain outstanding.
 
 ### Required final evidence

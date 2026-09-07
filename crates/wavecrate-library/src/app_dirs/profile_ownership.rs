@@ -474,10 +474,16 @@ mod tests {
         test_runtime::TestRuntimeGuard,
     };
     use std::fs;
-    use tempfile::tempdir;
 
     fn test_runtime() -> TestRuntimeGuard {
         TestRuntimeGuard::acquire()
+    }
+
+    fn profile_base() -> tempfile::TempDir {
+        // macOS exposes the default temporary root through /var -> /private/var.
+        // Resolve that ambient alias before exercising the no-follow profile capability.
+        let root = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+        tempfile::tempdir_in(root).expect("profile base")
     }
 
     fn profile_root(base: &std::path::Path, profile: &str) -> PathBuf {
@@ -487,7 +493,7 @@ mod tests {
     #[test]
     fn active_profile_owner_conflicts_without_replacing_lock_contents() {
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-conflict");
         let holder = WritableProfileGuard::acquire_current().expect("profile holder");
@@ -509,7 +515,7 @@ mod tests {
     #[test]
     fn dropping_profile_owner_allows_reopen() {
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-reopen");
         let holder = WritableProfileGuard::acquire_current().expect("profile holder");
@@ -524,7 +530,7 @@ mod tests {
     #[test]
     fn stale_lock_contents_do_not_block_acquisition() {
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-stale");
         let root = profile_root(base.path(), "ownership-stale");
@@ -544,7 +550,7 @@ mod tests {
     #[test]
     fn distinct_profile_roots_are_independently_writable() {
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let first_profile = PersistenceProfileGuard::named("ownership-one");
         let first = WritableProfileGuard::acquire_current().expect("first profile holder");
@@ -563,7 +569,7 @@ mod tests {
     #[test]
     fn retained_root_capability_and_identity_detect_profile_root_replacement() {
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-root-replaced");
         let guard = WritableProfileGuard::acquire_current().expect("profile holder");
@@ -599,7 +605,7 @@ mod tests {
     #[test]
     fn retained_lock_identity_detects_profile_lock_replacement() {
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-lock-replaced");
         let guard = WritableProfileGuard::acquire_current().expect("profile holder");
@@ -620,7 +626,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-symlink");
         let root = profile_root(base.path(), "ownership-symlink");
@@ -651,7 +657,7 @@ mod tests {
         use std::os::windows::fs::symlink_file;
 
         let _runtime = test_runtime();
-        let base = tempdir().expect("profile base");
+        let base = profile_base();
         let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
         let _profile_guard = PersistenceProfileGuard::named("ownership-reparse");
         let root = profile_root(base.path(), "ownership-reparse");
