@@ -129,6 +129,10 @@ fn parse_color(value: &str) -> Result<Color, String> {
     ))
 }
 
+fn default_waveform_playhead() -> Color {
+    Color::rgba(231, 229, 223, 210)
+}
+
 /// Semantic colors used by the Wavecrate application.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -173,6 +177,9 @@ pub struct Colors {
     pub waveform_mid: Color,
     /// Pale high-frequency waveform layer.
     pub waveform_high: Color,
+    /// Pale playback cursor drawn over the bounded waveform preview.
+    #[serde(default = "default_waveform_playhead")]
+    pub waveform_playhead: Color,
     /// Subtle raw waveform carrier layer.
     pub waveform_raw: Color,
     /// Played waveform bars.
@@ -316,6 +323,7 @@ impl Default for Theme {
                 waveform_low: Color::rgba(61, 72, 184, 240),
                 waveform_mid: Color::rgba(224, 71, 47, 235),
                 waveform_high: Color::rgba(232, 236, 237, 209),
+                waveform_playhead: default_waveform_playhead(),
                 waveform_raw: Color::rgba(236, 232, 223, 13),
                 waveform_played: Color::rgb(98, 102, 106),
                 waveform_grid: Color::rgb(54, 57, 57),
@@ -721,6 +729,15 @@ mod tests {
         assert_eq!(theme, Theme::default());
         assert!(json.contains("\"schema_version\": 1"));
         assert!(json.contains("\"accent\": \"#E95843FF\""));
+    }
+
+    #[test]
+    fn legacy_theme_defaults_the_optional_waveform_playhead_token() {
+        let legacy = valid_json().replace("    \"waveform_playhead\": \"#E7E5DFD2\",\n", "");
+
+        let theme = parse_theme_json(&legacy).expect("legacy theme validates");
+
+        assert_eq!(theme.colors.waveform_playhead, default_waveform_playhead());
     }
 
     #[test]

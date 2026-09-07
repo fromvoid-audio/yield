@@ -28,7 +28,11 @@ fn format_file_size(bytes: u64) -> String {
 }
 
 impl Browser {
-    fn render_waveform_panel(&self, theme: Theme) -> impl IntoElement {
+    fn render_waveform_panel(
+        &self,
+        theme: Theme,
+        playback_cursor_ratio: Option<f32>,
+    ) -> impl IntoElement {
         let (title, metadata) = if let Some(index) = self.selected {
             if let Some(entry) = self.entries.get(index) {
                 (
@@ -89,7 +93,11 @@ impl Browser {
                     .text_size(px(theme.typography.waveform_title_size))
                     .child(title),
             )
-            .child(waveform::render_waveform(self, theme.clone()))
+            .child(waveform::render_waveform(
+                self,
+                theme.clone(),
+                playback_cursor_ratio,
+            ))
             .child(
                 div()
                     .flex()
@@ -258,6 +266,7 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = active(cx).clone();
         let motion_frame = self.motion_frame(theme.motion, window);
+        let playback_cursor_ratio = self.playback_cursor_ratio(theme.motion.enabled);
         let root_label = self
             .root
             .as_ref()
@@ -600,7 +609,7 @@ impl Render for Browser {
                             .flex_col()
                             .flex_1()
                             .h_full()
-                            .child(self.render_waveform_panel(theme.clone()))
+                            .child(self.render_waveform_panel(theme.clone(), playback_cursor_ratio))
                             .child(
                                 div()
                                     .flex()

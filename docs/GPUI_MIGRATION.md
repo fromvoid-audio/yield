@@ -248,6 +248,26 @@ changing the settings panel height updated overflow feedback. Animations were
 restored after testing. Playhead motion, waveform gestures, and effects belonging
 to unported workflows remain pending.
 
+### Playback cursor, 2026-09-07
+
+The waveform now draws a pale playback cursor using the optional semantic
+`waveform_playhead` color. It maps engine elapsed time into the actual preview
+duration for the current zero-start one-shot transport, then hides outside the
+preview. Interpolation is bounded to 80 ms between received samples; disabled
+animation uses sampled positions. Stop, cancellation, errors, completion, and
+selection/source changes clear the cursor. Progress polling drains responses
+before scheduling the next request and remains inactive when transport is idle.
+The overlay does not invalidate cached waveform geometry.
+
+UI and design tests, UI check, formatting, diff checks, and a signed macOS build
+passed. Disposable-fixture GUI checks confirmed a cursor around the preview
+midpoint at three seconds in a twelve-second file, disappearance beyond the
+six-second preview, replay reset, selection clearing, and two-second one-shot
+completion. This establishes visual behavior, not audible synchronization or
+full waveform/seek/loop parity. A separate metadata fix removes a duplicate WAV
+channel-count division; two targeted probe tests passed, including mono,
+stereo, and four-channel duration coverage.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

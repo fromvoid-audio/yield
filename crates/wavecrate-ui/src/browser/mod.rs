@@ -141,6 +141,8 @@ pub(crate) struct Browser {
     playing_path: Option<PathBuf>,
     latest_playback_request_id: Option<PlaybackRequestId>,
     pending_progress_poll: Option<(PlaybackRequestId, u64)>,
+    playback_cursor_sample: Option<transport::PlaybackCursorSample>,
+    playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     waveform_task: Option<Task<()>>,
@@ -212,6 +214,8 @@ impl Browser {
             playing_path: None,
             latest_playback_request_id: None,
             pending_progress_poll: None,
+            playback_cursor_sample: None,
+            playback_cursor_interpolation: None,
             scan_cancel: None,
             scan_task: None,
             waveform_task: None,
@@ -547,6 +551,9 @@ impl Browser {
         };
 
         let mut frame = motion::MotionFrame::sample(motion, busy_elapsed);
+        if motion.enabled && self.playback_cursor_animation_pending(now) {
+            window.request_animation_frame();
+        }
         if let (Some(target), Some(elapsed), Some(envelope)) =
             (self.focus_target.as_ref(), focus_elapsed, focus_envelope)
         {

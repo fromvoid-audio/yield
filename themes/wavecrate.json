@@ -22,6 +22,7 @@
     "waveform_low": "#3D48B8F0",
     "waveform_mid": "#E0472FEB",
     "waveform_high": "#E8ECEDD1",
+    "waveform_playhead": "#E7E5DFD2",
     "waveform_raw": "#ECE8DF0D",
     "waveform_played": "#62666AFF",
     "waveform_grid": "#363939FF",

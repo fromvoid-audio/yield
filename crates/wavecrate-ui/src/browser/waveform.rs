@@ -5,7 +5,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use gpui::{Bounds, Path, PathBuilder, Pixels, canvas, div, point, prelude::*, px};
+use gpui::{Bounds, Path, PathBuilder, Pixels, canvas, div, fill, point, prelude::*, px};
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -221,7 +221,11 @@ fn lerp(start: f32, end: f32, amount: f32) -> f32 {
 }
 
 /// Render the selected sample's bounded preview using semantic waveform colors.
-pub(super) fn render_waveform(browser: &Browser, theme: Theme) -> impl IntoElement {
+pub(super) fn render_waveform(
+    browser: &Browser,
+    theme: Theme,
+    playback_cursor_ratio: Option<f32>,
+) -> impl IntoElement {
     let mut bars = div()
         .flex()
         .items_center()
@@ -229,6 +233,7 @@ pub(super) fn render_waveform(browser: &Browser, theme: Theme) -> impl IntoEleme
         .h_full()
         .w_full()
         .overflow_hidden()
+        .relative()
         .bg(color(theme.colors.waveform_background));
     if let Some(preview) = browser.waveform.as_ref() {
         if !preview.bands.is_empty() {
@@ -283,7 +288,41 @@ pub(super) fn render_waveform(browser: &Browser, theme: Theme) -> impl IntoEleme
                 .bg(color(theme.colors.waveform_grid)),
         );
     }
+    if let Some(ratio) = playback_cursor_ratio {
+        bars = bars.child(playback_cursor_overlay(
+            ratio,
+            color(theme.colors.waveform_playhead),
+        ));
+    }
     bars
+}
+
+const PLAYBACK_CURSOR_WIDTH: f32 = 2.0;
+
+fn playback_cursor_overlay(ratio: f32, cursor_color: gpui::Hsla) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            if !width.is_finite() || width <= 0.0 || !height.is_finite() || height <= 0.0 {
+                return;
+            }
+            let cursor_width = PLAYBACK_CURSOR_WIDTH.min(width);
+            let center = width * ratio.clamp(0.0, 1.0);
+            let left = (center - cursor_width / 2.0).clamp(0.0, width - cursor_width);
+            let cursor_bounds = Bounds::from_corners(
+                point(bounds.left() + px(left), bounds.top()),
+                point(bounds.left() + px(left + cursor_width), bounds.bottom()),
+            );
+            window.paint_quad(fill(cursor_bounds, cursor_color));
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left_0()
+    .right_0()
 }
 
 #[cfg(test)]

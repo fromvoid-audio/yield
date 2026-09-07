@@ -71,7 +71,9 @@ cannot replace the last valid theme.
 The canonical theme is [themes/wavecrate.json](../themes/wavecrate.json). A
 custom theme must contain the required fields in that document and use schema
 version `1`; the optional `motion` group defaults to the built-in timings for
-older themes. Open a JSON file from the gear settings panel, use `Reload` after
+older themes. The optional `colors.waveform_playhead` token controls the cursor
+independently of the frequency layers and defaults to the pale reference color.
+Open a JSON file from the gear settings panel, use `Reload` after
 editing it, and use `Default` to restore the built-in palette. Unknown fields,
 malformed colors, unsupported versions, oversized files, and incoherent
 dimensions are rejected with an error shown in the status bar. The embedded
