@@ -3,32 +3,117 @@
 
 //! Sources and folder-tree sidebar for the GPUI browser.
 
+use std::path::PathBuf;
+
 use gpui::{ClickEvent, Context, div, prelude::*, px, uniform_list};
 use wavecrate_design::Theme;
 
 use crate::theme::{color, transparent};
 
 use super::Browser;
+use super::motion::{self, MotionFrame};
+
+fn hover_rail(group: String, theme: &Theme) -> impl gpui::IntoElement {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(motion::HOVER_RAIL_WIDTH))
+        .bg(motion::with_alpha(
+            theme.interaction.focus_outline,
+            motion::HOVER_RAIL_ALPHA,
+        ))
+        .opacity(0.0)
+        .group_hover(group, |style| style.opacity(1.0))
+}
+
+fn pending_source_row(
+    theme: &Theme,
+    root: PathBuf,
+    label: String,
+    generation: u64,
+    motion_frame: MotionFrame,
+) -> impl gpui::IntoElement {
+    let row_group = format!(
+        "source-row:pending:{}:{}",
+        generation,
+        root.to_string_lossy()
+    );
+    div()
+        .group(row_group.clone())
+        .flex()
+        .flex_none()
+        .w_full()
+        .items_center()
+        .h(px(theme.spacing.row_height))
+        .relative()
+        .bg(transparent())
+        .child(
+            div()
+                .flex_none()
+                .w(px(theme.spacing.selected_marker_width))
+                .h_full()
+                .bg(transparent()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .pl(px(theme.spacing.row_padding_x))
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.warning))
+                .child(label),
+        )
+        .child(hover_rail(row_group, theme))
+        .child(motion::source_sweep_overlay(
+            motion_frame.source_phase,
+            motion::with_alpha(theme.colors.accent, motion::SOURCE_SWEEP_TRACK_ALPHA),
+            motion::with_alpha(theme.colors.accent, motion::SOURCE_SWEEP_SEGMENT_ALPHA),
+        ))
+}
 
 pub(super) fn render(
     browser: &Browser,
     theme: Theme,
+    motion_frame: MotionFrame,
     cx: &mut Context<Browser>,
 ) -> impl gpui::IntoElement {
     let source_rows = browser.source_rows();
-    let source_height = theme.spacing.row_height * source_rows.len().min(5) as f32;
+    let pending_source = browser.pending_source_row();
+    let source_count = source_rows.len() + usize::from(pending_source.is_some());
+    let source_height = theme.spacing.row_height * source_count.min(5) as f32;
     let source_list = if source_rows.is_empty() {
-        div()
-            .flex()
-            .flex_none()
-            .h(px(52.0))
-            .items_center()
-            .justify_center()
-            .text_size(px(theme.typography.small_size))
-            .text_color(color(theme.colors.text_muted))
-            .child("No sources")
+        if let Some((root, label, generation)) = pending_source.clone() {
+            div()
+                .flex_none()
+                .h(px(theme.spacing.row_height))
+                .child(pending_source_row(
+                    &theme,
+                    root,
+                    label,
+                    generation,
+                    motion_frame,
+                ))
+        } else {
+            div()
+                .flex()
+                .flex_none()
+                .h(px(52.0))
+                .items_center()
+                .justify_center()
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.text_muted))
+                .child("No sources")
+        }
     } else {
-        div()
+        let pending_slots = usize::from(pending_source.is_some());
+        let visible_source_rows = source_count.min(5).saturating_sub(pending_slots).max(1);
+        let source_list = div()
+            .flex()
+            .flex_col()
             .flex_none()
             .h(px(source_height.max(theme.spacing.row_height)))
             .child(
@@ -41,17 +126,22 @@ pub(super) fn render(
                             let source_rows = view.source_rows();
                             range
                                 .filter_map(|visible_index| {
-                                    let (index, label, selected, error) =
+                                    let (index, root, label, selected, error) =
                                         source_rows.get(visible_index).cloned()?;
                                     let hover_fill = color(list_theme.colors.selection_hover_fill);
                                     let pressed_fill = color(list_theme.interaction.pressed_fill);
+                                    let row_group =
+                                        format!("source-row:{}", root.to_string_lossy());
+                                    let scanning = view.source_scan_is_pending(&root);
                                     let source_row = div()
+                                        .group(row_group.clone())
                                         .id(("source-row", index))
                                         .flex()
                                         .flex_none()
                                         .w_full()
                                         .items_center()
                                         .h(px(list_theme.spacing.row_height))
+                                        .relative()
                                         .cursor_pointer()
                                         .bg(if selected {
                                             color(list_theme.colors.selection_fill)
@@ -110,16 +200,42 @@ pub(super) fn render(
                                                     },
                                                 ))
                                                 .child("×"),
-                                        );
-                                    Some(source_row)
+                                        )
+                                        .child(hover_rail(row_group, &list_theme));
+                                    Some(if scanning {
+                                        source_row.child(motion::source_sweep_overlay(
+                                            motion_frame.source_phase,
+                                            motion::with_alpha(
+                                                list_theme.colors.accent,
+                                                motion::SOURCE_SWEEP_TRACK_ALPHA,
+                                            ),
+                                            motion::with_alpha(
+                                                list_theme.colors.accent,
+                                                motion::SOURCE_SWEEP_SEGMENT_ALPHA,
+                                            ),
+                                        ))
+                                    } else {
+                                        source_row
+                                    })
                                 })
                                 .collect::<Vec<_>>()
                         }
                     }),
                 )
-                .h_full()
+                .h(px(theme.spacing.row_height * visible_source_rows as f32))
                 .track_scroll(browser.source_scroll_handle.clone()),
-            )
+            );
+        if let Some((root, label, generation)) = pending_source {
+            source_list.child(pending_source_row(
+                &theme,
+                root,
+                label,
+                generation,
+                motion_frame,
+            ))
+        } else {
+            source_list
+        }
     };
 
     let folder_rows = browser.folder_rows();
@@ -154,6 +270,7 @@ pub(super) fn render(
                                 let hover_fill = color(list_theme.colors.selection_hover_fill);
                                 let pressed_fill = color(list_theme.interaction.pressed_fill);
                                 let indent = row.depth as f32 * 12.0;
+                                let row_group = format!("folder-row:{}", row.path.display());
                                 let toggle =
                                     if row.has_children && row.path != std::path::Path::new(".") {
                                         div()
@@ -191,12 +308,14 @@ pub(super) fn render(
                                 };
                                 Some(
                                     div()
+                                        .group(row_group.clone())
                                         .id(("folder-row", visible_index))
                                         .flex()
                                         .flex_none()
                                         .w_full()
                                         .items_center()
                                         .h(px(list_theme.spacing.row_height))
+                                        .relative()
                                         .cursor_pointer()
                                         .bg(if selected {
                                             color(list_theme.colors.selection_fill)
@@ -214,6 +333,17 @@ pub(super) fn render(
                                                 );
                                             },
                                         ))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(list_theme.spacing.selected_marker_width))
+                                                .h_full()
+                                                .bg(if selected {
+                                                    color(list_theme.colors.accent)
+                                                } else {
+                                                    transparent()
+                                                }),
+                                        )
                                         .child(div().flex_none().w(px(indent)))
                                         .child(toggle)
                                         .child(
@@ -239,7 +369,8 @@ pub(super) fn render(
                                                 .text_size(px(list_theme.typography.small_size))
                                                 .text_color(color(list_theme.colors.text_disabled))
                                                 .child(row.audio_file_count.to_string()),
-                                        ),
+                                        )
+                                        .child(hover_rail(row_group, &list_theme)),
                                 )
                             })
                             .collect::<Vec<_>>()

@@ -28,7 +28,9 @@ The current GPUI frontend uses the original Wavecrate editorial-terminal
 palette and compact layout. Theme tokens are defined independently in
 `wavecrate-design`; the complete schema and a copyable default document are in
 [themes/wavecrate.json](themes/wavecrate.json). Open the gear settings control
-to import, reload, or reset a theme while the app is running.
+to import, reload, or reset a theme while the app is running. The same panel
+toggles animations for this session. Row hover rails remain immediate; loading
+indicators animate only during pending work and remain static when disabled.
 
 ## Run
 

@@ -11,6 +11,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 
 use gpui::{
     App, AppContext, BorrowAppContext, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent,
@@ -26,6 +27,7 @@ use wavecrate_media::{WaveformPreview, enumerate_audio_files_with_cancel, load_w
 use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
 
+mod motion;
 mod sidebar;
 mod transport;
 mod view;
@@ -140,6 +142,8 @@ pub(crate) struct Browser {
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     waveform_task: Option<Task<()>>,
+    waveform_pending: bool,
+    motion_started_at: Option<Instant>,
     theme_status: String,
     theme_load: ThemeLoadState,
     theme_task: Option<Task<()>>,
@@ -201,6 +205,8 @@ impl Browser {
             scan_cancel: None,
             scan_task: None,
             waveform_task: None,
+            waveform_pending: false,
+            motion_started_at: None,
             theme_status: "Wavecrate Editorial Terminal".to_string(),
             theme_load: ThemeLoadState::default(),
             theme_task: None,
@@ -246,6 +252,7 @@ impl Browser {
                 if self.selected.is_some() {
                     self.stop_playback();
                     self.selected = None;
+                    self.waveform_pending = false;
                     self.waveform = None;
                     self.waveform_error = None;
                     self.waveform_generation = self.waveform_generation.wrapping_add(1);
@@ -298,6 +305,7 @@ impl Browser {
         self.view_model.set_entries(&self.entries);
         self.selected = None;
         self.waveform_task.take();
+        self.waveform_pending = false;
         self.waveform = None;
         self.waveform_error = None;
         self.folder_tree = None;
@@ -417,6 +425,7 @@ impl Browser {
             self.view_model.set_entries(&self.entries);
             self.scan_status = error;
             self.selected = None;
+            self.waveform_pending = false;
             self.waveform = None;
             self.waveform_error = None;
             cx.notify();
@@ -457,19 +466,62 @@ impl Browser {
         self.restore_projection_focus(restore_id, restore_position, cx);
     }
 
-    pub(super) fn source_rows(&self) -> Vec<(usize, String, bool, Option<String>)> {
+    pub(super) fn source_rows(&self) -> Vec<(usize, PathBuf, String, bool, Option<String>)> {
         self.source_sessions
             .iter()
             .enumerate()
             .map(|(index, session)| {
                 (
                     index,
+                    session.root.clone(),
                     session.label.clone(),
                     self.active_source == Some(index),
                     session.last_error.clone(),
                 )
             })
             .collect()
+    }
+
+    pub(super) fn pending_source_row(&self) -> Option<(PathBuf, String, u64)> {
+        self.pending_source_label
+            .as_ref()
+            .zip(self.root.as_ref())
+            .map(|(label, root)| (root.clone(), label.clone(), self.scan_generation))
+    }
+
+    pub(super) fn source_scan_is_pending(&self, root: &Path) -> bool {
+        self.scan_cancel.is_some() && self.root.as_deref() == Some(root)
+    }
+
+    pub(super) fn motion_pending(&self) -> motion::PendingWork {
+        motion::pending_work(
+            self.scan_cancel.is_some(),
+            self.waveform_pending,
+            self.playback_init_task.is_some(),
+            self.playback_init_entry.is_some(),
+        )
+    }
+
+    pub(super) fn motion_frame(
+        &mut self,
+        motion: wavecrate_design::Motion,
+        window: &Window,
+    ) -> motion::MotionFrame {
+        let pending = self.motion_pending();
+        if !motion::should_schedule_frames(motion.enabled, pending) {
+            self.motion_started_at = None;
+            return motion::MotionFrame::sample(
+                wavecrate_design::Motion {
+                    enabled: false,
+                    ..wavecrate_design::Motion::default()
+                },
+                std::time::Duration::ZERO,
+            );
+        }
+        let started_at = *self.motion_started_at.get_or_insert_with(Instant::now);
+        window.request_animation_frame();
+        let elapsed = started_at.elapsed();
+        motion::MotionFrame::sample(motion, elapsed)
     }
 
     pub(super) fn folder_rows(&self) -> &[FolderTreeRow] {
@@ -546,6 +598,7 @@ impl Browser {
             self.folder_tree = None;
             self.folder_rows_cache.clear();
             self.selected = None;
+            self.waveform_pending = false;
             self.waveform = None;
             self.waveform_error = None;
             self.view_model.set_entries(&self.entries);
@@ -680,6 +733,7 @@ impl Browser {
         self.waveform_error = None;
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
         let generation = self.waveform_generation;
+        self.waveform_pending = true;
         let path = entry.path;
         self.playback_status = "Ready".to_string();
         self.waveform_task = Some(cx.spawn(async move |this, cx| {
@@ -691,6 +745,7 @@ impl Browser {
                 if view.waveform_generation != generation {
                     return;
                 }
+                view.waveform_pending = false;
                 match result {
                     Ok(preview) => view.waveform = Some(preview),
                     Err(error) => view.waveform_error = Some(error),
@@ -767,6 +822,18 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.theme_settings_open = !self.theme_settings_open;
+        cx.notify();
+    }
+
+    pub(super) fn toggle_motion(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut theme = crate::theme::active(cx).clone();
+        theme.motion.enabled = !theme.motion.enabled;
+        cx.set_global(ActiveTheme(Arc::new(theme)));
         cx.notify();
     }
 

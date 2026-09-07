@@ -201,6 +201,29 @@ optimized macOS bundle was rebuilt and signature-verified; the user tested it
 and confirmed responsiveness was "much better". The cached layered waveform
 remained visible after changing folders.
 
+### Hover and loading motion, 2026-09-07
+
+Sample, source, and folder rows now show the reference's immediate pale 2-point
+trailing hover rail while retaining their coral selection marker. Pending work
+drives a 1.15 Hz circular status pulse, and source scans show the 0.45 Hz
+wrapping sweep with a fading tail. The gear panel's session-only Animations
+toggle disables continuous motion while retaining static busy feedback.
+
+One browser-level frame gate checks current scan, waveform, and audio-init
+intent. Completed waveform tasks and cancelled audio-init intents cannot keep
+the animation cadence alive. No per-row timers were added, and waveform and
+folder caches remain unchanged. Pending source rows fit inside the existing
+source viewport rather than overflowing into folders.
+
+Validation: locked UI check, 15 UI tests (one manual benchmark ignored),
+workspace formatting, diff checks, and signed macOS bundle build passed. Tests
+cover frame eligibility, cancelled/terminal work signals, disabled motion, and
+sweep bounds. GUI checks confirmed sample/source hover rails, the toggle in
+both directions, valid preview recovery after an invalid WAV, and absence of a
+lingering busy indicator after the error. Short fixture loads did not establish
+manual timing acceptance of the pulse/sweep. Focus fades, scroll-edge fades,
+playhead motion, and effects belonging to unported workflows remain pending.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

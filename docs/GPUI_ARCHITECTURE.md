@@ -69,9 +69,10 @@ reset actions run through bounded background reads; an invalid or stale result
 cannot replace the last valid theme.
 
 The canonical theme is [themes/wavecrate.json](../themes/wavecrate.json). A
-custom theme must contain every field in that document and use schema version
-`1`. Open a JSON file from the gear settings panel, use `Reload` after editing
-it, and use `Default` to restore the built-in palette. Unknown fields,
+custom theme must contain the required fields in that document and use schema
+version `1`; the optional `motion` group defaults to the built-in timings for
+older themes. Open a JSON file from the gear settings panel, use `Reload` after
+editing it, and use `Default` to restore the built-in palette. Unknown fields,
 malformed colors, unsupported versions, oversized files, and incoherent
 dimensions are rejected with an error shown in the status bar. The embedded
 Ioskeley Mono font remains the default display family and is registered during
@@ -83,6 +84,14 @@ Copy the canonical JSON to create a theme. Colors accept `#RRGGBB` or
 no larger than 128 KiB. Font families fall back through the platform font system
 when unavailable. Theme selection is session-only until isolated application
 profiles are implemented; reopening the app restores the built-in theme.
+
+Motion timing and deterministic envelopes belong to `wavecrate-design`; GPUI
+frame requests and drawing belong to `wavecrate-ui`. Loading indicators must
+derive from current pending work, never from the mere existence of a retained
+task handle. Completion, failure, cancellation, and disabled motion must end
+frame requests. Disabled motion retains a static busy cue. Hover styling must
+not start a timer. Animation frames reuse waveform geometry and folder-row
+projections rather than rebuilding them.
 
 ## Work and lifecycle
 

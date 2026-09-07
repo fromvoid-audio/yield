@@ -226,14 +226,37 @@ impl Browser {
                     .on_click(cx.listener(Self::reset_theme))
                     .child("Default"),
             )
+            .child(
+                div()
+                    .id("toggle-animations")
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
+                    .px(px(theme.spacing.control_gap))
+                    .cursor_pointer()
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .text_color(color(if theme.motion.enabled {
+                        theme.colors.accent
+                    } else {
+                        theme.colors.text_muted
+                    }))
+                    .on_click(cx.listener(Self::toggle_motion))
+                    .child(if theme.motion.enabled {
+                        "Animations On"
+                    } else {
+                        "Animations Off"
+                    }),
+            )
             .child(div().flex_1())
             .child(self.theme_status.clone())
     }
 }
 
 impl Render for Browser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = active(cx).clone();
+        let motion_frame = self.motion_frame(theme.motion, window);
         let root_label = self
             .root
             .as_ref()
@@ -290,13 +313,17 @@ impl Render for Browser {
                                     let duration = format_duration(entry.duration_seconds);
                                     let hover_fill = color(list_theme.colors.selection_hover_fill);
                                     let pressed_fill = color(list_theme.interaction.pressed_fill);
+                                    let row_group =
+                                        format!("sample-row:{}", entry.path.to_string_lossy());
                                     div()
+                                        .group(row_group.clone())
                                         .id(index)
                                         .flex()
                                         .flex_none()
                                         .w_full()
                                         .items_center()
                                         .h(px(list_theme.spacing.row_height))
+                                        .relative()
                                         .cursor_pointer()
                                         .bg(if selected {
                                             color(list_theme.colors.selection_fill)
@@ -363,6 +390,20 @@ impl Render for Browser {
                                                 .text_size(px(list_theme.typography.small_size))
                                                 .text_color(color(list_theme.colors.text_muted))
                                                 .child(duration),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .right_0()
+                                                .w(px(super::motion::HOVER_RAIL_WIDTH))
+                                                .bg(super::motion::with_alpha(
+                                                    list_theme.interaction.focus_outline,
+                                                    super::motion::HOVER_RAIL_ALPHA,
+                                                ))
+                                                .opacity(0.0)
+                                                .group_hover(row_group, |style| style.opacity(1.0)),
                                         )
                                 })
                                 .collect::<Vec<_>>()
@@ -504,7 +545,12 @@ impl Render for Browser {
                     .flex()
                     .flex_1()
                     .h_full()
-                    .child(super::sidebar::render(self, theme.clone(), cx))
+                    .child(super::sidebar::render(
+                        self,
+                        theme.clone(),
+                        motion_frame,
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -592,7 +638,18 @@ impl Render for Browser {
                     .child(self.playback_status.clone())
                     .child(list_status)
                     .child(div().flex_1())
-                    .child(self.theme_status.clone()),
+                    .child(self.theme_status.clone())
+                    .when(self.motion_pending().any(), |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .rounded_full()
+                                .bg(color(theme.colors.accent))
+                                .opacity(f32::from(motion_frame.worker_alpha) / 255.0),
+                        )
+                    }),
             )
     }
 }
