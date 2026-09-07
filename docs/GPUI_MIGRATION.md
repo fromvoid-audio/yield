@@ -512,6 +512,41 @@ Shift-arrow steps, volume adjustment without restarting playback, and a final
 0.51 value persisted on quit and restored on reopen. Manual audible acceptance
 remains separate.
 
+### Audition audio output routing, 2026-09-08
+
+The browser now exposes Backend, Output, and Sample rate controls in a compact
+audio panel. Host changes clear the selected device and rate; device changes
+clear the rate, matching the reference cascade. The panel lists discovered
+choices asynchronously, keeps keyboard focus separate from the volume slider,
+and supports ArrowUp/ArrowDown/Enter navigation with Escape closing the
+dropdown before the panel. A pointer press outside the panel closes an open
+dropdown without selecting a new output. The floating panel and bounded option
+lists preserve the browser layout at the minimum window size.
+
+Requested routing is stored through the typed `AudioOutputPreferences` patch.
+The first audition waits for the preference baseline before opening output.
+Output opens are single-flight and generation-fenced, so a rapid sequence of
+hardware choices cleans up the stale completion before opening the latest
+request. The background worker waits for the old output's teardown before
+opening its replacement; a timeout retains that pending teardown for explicit
+retry. The resolved Reson host, device, sample rate, actual buffer, and
+fallback state are displayed independently from the requested values. Passive
+preference snapshots take effect on the next audition; an explicit choice
+reopens the runtime and resumes only the still-current playback intent. A
+successful open precedes persistence, and rejected or unavailable preference
+writes retain an explicit unsaved state with a Retry save action.
+
+Validation: the locked UI check and focused browser tests passed, with the
+manual waveform benchmark ignored. Formatting and the signed macOS development
+build passed. Disposable-profile GUI checks exercised Core Audio discovery,
+keyboard selection, the already-active Scarlett output at 44.1 kHz, playback
+resumption after reopening that output, and Escape dismissing a dropdown while
+playback continued. Quit flushed the explicit host/device/rate selection; reopen
+restored it alongside volume and loop preferences, and the first audition used
+that output. Tests did not change the hardware to another sample rate. Audible
+quality, other output backends, and Windows hardware acceptance remain manual
+platform checks.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

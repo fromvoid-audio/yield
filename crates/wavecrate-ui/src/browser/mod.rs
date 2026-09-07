@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use gpui::{
     App, AppContext, BorrowAppContext, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent,
-    PathPromptOptions, ScrollStrategy, Task, UniformListScrollHandle, Window,
+    PathPromptOptions, ScrollHandle, ScrollStrategy, Task, UniformListScrollHandle, Window,
 };
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
@@ -32,6 +32,7 @@ use wavecrate_session::{PreferencePatch, RegistryRevision, RequestId};
 use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
 
+mod audio_output;
 mod handoff;
 mod motion;
 mod preferences;
@@ -268,7 +269,30 @@ pub(crate) struct Browser {
     theme_load: ThemeLoadState,
     theme_task: Option<Task<()>>,
     theme_settings_open: bool,
-    playback_init_task: Option<Task<()>>,
+    audio_settings_open: bool,
+    audio_output_focus_handle: FocusHandle,
+    audio_output_dropdown: Option<audio_output::AudioOutputDropdown>,
+    audio_output_option_index: usize,
+    audio_output_options_scroll_handle: ScrollHandle,
+    audio_output_config: reson::AudioOutputConfig,
+    audio_output_resolved: Option<reson::ResolvedOutput>,
+    audio_output_hosts: Vec<reson::AudioHostSummary>,
+    audio_output_devices: Vec<reson::AudioDeviceSummary>,
+    audio_output_sample_rates: Vec<u32>,
+    audio_output_status: String,
+    audio_output_error: Option<String>,
+    audio_output_options_generation: u64,
+    audio_output_options_cancel: Option<Arc<AtomicBool>>,
+    audio_output_options_task: Option<Task<()>>,
+    audio_output_open_generation: u64,
+    audio_output_open_task: Option<Task<()>>,
+    audio_output_retiring: Option<PlaybackRuntime>,
+    audio_output_applied_config: Option<reson::AudioOutputConfig>,
+    audio_output_resume: Option<transport::PlaybackIntent>,
+    audio_output_resume_epoch: u64,
+    audio_output_resume_generation: u64,
+    audio_output_dirty: bool,
+    playback_waiting_for_preferences: bool,
     playback_init_intent: Option<transport::PlaybackIntent>,
     playback_init_epoch: u64,
     playback_init_generation: u64,
@@ -375,7 +399,30 @@ impl Browser {
             theme_load: ThemeLoadState::default(),
             theme_task: None,
             theme_settings_open: false,
-            playback_init_task: None,
+            audio_settings_open: false,
+            audio_output_focus_handle: cx.focus_handle(),
+            audio_output_dropdown: None,
+            audio_output_option_index: 0,
+            audio_output_options_scroll_handle: ScrollHandle::new(),
+            audio_output_config: reson::AudioOutputConfig::default(),
+            audio_output_resolved: None,
+            audio_output_hosts: Vec::new(),
+            audio_output_devices: Vec::new(),
+            audio_output_sample_rates: Vec::new(),
+            audio_output_status: "Audio output idle".to_string(),
+            audio_output_error: None,
+            audio_output_options_generation: 0,
+            audio_output_options_cancel: None,
+            audio_output_options_task: None,
+            audio_output_open_generation: 0,
+            audio_output_open_task: None,
+            audio_output_retiring: None,
+            audio_output_applied_config: None,
+            audio_output_resume: None,
+            audio_output_resume_epoch: 0,
+            audio_output_resume_generation: 0,
+            audio_output_dirty: false,
+            playback_waiting_for_preferences: false,
             playback_init_intent: None,
             playback_init_epoch: 0,
             playback_init_generation: 0,
@@ -789,7 +836,7 @@ impl Browser {
         motion::pending_work(
             self.scan_cancel.is_some(),
             self.waveform_pending,
-            self.playback_init_task.is_some(),
+            self.audio_output_open_task.is_some(),
             self.playback_init_intent.is_some(),
         )
     }
@@ -1215,6 +1262,11 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.theme_settings_open = !self.theme_settings_open;
+        if self.theme_settings_open {
+            self.audio_settings_open = false;
+            self.audio_output_dropdown = None;
+            self.cancel_audio_output_options();
+        }
         cx.notify();
     }
 
@@ -1506,6 +1558,9 @@ impl Browser {
             }
             return;
         }
+        if self.handle_audio_output_key_down(event, window, cx) {
+            return;
+        }
         if self.volume_focus_handle.is_focused(window) {
             if key == "escape" {
                 self.cancel_volume_drag(window, cx);
@@ -1570,9 +1625,15 @@ impl Drop for Browser {
         }
         self.source_registry_task.take();
         self.cancel_waveform_load();
+        self.cancel_audio_output_options();
+        self.audio_output_open_generation = self.audio_output_open_generation.wrapping_add(1);
+        self.audio_output_open_task.take();
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
         if let Some(runtime) = self.playback.as_ref() {
+            let _ = runtime.handle.try_shutdown();
+        }
+        if let Some(runtime) = self.audio_output_retiring.as_ref() {
             let _ = runtime.handle.try_shutdown();
         }
     }

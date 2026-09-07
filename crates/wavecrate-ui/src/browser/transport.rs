@@ -10,10 +10,9 @@ use super::Browser;
 use super::waveform::WaveformPlayRegion;
 use gpui::Context;
 use reson::{
-    AudioPlayer, PlaybackRequestId, PlaybackRuntime, PlaybackRuntimeConfig, PlaybackRuntimeEvent,
-    PlaybackRuntimeMode, PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy,
-    PlaybackRuntimeRequest, PlaybackRuntimeSource, PlaybackRuntimeStarted,
-    PlaybackRuntimeStreamPolicy,
+    PlaybackRequestId, PlaybackRuntimeEvent, PlaybackRuntimeMode, PlaybackRuntimeProgress,
+    PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest, PlaybackRuntimeSource,
+    PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy,
 };
 
 const PLAYBACK_MONITOR_INTERVAL: Duration = Duration::from_millis(80);
@@ -237,6 +236,7 @@ impl Browser {
         }
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.playback_init_intent = None;
+        self.playback_waiting_for_preferences = false;
         self.clear_playback_cursor();
         true
     }
@@ -327,8 +327,20 @@ impl Browser {
         }
         let intent = PlaybackIntent { start, ..intent };
         self.clear_playback_cursor();
+        self.audio_output_resume = None;
         self.playback_cursor_pending = Some(start as f32);
-        if self.playback_init_task.is_some() {
+        if !self.preferences.loaded() {
+            self.playback_init_intent = Some(intent);
+            self.playback_init_epoch = self.playback_epoch;
+            self.playback_init_generation = self.waveform_generation;
+            self.playback_waiting_for_preferences = true;
+            self.playback_status = "Loading settings…".to_string();
+            self.start_preferences_poll(cx);
+            cx.notify();
+            return;
+        }
+        self.playback_waiting_for_preferences = false;
+        if self.audio_output_open_task.is_some() {
             self.playback_init_intent = Some(intent);
             self.playback_init_epoch = self.playback_epoch;
             self.playback_init_generation = self.waveform_generation;
@@ -338,64 +350,30 @@ impl Browser {
         }
         if self.playback.is_none() {
             self.start_playback_runtime(intent, cx);
+        } else if self
+            .audio_output_applied_config
+            .as_ref()
+            .is_none_or(|applied| applied != &self.audio_output_config)
+        {
+            self.playback_init_intent = Some(intent);
+            self.playback_init_epoch = self.playback_epoch;
+            self.playback_init_generation = self.waveform_generation;
+            self.reconfigure_audio_output(cx);
         } else {
             self.queue_playback_intent(intent, cx);
         }
     }
 
-    fn start_playback_runtime(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
+    pub(super) fn start_playback_runtime(
+        &mut self,
+        intent: PlaybackIntent,
+        cx: &mut Context<Self>,
+    ) {
         self.playback_init_intent = Some(intent);
         self.playback_init_epoch = self.playback_epoch;
         self.playback_init_generation = self.waveform_generation;
         self.playback_status = "Starting audio…".to_string();
-        self.playback_init_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let player = AudioPlayer::new()?;
-                    PlaybackRuntime::spawn(player, PlaybackRuntimeConfig::default())
-                        .map_err(|error| format!("Could not start audio runtime: {error}"))
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                view.playback_init_task = None;
-                let pending_intent = view.playback_init_intent.take();
-                match result {
-                    Ok(runtime) => {
-                        view.playback = Some(runtime);
-                        view.retry_runtime_volume();
-                        let should_queue = pending_intent.as_ref().is_some_and(|intent| {
-                            let selected_path = view
-                                .selected
-                                .and_then(|index| view.entries.get(index))
-                                .map(|selected| selected.path.as_path());
-                            should_queue_initialized_playback(
-                                view.playback_init_generation,
-                                view.playback_init_epoch,
-                                view.waveform_generation,
-                                view.playback_epoch,
-                                selected_path,
-                                intent.path.as_path(),
-                            )
-                        });
-                        if should_queue {
-                            view.queue_playback_intent(
-                                pending_intent.expect("pending playback intent"),
-                                cx,
-                            );
-                        } else {
-                            view.clear_playback_cursor();
-                            view.playback_status = "Ready".to_string();
-                        }
-                    }
-                    Err(error) => {
-                        view.clear_playback_cursor();
-                        view.playback_status = error;
-                    }
-                }
-                cx.notify();
-            });
-        }));
+        self.begin_audio_output_open(cx);
     }
 
     fn queue_playback_intent(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
@@ -451,6 +429,8 @@ impl Browser {
         self.playback_monitor_running = false;
         self.pending_progress_poll = None;
         self.playback_init_intent = None;
+        self.playback_waiting_for_preferences = false;
+        self.audio_output_resume = None;
         self.clear_playback_cursor();
         if let Some(runtime) = self.playback.as_ref() {
             if let Ok(request_id) = runtime.handle.try_stop() {
@@ -549,6 +529,98 @@ impl Browser {
             }
         }
     }
+
+    fn capture_audio_output_resume_intent(&self) -> Option<PlaybackIntent> {
+        if let Some(intent) = self.playback_init_intent.clone() {
+            return Some(intent);
+        }
+        let selected_path = self
+            .selected
+            .and_then(|index| self.entries.get(index))
+            .map(|entry| entry.path.as_path());
+        if let Some(resume) = self.audio_output_resume.as_ref()
+            && audio_output_resume_is_current(
+                self.audio_output_resume_epoch,
+                self.audio_output_resume_generation,
+                self.playback_epoch,
+                self.waveform_generation,
+                selected_path,
+                resume.path.as_path(),
+            )
+        {
+            return Some(resume.clone());
+        }
+        let playing_path = self.playing_path.as_ref()?;
+        if selected_path != Some(playing_path) {
+            return None;
+        }
+        let region = self.waveform_play_region.filter(|region| region.is_valid());
+        Some(PlaybackIntent {
+            start: region.map_or(0.0, |region| region.start),
+            region,
+            looped: self.loop_enabled,
+            volume: super::volume::quantize_volume(self.volume),
+            path: playing_path.clone(),
+            origin: PlaybackIntentOrigin::Explicit,
+        })
+    }
+
+    pub(super) fn reconfigure_audio_output(&mut self, cx: &mut Context<Self>) {
+        let resume = self.capture_audio_output_resume_intent();
+        self.stop_playback();
+        if let Some(runtime) = self.playback.take() {
+            self.retire_audio_output_runtime(runtime);
+        }
+        self.audio_output_resume = resume;
+        self.audio_output_resume_epoch = self.playback_epoch;
+        self.audio_output_resume_generation = self.waveform_generation;
+        self.audio_output_resolved = None;
+        self.audio_output_applied_config = None;
+        self.audio_output_status = "Audio output change pending".to_string();
+        self.begin_audio_output_open(cx);
+    }
+
+    pub(super) fn resume_audio_output_playback_if_current(&mut self, cx: &mut Context<Self>) {
+        let resume = self.audio_output_resume.take();
+        let pending = resume.clone().or_else(|| self.playback_init_intent.take());
+        let Some(intent) = pending else {
+            self.playback_status = "Ready".to_string();
+            return;
+        };
+        let should_queue = if resume.is_some() {
+            let selected_path = self
+                .selected
+                .and_then(|index| self.entries.get(index))
+                .map(|entry| entry.path.as_path());
+            audio_output_resume_is_current(
+                self.audio_output_resume_epoch,
+                self.audio_output_resume_generation,
+                self.playback_epoch,
+                self.waveform_generation,
+                selected_path,
+                intent.path.as_path(),
+            )
+        } else {
+            let selected_path = self
+                .selected
+                .and_then(|index| self.entries.get(index))
+                .map(|entry| entry.path.as_path());
+            should_queue_initialized_playback(
+                self.playback_init_generation,
+                self.playback_init_epoch,
+                self.waveform_generation,
+                self.playback_epoch,
+                selected_path,
+                intent.path.as_path(),
+            )
+        };
+        if should_queue {
+            self.queue_playback_intent(intent, cx);
+        } else {
+            self.clear_playback_cursor();
+            self.playback_status = "Ready".to_string();
+        }
+    }
 }
 
 fn should_queue_initialized_playback(
@@ -562,6 +634,19 @@ fn should_queue_initialized_playback(
     requested_generation == current_generation
         && requested_epoch == current_epoch
         && selected_path == Some(requested_path)
+}
+
+fn audio_output_resume_is_current(
+    resume_epoch: u64,
+    resume_generation: u64,
+    current_epoch: u64,
+    current_generation: u64,
+    selected_path: Option<&Path>,
+    resume_path: &Path,
+) -> bool {
+    resume_epoch == current_epoch
+        && resume_generation == current_generation
+        && selected_path == Some(resume_path)
 }
 
 fn playback_mode_for_intent(intent: &PlaybackIntent) -> PlaybackRuntimeMode {
@@ -664,9 +749,9 @@ fn progress_poll_is_current(
 mod tests {
     use super::{
         PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin,
-        authoritative_cursor_progress, cursor_interpolation, normalized_playback_start,
-        playback_mode_for_intent, playback_request_number_is_current, preview_cursor_ratio,
-        should_cancel_pending_autoplay, should_queue_initialized_playback,
+        audio_output_resume_is_current, authoritative_cursor_progress, cursor_interpolation,
+        normalized_playback_start, playback_mode_for_intent, playback_request_number_is_current,
+        preview_cursor_ratio, should_cancel_pending_autoplay, should_queue_initialized_playback,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -713,6 +798,28 @@ mod tests {
             9,
             Some(path),
             path
+        ));
+    }
+
+    #[test]
+    fn output_reconfigure_preserves_resume_only_for_current_selection_and_epoch() {
+        let path = Path::new("sample.wav");
+        assert!(audio_output_resume_is_current(9, 4, 9, 4, Some(path), path,));
+        assert!(!audio_output_resume_is_current(
+            9,
+            4,
+            10,
+            4,
+            Some(path),
+            path,
+        ));
+        assert!(!audio_output_resume_is_current(
+            9,
+            4,
+            9,
+            4,
+            Some(Path::new("other.wav")),
+            path,
         ));
     }
 

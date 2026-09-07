@@ -84,6 +84,18 @@ impl PreferenceState {
         })
     }
 
+    pub(super) fn has_pending_audio_output_patch(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| matches!(pending.patch, PreferencePatch::SetAudioOutput(_)))
+    }
+
+    pub(super) fn has_pending_reset(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| matches!(pending.patch, PreferencePatch::Reset))
+    }
+
     pub(super) fn status(&self) -> &str {
         &self.status
     }
@@ -307,6 +319,9 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetOutputVolume(volume) => {
             preferences.output_volume = *volume;
         }
+        PreferencePatch::SetAudioOutput(audio_output) => {
+            preferences.audio_output = audio_output.clone();
+        }
         PreferencePatch::Reset => *preferences = UiPreferences::default(),
     }
 }
@@ -319,6 +334,7 @@ impl Browser {
         if let Some(error) = cx.global::<SourceRegistryGlobal>().start_error() {
             let error = SessionError::Persistence(error.to_string());
             self.preferences.mark_unavailable(&error);
+            self.apply_preference_projection(cx);
             return;
         }
         self.preferences_task = Some(cx.spawn(async move |this, cx| {
@@ -376,6 +392,11 @@ impl Browser {
             PreferenceEvent::RequestFailed { request, error } => {
                 let failed = self.preferences.fail_request(request, error.to_string());
                 if failed.is_some() {
+                    if let Some(failed_patch) = failed.as_ref()
+                        && matches!(failed_patch, PreferencePatch::SetAudioOutput(_))
+                    {
+                        self.audio_output_persistence_failed(error.to_string());
+                    }
                     let failed_theme = failed.as_ref().is_some_and(|patch| {
                         matches!(
                             patch,
@@ -398,15 +419,25 @@ impl Browser {
                 true
             }
             PreferenceEvent::PersistenceUnavailable { error, .. } => {
+                let audio_output_pending = self.preferences.has_pending_audio_output_patch();
                 self.preferences.mark_unavailable(&error);
+                if audio_output_pending {
+                    self.audio_output_persistence_failed(error.to_string());
+                }
                 let generation = self.theme_load.generation;
                 self.theme_load.reject(generation);
+                self.apply_preference_projection(cx);
                 true
             }
             PreferenceEvent::Closed => {
+                let audio_output_pending = self.preferences.has_pending_audio_output_patch();
                 self.preferences.mark_closed();
+                if audio_output_pending {
+                    self.audio_output_persistence_failed("settings persistence closed".to_string());
+                }
                 let generation = self.theme_load.generation;
                 self.theme_load.reject(generation);
+                self.apply_preference_projection(cx);
                 true
             }
         }
@@ -424,8 +455,19 @@ impl Browser {
         self.autoplay_selection = effective.autoplay_selection;
         self.loop_enabled = effective.loop_enabled;
         self.apply_preference_volume(effective.output_volume);
+        self.apply_preference_audio_output(
+            &effective.audio_output,
+            self.preferences.has_pending_reset(),
+            cx,
+        );
         if autoplay_was_enabled && !self.autoplay_selection {
             self.cancel_pending_selection_autoplay();
+        }
+        if self.playback_waiting_for_preferences && self.preferences.loaded() {
+            self.playback_waiting_for_preferences = false;
+            if let Some(intent) = self.playback_init_intent.clone() {
+                self.start_playback_runtime(intent, cx);
+            }
         }
 
         let preserve_inflight_theme =
@@ -583,5 +625,37 @@ mod tests {
                 .status()
                 .contains("choose Reset saved settings to retry")
         );
+    }
+
+    #[test]
+    fn audio_output_patch_is_optimistic_until_durability_ack() {
+        let mut state = PreferenceState::new();
+        let output = wavecrate_session::AudioOutputPreferences {
+            host: Some("coreaudio".to_string()),
+            device: Some("Built-in Output".to_string()),
+            sample_rate: Some(48_000),
+            buffer_size: Some(256),
+        };
+        state.queue_for_test(7, PreferencePatch::SetAudioOutput(output.clone()));
+        assert_eq!(state.effective().audio_output, output);
+        state.mark_applied_for_test(7, 1);
+        assert!(state.has_pending());
+        state.mark_persisted_for_test(1);
+        assert!(!state.has_pending());
+    }
+
+    #[test]
+    fn reset_is_visible_as_a_preference_override_for_dirty_output() {
+        let mut state = PreferenceState::new();
+        state.queue_for_test(
+            1,
+            PreferencePatch::SetAudioOutput(wavecrate_session::AudioOutputPreferences {
+                host: Some("coreaudio".to_string()),
+                ..wavecrate_session::AudioOutputPreferences::default()
+            }),
+        );
+        state.queue_for_test(2, PreferencePatch::Reset);
+        assert!(state.has_pending_reset());
+        assert_eq!(state.effective().audio_output, Default::default());
     }
 }

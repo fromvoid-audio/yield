@@ -523,6 +523,7 @@ impl Render for Browser {
             .flex()
             .flex_col()
             .size_full()
+            .relative()
             .bg(color(theme.colors.background))
             .text_color(color(theme.colors.text_primary))
             .font(font(theme.typography.font_family.clone()))
@@ -647,6 +648,34 @@ impl Render for Browser {
                             .child(root_label),
                     )
                     .child(volume::render_slider(self, theme.clone(), cx))
+                    .child(
+                        div()
+                            .id("audio-output-settings-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(theme.spacing.control_height))
+                            .px(px(theme.spacing.control_gap))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .text_size(px(theme.typography.small_size))
+                            .text_color(color(if self.audio_output_error.is_some() {
+                                theme.colors.danger
+                            } else if self
+                                .audio_output_resolved
+                                .as_ref()
+                                .is_some_and(|output| output.used_fallback)
+                            {
+                                theme.colors.warning
+                            } else {
+                                theme.colors.text_muted
+                            }))
+                            .on_click(cx.listener(Self::toggle_audio_output_settings))
+                            .child(self.audio_output_toolbar_label()),
+                    )
                     .child(
                         div()
                             .id("reveal-toolbar")
@@ -821,5 +850,16 @@ impl Render for Browser {
                         )
                     }),
             )
+            .when(self.audio_settings_open, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top(px(theme.spacing.toolbar_height))
+                        .right_0()
+                        .w(px(420.0))
+                        .occlude()
+                        .child(self.render_audio_output_settings(theme.clone(), cx)),
+                )
+            })
     }
 }

@@ -280,6 +280,9 @@ impl Browser {
             if let Some(intent) = self.playback_init_intent.as_mut() {
                 intent.set_volume(value);
             }
+            if let Some(intent) = self.audio_output_resume.as_mut() {
+                intent.set_volume(value);
+            }
             self.volume_runtime_pending = Some(value);
             self.volume_runtime_retry_count = 0;
             self.sync_runtime_volume();
@@ -294,6 +297,9 @@ impl Browser {
         let changed = self.volume.to_bits() != value.to_bits();
         self.volume = value;
         if let Some(intent) = self.playback_init_intent.as_mut() {
+            intent.set_volume(value);
+        }
+        if let Some(intent) = self.audio_output_resume.as_mut() {
             intent.set_volume(value);
         }
         if changed {

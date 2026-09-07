@@ -1166,6 +1166,10 @@ fn run_playback_runtime(
             }
         }
     }
+    // The event receiver is the browser's teardown barrier. Drop the executor
+    // first so its AudioPlayer releases the output device before the receiver
+    // reports that the runtime has disconnected.
+    drop(executor);
     events.close_sender();
 }
 
@@ -1628,7 +1632,10 @@ fn normalized_gain_from_peak(peak: f32) -> f32 {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Clone)]
     enum FakeOutcome {
@@ -1641,6 +1648,13 @@ mod tests {
         played: Arc<Mutex<Vec<PlaybackRuntimeMode>>>,
         retargeted: Arc<Mutex<Vec<PlaybackRuntimeSpanUpdate>>>,
         stopped: Arc<Mutex<usize>>,
+        dropped: Arc<AtomicBool>,
+        drop_gate: Option<DropGate>,
+    }
+
+    struct DropGate {
+        entered_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
     }
 
     impl FakeExecutor {
@@ -1650,6 +1664,8 @@ mod tests {
                 played: Arc::new(Mutex::new(Vec::new())),
                 retargeted: Arc::new(Mutex::new(Vec::new())),
                 stopped: Arc::new(Mutex::new(0)),
+                dropped: Arc::new(AtomicBool::new(false)),
+                drop_gate: None,
             }
         }
 
@@ -1659,6 +1675,20 @@ mod tests {
 
         fn retargeted(&self) -> Arc<Mutex<Vec<PlaybackRuntimeSpanUpdate>>> {
             Arc::clone(&self.retargeted)
+        }
+
+        fn dropped(&self) -> Arc<AtomicBool> {
+            Arc::clone(&self.dropped)
+        }
+    }
+
+    impl Drop for FakeExecutor {
+        fn drop(&mut self) {
+            if let Some(gate) = self.drop_gate.take() {
+                let _ = gate.entered_tx.send(());
+                let _ = gate.release_rx.recv();
+            }
+            self.dropped.store(true, Ordering::Release);
         }
     }
 
@@ -2280,6 +2310,41 @@ mod tests {
             }
         }
         panic!("retained handle should close after runtime shutdown");
+    }
+
+    #[test]
+    fn playback_runtime_disconnect_waits_for_executor_drop() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut executor = FakeExecutor::new(vec![]);
+        let dropped = executor.dropped();
+        executor.drop_gate = Some(DropGate {
+            entered_tx,
+            release_rx,
+        });
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        runtime.handle.try_shutdown().expect("shutdown");
+        let drop_entered = entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let disconnect_before_release = runtime.events.recv_timeout(Duration::from_millis(50));
+        let release_sent = release_tx.send(()).is_ok();
+        let disconnect_after_release = runtime.events.recv_timeout(Duration::from_secs(1));
+
+        assert!(drop_entered, "executor should be dropped during shutdown");
+        assert!(matches!(
+            disconnect_before_release,
+            Err(PlaybackRuntimeEventRecvTimeoutError::Timeout)
+        ));
+        assert!(
+            release_sent,
+            "drop gate should still own its release receiver"
+        );
+        assert!(matches!(
+            disconnect_after_release,
+            Err(PlaybackRuntimeEventRecvTimeoutError::Disconnected)
+        ));
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

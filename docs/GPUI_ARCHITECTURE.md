@@ -139,6 +139,18 @@ and progress events retain their intent/request fences through module moves.
 Audio processing remains in Reson; moving a control into a UI module does not
 move DSP into the UI.
 
+Audition output routing is split between the UI and the existing Reson output
+boundary. `wavecrate-session` stores only the optional host, device, sample
+rate, and buffer request in its typed preference stream; it does not enumerate
+hardware or open an audio stream. `wavecrate-ui` discovers choices off the UI
+thread and opens `AudioPlayer::from_config` through a single-flight,
+generation-fenced task. A resolved Reson output, including fallback and the
+actual buffer size, is shown separately from the requested settings. Passive
+preference snapshots update the request for the next audition; an explicit
+choice reopens the runtime and resumes the still-current audition only after a
+successful open. View destruction cancels UI tasks, while runtime shutdown
+remains nonblocking.
+
 New persistent workflows must acquire the existing profile/source authorities
 before admitting durable work. Development defaults must remain separate from
 the live Wavecrate profile. The current source registry uses only the isolated
