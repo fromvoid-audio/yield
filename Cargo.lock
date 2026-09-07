@@ -7031,6 +7031,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecrate-session"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.20",
+ "wavecrate-library",
+]
+
+[[package]]
 name = "wavecrate-ui"
 version = "0.1.0"
 dependencies = [
@@ -7040,7 +7049,9 @@ dependencies = [
  "unicode-segmentation",
  "wavecrate-core",
  "wavecrate-design",
+ "wavecrate-library",
  "wavecrate-media",
+ "wavecrate-session",
  "windows 0.62.2",
 ]
 

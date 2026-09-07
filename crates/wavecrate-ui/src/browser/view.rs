@@ -766,6 +766,7 @@ impl Render for Browser {
                     .text_color(color(theme.colors.text_muted))
                     .child(self.playback_status.clone())
                     .child(list_status)
+                    .child(self.source_registry_status.clone())
                     .when(selected_count.is_some(), move |element| {
                         element.child(selected_count.unwrap_or_default())
                     })

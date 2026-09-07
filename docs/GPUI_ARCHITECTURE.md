@@ -19,6 +19,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
+| `wavecrate-session` | App-owned source-registry commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
 | `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
@@ -30,10 +31,12 @@ flowchart TD
     UI --> Core[wavecrate-core]
     UI --> Media[wavecrate-media]
     UI --> Audio[reson]
+    UI --> Session[wavecrate-session]
     Media --> Core
     Media --> Library[wavecrate-library]
     Media --> Analysis[wavecrate-analysis]
     UI --> Design[wavecrate-design]
+    Session --> Library
     Scan[wavecrate-scan] --> Library
 ```
 
@@ -51,10 +54,12 @@ navigation clear batch membership. These choices remain session-only.
 
 The current media scanner is a read-only browsing service. It returns a canonical
 root and every traversed relative directory, including empty directories, so the
-UI can project a complete session-only folder tree without doing filesystem work
-while rendering. It does not replace
-the persistent scanner's ownership, watcher, readiness, journal, or recovery
-contracts. Those services will be integrated when persistent sources are ported.
+UI can project a complete folder tree without doing filesystem work while
+rendering. `wavecrate-session` owns only the ordered registry of accepted
+canonical roots in the isolated `gpui-development` profile. It submits through
+the existing library writer and never opens a source-local database or writes a
+source folder. Persistent scanning, watcher, readiness, journal, and recovery
+contracts remain outside this slice.
 
 WAV waveforms use two buffered streaming passes: the first finds the global
 mono peak and the second feeds normalized frames into bounded peak and frequency
@@ -118,27 +123,34 @@ list viewport and leave pointer and scroll input available to the list.
 
 ## Work and lifecycle
 
-The UI keeps source roots, selected relative folders, expansion sets, and direct
-or descendant scope in an in-memory session registry. Forgetting a source removes
-that record only; no source database or source folder is opened or changed. The
-UI schedules filesystem and decoding work off its event thread and consumes
-results only if their request identity is still current. Replacing a scan
-cancels the prior traversal. Playback initialization and progress events retain
-their intent/request fences through module moves. Audio processing remains in
-Reson; moving a control into a UI module does not move DSP into the UI.
+The browser keeps selected relative folders, expansion sets, direct or descendant
+scope, and scan results in an in-memory session registry. An app-owned
+`SourceRegistryGlobal` persists only canonical roots through `wavecrate-session`
+after a scan succeeds. Restored roots receive their durable IDs and empty
+session data; they do not trigger an automatic scan or audition. Forgetting a
+source stages removal in the same service and keeps it hidden until the command
+and durable snapshot are acknowledged. No source-local database or source
+folder is opened or changed. The UI schedules filesystem and decoding work off
+its event thread and consumes results only if their request identity is still
+current. Replacing a scan cancels the prior traversal. Playback initialization
+and progress events retain their intent/request fences through module moves.
+Audio processing remains in Reson; moving a control into a UI module does not
+move DSP into the UI.
 
 New persistent workflows must acquire the existing profile/source authorities
 before admitting durable work. Development defaults must remain separate from
-the live Wavecrate profile. The current GPUI browser writes no library data.
+the live Wavecrate profile. The current source registry uses only the isolated
+`gpui-development` profile and writes no source-local metadata or audio files;
+theme, autoplay, selection, and scan projections remain session-only.
 
-Future profile ownership belongs in an application-owned service, separate from
-view lifetime. GPUI 0.2.2 allows only 100 ms for quit-observer futures, which is
-not a durable writer-drain guarantee. The service must close admission and join
-its owner synchronously in the quit callback before returning a ready future;
-SQLite work stays on the owner thread. This termination-only wait must not be
-placed in ordinary view destruction or render paths. Release profile guards only
-after accepted commands have drained and database connections have closed.
-An asynchronous quit future alone does not satisfy this ordering.
+The source-registry service is application-owned and separate from view lifetime.
+GPUI 0.2.2 allows only 100 ms for quit-observer futures, which is not a durable
+writer-drain guarantee. The service closes admission and joins its owner
+synchronously in the quit callback before returning a ready future; SQLite work
+stays on the owner thread. This termination-only wait is not placed in ordinary
+view destruction or render paths. Release profile guards only after accepted
+commands have drained and database connections have closed. An asynchronous quit
+future alone does not satisfy this ordering.
 
 ## Development
 

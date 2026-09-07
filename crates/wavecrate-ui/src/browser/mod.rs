@@ -4,7 +4,7 @@
 //! Browser state, scan lifecycle, selection, and keyboard navigation.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
@@ -23,9 +23,11 @@ use wavecrate_core::{
     FolderTreeRow, SortColumn,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
+use wavecrate_library::sample_sources::{SampleSource, SourceId};
 use wavecrate_media::{
     WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
 };
+use wavecrate_session::{RegistryRevision, RequestId};
 
 use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
@@ -33,12 +35,28 @@ use crate::theme::ActiveTheme;
 mod handoff;
 mod motion;
 mod sidebar;
+mod source_registry;
 mod transport;
 mod view;
 mod waveform;
 
+/// Install the app-owned source registry and its application-quit shutdown observer.
+pub(crate) fn install_source_registry(cx: &mut App) {
+    cx.set_global(source_registry::SourceRegistryGlobal::start());
+    let quit_subscription = cx.on_app_quit(|cx| {
+        if cx.has_global::<source_registry::SourceRegistryGlobal>() {
+            cx.global_mut::<source_registry::SourceRegistryGlobal>()
+                .shutdown();
+        }
+        async {}
+    });
+    cx.global_mut::<source_registry::SourceRegistryGlobal>()
+        .retain_quit_subscription(quit_subscription);
+}
+
 #[derive(Clone, Debug)]
 struct SourceSession {
+    source_id: Option<SourceId>,
     root: PathBuf,
     label: String,
     entries: Vec<AudioFile>,
@@ -50,6 +68,12 @@ struct SourceSession {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingRegistryMutation {
+    root: PathBuf,
+    revision: Option<RegistryRevision>,
+}
+
 impl SourceSession {
     fn new(root: PathBuf) -> Self {
         let label = root
@@ -58,6 +82,7 @@ impl SourceSession {
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| root.display().to_string());
         Self {
+            source_id: None,
             root,
             label,
             entries: Vec::new(),
@@ -68,6 +93,12 @@ impl SourceSession {
             selected_audio_id: None,
             last_error: None,
         }
+    }
+
+    fn from_source(source: &SampleSource) -> Self {
+        let mut session = Self::new(source.root.clone());
+        session.source_id = Some(source.id.clone());
+        session
     }
 }
 
@@ -172,6 +203,7 @@ pub(crate) struct Browser {
     active_source: Option<usize>,
     pending_source_label: Option<String>,
     pending_source_return_index: Option<usize>,
+    pending_source_return_root: Option<PathBuf>,
     folder_tree: Option<FolderTree>,
     folder_rows_cache: Vec<FolderTreeRow>,
     selected_folder: PathBuf,
@@ -200,6 +232,15 @@ pub(crate) struct Browser {
     playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
+    source_registry_task: Option<Task<()>>,
+    source_registry_loaded: bool,
+    source_registry_revision: RegistryRevision,
+    source_registry_persisted_revision: RegistryRevision,
+    source_registry_known_roots: BTreeSet<PathBuf>,
+    source_registry_pending_adds: HashMap<RequestId, PendingRegistryMutation>,
+    source_registry_pending_removes: HashMap<RequestId, PendingRegistryMutation>,
+    source_registry_removed_roots: BTreeSet<PathBuf>,
+    source_registry_status: String,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
     waveform_pending: bool,
@@ -243,7 +284,7 @@ impl Browser {
                 view.restore_projection_focus(previous_id, previous_position, cx);
             });
         let motion_settings = Motion::default();
-        Self {
+        let mut browser = Self {
             focus_handle: cx.focus_handle(),
             search_input,
             _search_subscription: search_subscription,
@@ -253,6 +294,7 @@ impl Browser {
             active_source: None,
             pending_source_label: None,
             pending_source_return_index: None,
+            pending_source_return_root: None,
             folder_tree: None,
             folder_rows_cache: Vec::new(),
             selected_folder: PathBuf::from("."),
@@ -281,6 +323,15 @@ impl Browser {
             playback_cursor_interpolation: None,
             scan_cancel: None,
             scan_task: None,
+            source_registry_task: None,
+            source_registry_loaded: false,
+            source_registry_revision: RegistryRevision::default(),
+            source_registry_persisted_revision: RegistryRevision::default(),
+            source_registry_known_roots: BTreeSet::new(),
+            source_registry_pending_adds: HashMap::new(),
+            source_registry_pending_removes: HashMap::new(),
+            source_registry_removed_roots: BTreeSet::new(),
+            source_registry_status: "Loading sources…".to_string(),
             waveform_cancel: None,
             waveform_task: None,
             waveform_pending: false,
@@ -315,7 +366,9 @@ impl Browser {
             list_scroll_handle: UniformListScrollHandle::new(),
             source_scroll_handle: UniformListScrollHandle::new(),
             folder_scroll_handle: UniformListScrollHandle::new(),
-        }
+        };
+        browser.start_source_registry_poll(cx);
+        browser
     }
 
     fn selected_id(&self) -> Option<AudioFileId> {
@@ -455,11 +508,15 @@ impl Browser {
             None
         };
         self.stop_playback();
-        self.pending_source_return_index = if source_index.is_none() {
+        let pending_source_return_index = if source_index.is_none() {
             self.active_source.or(self.pending_source_return_index)
         } else {
             None
         };
+        self.pending_source_return_root = pending_source_return_index
+            .and_then(|index| self.source_sessions.get(index))
+            .map(|session| session.root.clone());
+        self.pending_source_return_index = pending_source_return_index;
         self.active_source = source_index;
         self.pending_source_label = source_index.is_none().then(|| source_label(&root));
         self.root = Some(root.clone());
@@ -491,6 +548,7 @@ impl Browser {
         self.scan_status = format!("Scanning {}…", root.display());
         cx.notify();
 
+        let scan_root = root.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -503,7 +561,7 @@ impl Browser {
                 view.scan_cancel = None;
                 match result {
                     Ok(scan) => view.apply_scan_result(scan, source_index, cx),
-                    Err(error) => view.apply_scan_error(source_index, error, cx),
+                    Err(error) => view.apply_scan_error(source_index, scan_root, error, cx),
                 }
                 cx.notify();
             });
@@ -534,6 +592,7 @@ impl Browser {
         let entries = scan.files;
         let root = scan.root;
         let skipped_entries = scan.skipped_entries;
+        let register_source = self.source_sessions[source_index].source_id.is_none();
         let session = &mut self.source_sessions[source_index];
         session.root = root.clone();
         session.label = source_label(&root);
@@ -547,7 +606,8 @@ impl Browser {
         self.active_source = Some(source_index);
         self.pending_source_label = None;
         self.pending_source_return_index = None;
-        self.root = Some(root);
+        self.pending_source_return_root = None;
+        self.root = Some(root.clone());
         self.entries = entries;
         self.folder_tree = Some(tree);
         self.selected_folder = state.selected;
@@ -565,6 +625,9 @@ impl Browser {
             if count == 1 { "" } else { "s" },
             skipped_entries
         );
+        if register_source {
+            self.submit_source_add(root.clone(), cx);
+        }
         let restore_id = self.restore_selection_id.take().or(previous_selected);
         let restore_position = self.restore_selection_position.take();
         self.restore_projection_focus(restore_id, restore_position, cx);
@@ -573,11 +636,39 @@ impl Browser {
     fn apply_scan_error(
         &mut self,
         source_index: Option<usize>,
+        scan_root: PathBuf,
         error: String,
         cx: &mut Context<Self>,
     ) {
-        let is_refresh = source_index.is_some();
-        let fallback_index = source_index.or(self.pending_source_return_index.take());
+        let source_index =
+            scan_source_index_for_error(&self.source_sessions, &scan_root, source_index);
+        let mut scan_session_index = source_index;
+        if scan_session_index.is_none() {
+            scan_session_index = self
+                .source_sessions
+                .iter()
+                .position(|session| session.root == scan_root);
+        }
+        if source_index.is_none()
+            && scan_session_index
+                .is_some_and(|index| self.source_sessions[index].source_id.is_none())
+        {
+            self.source_sessions
+                .remove(scan_session_index.take().expect("checked"));
+        }
+        let pending_return_root = self.pending_source_return_root.take();
+        let pending_return_index = self.pending_source_return_index.take();
+        let fallback_index = scan_session_index
+            .or_else(|| {
+                pending_return_root.and_then(|root| {
+                    self.source_sessions
+                        .iter()
+                        .position(|session| session.root == root)
+                })
+            })
+            .or_else(|| pending_return_index.filter(|index| *index < self.source_sessions.len()));
+        let is_refresh = source_index.is_some()
+            || fallback_index.is_some_and(|index| self.source_sessions[index].source_id.is_some());
         let Some(index) = fallback_index.filter(|index| *index < self.source_sessions.len()) else {
             self.active_source = None;
             self.pending_source_label = None;
@@ -600,6 +691,7 @@ impl Browser {
         }
         self.active_source = Some(index);
         self.pending_source_return_index = None;
+        self.pending_source_return_root = None;
         self.pending_source_label = None;
         self.root = Some(self.source_sessions[index].root.clone());
         self.entries = self.source_sessions[index].entries.clone();
@@ -631,9 +723,21 @@ impl Browser {
     }
 
     pub(super) fn source_rows(&self) -> Vec<(usize, PathBuf, String, bool, Option<String>)> {
+        let pending_add_roots: BTreeSet<&Path> = self
+            .source_registry_pending_adds
+            .values()
+            .map(|mutation| mutation.root.as_path())
+            .collect();
         self.source_sessions
             .iter()
             .enumerate()
+            .filter(|(_, session)| {
+                !self.source_registry_removed_roots.contains(&session.root)
+                    && !(session.source_id.is_none()
+                        && self.scan_cancel.is_some()
+                        && self.root.as_deref() == Some(session.root.as_path())
+                        && !pending_add_roots.contains(session.root.as_path()))
+            })
             .map(|(index, session)| {
                 (
                     index,
@@ -801,18 +905,34 @@ impl Browser {
         if index >= self.source_sessions.len() {
             return;
         }
+        let root = self.source_sessions[index].root.clone();
+        let has_registry_identity = self.source_sessions[index].source_id.is_some()
+            || self
+                .source_registry_pending_adds
+                .values()
+                .any(|mutation| mutation.root == root);
+        if !self.submit_source_remove(root.clone(), cx) {
+            cx.notify();
+            return;
+        }
         self.reset_focus();
         self.reset_scroll_edges();
         let was_active = self.active_source == Some(index);
+        if !has_registry_identity {
+            self.source_sessions.remove(index);
+            if let Some(active) = self.active_source
+                && active > index
+            {
+                self.active_source = Some(active - 1);
+            }
+        }
         if was_active {
             self.selection.clear();
         }
-        let had_pending_scan = if let Some(cancellation) = self.scan_cancel.take() {
+        let had_pending_scan = self.scan_cancel.is_some() && self.root.as_deref() == Some(&root);
+        if had_pending_scan && let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
-            true
-        } else {
-            false
-        };
+        }
         if had_pending_scan {
             self.selection.clear();
         }
@@ -823,35 +943,10 @@ impl Browser {
             self.stop_playback();
         }
         self.pending_source_return_index = None;
-        self.source_sessions.remove(index);
-        if self.source_sessions.is_empty() {
+        self.pending_source_return_root = None;
+        if was_active {
             self.active_source = None;
-            self.pending_source_label = None;
-            self.root = None;
-            self.entries.clear();
-            self.folder_tree = None;
-            self.folder_rows_cache.clear();
-            self.selected = None;
-            self.waveform_pending = false;
-            self.waveform = None;
-            self.waveform_error = None;
-            self.view_model.set_entries(&self.entries);
-            self.scan_status = "Add a source folder to begin".to_string();
-        } else if was_active || had_pending_scan {
-            let next_index = next_source_index_after_removal(
-                self.active_source,
-                index,
-                self.source_sessions.len(),
-            )
-            .expect("source list is non-empty after removal");
-            self.active_source = None;
-            self.select_source(next_index, _window, cx);
-            self.reset_focus();
-        } else if let Some(active) = self.active_source {
-            self.active_source = Some(
-                next_source_index_after_removal(Some(active), index, self.source_sessions.len())
-                    .expect("source list is non-empty after removal"),
-            );
+            self.clear_active_source_projection(cx);
         }
         cx.notify();
     }
@@ -1357,6 +1452,7 @@ impl Drop for Browser {
         if let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }
+        self.source_registry_task.take();
         self.cancel_waveform_load();
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
@@ -1394,26 +1490,22 @@ fn resolve_scan_source_index(
     sessions.len() - 1
 }
 
-fn next_source_index_after_removal(
-    active_source: Option<usize>,
-    removed_index: usize,
-    remaining_sources: usize,
+fn scan_source_index_for_error(
+    sessions: &[SourceSession],
+    scan_root: &Path,
+    source_index_hint: Option<usize>,
 ) -> Option<usize> {
-    if remaining_sources == 0 {
-        return None;
-    }
-    Some(
-        active_source
-            .map(|active| {
-                if active > removed_index {
-                    active - 1
-                } else {
-                    active
-                }
-            })
-            .unwrap_or(0)
-            .min(remaining_sources - 1),
-    )
+    source_index_hint
+        .filter(|index| {
+            sessions
+                .get(*index)
+                .is_some_and(|session| session.root == scan_root)
+        })
+        .or_else(|| {
+            sessions
+                .iter()
+                .position(|session| session.root == scan_root)
+        })
 }
 
 fn source_label(root: &Path) -> String {
@@ -1427,10 +1519,11 @@ fn source_label(root: &Path) -> String {
 mod tests {
     use super::{
         SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
-        next_source_index_after_removal, resolve_scan_source_index, sample_click_intent,
+        resolve_scan_source_index, sample_click_intent, scan_source_index_for_error,
         selection_origin_for_click, selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
+    use wavecrate_library::sample_sources::{SampleSource, SourceId};
 
     #[test]
     fn invalid_theme_keeps_the_last_good_path() {
@@ -1483,10 +1576,31 @@ mod tests {
     }
 
     #[test]
-    fn source_removal_remaps_active_index_and_fences_empty_state() {
-        assert_eq!(next_source_index_after_removal(Some(2), 0, 2), Some(1));
-        assert_eq!(next_source_index_after_removal(Some(0), 1, 2), Some(0));
-        assert_eq!(next_source_index_after_removal(None, 0, 0), None);
+    fn scan_failure_ignores_stale_index_after_source_reorder() {
+        let first = PathBuf::from("/canonical/first");
+        let second = PathBuf::from("/canonical/second");
+        let sessions = vec![
+            SourceSession::new(first),
+            SourceSession::new(second.clone()),
+        ];
+
+        assert_eq!(
+            scan_source_index_for_error(&sessions, &second, Some(0)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn restored_source_session_starts_with_identity_but_empty_projection() {
+        let root = PathBuf::from("/canonical/restored");
+        let source = SampleSource::new_with_id(SourceId::from_string("restored-id"), root.clone());
+        let session = SourceSession::from_source(&source);
+
+        assert_eq!(session.source_id, Some(source.id));
+        assert_eq!(session.root, root);
+        assert!(session.entries.is_empty());
+        assert_eq!(session.tree, super::FolderTree::default());
+        assert!(session.selected_audio_id.is_none());
     }
 
     #[test]

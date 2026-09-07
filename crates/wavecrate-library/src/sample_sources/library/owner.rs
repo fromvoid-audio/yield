@@ -139,6 +139,10 @@ enum WriterCommand {
     LoadSourceRegistry {
         result: SyncSender<Result<SourceRegistrySnapshot, LibraryError>>,
     },
+    LookupRetainedSource {
+        root: PathBuf,
+        result: SyncSender<Result<Option<SampleSource>, LibraryError>>,
+    },
     ReplaceSourceRegistry {
         snapshot: SourceRegistrySnapshot,
         result: SyncSender<Result<(), LibraryError>>,
@@ -149,6 +153,10 @@ enum WriterReply {
     Load {
         result: SyncSender<Result<SourceRegistrySnapshot, LibraryError>>,
         value: Result<SourceRegistrySnapshot, LibraryError>,
+    },
+    LookupRetainedSource {
+        result: SyncSender<Result<Option<SampleSource>, LibraryError>>,
+        value: Result<Option<SampleSource>, LibraryError>,
     },
     Replace {
         result: SyncSender<Result<(), LibraryError>>,
@@ -162,6 +170,9 @@ impl WriterReply {
             Self::Load { result, value } => {
                 let _ = result.send(value);
             }
+            Self::LookupRetainedSource { result, value } => {
+                let _ = result.send(value);
+            }
             Self::Replace { result, value } => {
                 let _ = result.send(value);
             }
@@ -171,6 +182,9 @@ impl WriterReply {
     fn send_error(self, error: LibraryError) {
         match self {
             Self::Load { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::LookupRetainedSource { result, .. } => {
                 let _ = result.send(Err(error));
             }
             Self::Replace { result, .. } => {
@@ -357,6 +371,25 @@ impl GlobalLibraryWriter {
         self.ensure_available()?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.send(WriterCommand::LoadSourceRegistry { result: result_tx })?;
+        Ok(result_rx)
+    }
+
+    /// Queue a lookup of the retained descriptor for one source root.
+    ///
+    /// The root is owned by the queued command so the lookup remains confined to the profile
+    /// owner thread. This preserves historical source ids and metadata policy without exposing
+    /// the library database connection to callers.
+    pub fn lookup_retained_source_for_root(
+        &self,
+        root: PathBuf,
+    ) -> Result<Receiver<Result<Option<SampleSource>, LibraryError>>, GlobalLibraryWriterQueueError>
+    {
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::LookupRetainedSource {
+            root,
+            result: result_tx,
+        })?;
         Ok(result_rx)
     }
 
@@ -587,6 +620,10 @@ fn execute_command(command: WriterCommand, database: &mut LibraryDatabase) -> Wr
             value: database.load_source_registry(),
             result,
         },
+        WriterCommand::LookupRetainedSource { root, result } => WriterReply::LookupRetainedSource {
+            value: database.lookup_retained_source(&root),
+            result,
+        },
         WriterCommand::ReplaceSourceRegistry { snapshot, result } => WriterReply::Replace {
             value: database.replace_source_registry(&snapshot),
             result,
@@ -631,6 +668,9 @@ fn reject_remaining_profile_change(
 fn send_command_error(command: WriterCommand, error: LibraryError) {
     match command {
         WriterCommand::LoadSourceRegistry { result } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::LookupRetainedSource { result, .. } => {
             let _ = result.send(Err(error));
         }
         WriterCommand::ReplaceSourceRegistry { result, .. } => {
@@ -947,6 +987,16 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("remove result")
             .expect("remove");
+        let retained_lookup = writer
+            .lookup_retained_source_for_root(root.clone())
+            .expect("retained lookup admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retained lookup result")
+            .expect("retained lookup");
+        assert_eq!(
+            retained_lookup.expect("retained descriptor").id,
+            retained.id
+        );
         assert!(writer.shutdown());
         drop(writable_guard);
 

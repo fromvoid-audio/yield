@@ -386,6 +386,44 @@ repairing a format-ID type and test borrow errors. Full Windows app compilation
 remains blocked by the missing C cross-toolchain; Windows execution and DAW
 paste acceptance remain unverified.
 
+### Isolated source registry and application shutdown, 2026-09-07
+
+`wavecrate-session` now owns the ordered registry of accepted canonical source
+roots in the isolated `gpui-development` profile. The browser submits `AddRoot`
+only after a scan succeeds and consumes immutable snapshots through the
+app-owned `SourceRegistryGlobal`; restored roots receive durable IDs and empty
+session data without an automatic scan or audition. Removal hides a source
+while its request is pending and reconciles it only after the corresponding
+request and durable snapshot acknowledgements. Duplicate add/remove requests
+are resolved by explicit `RequestApplied` events, including idempotent no-ops,
+so UI state does not infer completion from an intermediate snapshot. Persistence
+failure closes the mutation path and leaves an error in the status bar.
+
+The service is retained until application quit. The quit observer closes
+admission and joins the owner synchronously before returning its ready future;
+dropping a Browser only cancels its event poll. The service writes only the
+isolated source registry through the existing library writer. It does not write
+source-local databases, metadata, or audio files; theme, autoplay, selection,
+and scan projections remain session-only. The application Quit menu item and
+Cmd/Ctrl-Q action use the same graceful boundary, so normal exit exercises the
+service shutdown observer.
+
+Validation: `cargo test -p wavecrate-ui --lib` passed 45 tests with one manual
+waveform benchmark ignored, and `cargo check -p wavecrate-ui` passed after the
+integration. The focused tests cover restored-ID matching, in-flight scan
+preservation, stable-root failure mapping after source reorder, and the
+selection session projection. `cargo fmt --all -- --check` and `git diff --check`
+passed. The session service passed 11 tests and the library writer passed 15
+targeted tests. The full locked workspace suite and signed macOS build passed.
+Independent review identified idle ownership-failure reporting and unresolved
+requests; the fix was reviewed with no residual finding in those paths.
+
+Live validation used a disposable config base under `target/qa`: successful
+scan/add and save, graceful Cmd-Q, restored source without scanning or audition,
+source removal, another graceful quit, and an empty registry on reopen. Source
+audio files remained unchanged and the database was confined to the
+`gpui-development` profile. Windows lifecycle execution remains unverified.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

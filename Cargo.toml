@@ -8,6 +8,7 @@ members = [
     "crates/reson",
     "crates/wavecrate-analysis",
     "crates/wavecrate-library",
+    "crates/wavecrate-session",
     "crates/wavecrate-scan",
 ]
 default-members = ["crates/wavecrate-gpui"]
@@ -35,6 +36,7 @@ wavecrate-core = { path = "crates/wavecrate-core" }
 wavecrate-media = { path = "crates/wavecrate-media" }
 wavecrate-design = { path = "crates/wavecrate-design" }
 wavecrate-ui = { path = "crates/wavecrate-ui" }
+wavecrate-session = { path = "crates/wavecrate-session" }
 tempfile = "3.23.0"
 
 # Keep GPUI layout/tessellation and audio decoding optimized in development.

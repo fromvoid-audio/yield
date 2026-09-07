@@ -7,8 +7,8 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use gpui::{
-    App, AppContext, Application, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowOptions,
-    point, px, size,
+    App, AppContext, Application, Bounds, Focusable, KeyBinding, Menu, MenuItem, TitlebarOptions,
+    WindowBounds, WindowOptions, actions, point, px, size,
 };
 
 mod browser;
@@ -16,12 +16,29 @@ pub(crate) mod external_clipboard;
 mod search_input;
 mod theme;
 
+actions!(
+    wavecrate_ui,
+    [
+        #[allow(missing_docs)]
+        Quit
+    ]
+);
+
 const WINDOW_WIDTH: f32 = 1_120.0;
 const WINDOW_HEIGHT: f32 = 720.0;
 
 /// Start the browser window.
 pub fn run(initial_root: Option<PathBuf>) {
     Application::new().run(move |cx: &mut App| {
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("ctrl-q", Quit, None),
+        ]);
+        cx.set_menus(vec![Menu {
+            name: "Wavecrate".into(),
+            items: vec![MenuItem::action("Quit", Quit)],
+        }]);
         cx.set_global(theme::ActiveTheme::default());
         if let Err(error) = cx
             .text_system()
@@ -32,6 +49,7 @@ pub fn run(initial_root: Option<PathBuf>) {
             eprintln!("could not register Ioskeley Mono: {error}");
         }
         search_input::install_keybindings(cx);
+        browser::install_source_registry(cx);
         let initial_root = initial_root.clone();
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         cx.open_window(
