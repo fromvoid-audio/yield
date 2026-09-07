@@ -336,6 +336,29 @@ Live fixture checks confirmed seeking near 75%, repeated two-second loop playbac
 and one-shot completion with looping disabled. These are transport/UI checks,
 not manual audible acceptance.
 
+### Waveform play-region audition, 2026-09-07
+
+Primary-button dragging over a loaded waveform previews a normalized play
+region and commits the ordered, non-zero range on release. A release within the
+reference two-logical-pixel horizontal click slop clears the prior region and
+auditions the release position; releases outside the waveform clamp to its
+captured bounds. Escape cancels the provisional drag and preserves the previous
+committed region. Space and toolbar Play use the committed region for bounded
+one-shot playback or the next loop audition, while a direct waveform click
+clears it before seeking. The selection fill and playhead theme tokens are
+paint-only overlays, so waveform geometry caching and idle rendering remain
+unchanged. Source/sample changes, generation invalidation, and waveform load
+errors clear both provisional and committed regions.
+
+Secondary edit selections, region resize/move/shift gestures, zoom/pan, and
+extraction/editing remain outside this slice.
+
+Validation: the isolated clean-base region build passed all 49 UI tests (one
+manual geometry benchmark ignored), formatting, diff checks, and signed macOS
+build verification. Live fixture checks confirmed drag edges, bounded one-shot
+completion, sustained region looping, and click-to-clear seeking. Manual audible
+acceptance remains separate.
+
 ### Selection autoplay, 2026-09-07
 
 Selection autoplay is a session-only preference enabled by default. A changed

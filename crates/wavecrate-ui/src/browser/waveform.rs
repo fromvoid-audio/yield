@@ -6,14 +6,91 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    Bounds, ClickEvent, Context, Path, PathBuilder, Pixels, Point, canvas, div, fill, point,
-    prelude::*, px,
+    Bounds, Context, DragMoveEvent, MouseButton, MouseDownEvent, MouseUpEvent, Path, PathBuilder,
+    Pixels, Point, Render, Window, canvas, div, fill, point, prelude::*, px,
 };
 use wavecrate_design::Theme;
 
 use crate::theme::color;
 
 use super::Browser;
+
+const WAVEFORM_SELECTION_CLICK_SLOP_PX: f32 = 2.0;
+const WAVEFORM_SELECTION_EDGE_WIDTH: f32 = 1.0;
+
+/// One normalized, ordered playback region in the selected waveform.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct WaveformPlayRegion {
+    pub(super) start: f64,
+    pub(super) end: f64,
+}
+
+impl WaveformPlayRegion {
+    pub(super) fn new(start: f64, end: f64) -> Option<Self> {
+        let start = normalized_waveform_position(start)?;
+        let end = normalized_waveform_position(end)?;
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        (start < end).then_some(Self { start, end })
+    }
+
+    pub(super) fn is_valid(self) -> bool {
+        self.start.is_finite()
+            && self.end.is_finite()
+            && (0.0..=1.0).contains(&self.start)
+            && (0.0..=1.0).contains(&self.end)
+            && self.start < self.end
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct WaveformRegionDrag {
+    anchor: f64,
+    current: f64,
+    anchor_x: f32,
+    bounds: Bounds<Pixels>,
+    moved: bool,
+    generation: u64,
+}
+
+impl WaveformRegionDrag {
+    fn begin(position: Point<Pixels>, ratio: f64, bounds: Bounds<Pixels>, generation: u64) -> Self {
+        Self {
+            anchor: ratio,
+            current: ratio,
+            anchor_x: f32::from(position.x),
+            bounds,
+            moved: false,
+            generation,
+        }
+    }
+
+    fn update(&mut self, position: Point<Pixels>) {
+        if let Some(ratio) = waveform_click_ratio(position, self.bounds) {
+            self.current = ratio;
+        }
+        self.moved |=
+            (f32::from(position.x) - self.anchor_x).abs() > WAVEFORM_SELECTION_CLICK_SLOP_PX;
+    }
+
+    fn preview_region(self) -> Option<WaveformPlayRegion> {
+        WaveformPlayRegion::new(self.anchor, self.current)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WaveformDragToken;
+
+struct WaveformDragGhost;
+
+impl Render for WaveformDragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
 
 fn build_waveform_path(
     extents: &[[f32; 4]],
@@ -308,24 +385,124 @@ pub(super) fn render_waveform(
         .left_0()
         .right_0(),
     );
+    if let Some(region) = browser
+        .waveform_region_drag
+        .and_then(WaveformRegionDrag::preview_region)
+        .or(browser.waveform_play_region)
+    {
+        bars = bars.child(waveform_region_overlay(
+            region,
+            color(theme.colors.selection_fill),
+            color(theme.colors.waveform_playhead),
+        ));
+    }
     if let Some(ratio) = playback_cursor_ratio {
         bars = bars.child(playback_cursor_overlay(
             ratio,
             color(theme.colors.waveform_playhead),
         ));
     }
-    bars.on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
-        window.focus(&view.focus_handle);
-        if view.waveform.is_none() {
-            return;
+    let click_bounds_for_down = Rc::clone(&click_bounds);
+    bars.on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            window.focus(&view.focus_handle);
+            if view.waveform.is_none() {
+                return;
+            }
+            let Some(bounds) = click_bounds_for_down.borrow().as_ref().copied() else {
+                return;
+            };
+            let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
+                return;
+            };
+            view.waveform_region_drag = Some(WaveformRegionDrag::begin(
+                event.position,
+                ratio,
+                bounds,
+                view.waveform_generation,
+            ));
+            cx.notify();
+        }),
+    )
+    .on_drag(WaveformDragToken, |_, _, _, cx| {
+        cx.new(|_| WaveformDragGhost)
+    })
+    .on_drag_move::<WaveformDragToken>(cx.listener(
+        |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
+            view.update_waveform_region_drag(event.event.position);
+            cx.notify();
+        },
+    ))
+    .on_mouse_up(
+        MouseButton::Left,
+        cx.listener(|view, event: &MouseUpEvent, _, cx| {
+            view.finish_waveform_region_drag(event.position, cx);
+        }),
+    )
+    .on_mouse_up_out(
+        MouseButton::Left,
+        cx.listener(|view, event: &MouseUpEvent, _, cx| {
+            view.finish_waveform_region_drag(event.position, cx);
+        }),
+    )
+}
+
+impl Browser {
+    pub(super) fn clear_waveform_region(&mut self) {
+        self.waveform_play_region = None;
+        self.waveform_region_drag = None;
+    }
+
+    pub(super) fn cancel_waveform_region_drag(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.waveform_region_drag.take().is_none() {
+            return false;
         }
-        let Some(bounds) = click_bounds.borrow().as_ref().copied() else {
+        cx.stop_active_drag(window);
+        true
+    }
+
+    pub(super) fn invalidate_waveform_generation(&mut self) {
+        self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.clear_waveform_region();
+    }
+
+    fn update_waveform_region_drag(&mut self, position: Point<Pixels>) {
+        let Some(drag) = self.waveform_region_drag.as_mut() else {
             return;
         };
-        if let Some(ratio) = waveform_click_ratio(event.position(), bounds) {
-            view.start_playback_from_position(ratio, cx);
+        if !waveform_drag_is_current(*drag, self.waveform_generation, self.waveform.is_some()) {
+            self.waveform_region_drag = None;
+            return;
         }
-    }))
+        drag.update(position);
+    }
+
+    fn finish_waveform_region_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.waveform_region_drag.take() else {
+            return;
+        };
+        if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
+            return;
+        }
+        let Some(ratio) = waveform_click_ratio(position, drag.bounds) else {
+            return;
+        };
+        let mut drag = drag;
+        drag.update(position);
+        if drag.moved {
+            self.stop_playback();
+            self.waveform_play_region = drag.preview_region();
+        } else {
+            self.waveform_play_region = None;
+            self.start_playback_from_position(ratio, cx);
+        }
+        cx.notify();
+    }
 }
 
 fn waveform_click_ratio(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<f64> {
@@ -336,6 +513,61 @@ fn waveform_click_ratio(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Opti
         return None;
     }
     Some(((x - left) / width).clamp(0.0, 1.0) as f64)
+}
+
+fn normalized_waveform_position(position: f64) -> Option<f64> {
+    position.is_finite().then(|| position.clamp(0.0, 1.0))
+}
+
+fn waveform_drag_is_current(
+    drag: WaveformRegionDrag,
+    generation: u64,
+    waveform_loaded: bool,
+) -> bool {
+    waveform_loaded && drag.generation == generation
+}
+
+fn waveform_region_overlay(
+    region: WaveformPlayRegion,
+    selection_color: gpui::Hsla,
+    edge_color: gpui::Hsla,
+) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            if !width.is_finite() || width <= 0.0 || !height.is_finite() || height <= 0.0 {
+                return;
+            }
+            let start = width * region.start as f32;
+            let end = width * region.end as f32;
+            if !start.is_finite() || !end.is_finite() || end <= start {
+                return;
+            }
+            let selection_bounds = Bounds::from_corners(
+                point(bounds.left() + px(start), bounds.top()),
+                point(bounds.left() + px(end), bounds.bottom()),
+            );
+            window.paint_quad(fill(selection_bounds, selection_color));
+            let edge_width = WAVEFORM_SELECTION_EDGE_WIDTH.min(width);
+            for x in [start, (end - edge_width).max(start)] {
+                let edge_bounds = Bounds::from_corners(
+                    point(bounds.left() + px(x), bounds.top()),
+                    point(
+                        bounds.left() + px((x + edge_width).min(width)),
+                        bounds.bottom(),
+                    ),
+                );
+                window.paint_quad(fill(edge_bounds, edge_color));
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left_0()
+    .right_0()
 }
 
 const PLAYBACK_CURSOR_WIDTH: f32 = 2.0;
@@ -457,6 +689,76 @@ mod tests {
     fn waveform_click_position_rejects_empty_bounds() {
         let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(0.0), px(20.0)));
         assert_eq!(waveform_click_ratio(point(px(5.0), px(5.0)), bounds), None);
+    }
+
+    #[test]
+    fn play_region_orders_clamps_and_rejects_zero_width_or_non_finite_ranges() {
+        assert_eq!(
+            WaveformPlayRegion::new(0.75, 0.25),
+            Some(WaveformPlayRegion {
+                start: 0.25,
+                end: 0.75,
+            })
+        );
+        assert_eq!(
+            WaveformPlayRegion::new(-0.2, 1.2),
+            Some(WaveformPlayRegion {
+                start: 0.0,
+                end: 1.0,
+            })
+        );
+        assert_eq!(WaveformPlayRegion::new(0.5, 0.5), None);
+        assert_eq!(WaveformPlayRegion::new(f64::NAN, 0.5), None);
+        assert_eq!(WaveformPlayRegion::new(0.5, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn region_drag_uses_logical_pixel_slop_and_clamped_release_position() {
+        let bounds = test_bounds(100.0, 20.0);
+        let mut drag = WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, 9);
+
+        drag.update(point(px(27.0), px(5.0)));
+        assert!(!drag.moved);
+        let preview = drag.preview_region().expect("preview remains non-zero");
+        assert_eq!(preview.start, 0.25);
+        assert!((preview.end - 0.27).abs() < 1e-6);
+
+        let mut vertical_drag =
+            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, 9);
+        vertical_drag.update(point(px(25.0), px(80.0)));
+        assert!(!vertical_drag.moved);
+        assert_eq!(vertical_drag.preview_region(), None);
+
+        drag.update(point(px(140.0), px(5.0)));
+        assert!(drag.moved);
+        assert_eq!(
+            drag.preview_region(),
+            Some(WaveformPlayRegion {
+                start: 0.25,
+                end: 1.0,
+            })
+        );
+        assert_eq!(drag.generation, 9);
+
+        let mut threshold_drag =
+            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, 9);
+        threshold_drag.update(point(px(27.01), px(5.0)));
+        assert!(threshold_drag.moved);
+
+        let mut outside_drag = WaveformRegionDrag::begin(point(px(50.0), px(5.0)), 0.5, bounds, 9);
+        outside_drag.update(point(px(-5.0), px(5.0)));
+        assert!(outside_drag.moved);
+        assert_eq!(outside_drag.current, 0.0);
+    }
+
+    #[test]
+    fn stale_or_unloaded_region_drags_cannot_commit() {
+        let drag =
+            WaveformRegionDrag::begin(point(px(20.0), px(5.0)), 0.2, test_bounds(100.0, 20.0), 9);
+
+        assert!(waveform_drag_is_current(drag, 9, true));
+        assert!(!waveform_drag_is_current(drag, 10, true));
+        assert!(!waveform_drag_is_current(drag, 9, false));
     }
 
     #[test]

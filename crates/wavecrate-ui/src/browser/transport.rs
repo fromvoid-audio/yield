@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::Browser;
+use super::waveform::WaveformPlayRegion;
 use gpui::Context;
 use reson::{
     AudioPlayer, PlaybackRequestId, PlaybackRuntime, PlaybackRuntimeConfig, PlaybackRuntimeEvent,
@@ -33,6 +34,7 @@ pub(super) enum PlaybackIntentOrigin {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PlaybackIntent {
     pub(super) start: f64,
+    pub(super) region: Option<WaveformPlayRegion>,
     pub(super) looped: bool,
     pub(super) path: std::path::PathBuf,
     pub(super) origin: PlaybackIntentOrigin,
@@ -283,8 +285,11 @@ impl Browser {
             self.playback_status = "Invalid playback position".to_string();
             return None;
         };
+        let region = self.waveform_play_region.filter(|region| region.is_valid());
+        let start = region.map_or(start, |region| region.start);
         Some(PlaybackIntent {
             start,
+            region,
             looped: self.loop_enabled,
             path,
             origin,
@@ -298,6 +303,12 @@ impl Browser {
             cx.notify();
             return;
         };
+        if intent.region.is_some_and(|region| !region.is_valid()) {
+            self.clear_playback_cursor();
+            self.playback_status = "Invalid playback region".to_string();
+            cx.notify();
+            return;
+        }
         let intent = PlaybackIntent { start, ..intent };
         self.clear_playback_cursor();
         self.playback_cursor_pending = Some(start as f32);
@@ -537,6 +548,19 @@ fn should_queue_initialized_playback(
 
 fn playback_mode_for_intent(intent: &PlaybackIntent) -> PlaybackRuntimeMode {
     let start = normalized_playback_start(intent.start).unwrap_or(0.0);
+    if let Some(region) = intent.region.filter(|region| region.is_valid()) {
+        if intent.looped {
+            return PlaybackRuntimeMode::Looped {
+                start: region.start,
+                end: region.end,
+                offset: region.start,
+            };
+        }
+        return PlaybackRuntimeMode::OneShot {
+            start: region.start,
+            end: region.end,
+        };
+    }
     if intent.looped {
         PlaybackRuntimeMode::Looped {
             start: 0.0,
@@ -630,6 +654,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use super::super::waveform::WaveformPlayRegion;
+
     #[test]
     fn stale_stop_event_cannot_clear_a_replay() {
         let first_play = 1;
@@ -695,6 +721,7 @@ mod tests {
         assert_eq!(
             playback_mode_for_intent(&PlaybackIntent {
                 start: 1.2,
+                region: None,
                 looped: false,
                 path: path.clone(),
                 origin: PlaybackIntentOrigin::Explicit,
@@ -707,6 +734,7 @@ mod tests {
         assert_eq!(
             playback_mode_for_intent(&PlaybackIntent {
                 start: 0.35,
+                region: None,
                 looped: true,
                 path,
                 origin: PlaybackIntentOrigin::SelectionAutoplay,
@@ -715,6 +743,39 @@ mod tests {
                 start: 0.0,
                 end: 1.0,
                 offset: 0.35,
+            }
+        );
+    }
+
+    #[test]
+    fn playback_mode_uses_the_selected_region_for_one_shot_and_loop() {
+        let path = PathBuf::from("sample.wav");
+        let region = WaveformPlayRegion::new(0.25, 0.75).expect("valid region");
+        let one_shot = PlaybackIntent {
+            start: region.start,
+            region: Some(region),
+            looped: false,
+            path: path.clone(),
+            origin: PlaybackIntentOrigin::Explicit,
+        };
+        assert_eq!(
+            playback_mode_for_intent(&one_shot),
+            PlaybackRuntimeMode::OneShot {
+                start: 0.25,
+                end: 0.75,
+            }
+        );
+
+        let looped = PlaybackIntent {
+            looped: true,
+            ..one_shot
+        };
+        assert_eq!(
+            playback_mode_for_intent(&looped),
+            PlaybackRuntimeMode::Looped {
+                start: 0.25,
+                end: 0.75,
+                offset: 0.25,
             }
         );
     }

@@ -423,7 +423,7 @@ impl Browser {
         self.stop_playback();
         self.cancel_waveform_load();
         self.scan_generation = self.scan_generation.wrapping_add(1);
-        self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.invalidate_waveform_generation();
         self.active_source = None;
         self.root = None;
         self.entries.clear();

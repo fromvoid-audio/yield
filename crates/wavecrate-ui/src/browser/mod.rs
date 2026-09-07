@@ -217,6 +217,8 @@ pub(crate) struct Browser {
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
+    waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    waveform_region_drag: Option<waveform::WaveformRegionDrag>,
     scan_status: String,
     playback_status: String,
     scan_generation: u64,
@@ -308,6 +310,8 @@ impl Browser {
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
+            waveform_play_region: None,
+            waveform_region_drag: None,
             scan_status: "Choose a folder or pass one on the command line".to_string(),
             playback_status: "Ready".to_string(),
             scan_generation: 0,
@@ -464,7 +468,7 @@ impl Browser {
                     self.waveform_pending = false;
                     self.waveform = None;
                     self.waveform_error = None;
-                    self.waveform_generation = self.waveform_generation.wrapping_add(1);
+                    self.invalidate_waveform_generation();
                 }
                 if let Some(index) = self.active_source
                     && let Some(session) = self.source_sessions.get_mut(index)
@@ -508,6 +512,7 @@ impl Browser {
             None
         };
         self.stop_playback();
+        self.clear_waveform_region();
         let pending_source_return_index = if source_index.is_none() {
             self.active_source.or(self.pending_source_return_index)
         } else {
@@ -540,7 +545,7 @@ impl Browser {
             self.expanded_folders = BTreeSet::from([PathBuf::from(".")]);
             self.folder_scope = FolderScope::DirectOnly;
         }
-        self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.invalidate_waveform_generation();
         self.scan_generation = self.scan_generation.wrapping_add(1);
         let generation = self.scan_generation;
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -938,7 +943,7 @@ impl Browser {
         }
         if had_pending_scan || was_active {
             self.scan_generation = self.scan_generation.wrapping_add(1);
-            self.waveform_generation = self.waveform_generation.wrapping_add(1);
+            self.invalidate_waveform_generation();
             self.cancel_waveform_load();
             self.stop_playback();
         }
@@ -1086,7 +1091,7 @@ impl Browser {
         }
         self.waveform = None;
         self.waveform_error = None;
-        self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.invalidate_waveform_generation();
         let generation = self.waveform_generation;
         self.waveform_pending = true;
         let path = entry.path;
@@ -1107,7 +1112,10 @@ impl Browser {
                 view.waveform_pending = false;
                 match result {
                     Ok(preview) => view.waveform = Some(preview),
-                    Err(error) => view.waveform_error = Some(error),
+                    Err(error) => {
+                        view.clear_waveform_region();
+                        view.waveform_error = Some(error);
+                    }
                 }
                 cx.notify();
             });
@@ -1439,6 +1447,7 @@ impl Browser {
                 cx,
             ),
             "escape" => {
+                self.cancel_waveform_region_drag(window, cx);
                 self.stop_playback();
                 cx.notify();
             }
