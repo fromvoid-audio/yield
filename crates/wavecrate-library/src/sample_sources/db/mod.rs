@@ -597,9 +597,7 @@ fn snapshot_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
 
 /// Unit tests for source-database open, migration, and metadata invariants.
 #[cfg(test)]
-#[path = "../../../../../tests/unit/source_db_mod_tests/mod.rs"]
 mod source_db_mod_tests;
 
 #[cfg(test)]
-#[path = "../../../../../tests/unit/source_db_migration_tests.rs"]
 mod source_db_migration_tests;

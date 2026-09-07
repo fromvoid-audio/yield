@@ -144,5 +144,4 @@ impl Default for ResolvedOutput {
 
 /// Unit tests for audio output callback and stream config behavior.
 #[cfg(test)]
-#[path = "../../../../tests/unit/audio_output_tests.rs"]
 mod tests;
