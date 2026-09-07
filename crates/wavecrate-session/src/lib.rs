@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use wavecrate_library::app_dirs::{
@@ -26,7 +26,7 @@ use wavecrate_library::sample_sources::{
 
 mod preferences;
 
-use preferences::{PreferenceCoordinator, PreferenceOutcome};
+use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 pub use preferences::{
     PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
     UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
@@ -402,6 +402,25 @@ struct PreferenceSaveInFlight {
     receiver: Receiver<Result<(), LibraryError>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreferenceSaveHint {
+    None,
+    DebounceOutputVolume,
+    Immediate,
+}
+
+impl PreferenceSaveHint {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Immediate, _) | (_, Self::Immediate) => Self::Immediate,
+            (Self::DebounceOutputVolume, _) | (_, Self::DebounceOutputVolume) => {
+                Self::DebounceOutputVolume
+            }
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+}
+
 struct Coordinator {
     loaded: bool,
     baseline: Vec<SampleSource>,
@@ -611,6 +630,7 @@ struct Persistence {
     pending_adds: HashMap<RequestId, PendingAdd>,
     save: Option<SaveInFlight>,
     preference_save: Option<PreferenceSaveInFlight>,
+    preference_save_deadline: PreferenceSaveDeadline,
     force_save: bool,
     unavailable: Option<SessionError>,
     preference_unavailable: Option<SessionError>,
@@ -629,6 +649,7 @@ impl Persistence {
             pending_adds: HashMap::new(),
             save: None,
             preference_save: None,
+            preference_save_deadline: PreferenceSaveDeadline::default(),
             force_save: false,
             unavailable: None,
             preference_unavailable: None,
@@ -687,6 +708,7 @@ impl Persistence {
         self.save = None;
         self.preference_load = None;
         self.preference_save = None;
+        self.preference_save_deadline.clear();
         self.load = None;
         self.pending_adds.clear();
         self.preference_unavailable = None;
@@ -765,6 +787,7 @@ fn run_worker(
             &mut preference_reported_unavailable,
             &mut applied_preference_requests,
             &mut unfinalized_preference_requests,
+            false,
         );
         let command = if can_block_on_command(&persistence, &coordinator, &preference_coordinator) {
             match command_rx.recv_timeout(IDLE_STATUS_CHECK_INTERVAL) {
@@ -898,9 +921,18 @@ fn run_worker(
                 coordinator.compact_if_resolved(!persistence.pending_adds.is_empty());
             }
             Command::PatchPreferences { request, patch } => {
+                let output_volume_patch = matches!(&patch, PreferencePatch::SetOutputVolume(_));
                 match preference_coordinator.apply_loaded_patch(request, patch) {
                     Ok(changed) if preference_coordinator.loaded() => {
                         if changed {
+                            apply_preference_save_hint(
+                                &mut persistence,
+                                if output_volume_patch {
+                                    PreferenceSaveHint::DebounceOutputVolume
+                                } else {
+                                    PreferenceSaveHint::Immediate
+                                },
+                            );
                             let _ = preference_event_tx.send(PreferenceEvent::Snapshot {
                                 revision: preference_coordinator.revision(),
                                 preferences: preference_coordinator.snapshot(),
@@ -1062,6 +1094,7 @@ fn drive_preferences(
     reported_unavailable: &mut bool,
     applied_requests: &mut HashSet<PreferenceRequestId>,
     unfinalized_requests: &mut HashSet<PreferenceRequestId>,
+    bypass_volume_deadline: bool,
 ) {
     if let Some(error) = persistence.unavailable.clone() {
         report_preference_unavailable(
@@ -1104,7 +1137,7 @@ fn drive_preferences(
         applied_requests,
         unfinalized_requests,
     );
-    queue_preference_save(persistence, coordinator);
+    queue_preference_save(persistence, coordinator, bypass_volume_deadline);
     poll_preference_save(
         persistence,
         coordinator,
@@ -1112,7 +1145,7 @@ fn drive_preferences(
         reported_unavailable,
         unfinalized_requests,
     );
-    queue_preference_save(persistence, coordinator);
+    queue_preference_save(persistence, coordinator, bypass_volume_deadline);
     if let Some(error) = persistence.unavailable.clone() {
         report_preference_unavailable(
             coordinator,
@@ -1131,6 +1164,16 @@ fn drive_preferences(
             reported_unavailable,
             unfinalized_requests,
         );
+    }
+}
+
+fn apply_preference_save_hint(persistence: &mut Persistence, hint: PreferenceSaveHint) {
+    match hint {
+        PreferenceSaveHint::None => {}
+        PreferenceSaveHint::DebounceOutputVolume => persistence
+            .preference_save_deadline
+            .defer_output_volume(Instant::now()),
+        PreferenceSaveHint::Immediate => persistence.preference_save_deadline.clear(),
     }
 }
 
@@ -1162,7 +1205,7 @@ fn poll_preference_load(
         Ok(Ok(None)) => {
             persistence.preference_load = None;
             let outcomes = coordinator.load_missing();
-            emit_preference_snapshot_and_outcomes(
+            let hint = emit_preference_snapshot_and_outcomes(
                 coordinator,
                 event_tx,
                 applied_requests,
@@ -1170,13 +1213,14 @@ fn poll_preference_load(
                 outcomes,
                 true,
             );
+            apply_preference_save_hint(persistence, hint);
         }
         Ok(Ok(Some(payload))) => {
             persistence.preference_load = None;
             match UiPreferences::from_payload(&payload) {
                 Ok(preferences) => {
                     let outcomes = coordinator.load_valid(preferences);
-                    emit_preference_snapshot_and_outcomes(
+                    let hint = emit_preference_snapshot_and_outcomes(
                         coordinator,
                         event_tx,
                         applied_requests,
@@ -1184,19 +1228,21 @@ fn poll_preference_load(
                         outcomes,
                         true,
                     );
+                    apply_preference_save_hint(persistence, hint);
                 }
                 Err(error) => {
                     let outcomes = coordinator.load_invalid();
                     let _ = event_tx.send(PreferenceEvent::LoadFailed {
                         error: SessionError::Preference(error.to_string()),
                     });
-                    emit_preference_outcomes(
+                    let hint = emit_preference_outcomes(
                         coordinator,
                         event_tx,
                         applied_requests,
                         unfinalized_requests,
                         outcomes,
                     );
+                    apply_preference_save_hint(persistence, hint);
                     if coordinator.valid() {
                         let _ = event_tx.send(PreferenceEvent::Snapshot {
                             revision: coordinator.revision(),
@@ -1212,13 +1258,14 @@ fn poll_preference_load(
             let _ = event_tx.send(PreferenceEvent::LoadFailed {
                 error: SessionError::Preference(error.to_string()),
             });
-            emit_preference_outcomes(
+            let hint = emit_preference_outcomes(
                 coordinator,
                 event_tx,
                 applied_requests,
                 unfinalized_requests,
                 outcomes,
             );
+            apply_preference_save_hint(persistence, hint);
             if coordinator.valid() {
                 let _ = event_tx.send(PreferenceEvent::Snapshot {
                     revision: coordinator.revision(),
@@ -1240,7 +1287,11 @@ fn poll_preference_load(
     }
 }
 
-fn queue_preference_save(persistence: &mut Persistence, coordinator: &PreferenceCoordinator) {
+fn queue_preference_save(
+    persistence: &mut Persistence,
+    coordinator: &PreferenceCoordinator,
+    bypass_volume_deadline: bool,
+) {
     if !coordinator.loaded()
         || !coordinator.valid()
         || persistence.preference_load.is_some()
@@ -1248,6 +1299,12 @@ fn queue_preference_save(persistence: &mut Persistence, coordinator: &Preference
         || persistence.preference_unavailable.is_some()
         || !persistence.available()
         || !coordinator.is_dirty()
+    {
+        return;
+    }
+    if !persistence
+        .preference_save_deadline
+        .permits_save(Instant::now(), bypass_volume_deadline)
     {
         return;
     }
@@ -1267,6 +1324,7 @@ fn queue_preference_save(persistence: &mut Persistence, coordinator: &Preference
                 revision: coordinator.revision(),
                 receiver,
             });
+            persistence.preference_save_deadline.clear();
         }
         Err(GlobalLibraryWriterQueueError::Initializing | GlobalLibraryWriterQueueError::Full) => {}
         Err(error @ GlobalLibraryWriterQueueError::PayloadTooLarge { .. }) => {
@@ -1353,7 +1411,7 @@ fn emit_preference_snapshot_and_outcomes(
     unfinalized_requests: &mut HashSet<PreferenceRequestId>,
     outcomes: Vec<PreferenceOutcome>,
     emit_persisted_baseline: bool,
-) {
+) -> PreferenceSaveHint {
     let _ = event_tx.send(PreferenceEvent::Snapshot {
         revision: coordinator.revision(),
         preferences: coordinator.snapshot(),
@@ -1369,7 +1427,7 @@ fn emit_preference_snapshot_and_outcomes(
         applied_requests,
         unfinalized_requests,
         outcomes,
-    );
+    )
 }
 
 fn emit_preference_outcomes(
@@ -1378,11 +1436,18 @@ fn emit_preference_outcomes(
     applied_requests: &mut HashSet<PreferenceRequestId>,
     unfinalized_requests: &mut HashSet<PreferenceRequestId>,
     outcomes: Vec<PreferenceOutcome>,
-) {
+) -> PreferenceSaveHint {
+    let mut hint = PreferenceSaveHint::None;
     for outcome in outcomes {
         match outcome.result {
             Ok(changed) => {
-                let _ = changed;
+                if changed {
+                    hint = hint.merge(if outcome.output_volume_changed {
+                        PreferenceSaveHint::DebounceOutputVolume
+                    } else {
+                        PreferenceSaveHint::Immediate
+                    });
+                }
                 announce_preference_request(
                     event_tx,
                     applied_requests,
@@ -1399,6 +1464,7 @@ fn emit_preference_outcomes(
             ),
         }
     }
+    hint
 }
 
 fn queue_load(persistence: &mut Persistence, coordinator: &Coordinator) {
@@ -1886,6 +1952,7 @@ fn drain_shutdown(
             preference_reported_unavailable,
             applied_preference_requests,
             unfinalized_preference_requests,
+            true,
         );
         if persistence.unavailable.is_some() {
             return Err(persistence
@@ -2204,6 +2271,34 @@ mod tests {
         );
         assert_eq!(restored.theme_source_path, Some(source_path));
         reopened.shutdown().expect("reopen preference shutdown");
+    }
+
+    #[test]
+    fn immediate_shutdown_persists_latest_output_volume() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+
+        service
+            .patch_preferences(PreferencePatch::SetOutputVolume(0.25))
+            .expect("first volume patch");
+        service
+            .patch_preferences(PreferencePatch::SetOutputVolume(0.73))
+            .expect("latest volume patch");
+        service.shutdown().expect("immediate shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            (preferences.output_volume - 0.73).abs() < f32::EPSILON
+        });
+        assert!((restored.output_volume - 0.73).abs() < f32::EPSILON);
+        reopened.shutdown().expect("reopen shutdown");
     }
 
     #[test]
@@ -2647,6 +2742,7 @@ mod tests {
             pending_adds: HashMap::new(),
             save: None,
             preference_save: None,
+            preference_save_deadline: PreferenceSaveDeadline::default(),
             force_save: false,
             unavailable: None,
             preference_unavailable: None,
@@ -2710,6 +2806,7 @@ mod tests {
             pending_adds: HashMap::new(),
             save: None,
             preference_save: None,
+            preference_save_deadline: PreferenceSaveDeadline::default(),
             force_save: false,
             unavailable: None,
             preference_unavailable: Some(SessionError::Preference(String::from(

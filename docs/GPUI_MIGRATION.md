@@ -481,6 +481,37 @@ payload remained untouched on startup, and Reset saved settings persisted valid
 defaults and allowed a clean quit. Backend regressions cover write-failure
 isolation, lookup fairness, load-failure shutdown, and rapid revision reversions.
 
+### Audition output volume, 2026-09-08
+
+The browser toolbar now exposes a compact normalized audition-volume slider using
+the reference 112×16 logical control and 8px track. Pointer presses and captured
+drags clamp at both ends; Left/Right and Up/Down change volume by 5%, Home/End
+select an endpoint, and Shift changes use a 1% fine step. The slider keeps
+search and browser keyboard focus separate and remains usable at the 960px
+minimum window width. There is no mute action: the control changes Reson
+audition output volume only.
+
+Values are sanitized to finite 0..=1 input, quantized to 1/1000 before typed
+preference patches and runtime commands, and submitted on each changed
+quantized value so the session service owns its 250ms save coalescing and quit
+flush. A changed volume updates a pending playback-init intent, while a
+restored preference applies to an existing runtime without replaying playback.
+Runtime queue failures retain the latest intent, show an explicit status, and
+retry only within a bounded budget on a fresh runtime or later user change; a
+rejected preference submission leaves the prior volume and audio state intact.
+
+Validation: `cargo check -p wavecrate-ui` passed; `cargo test -p wavecrate-ui`
+passed 58 tests with one manual waveform benchmark ignored; `cargo fmt -p
+wavecrate-ui` completed successfully; and `git diff --check` passed. The
+focused volume tests cover non-finite and endpoint clamping, pointer
+quantization, reference keyboard steps, fine keyboard steps, and bounded
+quantization. Session tests passed 30 cases, including immediate shutdown and
+reopen with the latest volume. The signed macOS build passed. Live disposable
+fixture checks confirmed pointer and outside-drag clamping, 5% arrow and 1%
+Shift-arrow steps, volume adjustment without restarting playback, and a final
+0.51 value persisted on quit and restored on reopen. Manual audible acceptance
+remains separate.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

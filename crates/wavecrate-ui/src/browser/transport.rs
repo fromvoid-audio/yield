@@ -36,8 +36,15 @@ pub(super) struct PlaybackIntent {
     pub(super) start: f64,
     pub(super) region: Option<WaveformPlayRegion>,
     pub(super) looped: bool,
+    pub(super) volume: f32,
     pub(super) path: std::path::PathBuf,
     pub(super) origin: PlaybackIntentOrigin,
+}
+
+impl PlaybackIntent {
+    pub(super) fn set_volume(&mut self, volume: f32) {
+        self.volume = super::volume::quantize_volume(volume);
+    }
 }
 
 /// Bounded motion between two authoritative playback samples.
@@ -299,6 +306,7 @@ impl Browser {
             start,
             region,
             looped: self.loop_enabled,
+            volume: super::volume::quantize_volume(self.volume),
             path,
             origin,
         })
@@ -355,6 +363,7 @@ impl Browser {
                 match result {
                     Ok(runtime) => {
                         view.playback = Some(runtime);
+                        view.retry_runtime_volume();
                         let should_queue = pending_intent.as_ref().is_some_and(|intent| {
                             let selected_path = view
                                 .selected
@@ -406,7 +415,7 @@ impl Browser {
             },
             mode,
             stream_policy: PlaybackRuntimeStreamPolicy::transient_navigation(),
-            volume: 1.0,
+            volume: super::volume::quantize_volume(intent.volume),
             playback_gain: 1.0,
             playback_gain_normalization: None,
             replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
@@ -419,6 +428,7 @@ impl Browser {
         self.playback_cursor_interpolation = None;
         match handle.try_play(request) {
             Ok(request_id) => {
+                self.mark_volume_applied_by_play();
                 self.latest_playback_request_id = Some(request_id);
                 self.playing_path = Some(intent.path);
                 self.playback_cursor_pending = Some(start as f32);
@@ -731,6 +741,7 @@ mod tests {
                 start: 1.2,
                 region: None,
                 looped: false,
+                volume: 1.0,
                 path: path.clone(),
                 origin: PlaybackIntentOrigin::Explicit,
             }),
@@ -744,6 +755,7 @@ mod tests {
                 start: 0.35,
                 region: None,
                 looped: true,
+                volume: 1.0,
                 path,
                 origin: PlaybackIntentOrigin::SelectionAutoplay,
             }),
@@ -763,6 +775,7 @@ mod tests {
             start: region.start,
             region: Some(region),
             looped: false,
+            volume: 1.0,
             path: path.clone(),
             origin: PlaybackIntentOrigin::Explicit,
         };
@@ -786,6 +799,20 @@ mod tests {
                 offset: 0.25,
             }
         );
+    }
+
+    #[test]
+    fn pending_playback_intent_tracks_the_latest_quantized_volume() {
+        let mut intent = PlaybackIntent {
+            start: 0.0,
+            region: None,
+            looped: false,
+            volume: 1.0,
+            path: PathBuf::from("sample.wav"),
+            origin: PlaybackIntentOrigin::Explicit,
+        };
+        intent.set_volume(0.7346);
+        assert_eq!(intent.volume, 0.735);
     }
 
     #[test]

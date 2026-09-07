@@ -1,6 +1,7 @@
 //! GPUI-free persisted preferences and their ordered session patches.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,9 +13,32 @@ use crate::SessionError;
 /// The only persisted GPUI-preferences document version understood by this session owner.
 pub const UI_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
+const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 fn default_autoplay_selection() -> bool {
     true
+}
+
+fn default_output_volume() -> f32 {
+    1.0
+}
+
+/// Deadline gate used by the session worker to coalesce rapid output-volume edits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PreferenceSaveDeadline(Option<Instant>);
+
+impl PreferenceSaveDeadline {
+    pub(crate) fn defer_output_volume(&mut self, now: Instant) {
+        self.0 = Some(now + OUTPUT_VOLUME_SAVE_DEBOUNCE);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0 = None;
+    }
+
+    pub(crate) fn permits_save(self, now: Instant, bypass: bool) -> bool {
+        bypass || self.0.is_none_or(|deadline| now >= deadline)
+    }
 }
 
 /// The complete GPUI preference document stored in the profile-owned library metadata table.
@@ -34,6 +58,9 @@ pub struct UiPreferences {
     /// Whether audition playback loops its active region.
     #[serde(default)]
     pub loop_enabled: bool,
+    /// Linear output volume applied to audition playback.
+    #[serde(default = "default_output_volume")]
+    pub output_volume: f32,
 }
 
 impl Default for UiPreferences {
@@ -44,6 +71,7 @@ impl Default for UiPreferences {
             theme_source_path: None,
             autoplay_selection: true,
             loop_enabled: false,
+            output_volume: 1.0,
         }
     }
 }
@@ -61,6 +89,7 @@ impl UiPreferences {
         if let Some(path) = self.theme_source_path.as_deref() {
             validate_theme_source_path(path)?;
         }
+        validate_output_volume(self.output_volume)?;
         Ok(Self { theme, ..self })
     }
 
@@ -111,6 +140,9 @@ pub enum PreferenceError {
     /// The optional theme reload path exceeded the bounded payload policy.
     #[error("theme source path exceeds the {MAX_THEME_SOURCE_PATH_BYTES}-byte limit")]
     ThemeSourcePathTooLarge,
+    /// The output volume was not a finite value in the inclusive 0..=1 range.
+    #[error("output volume must be finite and between 0 and 1")]
+    InvalidOutputVolume,
     /// The profile payload exceeded its bounded UTF-8 byte limit.
     #[error(
         "UI preferences payload exceeds the {UI_PREFERENCES_MAX_BYTES}-byte limit ({actual} bytes)"
@@ -148,6 +180,13 @@ fn validate_theme_source_path(path: &Path) -> Result<(), PreferenceError> {
     Ok(())
 }
 
+fn validate_output_volume(volume: f32) -> Result<(), PreferenceError> {
+    if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+        return Err(PreferenceError::InvalidOutputVolume);
+    }
+    Ok(())
+}
+
 /// One typed user intent applied to the loaded preference document.
 #[derive(Clone, Debug)]
 pub enum PreferencePatch {
@@ -164,6 +203,8 @@ pub enum PreferencePatch {
     SetAutoplaySelection(bool),
     /// Change the audition loop preference.
     SetLoopEnabled(bool),
+    /// Change the linear audition output volume.
+    SetOutputVolume(f32),
     /// Replace the invalid or current document with built-in defaults.
     Reset,
 }
@@ -183,6 +224,10 @@ impl PreferencePatch {
             Self::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = enabled,
             Self::SetAutoplaySelection(enabled) => preferences.autoplay_selection = enabled,
             Self::SetLoopEnabled(enabled) => preferences.loop_enabled = enabled,
+            Self::SetOutputVolume(volume) => {
+                validate_output_volume(volume)?;
+                preferences.output_volume = volume;
+            }
             Self::Reset => *preferences = Self::default_preferences(),
         }
         Ok(before != *preferences)
@@ -398,10 +443,14 @@ impl PreferenceCoordinator {
         edits
             .into_iter()
             .map(|edit| {
+                let output_volume_patch =
+                    matches!(&edit.patch, PreferencePatch::SetOutputVolume(_));
                 let result = self.apply_patch(edit.request, edit.patch);
+                let output_volume_changed = output_volume_patch && matches!(&result, Ok(true));
                 PreferenceOutcome {
                     request: edit.request,
                     result,
+                    output_volume_changed,
                 }
             })
             .collect()
@@ -435,11 +484,13 @@ impl PreferenceCoordinator {
 pub(crate) struct PreferenceOutcome {
     pub(crate) request: PreferenceRequestId,
     pub(crate) result: Result<bool, PreferenceError>,
+    pub(crate) output_volume_changed: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use wavecrate_design::Color;
 
     #[test]
@@ -450,12 +501,55 @@ mod tests {
         preferences.theme_source_path = Some(PathBuf::from("/tmp/custom theme.json"));
         preferences.autoplay_selection = false;
         preferences.loop_enabled = true;
+        preferences.output_volume = 0.37;
 
         let payload = preferences.to_payload().expect("encode preferences");
         assert_eq!(
             UiPreferences::from_payload(&payload).expect("decode"),
             preferences
         );
+    }
+
+    #[test]
+    fn payload_omitting_output_volume_uses_full_volume_default() {
+        let mut payload = serde_json::to_value(UiPreferences::default()).expect("encode");
+        payload
+            .as_object_mut()
+            .expect("preferences object")
+            .remove("output_volume");
+        let payload = serde_json::to_string(&payload).expect("encode legacy payload");
+
+        let preferences = UiPreferences::from_payload(&payload).expect("decode legacy payload");
+        assert_eq!(preferences.output_volume, 1.0);
+    }
+
+    #[test]
+    fn invalid_output_volume_patch_rejects_before_mutation() {
+        for volume in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            let mut preferences = UiPreferences::default();
+            preferences.output_volume = 0.4;
+            let before = preferences.clone();
+
+            let error = PreferencePatch::SetOutputVolume(volume)
+                .apply(&mut preferences)
+                .expect_err("invalid volume must be rejected");
+            assert_eq!(error, PreferenceError::InvalidOutputVolume);
+            assert_eq!(preferences, before);
+        }
+    }
+
+    #[test]
+    fn output_volume_save_deadline_is_deterministic_without_sleeping() {
+        let start = Instant::now();
+        let mut deadline = PreferenceSaveDeadline::default();
+        deadline.defer_output_volume(start);
+
+        assert!(!deadline.permits_save(start + Duration::from_millis(249), false));
+        assert!(deadline.permits_save(start + Duration::from_millis(250), false));
+        assert!(deadline.permits_save(start, true));
+
+        deadline.clear();
+        assert!(deadline.permits_save(start, false));
     }
 
     #[test]

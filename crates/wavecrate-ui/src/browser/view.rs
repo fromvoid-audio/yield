@@ -13,6 +13,7 @@ use crate::theme::{active, color, transparent};
 
 use super::Browser;
 use super::motion;
+use super::volume;
 use super::waveform;
 
 fn format_file_size(bytes: u64) -> String {
@@ -645,6 +646,7 @@ impl Render for Browser {
                             .text_color(color(theme.colors.text_muted))
                             .child(root_label),
                     )
+                    .child(volume::render_slider(self, theme.clone(), cx))
                     .child(
                         div()
                             .id("reveal-toolbar")
@@ -797,6 +799,9 @@ impl Render for Browser {
                     .text_size(px(theme.typography.small_size))
                     .text_color(color(theme.colors.text_muted))
                     .child(self.playback_status.clone())
+                    .when(self.volume_status.is_some(), |element| {
+                        element.child(self.volume_status.clone().unwrap_or_default())
+                    })
                     .child(list_status)
                     .child(self.source_registry_status.clone())
                     .when(selected_count.is_some(), move |element| {

@@ -304,6 +304,9 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = *enabled,
         PreferencePatch::SetAutoplaySelection(enabled) => preferences.autoplay_selection = *enabled,
         PreferencePatch::SetLoopEnabled(enabled) => preferences.loop_enabled = *enabled,
+        PreferencePatch::SetOutputVolume(volume) => {
+            preferences.output_volume = *volume;
+        }
         PreferencePatch::Reset => *preferences = UiPreferences::default(),
     }
 }
@@ -420,6 +423,7 @@ impl Browser {
         let autoplay_was_enabled = self.autoplay_selection;
         self.autoplay_selection = effective.autoplay_selection;
         self.loop_enabled = effective.loop_enabled;
+        self.apply_preference_volume(effective.output_volume);
         if autoplay_was_enabled && !self.autoplay_selection {
             self.cancel_pending_selection_autoplay();
         }

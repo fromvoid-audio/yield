@@ -39,6 +39,7 @@ mod sidebar;
 mod source_registry;
 mod transport;
 mod view;
+mod volume;
 mod waveform;
 
 /// Install the app-owned source registry and its application-quit shutdown observer.
@@ -196,6 +197,7 @@ impl ThemeLoadState {
 
 pub(crate) struct Browser {
     focus_handle: FocusHandle,
+    volume_focus_handle: FocusHandle,
     search_input: gpui::Entity<SearchInput>,
     _search_subscription: gpui::Subscription,
     root: Option<PathBuf>,
@@ -222,6 +224,11 @@ pub(crate) struct Browser {
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
     scan_status: String,
     playback_status: String,
+    volume: f32,
+    volume_drag: Option<volume::VolumeDrag>,
+    volume_runtime_pending: Option<f32>,
+    volume_runtime_retry_count: u8,
+    volume_status: Option<String>,
     scan_generation: u64,
     waveform_generation: u64,
     playback_epoch: u64,
@@ -291,6 +298,7 @@ impl Browser {
         let motion_settings = Motion::default();
         let mut browser = Self {
             focus_handle: cx.focus_handle(),
+            volume_focus_handle: cx.focus_handle(),
             search_input,
             _search_subscription: search_subscription,
             root: None,
@@ -317,6 +325,11 @@ impl Browser {
             waveform_region_drag: None,
             scan_status: "Choose a folder or pass one on the command line".to_string(),
             playback_status: "Ready".to_string(),
+            volume: volume::DEFAULT_VOLUME,
+            volume_drag: None,
+            volume_runtime_pending: None,
+            volume_runtime_retry_count: 0,
+            volume_status: None,
             scan_generation: 0,
             waveform_generation: 0,
             playback_epoch: 0,
@@ -1325,6 +1338,7 @@ impl Browser {
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
         self.autoplay_selection = true;
         self.loop_enabled = false;
+        self.apply_preference_volume(volume::DEFAULT_VOLUME);
         if let Some(intent) = self.playback_init_intent.as_mut() {
             intent.looped = false;
         }
@@ -1489,6 +1503,16 @@ impl Browser {
             }
             if key == "escape" {
                 window.focus(&self.focus_handle);
+            }
+            return;
+        }
+        if self.volume_focus_handle.is_focused(window) {
+            if key == "escape" {
+                self.cancel_volume_drag(window, cx);
+                window.focus(&self.focus_handle);
+                cx.notify();
+            } else if !event.is_held || volume::is_keyboard_key(key) {
+                self.change_volume_from_key(key, shift, cx);
             }
             return;
         }
