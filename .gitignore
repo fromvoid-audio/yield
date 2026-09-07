@@ -1,4 +1,19 @@
-/target
+# Rust build output, including standalone workspaces such as apps/wavecrate-gpui.
+target/
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# Local editor and operating-system files.
+.idea/
+*.swp
+*.swo
+*~
+.AppleDouble
+.LSOverride
+
+# Keep Cargo.lock tracked for reproducible application builds.
+
 /book
 /dist
 .sandbox/

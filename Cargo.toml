@@ -9,6 +9,7 @@ members = [
     "tools/bench-cli",
     "tools/gui-test-cli",
 ]
+exclude = ["apps/wavecrate-gpui"]
 default-members = ["."]
 resolver = "3"
 
