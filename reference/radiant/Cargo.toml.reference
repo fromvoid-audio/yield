@@ -1,0 +1,178 @@
+[workspace]
+members = [
+    ".",
+    "crates/reson",
+    "crates/wavecrate-analysis",
+    "crates/wavecrate-library",
+    "crates/wavecrate-scan",
+    "tools/analysis-admin",
+    "tools/bench-cli",
+    "tools/gui-test-cli",
+]
+exclude = ["apps/wavecrate-gpui"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.metadata.radiant]
+repository = "https://github.com/PORTALSURFER/radiant.git"
+revision = "fa707ff5cba809d334968416f9bcd1b702083db1"
+path = "../radiant"
+
+[package]
+name = "wavecrate"
+version = "0.19.1"
+edition = "2024"
+default-run = "wavecrate"
+autobins = false
+
+[lints.rust]
+warnings = "deny"
+missing_docs = "deny"
+
+[features]
+default = []
+gui-performance = []
+legacy-controller = []
+native-bridge-metrics = []
+sqlite-ext-unsafe = ["wavecrate-library/sqlite-ext-unsafe"]
+
+[dependencies]
+hound = "3.5.1"
+sysinfo = "0.37.2"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
+rusqlite = { version = "0.37.0", features = ["bundled", "load_extension"] }
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+bincode = "1.3.3"
+toml = "0.8.19"
+thiserror = "2.0.17"
+regex = "1.12.2"
+directories = "6.0.0"
+rfd = "0.16.0"
+winit = "0.30.12"
+arboard = "3.6.1"
+pollster = "0.4.0"
+vello = "0.7.0"
+skrifa = "0.40.0"
+radiant = { path = "../radiant" }
+open = "5.3.3"
+image = "0.25.9"
+raw-window-handle = "0.6"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = [
+    "env-filter",
+    "fmt",
+    "time",
+] }
+tracing-appender = "0.2.4"
+notify = "6.1.1"
+time = { version = "0.3.44", features = [
+    "formatting",
+    "macros",
+    "local-offset",
+] }
+fuzzy-matcher = "0.3.7"
+rand = "0.9.2"
+rand_08 = { package = "rand", version = "0.8.5" }
+ordered-float = "3.2.0"
+semver = "1.0.27"
+sha2 = "0.10.9"
+blake3 = "1.6.1"
+tempfile = "3.23.0"
+ureq = { version = "2.12.1", features = ["json", "tls"] }
+url = "2.5.4"
+zip = { version = "2.2.1", default-features = false, features = ["deflate"] }
+keyring = "3.6.2"
+chacha20poly1305 = "0.10.1"
+base64 = "0.22.1"
+ed25519-dalek = "2.2.0"
+wavecrate-analysis = { path = "crates/wavecrate-analysis" }
+wavecrate-library = { path = "crates/wavecrate-library" }
+wavecrate-scan = { path = "crates/wavecrate-scan" }
+symphonia = { version = "0.5.4", features = ["wav", "pcm", "mp3", "flac"] }
+rayon = "1.10"
+crossbeam-queue = "0.3.12"
+reson = { path = "crates/reson" }
+
+[patch.crates-io]
+vello = { git = "https://github.com/PORTALSURFER/vello.git", rev = "a08d1c11641908414e5e273d18e50f0f367095a1" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fsevent-sys = "4.1.0"
+objc2 = "0.6.3"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSImage",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSString",
+] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Storage",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-implement = "0.60.2"
+windows-core = "0.62.2"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2.176"
+
+[dev-dependencies]
+criterion = "0.8.1"
+filetime = "0.2.26"
+wavecrate-library = { path = "crates/wavecrate-library", features = ["test-support"] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[[bin]]
+name = "wavecrate"
+path = "src/main.rs"
+
+[[bin]]
+name = "wavecrate-fixture"
+path = "tools/native-fixture-cli/main.rs"
+
+[[bench]]
+name = "tagging"
+harness = false
+
+[[test]]
+name = "controller_browser_integration"
+path = "tests/controller_browser_integration.rs"
+required-features = ["legacy-controller"]
+
+[profile.release-local]
+inherits = "release"
+incremental = true
+codegen-units = 256
+opt-level = 2
+strip = "none"

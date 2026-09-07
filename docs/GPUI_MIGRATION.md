@@ -27,8 +27,9 @@ not become implemented merely because they appear in the target document.
 
 ## Architecture
 
-The new application lives in `apps/wavecrate-gpui`. Its dependency tree must not
-include the root `wavecrate` package or Radiant. Keep the existing library,
+The root workspace composes `crates/wavecrate-gpui` from the core, media, and UI
+crates described in `GPUI_ARCHITECTURE.md`. Its dependency tree must not include
+the archived Radiant application or Radiant. Keep the existing library,
 analysis, scan, and Reson audio crates as shared engines. Extract application
 services from the original frontend as each workflow is migrated; do not expose
 Radiant widget messages, geometry, subscriptions, or runtime handles as the new
@@ -49,6 +50,9 @@ They must not open the live Wavecrate database or recovery journal by default.
 File mutation features require the existing capability, journal, and undo
 boundaries; a path-based shortcut is not an equivalent implementation.
 
+The original application source now lives under `reference/radiant/src`.
+Unqualified reference-area names below are relative to that archived frontend.
+
 ## Parity register
 
 Every row below requires GPUI implementation and validation. The presence of
@@ -56,7 +60,7 @@ reference source or backend code does not satisfy the row.
 
 | Workflow | Reference area | Required acceptance |
 | --- | --- | --- |
-| Startup, profile, shutdown | `src/native_app/shell`, `app/state` | Isolated profile, error handling, worker shutdown, reopen |
+| Startup, profile, shutdown | `reference/radiant/src/native_app/shell`, `app/state` | Isolated profile, error handling, worker shutdown, reopen |
 | Sources and folders | `sample_library`, `source_processing` | Add/remove, navigation, unavailable roots, scans, watcher convergence |
 | Browser | `app_chrome/library_browser` | Virtual rows, sorting, search, filters, multiselect, keyboard navigation |
 | Audition | `audio`, `crates/reson` | Immediate selection playback, transport, seek, loop, history, device errors |
@@ -69,7 +73,7 @@ reference source or backend code does not satisfy the row.
 | Timing | `audio`, `waveform` | BPM/grid controls, existing warp and normalized-audition behavior |
 | DAW handoff | `external_drag`, `external_clipboard`, `workflows` | Drag, copy, reveal, external open, region handoff |
 | Settings and auxiliary UI | `app_chrome`, `release_update` | Audio options, dialogs, context menus, shortcuts, updates, diagnostics |
-| Platform behavior | `shell`, `native_runtime` | macOS and Windows build/input/window lifecycle coverage |
+| Platform behavior | `reference/radiant/src/native_app/shell`, `reference/radiant/src/native_runtime` | macOS and Windows build/input/window lifecycle coverage |
 
 ## Completion evidence
 
@@ -92,6 +96,37 @@ claim. No manual GUI/audio or Windows acceptance is recorded. Persistent source
 registration, search/filter/tagging, editing, recovery, full-length waveforms,
 non-WAV audition, and handoff remain outstanding. Preview currently rejects
 files above 256 MiB and renders only a bounded initial segment.
+
+### Root workspace and browser slice, 2026-09-07
+
+The active root workspace now has a thin GPUI executable plus defined core,
+media, and UI crates alongside the existing four engine crates. The core crate
+has no dependencies. The launcher depends only on the UI crate. All 2,327
+relocated reference source/test/tool files were checked against their original
+Git blob hashes and match exactly. The original pre-migration manifest and dirty
+root lockfile were also preserved in the local ignored `.sandbox` backup.
+
+Implemented filename filtering, Name/Size/Extension sorting, stable focused-file
+projection, native text-edit actions, search/browser focus routing, visible
+virtual-list sizing, full-width rows, and constrained waveform drawing. The
+native folder picker now uses GPUI's asynchronous path prompt; this fixes the
+observed reentrant-borrow crash from the prior synchronous dialog.
+
+Passed on macOS: root workspace check and build; 10 targeted tests (four core,
+four media, two UI); formatting checks; development-bundle signature verification.
+Cargo metadata confirms eight members, the GPUI launcher as default, and the
+documented dependency direction. The existing engine crates were unchanged.
+
+GUI checks with disposable fixtures confirmed visible rows, pointer/arrow
+selection, scrolling a 2,000-file folder, filename filtering, native select-all
+and deletion, spaces in search, selection preservation after Size sorting, and
+the corrected folder picker. The final root-workspace bundle loaded a selected
+folder through that picker and showed the correct filtered-result count.
+
+Clipboard automation timed out despite a later text update; Unicode text
+injection did not establish GUI acceptance. Clipboard/IME/Unicode interaction,
+manual audible/DAW acceptance, and Windows behavior remain unverified. This
+slice does not complete full feature parity.
 
 ### Required final evidence
 

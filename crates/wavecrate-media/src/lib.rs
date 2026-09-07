@@ -1,13 +1,14 @@
 #![deny(missing_docs)]
 #![deny(warnings)]
 
-//! Backend helpers for the standalone GPUI sample browser.
+//! Read-only audio scanning and bounded waveform previews for the GPUI browser.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use wavecrate_analysis::{decode_for_analysis_with_rate_limit, probe_metadata};
+use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
 /// Maximum number of bars generated for a selected sample's preview.
@@ -20,21 +21,6 @@ const PREVIEW_SAMPLE_RATE: u32 = 16_000;
 const MAX_PREVIEW_SOURCE_SAMPLES: u64 = 8_000_000;
 const ANALYSIS_WINDOW_PADDING_SECONDS: f64 = 2.0;
 const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
-
-/// A source audio file discovered by a folder scan.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AudioFile {
-    /// Absolute or user-provided path to the audio file.
-    pub path: PathBuf,
-    /// Path relative to the selected folder.
-    pub relative_path: PathBuf,
-    /// File size in bytes when metadata was available.
-    pub byte_len: u64,
-    /// Duration reported by a container-level metadata probe.
-    pub duration_seconds: Option<f32>,
-    /// Sample rate reported by a container-level metadata probe.
-    pub sample_rate: Option<u32>,
-}
 
 /// Result of an in-memory folder scan.
 #[derive(Clone, Debug, PartialEq)]
@@ -73,13 +59,16 @@ pub fn enumerate_audio_files_with_cancel(
     root: &Path,
     cancellation: Option<&AtomicBool>,
 ) -> Result<AudioScan, String> {
-    let root_metadata = fs::metadata(root)
+    // Resolve the selected root once in the worker. Projection and UI code can then treat the
+    // paths as stable identities without performing filesystem calls during filtering or sorting.
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root_metadata = fs::metadata(&root)
         .map_err(|error| format!("Could not read folder {}: {error}", root.display()))?;
     if !root_metadata.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
     }
 
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = vec![root.clone()];
     let mut files = Vec::new();
     let mut skipped_entries = 0;
 
@@ -130,7 +119,7 @@ pub fn enumerate_audio_files_with_cancel(
             let byte_len = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             let probe = probe_metadata(&path).ok();
             let relative_path = path
-                .strip_prefix(root)
+                .strip_prefix(&root)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|_| {
                     path.file_name()
@@ -215,15 +204,6 @@ fn preview_decode_seconds(path: &Path) -> Result<f32, String> {
         ));
     }
     Ok(requested_seconds)
-}
-
-/// Format a duration for compact display in the browser chrome.
-pub fn format_duration(duration_seconds: Option<f32>) -> String {
-    let Some(duration_seconds) = duration_seconds.filter(|duration| duration.is_finite()) else {
-        return "--:--".to_string();
-    };
-    let total_seconds = duration_seconds.max(0.0).round() as u64;
-    format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
 }
 
 fn peak_envelope(samples: &[f32], point_count: usize) -> Vec<f32> {
@@ -341,12 +321,5 @@ mod tests {
 
         let error = preview_decode_seconds(&path).expect_err("preview must be rejected");
         assert!(error.contains("too many source samples"));
-    }
-
-    #[test]
-    fn duration_format_is_stable_for_missing_and_long_values() {
-        assert_eq!(format_duration(None), "--:--");
-        assert_eq!(format_duration(Some(65.4)), "01:05");
-        assert_eq!(format_duration(Some(3600.0)), "60:00");
     }
 }

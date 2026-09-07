@@ -1,0 +1,16 @@
+[package]
+name = "wavecrate-ui"
+version.workspace = true
+edition.workspace = true
+license = "CC0-1.0 AND Apache-2.0"
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui.workspace = true
+reson.workspace = true
+unicode-segmentation.workspace = true
+wavecrate-core.workspace = true
+wavecrate-media.workspace = true

@@ -1,4 +1,4 @@
-# Rust build output, including standalone workspaces such as apps/wavecrate-gpui.
+# Rust build output at every workspace and crate depth.
 target/
 **/*.rs.bk
 *.profraw

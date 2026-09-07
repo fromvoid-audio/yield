@@ -1,48 +1,67 @@
 # Wavecrate GPUI
 
-Private development fork of [Wavecrate](https://github.com/PORTALSURFER/wavecrate),
-reimplementing the desktop frontend in GPUI with **full current feature parity**
-as the target.
+A private GPUI reimplementation of [Wavecrate](https://github.com/PORTALSURFER/wavecrate).
+Full current feature parity is the target; the migration is in progress.
 
-The migration is in progress. The original Radiant application is retained as a
-behavioral reference; this fork is not yet a feature-complete replacement.
+## Workspace
 
-## Run the GPUI application
+The root Cargo workspace follows Rox's approach of a thin executable composing
+separate crates with defined ownership:
+
+| Crate | Responsibility |
+| --- | --- |
+| `wavecrate-gpui` | Thin executable and launch arguments |
+| `wavecrate-core` | Pure sample types, filtering, sorting, selection projection |
+| `wavecrate-media` | Background file discovery and waveform preparation |
+| `wavecrate-ui` | GPUI views, input components, UI and transport coordination |
+| `reson` | Existing audio engine |
+| `wavecrate-library` | Existing persistence and source-ownership primitives |
+| `wavecrate-scan` | Existing persistent scanner |
+| `wavecrate-analysis` | Existing decoding and analysis |
+
+See [crate boundaries and dependency direction](docs/GPUI_ARCHITECTURE.md).
+The original frontend is preserved in [reference/radiant](reference/radiant/README.md)
+and excluded from the active build.
+
+## Run
 
 ```sh
+cargo run -- /path/to/samples
+# Or open the folder picker:
 ./run-gpui.sh
-# Or open a sample folder at startup:
-./run-gpui.sh /path/to/samples
 ```
 
-The GPUI application has a separate Cargo workspace under `apps/wavecrate-gpui`.
-It uses published GPUI and the existing Reson engine without requiring a
-Radiant checkout. Native Rust build tools and the platform audio/graphics build
-dependencies are required.
+On macOS, build a development application bundle with:
 
 ```sh
-cargo check --locked --manifest-path apps/wavecrate-gpui/Cargo.toml
-cargo test --locked --manifest-path apps/wavecrate-gpui/Cargo.toml
+./scripts/build-gpui-macos.sh
 ```
 
-## Migration
+The script prints the `.app` path under the ignored Cargo target directory.
+Rust and the platform's native audio/graphics build tools are required.
 
-See [the parity register and architecture](docs/GPUI_MIGRATION.md) for the
-baseline, extraction boundaries, remaining workflows, and completion evidence.
-The first slice establishes browsing and auditioning. Editing, persistent library
-curation, recovery, and platform handoff must pass their own parity checks.
+## Current behavior
 
-Current controls: choose a folder or supply it on the command line, select a row
-with the pointer or Up/Down, and use Space to play/stop or Escape to stop.
+Browse a folder, search filenames with Cmd/Ctrl+F, and sort by name, size, or
+extension. Select a row with the pointer or Up/Down; Space plays/stops and Escape
+stops playback. While searching, Space enters text and Escape returns browser
+focus. Filtering and sorting preserve the focused sample when it remains visible.
+
 Audition and waveform previews currently support WAV. Other recognized audio
-formats are listed, but their previews are not implemented. Waveforms show a
-bounded initial segment; files over 256 MiB are not previewed in this slice.
-The application does not persist library state or modify sample files.
+formats are listed. Waveforms show a bounded initial segment; files over 256 MiB
+are not previewed. The application does not persist library state or modify
+sample files.
 
-The initial macOS build, compile check, formatting check, and seven focused tests
-pass. Manual GUI/audio acceptance, Windows validation, and full feature parity
-remain outstanding.
+See the [parity register](docs/GPUI_MIGRATION.md) for remaining workflows and
+validation evidence. Editing, persistent curation, recovery, multiselect,
+full-length waveforms, and DAW handoff remain outstanding. Inherited release
+workflows are disabled.
 
-Inherited release workflows are disabled. The original application's README is
-preserved in [README.upstream.md](README.upstream.md); its launch and distribution
-instructions describe the Radiant reference application.
+## Validate
+
+```sh
+cargo check --locked -p wavecrate-gpui
+cargo test --locked -p wavecrate-core -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
+```
+
+Third-party component attribution is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

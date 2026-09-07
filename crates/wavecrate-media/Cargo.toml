@@ -1,0 +1,18 @@
+[package]
+name = "wavecrate-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hound.workspace = true
+wavecrate-analysis.workspace = true
+wavecrate-core.workspace = true
+wavecrate-library.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
