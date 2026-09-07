@@ -13,6 +13,7 @@ use crate::SessionError;
 /// The only persisted GPUI-preferences document version understood by this session owner.
 pub const UI_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
+const MAX_AUDIO_OUTPUT_NAME_BYTES: usize = 1024;
 const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 fn default_autoplay_selection() -> bool {
@@ -21,6 +22,45 @@ fn default_autoplay_selection() -> bool {
 
 fn default_output_volume() -> f32 {
     1.0
+}
+
+/// The optional, renderer-neutral audio output routing persisted with the UI preferences.
+///
+/// The session owner validates the shape of these values but does not probe or enumerate
+/// platform audio devices. An absent field lets the playback backend choose its default.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioOutputPreferences {
+    /// Optional host or driver name selected by the user.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Optional device name selected by the user.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// Optional requested sample rate in hertz.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    /// Optional requested output buffer size in frames.
+    #[serde(default)]
+    pub buffer_size: Option<u32>,
+}
+
+impl AudioOutputPreferences {
+    fn validate(&self) -> Result<(), PreferenceError> {
+        validate_audio_output_name(self.host.as_deref(), "host")?;
+        validate_audio_output_name(self.device.as_deref(), "device")?;
+        if self.sample_rate == Some(0) {
+            return Err(PreferenceError::InvalidAudioOutputValue {
+                field: "sample_rate",
+            });
+        }
+        if self.buffer_size == Some(0) {
+            return Err(PreferenceError::InvalidAudioOutputValue {
+                field: "buffer_size",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Deadline gate used by the session worker to coalesce rapid output-volume edits.
@@ -61,6 +101,9 @@ pub struct UiPreferences {
     /// Linear output volume applied to audition playback.
     #[serde(default = "default_output_volume")]
     pub output_volume: f32,
+    /// Optional output routing requested by the user.
+    #[serde(default)]
+    pub audio_output: AudioOutputPreferences,
 }
 
 impl Default for UiPreferences {
@@ -72,6 +115,7 @@ impl Default for UiPreferences {
             autoplay_selection: true,
             loop_enabled: false,
             output_volume: 1.0,
+            audio_output: AudioOutputPreferences::default(),
         }
     }
 }
@@ -90,6 +134,7 @@ impl UiPreferences {
             validate_theme_source_path(path)?;
         }
         validate_output_volume(self.output_volume)?;
+        self.audio_output.validate()?;
         Ok(Self { theme, ..self })
     }
 
@@ -143,6 +188,20 @@ pub enum PreferenceError {
     /// The output volume was not a finite value in the inclusive 0..=1 range.
     #[error("output volume must be finite and between 0 and 1")]
     InvalidOutputVolume,
+    /// An audio output host or device name was empty, contained a NUL, or exceeded its bound.
+    #[error(
+        "audio output {field} must be non-empty, contain no NUL bytes, and be at most {MAX_AUDIO_OUTPUT_NAME_BYTES} bytes"
+    )]
+    InvalidAudioOutputName {
+        /// The invalid audio output field name.
+        field: &'static str,
+    },
+    /// An audio output numeric setting was zero even though it is optional and positive.
+    #[error("audio output {field} must be greater than zero when provided")]
+    InvalidAudioOutputValue {
+        /// The invalid audio output field name.
+        field: &'static str,
+    },
     /// The profile payload exceeded its bounded UTF-8 byte limit.
     #[error(
         "UI preferences payload exceeds the {UI_PREFERENCES_MAX_BYTES}-byte limit ({actual} bytes)"
@@ -187,6 +246,22 @@ fn validate_output_volume(volume: f32) -> Result<(), PreferenceError> {
     Ok(())
 }
 
+fn validate_audio_output_name(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<(), PreferenceError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_empty()
+        || value.as_bytes().contains(&0)
+        || value.len() > MAX_AUDIO_OUTPUT_NAME_BYTES
+    {
+        return Err(PreferenceError::InvalidAudioOutputName { field });
+    }
+    Ok(())
+}
+
 /// One typed user intent applied to the loaded preference document.
 #[derive(Clone, Debug)]
 pub enum PreferencePatch {
@@ -205,6 +280,8 @@ pub enum PreferencePatch {
     SetLoopEnabled(bool),
     /// Change the linear audition output volume.
     SetOutputVolume(f32),
+    /// Replace all optional audio output routing fields atomically.
+    SetAudioOutput(AudioOutputPreferences),
     /// Replace the invalid or current document with built-in defaults.
     Reset,
 }
@@ -227,6 +304,10 @@ impl PreferencePatch {
             Self::SetOutputVolume(volume) => {
                 validate_output_volume(volume)?;
                 preferences.output_volume = volume;
+            }
+            Self::SetAudioOutput(audio_output) => {
+                audio_output.validate()?;
+                preferences.audio_output = audio_output;
             }
             Self::Reset => *preferences = Self::default_preferences(),
         }
@@ -524,6 +605,35 @@ mod tests {
     }
 
     #[test]
+    fn payload_omitting_audio_output_uses_empty_output_defaults() {
+        let mut payload = serde_json::to_value(UiPreferences::default()).expect("encode");
+        payload
+            .as_object_mut()
+            .expect("preferences object")
+            .remove("audio_output");
+        let payload = serde_json::to_string(&payload).expect("encode legacy payload");
+
+        let preferences = UiPreferences::from_payload(&payload).expect("decode legacy payload");
+        assert_eq!(preferences.audio_output, AudioOutputPreferences::default());
+    }
+
+    #[test]
+    fn audio_output_round_trip_preserves_optional_fields() {
+        let audio_output = AudioOutputPreferences {
+            host: Some(String::from("CoreAudio")),
+            device: Some(String::from("Built-in Output")),
+            sample_rate: Some(48_000),
+            buffer_size: Some(256),
+        };
+        let mut preferences = UiPreferences::default();
+        preferences.audio_output = audio_output.clone();
+
+        let payload = preferences.to_payload().expect("encode preferences");
+        let restored = UiPreferences::from_payload(&payload).expect("decode preferences");
+        assert_eq!(restored.audio_output, audio_output);
+    }
+
+    #[test]
     fn invalid_output_volume_patch_rejects_before_mutation() {
         for volume in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
             let mut preferences = UiPreferences::default();
@@ -536,6 +646,72 @@ mod tests {
             assert_eq!(error, PreferenceError::InvalidOutputVolume);
             assert_eq!(preferences, before);
         }
+    }
+
+    #[test]
+    fn invalid_audio_output_patch_rejects_before_mutation() {
+        let invalid_outputs = [
+            AudioOutputPreferences {
+                host: Some(String::new()),
+                ..AudioOutputPreferences::default()
+            },
+            AudioOutputPreferences {
+                device: Some(String::from("USB\0Output")),
+                ..AudioOutputPreferences::default()
+            },
+            AudioOutputPreferences {
+                host: Some("h".repeat(MAX_AUDIO_OUTPUT_NAME_BYTES + 1)),
+                ..AudioOutputPreferences::default()
+            },
+            AudioOutputPreferences {
+                sample_rate: Some(0),
+                ..AudioOutputPreferences::default()
+            },
+            AudioOutputPreferences {
+                buffer_size: Some(0),
+                ..AudioOutputPreferences::default()
+            },
+        ];
+
+        for audio_output in invalid_outputs {
+            let mut preferences = UiPreferences::default();
+            preferences.theme.name = String::from("Keep this theme");
+            preferences.output_volume = 0.4;
+            let before = preferences.clone();
+
+            let error = PreferencePatch::SetAudioOutput(audio_output)
+                .apply(&mut preferences)
+                .expect_err("invalid audio output must be rejected");
+            assert!(matches!(
+                error,
+                PreferenceError::InvalidAudioOutputName { .. }
+                    | PreferenceError::InvalidAudioOutputValue { .. }
+            ));
+            assert_eq!(preferences, before);
+        }
+    }
+
+    #[test]
+    fn audio_output_patch_preserves_other_preferences() {
+        let mut preferences = UiPreferences::default();
+        preferences.theme.name = String::from("Keep this theme");
+        preferences.output_volume = 0.4;
+        let theme = preferences.theme.clone();
+        let audio_output = AudioOutputPreferences {
+            host: Some(String::from("CoreAudio")),
+            device: Some(String::from("USB Output")),
+            sample_rate: Some(44_100),
+            buffer_size: Some(512),
+        };
+
+        assert!(
+            PreferencePatch::SetAudioOutput(audio_output.clone())
+                .apply(&mut preferences)
+                .expect("valid audio output patch")
+        );
+        assert_eq!(preferences.theme, theme);
+        assert_eq!(preferences.output_volume, 0.4);
+        assert_eq!(preferences.audio_output, audio_output);
     }
 
     #[test]

@@ -26,11 +26,11 @@ use wavecrate_library::sample_sources::{
 
 mod preferences;
 
-use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 pub use preferences::{
-    PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
-    UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
+    AudioOutputPreferences, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
+    PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
+use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 
 /// The non-live profile used by the GPUI application session.
 pub const GPUI_DEVELOPMENT_PROFILE: &str = "gpui-development";
