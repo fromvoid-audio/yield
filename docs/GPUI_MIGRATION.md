@@ -288,6 +288,30 @@ search-field Select All routing, plain-click reset, and focused toggle. Modified
 pointer routing has code/core coverage; manual modifier-click acceptance remains
 unrecorded. Batch file mutations and persisted selection remain outside this slice.
 
+### Full-length WAV waveforms, 2026-09-07
+
+WAV waveforms now cover the complete source timeline, including silence, using
+two buffered streaming passes and fixed 180-peak/2,048-band output. The first
+pass finds the global mono peak; the second normalizes and projects the existing
+frequency layers at the source sample rate. The six-second and 256 MiB preview
+limits are removed. Cancellation checks run during both passes, and the UI
+cancels superseded loads while retaining generation fencing. Malformed or
+truncated files fail without publishing partial output.
+
+Validation: 14 media tests and 22 UI tests passed (one manual benchmark ignored),
+plus UI check, formatting, diff checks, and signed macOS build. Independent
+review found no meaningful issues in memory bounds, decoding, cancellation, or
+cache invalidation. Live checks confirmed a late transient at eight seconds in
+a twelve-second stereo file, successful loading of a 300 MiB WAV, and prompt
+switching from that pending load to a one-second file. Sampled process RSS was
+104,560/104,608/104,624 KiB before/during/after the large-file load; these are
+samples rather than a peak-memory benchmark. CPU returned to idle after loading.
+
+A broader workspace test run reported 439 passes and six library profile
+ownership failures involving temporary paths (`Not a directory`). Those failures
+are being investigated separately; the workspace suite is not claimed green.
+Non-WAV preview, zoom/edit gestures, and seek/loop transport remain outstanding.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

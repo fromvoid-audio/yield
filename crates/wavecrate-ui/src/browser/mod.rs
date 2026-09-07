@@ -23,7 +23,9 @@ use wavecrate_core::{
     FolderTreeRow, SortColumn,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
-use wavecrate_media::{WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview};
+use wavecrate_media::{
+    WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
+};
 
 use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
@@ -162,6 +164,7 @@ pub(crate) struct Browser {
     playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
+    waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
     waveform_pending: bool,
     motion_started_at: Option<Instant>,
@@ -237,6 +240,7 @@ impl Browser {
             playback_cursor_interpolation: None,
             scan_cancel: None,
             scan_task: None,
+            waveform_cancel: None,
             waveform_task: None,
             waveform_pending: false,
             motion_started_at: None,
@@ -275,6 +279,13 @@ impl Browser {
         self.selected
             .and_then(|index| self.entries.get(index))
             .map(AudioFile::stable_id)
+    }
+
+    fn cancel_waveform_load(&mut self) {
+        if let Some(cancellation) = self.waveform_cancel.take() {
+            cancellation.store(true, Ordering::Release);
+        }
+        self.waveform_task.take();
     }
 
     fn visible_selection_ids(&self) -> Vec<AudioFileId> {
@@ -352,6 +363,7 @@ impl Browser {
                 if self.selected.is_some() {
                     self.stop_playback();
                     self.selected = None;
+                    self.cancel_waveform_load();
                     self.waveform_pending = false;
                     self.waveform = None;
                     self.waveform_error = None;
@@ -410,7 +422,7 @@ impl Browser {
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
         self.selected = None;
-        self.waveform_task.take();
+        self.cancel_waveform_load();
         self.waveform_pending = false;
         self.waveform = None;
         self.waveform_error = None;
@@ -763,7 +775,7 @@ impl Browser {
         if had_pending_scan || was_active {
             self.scan_generation = self.scan_generation.wrapping_add(1);
             self.waveform_generation = self.waveform_generation.wrapping_add(1);
-            self.waveform_task.take();
+            self.cancel_waveform_load();
             self.stop_playback();
         }
         self.pending_source_return_index = None;
@@ -924,6 +936,7 @@ impl Browser {
             return;
         }
         self.stop_playback();
+        self.cancel_waveform_load();
         self.selected = Some(index);
         if let Some(source_index) = self.active_source
             && let Some(session) = self.source_sessions.get_mut(source_index)
@@ -936,16 +949,20 @@ impl Browser {
         let generation = self.waveform_generation;
         self.waveform_pending = true;
         let path = entry.path;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.waveform_cancel = Some(Arc::clone(&cancellation));
         self.playback_status = "Ready".to_string();
         self.waveform_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { load_waveform_preview(&path) })
+                .spawn(async move { load_waveform_preview_with_cancel(&path, Some(&cancellation)) })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.waveform_generation != generation {
                     return;
                 }
+                view.waveform_cancel = None;
+                view.waveform_task = None;
                 view.waveform_pending = false;
                 match result {
                     Ok(preview) => view.waveform = Some(preview),
@@ -1233,6 +1250,7 @@ impl Drop for Browser {
         if let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }
+        self.cancel_waveform_load();
         if let Some(runtime) = self.playback.as_ref() {
             let _ = runtime.handle.try_shutdown();
         }

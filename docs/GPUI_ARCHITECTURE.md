@@ -56,6 +56,13 @@ while rendering. It does not replace
 the persistent scanner's ownership, watcher, readiness, journal, or recovery
 contracts. Those services will be integrated when persistent sources are ported.
 
+WAV waveforms use two buffered streaming passes: the first finds the global
+mono peak and the second feeds normalized frames into bounded peak and frequency
+columns. They retain the full source timeline, including silence, without
+retaining PCM for the entire file. Cancellation is checked during both passes;
+the UI also fences completion by selection generation. Waveform loading has no
+source-write authority and shares no connection with persistent scanning.
+
 ## UI organization
 
 The UI crate separates browser state/lifecycle, rendering, transport coordination,

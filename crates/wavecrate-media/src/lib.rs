@@ -4,10 +4,11 @@
 //! Read-only audio scanning and bounded waveform previews for the GPUI browser.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-use wavecrate_analysis::{decode_for_analysis_with_rate_limit, probe_metadata};
+use wavecrate_analysis::probe_metadata;
 use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
@@ -18,14 +19,6 @@ pub const MAX_WAVEFORM_POINTS: usize = 180;
 
 /// Maximum number of frequency-layer columns generated for a selected sample's preview.
 pub const MAX_WAVEFORM_BAND_POINTS: usize = 2_048;
-
-/// Maximum analysis window requested for a waveform preview.
-pub const MAX_PREVIEW_SECONDS: f32 = 6.0;
-
-const PREVIEW_SAMPLE_RATE: u32 = 16_000;
-const MAX_PREVIEW_SOURCE_SAMPLES: u64 = 8_000_000;
-const ANALYSIS_WINDOW_PADDING_SECONDS: f64 = 2.0;
-const MAX_PREVIEW_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Result of an in-memory folder scan.
 #[derive(Clone, Debug, PartialEq)]
@@ -186,91 +179,226 @@ pub fn enumerate_audio_files_with_cancel(
     })
 }
 
-/// Decode a bounded, mono waveform preview from a source file.
+/// Decode a full-length, bounded-memory mono waveform preview from a source file.
 pub fn load_waveform_preview(path: &Path) -> Result<WaveformPreview, String> {
-    let decode_seconds = preview_decode_seconds(path)?;
-    let decoded =
-        decode_for_analysis_with_rate_limit(path, PREVIEW_SAMPLE_RATE, Some(decode_seconds))?;
-    let peaks = peak_envelope(&decoded.mono, MAX_WAVEFORM_POINTS);
-    let bands = visual_bands::project(
-        &decoded.mono,
-        decoded.sample_rate_used,
-        MAX_WAVEFORM_BAND_POINTS,
-    );
-    if peaks.is_empty() {
-        return Err(format!("{} contains no decodable samples", path.display()));
-    }
-    Ok(WaveformPreview {
-        peaks,
-        bands,
-        duration_seconds: decoded.duration_seconds,
-        sample_rate: decoded.sample_rate_used,
-    })
+    load_waveform_preview_with_cancel(path, None)
 }
 
-fn preview_decode_seconds(path: &Path) -> Result<f32, String> {
-    let byte_len = fs::metadata(path)
-        .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?
-        .len();
-    if byte_len > MAX_PREVIEW_FILE_BYTES {
-        return Err(format!(
-            "{} is too large for a bounded waveform preview ({} MiB limit)",
-            path.display(),
-            MAX_PREVIEW_FILE_BYTES / (1024 * 1024)
-        ));
+/// Decode a full-length WAV waveform while honoring an optional cancellation flag.
+pub fn load_waveform_preview_with_cancel(
+    path: &Path,
+    cancellation: Option<&AtomicBool>,
+) -> Result<WaveformPreview, String> {
+    if is_cancelled(cancellation) {
+        return Err(String::from("waveform preview canceled"));
     }
-
-    let is_wav = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
-    if !is_wav {
+    if !is_wav_path(path) {
         return Err(format!(
             "{} waveform preview currently requires WAV channel metadata",
             path.display()
         ));
     }
-    let reader = hound::WavReader::open(path)
-        .map_err(|error| format!("WAV preview probe failed for {}: {error}", path.display()))?;
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))?;
     let spec = reader.spec();
-    let (sample_rate, channels) = (spec.sample_rate.max(1), spec.channels.max(1));
-
-    let source_seconds = MAX_PREVIEW_SOURCE_SAMPLES as f64
-        / (sample_rate as f64 * u64::from(channels.max(1)) as f64);
-    let requested_seconds =
-        MAX_PREVIEW_SECONDS.min((source_seconds - ANALYSIS_WINDOW_PADDING_SECONDS).max(0.0) as f32);
-    if requested_seconds <= 0.0 {
+    if spec.sample_rate == 0 {
         return Err(format!(
-            "{} has too many source samples per second for a bounded waveform preview",
-            path.display()
+            "{} WAV has an invalid zero sample rate",
+            path.display(),
         ));
     }
-    Ok(requested_seconds)
+    if spec.channels == 0 {
+        return Err(format!("{} WAV has no channels", path.display()));
+    }
+    let total_frames = reader.duration() as usize;
+    if total_frames == 0 {
+        return Err(format!("{} contains no decodable samples", path.display()));
+    }
+    let channels = usize::from(spec.channels);
+    let global_peak =
+        stream_global_mono_peak(&mut reader, spec, channels, total_frames, cancellation)?;
+    if is_cancelled(cancellation) {
+        return Err(String::from("waveform preview canceled"));
+    }
+    reader
+        .seek(0)
+        .map_err(|error| format!("Failed to rewind WAV {}: {error}", path.display()))?;
+    let normalization_gain = if global_peak.is_finite() && global_peak >= f32::MIN_POSITIVE {
+        1.0 / global_peak
+    } else {
+        1.0
+    };
+    let peak_count = total_frames.min(MAX_WAVEFORM_POINTS);
+    let mut peaks = vec![0.0_f32; peak_count];
+    let mut bands = visual_bands::StreamingProjector::new(
+        spec.sample_rate,
+        total_frames,
+        MAX_WAVEFORM_BAND_POINTS,
+    );
+    stream_wav_frames(
+        &mut reader,
+        spec,
+        channels,
+        total_frames,
+        cancellation,
+        |frame_index, mono| {
+            let normalized = (mono * normalization_gain).clamp(-1.0, 1.0);
+            let peak_index = column_index(frame_index, total_frames, peak_count);
+            peaks[peak_index] = peaks[peak_index].max(normalized.abs());
+            bands.push(frame_index, normalized);
+            Ok(())
+        },
+    )?;
+    if is_cancelled(cancellation) {
+        return Err(String::from("waveform preview canceled"));
+    }
+    let bands = bands.finish();
+    let duration_seconds = total_frames as f64 / spec.sample_rate as f64;
+    let duration_seconds = duration_seconds as f32;
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return Err(format!("{} has an invalid WAV duration", path.display()));
+    }
+    Ok(WaveformPreview {
+        peaks,
+        bands,
+        duration_seconds,
+        sample_rate: spec.sample_rate,
+    })
 }
 
-fn peak_envelope(samples: &[f32], point_count: usize) -> Vec<f32> {
-    if samples.is_empty() || point_count == 0 {
-        return Vec::new();
+fn stream_global_mono_peak<R: Read>(
+    reader: &mut hound::WavReader<R>,
+    spec: hound::WavSpec,
+    channels: usize,
+    total_frames: usize,
+    cancellation: Option<&AtomicBool>,
+) -> Result<f32, String> {
+    let mut global_peak = 0.0_f32;
+    stream_wav_frames(
+        reader,
+        spec,
+        channels,
+        total_frames,
+        cancellation,
+        |_, mono| {
+            global_peak = global_peak.max(mono.abs());
+            Ok(())
+        },
+    )?;
+    Ok(global_peak)
+}
+
+fn stream_wav_frames<R: Read, F>(
+    reader: &mut hound::WavReader<R>,
+    spec: hound::WavSpec,
+    channels: usize,
+    total_frames: usize,
+    cancellation: Option<&AtomicBool>,
+    process: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, f32) -> Result<(), String>,
+{
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            let mut samples = reader.samples::<f32>();
+            stream_sample_frames(
+                &mut samples,
+                channels,
+                total_frames,
+                cancellation,
+                "float",
+                sanitize_stream_sample,
+                process,
+            )
+        }
+        hound::SampleFormat::Int if spec.bits_per_sample <= 16 => {
+            let scale = integer_sample_scale(spec.bits_per_sample);
+            let mut samples = reader.samples::<i16>();
+            stream_sample_frames(
+                &mut samples,
+                channels,
+                total_frames,
+                cancellation,
+                "integer",
+                move |sample| sanitize_stream_sample(f32::from(sample) / scale),
+                process,
+            )
+        }
+        hound::SampleFormat::Int => {
+            let scale = integer_sample_scale(spec.bits_per_sample);
+            let mut samples = reader.samples::<i32>();
+            stream_sample_frames(
+                &mut samples,
+                channels,
+                total_frames,
+                cancellation,
+                "integer",
+                move |sample| sanitize_stream_sample(sample as f32 / scale),
+                process,
+            )
+        }
     }
-    let point_count = point_count.min(samples.len());
-    (0..point_count)
-        .map(|point| {
-            let start = point * samples.len() / point_count;
-            let end = ((point + 1) * samples.len() / point_count).max(start + 1);
-            samples[start..end.min(samples.len())]
-                .iter()
-                .copied()
-                .map(|sample| {
-                    if sample.is_finite() {
-                        sample.abs()
-                    } else {
-                        0.0
-                    }
-                })
-                .fold(0.0, f32::max)
-                .clamp(0.0, 1.0)
-        })
-        .collect()
+}
+
+fn stream_sample_frames<T, I, D, F>(
+    samples: &mut I,
+    channels: usize,
+    total_frames: usize,
+    cancellation: Option<&AtomicBool>,
+    sample_kind: &str,
+    mut decode: D,
+    mut process: F,
+) -> Result<(), String>
+where
+    I: Iterator<Item = Result<T, hound::Error>>,
+    D: FnMut(T) -> f32,
+    F: FnMut(usize, f32) -> Result<(), String>,
+{
+    for frame_index in 0..total_frames {
+        if is_cancelled(cancellation) {
+            return Err(String::from("waveform preview canceled"));
+        }
+        let mut sum = 0.0_f32;
+        for _ in 0..channels {
+            let sample = samples
+                .next()
+                .transpose()
+                .map_err(|error| format!("failed to read {sample_kind} sample: {error}"))?
+                .ok_or_else(|| String::from("WAV ended before declared frame count"))?;
+            sum += decode(sample);
+        }
+        process(frame_index, sum / channels as f32)?;
+    }
+    Ok(())
+}
+
+fn integer_sample_scale(bits_per_sample: u16) -> f32 {
+    (1_i64 << bits_per_sample.saturating_sub(1).min(31)).max(1) as f32
+}
+
+fn sanitize_stream_sample(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn column_index(frame_index: usize, total_frames: usize, column_count: usize) -> usize {
+    debug_assert!(total_frames > 0);
+    debug_assert!(column_count > 0);
+    ((frame_index as u128 * column_count as u128) / total_frames as u128) as usize
+}
+
+fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
+    cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+}
+
+fn is_wav_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
 }
 
 #[cfg(test)]
@@ -278,6 +406,7 @@ mod tests {
     use super::*;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::f32::consts::TAU;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     fn write_fixture(path: &Path) {
@@ -350,50 +479,215 @@ mod tests {
                 .flatten()
                 .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
         );
-        assert_eq!(preview.sample_rate, PREVIEW_SAMPLE_RATE);
+        assert_eq!(preview.sample_rate, 16_000);
         assert!((preview.duration_seconds - 1.0).abs() < 0.02);
     }
 
     #[test]
-    fn preview_probe_caps_high_rate_multichannel_source() {
+    fn full_length_preview_keeps_a_late_transient_after_six_seconds() {
         let directory = TempDir::new().expect("temporary directory");
-        let path = directory.path().join("wide.wav");
+        let path = directory.path().join("long.wav");
         let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(&path, spec).expect("create fixture");
+        let frames = 8 * spec.sample_rate as usize;
+        for frame in 0..frames {
+            let sample = if frame == frames - 1 { 0.75 } else { 0.0 };
+            writer.write_sample(sample).expect("write fixture");
+        }
+        writer.finalize().expect("finish fixture");
+
+        let preview = load_waveform_preview(&path).expect("full preview");
+        assert!((preview.duration_seconds - 8.0).abs() < 0.001);
+        assert_eq!(preview.peaks.len(), MAX_WAVEFORM_POINTS);
+        assert_eq!(preview.bands.len(), MAX_WAVEFORM_BAND_POINTS);
+        assert!(preview.peaks.last().copied().unwrap_or_default() > 0.99);
+        assert!(preview.bands.last().copied().unwrap_or_default()[3] > 0.99);
+    }
+
+    #[test]
+    fn streaming_projection_matches_the_slice_projector_after_global_normalization() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("projection.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(&path, spec).expect("create fixture");
+        let samples = [0.1_f32, -0.25, 0.8, 0.3, -0.4, 0.05, 0.2, -0.7];
+        for sample in samples {
+            writer.write_sample(sample).expect("write fixture");
+        }
+        writer.finalize().expect("finish fixture");
+
+        let preview = load_waveform_preview(&path).expect("full preview");
+        let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        let normalized = samples
+            .iter()
+            .copied()
+            .map(|sample| sample / peak)
+            .collect::<Vec<_>>();
+        let expected =
+            visual_bands::project(&normalized, spec.sample_rate, MAX_WAVEFORM_BAND_POINTS);
+        assert_eq!(preview.bands, expected);
+        assert_eq!(preview.peaks.iter().copied().fold(0.0, f32::max), 1.0);
+    }
+
+    #[test]
+    fn stereo_duration_is_frame_based_and_high_rate_multichannel_streams() {
+        let directory = TempDir::new().expect("temporary directory");
+        let stereo_path = directory.path().join("stereo.wav");
+        let stereo_spec = WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut stereo = WavWriter::create(&stereo_path, stereo_spec).expect("create stereo");
+        for _ in 0..4 {
+            stereo.write_sample::<i16>(16_000).expect("left sample");
+            stereo.write_sample::<i16>(-16_000).expect("right sample");
+        }
+        stereo.finalize().expect("finish stereo");
+        let stereo_preview = load_waveform_preview(&stereo_path).expect("stereo preview");
+        assert!((stereo_preview.duration_seconds - 4.0 / 48_000.0).abs() < 1e-6);
+        assert_eq!(stereo_preview.sample_rate, 48_000);
+        assert_eq!(stereo_preview.peaks.len(), 4);
+
+        let wide_path = directory.path().join("wide.wav");
+        let wide_spec = WavSpec {
             channels: 8,
             sample_rate: 384_000,
             bits_per_sample: 16,
             sample_format: SampleFormat::Int,
         };
-        let mut writer = WavWriter::create(&path, spec).expect("create fixture");
-        for _ in 0..8 {
-            for _ in 0..10 {
-                writer.write_sample::<i16>(0).expect("write fixture");
+        let mut wide = WavWriter::create(&wide_path, wide_spec).expect("create wide");
+        for frame in 0..32 {
+            for channel in 0..8 {
+                let sample = if frame == 31 && channel == 7 {
+                    i16::MAX
+                } else {
+                    0
+                };
+                wide.write_sample::<i16>(sample).expect("wide sample");
             }
         }
-        writer.finalize().expect("finish fixture");
-
-        let seconds = preview_decode_seconds(&path).expect("bounded preview");
-        assert!(seconds > 0.5);
-        assert!(seconds < 0.7);
+        wide.finalize().expect("finish wide");
+        let wide_preview = load_waveform_preview(&wide_path).expect("wide preview");
+        assert!((wide_preview.duration_seconds - 32.0 / 384_000.0).abs() < 1e-8);
+        assert_eq!(wide_preview.sample_rate, 384_000);
+        assert_eq!(wide_preview.peaks.len(), 32);
+        assert!(wide_preview.peaks.last().copied().unwrap_or_default() > 0.99);
     }
 
     #[test]
-    fn preview_probe_rejects_an_impossible_source_rate() {
+    fn pcm24_float_nonfinite_and_malformed_inputs_are_handled() {
         let directory = TempDir::new().expect("temporary directory");
-        let path = directory.path().join("impossible.wav");
+        let pcm_path = directory.path().join("pcm24.wav");
+        let pcm_spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            sample_format: SampleFormat::Int,
+        };
+        let mut pcm = WavWriter::create(&pcm_path, pcm_spec).expect("create pcm24");
+        pcm.write_sample::<i32>(8_388_607).expect("positive pcm24");
+        pcm.write_sample::<i32>(-8_388_608).expect("negative pcm24");
+        pcm.finalize().expect("finish pcm24");
+        let pcm_preview = load_waveform_preview(&pcm_path).expect("pcm24 preview");
+        assert!(pcm_preview.peaks.iter().copied().any(|peak| peak > 0.99));
+
+        let float_path = directory.path().join("nonfinite.wav");
+        let float_spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut float = WavWriter::create(&float_path, float_spec).expect("create float");
+        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.25] {
+            float.write_sample(sample).expect("float sample");
+        }
+        float.finalize().expect("finish float");
+        let float_preview = load_waveform_preview(&float_path).expect("float preview");
+        assert!(
+            float_preview
+                .peaks
+                .iter()
+                .chain(float_preview.bands.iter().flatten())
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        );
+        assert_eq!(float_preview.peaks[0], 0.0);
+        assert!(float_preview.peaks[3] > 0.99);
+
+        let mut truncated = std::fs::read(&pcm_path).expect("read pcm24");
+        truncated.pop();
+        let truncated_path = directory.path().join("truncated.wav");
+        std::fs::write(&truncated_path, truncated).expect("write truncated");
+        let error = load_waveform_preview(&truncated_path).expect_err("truncated must fail");
+        assert!(error.contains("failed to read") || error.contains("ended before"));
+    }
+
+    #[test]
+    fn empty_and_non_wav_inputs_are_rejected() {
+        let directory = TempDir::new().expect("temporary directory");
+        let empty_path = directory.path().join("empty.wav");
         let spec = WavSpec {
-            channels: 8,
-            sample_rate: 10_000_000,
+            channels: 1,
+            sample_rate: 16_000,
             bits_per_sample: 16,
             sample_format: SampleFormat::Int,
         };
-        let mut writer = WavWriter::create(&path, spec).expect("create fixture");
-        for _ in 0..8 {
-            writer.write_sample::<i16>(0).expect("write fixture");
-        }
-        writer.finalize().expect("finish fixture");
+        let writer = WavWriter::create(&empty_path, spec).expect("create empty");
+        writer.finalize().expect("finish empty");
+        let empty_error = load_waveform_preview(&empty_path).expect_err("empty must fail");
+        assert!(empty_error.contains("no decodable samples"));
 
-        let error = preview_decode_seconds(&path).expect_err("preview must be rejected");
-        assert!(error.contains("too many source samples"));
+        let text_path = directory.path().join("not-a-wav.txt");
+        std::fs::write(&text_path, b"audio").expect("write text");
+        let text_error = load_waveform_preview(&text_path).expect_err("non-wav must fail");
+        assert!(text_error.contains("requires WAV"));
+    }
+
+    #[test]
+    fn cancellation_is_honored_before_and_during_streaming() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("cancel.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(&path, spec).expect("create cancel fixture");
+        for _ in 0..16_000 {
+            writer.write_sample::<i16>(1_000).expect("cancel sample");
+        }
+        writer.finalize().expect("finish cancel fixture");
+
+        let already_cancelled = AtomicBool::new(true);
+        let error = load_waveform_preview_with_cancel(&path, Some(&already_cancelled))
+            .expect_err("pre-cancel must stop");
+        assert_eq!(error, "waveform preview canceled");
+
+        let mut reader = hound::WavReader::open(&path).expect("open cancel fixture");
+        let flag = AtomicBool::new(false);
+        let mut seen = 0usize;
+        let total_frames = reader.duration() as usize;
+        let result = stream_wav_frames(&mut reader, spec, 1, total_frames, Some(&flag), |_, _| {
+            seen += 1;
+            if seen == 8 {
+                flag.store(true, AtomicOrdering::Release);
+            }
+            Ok(())
+        });
+        assert_eq!(result, Err(String::from("waveform preview canceled")));
+        assert_eq!(seen, 8);
     }
 }

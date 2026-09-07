@@ -74,13 +74,14 @@ preserving a batch selection; a plain click starts fresh. The status bar shows
 the explicit selected count.
 
 Audition and waveform previews currently support WAV. Other recognized audio
-formats are listed. Waveforms show a bounded initial segment; files over 256 MiB
-are not previewed. The application does not persist library state or modify
+formats are listed. WAV waveforms cover the full file using cancellable,
+bounded-memory streaming and show the playback cursor during audition.
+The application does not persist library state or modify
 sample files.
 
 See the [parity register](docs/GPUI_MIGRATION.md) for remaining workflows and
 validation evidence. Editing, persistent curation, recovery,
-full-length waveforms, and DAW handoff remain outstanding. Inherited release
+waveform zoom/edit gestures, and DAW handoff remain outstanding. Inherited release
 workflows are disabled.
 
 ## Validate

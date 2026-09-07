@@ -55,50 +55,87 @@ impl VisualBandFrameProcessor {
     }
 }
 
+/// Incrementally project a known-length mono stream into bounded visual columns.
+pub(super) struct StreamingProjector {
+    processor: VisualBandFrameProcessor,
+    total_frames: usize,
+    point_count: usize,
+    columns: Vec<[f32; BAND_COUNT]>,
+}
+
+impl StreamingProjector {
+    /// Create a projector sized to the source frame count and column limit.
+    pub(super) fn new(sample_rate: u32, total_frames: usize, max_points: usize) -> Self {
+        let point_count = total_frames.min(max_points);
+        Self {
+            processor: VisualBandFrameProcessor::new(sample_rate),
+            total_frames,
+            point_count,
+            columns: vec![[0.0_f32; BAND_COUNT]; point_count],
+        }
+    }
+
+    /// Add one mono source frame at its full-file position.
+    pub(super) fn push(&mut self, frame_index: usize, sample: f32) {
+        if self.point_count == 0 || frame_index >= self.total_frames {
+            return;
+        }
+        let frame = self.processor.process(sample);
+        let column =
+            ((frame_index as u128 * self.point_count as u128) / self.total_frames as u128) as usize;
+        let Some(column_values) = self.columns.get_mut(column) else {
+            return;
+        };
+        for lane in 0..VISUAL_BAND_COUNT {
+            column_values[lane] = column_values[lane].max(frame[lane]);
+        }
+        column_values[3] = column_values[3].max(frame[3].abs());
+    }
+
+    /// Finish the projection with the same file-level visual normalization as the slice path.
+    pub(super) fn finish(mut self) -> Vec<[f32; BAND_COUNT]> {
+        let raw_peak = self
+            .columns
+            .iter()
+            .map(|column| column[3])
+            .fold(0.0_f32, f32::max);
+        let peaks = [
+            self.columns
+                .iter()
+                .map(|column| column[0])
+                .fold(0.0_f32, f32::max),
+            self.columns
+                .iter()
+                .map(|column| column[1])
+                .fold(0.0_f32, f32::max),
+            self.columns
+                .iter()
+                .map(|column| column[2])
+                .fold(0.0_f32, f32::max),
+        ];
+        let gains = visual_band_normalization(raw_peak, peaks);
+        for column in &mut self.columns {
+            for (band, gain) in gains.into_iter().enumerate() {
+                column[band] = finite_unit(column[band] * gain);
+            }
+            column[3] = finite_unit(column[3]);
+        }
+        self.columns
+    }
+}
+
 /// Project mono samples into bounded per-column frequency-layer peak magnitudes.
+#[cfg(test)]
 pub(super) fn project(samples: &[f32], sample_rate: u32, max_points: usize) -> Vec<[f32; 4]> {
     if samples.is_empty() || max_points == 0 {
         return Vec::new();
     }
 
-    let point_count = samples.len().min(max_points);
-    let mut columns = vec![[0.0_f32; BAND_COUNT]; point_count];
-    let mut processor = VisualBandFrameProcessor::new(sample_rate);
+    let mut projector = StreamingProjector::new(sample_rate, samples.len(), max_points);
     for (index, sample) in samples.iter().copied().enumerate() {
-        let frame = processor.process(sample);
-        let column = ((index as u128 * point_count as u128) / samples.len() as u128) as usize;
-        for lane in 0..VISUAL_BAND_COUNT {
-            columns[column][lane] = columns[column][lane].max(frame[lane]);
-        }
-        columns[column][3] = columns[column][3].max(frame[3].abs());
+        projector.push(index, sample);
     }
-
-    let raw_peak = columns
-        .iter()
-        .map(|column| column[3])
-        .fold(0.0_f32, f32::max);
-    let peaks = [
-        columns
-            .iter()
-            .map(|column| column[0])
-            .fold(0.0_f32, f32::max),
-        columns
-            .iter()
-            .map(|column| column[1])
-            .fold(0.0_f32, f32::max),
-        columns
-            .iter()
-            .map(|column| column[2])
-            .fold(0.0_f32, f32::max),
-    ];
-    let gains = visual_band_normalization(raw_peak, peaks);
-    for column in &mut columns {
-        for (band, gain) in gains.into_iter().enumerate() {
-            column[band] = finite_unit(column[band] * gain);
-        }
-        column[3] = finite_unit(column[3]);
-    }
-    columns
+    projector.finish()
 }
 
 fn visual_band_normalization(

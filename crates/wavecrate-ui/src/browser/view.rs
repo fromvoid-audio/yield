@@ -65,7 +65,7 @@ impl Browser {
             )
         } else if self.selected.is_some() {
             (
-                "Loading bounded waveform preview…".to_string(),
+                "Loading waveform…".to_string(),
                 theme.colors.warning,
             )
         } else {
