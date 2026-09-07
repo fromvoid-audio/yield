@@ -224,6 +224,30 @@ lingering busy indicator after the error. Short fixture loads did not establish
 manual timing acceptance of the pulse/sweep. Focus fades, scroll-edge fades,
 playhead motion, and effects belonging to unported workflows remain pending.
 
+### Focus and scroll-edge motion, 2026-09-07
+
+Sample, source, and folder focus uses stable path identity and a pale 6-point
+rail over the persistent coral selection marker. Pointer focus fades over
+250 ms; keyboard focus holds for 800 ms before fading. Selection reconciliation
+clears stale sample focus without restarting effects during sorting or rendering.
+
+Scrollable lists show 48-point directional edge gradients driven by actual
+viewport bounds and scroll range. Their 260 ms transitions reverse from the
+current opacity and stop requesting frames when settled. The reference's folder
+edge affordance also applies to GPUI source and sample lists. Paint-only overlays
+preserve row input. Disabling animation keeps focus static and updates edges
+immediately; waveform geometry and folder projection caches remain unchanged.
+
+Validation: 17 UI tests passed (one manual benchmark ignored), launcher check,
+workspace formatting, diff checks, and signed macOS bundle build passed. Focused
+independent review found no actionable issues. Disposable-fixture GUI checks
+confirmed edge direction at both scroll limits, row clicks through gradients,
+keyboard focus settling to the coral selection rail, and immediate disabled-motion
+feedback. Filtering to one file removed overflow gradients and stale focus;
+changing the settings panel height updated overflow feedback. Animations were
+restored after testing. Playhead motion, waveform gestures, and effects belonging
+to unported workflows remain pending.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

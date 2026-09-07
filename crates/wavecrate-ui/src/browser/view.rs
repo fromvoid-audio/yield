@@ -12,6 +12,7 @@ use wavecrate_design::Theme;
 use crate::theme::{active, color, transparent};
 
 use super::Browser;
+use super::motion;
 use super::waveform;
 
 fn format_file_size(bytes: u64) -> String {
@@ -291,128 +292,170 @@ impl Render for Browser {
                     "No matching filenames".to_string()
                 })
         } else {
-            div().flex_1().h_full().child(
-                uniform_list(
-                    "sample-list",
-                    self.view_model.rows().len(),
-                    cx.processor({
-                        let list_theme = theme.clone();
-                        move |view, range: std::ops::Range<usize>, _window, cx| {
-                            range
-                                .map(|visible_index| {
-                                    let row = view.view_model.rows()[visible_index].clone();
-                                    let index = row.entry_index;
-                                    let entry = view.entries[index].clone();
-                                    let selected = view.selected == Some(index);
-                                    let extension = entry
-                                        .path
-                                        .extension()
-                                        .map(|extension| extension.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    let size = format_file_size(entry.byte_len);
-                                    let duration = format_duration(entry.duration_seconds);
-                                    let hover_fill = color(list_theme.colors.selection_hover_fill);
-                                    let pressed_fill = color(list_theme.interaction.pressed_fill);
-                                    let row_group =
-                                        format!("sample-row:{}", entry.path.to_string_lossy());
-                                    div()
-                                        .group(row_group.clone())
-                                        .id(index)
-                                        .flex()
-                                        .flex_none()
-                                        .w_full()
-                                        .items_center()
-                                        .h(px(list_theme.spacing.row_height))
-                                        .relative()
-                                        .cursor_pointer()
-                                        .bg(if selected {
-                                            color(list_theme.colors.selection_fill)
-                                        } else {
-                                            color(list_theme.colors.surface)
-                                        })
-                                        .hover(move |style| style.bg(hover_fill))
-                                        .active(move |style| style.bg(pressed_fill))
-                                        .on_click(cx.listener(
-                                            move |view, _: &ClickEvent, _, cx| {
-                                                view.select_entry(index, cx);
-                                            },
-                                        ))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(list_theme.spacing.selected_marker_width))
-                                                .h_full()
-                                                .bg(if selected {
-                                                    color(list_theme.colors.accent)
-                                                } else {
-                                                    transparent()
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .text_ellipsis()
-                                                .pl(px(list_theme.spacing.row_padding_x))
-                                                .pr(px(list_theme.spacing.control_gap))
-                                                .text_size(px(list_theme.typography.body_size))
-                                                .text_color(if selected {
-                                                    color(list_theme.colors.accent)
-                                                } else {
-                                                    color(list_theme.colors.text_primary)
-                                                })
-                                                .child(entry.relative_path.display().to_string()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(extension_width))
-                                                .px(px(list_theme.spacing.control_gap))
-                                                .text_size(px(list_theme.typography.small_size))
-                                                .text_color(color(list_theme.colors.text_muted))
-                                                .child(extension),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(size_width))
-                                                .px(px(list_theme.spacing.control_gap))
-                                                .text_size(px(list_theme.typography.small_size))
-                                                .text_color(color(list_theme.colors.text_muted))
-                                                .child(size),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(duration_width))
-                                                .px(px(list_theme.spacing.control_gap))
-                                                .text_size(px(list_theme.typography.small_size))
-                                                .text_color(color(list_theme.colors.text_muted))
-                                                .child(duration),
-                                        )
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .top_0()
-                                                .bottom_0()
-                                                .right_0()
-                                                .w(px(super::motion::HOVER_RAIL_WIDTH))
-                                                .bg(super::motion::with_alpha(
-                                                    list_theme.interaction.focus_outline,
-                                                    super::motion::HOVER_RAIL_ALPHA,
-                                                ))
-                                                .opacity(0.0)
-                                                .group_hover(row_group, |style| style.opacity(1.0)),
-                                        )
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                    }),
-                )
+            div()
+                .flex_1()
                 .h_full()
-                .track_scroll(self.list_scroll_handle.clone()),
-            )
+                .relative()
+                .overflow_hidden()
+                .child(
+                    uniform_list(
+                        "sample-list",
+                        self.view_model.rows().len(),
+                        cx.processor({
+                            let list_theme = theme.clone();
+                            move |view, range: std::ops::Range<usize>, _window, cx| {
+                                range
+                                    .map(|visible_index| {
+                                        let row = view.view_model.rows()[visible_index].clone();
+                                        let index = row.entry_index;
+                                        let entry = view.entries[index].clone();
+                                        let selected = view.selected == Some(index);
+                                        let focused = motion_frame.focus_alpha > 0
+                                            && view.focus_matches_sample(&entry.path);
+                                        let extension = entry
+                                            .path
+                                            .extension()
+                                            .map(|extension| {
+                                                extension.to_string_lossy().to_string()
+                                            })
+                                            .unwrap_or_default();
+                                        let size = format_file_size(entry.byte_len);
+                                        let duration = format_duration(entry.duration_seconds);
+                                        let hover_fill =
+                                            color(list_theme.colors.selection_hover_fill);
+                                        let pressed_fill =
+                                            color(list_theme.interaction.pressed_fill);
+                                        let row_group =
+                                            format!("sample-row:{}", entry.path.to_string_lossy());
+                                        let sample_row = div()
+                                            .group(row_group.clone())
+                                            .id(index)
+                                            .flex()
+                                            .flex_none()
+                                            .w_full()
+                                            .items_center()
+                                            .h(px(list_theme.spacing.row_height))
+                                            .relative()
+                                            .cursor_pointer()
+                                            .bg(if selected {
+                                                color(list_theme.colors.selection_fill)
+                                            } else {
+                                                color(list_theme.colors.surface)
+                                            })
+                                            .hover(move |style| style.bg(hover_fill))
+                                            .active(move |style| style.bg(pressed_fill))
+                                            .on_click(cx.listener(
+                                                move |view, _: &ClickEvent, _, cx| {
+                                                    view.select_entry(
+                                                        index,
+                                                        Some(motion::FocusTrigger::Pointer),
+                                                        cx,
+                                                    );
+                                                },
+                                            ))
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(list_theme.spacing.selected_marker_width))
+                                                    .h_full()
+                                                    .bg(if selected {
+                                                        color(list_theme.colors.accent)
+                                                    } else {
+                                                        transparent()
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .pl(px(list_theme.spacing.row_padding_x))
+                                                    .pr(px(list_theme.spacing.control_gap))
+                                                    .text_size(px(list_theme.typography.body_size))
+                                                    .text_color(if selected {
+                                                        color(list_theme.colors.accent)
+                                                    } else {
+                                                        color(list_theme.colors.text_primary)
+                                                    })
+                                                    .child(
+                                                        entry.relative_path.display().to_string(),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(extension_width))
+                                                    .px(px(list_theme.spacing.control_gap))
+                                                    .text_size(px(list_theme.typography.small_size))
+                                                    .text_color(color(list_theme.colors.text_muted))
+                                                    .child(extension),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(size_width))
+                                                    .px(px(list_theme.spacing.control_gap))
+                                                    .text_size(px(list_theme.typography.small_size))
+                                                    .text_color(color(list_theme.colors.text_muted))
+                                                    .child(size),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(duration_width))
+                                                    .px(px(list_theme.spacing.control_gap))
+                                                    .text_size(px(list_theme.typography.small_size))
+                                                    .text_color(color(list_theme.colors.text_muted))
+                                                    .child(duration),
+                                            )
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .right_0()
+                                                    .w(px(super::motion::HOVER_RAIL_WIDTH))
+                                                    .bg(super::motion::with_alpha(
+                                                        list_theme.interaction.focus_outline,
+                                                        super::motion::HOVER_RAIL_ALPHA,
+                                                    ))
+                                                    .opacity(0.0)
+                                                    .group_hover(row_group, |style| {
+                                                        style.opacity(1.0)
+                                                    }),
+                                            );
+                                        if focused {
+                                            sample_row.child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .w(px(motion::FOCUS_MARKER_WIDTH))
+                                                    .bg(motion::with_alpha(
+                                                        list_theme.interaction.focus_outline,
+                                                        motion_frame.focus_alpha,
+                                                    )),
+                                            )
+                                        } else {
+                                            sample_row
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                        }),
+                    )
+                    .h_full()
+                    .track_scroll(self.list_scroll_handle.clone()),
+                )
+                .child(motion::scroll_edge_fades(
+                    self.list_scroll_handle.clone(),
+                    self.sample_edge_transitions.clone(),
+                    theme.motion,
+                    self.motion_clock_origin,
+                    theme.colors.surface,
+                ))
         };
 
         div()

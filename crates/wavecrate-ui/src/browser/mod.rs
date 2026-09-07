@@ -5,8 +5,10 @@
 //!
 //! Selection is currently a single focused row; shift-based multiselect remains future work.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -21,7 +23,7 @@ use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserViewModel, FolderScope, FolderTree, FolderTreeRow, SortColumn,
 };
-use wavecrate_design::{Theme, load_theme_file};
+use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_media::{WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview};
 
 use crate::search_input::{SearchChanged, SearchInput};
@@ -144,6 +146,13 @@ pub(crate) struct Browser {
     waveform_task: Option<Task<()>>,
     waveform_pending: bool,
     motion_started_at: Option<Instant>,
+    motion_clock_origin: Instant,
+    focus_target: Option<motion::FocusTarget>,
+    focus_trigger: motion::FocusTrigger,
+    focus_started_at: Option<Instant>,
+    sample_edge_transitions: Rc<RefCell<motion::ScrollEdgeTransitions>>,
+    source_edge_transitions: Rc<RefCell<motion::ScrollEdgeTransitions>>,
+    folder_edge_transitions: Rc<RefCell<motion::ScrollEdgeTransitions>>,
     theme_status: String,
     theme_load: ThemeLoadState,
     theme_task: Option<Task<()>>,
@@ -172,6 +181,7 @@ impl Browser {
                 view.view_model.set_query(&view.entries, query);
                 view.restore_projection_focus(previous_id, previous_position, cx);
             });
+        let motion_settings = Motion::default();
         Self {
             focus_handle: cx.focus_handle(),
             search_input,
@@ -207,6 +217,19 @@ impl Browser {
             waveform_task: None,
             waveform_pending: false,
             motion_started_at: None,
+            motion_clock_origin: Instant::now(),
+            focus_target: None,
+            focus_trigger: motion::FocusTrigger::Pointer,
+            focus_started_at: None,
+            sample_edge_transitions: Rc::new(RefCell::new(motion::ScrollEdgeTransitions::new(
+                motion_settings,
+            ))),
+            source_edge_transitions: Rc::new(RefCell::new(motion::ScrollEdgeTransitions::new(
+                motion_settings,
+            ))),
+            folder_edge_transitions: Rc::new(RefCell::new(motion::ScrollEdgeTransitions::new(
+                motion_settings,
+            ))),
             theme_status: "Wavecrate Editorial Terminal".to_string(),
             theme_load: ThemeLoadState::default(),
             theme_task: None,
@@ -247,7 +270,7 @@ impl Browser {
             .view_model
             .restore_focus(previous_id.as_ref(), previous_position);
         match next {
-            Some(index) => self.select_entry(index, cx),
+            Some(index) => self.select_entry(index, None, cx),
             None => {
                 if self.selected.is_some() {
                     self.stop_playback();
@@ -262,6 +285,7 @@ impl Browser {
                 {
                     session.selected_audio_id = None;
                 }
+                self.reset_focus();
                 cx.notify();
             }
         }
@@ -277,6 +301,8 @@ impl Browser {
         source_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.reset_focus();
+        self.reset_scroll_edges();
         if let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }
@@ -502,26 +528,81 @@ impl Browser {
         )
     }
 
-    pub(super) fn motion_frame(
-        &mut self,
-        motion: wavecrate_design::Motion,
-        window: &Window,
-    ) -> motion::MotionFrame {
+    pub(super) fn motion_frame(&mut self, motion: Motion, window: &Window) -> motion::MotionFrame {
+        let now = Instant::now();
         let pending = self.motion_pending();
-        if !motion::should_schedule_frames(motion.enabled, pending) {
+        let focus_elapsed = self
+            .focus_started_at
+            .map(|started_at| now.duration_since(started_at));
+        let focus_envelope = focus_elapsed.map(|_| self.focus_trigger.envelope(motion));
+        let focus_pending = focus_envelope
+            .zip(focus_elapsed)
+            .is_some_and(|(envelope, elapsed)| envelope.needs_animation_at(elapsed));
+        let busy_elapsed = if pending.any() {
+            let started_at = *self.motion_started_at.get_or_insert(now);
+            now.duration_since(started_at)
+        } else {
             self.motion_started_at = None;
-            return motion::MotionFrame::sample(
-                wavecrate_design::Motion {
-                    enabled: false,
-                    ..wavecrate_design::Motion::default()
-                },
-                std::time::Duration::ZERO,
-            );
+            std::time::Duration::ZERO
+        };
+
+        let mut frame = motion::MotionFrame::sample(motion, busy_elapsed);
+        if let (Some(target), Some(elapsed), Some(envelope)) =
+            (self.focus_target.as_ref(), focus_elapsed, focus_envelope)
+        {
+            frame.focus_alpha = envelope.alpha_at(elapsed);
+            frame.focus_surface = target.surface();
         }
-        let started_at = *self.motion_started_at.get_or_insert_with(Instant::now);
-        window.request_animation_frame();
-        let elapsed = started_at.elapsed();
-        motion::MotionFrame::sample(motion, elapsed)
+        if motion::should_schedule_frames(motion.enabled, pending, focus_pending) {
+            window.request_animation_frame();
+        }
+        frame
+    }
+
+    fn motion_time_now(&self) -> std::time::Duration {
+        Instant::now().duration_since(self.motion_clock_origin)
+    }
+
+    fn reset_scroll_edges(&mut self) {
+        let now = self.motion_time_now();
+        self.sample_edge_transitions
+            .borrow_mut()
+            .retarget(motion::ScrollEdges::default(), now);
+        self.source_edge_transitions
+            .borrow_mut()
+            .retarget(motion::ScrollEdges::default(), now);
+        self.folder_edge_transitions
+            .borrow_mut()
+            .retarget(motion::ScrollEdges::default(), now);
+    }
+
+    fn reset_focus(&mut self) {
+        self.focus_target = None;
+        self.focus_started_at = None;
+    }
+
+    fn start_focus(&mut self, target: motion::FocusTarget, trigger: motion::FocusTrigger) {
+        self.focus_target = Some(target);
+        self.focus_trigger = trigger;
+        self.focus_started_at = Some(Instant::now());
+    }
+
+    fn focus_matches_sample(&self, path: &Path) -> bool {
+        self.focus_target
+            .as_ref()
+            .is_some_and(|target| target.matches_sample(path))
+    }
+
+    fn focus_matches_source(&self, path: &Path) -> bool {
+        self.focus_target
+            .as_ref()
+            .is_some_and(|target| target.matches_source(path))
+    }
+
+    fn focus_matches_folder(&self, path: &Path) -> bool {
+        self.focus_target
+            .as_ref()
+            .is_some_and(|target| target.matches_folder(path))
     }
 
     pub(super) fn folder_rows(&self) -> &[FolderTreeRow] {
@@ -563,7 +644,11 @@ impl Browser {
             return;
         };
         window.focus(&self.focus_handle);
-        self.begin_source_scan(root, Some(index), cx);
+        self.begin_source_scan(root.clone(), Some(index), cx);
+        self.start_focus(
+            motion::FocusTarget::Source(root),
+            motion::FocusTrigger::Pointer,
+        );
     }
 
     pub(super) fn forget_source(
@@ -575,6 +660,8 @@ impl Browser {
         if index >= self.source_sessions.len() {
             return;
         }
+        self.reset_focus();
+        self.reset_scroll_edges();
         let was_active = self.active_source == Some(index);
         let had_pending_scan = if let Some(cancellation) = self.scan_cancel.take() {
             cancellation.store(true, Ordering::Release);
@@ -612,6 +699,7 @@ impl Browser {
             .expect("source list is non-empty after removal");
             self.active_source = None;
             self.select_source(next_index, _window, cx);
+            self.reset_focus();
         } else if let Some(active) = self.active_source {
             self.active_source = Some(
                 next_source_index_after_removal(Some(active), index, self.source_sessions.len())
@@ -655,8 +743,12 @@ impl Browser {
             return;
         }
         window.focus(&self.focus_handle);
-        self.selected_folder = path;
+        self.selected_folder = path.clone();
         self.update_active_folder_projection(cx);
+        self.start_focus(
+            motion::FocusTarget::Folder(path),
+            motion::FocusTrigger::Pointer,
+        );
     }
 
     pub(super) fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -702,10 +794,26 @@ impl Browser {
             .unwrap_or_default();
     }
 
-    fn select_entry(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn select_entry(
+        &mut self,
+        index: usize,
+        trigger: Option<motion::FocusTrigger>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(entry) = self.entries.get(index).cloned() else {
             return;
         };
+        if trigger.is_none()
+            && self.focus_target.as_ref().is_some_and(|target| {
+                matches!(target, motion::FocusTarget::Sample(_))
+                    && !target.matches_sample(&entry.path)
+            })
+        {
+            self.reset_focus();
+        }
+        if let Some(trigger) = trigger {
+            self.start_focus(motion::FocusTarget::Sample(entry.path.clone()), trigger);
+        }
         let previous_id = self.selected_id();
         let next_id = entry.stable_id();
         if previous_id.as_ref() == Some(&next_id) {
@@ -938,7 +1046,7 @@ impl Browser {
             (current + direction).clamp(0, self.view_model.rows().len() as isize - 1) as usize;
         let next = self.view_model.rows()[next_position].entry_index;
         if Some(next) != self.selected {
-            self.select_entry(next, cx);
+            self.select_entry(next, Some(motion::FocusTrigger::Keyboard), cx);
         }
     }
 

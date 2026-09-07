@@ -117,113 +117,148 @@ pub(super) fn render(
             .flex_none()
             .h(px(source_height.max(theme.spacing.row_height)))
             .child(
-                uniform_list(
-                    "source-list",
-                    source_rows.len(),
-                    cx.processor({
-                        let list_theme = theme.clone();
-                        move |view, range: std::ops::Range<usize>, _window, cx| {
-                            let source_rows = view.source_rows();
-                            range
-                                .filter_map(|visible_index| {
-                                    let (index, root, label, selected, error) =
-                                        source_rows.get(visible_index).cloned()?;
-                                    let hover_fill = color(list_theme.colors.selection_hover_fill);
-                                    let pressed_fill = color(list_theme.interaction.pressed_fill);
-                                    let row_group =
-                                        format!("source-row:{}", root.to_string_lossy());
-                                    let scanning = view.source_scan_is_pending(&root);
-                                    let source_row = div()
-                                        .group(row_group.clone())
-                                        .id(("source-row", index))
-                                        .flex()
-                                        .flex_none()
-                                        .w_full()
-                                        .items_center()
-                                        .h(px(list_theme.spacing.row_height))
-                                        .relative()
-                                        .cursor_pointer()
-                                        .bg(if selected {
-                                            color(list_theme.colors.selection_fill)
-                                        } else {
-                                            transparent()
-                                        })
-                                        .hover(move |style| style.bg(hover_fill))
-                                        .active(move |style| style.bg(pressed_fill))
-                                        .on_click(cx.listener(
-                                            move |view, _: &ClickEvent, window, cx| {
-                                                view.select_source(index, window, cx);
-                                            },
-                                        ))
-                                        .child(
-                                            div()
+                div()
+                    .relative()
+                    .overflow_hidden()
+                    .h(px(theme.spacing.row_height * visible_source_rows as f32))
+                    .child(
+                        uniform_list(
+                            "source-list",
+                            source_rows.len(),
+                            cx.processor({
+                                let list_theme = theme.clone();
+                                move |view, range: std::ops::Range<usize>, _window, cx| {
+                                    let source_rows = view.source_rows();
+                                    range
+                                        .filter_map(|visible_index| {
+                                            let (index, root, label, selected, error) =
+                                                source_rows.get(visible_index).cloned()?;
+                                            let hover_fill =
+                                                color(list_theme.colors.selection_hover_fill);
+                                            let pressed_fill =
+                                                color(list_theme.interaction.pressed_fill);
+                                            let row_group =
+                                                format!("source-row:{}", root.to_string_lossy());
+                                            let scanning = view.source_scan_is_pending(&root);
+                                            let focused = motion_frame.focus_alpha > 0
+                                                && view.focus_matches_source(&root);
+                                            let source_row = div()
+                                                .group(row_group.clone())
+                                                .id(("source-row", index))
+                                                .flex()
                                                 .flex_none()
-                                                .w(px(list_theme.spacing.selected_marker_width))
-                                                .h_full()
+                                                .w_full()
+                                                .items_center()
+                                                .h(px(list_theme.spacing.row_height))
+                                                .relative()
+                                                .cursor_pointer()
                                                 .bg(if selected {
-                                                    color(list_theme.colors.accent)
+                                                    color(list_theme.colors.selection_fill)
                                                 } else {
                                                     transparent()
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .text_ellipsis()
-                                                .pl(px(list_theme.spacing.row_padding_x))
-                                                .text_size(px(list_theme.typography.small_size))
-                                                .text_color(if selected {
-                                                    color(list_theme.colors.text_primary)
-                                                } else {
-                                                    color(list_theme.colors.text_muted)
                                                 })
-                                                .child(label),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(("forget-source", index))
-                                                .flex_none()
-                                                .w(px(24.0))
-                                                .items_center()
-                                                .justify_center()
-                                                .text_color(color(if error.is_some() {
-                                                    list_theme.colors.danger
-                                                } else {
-                                                    list_theme.colors.text_muted
-                                                }))
+                                                .hover(move |style| style.bg(hover_fill))
+                                                .active(move |style| style.bg(pressed_fill))
                                                 .on_click(cx.listener(
                                                     move |view, _: &ClickEvent, window, cx| {
-                                                        cx.stop_propagation();
-                                                        view.forget_source(index, window, cx);
+                                                        view.select_source(index, window, cx);
                                                     },
                                                 ))
-                                                .child("×"),
-                                        )
-                                        .child(hover_rail(row_group, &list_theme));
-                                    Some(if scanning {
-                                        source_row.child(motion::source_sweep_overlay(
-                                            motion_frame.source_phase,
-                                            motion::with_alpha(
-                                                list_theme.colors.accent,
-                                                motion::SOURCE_SWEEP_TRACK_ALPHA,
-                                            ),
-                                            motion::with_alpha(
-                                                list_theme.colors.accent,
-                                                motion::SOURCE_SWEEP_SEGMENT_ALPHA,
-                                            ),
-                                        ))
-                                    } else {
-                                        source_row
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                    }),
-                )
-                .h(px(theme.spacing.row_height * visible_source_rows as f32))
-                .track_scroll(browser.source_scroll_handle.clone()),
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .w(px(
+                                                            list_theme.spacing.selected_marker_width,
+                                                        ))
+                                                        .h_full()
+                                                        .bg(if selected {
+                                                            color(list_theme.colors.accent)
+                                                        } else {
+                                                            transparent()
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .pl(px(list_theme.spacing.row_padding_x))
+                                                        .text_size(px(list_theme.typography.small_size))
+                                                        .text_color(if selected {
+                                                            color(list_theme.colors.text_primary)
+                                                        } else {
+                                                            color(list_theme.colors.text_muted)
+                                                        })
+                                                        .child(label),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("forget-source", index))
+                                                        .flex_none()
+                                                        .w(px(24.0))
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_color(color(if error.is_some() {
+                                                            list_theme.colors.danger
+                                                        } else {
+                                                            list_theme.colors.text_muted
+                                                        }))
+                                                        .on_click(cx.listener(
+                                                            move |view, _: &ClickEvent, window, cx| {
+                                                                cx.stop_propagation();
+                                                                view.forget_source(index, window, cx);
+                                                            },
+                                                        ))
+                                                        .child("×"),
+                                                )
+                                                .child(hover_rail(row_group, &list_theme));
+                                            let source_row = if focused {
+                                                source_row.child(
+                                                    div()
+                                                        .absolute()
+                                                        .top_0()
+                                                        .bottom_0()
+                                                        .left_0()
+                                                        .w(px(motion::FOCUS_MARKER_WIDTH))
+                                                        .bg(motion::with_alpha(
+                                                            list_theme.interaction.focus_outline,
+                                                            motion_frame.focus_alpha,
+                                                        )),
+                                                )
+                                            } else {
+                                                source_row
+                                            };
+                                            Some(if scanning {
+                                                source_row.child(motion::source_sweep_overlay(
+                                                    motion_frame.source_phase,
+                                                    motion::with_alpha(
+                                                        list_theme.colors.accent,
+                                                        motion::SOURCE_SWEEP_TRACK_ALPHA,
+                                                    ),
+                                                    motion::with_alpha(
+                                                        list_theme.colors.accent,
+                                                        motion::SOURCE_SWEEP_SEGMENT_ALPHA,
+                                                    ),
+                                                ))
+                                            } else {
+                                                source_row
+                                            })
+                                        })
+                                        .collect::<Vec<_>>()
+                                }
+                            }),
+                        )
+                        .h_full()
+                        .track_scroll(browser.source_scroll_handle.clone()),
+                    )
+                    .child(motion::scroll_edge_fades(
+                        browser.source_scroll_handle.clone(),
+                        browser.source_edge_transitions.clone(),
+                        theme.motion,
+                        browser.motion_clock_origin,
+                        theme.colors.surface_raised,
+                    )),
             );
         if let Some((root, label, generation)) = pending_source {
             source_list.child(pending_source_row(
@@ -253,26 +288,34 @@ pub(super) fn render(
                 "Choose a source folder"
             })
     } else {
-        div().flex_1().h_full().child(
-            uniform_list(
-                "folder-list",
-                folder_rows.len(),
-                cx.processor({
-                    let list_theme = theme.clone();
-                    move |view, range: std::ops::Range<usize>, _window, cx| {
-                        let folder_rows = view.folder_rows();
-                        range
-                            .filter_map(|visible_index| {
-                                let row = folder_rows.get(visible_index).cloned()?;
-                                let path_for_select = row.path.clone();
-                                let path_for_toggle = row.path.clone();
-                                let selected = view.selected_folder == row.path;
-                                let hover_fill = color(list_theme.colors.selection_hover_fill);
-                                let pressed_fill = color(list_theme.interaction.pressed_fill);
-                                let indent = row.depth as f32 * 12.0;
-                                let row_group = format!("folder-row:{}", row.path.display());
-                                let toggle =
-                                    if row.has_children && row.path != std::path::Path::new(".") {
+        div()
+            .flex_1()
+            .h_full()
+            .relative()
+            .overflow_hidden()
+            .child(
+                uniform_list(
+                    "folder-list",
+                    folder_rows.len(),
+                    cx.processor({
+                        let list_theme = theme.clone();
+                        move |view, range: std::ops::Range<usize>, _window, cx| {
+                            let folder_rows = view.folder_rows();
+                            range
+                                .filter_map(|visible_index| {
+                                    let row = folder_rows.get(visible_index).cloned()?;
+                                    let path_for_select = row.path.clone();
+                                    let path_for_toggle = row.path.clone();
+                                    let selected = view.selected_folder == row.path;
+                                    let focused = motion_frame.focus_alpha > 0
+                                        && view.focus_matches_folder(&row.path);
+                                    let hover_fill = color(list_theme.colors.selection_hover_fill);
+                                    let pressed_fill = color(list_theme.interaction.pressed_fill);
+                                    let indent = row.depth as f32 * 12.0;
+                                    let row_group = format!("folder-row:{}", row.path.display());
+                                    let toggle = if row.has_children
+                                        && row.path != std::path::Path::new(".")
+                                    {
                                         div()
                                             .id(("folder-toggle", visible_index))
                                             .flex_none()
@@ -298,16 +341,15 @@ pub(super) fn render(
                                             .w(px(18.0))
                                             .child("")
                                     };
-                                let label = if row.path == std::path::Path::new(".") {
-                                    ".".to_string()
-                                } else {
-                                    row.path
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| row.path.display().to_string())
-                                };
-                                Some(
-                                    div()
+                                    let label = if row.path == std::path::Path::new(".") {
+                                        ".".to_string()
+                                    } else {
+                                        row.path
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| row.path.display().to_string())
+                                    };
+                                    let folder_row = div()
                                         .group(row_group.clone())
                                         .id(("folder-row", visible_index))
                                         .flex()
@@ -370,16 +412,38 @@ pub(super) fn render(
                                                 .text_color(color(list_theme.colors.text_disabled))
                                                 .child(row.audio_file_count.to_string()),
                                         )
-                                        .child(hover_rail(row_group, &list_theme)),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    }
-                }),
+                                        .child(hover_rail(row_group, &list_theme));
+                                    Some(if focused {
+                                        folder_row.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .left_0()
+                                                .w(px(motion::FOCUS_MARKER_WIDTH))
+                                                .bg(motion::with_alpha(
+                                                    list_theme.interaction.focus_outline,
+                                                    motion_frame.focus_alpha,
+                                                )),
+                                        )
+                                    } else {
+                                        folder_row
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    }),
+                )
+                .h_full()
+                .track_scroll(browser.folder_scroll_handle.clone()),
             )
-            .h_full()
-            .track_scroll(browser.folder_scroll_handle.clone()),
-        )
+            .child(motion::scroll_edge_fades(
+                browser.folder_scroll_handle.clone(),
+                browser.folder_edge_transitions.clone(),
+                theme.motion,
+                browser.motion_clock_origin,
+                theme.colors.surface_raised,
+            ))
     };
 
     let scope_label = format!("Scope: {}", browser.folder_scope.label());

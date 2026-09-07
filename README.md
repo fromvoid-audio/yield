@@ -31,6 +31,9 @@ palette and compact layout. Theme tokens are defined independently in
 to import, reload, or reset a theme while the app is running. The same panel
 toggles animations for this session. Row hover rails remain immediate; loading
 indicators animate only during pending work and remain static when disabled.
+Focus rails fade independently of selection, and clipped lists show directional
+scroll-edge fades. Disabling animation keeps focus feedback visible and updates
+scroll-edge feedback immediately.
 
 ## Run
 

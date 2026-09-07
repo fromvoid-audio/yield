@@ -93,6 +93,13 @@ frame requests. Disabled motion retains a static busy cue. Hover styling must
 not start a timer. Animation frames reuse waveform geometry and folder-row
 projections rather than rebuilding them.
 
+Focus feedback follows the input event and stable source/folder/sample identity,
+not a virtual row index. Reconciliation, sorting, and rendering must not restart
+its envelope. Scroll fades derive their targets from the laid-out viewport and
+scroll range. Reversing a transition starts from its current opacity; a settled
+fade must not keep requesting frames. Gradient overlays must remain inside the
+list viewport and leave pointer and scroll input available to the list.
+
 ## Work and lifecycle
 
 The UI keeps source roots, selected relative folders, expansion sets, and direct
