@@ -405,10 +405,10 @@ struct PreferenceSaveInFlight {
 struct Coordinator {
     loaded: bool,
     baseline: Vec<SampleSource>,
-    persisted: Vec<SampleSource>,
     current: Vec<SampleSource>,
     edits: Vec<Edit>,
     revision: RegistryRevision,
+    durable_revision: RegistryRevision,
 }
 
 impl Coordinator {
@@ -416,10 +416,10 @@ impl Coordinator {
         Self {
             loaded: false,
             baseline: Vec::new(),
-            persisted: Vec::new(),
             current: Vec::new(),
             edits: Vec::new(),
             revision: RegistryRevision::default(),
+            durable_revision: RegistryRevision::default(),
         }
     }
 
@@ -476,9 +476,9 @@ impl Coordinator {
     fn load(&mut self, snapshot: SourceRegistrySnapshot) -> Result<bool, SessionError> {
         self.loaded = true;
         self.baseline = snapshot.as_slice().to_vec();
-        self.persisted = self.baseline.clone();
         self.current = self.baseline.clone();
         self.revision = RegistryRevision::default();
+        self.durable_revision = RegistryRevision::default();
         self.rebuild()
     }
 
@@ -521,11 +521,11 @@ impl Coordinator {
     }
 
     fn is_dirty(&self) -> bool {
-        !sources_equal(&self.current, &self.persisted)
+        self.revision != self.durable_revision
     }
 
     fn mark_persisted(&mut self) {
-        self.persisted = self.current.clone();
+        self.durable_revision = self.revision;
     }
 
     fn accept_save_ack(&mut self, revision: RegistryRevision) -> bool {
@@ -2052,6 +2052,29 @@ mod tests {
         assert!(!coordinator.accept_save_ack(first_revision));
         assert!(coordinator.is_dirty());
         assert_eq!(coordinator.current.len(), 2);
+    }
+
+    #[test]
+    fn add_remove_reversion_requires_persisting_newer_revision() {
+        let temp = TempDir::new().expect("temp");
+        let source_root = root(&temp, "reversion");
+        let mut coordinator = Coordinator::new();
+        coordinator
+            .load(SourceRegistrySnapshot::new(Vec::new()))
+            .expect("load");
+        coordinator.add_edit(RequestId(1), source_root.clone());
+        coordinator
+            .resolve_add(RequestId(1), source(&source_root, "reversion-id"))
+            .expect("resolve add");
+        let add_revision = coordinator.revision();
+        assert_eq!(add_revision.get(), 1);
+        coordinator.remove_edit(RequestId(2), source_root);
+        assert!(coordinator.rebuild().expect("rebuild remove"));
+        assert!(coordinator.current.is_empty());
+        assert_eq!(coordinator.revision().get(), 2);
+        assert!(coordinator.is_dirty());
+        assert!(coordinator.accept_save_ack(coordinator.revision()));
+        assert!(!coordinator.is_dirty());
     }
 
     #[test]
