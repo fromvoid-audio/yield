@@ -7036,10 +7036,12 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "reson",
+ "tempfile",
  "unicode-segmentation",
  "wavecrate-core",
  "wavecrate-design",
  "wavecrate-media",
+ "windows 0.62.2",
 ]
 
 [[package]]

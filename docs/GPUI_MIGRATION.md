@@ -359,6 +359,33 @@ macOS app passed live checks for pointer/arrow autoplay, silent Shift selection,
 disabling autoplay, and explicit Space playback with autoplay disabled.
 Audible acceptance remains separate.
 
+### Native file handoff and reveal, 2026-09-07
+
+When browser focus owns Cmd/Ctrl+C, the current visible explicit membership is
+copied in display order through the native file clipboard service. If no
+explicit visible member remains after filtering, the focused sample is the
+single fallback target; an empty browser has no platform side effect. Search
+focus keeps its native text-copy action, and entering or copying from search
+invalidates pending file publication. Reveal is a toolbar action for the
+focused sample only. Filesystem validation runs on the background executor;
+clipboard publication and `cx.reveal_path` run on the UI thread. Command
+generation plus source, focus, selection, and visible-projection context fence
+late completions, and browser drop cancels the handoff task.
+
+Validation: 7 focused handoff tests and the full UI library suite passed (41
+passed, one manual waveform benchmark ignored). `cargo check -p wavecrate-ui`,
+`cargo fmt --all -- --check`, and `git diff --check` passed. The signed macOS
+app copied two selected WAV files into Finder; both pasted copies matched their
+sources byte for byte. Reveal selected the focused file despite batch membership,
+and search text copy/paste retained its text behavior.
+
+Native clipboard review found a Windows format-ordering issue, now fixed by
+publishing mandatory CF_HDROP before the optional drop-effect hint. An isolated
+Windows-target harness type-checked the service and tests successfully after
+repairing a format-ID type and test borrow errors. Full Windows app compilation
+remains blocked by the missing C cross-toolchain; Windows execution and DAW
+paste acceptance remain unverified.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

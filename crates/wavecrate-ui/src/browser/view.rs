@@ -597,6 +597,10 @@ impl Render for Browser {
                         div()
                             .flex_none()
                             .w(px(220.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::invalidate_file_handoff_from_search_mouse),
+                            )
                             .child(self.search_input.clone()),
                     )
                     .child(
@@ -608,6 +612,22 @@ impl Render for Browser {
                             .text_size(px(theme.typography.small_size))
                             .text_color(color(theme.colors.text_muted))
                             .child(root_label),
+                    )
+                    .child(
+                        div()
+                            .id("reveal-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(theme.spacing.control_height))
+                            .px(px(theme.spacing.control_gap))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .text_size(px(theme.typography.small_size))
+                            .on_click(cx.listener(Self::reveal_focused_file))
+                            .child("Reveal"),
                     )
                     .child(
                         div()

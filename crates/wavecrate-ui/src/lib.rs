@@ -12,6 +12,7 @@ use gpui::{
 };
 
 mod browser;
+pub(crate) mod external_clipboard;
 mod search_input;
 mod theme;
 

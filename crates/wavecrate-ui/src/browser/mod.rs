@@ -30,6 +30,7 @@ use wavecrate_media::{
 use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
 
+mod handoff;
 mod motion;
 mod sidebar;
 mod transport;
@@ -222,6 +223,8 @@ pub(crate) struct Browser {
     playback_monitor_generation: u64,
     playback_monitor_running: bool,
     playback: Option<PlaybackRuntime>,
+    handoff_task: Option<Task<()>>,
+    handoff_generation: u64,
     list_scroll_handle: UniformListScrollHandle,
     source_scroll_handle: UniformListScrollHandle,
     folder_scroll_handle: UniformListScrollHandle,
@@ -307,6 +310,8 @@ impl Browser {
             playback_monitor_generation: 0,
             playback_monitor_running: false,
             playback: None,
+            handoff_task: None,
+            handoff_generation: 0,
             list_scroll_handle: UniformListScrollHandle::new(),
             source_scroll_handle: UniformListScrollHandle::new(),
             folder_scroll_handle: UniformListScrollHandle::new(),
@@ -1281,17 +1286,36 @@ impl Browser {
     ) {
         let key = event.keystroke.key.as_str();
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
-        let navigation_suppresses_autoplay =
-            secondary || event.keystroke.modifiers.alt || event.keystroke.modifiers.function;
+        let alt = event.keystroke.modifiers.alt;
+        let function = event.keystroke.modifiers.function;
+        let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
         if key.eq_ignore_ascii_case("f") && secondary {
+            self.invalidate_file_handoff();
             window.focus(&self.search_input.read(cx).focus_handle());
             return;
         }
         if self.search_input.read(cx).focus_handle().is_focused(window) {
+            if !event.is_held
+                && handoff::is_browser_copy_shortcut(key, secondary, shift, alt, function)
+            {
+                self.invalidate_file_handoff();
+            }
             if key == "escape" {
                 window.focus(&self.focus_handle);
             }
+            return;
+        }
+        if handoff::should_route_browser_copy(
+            false,
+            event.is_held,
+            key,
+            secondary,
+            shift,
+            alt,
+            function,
+        ) {
+            self.copy_selected_files(cx);
             return;
         }
         if event.is_held && key == "space" {
@@ -1334,6 +1358,8 @@ impl Drop for Browser {
             cancellation.store(true, Ordering::Release);
         }
         self.cancel_waveform_load();
+        self.handoff_generation = self.handoff_generation.wrapping_add(1);
+        self.handoff_task.take();
         if let Some(runtime) = self.playback.as_ref() {
             let _ = runtime.handle.try_shutdown();
         }
