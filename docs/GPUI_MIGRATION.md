@@ -315,6 +315,10 @@ ambient macOS temporary-directory alias before exercising the no-follow root
 capability. All seven ownership tests pass, including replaced-root, replaced-lock,
 and symlink rejection coverage. Production ownership rules are unchanged. The
 broader workspace suite has not been rerun after this targeted fixture repair.
+That failure report is historical: at baseline commit `288430e10`,
+`cargo test --locked --workspace` was rerun after the fixture repair and passed
+all workspace binaries and doc tests, with two tests ignored. The output is
+retained at `/tmp/wavecrate-gpui-workspace-tests.log`.
 Non-WAV preview and zoom/edit gestures remain outstanding.
 
 ### Waveform seek and loop audition, 2026-09-07
@@ -331,6 +335,29 @@ core tests passed, plus UI check, formatting, diff check, and signed macOS build
 Live fixture checks confirmed seeking near 75%, repeated two-second loop playback,
 and one-shot completion with looping disabled. These are transport/UI checks,
 not manual audible acceptance.
+
+### Selection autoplay, 2026-09-07
+
+Selection autoplay is a session-only preference enabled by default. A changed
+sample selected with a plain pointer click or unmodified Up/Down queues the
+latest selection-autoplay intent. Shift/Cmd/Ctrl/Alt/Function selection gestures,
+range and toggle membership changes, X, Select All, and passive projection/source
+restore remain silent. Waveform seek, Space, toolbar Play, and explicit replay
+retain their explicit transport origin and work when autoplay is disabled.
+Disabling the preference cancels only a pending selection-autoplay audio
+initialization; explicit pending and active playback remain intact. Existing
+epoch, generation, and selected-path fences still reject stale completions.
+
+Validation: the focused autoplay routing run passed 3 UI tests; the full UI
+library run passed 34 tests with one manual benchmark ignored, and the core and
+design libraries passed 19 and 17 tests. The UI test commands used a temporary
+module-level `dead_code` allowance while the parallel external-clipboard module
+is registered but not yet consumed; no global lint suppression was used, and no
+selection-autoplay warnings or failures were reported. Formatting and diff
+checks (`cargo fmt --all -- --check`, `git diff --check`) passed. The signed
+macOS app passed live checks for pointer/arrow autoplay, silent Shift selection,
+disabling autoplay, and explicit Space playback with autoplay disabled.
+Audible acceptance remains separate.
 
 ### Required final evidence
 

@@ -24,11 +24,18 @@ pub(super) struct PlaybackCursorSample {
     pub(super) ratio: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackIntentOrigin {
+    Explicit,
+    SelectionAutoplay,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PlaybackIntent {
     pub(super) start: f64,
     pub(super) looped: bool,
     pub(super) path: std::path::PathBuf,
+    pub(super) origin: PlaybackIntentOrigin,
 }
 
 /// Bounded motion between two authoritative playback samples.
@@ -181,7 +188,8 @@ impl Browser {
             cx.notify();
             return;
         }
-        let Some(intent) = self.selected_playback_intent(0.0) else {
+        let Some(intent) = self.selected_playback_intent(0.0, PlaybackIntentOrigin::Explicit)
+        else {
             cx.notify();
             return;
         };
@@ -189,11 +197,39 @@ impl Browser {
     }
 
     pub(super) fn start_playback_from_position(&mut self, start: f64, cx: &mut Context<Self>) {
-        let Some(intent) = self.selected_playback_intent(start) else {
+        let Some(intent) = self.selected_playback_intent(start, PlaybackIntentOrigin::Explicit)
+        else {
             cx.notify();
             return;
         };
         self.request_playback_intent(intent, cx);
+    }
+
+    pub(super) fn request_selection_autoplay(&mut self, cx: &mut Context<Self>) {
+        if !self.autoplay_selection {
+            return;
+        }
+        let Some(intent) =
+            self.selected_playback_intent(0.0, PlaybackIntentOrigin::SelectionAutoplay)
+        else {
+            cx.notify();
+            return;
+        };
+        self.request_playback_intent(intent, cx);
+    }
+
+    pub(super) fn cancel_pending_selection_autoplay(&mut self) -> bool {
+        let origin = self
+            .playback_init_intent
+            .as_ref()
+            .map(|intent| intent.origin);
+        if !should_cancel_pending_autoplay(self.autoplay_selection, origin) {
+            return false;
+        }
+        self.playback_epoch = self.playback_epoch.wrapping_add(1);
+        self.playback_init_intent = None;
+        self.clear_playback_cursor();
+        true
     }
 
     pub(super) fn toggle_loop(&mut self, cx: &mut Context<Self>) {
@@ -223,7 +259,11 @@ impl Browser {
         cx.notify();
     }
 
-    fn selected_playback_intent(&mut self, start: f64) -> Option<PlaybackIntent> {
+    fn selected_playback_intent(
+        &mut self,
+        start: f64,
+        origin: PlaybackIntentOrigin,
+    ) -> Option<PlaybackIntent> {
         let Some(index) = self.selected else {
             self.playback_status = "Select a sample first".to_string();
             return None;
@@ -247,6 +287,7 @@ impl Browser {
             start,
             looped: self.loop_enabled,
             path,
+            origin,
         })
     }
 
@@ -511,6 +552,13 @@ fn normalized_playback_start(start: f64) -> Option<f64> {
     start.is_finite().then(|| start.clamp(0.0, 1.0))
 }
 
+fn should_cancel_pending_autoplay(
+    autoplay_enabled: bool,
+    origin: Option<PlaybackIntentOrigin>,
+) -> bool {
+    !autoplay_enabled && origin == Some(PlaybackIntentOrigin::SelectionAutoplay)
+}
+
 fn preview_cursor_ratio_for_browser(browser: &Browser, ratio: f32) -> Option<f32> {
     browser.waveform.as_ref()?;
     preview_cursor_ratio(ratio)
@@ -573,10 +621,10 @@ fn progress_poll_is_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaybackCursorInterpolation, PlaybackIntent, authoritative_cursor_progress,
-        cursor_interpolation, normalized_playback_start, playback_mode_for_intent,
-        playback_request_number_is_current, preview_cursor_ratio,
-        should_queue_initialized_playback,
+        PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin,
+        authoritative_cursor_progress, cursor_interpolation, normalized_playback_start,
+        playback_mode_for_intent, playback_request_number_is_current, preview_cursor_ratio,
+        should_cancel_pending_autoplay, should_queue_initialized_playback,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -625,6 +673,23 @@ mod tests {
     }
 
     #[test]
+    fn disabling_autoplay_only_cancels_selection_origin() {
+        assert!(should_cancel_pending_autoplay(
+            false,
+            Some(PlaybackIntentOrigin::SelectionAutoplay)
+        ));
+        assert!(!should_cancel_pending_autoplay(
+            false,
+            Some(PlaybackIntentOrigin::Explicit)
+        ));
+        assert!(!should_cancel_pending_autoplay(
+            true,
+            Some(PlaybackIntentOrigin::SelectionAutoplay)
+        ));
+        assert!(!should_cancel_pending_autoplay(false, None));
+    }
+
+    #[test]
     fn playback_mode_preserves_click_offset_and_loop_preference() {
         let path = PathBuf::from("sample.wav");
         assert_eq!(
@@ -632,6 +697,7 @@ mod tests {
                 start: 1.2,
                 looped: false,
                 path: path.clone(),
+                origin: PlaybackIntentOrigin::Explicit,
             }),
             PlaybackRuntimeMode::OneShot {
                 start: 1.0,
@@ -643,6 +709,7 @@ mod tests {
                 start: 0.35,
                 looped: true,
                 path,
+                origin: PlaybackIntentOrigin::SelectionAutoplay,
             }),
             PlaybackRuntimeMode::Looped {
                 start: 0.0,

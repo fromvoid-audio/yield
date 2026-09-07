@@ -131,6 +131,15 @@ New persistent workflows must acquire the existing profile/source authorities
 before admitting durable work. Development defaults must remain separate from
 the live Wavecrate profile. The current GPUI browser writes no library data.
 
+Future profile ownership belongs in an application-owned service, separate from
+view lifetime. GPUI 0.2.2 allows only 100 ms for quit-observer futures, which is
+not a durable writer-drain guarantee. The service must close admission and join
+its owner synchronously in the quit callback before returning a ready future;
+SQLite work stays on the owner thread. This termination-only wait must not be
+placed in ordinary view destruction or render paths. Release profile guards only
+after accepted commands have drained and database connections have closed.
+An asynchronous quit future alone does not satisfy this ordering.
+
 ## Development
 
 ```sh

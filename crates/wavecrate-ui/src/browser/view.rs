@@ -256,6 +256,28 @@ impl Browser {
                         "Animations Off"
                     }),
             )
+            .child(
+                div()
+                    .id("toggle-autoplay")
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
+                    .px(px(theme.spacing.control_gap))
+                    .cursor_pointer()
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .text_color(color(if self.autoplay_selection {
+                        theme.colors.accent
+                    } else {
+                        theme.colors.text_muted
+                    }))
+                    .on_click(cx.listener(Self::toggle_autoplay))
+                    .child(if self.autoplay_selection {
+                        "Autoplay On"
+                    } else {
+                        "Autoplay Off"
+                    }),
+            )
             .child(div().flex_1())
             .child(self.theme_status.clone())
     }

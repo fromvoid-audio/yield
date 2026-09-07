@@ -78,6 +78,38 @@ enum SampleClickIntent {
     Toggle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionOrigin {
+    Intentional,
+    Batch,
+    Passive,
+}
+
+fn should_autoplay_selection(enabled: bool, origin: SelectionOrigin) -> bool {
+    enabled && matches!(origin, SelectionOrigin::Intentional)
+}
+
+fn selection_origin_for_click(
+    intent: SampleClickIntent,
+    suppress_autoplay: bool,
+) -> SelectionOrigin {
+    match intent {
+        SampleClickIntent::Focus if !suppress_autoplay => SelectionOrigin::Intentional,
+        SampleClickIntent::Focus => SelectionOrigin::Passive,
+        SampleClickIntent::ReplaceRange
+        | SampleClickIntent::AddRange
+        | SampleClickIntent::Toggle => SelectionOrigin::Batch,
+    }
+}
+
+fn selection_origin_for_navigation(extend: bool, suppress_autoplay: bool) -> SelectionOrigin {
+    if extend || suppress_autoplay {
+        SelectionOrigin::Batch
+    } else {
+        SelectionOrigin::Intentional
+    }
+}
+
 fn sample_click_intent(shift: bool, secondary: bool) -> SampleClickIntent {
     match (shift, secondary) {
         (true, true) => SampleClickIntent::AddRange,
@@ -159,6 +191,7 @@ pub(crate) struct Browser {
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
     loop_enabled: bool,
+    autoplay_selection: bool,
     latest_playback_request_id: Option<PlaybackRequestId>,
     pending_progress_poll: Option<(PlaybackRequestId, u64)>,
     playback_cursor_pending: Option<f32>,
@@ -237,6 +270,7 @@ impl Browser {
             playback_epoch: 0,
             playing_path: None,
             loop_enabled: false,
+            autoplay_selection: true,
             latest_playback_request_id: None,
             pending_progress_poll: None,
             playback_cursor_pending: None,
@@ -334,6 +368,7 @@ impl Browser {
         let focused_id = self.selected_id();
         let modifiers = event.modifiers();
         let intent = sample_click_intent(modifiers.shift, modifiers.platform || modifiers.control);
+        let origin = selection_origin_for_click(intent, modifiers.alt || modifiers.function);
         match intent {
             SampleClickIntent::Focus => self.selection.focus_pointer(&target_id),
             SampleClickIntent::ReplaceRange | SampleClickIntent::AddRange => {
@@ -349,7 +384,7 @@ impl Browser {
                 self.selection.toggle(&target_id, focused_id.as_ref());
             }
         }
-        self.select_entry(index, Some(motion::FocusTrigger::Pointer), cx);
+        self.select_entry(index, Some(motion::FocusTrigger::Pointer), origin, cx);
     }
 
     fn restore_projection_focus(
@@ -362,7 +397,7 @@ impl Browser {
             .view_model
             .restore_focus(previous_id.as_ref(), previous_position);
         match next {
-            Some(index) => self.select_entry(index, None, cx),
+            Some(index) => self.select_entry(index, None, SelectionOrigin::Passive, cx),
             None => {
                 if self.selected.is_some() {
                     self.stop_playback();
@@ -907,6 +942,7 @@ impl Browser {
         &mut self,
         index: usize,
         trigger: Option<motion::FocusTrigger>,
+        origin: SelectionOrigin,
         cx: &mut Context<Self>,
     ) {
         let Some(entry) = self.entries.get(index).cloned() else {
@@ -925,6 +961,7 @@ impl Browser {
         }
         let previous_id = self.selected_id();
         let next_id = entry.stable_id();
+        let autoplay = should_autoplay_selection(self.autoplay_selection, origin);
         if previous_id.as_ref() == Some(&next_id) {
             self.selected = Some(index);
             if let Some(position) = self
@@ -975,6 +1012,9 @@ impl Browser {
                 cx.notify();
             });
         }));
+        if autoplay {
+            self.request_selection_autoplay(cx);
+        }
         if let Some(position) = self
             .view_model
             .rows()
@@ -1056,6 +1096,19 @@ impl Browser {
         let mut theme = crate::theme::active(cx).clone();
         theme.motion.enabled = !theme.motion.enabled;
         cx.set_global(ActiveTheme(Arc::new(theme)));
+        cx.notify();
+    }
+
+    fn toggle_autoplay(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.autoplay_selection = !self.autoplay_selection;
+        if !self.autoplay_selection {
+            self.cancel_pending_selection_autoplay();
+        }
+        self.playback_status = if self.autoplay_selection {
+            "Autoplay enabled".to_string()
+        } else {
+            "Autoplay disabled".to_string()
+        };
         cx.notify();
     }
 
@@ -1161,6 +1214,7 @@ impl Browser {
         direction: isize,
         extend: bool,
         additive: bool,
+        suppress_autoplay: bool,
         cx: &mut Context<Self>,
     ) {
         if self.view_model.rows().is_empty() {
@@ -1188,7 +1242,8 @@ impl Browser {
             self.selection.move_anchor_to(&next_id);
         }
         if Some(next) != self.selected {
-            self.select_entry(next, Some(motion::FocusTrigger::Keyboard), cx);
+            let origin = selection_origin_for_navigation(extend, suppress_autoplay);
+            self.select_entry(next, Some(motion::FocusTrigger::Keyboard), origin, cx);
         } else {
             cx.notify();
         }
@@ -1226,6 +1281,8 @@ impl Browser {
     ) {
         let key = event.keystroke.key.as_str();
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+        let navigation_suppresses_autoplay =
+            secondary || event.keystroke.modifiers.alt || event.keystroke.modifiers.function;
         let shift = event.keystroke.modifiers.shift;
         if key.eq_ignore_ascii_case("f") && secondary {
             window.focus(&self.search_input.read(cx).focus_handle());
@@ -1248,8 +1305,20 @@ impl Browser {
             "space" => self.toggle_playback(cx),
             "l" | "L" => self.toggle_loop(cx),
             "x" if !shift && !secondary => self.toggle_focused_selection(cx),
-            "up" | "arrowup" => self.move_selection(-1, shift, secondary && shift, cx),
-            "down" | "arrowdown" => self.move_selection(1, shift, secondary && shift, cx),
+            "up" | "arrowup" => self.move_selection(
+                -1,
+                shift,
+                secondary && shift,
+                navigation_suppresses_autoplay,
+                cx,
+            ),
+            "down" | "arrowdown" => self.move_selection(
+                1,
+                shift,
+                secondary && shift,
+                navigation_suppresses_autoplay,
+                cx,
+            ),
             "escape" => {
                 self.stop_playback();
                 cx.notify();
@@ -1331,8 +1400,9 @@ fn source_label(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SampleClickIntent, SourceSession, ThemeLoadState, next_source_index_after_removal,
-        resolve_scan_source_index, sample_click_intent,
+        SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
+        next_source_index_after_removal, resolve_scan_source_index, sample_click_intent,
+        selection_origin_for_click, selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
 
@@ -1394,13 +1464,72 @@ mod tests {
     }
 
     #[test]
-    fn sample_click_modifiers_route_to_core_selection_intents() {
-        assert_eq!(sample_click_intent(false, false), SampleClickIntent::Focus);
-        assert_eq!(
-            sample_click_intent(true, false),
-            SampleClickIntent::ReplaceRange
-        );
-        assert_eq!(sample_click_intent(false, true), SampleClickIntent::Toggle);
-        assert_eq!(sample_click_intent(true, true), SampleClickIntent::AddRange);
+    fn selection_modifiers_route_autoplay_only_for_plain_focus() {
+        let cases = [
+            (
+                false,
+                false,
+                false,
+                false,
+                SampleClickIntent::Focus,
+                SelectionOrigin::Intentional,
+                true,
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                SampleClickIntent::Focus,
+                SelectionOrigin::Passive,
+                false,
+            ),
+            (
+                true,
+                false,
+                false,
+                false,
+                SampleClickIntent::ReplaceRange,
+                SelectionOrigin::Batch,
+                false,
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                SampleClickIntent::Toggle,
+                SelectionOrigin::Batch,
+                false,
+            ),
+            (
+                true,
+                true,
+                false,
+                true,
+                SampleClickIntent::AddRange,
+                SelectionOrigin::Batch,
+                false,
+            ),
+        ];
+
+        for (shift, secondary, alt, function, intent, origin, autoplay) in cases {
+            assert_eq!(sample_click_intent(shift, secondary), intent);
+            assert_eq!(selection_origin_for_click(intent, alt || function), origin);
+            assert_eq!(should_autoplay_selection(true, origin), autoplay);
+        }
+
+        for (extend, modifier, expected) in [
+            (false, false, SelectionOrigin::Intentional),
+            (true, false, SelectionOrigin::Batch),
+            (false, true, SelectionOrigin::Batch),
+            (true, true, SelectionOrigin::Batch),
+        ] {
+            assert_eq!(selection_origin_for_navigation(extend, modifier), expected);
+            assert_eq!(
+                should_autoplay_selection(true, expected),
+                !extend && !modifier
+            );
+        }
     }
 }
