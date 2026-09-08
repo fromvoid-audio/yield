@@ -204,6 +204,16 @@ impl CurationState {
             .is_some_and(|lineage| !lineage.pending.is_empty())
     }
 
+    /// Return whether a source lifecycle still has an accepted operation in flight, including
+    /// operations retained after its active projection was replaced.
+    pub(super) fn has_pending_for_lifecycle(&self, key: &CurationLifecycleKey) -> bool {
+        self.has_pending(key)
+            || self
+                .retired_pending
+                .iter()
+                .any(|(retired_key, _)| retired_key == key)
+    }
+
     /// Verify that a browser metadata context still names this exact curation lineage.
     pub(super) fn authority_matches(
         &self,

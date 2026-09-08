@@ -280,6 +280,7 @@ impl Browser {
         changed |= tags::poll(self, cx);
         changed |= tag_chips::poll(self, cx);
         changed |= self.retry_catalog_commands(cx);
+        changed |= super::source_recovery::poll(self, cx);
         changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
         if changed {
@@ -598,6 +599,7 @@ impl Browser {
         tag_chips::cancel_for_source_change(self);
         tag_completion::cancel_for_source_change(self, cx);
         tag_filter::cancel_for_source_change(self);
+        super::source_recovery::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.stop_playback();

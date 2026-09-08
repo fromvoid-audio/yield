@@ -1661,3 +1661,57 @@ session and workspace checks. Temporary-root tests cover normal verified audit,
 missing-root handle retention, physical replacement, symlink target replacement
 and initial-audit identity fencing. Modified-file formatting and diff checks
 passed.
+
+An isolated native production-mode harness against clean `b64b3ae08` moved a root
+away, observed its stale-root failure, and restored the same physical folder.
+The watcher produced a new authoritative audit in the same generation without an
+explicit refresh. Replacing the folder instead remained fenced; resolving a new
+proof, registering generation 2 and auditing produced only the replacement file.
+The observed revisions were 2 → 3 → 6. This covers backend native convergence;
+browser recovery integration is still in progress.
+
+### Browser recovery for missing or replaced source roots
+
+The browser retains worker registration state separately from command admission,
+and retains the last known root identity across metadata resets. Root failures
+cancel pending projections and retire stale tag work while preserving the last
+rows and loaded transport. One correlated background probe retries quietly;
+repeated Refresh coalesces it instead of starting additional filesystem calls.
+A returning known identity uses the existing generation. A fresh matching watcher
+audit can win a pending probe and retire its correlation immediately.
+
+A changed root waits for active and retired curation receipts before starting a
+verified generation and a fresh audit. Old snapshots cannot establish authority
+during rebind. Changed canonical targets remain unavailable instead of silently
+changing a durable source row. Source switches/removal/closure cancel recovery;
+registration and audit failures retry through typed operation handling. Manual
+Refresh renders its pending state immediately even if filesystem probing stalls.
+
+Verification: the full UI library suite passed 210 tests with one existing
+ignored test. Eight focused recovery tests, UI check and formatting passed again
+after the final notification fix. Production transition tests cover coalesced
+Refresh, immediate retry from waiting, stale correlation retirement, identity
+classification and curation-drain decisions. Native backend return/replacement
+convergence is recorded above; this is not a claim of native visual/input recovery
+acceptance.
+
+### Selected assignment counts for displayed tag identities
+
+An additive selected-ID tag-page query returns bounded existing source tags with
+exact all/mixed/zero assignment counts for the current path set. It accepts at
+most 64 positive IDs, canonicalizes duplicate IDs/paths, includes zero matches,
+and omits unknown IDs. Cursor identity includes the selected paths, tag IDs and
+revision. Existing root/lifecycle/live-manifest fences and shared input credits
+cover the new query; label previews remain bounded and never replace IDs.
+
+Transactional TEMP tables and indexed joins avoid loading the whole vocabulary
+or selection tag union. The count uses schema-enforced uniqueness rather than
+retaining redundant DISTINCT sets. SQLite progress cancellation and rollback
+release temporary scope before the next query.
+
+Verification: 26 library tag tests, 77 catalog tests and 43 session tests passed.
+After the final COUNT/validation-order refinement, five focused selected-ID and
+query-plan/cancellation tests passed, along with the catalog check and diff check.
+A deterministic SQL-progress test cancels before the grouped read emits its first
+row, then successfully reuses the same database connection. The backend is ready
+for the native Tag Editor library panel; that panel remains follow-on UI work.

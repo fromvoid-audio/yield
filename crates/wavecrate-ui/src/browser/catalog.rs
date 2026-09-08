@@ -10,7 +10,10 @@ use wavecrate_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree, Play
 use wavecrate_library::sample_sources::{
     BrowserFileMetadata, SourceId, SourcePlaybackType, reconciliation::RootIdentity,
 };
-use wavecrate_session::{CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError};
+use wavecrate_session::{
+    CatalogCommand, CatalogEvent, CatalogOperation, CatalogStatus, CatalogSubmitError,
+    VerifiedSourceRoot,
+};
 
 use super::source_registry::SourceRegistryGlobal;
 use super::{Browser, SourceSession, catalog_metadata};
@@ -31,6 +34,8 @@ pub(super) struct CatalogActivation {
     pub(super) source_id: SourceId,
     pub(super) root: PathBuf,
     pub(super) lifecycle_generation: u64,
+    /// Whether the worker published a matching Registered event for this generation.
+    pub(super) registered: bool,
     /// Whether the worker accepted this activation's Register command.
     ///
     /// A remove is only meaningful after registration admission. Keeping this
@@ -38,6 +43,8 @@ pub(super) struct CatalogActivation {
     /// activations from accumulating remove commands for sources that were
     /// never registered with the worker.
     pub(super) registration_admitted: bool,
+    /// Last authoritative or verified physical root identity for this activation.
+    pub(super) root_identity: Option<RootIdentity>,
     pub(super) audit_finished: bool,
     pub(super) audit_error: Option<String>,
     pub(super) force_reload: bool,
@@ -50,6 +57,11 @@ pub(super) enum CatalogCommandIntent {
     Register {
         source_id: SourceId,
         root: PathBuf,
+        lifecycle_generation: u64,
+    },
+    RegisterVerified {
+        source_id: SourceId,
+        root: VerifiedSourceRoot,
         lifecycle_generation: u64,
     },
     Audit {
@@ -66,6 +78,7 @@ impl CatalogCommandIntent {
     fn source_id(&self) -> &SourceId {
         match self {
             Self::Register { source_id, .. }
+            | Self::RegisterVerified { source_id, .. }
             | Self::Audit { source_id, .. }
             | Self::Remove { source_id, .. } => source_id,
         }
@@ -74,6 +87,10 @@ impl CatalogCommandIntent {
     fn lifecycle_generation(&self) -> u64 {
         match self {
             Self::Register {
+                lifecycle_generation,
+                ..
+            }
+            | Self::RegisterVerified {
                 lifecycle_generation,
                 ..
             }
@@ -97,6 +114,15 @@ impl CatalogCommandIntent {
             } => CatalogCommand::Register {
                 source_id,
                 canonical_root: root,
+                lifecycle_generation,
+            },
+            Self::RegisterVerified {
+                source_id,
+                root,
+                lifecycle_generation,
+            } => CatalogCommand::RegisterVerified {
+                source_id,
+                root,
                 lifecycle_generation,
             },
             Self::Audit {
@@ -140,6 +166,7 @@ impl Browser {
         fallback_to_scan: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        super::source_recovery::cancel_for_source_change(self);
         super::tags::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
@@ -253,7 +280,9 @@ impl Browser {
             source_id: source_id.clone(),
             root: root.clone(),
             lifecycle_generation,
+            registered: false,
             registration_admitted: false,
+            root_identity: None,
             audit_finished: false,
             audit_error: None,
             force_reload,
@@ -295,6 +324,7 @@ impl Browser {
 
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
+        super::source_recovery::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -353,7 +383,7 @@ impl Browser {
         coalesce_catalog_remove(&mut self.catalog_pending_removes, source_id, intent);
     }
 
-    fn cancel_catalog_projection(&mut self) {
+    pub(super) fn cancel_catalog_projection(&mut self) {
         if let Some(cancellation) = self.catalog_projection_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }
@@ -376,6 +406,7 @@ impl Browser {
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
+                super::source_recovery::cancel_for_source_change(self);
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -414,6 +445,11 @@ impl Browser {
                     source_id,
                     lifecycle_generation,
                     ..
+                }
+                | CatalogCommandIntent::RegisterVerified {
+                    source_id,
+                    lifecycle_generation,
+                    ..
                 } => Some((source_id.clone(), *lifecycle_generation)),
                 CatalogCommandIntent::Audit { .. } | CatalogCommandIntent::Remove { .. } => None,
             };
@@ -425,6 +461,11 @@ impl Browser {
                         && activation.lifecycle_generation == lifecycle_generation
                     {
                         activation.registration_admitted = true;
+                        super::source_recovery::note_registration_admitted(
+                            self,
+                            &source_id,
+                            lifecycle_generation,
+                        );
                     }
                     self.catalog_pending_command = None;
                     return true;
@@ -449,6 +490,7 @@ impl Browser {
         let Some(activation) = self.catalog_activation.clone() else {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
+            super::source_recovery::cancel_for_source_change(self);
             super::tag_chips::cancel_for_source_change(self);
             super::tag_completion::cancel_for_source_change(self, cx);
             self.reset_catalog_metadata();
@@ -457,6 +499,7 @@ impl Browser {
         };
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
+        super::source_recovery::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -502,8 +545,24 @@ impl Browser {
             // later receipt cannot be mistaken for a new source's metadata.
             return self.apply_curation_event(&event, cx);
         }
+        if let CatalogEvent::Failed {
+            operation: CatalogOperation::Register,
+            ..
+        } = &event
+            && let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event)
+            && let Some(activation) = self.catalog_activation.as_mut()
+            && activation.source_id == source_id
+            && activation.lifecycle_generation == lifecycle_generation
+        {
+            activation.registered = false;
+        }
+        match super::source_recovery::before_catalog_event(self, &event, cx) {
+            super::source_recovery::CatalogEventDisposition::Consume => return true,
+            super::source_recovery::CatalogEventDisposition::Pass => {}
+        }
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
+                super::source_recovery::cancel_for_source_change(self);
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -525,6 +584,9 @@ impl Browser {
         }
         match &event {
             CatalogEvent::Registered { .. } => {
+                if let Some(activation) = self.catalog_activation.as_mut() {
+                    activation.registered = true;
+                }
                 self.catalog_pending_command = Some(CatalogCommandIntent::Audit {
                     source_id,
                     lifecycle_generation,
@@ -540,6 +602,11 @@ impl Browser {
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = None;
+                }
+                if let CatalogEvent::AuditCommitted { snapshot } = &event
+                    && let Some(activation) = self.catalog_activation.as_mut()
+                {
+                    activation.root_identity = Some(snapshot.root_identity.clone());
                 }
                 self.scan_status = "Catalog audit committed…".to_string();
                 self.start_catalog_projection(event, cx);
@@ -657,6 +724,9 @@ impl Browser {
             activation.audit_finished && activation.audit_error.is_none()
         });
         if audit_ready {
+            if let Some(activation) = self.catalog_activation.as_mut() {
+                activation.root_identity = Some(projection.root_identity.clone());
+            }
             self.curation_state.install_projection(
                 super::curation::CurationLifecycleKey {
                     source_id: projection.source_id.clone(),
@@ -775,7 +845,7 @@ impl Browser {
     }
 }
 
-fn catalog_status(cx: &Context<Browser>) -> Option<CatalogStatus> {
+pub(super) fn catalog_status(cx: &Context<Browser>) -> Option<CatalogStatus> {
     cx.has_global::<SourceRegistryGlobal>()
         .then(|| cx.global::<SourceRegistryGlobal>().catalog_status())
 }
@@ -1254,7 +1324,9 @@ mod tests {
             source_id,
             root: PathBuf::from("/library"),
             lifecycle_generation: 1,
+            registered: false,
             registration_admitted: false,
+            root_identity: None,
             audit_finished: false,
             audit_error: None,
             force_reload: false,

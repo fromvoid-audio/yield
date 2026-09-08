@@ -64,7 +64,9 @@ Source folders and preferences persist in the isolated GPUI profile. Add, switch
 or forget sources from the sidebar, expand the relative folder tree, and choose
 direct-only or descendant scope. File changes refresh automatically through bounded
 native watcher hints and authoritative catalog audits. Refresh preserves valid navigation state; an
-unavailable source keeps its last successful view available for retry.
+unavailable source keeps its last successful view while recovery probes run in
+the background. A returning folder is audited again; a physically replaced folder
+gets a verified new catalog generation after earlier metadata saves finish.
 
 Search filenames with Cmd/Ctrl+F. Sort by name, rating, Type, collection, extension,
 size, or Last Played. Type and Last Played columns appear when the window has

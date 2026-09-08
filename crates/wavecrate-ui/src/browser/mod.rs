@@ -42,6 +42,7 @@ mod history;
 mod motion;
 mod preferences;
 mod sidebar;
+mod source_recovery;
 mod source_registry;
 mod tag_chips;
 mod tag_completion;
@@ -293,6 +294,7 @@ pub(crate) struct Browser {
     catalog_projection_task: Option<Task<()>>,
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
     catalog_metadata: catalog_metadata::CatalogMetadataState,
+    source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
@@ -475,6 +477,7 @@ impl Browser {
             catalog_projection_task: None,
             catalog_projection_cancel: None,
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
+            source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
@@ -1257,6 +1260,9 @@ impl Browser {
         else {
             return;
         };
+        if self.catalog_activation.is_some() && source_recovery::manual_refresh(self, cx) {
+            return;
+        }
         if !self.begin_catalog_activation(index, true, false, true, cx) {
             self.begin_source_scan(root, Some(index), cx);
         }
