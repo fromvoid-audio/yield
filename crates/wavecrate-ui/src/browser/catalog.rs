@@ -140,6 +140,8 @@ impl Browser {
         fallback_to_scan: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.browser_focus_override = None;
+        self.context_menu = None;
         let Some((source_id, root, label)) = self
             .source_sessions
             .get(index)
@@ -567,6 +569,8 @@ impl Browser {
         force_reload: bool,
         cx: &mut Context<Self>,
     ) {
+        self.browser_focus_override = None;
+        self.context_menu = None;
         let Some(index) = self.active_source.filter(|index| {
             self.source_sessions.get(*index).is_some_and(|session| {
                 session.source_id.as_ref() == Some(&projection.source_id)

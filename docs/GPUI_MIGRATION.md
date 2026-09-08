@@ -969,3 +969,28 @@ Unlock is represented in the core planner but awaits its reference context-menu
 control. Fourth-negative filesystem trash requests remain explicitly unavailable
 until file-transaction integration; the UI does not silently treat them as saved
 metadata edits. This does not complete full feature parity.
+
+### Sample context menu and passive browser focus
+
+The GPUI browser now provides an anchored, themed sample-row menu with Copy Path,
+Reveal in the platform file manager, conditional Unlock, and Remove from the
+active collection. Copy Path writes normalized plain text and quotes paths with
+spaces. Reveal reuses the asynchronous file-handoff validation lane. Unlock uses
+selected locked rows only when the context target belongs to that selection;
+collection removal always targets the context file and is idempotent.
+
+Passive browser focus is independent of the loaded preview. Opening and dismissing
+a menu does not load another waveform or restart transport. Escape/W dismiss,
+arrow keys navigate, and Enter activates; menu input suppresses browser shortcuts.
+Captured source, lifecycle, root, revision, and projection identity fence actions.
+Row rendering compares stable identities directly rather than scanning the file
+list for every visible row.
+
+Validation: nine core curation tests, six context-menu tests, twelve UI curation
+tests, formatting, diff checks, and the locked application build passed. A
+separately signed QA bundle rendered the menu on a disposable three-file source;
+rating locks and collection edits were confirmed in its database. Further native
+menu checks were inconclusive because the open QA window acquired edits outside
+the scripted sequence; UI automation was paused and both open apps were left
+untouched. Native interaction acceptance remains outstanding. Filesystem trash,
+duplication, and other context-menu actions remain subsequent parity work.

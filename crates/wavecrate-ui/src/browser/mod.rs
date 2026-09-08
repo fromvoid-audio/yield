@@ -35,6 +35,7 @@ use crate::theme::ActiveTheme;
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod context_menu;
 mod curation;
 mod handoff;
 mod history;
@@ -229,6 +230,8 @@ pub(crate) struct Browser {
     view_model: BrowserViewModel,
     selected: Option<usize>,
     selection: BrowserSelection,
+    browser_focus_override: Option<AudioFileId>,
+    context_menu: Option<context_menu::ContextMenuState>,
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
@@ -338,8 +341,10 @@ impl Browser {
         let search_input = cx.new(SearchInput::new);
         let search_subscription =
             cx.subscribe(&search_input, |view, input, _: &SearchChanged, cx| {
-                let previous_id = view.selected_id();
+                let previous_id = view.browser_focus_id();
                 let previous_position = view.selected_visible_position();
+                view.browser_focus_override = None;
+                view.context_menu = None;
                 let query = input.read(cx).content().to_owned();
                 view.view_model.set_query(&view.entries, query);
                 view.refresh_collection_filter_counts();
@@ -370,6 +375,8 @@ impl Browser {
             view_model: BrowserViewModel::new(&[]),
             selected: None,
             selection: BrowserSelection::new(),
+            browser_focus_override: None,
+            context_menu: None,
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
@@ -490,6 +497,21 @@ impl Browser {
             .map(AudioFile::stable_id)
     }
 
+    /// Return the browser row focus, keeping it independent from the loaded waveform selection.
+    fn browser_focus_id(&self) -> Option<AudioFileId> {
+        self.browser_focus_override
+            .clone()
+            .or_else(|| self.selected_id())
+    }
+
+    /// Resolve browser focus to the current scan index without changing the loaded preview.
+    fn browser_focus_index(&self) -> Option<usize> {
+        let focus_id = self.browser_focus_id()?;
+        self.entries
+            .iter()
+            .position(|entry| entry.stable_id() == focus_id)
+    }
+
     fn cancel_waveform_load(&mut self) {
         self.waveform_detail.cancel();
         if let Some(cancellation) = self.waveform_cancel.take() {
@@ -512,9 +534,12 @@ impl Browser {
     }
 
     /// Highlight batch members, falling back to the focused sample for ordinary navigation.
-    fn sample_row_is_selected(&self, entry_index: usize, id: &AudioFileId) -> bool {
-        self.selection.contains(id)
-            || (self.selection.is_empty() && self.selected == Some(entry_index))
+    fn sample_row_is_selected_with_focus(
+        &self,
+        id: &AudioFileId,
+        browser_focus_id: Option<&AudioFileId>,
+    ) -> bool {
+        self.selection.contains(id) || (self.selection.is_empty() && browser_focus_id == Some(id))
     }
 
     fn selected_count_label(&self) -> Option<String> {
@@ -522,7 +547,7 @@ impl Browser {
     }
 
     fn selected_visible_position(&self) -> Option<usize> {
-        self.selected_id()
+        self.browser_focus_id()
             .as_ref()
             .and_then(|id| self.view_model.visible_position_for(id))
     }
@@ -537,7 +562,7 @@ impl Browser {
             return;
         };
         let target_id = entry.stable_id();
-        let focused_id = self.selected_id();
+        let focused_id = self.browser_focus_id();
         let modifiers = event.modifiers();
         let intent = sample_click_intent(modifiers.shift, modifiers.platform || modifiers.control);
         let origin = selection_origin_for_click(intent, modifiers.alt || modifiers.function);
@@ -601,6 +626,8 @@ impl Browser {
         source_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.browser_focus_override = None;
+        self.context_menu = None;
         self.deactivate_catalog_source(cx);
         if source_index != self.active_source {
             self.selection.clear();
@@ -1139,8 +1166,10 @@ impl Browser {
     }
 
     fn update_active_folder_projection(&mut self, cx: &mut Context<Self>) {
-        let previous_id = self.selected_id();
+        let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
+        self.browser_focus_override = None;
+        self.context_menu = None;
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
@@ -1174,6 +1203,8 @@ impl Browser {
         origin: SelectionOrigin,
         cx: &mut Context<Self>,
     ) {
+        self.browser_focus_override = None;
+        self.context_menu = None;
         let Some(entry) = self.entries.get(index).cloned() else {
             return;
         };
@@ -1536,7 +1567,7 @@ impl Browser {
             return;
         }
         let current = self
-            .selected_id()
+            .browser_focus_id()
             .as_ref()
             .and_then(|id| self.view_model.visible_position_for(id))
             .unwrap_or(0) as isize;
@@ -1545,7 +1576,7 @@ impl Browser {
         let next_row = self.view_model.rows()[next_position].clone();
         let next = next_row.entry_index;
         let next_id = next_row.id;
-        let focused_id = self.selected_id();
+        let focused_id = self.browser_focus_id();
         if extend {
             self.selection.extend_range(
                 self.view_model.rows().iter().map(|row| &row.id),
@@ -1565,8 +1596,10 @@ impl Browser {
     }
 
     fn toggle_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
-        let previous_id = self.selected_id();
+        let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
+        self.browser_focus_override = None;
+        self.context_menu = None;
         self.view_model.toggle_sort(&self.entries, column);
         self.reconcile_selection();
         self.restore_projection_focus(previous_id, previous_position, cx);
@@ -1581,7 +1614,7 @@ impl Browser {
     /// Toggle explicit membership for the focused row. This is the reference browser's `X`
     /// action; focused-row fallback still makes an empty explicit set auditionable as one item.
     fn toggle_focused_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(focused_id) = self.selected_id() else {
+        let Some(focused_id) = self.browser_focus_id() else {
             return;
         };
         self.selection.toggle(&focused_id, Some(&focused_id));
@@ -1600,6 +1633,9 @@ impl Browser {
         let function = event.keystroke.modifiers.function;
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
+        if self.handle_context_menu_key_down(event, window, cx) {
+            return;
+        }
         if key.eq_ignore_ascii_case("f") && secondary {
             self.invalidate_file_handoff();
             window.focus(&self.search_input.read(cx).focus_handle());

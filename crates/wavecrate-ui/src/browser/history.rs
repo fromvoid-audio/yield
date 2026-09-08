@@ -52,6 +52,8 @@ impl Browser {
         direction: PlaybackHistoryDirection,
         cx: &mut Context<Self>,
     ) {
+        self.browser_focus_override = None;
+        self.context_menu = None;
         let entry = match direction {
             PlaybackHistoryDirection::Back => self.playback_history.back(),
             PlaybackHistoryDirection::Forward => self.playback_history.forward(),

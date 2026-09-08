@@ -4,8 +4,8 @@
 //! Browser rendering and the compact Wavecrate application shell.
 
 use gpui::{
-    ClickEvent, Context, Div, MouseButton, MouseMoveEvent, MouseUpEvent, Render, Window, div, font,
-    prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
+    Window, div, font, prelude::*, px, uniform_list,
 };
 use wavecrate_core::{SortColumn, SortDirection, format_duration};
 use wavecrate_design::Theme;
@@ -13,6 +13,7 @@ use wavecrate_design::Theme;
 use crate::theme::{active, color, transparent};
 
 use super::Browser;
+use super::context_menu;
 use super::curation;
 use super::motion;
 use super::volume;
@@ -354,6 +355,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        context_menu::invalidate_if_stale(self);
         let theme = active(cx).clone();
         let motion_frame = self.motion_frame(theme.motion, window);
         let playback_cursor_ratio = self.playback_cursor_ratio(theme.motion.enabled);
@@ -435,13 +437,18 @@ impl Render for Browser {
                                         view.observe_catalog_metadata(context, metadata_paths, cx);
                                     });
                                 }
+                                let browser_focus_id = view.browser_focus_id();
                                 range
                                     .map(|visible_index| {
                                         let row = view.view_model.rows()[visible_index].clone();
                                         let index = row.entry_index;
                                         let entry = view.entries[index].clone();
-                                        let selected = view.sample_row_is_selected(index, &row.id);
-                                        let current_sample = view.selected == Some(index);
+                                        let selected = view.sample_row_is_selected_with_focus(
+                                            &row.id,
+                                            browser_focus_id.as_ref(),
+                                        );
+                                        let current_sample =
+                                            browser_focus_id.as_ref() == Some(&row.id);
                                         let focused = motion_frame.focus_alpha > 0
                                             && view.focus_matches_sample(&entry.path);
                                         let extension = entry
@@ -481,6 +488,19 @@ impl Render for Browser {
                                                     view.select_entry_from_click(index, event, cx);
                                                 },
                                             ))
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |view,
+                                                          event: &MouseDownEvent,
+                                                          window,
+                                                          cx| {
+                                                        view.open_context_menu(
+                                                            index, event, window, cx,
+                                                        );
+                                                    },
+                                                ),
+                                            )
                                             .child(
                                                 div()
                                                     .flex_none()
@@ -988,6 +1008,9 @@ impl Render for Browser {
                         .occlude()
                         .child(self.render_audio_output_settings(theme.clone(), cx)),
                 )
+            })
+            .when(self.context_menu.is_some(), |element| {
+                element.child(context_menu::render_overlay(self, &theme, cx))
             })
     }
 }

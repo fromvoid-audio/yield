@@ -41,6 +41,12 @@ impl Browser {
         self.start_file_handoff(HandoffCommand::Reveal, cx);
     }
 
+    /// Reveal one context-menu target through the same asynchronous preflight lane as toolbar
+    /// reveals.
+    pub(super) fn reveal_context_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.start_file_handoff_with_paths(HandoffCommand::Reveal, vec![path], cx);
+    }
+
     pub(super) fn invalidate_file_handoff_from_search_mouse(
         &mut self,
         _: &MouseDownEvent,
@@ -51,21 +57,30 @@ impl Browser {
     }
 
     fn start_file_handoff(&mut self, command: HandoffCommand, cx: &mut Context<Self>) {
-        self.handoff_generation = self.handoff_generation.wrapping_add(1);
-        let generation = self.handoff_generation;
-        self.handoff_task.take();
-        let context = self.handoff_context();
         let paths = match command {
             HandoffCommand::Copy => file_handoff_paths(
                 &self.entries,
                 self.view_model.rows(),
                 &self.selection,
-                self.selected,
+                self.browser_focus_index(),
             ),
-            HandoffCommand::Reveal => focused_file_path(&self.entries, self.selected)
+            HandoffCommand::Reveal => focused_file_path(&self.entries, self.browser_focus_index())
                 .into_iter()
                 .collect(),
         };
+        self.start_file_handoff_with_paths(command, paths, cx);
+    }
+
+    fn start_file_handoff_with_paths(
+        &mut self,
+        command: HandoffCommand,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.handoff_generation = self.handoff_generation.wrapping_add(1);
+        let generation = self.handoff_generation;
+        self.handoff_task.take();
+        let context = self.handoff_context();
         if paths.is_empty() {
             self.playback_status = match command {
                 HandoffCommand::Copy => "No selected files to copy".to_string(),
@@ -145,7 +160,7 @@ impl Browser {
             .collect::<Vec<_>>();
         HandoffContext {
             source_root: self.root.clone(),
-            focused_id: self.selected_id(),
+            focused_id: self.browser_focus_id(),
             selected_ids: self.selection.selected_in_order(&visible_ids),
             visible_ids,
         }

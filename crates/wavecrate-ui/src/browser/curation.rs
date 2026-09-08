@@ -611,6 +611,15 @@ fn updates_for_action(
                 vec![SourceCurationUpdate::RemoveCollection { path, collection }]
             }
         }
+        CurationAction::RemoveCollection { slot } => {
+            let Some(collection) = SampleCollection::new(slot as u8) else {
+                return Vec::new();
+            };
+            (current.has_collection(slot) && !after.has_collection(slot))
+                .then_some(SourceCurationUpdate::RemoveCollection { path, collection })
+                .into_iter()
+                .collect()
+        }
         CurationAction::UnlockKeepRating => (current.rating().locked() != after.rating().locked())
             .then_some(SourceCurationUpdate::SetLocked {
                 path,
@@ -855,8 +864,10 @@ impl Browser {
         if self.active_source.is_none() {
             return;
         }
-        let previous_id = self.selected_id();
+        let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
+        self.browser_focus_override = None;
+        self.context_menu = None;
         if !self
             .view_model
             .toggle_collection_filter(&self.entries, slot)
@@ -874,11 +885,16 @@ impl Browser {
         let Some(action) = shortcut_action(key) else {
             return false;
         };
-        self.submit_curation_action(action, cx);
+        self.submit_curation_action(action, None, cx);
         true
     }
 
-    fn submit_curation_action(&mut self, action: CurationAction, cx: &mut Context<Self>) {
+    pub(super) fn submit_curation_action(
+        &mut self,
+        action: CurationAction,
+        explicit_paths: Option<Vec<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(activation) = self.catalog_activation.as_ref() else {
             self.scan_status =
                 String::from("Curation requires a successful audited catalog projection");
@@ -919,7 +935,7 @@ impl Browser {
             cx.notify();
             return;
         }
-        let target_paths = self.curation_target_paths();
+        let target_paths = explicit_paths.unwrap_or_else(|| self.curation_target_paths());
         match self.curation_state.plan_action(&key, action, &target_paths) {
             CurationPlan::Rejected(message) => {
                 self.curation_state.set_message(&key, message);
@@ -981,7 +997,7 @@ impl Browser {
                 .map(|entry| entry.relative_path.clone())
                 .collect();
         }
-        self.selected
+        self.browser_focus_index()
             .and_then(|index| self.entries.get(index))
             .map(|entry| vec![entry.relative_path.clone()])
             .unwrap_or_default()
@@ -1458,6 +1474,30 @@ mod tests {
             plan.batches[0].as_slice(),
             [SourceCurationUpdate::AddCollection { collection, .. }]
                 if collection.index() == 2
+        ));
+    }
+
+    #[test]
+    fn remove_collection_action_targets_only_the_active_slot() {
+        let path = PathBuf::from("member.wav");
+        let state = install(&[entry("member.wav", 1, false, 0b0000_0101)]);
+        let plan = ready_plan(
+            &state,
+            CurationAction::RemoveCollection { slot: 2 },
+            std::slice::from_ref(&path),
+        );
+        assert!(matches!(
+            plan.batches[0].as_slice(),
+            [SourceCurationUpdate::RemoveCollection { collection, .. }]
+                if collection.index() == 2
+        ));
+        assert!(matches!(
+            state.plan_action(
+                &key(),
+                CurationAction::RemoveCollection { slot: 1 },
+                std::slice::from_ref(&path),
+            ),
+            CurationPlan::NoChange { trash_required: 0 }
         ));
     }
 

@@ -535,6 +535,8 @@ impl Browser {
     }
 
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
+        self.browser_focus_override = None;
+        self.context_menu = None;
         self.stop_playback();
         self.cancel_waveform_load();
         self.reset_catalog_metadata();

@@ -23,6 +23,11 @@ pub enum CurationAction {
         /// Zero-based collection slot to toggle.
         slot: usize,
     },
+    /// Remove membership from one fixed collection slot when it is present.
+    RemoveCollection {
+        /// Zero-based collection slot to remove.
+        slot: usize,
+    },
     /// Unlock a locked maximum keep rating.
     UnlockKeepRating,
 }
@@ -65,6 +70,15 @@ pub fn plan_curation_action(
             CurationTransition::Changed(with_collection_mask(
                 current,
                 current.collection_mask() ^ (1 << slot),
+            ))
+        }
+        CurationAction::RemoveCollection { slot } => {
+            if slot >= COLLECTION_COUNT || !current.has_collection(slot) {
+                return CurationTransition::Unchanged;
+            }
+            CurationTransition::Changed(with_collection_mask(
+                current,
+                current.collection_mask() & !(1 << slot),
             ))
         }
         CurationAction::UnlockKeepRating => {
@@ -199,6 +213,31 @@ mod tests {
             CurationTransition::Unchanged
         );
         assert_eq!(current, curation(0, false, 0b0000_0011));
+    }
+
+    #[test]
+    fn remove_collection_is_idempotent_and_preserves_other_memberships() {
+        let current = curation(0, false, 0b0000_0101);
+        assert_eq!(
+            plan_curation_action(current, CurationAction::RemoveCollection { slot: 2 }),
+            CurationTransition::Changed(curation(0, false, 0b0000_0001))
+        );
+        assert_eq!(
+            plan_curation_action(
+                curation(0, false, 0b0000_0001),
+                CurationAction::RemoveCollection { slot: 2 },
+            ),
+            CurationTransition::Unchanged
+        );
+        assert_eq!(
+            plan_curation_action(
+                current,
+                CurationAction::RemoveCollection {
+                    slot: COLLECTION_COUNT,
+                },
+            ),
+            CurationTransition::Unchanged
+        );
     }
 
     #[test]
