@@ -14,6 +14,7 @@ use super::Browser;
 use super::curation;
 use super::motion::{self, MotionFrame};
 use super::tag_chips;
+use super::tag_completion;
 use super::tag_filter;
 use super::tags;
 
@@ -535,6 +536,7 @@ pub(super) fn render(
         .child(curation::render_rating_filters(browser, theme.clone(), cx))
         .child(tag_filter::render(browser, theme.clone(), cx))
         .child(tags::render(browser, theme.clone(), cx))
+        .child(tag_completion::render(browser, theme.clone(), cx))
         .child(tag_chips::render(browser, theme.clone(), cx))
         .child(
             div()

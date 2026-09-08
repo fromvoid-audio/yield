@@ -44,6 +44,7 @@ mod preferences;
 mod sidebar;
 mod source_registry;
 mod tag_chips;
+mod tag_completion;
 mod tag_filter;
 mod tags;
 mod transport;
@@ -294,6 +295,7 @@ pub(crate) struct Browser {
     catalog_metadata: catalog_metadata::CatalogMetadataState,
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
+    tag_completion: tag_completion::TagCompletionState,
     tag_filter: tag_filter::TagFilterState,
     tag_chips: tag_chips::TagChipsState,
     collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
@@ -370,10 +372,12 @@ impl Browser {
         let tag_subscription = cx.subscribe(&tag_input, |view, input, _: &SearchChanged, cx| {
             let content = input.read(cx).content().to_owned();
             tags::on_changed(view, &content, cx);
+            tag_completion::on_changed(view, &content, cx);
         });
         let tag_rejected_subscription =
             cx.subscribe(&tag_input, |view, _input, _: &SearchInputRejected, cx| {
                 tags::on_rejected(view, cx);
+                tag_completion::on_rejected(view, cx);
             });
         let tag_filter_input =
             cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::tag_filter()));
@@ -473,6 +477,7 @@ impl Browser {
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),
+            tag_completion: tag_completion::TagCompletionState::default(),
             tag_filter: tag_filter::TagFilterState::default(),
             tag_chips: tag_chips::TagChipsState::default(),
             collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],
@@ -1802,6 +1807,19 @@ impl Browser {
                 self.invalidate_file_handoff();
             }
             let is_composing = self.tag_input.read(cx).is_composing();
+            if tag_completion::handle_focused_key_down(
+                self,
+                key,
+                event.is_held,
+                is_composing,
+                secondary,
+                shift,
+                alt,
+                function,
+                cx,
+            ) {
+                return;
+            }
             tags::handle_focused_key_down(
                 self,
                 key,

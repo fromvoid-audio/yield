@@ -1611,3 +1611,28 @@ catalog convergence; visual/audible app acceptance remains separate.
 `Wavecrate Watcher Preview f334852.app` was built from the clean watcher acceptance
 checkout at `f33485214`, packaged under `target/qa`, and passed strict ad-hoc
 signature verification. The agent did not launch it or modify existing previews.
+
+### Bounded native ADD TAG completion
+
+Single-label drafts now merge defaults, source vocabulary and profile vocabulary
+into one six-row suggestion page. Independent 64-row windows retain their
+unconsumed suffixes; a 32-step composite cursor history supports First, Previous
+and Next without collecting the dictionary. Exact duplicates retain source tag
+IDs. Legacy bounded previews remain selectable by persisted numeric ID, including
+when the query is longer than the preview; they do not become mutation labels or
+claim full lexical ordering beyond their visible preview.
+
+Only explicit arrow/hover selection substitutes a suggestion on Enter. The first
+suggestion supplies a display-only ghost suffix, hidden during composition,
+selection or an interior cursor. Native hit testing clamps to real input content.
+Editor/source cancellation and page restoration clear the ghost immediately.
+Source context, revision, menu epoch and candidate identity fence activation;
+source suggestions submit bounded ID assignments through existing curation.
+
+Verification: the fresh-target full UI library suite passed 200 tests with one
+existing ignored test after the preview-prefix and ghost-reset fixes. Ten focused
+completion tests then passed after extracting production page/checkpoint helpers,
+including real database cursors across a 64-row refill, profile carry, source-ID
+deduplication and identical replay after restoring a composite checkpoint.
+Formatting, UI check and diff checks passed. Native visual/input acceptance is
+still separate from automated verification.

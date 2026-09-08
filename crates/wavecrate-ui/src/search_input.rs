@@ -117,6 +117,7 @@ pub(crate) struct SearchInput {
     options: SearchInputOptions,
     content: SharedString,
     placeholder: SharedString,
+    ghost: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -139,6 +140,7 @@ impl SearchInput {
             options,
             content: "".into(),
             placeholder: options.placeholder.into(),
+            ghost: "".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -156,6 +158,18 @@ impl SearchInput {
         &self.content
     }
 
+    /// Set the noncommittal completion suffix shown after the current content.
+    pub(crate) fn set_ghost(&mut self, ghost: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let ghost = ghost.into();
+        if self.ghost == ghost {
+            return;
+        }
+        self.ghost = ghost;
+        self.last_layout = None;
+        self.last_bounds = None;
+        cx.notify();
+    }
+
     pub(crate) fn is_composing(&self) -> bool {
         self.marked_range.is_some()
     }
@@ -168,6 +182,7 @@ impl SearchInput {
             return;
         }
         self.content = content;
+        self.ghost = "".into();
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -330,6 +345,7 @@ impl SearchInput {
             return self.content.len();
         }
         line.closest_index_for_x(position.x - bounds.left())
+            .min(self.content.len())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -440,6 +456,7 @@ impl EntityInputHandler for SearchInput {
             return;
         };
         self.content = replace_content(&self.content, &range, new_text, resulting_len).into();
+        self.ghost = "".into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range = None;
@@ -467,6 +484,7 @@ impl EntityInputHandler for SearchInput {
             return;
         };
         self.content = replace_content(&self.content, &range, new_text, resulting_len).into();
+        self.ghost = "".into();
         self.marked_range =
             (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
         self.selected_range =
@@ -505,7 +523,13 @@ impl EntityInputHandler for SearchInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        Some(self.offset_to_utf16(last_layout.index_for_x(point.x - line_point.x)?))
+        Some(
+            self.offset_to_utf16(
+                last_layout
+                    .index_for_x(point.x - line_point.x)?
+                    .min(self.content.len()),
+            ),
+        )
     }
 }
 
@@ -564,30 +588,72 @@ impl Element for TextElement {
         let input = self.input.read(cx);
         let theme = active(cx);
         let content = input.content.clone();
+        let ghost = input.ghost.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
-        let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), color(theme.colors.text_muted))
+        let ghost_visible = !content.is_empty()
+            && !ghost.is_empty()
+            && selected_range.is_empty()
+            && input.marked_range.is_none()
+            && cursor == content.len()
+            && input.focus_handle.is_focused(window);
+        let (display_text, runs) = if content.is_empty() {
+            let text_color = color(theme.colors.text_muted);
+            let display_text = input.placeholder.clone();
+            let run = TextRun {
+                len: display_text.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: input.marked_range.as_ref().map(|_| UnderlineStyle {
+                    color: Some(text_color),
+                    thickness: px(1.0),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            (display_text, vec![run])
+        } else if ghost_visible {
+            let mut display_text = String::with_capacity(content.len() + ghost.len());
+            display_text.push_str(&content);
+            display_text.push_str(&ghost);
+            let content_run = TextRun {
+                len: content.len(),
+                font: style.font(),
+                color: style.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let ghost_run = TextRun {
+                len: ghost.len(),
+                font: style.font(),
+                color: color(theme.colors.text_muted),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            (display_text.into(), vec![content_run, ghost_run])
         } else {
-            (content, style.color)
-        };
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: input.marked_range.as_ref().map(|_| UnderlineStyle {
-                color: Some(text_color),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            strikethrough: None,
+            let run = TextRun {
+                len: content.len(),
+                font: style.font(),
+                color: style.color,
+                background_color: None,
+                underline: input.marked_range.as_ref().map(|_| UnderlineStyle {
+                    color: Some(style.color),
+                    thickness: px(1.0),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            (content, vec![run])
         };
         let line = window.text_system().shape_line(
             display_text,
             style.font_size.to_pixels(window.rem_size()),
-            &[run],
+            &runs,
             None,
         );
         let cursor_pos = line.x_for_index(cursor);

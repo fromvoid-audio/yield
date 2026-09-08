@@ -50,6 +50,7 @@ struct PendingCurationOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TagMutation {
     Add,
+    AddExisting { tag_id: i64 },
     Remove,
     RemoveExisting { tag_id: i64 },
 }
@@ -426,7 +427,7 @@ impl CurationState {
         let mut seen_labels = HashSet::with_capacity(label_capacity);
         let mut unique_labels = Vec::with_capacity(label_capacity);
         let label_count = match mutation {
-            TagMutation::RemoveExisting { tag_id } => {
+            TagMutation::AddExisting { tag_id } | TagMutation::RemoveExisting { tag_id } => {
                 if tag_id <= 0 {
                     return CurationPlan::Rejected(String::from(
                         "Existing tag id must be positive",
@@ -541,7 +542,7 @@ impl CurationState {
         }
 
         let label_bytes = match mutation {
-            TagMutation::RemoveExisting { .. } => 0,
+            TagMutation::AddExisting { .. } | TagMutation::RemoveExisting { .. } => 0,
             TagMutation::Add | TagMutation::Remove => match unique_labels
                 .iter()
                 .try_fold(0usize, |total, label| total.checked_add(label.len()))
@@ -584,7 +585,7 @@ impl CurationState {
             )
             .saturating_add(total_updates.saturating_mul(256))
             .saturating_add(match mutation {
-                TagMutation::RemoveExisting { .. } => {
+                TagMutation::AddExisting { .. } | TagMutation::RemoveExisting { .. } => {
                     total_updates.saturating_mul(std::mem::size_of::<i64>())
                 }
                 TagMutation::Add | TagMutation::Remove => 0,
@@ -617,6 +618,12 @@ impl CurationState {
                 batch.reserve(paths_per_batch * label_count);
             }
             match mutation {
+                TagMutation::AddExisting { tag_id } => {
+                    batch.push(SourceCurationUpdate::AssignExistingTag {
+                        path: relative_path,
+                        tag_id,
+                    });
+                }
                 TagMutation::RemoveExisting { tag_id } => {
                     batch.push(SourceCurationUpdate::RemoveExistingTag {
                         path: relative_path,
@@ -634,8 +641,9 @@ impl CurationState {
                                 path: relative_path.clone(),
                                 label: (*label).to_owned(),
                             },
-                            TagMutation::RemoveExisting { .. } => {
-                                unreachable!("existing-tag removal was handled above")
+                            TagMutation::AddExisting { .. }
+                            | TagMutation::RemoveExisting { .. } => {
+                                unreachable!("existing-tag update was handled above")
                             }
                         };
                         batch.push(update);
@@ -701,6 +709,16 @@ impl CurationState {
             &[],
             target_paths,
         )
+    }
+
+    /// Plan one exact assignment by the persisted source tag identifier.
+    pub(super) fn plan_add_tag_id(
+        &self,
+        key: &CurationLifecycleKey,
+        tag_id: i64,
+        target_paths: &[PathBuf],
+    ) -> CurationPlan {
+        self.plan_tag_operation(key, TagMutation::AddExisting { tag_id }, &[], target_paths)
     }
 
     /// Record an operation only after the catalog accepted its command.
@@ -1761,6 +1779,21 @@ impl Browser {
         self.submit_tag_operation(TagMutation::Add, labels, explicit_paths, cx)
     }
 
+    /// Submit one bounded assignment for a persisted source-tag identifier.
+    pub(super) fn submit_add_tag_id(
+        &mut self,
+        tag_id: i64,
+        explicit_paths: Option<Vec<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) -> TagAdmissionResult {
+        self.submit_tag_operation(
+            TagMutation::AddExisting { tag_id },
+            Vec::new(),
+            explicit_paths,
+            cx,
+        )
+    }
+
     #[expect(
         dead_code,
         reason = "tag-chip removal will use the typed admission result later"
@@ -1850,6 +1883,10 @@ impl Browser {
             TagMutation::Add => self
                 .curation_state
                 .plan_add_tags(&key, &labels, &target_paths),
+            TagMutation::AddExisting { tag_id } => {
+                self.curation_state
+                    .plan_add_tag_id(&key, tag_id, &target_paths)
+            }
             TagMutation::Remove => self.curation_state.plan_remove_tag(
                 &key,
                 labels.first().map(String::as_str).unwrap_or_default(),

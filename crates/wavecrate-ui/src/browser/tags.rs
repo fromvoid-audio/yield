@@ -333,6 +333,15 @@ pub(super) fn on_rejected(browser: &mut Browser, cx: &mut Context<Browser>) {
     cx.notify();
 }
 
+/// Return whether the category chooser currently owns tag-input keyboard focus.
+pub(super) fn category_picker_active(browser: &Browser) -> bool {
+    browser
+        .tag_editor
+        .pending
+        .as_ref()
+        .is_some_and(|pending| matches!(pending.stage, TagStage::AwaitingCategory { .. }))
+}
+
 /// Handle keyboard commands while the tag input owns focus.
 pub(super) fn handle_focused_key_down(
     browser: &mut Browser,
@@ -722,6 +731,7 @@ impl Browser {
     pub(super) fn cancel_tag_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tag_editor.pending = None;
         self.tag_editor.message = None;
+        super::tag_completion::cancel_for_editor(self, cx);
         window.focus(&self.focus_handle);
         cx.notify();
     }

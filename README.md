@@ -90,7 +90,10 @@ Accepted audition requests update Last Played through the same metadata lane.
 
 Use ADD TAG for the selection or focused file. Enter submits typed tags; a single
 new tag opens a category chooser with Up/Down, Enter, and Escape controls. Multiple
-comma-separated tags can be added together. Selected-tag chips show All or Mixed
+comma-separated tags can be added together. Single-tag drafts show a bounded,
+paged suggestion list and a faint completion suffix. Up/Down or hover explicitly
+selects a suggestion; Enter otherwise submits the text you typed. Existing source
+tags retain their database identity when selected. Selected-tag chips show All or Mixed
 membership, and their × control removes that assignment from the selection.
 Larger tag unions have paging controls. Chips update after metadata is saved.
 

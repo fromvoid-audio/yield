@@ -142,6 +142,7 @@ impl Browser {
     ) -> bool {
         super::tags::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
@@ -295,6 +296,7 @@ impl Browser {
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
@@ -375,6 +377,7 @@ impl Browser {
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
@@ -447,6 +450,7 @@ impl Browser {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
             super::tag_chips::cancel_for_source_change(self);
+            super::tag_completion::cancel_for_source_change(self, cx);
             self.reset_catalog_metadata();
             self.curation_state.prune_completed_except(None);
             return true;
@@ -454,6 +458,7 @@ impl Browser {
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         self.cancel_catalog_projection();
         self.reset_catalog_metadata();
@@ -479,7 +484,8 @@ impl Browser {
         if matches!(
             &event,
             CatalogEvent::TagPageReady { .. } | CatalogEvent::TagPageFailed { .. }
-        ) && (super::tags::apply_catalog_event(self, &event, cx)
+        ) && (super::tag_completion::apply_catalog_event(self, &event, cx)
+            || super::tags::apply_catalog_event(self, &event, cx)
             || super::tag_chips::apply_catalog_event(self, &event))
         {
             return true;
@@ -499,6 +505,7 @@ impl Browser {
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
@@ -550,6 +557,7 @@ impl Browser {
             | CatalogEvent::TagFilterFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
@@ -566,6 +574,7 @@ impl Browser {
             }
             CatalogEvent::Removed { .. } => {
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
                 false
             }
@@ -582,6 +591,7 @@ impl Browser {
         let force_reload = activation.force_reload;
         let root = activation.root.clone();
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         self.cancel_catalog_projection();

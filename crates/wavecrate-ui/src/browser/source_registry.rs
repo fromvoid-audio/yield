@@ -7,8 +7,9 @@ use wavecrate_library::sample_sources::SampleSource;
 use wavecrate_session::{
     CanonicalSourceRoot, CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
     PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
-    ProfileTagVocabularyLookup, ProfileTagVocabularySetReceipt, RegistryEvent, RequestId,
-    SourceRegistryService, SubmitError, VocabularyRequest, VocabularyStatus, VocabularySubmitError,
+    ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
+    ProfileTagVocabularySetReceipt, RegistryEvent, RequestId, SourceRegistryService, SubmitError,
+    VocabularyRequest, VocabularyStatus, VocabularySubmitError,
 };
 
 /// The app-owned source registry service.
@@ -105,6 +106,20 @@ impl SourceRegistryGlobal {
             .as_ref()
             .ok_or(VocabularySubmitError::Closed)?
             .lookup_profile_tag_categories(labels)
+    }
+
+    /// Submit one bounded literal-prefix profile vocabulary page.
+    pub(crate) fn profile_tag_vocabulary_page(
+        &self,
+        expected_revision: Option<u64>,
+        prefix: String,
+        after_cursor: Option<ProfileTagVocabularyPageCursor>,
+        requested_limit: usize,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyPage>, VocabularySubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(VocabularySubmitError::Closed)?
+            .profile_tag_vocabulary_page(expected_revision, prefix, after_cursor, requested_limit)
     }
 
     /// Submit one revision-fenced profile tag category assignment.
@@ -213,8 +228,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips, tag_filter,
-    tags,
+    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips,
+    tag_completion, tag_filter, tags,
 };
 use gpui::Context;
 
@@ -265,6 +280,7 @@ impl Browser {
         changed |= tags::poll(self, cx);
         changed |= tag_chips::poll(self, cx);
         changed |= self.retry_catalog_commands(cx);
+        changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
         if changed {
             cx.notify();
@@ -275,6 +291,7 @@ impl Browser {
             || catalog_events_capped
             || tags::has_pending(self)
             || tag_chips::has_pending(self)
+            || tag_completion::has_pending(self)
             || tag_filter::has_pending(self)
             || catalog::catalog_poll_needed(self)
     }
@@ -579,6 +596,7 @@ impl Browser {
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
         tags::cancel_for_source_change(self);
         tag_chips::cancel_for_source_change(self);
+        tag_completion::cancel_for_source_change(self, cx);
         tag_filter::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
