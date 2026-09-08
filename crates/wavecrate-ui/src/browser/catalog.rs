@@ -433,7 +433,8 @@ impl Browser {
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
                     | CatalogSubmitError::InvalidCurationRequest(_)
                     | CatalogSubmitError::InvalidTagPageRequest(_)
-                    | CatalogSubmitError::InvalidTagFilterRequest(_),
+                    | CatalogSubmitError::InvalidTagFilterRequest(_)
+                    | CatalogSubmitError::InvalidDisplayLabelsRequest(_),
                 ) => {
                     return false;
                 }
@@ -479,7 +480,8 @@ impl Browser {
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
                     | CatalogSubmitError::InvalidCurationRequest(_)
                     | CatalogSubmitError::InvalidTagPageRequest(_)
-                    | CatalogSubmitError::InvalidTagFilterRequest(_),
+                    | CatalogSubmitError::InvalidTagFilterRequest(_)
+                    | CatalogSubmitError::InvalidDisplayLabelsRequest(_),
                 ) => return false,
             }
         }
@@ -622,7 +624,9 @@ impl Browser {
             | CatalogEvent::TagPageReady { .. }
             | CatalogEvent::TagPageFailed { .. }
             | CatalogEvent::TagFilterReady { .. }
-            | CatalogEvent::TagFilterFailed { .. } => false,
+            | CatalogEvent::TagFilterFailed { .. }
+            | CatalogEvent::DisplayLabelsReady { .. }
+            | CatalogEvent::DisplayLabelsFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
@@ -902,6 +906,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::TagFilterReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::DisplayLabelsReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::DisplayLabelsFailed {
             source_id,
             lifecycle_generation,
             ..

@@ -1781,3 +1781,11 @@ Dictionary requests survive panel/source/page changes. Category writes also reta
 Validation: two dictionary-state tests, nine tag-panel tests, the completion refresh regression, UI test compilation, formatting and diff checks passed. Request retention across panel resets was code-reviewed; no new end-to-end GPUI lifecycle fixture was added. Backend session tests cover stale revision rejection. Native interaction acceptance remains pending, and this scoped undo does not implement global assignment deletion or application-wide undo.
 
 A clean detached `cd1830f82` snapshot built `target/qa/Wavecrate Dictionary Preview cd1830f.app` in 19.74 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
+
+### Catalog display-label delivery
+
+The catalog and session now expose targeted `RequestDisplayLabels` reads with typed admission failures and ready/failed events. Reads check the profile lease, source lifecycle, retained live manifest, physical root, directory generation, and exact database revision. Admission rejects raw or combined path-byte overflow before queueing. The shared 32 MiB tag-read result budget reserves the worst-case bounded label reply until its event is consumed or discarded; existing input and lifecycle credits remain separate.
+
+Validation: all 84 catalog tests passed, including seven display-label tests, and catalog/session checks and formatting passed. The new UI loader is still being implemented; this delivery layer does not change the browser display by itself.
+
+Independent review found no actionable lifecycle, cancellation, or result-credit issue. The supersession test was strengthened to reject any label event encountered before the replacement snapshot; that focused regression passed after the assertion change.

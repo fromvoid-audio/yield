@@ -26,9 +26,11 @@ use wavecrate_library::sample_sources::db::{
 };
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use wavecrate_library::sample_sources::{
-    BrowserFileMetadata, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
-    SourceCurationCommitReceipt, SourceCurationUpdate, SourceTagPage, SourceTagPageCursor,
+    BrowserFileMetadata, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
+    SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,
+    SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
+    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt,
+    SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor,
     SourceTagPageEntry,
 };
 use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId};
@@ -42,6 +44,7 @@ use wavecrate_source_watcher::WatchHintEvidence;
 use wavecrate_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
 mod curation;
+mod display_labels;
 mod root;
 mod tags;
 mod watcher;
@@ -346,10 +349,17 @@ pub const MAX_TAG_PAGE_INPUT_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum mask storage admitted for one source tag-filter result.
 pub const MAX_TAG_FILTER_MASK_BYTES: usize = 4 * 1024 * 1024;
 
-/// Maximum aggregate source tag-filter result payload retained across queued outcomes.
+/// Maximum aggregate bounded tag-read result payload retained across queued outcomes.
 pub const MAX_TAG_FILTER_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 const TAG_FILTER_PAYLOAD_METADATA_BYTES: usize = 1024;
+const DISPLAY_LABEL_PAYLOAD_METADATA_BYTES: usize = 4096;
+const MAX_DISPLAY_LABEL_PAYLOAD_BYTES: usize = SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES * 2
+    + SOURCE_DISPLAY_LABEL_MAX_PATHS * SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES
+    + SOURCE_DISPLAY_LABEL_MAX_PATHS * std::mem::size_of::<SourceDisplayLabelEntry>()
+    + std::mem::size_of::<Vec<PathBuf>>()
+    + std::mem::size_of::<Vec<SourceDisplayLabelEntry>>()
+    + DISPLAY_LABEL_PAYLOAD_METADATA_BYTES;
 
 pub use curation::{
     CatalogCurationRequestError, SourceCurationOperationFailure, SourceCurationOperationFence,
@@ -444,6 +454,22 @@ pub enum CatalogCommand {
         expected_manifest_len: usize,
         /// Required source-tag identities before library normalization.
         required_tags: Vec<String>,
+    },
+    /// Read bounded ordered display labels for exact paths in the retained source snapshot.
+    ///
+    /// Display-label reads are ephemeral. A superseded, removed, or canceled lifecycle may
+    /// discard the request without publishing a completion event.
+    RequestDisplayLabels {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Generation that must still own the source when the request publishes.
+        lifecycle_generation: u64,
+        /// Retained catalog revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Exact source-relative paths to project.
+        relative_paths: Vec<PathBuf>,
     },
     /// Apply one durable, revision-fenced source curation batch.
     ///
@@ -641,6 +667,38 @@ pub enum CatalogTagFilterRequestError {
     },
 }
 
+/// Why a bounded source display-label request could not be admitted.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogDisplayLabelsRequestError {
+    /// No source-relative paths were supplied.
+    #[error("display-label request is empty")]
+    Empty,
+    /// The request exceeded the bounded exact-path admission limit.
+    #[error("display-label request contains {actual} paths; maximum is {max}")]
+    TooManyPaths {
+        /// Maximum admitted path count.
+        max: usize,
+        /// Supplied path count.
+        actual: usize,
+    },
+    /// The request exceeded its aggregate raw plus normalized source-relative path-byte limit.
+    #[error("display-label request paths contain {actual} bytes; maximum is {max}")]
+    PathBytesTooLarge {
+        /// Maximum aggregate raw plus normalized path bytes.
+        max: usize,
+        /// Supplied aggregate raw plus normalized path bytes.
+        actual: usize,
+    },
+    /// One path could not be represented as a safe source-relative path.
+    #[error("invalid display-label path {path}: {reason}")]
+    InvalidPath {
+        /// Rejected path spelling.
+        path: PathBuf,
+        /// Validation failure reported by the shared root-relative path type.
+        reason: wavecrate_library::sample_sources::reconciliation::RootRelativePathError,
+    },
+}
+
 /// Why a lazy WAV metadata request could not be admitted.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogWavMetadataRequestError {
@@ -683,6 +741,9 @@ pub enum CatalogSubmitError {
     /// A source tag-filter request failed bounded input admission.
     #[error("invalid tag-filter request: {0}")]
     InvalidTagFilterRequest(#[from] CatalogTagFilterRequestError),
+    /// A source display-label request failed bounded input admission.
+    #[error("invalid display-label request: {0}")]
+    InvalidDisplayLabelsRequest(#[from] CatalogDisplayLabelsRequestError),
     /// A durable curation request failed bounded or lifecycle admission.
     #[error("invalid source curation request: {0}")]
     InvalidCurationRequest(#[from] CatalogCurationRequestError),
@@ -743,6 +804,14 @@ pub enum CatalogError {
     /// A selected-path tag query named a path outside the retained live manifest.
     #[error("tag-page path is not a live source member for {source_id}: {path}")]
     TagPagePathMissing {
+        /// Source whose retained manifest was queried.
+        source_id: SourceId,
+        /// Missing source-relative path.
+        path: PathBuf,
+    },
+    /// A display-label request named a path outside the retained live manifest.
+    #[error("display-label path is not a live source member for {source_id}: {path}")]
+    DisplayLabelPathMissing {
         /// Source whose retained manifest was queried.
         source_id: SourceId,
         /// Missing source-relative path.
@@ -966,6 +1035,40 @@ pub enum CatalogEvent {
         /// Typed failure.
         error: CatalogError,
     },
+    /// A bounded source display-label read completed.
+    DisplayLabelsReady {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the labels.
+        lifecycle_generation: u64,
+        /// Physical source-root identity checked by the display-label read.
+        root_identity: RootIdentity,
+        /// Active directory generation represented by the retained snapshot.
+        directory_generation: u64,
+        /// Catalog revision represented by the labels.
+        revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Original exact paths requested by the caller.
+        requested_paths: Vec<PathBuf>,
+        /// Bounded ordered display-label entries.
+        entries: Vec<SourceDisplayLabelEntry>,
+    },
+    /// A bounded source display-label read failed after admission.
+    DisplayLabelsFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Revision required by the request.
+        expected_revision: u64,
+        /// Revision observed before a typed failure, when available.
+        observed_revision: Option<u64>,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
+    },
     /// A durable curation batch committed and returned its bounded metadata patch.
     CurationCommitted {
         /// Stable source identifier.
@@ -1055,7 +1158,7 @@ struct AdmissionState {
     curation_payload_bytes: usize,
     curation_update_count: usize,
     tag_page_input_bytes: usize,
-    tag_filter_payload_bytes: usize,
+    tag_read_payload_bytes: usize,
     sources: HashMap<SourceId, DesiredSource>,
 }
 
@@ -1068,7 +1171,7 @@ impl AdmissionState {
             curation_payload_bytes: 0,
             curation_update_count: 0,
             tag_page_input_bytes: 0,
-            tag_filter_payload_bytes: 0,
+            tag_read_payload_bytes: 0,
             sources: HashMap::new(),
         }
     }
@@ -1092,7 +1195,7 @@ struct QueuedEvent {
     event: CatalogEvent,
     curation_payload_bytes: usize,
     curation_update_count: usize,
-    tag_filter_payload_bytes: usize,
+    tag_read_payload_bytes: usize,
 }
 
 struct CommandInputReservation<'a> {
@@ -1134,7 +1237,7 @@ impl EventHub {
         event: CatalogEvent,
         curation_payload_bytes: usize,
         curation_update_count: usize,
-        tag_filter_payload_bytes: usize,
+        tag_read_payload_bytes: usize,
     ) -> bool {
         let mut queue = self
             .queue
@@ -1147,7 +1250,7 @@ impl EventHub {
             event,
             curation_payload_bytes,
             curation_update_count,
-            tag_filter_payload_bytes,
+            tag_read_payload_bytes,
         });
         self.wake.notify_one();
         true
@@ -1165,7 +1268,7 @@ impl EventHub {
             event: CatalogEvent::Closed,
             curation_payload_bytes: 0,
             curation_update_count: 0,
-            tag_filter_payload_bytes: 0,
+            tag_read_payload_bytes: 0,
         });
         queue.closed = true;
         self.wake.notify_all();
@@ -1182,7 +1285,7 @@ impl EventHub {
                 event.event,
                 event.curation_payload_bytes,
                 event.curation_update_count,
-                event.tag_filter_payload_bytes,
+                event.tag_read_payload_bytes,
             ));
         }
         if queue.closed {
@@ -1205,7 +1308,7 @@ impl EventHub {
                 event.event,
                 event.curation_payload_bytes,
                 event.curation_update_count,
-                event.tag_filter_payload_bytes,
+                event.tag_read_payload_bytes,
             ));
         }
         if queue.closed {
@@ -1220,7 +1323,7 @@ impl EventHub {
                 event.event,
                 event.curation_payload_bytes,
                 event.curation_update_count,
-                event.tag_filter_payload_bytes,
+                event.tag_read_payload_bytes,
             ));
         }
         if queue.closed {
@@ -1240,7 +1343,7 @@ struct EventReservation<'a> {
     remaining: usize,
     curation_payload_bytes: usize,
     curation_update_count: usize,
-    tag_filter_payload_bytes: usize,
+    tag_read_payload_bytes: usize,
 }
 
 impl EventReservation<'_> {
@@ -1250,21 +1353,21 @@ impl EventReservation<'_> {
                 event,
                 self.curation_payload_bytes,
                 self.curation_update_count,
-                self.tag_filter_payload_bytes,
+                self.tag_read_payload_bytes,
             ),
             "catalog event capacity accounting invariant violated"
         );
         self.remaining = self.remaining.saturating_sub(1);
         self.curation_payload_bytes = 0;
         self.curation_update_count = 0;
-        self.tag_filter_payload_bytes = 0;
+        self.tag_read_payload_bytes = 0;
     }
 
     fn finish(self) {
         if self.remaining == 0
             && self.curation_payload_bytes == 0
             && self.curation_update_count == 0
-            && self.tag_filter_payload_bytes == 0
+            && self.tag_read_payload_bytes == 0
         {
             return;
         }
@@ -1279,9 +1382,9 @@ impl EventReservation<'_> {
         state.curation_update_count = state
             .curation_update_count
             .saturating_sub(self.curation_update_count);
-        state.tag_filter_payload_bytes = state
-            .tag_filter_payload_bytes
-            .saturating_sub(self.tag_filter_payload_bytes);
+        state.tag_read_payload_bytes = state
+            .tag_read_payload_bytes
+            .saturating_sub(self.tag_read_payload_bytes);
     }
 }
 
@@ -1320,6 +1423,9 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
             required_tags,
             ..
         } => validate_tag_filter_request(*expected_manifest_len, required_tags)?,
+        CatalogCommand::RequestDisplayLabels { relative_paths, .. } => {
+            validate_display_labels_request(relative_paths)?
+        }
         _ => {}
     }
     Ok(())
@@ -1361,6 +1467,72 @@ fn validate_tag_filter_request(
     checked_tag_filter_mask_words(expected_manifest_len)
         .map(|_| ())
         .map_err(CatalogSubmitError::InvalidTagFilterRequest)
+}
+
+fn validate_display_labels_request(relative_paths: &[PathBuf]) -> Result<(), CatalogSubmitError> {
+    if relative_paths.is_empty() {
+        return Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+            CatalogDisplayLabelsRequestError::Empty,
+        ));
+    }
+    if relative_paths.len() > wavecrate_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATHS {
+        return Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+            CatalogDisplayLabelsRequestError::TooManyPaths {
+                max: wavecrate_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATHS,
+                actual: relative_paths.len(),
+            },
+        ));
+    }
+    let raw_path_bytes = relative_paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(encoded_path_len(path))
+    });
+    if raw_path_bytes > wavecrate_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES {
+        return Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+            CatalogDisplayLabelsRequestError::PathBytesTooLarge {
+                max: wavecrate_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+                actual: raw_path_bytes,
+            },
+        ));
+    }
+    for path in relative_paths {
+        if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
+            return Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+                CatalogDisplayLabelsRequestError::InvalidPath {
+                    path: path.clone(),
+                    reason,
+                },
+            ));
+        }
+    }
+    let normalized_path_bytes = relative_paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(normalized_relative_path_len(path))
+    });
+    let path_bytes = raw_path_bytes.saturating_add(normalized_path_bytes);
+    if path_bytes > wavecrate_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES {
+        return Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+            CatalogDisplayLabelsRequestError::PathBytesTooLarge {
+                max: wavecrate_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+                actual: path_bytes,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_relative_path_len(path: &Path) -> usize {
+    let mut bytes = 0usize;
+    let mut has_component = false;
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        if has_component {
+            bytes = bytes.saturating_add(1);
+        }
+        bytes = bytes.saturating_add(part.as_encoded_bytes().len());
+        has_component = true;
+    }
+    bytes
 }
 
 fn checked_tag_filter_mask_words(
@@ -1493,6 +1665,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestTagPage { .. }
         | CatalogCommand::RequestTagFilter { .. }
+        | CatalogCommand::RequestDisplayLabels { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
         | CatalogCommand::ReadSnapshot { .. }
@@ -1549,6 +1722,9 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
                     .saturating_mul(std::mem::size_of::<String>()),
             )
         }
+        CatalogCommand::RequestDisplayLabels { relative_paths, .. } => {
+            selected_paths_input_bytes(relative_paths)
+        }
         _ => 0,
     }
 }
@@ -1564,19 +1740,21 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
     )
 }
 
-fn command_tag_filter_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
-    let CatalogCommand::RequestTagFilter {
-        expected_manifest_len,
-        ..
-    } = command
-    else {
-        return Ok(0);
-    };
-    let words = checked_tag_filter_mask_words(*expected_manifest_len)
-        .map_err(CatalogSubmitError::InvalidTagFilterRequest)?;
-    Ok(words
-        .saturating_mul(std::mem::size_of::<u64>())
-        .saturating_add(TAG_FILTER_PAYLOAD_METADATA_BYTES))
+fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
+    match command {
+        CatalogCommand::RequestTagFilter {
+            expected_manifest_len,
+            ..
+        } => {
+            let words = checked_tag_filter_mask_words(*expected_manifest_len)
+                .map_err(CatalogSubmitError::InvalidTagFilterRequest)?;
+            Ok(words
+                .saturating_mul(std::mem::size_of::<u64>())
+                .saturating_add(TAG_FILTER_PAYLOAD_METADATA_BYTES))
+        }
+        CatalogCommand::RequestDisplayLabels { .. } => Ok(MAX_DISPLAY_LABEL_PAYLOAD_BYTES),
+        _ => Ok(0),
+    }
 }
 
 #[derive(Clone)]
@@ -1589,6 +1767,7 @@ enum AdmissionAction {
     RequestWavMetadata,
     RequestTagPage,
     RequestTagFilter,
+    RequestDisplayLabels,
     ApplyCuration,
     ApplyCurationOperation {
         source_id: SourceId,
@@ -1621,6 +1800,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestTagPage { .. } => AdmissionAction::RequestTagPage,
         CatalogCommand::RequestTagFilter { .. } => AdmissionAction::RequestTagFilter,
+        CatalogCommand::RequestDisplayLabels { .. } => AdmissionAction::RequestDisplayLabels,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
             source_id,
@@ -1702,6 +1882,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         | AdmissionAction::RequestWavMetadata
         | AdmissionAction::RequestTagPage
         | AdmissionAction::RequestTagFilter
+        | AdmissionAction::RequestDisplayLabels
         | AdmissionAction::ApplyCuration
         | AdmissionAction::ReadSnapshot => {}
         AdmissionAction::ApplyCurationOperation {
@@ -1912,7 +2093,7 @@ impl CatalogService {
         let curation_payload_bytes = command_curation_payload_bytes(&command);
         let curation_update_count = command_curation_update_count(&command);
         let tag_page_input_bytes = command_tag_page_input_bytes(&command);
-        let tag_filter_payload_bytes = command_tag_filter_payload_bytes(&command)?;
+        let tag_read_payload_bytes = command_tag_read_payload_bytes(&command)?;
         if admission
             .tag_page_input_bytes
             .saturating_add(tag_page_input_bytes)
@@ -1935,8 +2116,8 @@ impl CatalogService {
             return Err(CatalogSubmitError::Full);
         }
         if admission
-            .tag_filter_payload_bytes
-            .saturating_add(tag_filter_payload_bytes)
+            .tag_read_payload_bytes
+            .saturating_add(tag_read_payload_bytes)
             > MAX_TAG_FILTER_PAYLOAD_BYTES
         {
             return Err(CatalogSubmitError::Full);
@@ -1944,9 +2125,9 @@ impl CatalogService {
         admission.tag_page_input_bytes = admission
             .tag_page_input_bytes
             .saturating_add(tag_page_input_bytes);
-        admission.tag_filter_payload_bytes = admission
-            .tag_filter_payload_bytes
-            .saturating_add(tag_filter_payload_bytes);
+        admission.tag_read_payload_bytes = admission
+            .tag_read_payload_bytes
+            .saturating_add(tag_read_payload_bytes);
         match self.commands.try_send(command) {
             Ok(()) => {
                 admission.event_budget += event_budget;
@@ -1959,18 +2140,18 @@ impl CatalogService {
                 admission.tag_page_input_bytes = admission
                     .tag_page_input_bytes
                     .saturating_sub(tag_page_input_bytes);
-                admission.tag_filter_payload_bytes = admission
-                    .tag_filter_payload_bytes
-                    .saturating_sub(tag_filter_payload_bytes);
+                admission.tag_read_payload_bytes = admission
+                    .tag_read_payload_bytes
+                    .saturating_sub(tag_read_payload_bytes);
                 Err(CatalogSubmitError::Full)
             }
             Err(TrySendError::Disconnected(_)) => {
                 admission.tag_page_input_bytes = admission
                     .tag_page_input_bytes
                     .saturating_sub(tag_page_input_bytes);
-                admission.tag_filter_payload_bytes = admission
-                    .tag_filter_payload_bytes
-                    .saturating_sub(tag_filter_payload_bytes);
+                admission.tag_read_payload_bytes = admission
+                    .tag_read_payload_bytes
+                    .saturating_sub(tag_read_payload_bytes);
                 admission.closed = true;
                 Err(CatalogSubmitError::Closed)
             }
@@ -1979,12 +2160,12 @@ impl CatalogService {
 
     /// Read the next worker event without blocking.
     pub fn try_recv_event(&self) -> Result<CatalogEvent, TryRecvError> {
-        let (event, curation_payload_bytes, curation_update_count, tag_filter_payload_bytes) =
+        let (event, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
             self.events.try_recv()?;
         self.release_event_credit(
             curation_payload_bytes,
             curation_update_count,
-            tag_filter_payload_bytes,
+            tag_read_payload_bytes,
         );
         Ok(event)
     }
@@ -1994,12 +2175,12 @@ impl CatalogService {
         &self,
         timeout: Duration,
     ) -> Result<CatalogEvent, mpsc::RecvTimeoutError> {
-        let (event, curation_payload_bytes, curation_update_count, tag_filter_payload_bytes) =
+        let (event, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
             self.events.recv_timeout(timeout)?;
         self.release_event_credit(
             curation_payload_bytes,
             curation_update_count,
-            tag_filter_payload_bytes,
+            tag_read_payload_bytes,
         );
         Ok(event)
     }
@@ -2008,7 +2189,7 @@ impl CatalogService {
         &self,
         curation_payload_bytes: usize,
         curation_update_count: usize,
-        tag_filter_payload_bytes: usize,
+        tag_read_payload_bytes: usize,
     ) {
         let mut admission = self
             .admission
@@ -2021,9 +2202,9 @@ impl CatalogService {
         admission.curation_update_count = admission
             .curation_update_count
             .saturating_sub(curation_update_count);
-        admission.tag_filter_payload_bytes = admission
-            .tag_filter_payload_bytes
-            .saturating_sub(tag_filter_payload_bytes);
+        admission.tag_read_payload_bytes = admission
+            .tag_read_payload_bytes
+            .saturating_sub(tag_read_payload_bytes);
     }
 
     /// Request cancellation and synchronously join the worker.
@@ -2107,8 +2288,8 @@ fn run_worker(
             remaining: reserved_events,
             curation_payload_bytes: command_curation_payload_bytes(&command),
             curation_update_count: command_curation_update_count(&command),
-            tag_filter_payload_bytes: command_tag_filter_payload_bytes(&command)
-                .expect("validated tag-filter command has a bounded mask"),
+            tag_read_payload_bytes: command_tag_read_payload_bytes(&command)
+                .expect("validated tag-read command has bounded output"),
         };
         if closing && !curation::is_durable(&command) {
             reservation.finish();
@@ -2269,6 +2450,26 @@ fn handle_command(
                 request_id,
                 expected_manifest_len,
                 required_tags,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::RequestDisplayLabels {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            relative_paths,
+        } => {
+            request_display_labels(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                relative_paths,
                 profile_guard,
                 reservation,
                 admission,
@@ -2530,6 +2731,96 @@ fn request_tag_filter(
             );
         }
         Err(error) => emit_tag_filter_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            Some(&token),
+            error,
+        ),
+    }
+}
+
+fn request_display_labels(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    relative_paths: Vec<PathBuf>,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let Some(current_generation) = sources
+        .get(&source_id)
+        .map(|source| source.lifecycle_generation)
+    else {
+        emit_display_labels_failure(
+            reservation,
+            admission,
+            source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            CatalogError::NotRegistered(source_id),
+        );
+        return;
+    };
+    if let Err(error) = ensure_generation(&source_id, current_generation, lifecycle_generation) {
+        emit_display_labels_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            error,
+        );
+        return;
+    }
+    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+        return;
+    };
+    let Some(source) = sources.get_mut(&source_id) else {
+        return;
+    };
+    source.attempt_token = Some(Arc::clone(&token));
+    let result = display_labels::read(
+        source,
+        &source_id,
+        lifecycle_generation,
+        expected_revision,
+        relative_paths,
+        &token,
+        admission,
+        profile_guard,
+    );
+    match result {
+        Ok(patch) => {
+            let _ = publish_if_current(
+                admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                Some(&token),
+                CatalogEvent::DisplayLabelsReady {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    root_identity: patch.root_identity,
+                    directory_generation: patch.directory_generation,
+                    revision: patch.revision,
+                    request_id,
+                    requested_paths: patch.requested_paths,
+                    entries: patch.entries,
+                },
+            );
+        }
+        Err(error) => emit_display_labels_failure(
             reservation,
             admission,
             source_id,
@@ -3703,8 +3994,43 @@ fn emit_tag_filter_failure(
     );
 }
 
+fn emit_display_labels_failure(
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    token: Option<&Arc<AtomicBool>>,
+    error: CatalogError,
+) {
+    let observed_revision = match &error {
+        CatalogError::StaleRevision { actual, .. } => Some(*actual),
+        _ => None,
+    };
+    let _ = publish_if_current(
+        admission,
+        reservation,
+        &source_id,
+        lifecycle_generation,
+        token,
+        CatalogEvent::DisplayLabelsFailed {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            observed_revision,
+            request_id,
+            error,
+        },
+    );
+}
+
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
     match error {
+        SourceDbError::Canceled => CatalogError::Canceled,
+        SourceDbError::DisplayLabelStaleRevision { expected, actual } => {
+            CatalogError::StaleRevision { expected, actual }
+        }
         SourceDbError::InvalidTagId { tag_id } => CatalogError::InvalidTagId { tag_id },
         SourceDbError::TagIdNotFound { tag_id } => CatalogError::TagIdNotFound { tag_id },
         error => CatalogError::Database(error.to_string()),
@@ -3832,6 +4158,21 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "tag-page input reservation was not released"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_tag_read_payload(service: &CatalogService, expected: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if admission_state(&service.admission, |state| state.tag_read_payload_bytes) == expected
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tag-read payload credit did not reach {expected}"
             );
             thread::yield_now();
         }
@@ -4547,9 +4888,7 @@ mod tests {
         let valid_tail = (1_u64 << (snapshot.manifest.len() % 64)) - 1;
         assert_eq!(mask[2] & !valid_tail, 0);
         assert_eq!(
-            admission_state(&service.admission, |state| {
-                state.tag_filter_payload_bytes
-            }),
+            admission_state(&service.admission, |state| { state.tag_read_payload_bytes }),
             0
         );
         service.shutdown();
@@ -4643,7 +4982,7 @@ mod tests {
                 .expect("bounded tag-filter payload admission");
         }
         assert_eq!(
-            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
             expected_payload * 7
         );
         assert_eq!(
@@ -4662,7 +5001,7 @@ mod tests {
             )
         });
         assert_eq!(
-            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
             expected_payload * 6
         );
         for request_id in 1_421..1_427 {
@@ -4677,7 +5016,7 @@ mod tests {
             });
         }
         assert_eq!(
-            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
             0
         );
         service.shutdown();
@@ -4726,7 +5065,7 @@ mod tests {
                 && observed_revision == snapshot.committed_revision
         ));
         assert_eq!(
-            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
             0
         );
         service.shutdown();
@@ -4752,7 +5091,7 @@ mod tests {
             })
             .expect("tag-filter admission");
         assert!(admission_state(&service.admission, |state| {
-            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+            state.tag_page_input_bytes > 0 && state.tag_read_payload_bytes > 0
         }));
         service
             .submit(CatalogCommand::Register {
@@ -4780,7 +5119,7 @@ mod tests {
         assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
         assert_eq!(
             admission_state(&service.admission, |state| {
-                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
             }),
             (0, 0)
         );
@@ -4807,7 +5146,7 @@ mod tests {
             })
             .expect("tag-filter admission");
         assert!(admission_state(&service.admission, |state| {
-            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+            state.tag_page_input_bytes > 0 && state.tag_read_payload_bytes > 0
         }));
         service
             .submit(CatalogCommand::Remove {
@@ -4829,7 +5168,7 @@ mod tests {
         assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
         assert_eq!(
             admission_state(&service.admission, |state| {
-                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
             }),
             (0, 0)
         );
@@ -4856,7 +5195,7 @@ mod tests {
             })
             .expect("tag-filter admission");
         assert!(admission_state(&service.admission, |state| {
-            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+            state.tag_page_input_bytes > 0 && state.tag_read_payload_bytes > 0
         }));
         let service = Arc::new(service);
         let shutdown_service = Arc::clone(&service);
@@ -4885,7 +5224,7 @@ mod tests {
         assert!(saw_closed);
         assert_eq!(
             admission_state(&service.admission, |state| {
-                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
             }),
             (0, 0)
         );
@@ -4934,7 +5273,7 @@ mod tests {
         ));
         assert_eq!(
             admission_state(&service.admission, |state| {
-                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
             }),
             (0, 0)
         );
@@ -4961,7 +5300,7 @@ mod tests {
             })
             .expect("tag-filter admission");
         assert!(admission_state(&service.admission, |state| {
-            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+            state.tag_page_input_bytes > 0 && state.tag_read_payload_bytes > 0
         }));
 
         let root = fixture.root.path().to_path_buf();
@@ -4994,7 +5333,7 @@ mod tests {
         wait_for_tag_page_input_release(&service);
         assert_eq!(
             admission_state(&service.admission, |state| {
-                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
             }),
             (0, 0)
         );
@@ -8404,6 +8743,411 @@ mod tests {
             1,
             WatchHintEvidence::DESCENDANT_CHANGED,
         ));
+    }
+
+    #[test]
+    fn bounded_display_labels_publish_ordered_fallback_and_fenced_output() {
+        let fixture = Fixture::new("catalog-display-labels-ready");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        write_test_wav(&fixture.root.path().join("empty.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-display-labels-ready");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let one =
+            RootRelativePath::try_from_path(PathBuf::from("one.wav")).expect("relative one path");
+        let receipt = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            9_100,
+            vec![
+                SourceCurationUpdate::AddTag {
+                    path: one.clone(),
+                    label: String::from("zulu"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: one.clone(),
+                    label: String::from("Alpha"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: one.clone(),
+                    label: String::from("loop"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: one,
+                    label: String::from("warm"),
+                },
+            ],
+        );
+        let revision = receipt.source_revision();
+        let requested_paths = vec![PathBuf::from("one.wav"), PathBuf::from("empty.wav")];
+        service
+            .submit(CatalogCommand::RequestDisplayLabels {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 9_101,
+                relative_paths: requested_paths.clone(),
+            })
+            .expect("display-label request");
+        wait_for_tag_read_payload(&service, MAX_DISPLAY_LABEL_PAYLOAD_BYTES);
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::DisplayLabelsReady {
+                    request_id: 9_101,
+                    ..
+                }
+            )
+        });
+        match event {
+            CatalogEvent::DisplayLabelsReady {
+                source_id: event_source,
+                lifecycle_generation,
+                root_identity,
+                directory_generation,
+                revision: event_revision,
+                request_id: 9_101,
+                requested_paths: received_paths,
+                entries,
+            } => {
+                assert_eq!(event_source, source_id);
+                assert_eq!(lifecycle_generation, 1);
+                assert_eq!(root_identity, snapshot.root_identity);
+                assert_eq!(directory_generation, snapshot.directory_generation);
+                assert_eq!(event_revision, revision);
+                assert_eq!(received_paths, requested_paths);
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].relative_path, Path::new("empty.wav"));
+                assert_eq!(entries[0].display_label, None);
+                assert!(!entries[0].truncated);
+                assert_eq!(entries[1].relative_path, Path::new("one.wav"));
+                assert_eq!(
+                    entries[1].display_label.as_deref(),
+                    Some("Alpha_loop_warm_zulu")
+                );
+                assert!(!entries[1].truncated);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn display_labels_admission_rejects_empty_invalid_and_overlarge_paths() {
+        let fixture = Fixture::new("catalog-display-labels-admission");
+        let source_id = SourceId::from_string("source-display-labels-admission");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let request = |relative_paths| CatalogCommand::RequestDisplayLabels {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: 0,
+            request_id: 9_110,
+            relative_paths,
+        };
+
+        assert_eq!(
+            service.submit(request(Vec::new())),
+            Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+                CatalogDisplayLabelsRequestError::Empty
+            ))
+        );
+        let too_many = (0..=SOURCE_DISPLAY_LABEL_MAX_PATHS)
+            .map(|index| PathBuf::from(format!("{index}.wav")))
+            .collect();
+        assert!(matches!(
+            service.submit(request(too_many)),
+            Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+                CatalogDisplayLabelsRequestError::TooManyPaths { .. }
+            ))
+        ));
+        let too_many_bytes = vec![PathBuf::from(
+            "x".repeat(SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES + 1),
+        )];
+        assert!(matches!(
+            service.submit(request(too_many_bytes)),
+            Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+                CatalogDisplayLabelsRequestError::PathBytesTooLarge { .. }
+            ))
+        ));
+        let combined_bytes = vec![PathBuf::from(format!(
+            "{}/./y",
+            "x".repeat(SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES / 2)
+        ))];
+        assert!(matches!(
+            service.submit(request(combined_bytes)),
+            Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+                CatalogDisplayLabelsRequestError::PathBytesTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(request(vec![PathBuf::from("../escape.wav")])),
+            Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
+                CatalogDisplayLabelsRequestError::InvalidPath {
+                    reason: wavecrate_library::sample_sources::reconciliation::RootRelativePathError::ParentTraversal,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
+            }),
+            (0, 0)
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn display_labels_stale_revision_reports_observed_revision() {
+        let fixture = Fixture::new("catalog-display-labels-stale");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-display-labels-stale");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let expected_revision = snapshot.committed_revision + 1;
+        service
+            .submit(CatalogCommand::RequestDisplayLabels {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision,
+                request_id: 9_120,
+                relative_paths: vec![PathBuf::from("one.wav")],
+            })
+            .expect("stale display-label request");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::DisplayLabelsFailed {
+                    request_id: 9_120,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::DisplayLabelsFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                expected_revision: received_expected,
+                observed_revision: Some(observed),
+                request_id: 9_120,
+                error: CatalogError::StaleRevision { expected, actual },
+            } if event_source == source_id
+                && received_expected == expected_revision
+                && expected == expected_revision
+                && observed == snapshot.committed_revision
+                && actual == snapshot.committed_revision
+        ));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn display_labels_reject_absent_and_unsupported_snapshot_paths() {
+        let fixture = Fixture::new("catalog-display-labels-path-fence");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        fs::write(fixture.root.path().join("notes.txt"), b"not audio").expect("notes file");
+        let source_id = SourceId::from_string("source-display-labels-path-fence");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        for (request_id, path) in [(9_130, "missing.wav"), (9_131, "notes.txt")] {
+            service
+                .submit(CatalogCommand::RequestDisplayLabels {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    expected_revision: snapshot.committed_revision,
+                    request_id,
+                    relative_paths: vec![PathBuf::from(path)],
+                })
+                .expect("path-fenced display-label request");
+            let event = receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::DisplayLabelsFailed {
+                        request_id: received,
+                        ..
+                    } if *received == request_id
+                )
+            });
+            assert!(matches!(
+                event,
+                CatalogEvent::DisplayLabelsFailed {
+                    source_id: event_source,
+                    error: CatalogError::DisplayLabelPathMissing {
+                        source_id: error_source,
+                        path: error_path,
+                    },
+                    ..
+                } if event_source == source_id
+                    && error_source == source_id
+                    && error_path == Path::new(path)
+            ));
+        }
+        service.shutdown();
+    }
+
+    #[test]
+    fn display_labels_root_replacement_fails_closed_before_publication() {
+        let fixture = Fixture::new("catalog-display-labels-root-replacement");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-display-labels-root-replacement");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestDisplayLabels {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 9_140,
+                relative_paths: vec![PathBuf::from("one.wav")],
+            })
+            .expect("display-label request");
+
+        let root = fixture.root.path().to_path_buf();
+        let displaced_root = root.with_extension("old");
+        assert!(!displaced_root.exists());
+        fs::rename(&root, &displaced_root).expect("displace source root");
+        fs::create_dir(&root).expect("replace source root");
+        pause.release();
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::DisplayLabelsFailed {
+                    request_id: 9_140,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::DisplayLabelsFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            } if event_source == source_id
+        ));
+        wait_for_tag_page_input_release(&service);
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+        fs::remove_dir_all(displaced_root).expect("remove displaced source root");
+    }
+
+    #[test]
+    fn superseded_display_labels_are_discarded_and_release_credits() {
+        let fixture = Fixture::new("catalog-display-labels-superseded");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-display-labels-superseded");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestDisplayLabels {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 9_150,
+                relative_paths: vec![PathBuf::from("one.wav")],
+            })
+            .expect("display-label request");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("replacement admission");
+        pause.release();
+
+        let _ = receive_until(&service, |event| {
+            assert!(
+                !matches!(
+                    event,
+                    CatalogEvent::DisplayLabelsReady { .. }
+                        | CatalogEvent::DisplayLabelsFailed { .. }
+                ),
+                "superseded display-label request published an event: {event:?}"
+            );
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: event_source,
+                    lifecycle_generation: 2,
+                } if event_source == &source_id
+            )
+        });
+        let _ = receive_until(&service, |event| {
+            assert!(
+                !matches!(
+                    event,
+                    CatalogEvent::DisplayLabelsReady { .. }
+                        | CatalogEvent::DisplayLabelsFailed { .. }
+                ),
+                "superseded display-label request published an event: {event:?}"
+            );
+            matches!(
+                event,
+                CatalogEvent::SnapshotReady { snapshot: received }
+                    if received.source_id == source_id && received.lifecycle_generation == 2
+            )
+        });
+        wait_for_tag_page_input_release(&service);
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn display_labels_submit_rejection_releases_shared_payload_credit() {
+        let fixture = Fixture::new("catalog-display-labels-submit-rejection");
+        let source_id = SourceId::from_string("source-display-labels-submit-rejection");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let pause = test_gate.pause_next();
+        let request = |request_id| CatalogCommand::RequestDisplayLabels {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: 0,
+            request_id,
+            relative_paths: vec![PathBuf::from("one.wav")],
+        };
+        for request_id in 0..COMMAND_CAPACITY {
+            service
+                .submit(request(9_160 + request_id as u64))
+                .expect("bounded display-label admission");
+        }
+        assert_eq!(
+            service.submit(request(9_200)),
+            Err(CatalogSubmitError::Full)
+        );
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            MAX_DISPLAY_LABEL_PAYLOAD_BYTES * COMMAND_CAPACITY
+        );
+        pause.release();
+        wait_for_tag_page_input_release(&service);
+        wait_for_tag_read_payload(&service, 0);
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
     }
 
     #[test]

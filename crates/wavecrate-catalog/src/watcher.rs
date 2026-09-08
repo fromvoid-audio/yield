@@ -306,7 +306,7 @@ pub(super) fn run_watcher_idle_work(
         remaining: 1,
         curation_payload_bytes: 0,
         curation_update_count: 0,
-        tag_filter_payload_bytes: 0,
+        tag_read_payload_bytes: 0,
     };
     let disposition = request_audit(
         source_id.clone(),
