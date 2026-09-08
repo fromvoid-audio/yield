@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use gpui::{ClickEvent, Context, div, prelude::*, px};
+use gpui::{ClickEvent, Context, ScrollStrategy, div, prelude::*, px};
 use wavecrate_core::{
-    AudioFile, AudioFileCuration, COLLECTION_COUNT, CurationAction, CurationTransition,
-    RATING_FILTER_LEVELS, RatingFilter, plan_curation_action,
+    AudioFile, AudioFileCuration, AudioFileId, COLLECTION_COUNT, CurationAction,
+    CurationTransition, RATING_FILTER_LEVELS, RatingFilter, plan_curation_action,
 };
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{
@@ -1167,14 +1167,18 @@ impl Browser {
                     && context.lifecycle_generation == key.lifecycle_generation
             })
             .map(|context| context.entry_indices);
-        let (collection_changed, filter_membership_changed, rating_filter_membership_changed) =
-            patch_visible_entries(
-                &mut self.entries,
-                patches,
-                collection_filter,
-                rating_filter,
-                entry_indices.as_deref(),
-            );
+        let (
+            collection_changed,
+            filter_membership_changed,
+            rating_filter_membership_changed,
+            last_played_changed,
+        ) = patch_visible_entries(
+            &mut self.entries,
+            patches,
+            collection_filter,
+            rating_filter,
+            entry_indices.as_deref(),
+        );
         patch_visible_entries(
             &mut self.source_sessions[active_index].entries,
             patches,
@@ -1187,13 +1191,39 @@ impl Browser {
         }
         if sort_column == wavecrate_core::SortColumn::Rating
             || sort_column == wavecrate_core::SortColumn::Collection
+            || (sort_column == wavecrate_core::SortColumn::LastPlayed && last_played_changed)
             || filter_membership_changed
             || rating_filter_membership_changed
         {
             self.view_model.set_entries(&self.entries);
             self.reconcile_selection();
-            self.restore_projection_focus(previous_id, previous_position, cx);
+            self.restore_metadata_projection_focus(previous_id, previous_position, cx);
         }
+    }
+
+    fn restore_metadata_projection_focus(
+        &mut self,
+        previous_id: Option<AudioFileId>,
+        previous_position: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let focused_position = previous_id
+            .as_ref()
+            .and_then(|id| self.view_model.visible_position_for(id));
+        if should_retain_passive_browser_focus(
+            self.browser_focus_override.as_ref(),
+            previous_id.as_ref(),
+            focused_position.is_some(),
+        ) {
+            if let Some(position) = focused_position {
+                self.list_scroll_handle
+                    .scroll_to_item(position, ScrollStrategy::Center);
+            }
+            cx.notify();
+            return;
+        }
+        self.browser_focus_override = None;
+        self.restore_projection_focus(previous_id, previous_position, cx);
     }
 
     /// Consume a compound catalog outcome before active-source event filtering.
@@ -1304,10 +1334,11 @@ fn patch_visible_entries(
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
     entry_indices: Option<&HashMap<PathBuf, usize>>,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
     let mut collection_changed = false;
     let mut filter_membership_changed = false;
     let mut rating_filter_membership_changed = false;
+    let mut last_played_changed = false;
     for (path, curation) in patches {
         let index = match entry_indices {
             Some(indices) => indices.get(path).copied(),
@@ -1331,12 +1362,15 @@ fn patch_visible_entries(
         });
         rating_filter_membership_changed |= curation_matches_rating_filter(rating_filter, previous)
             != curation_matches_rating_filter(rating_filter, Some(*curation));
+        last_played_changed |=
+            previous.and_then(AudioFileCuration::last_played_at) != curation.last_played_at();
         entry.curation = Some(*curation);
     }
     (
         collection_changed,
         filter_membership_changed,
         rating_filter_membership_changed,
+        last_played_changed,
     )
 }
 
@@ -1345,6 +1379,16 @@ fn curation_matches_rating_filter(
     curation: Option<AudioFileCuration>,
 ) -> bool {
     filter.is_disabled() || curation.is_some_and(|curation| filter.matches(curation.rating()))
+}
+
+fn should_retain_passive_browser_focus(
+    browser_focus_override: Option<&AudioFileId>,
+    previous_focus_id: Option<&AudioFileId>,
+    focused_row_visible: bool,
+) -> bool {
+    focused_row_visible
+        && browser_focus_override.is_some()
+        && browser_focus_override == previous_focus_id
 }
 
 #[cfg(test)]
@@ -1758,17 +1802,22 @@ mod tests {
         let alpha = PathBuf::from("alpha.wav");
         let changed_alpha = curation(1, false, 0b0000_0001);
         let patches = BTreeMap::from([(alpha.clone(), changed_alpha)]);
-        let (collection_changed, collection_membership_changed, rating_membership_changed) =
-            patch_visible_entries(
-                &mut entries,
-                &patches,
-                model.collection_filter(),
-                model.rating_filter(),
-                None,
-            );
+        let (
+            collection_changed,
+            collection_membership_changed,
+            rating_membership_changed,
+            last_played_changed,
+        ) = patch_visible_entries(
+            &mut entries,
+            &patches,
+            model.collection_filter(),
+            model.rating_filter(),
+            None,
+        );
         assert!(!collection_changed);
         assert!(!collection_membership_changed);
         assert!(rating_membership_changed);
+        assert!(!last_played_changed);
         assert_eq!(entries[0].curation, Some(changed_alpha));
 
         model.set_entries(&entries);
@@ -1784,7 +1833,7 @@ mod tests {
 
         let restored_alpha = curation(0, false, 0b0000_0001);
         let patches = BTreeMap::from([(alpha, restored_alpha)]);
-        let (_, _, rating_membership_changed) = patch_visible_entries(
+        let (_, _, rating_membership_changed, last_played_changed) = patch_visible_entries(
             &mut entries,
             &patches,
             model.collection_filter(),
@@ -1792,6 +1841,7 @@ mod tests {
             None,
         );
         assert!(rating_membership_changed);
+        assert!(!last_played_changed);
         model.set_entries(&entries);
         assert_eq!(
             model
@@ -1802,5 +1852,68 @@ mod tests {
             vec![0, 1]
         );
         assert_eq!(model.collection_counts(&entries), [1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn last_played_curation_patch_reorders_history_sorted_projection() {
+        let mut entries = vec![
+            entry("alpha.wav", 0, false, 0),
+            entry("bravo.wav", 0, false, 0),
+        ];
+        entries[0].curation = AudioFileCuration::from_parts(0, false, 0, Some(1), None);
+        entries[1].curation = AudioFileCuration::from_parts(0, false, 0, Some(2), None);
+        let mut model = BrowserViewModel::new(&entries);
+        model.toggle_sort(&entries, wavecrate_core::SortColumn::LastPlayed);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        let alpha = PathBuf::from("alpha.wav");
+        let updated_alpha =
+            AudioFileCuration::from_parts(0, false, 0, Some(3), None).expect("valid curation");
+        let patches = BTreeMap::from([(alpha, updated_alpha)]);
+        let (_, _, _, last_played_changed) =
+            patch_visible_entries(&mut entries, &patches, None, RatingFilter::disabled(), None);
+        assert!(last_played_changed);
+        model.set_entries(&entries);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn metadata_reprojection_retains_passive_focus_only_while_visible() {
+        let passive = entry("passive.wav", 0, false, 0).stable_id();
+        let loaded = entry("loaded.wav", 0, false, 0).stable_id();
+        assert!(should_retain_passive_browser_focus(
+            Some(&passive),
+            Some(&passive),
+            true
+        ));
+        assert!(!should_retain_passive_browser_focus(
+            Some(&passive),
+            Some(&passive),
+            false
+        ));
+        assert!(!should_retain_passive_browser_focus(
+            Some(&passive),
+            Some(&loaded),
+            true
+        ));
+        assert!(!should_retain_passive_browser_focus(
+            None,
+            Some(&passive),
+            true
+        ));
     }
 }

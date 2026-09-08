@@ -1029,3 +1029,23 @@ strengthened. Catalog compilation verifies a static bound covering the command,
 receipt row, and fixed collection storage within the existing row allowance.
 Playback admission/debounce and shutdown integration remain separate work; this
 backend API alone does not yet record audition history automatically.
+
+### Last Played column and metadata-sort focus
+
+The browser displays Last Played from catalog timestamps using Never, Today,
+1 day, and elapsed-day labels. Ascending sort places recent listens first and
+never-played rows last, with deterministic name/path ties. Formatting and sorting
+use explicit clock samples with bounded negative/future/overflow handling;
+unavailable curation metadata displays a dash rather than asserting Never.
+
+The new theme width has a backward-compatible default. The column appears only
+when the window can retain the existing sample-name width allowance, so previously
+valid wide-sidebar themes remain valid. Duration remains available. Metadata
+re-sorting preserves a passive context-row focus independently of the loaded
+preview when that row remains visible; it does not switch playing files merely
+because browser focus and preview differ.
+
+Validation: 61 core tests, 20 design tests, 15 UI curation tests, six context-menu
+tests, one responsive-layout test, the UI package check, formatting, and diff
+checks passed. Native visual acceptance remains pending while open apps are left
+untouched. Automatic playback timestamp recording follows as a separate slice.

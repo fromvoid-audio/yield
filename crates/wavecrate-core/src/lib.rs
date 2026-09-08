@@ -4,9 +4,11 @@
 //! Pure browser data types and projection logic for the GPUI application.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod curation;
 mod folder_tree;
+mod last_played;
 mod playback_history;
 mod rating;
 mod rating_filter;
@@ -17,6 +19,9 @@ mod waveform_viewport;
 pub use curation::{CurationAction, CurationTransition, plan_curation_action};
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
+};
+pub use last_played::{
+    SECONDS_PER_DAY, format_last_played, last_played_age_seconds, last_played_sort_key,
 };
 pub use playback_history::{
     PLAYBACK_NAVIGATION_HISTORY_LIMIT, PlaybackHistoryEntry, PlaybackNavigationHistory,
@@ -162,6 +167,8 @@ pub enum SortColumn {
     Rating,
     /// Order by the first assigned collection slot.
     Collection,
+    /// Order by elapsed time since the catalog last recorded playback.
+    LastPlayed,
 }
 
 /// Direction used by a browser sort.
@@ -404,6 +411,10 @@ impl BrowserViewModel {
     }
 
     fn rebuild(&mut self, entries: &[AudioFile]) {
+        self.rebuild_with_now(entries, current_unix_epoch_seconds());
+    }
+
+    fn rebuild_with_now(&mut self, entries: &[AudioFile], now_epoch_seconds: i64) {
         let query = self.query.trim().to_ascii_lowercase();
         let mut projected = entries
             .iter()
@@ -428,6 +439,10 @@ impl BrowserViewModel {
                     entry.byte_len,
                     entry.curation.map(|curation| curation.rating().value()),
                     entry.curation.and_then(AudioFileCuration::first_collection),
+                    last_played_sort_key(
+                        entry.curation.and_then(AudioFileCuration::last_played_at),
+                        now_epoch_seconds,
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -438,6 +453,7 @@ impl BrowserViewModel {
                 SortColumn::Extension => left.3.cmp(&right.3),
                 SortColumn::Rating => left.5.cmp(&right.5),
                 SortColumn::Collection => left.6.cmp(&right.6),
+                SortColumn::LastPlayed => left.7.cmp(&right.7),
             }
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.1.path().cmp(right.1.path()));
@@ -448,7 +464,7 @@ impl BrowserViewModel {
         });
         self.rows = projected
             .into_iter()
-            .map(|(entry_index, id, _, _, _, _, _)| BrowserRow { entry_index, id })
+            .map(|(entry_index, id, _, _, _, _, _, _)| BrowserRow { entry_index, id })
             .collect();
     }
 
@@ -463,6 +479,13 @@ impl BrowserViewModel {
             || entry
                 .curation
                 .is_some_and(|curation| self.rating_filter.matches(curation.rating()))
+    }
+}
+
+fn current_unix_epoch_seconds() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
     }
 }
 
@@ -844,6 +867,72 @@ mod tests {
                 .map(|row| row.entry_index)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn last_played_sort_is_recent_first_with_deterministic_ties_and_nulls() {
+        const NOW: i64 = 1_700_000_000;
+        let curation =
+            |last_played_at| AudioFileCuration::from_parts(0, false, 0, last_played_at, None);
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/z/alpha.wav"),
+                relative_path: PathBuf::from("z/alpha.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: curation(Some(NOW - 2 * SECONDS_PER_DAY as i64)),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/a/alpha.wav"),
+                relative_path: PathBuf::from("a/alpha.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: curation(Some(NOW - 2 * SECONDS_PER_DAY as i64)),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/recent.wav"),
+                relative_path: PathBuf::from("recent.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: curation(Some(NOW - 1)),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/never.wav"),
+                relative_path: PathBuf::from("never.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: curation(None),
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.sort = SortSpec {
+            column: SortColumn::LastPlayed,
+            direction: SortDirection::Ascending,
+        };
+        model.rebuild_with_now(&entries, NOW);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0, 3]
+        );
+
+        model.sort.direction = SortDirection::Descending;
+        model.rebuild_with_now(&entries, NOW);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![3, 0, 1, 2]
         );
     }
 

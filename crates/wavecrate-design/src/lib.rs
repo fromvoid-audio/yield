@@ -168,6 +168,10 @@ fn default_collection_column_width() -> f32 {
     72.0
 }
 
+fn default_last_played_column_width() -> f32 {
+    112.0
+}
+
 /// Semantic colors used by the Wavecrate application.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -295,6 +299,9 @@ pub struct Spacing {
     pub size_column_width: f32,
     /// Duration column width in the sample browser.
     pub duration_column_width: f32,
+    /// Last-played column width in the sample browser.
+    #[serde(default = "default_last_played_column_width")]
+    pub last_played_column_width: f32,
     /// Waveform bar gap.
     pub waveform_bar_gap: f32,
     /// Minimum waveform bar height.
@@ -415,6 +422,7 @@ impl Default for Theme {
                 extension_column_width: 64.0,
                 size_column_width: 88.0,
                 duration_column_width: 88.0,
+                last_played_column_width: default_last_played_column_width(),
                 waveform_bar_gap: 1.0,
                 waveform_min_bar_height: 3.0,
             },
@@ -663,6 +671,12 @@ pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         240.0,
     )?;
     finite_range(
+        "spacing.last_played_column_width",
+        theme.spacing.last_played_column_width,
+        32.0,
+        240.0,
+    )?;
+    finite_range(
         "spacing.waveform_bar_gap",
         theme.spacing.waveform_bar_gap,
         0.0,
@@ -823,6 +837,10 @@ mod tests {
             theme.spacing.collection_column_width,
             default_collection_column_width()
         );
+        assert_eq!(
+            theme.spacing.last_played_column_width,
+            default_last_played_column_width()
+        );
     }
 
     #[test]
@@ -863,6 +881,7 @@ mod tests {
             .expect("spacing object");
         spacing.remove("rating_column_width");
         spacing.remove("collection_column_width");
+        spacing.remove("last_played_column_width");
         let legacy = serde_json::to_string(&legacy).expect("legacy theme serializes");
 
         let theme = parse_theme_json(&legacy).expect("legacy theme validates");
@@ -881,6 +900,10 @@ mod tests {
             theme.spacing.collection_column_width,
             default_collection_column_width()
         );
+        assert_eq!(
+            theme.spacing.last_played_column_width,
+            default_last_played_column_width()
+        );
     }
 
     #[test]
@@ -894,6 +917,7 @@ mod tests {
             .expect("spacing object");
         spacing.remove("rating_column_width");
         spacing.remove("collection_column_width");
+        spacing.remove("last_played_column_width");
         // The pre-curation fixed columns total exactly 640px. The additive defaults therefore
         // leave the compatibility 192px name-column budget at the 960px minimum window.
         spacing.insert("sidebar_width".to_string(), serde_json::Value::from(398.0));
@@ -903,6 +927,7 @@ mod tests {
 
         assert_eq!(theme.spacing.rating_column_width, 56.0);
         assert_eq!(theme.spacing.collection_column_width, 72.0);
+        assert_eq!(theme.spacing.last_played_column_width, 112.0);
     }
 
     #[test]

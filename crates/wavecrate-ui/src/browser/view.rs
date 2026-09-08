@@ -7,7 +7,8 @@ use gpui::{
     ClickEvent, Context, Div, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
     Window, div, font, prelude::*, px, uniform_list,
 };
-use wavecrate_core::{SortColumn, SortDirection, format_duration};
+use std::time::{SystemTime, UNIX_EPOCH};
+use wavecrate_core::{SortColumn, SortDirection, format_duration, format_last_played};
 use wavecrate_design::Theme;
 
 use crate::theme::{active, color, transparent};
@@ -29,6 +30,31 @@ fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn current_unix_epoch_seconds() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+const MIN_SAMPLE_NAME_WIDTH: f32 = 192.0;
+
+fn last_played_column_min_window_width(theme: &Theme) -> f32 {
+    theme.spacing.sidebar_width
+        + theme.spacing.selected_marker_width
+        + theme.spacing.rating_column_width
+        + theme.spacing.collection_column_width
+        + theme.spacing.extension_column_width
+        + theme.spacing.size_column_width
+        + theme.spacing.duration_column_width
+        + theme.spacing.last_played_column_width
+        + MIN_SAMPLE_NAME_WIDTH
+}
+
+fn last_played_column_visible(window_width: f32, theme: &Theme) -> bool {
+    window_width.is_finite() && window_width >= last_played_column_min_window_width(theme)
 }
 
 impl Browser {
@@ -385,8 +411,12 @@ impl Render for Browser {
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
+        let last_played_width = theme.spacing.last_played_column_width;
         let rating_width = theme.spacing.rating_column_width;
         let collection_width = theme.spacing.collection_column_width;
+        let now_epoch_seconds = current_unix_epoch_seconds();
+        let show_last_played =
+            last_played_column_visible(f32::from(window.bounds().size.width), &theme);
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
         if self.view_model.rows().is_empty()
@@ -460,6 +490,17 @@ impl Render for Browser {
                                             .unwrap_or_default();
                                         let size = format_file_size(entry.byte_len);
                                         let duration = format_duration(entry.duration_seconds);
+                                        let last_played = show_last_played.then(|| {
+                                            entry
+                                                .curation
+                                                .map(|curation| {
+                                                    format_last_played(
+                                                        curation.last_played_at(),
+                                                        now_epoch_seconds,
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| "—".to_string())
+                                        });
                                         let hover_fill =
                                             color(list_theme.colors.selection_hover_fill);
                                         let pressed_fill =
@@ -567,22 +608,34 @@ impl Render for Browser {
                                                     .text_color(color(list_theme.colors.text_muted))
                                                     .child(duration),
                                             )
-                                            .child(
+                                            ;
+                                        let sample_row = if let Some(last_played) = last_played {
+                                            sample_row.child(
                                                 div()
-                                                    .absolute()
-                                                    .top_0()
-                                                    .bottom_0()
-                                                    .right_0()
-                                                    .w(px(super::motion::HOVER_RAIL_WIDTH))
-                                                    .bg(super::motion::with_alpha(
-                                                        list_theme.interaction.focus_outline,
-                                                        super::motion::HOVER_RAIL_ALPHA,
-                                                    ))
-                                                    .opacity(0.0)
-                                                    .group_hover(row_group, |style| {
-                                                        style.opacity(1.0)
-                                                    }),
-                                            );
+                                                    .flex_none()
+                                                    .w(px(last_played_width))
+                                                    .px(px(list_theme.spacing.control_gap))
+                                                    .text_size(px(list_theme.typography.small_size))
+                                                    .text_color(color(list_theme.colors.text_muted))
+                                                    .child(last_played),
+                                            )
+                                        } else {
+                                            sample_row
+                                        };
+                                        let sample_row = sample_row.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .right_0()
+                                                .w(px(super::motion::HOVER_RAIL_WIDTH))
+                                                .bg(super::motion::with_alpha(
+                                                    list_theme.interaction.focus_outline,
+                                                    super::motion::HOVER_RAIL_ALPHA,
+                                                ))
+                                                .opacity(0.0)
+                                                .group_hover(row_group, |style| style.opacity(1.0)),
+                                        );
                                         if focused {
                                             sample_row.child(
                                                 div()
@@ -880,8 +933,8 @@ impl Render for Browser {
                                     .flex_1()
                                     .h_full()
                                     .bg(color(theme.colors.surface))
-                                    .child(
-                                        div()
+                                    .child({
+                                        let mut column_header = div()
                                             .flex()
                                             .flex_none()
                                             .items_center()
@@ -947,8 +1000,20 @@ impl Render for Browser {
                                                     .text_size(px(theme.typography.small_size))
                                                     .text_color(color(theme.colors.text_muted))
                                                     .child("Duration"),
-                                            ),
-                                    )
+                                            );
+                                        if show_last_played {
+                                            column_header =
+                                                column_header.child(self.render_column_header(
+                                                    "Last Played",
+                                                    SortColumn::LastPlayed,
+                                                    theme.clone(),
+                                                    cx,
+                                                    Some(last_played_width),
+                                                    theme.spacing.control_gap,
+                                                ));
+                                        }
+                                        column_header
+                                    })
                                     .child(list),
                             ),
                     ),
@@ -1012,5 +1077,27 @@ impl Render for Browser {
             .when(self.context_menu.is_some(), |element| {
                 element.child(context_menu::render_overlay(self, &theme, cx))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_played_column_reserves_name_space_responsively() {
+        let theme = Theme::default();
+        let required_width = last_played_column_min_window_width(&theme);
+        assert!(last_played_column_visible(required_width, &theme));
+        assert!(!last_played_column_visible(required_width - 0.1, &theme));
+
+        let mut legacy_theme = theme.clone();
+        legacy_theme.spacing.sidebar_width = 398.0;
+        assert!(!last_played_column_visible(960.0, &legacy_theme));
+        assert!(last_played_column_visible(
+            last_played_column_min_window_width(&legacy_theme),
+            &legacy_theme
+        ));
+        assert!(!last_played_column_visible(f32::NAN, &theme));
     }
 }
