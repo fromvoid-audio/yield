@@ -26,6 +26,7 @@ use super::shortcut_help;
 use super::tag_filter;
 use super::volume;
 use super::waveform;
+use super::zero_crossing;
 
 fn format_file_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
@@ -475,6 +476,7 @@ impl Render for Browser {
         let selected_count = self.selected_count_label();
         let metadata_status = self.catalog_metadata.status_label();
         let display_labels_status = self.display_labels.status_label();
+        let zero_crossing_status = self.zero_crossing.status_label();
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
@@ -493,6 +495,12 @@ impl Render for Browser {
         let loop_label = self.loop_toolbar_label();
         let bpm_snap_enabled = self.bpm_snap_enabled;
         let bpm_snap_color = color(if bpm_snap_enabled {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
+        let zero_crossing_enabled = self.zero_crossing.enabled();
+        let zero_crossing_color = color(if zero_crossing_enabled {
             theme.colors.accent
         } else {
             theme.colors.text_muted
@@ -997,6 +1005,27 @@ impl Render for Browser {
                     )
                     .child(
                         div()
+                            .id("zero-crossing-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(zero_crossing::tooltip)
+                            })
+                            .on_click(cx.listener(Self::toggle_zero_crossing_from_toolbar))
+                            .child(zero_crossing::render_icon(zero_crossing_color)),
+                    )
+                    .child(
+                        div()
                             .id("beat-guides-toolbar")
                             .flex_none()
                             .flex()
@@ -1343,6 +1372,9 @@ impl Render for Browser {
                     })
                     .when(display_labels_status.is_some(), move |element| {
                         element.child(display_labels_status.clone().unwrap_or_default())
+                    })
+                    .when(zero_crossing_status.is_some(), move |element| {
+                        element.child(zero_crossing_status.unwrap_or_default())
                     })
                     .when(selected_count.is_some(), move |element| {
                         element.child(selected_count.unwrap_or_default())

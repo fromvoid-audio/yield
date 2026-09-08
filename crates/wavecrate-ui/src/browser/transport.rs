@@ -524,6 +524,8 @@ impl Browser {
         intent: PlaybackIntent,
         cx: &mut Context<Self>,
     ) {
+        super::zero_crossing::cancel_for_interruption(self);
+        self.zero_crossing_queued = None;
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
             self.playback_status = "Invalid playback position".to_string();
@@ -705,6 +707,8 @@ impl Browser {
     }
 
     pub(super) fn stop_playback(&mut self) {
+        super::zero_crossing::cancel_for_interruption(self);
+        self.zero_crossing_queued = None;
         self.cancel_normalized_audition();
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.playback_monitor_generation = self.playback_monitor_generation.wrapping_add(1);

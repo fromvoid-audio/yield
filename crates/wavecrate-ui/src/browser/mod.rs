@@ -63,6 +63,7 @@ mod volume;
 mod waveform;
 mod waveform_detail;
 mod waveform_scrollbar;
+mod zero_crossing;
 
 /// Install the app-owned source registry and its application-quit shutdown observer.
 pub(crate) fn install_source_registry(cx: &mut App) {
@@ -260,6 +261,7 @@ pub(crate) struct Browser {
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
     waveform_detail: waveform_detail::WaveformDetailState,
+    zero_crossing: zero_crossing::ZeroCrossingState,
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
@@ -323,6 +325,8 @@ pub(crate) struct Browser {
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
+    zero_crossing_task: Option<Task<()>>,
+    zero_crossing_queued: Option<zero_crossing::ZeroCrossingIntent>,
     normalized_audition_task: Option<Task<()>>,
     normalized_audition_queued: Option<normalized_audition::PendingNormalizedAudition>,
     normalized_audition_deferred_play: Option<normalized_audition::PendingNormalizedAudition>,
@@ -470,6 +474,7 @@ impl Browser {
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
             waveform_detail: waveform_detail::WaveformDetailState::default(),
+            zero_crossing: zero_crossing::ZeroCrossingState::default(),
             bpm_snap_enabled: false,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
@@ -533,6 +538,8 @@ impl Browser {
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
             waveform_task: None,
+            zero_crossing_task: None,
+            zero_crossing_queued: None,
             normalized_audition_task: None,
             normalized_audition_queued: None,
             normalized_audition_deferred_play: None,
@@ -666,6 +673,7 @@ impl Browser {
 
     fn cancel_waveform_load(&mut self) {
         self.waveform_detail.cancel();
+        zero_crossing::cancel_for_interruption(self);
         if let Some(cancellation) = self.waveform_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }
@@ -1664,6 +1672,15 @@ impl Browser {
         cx.notify();
     }
 
+    fn toggle_zero_crossing_from_toolbar(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        zero_crossing::toggle_from_toolbar(self, event, window, cx);
+    }
+
     fn toggle_beat_guides_from_toolbar(
         &mut self,
         _: &ClickEvent,
@@ -2056,7 +2073,11 @@ impl Browser {
                 waveform::waveform_region_navigation_key(key, secondary, shift, alt, function)
             {
                 let canceled = self.cancel_waveform_gestures(window, cx);
-                if self.slide_waveform_region(direction) || canceled {
+                let moved = self.slide_waveform_region(direction);
+                if moved {
+                    zero_crossing::schedule_for_committed_region(self, cx);
+                }
+                if moved || canceled {
                     cx.notify();
                 }
                 return;
@@ -2132,6 +2153,8 @@ impl Drop for Browser {
         self.waveform_detail.reset();
         self.reset_catalog_metadata();
         self.cancel_waveform_load();
+        zero_crossing::cancel_for_shutdown(self);
+        self.zero_crossing_task.take();
         self.cancel_audio_output_options();
         self.audio_output_open_generation = self.audio_output_open_generation.wrapping_add(1);
         self.audio_output_open_task.take();

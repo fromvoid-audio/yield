@@ -18,6 +18,7 @@ use crate::theme::color;
 
 use super::Browser;
 use super::waveform_scrollbar;
+use super::zero_crossing;
 
 const WAVEFORM_SELECTION_CLICK_SLOP_PX: f32 = 2.0;
 const WAVEFORM_SELECTION_EDGE_WIDTH: f32 = 1.0;
@@ -361,7 +362,10 @@ impl WaveformRegionDrag {
         self.preview_region_with_bpm(BpmSnapSettings::disabled())
     }
 
-    fn preview_region_with_bpm(self, bpm_snap: BpmSnapSettings) -> Option<WaveformPlayRegion> {
+    pub(super) fn preview_region_with_bpm(
+        self,
+        bpm_snap: BpmSnapSettings,
+    ) -> Option<WaveformPlayRegion> {
         if !self.moved {
             match self.mode {
                 WaveformRegionDragMode::Create => {}
@@ -397,6 +401,17 @@ impl WaveformRegionDrag {
 
     fn is_handle_drag(self) -> bool {
         !matches!(self.mode, WaveformRegionDragMode::Create)
+    }
+
+    pub(super) fn zero_crossing_applies(self, bpm_snap: BpmSnapSettings) -> bool {
+        self.moved && (!self.is_resize() || !bpm_snap.enabled)
+    }
+
+    fn is_resize(self) -> bool {
+        matches!(
+            self.mode,
+            WaveformRegionDragMode::ResizeStart { .. } | WaveformRegionDragMode::ResizeEnd { .. }
+        )
     }
 }
 
@@ -938,14 +953,13 @@ pub(super) fn render_waveform(
         .left_0()
         .right_0(),
     );
-    let bpm_snap = browser.bpm_snap_settings();
     let beat_guides = browser.beat_guides_enabled.then_some((
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
     ));
     if let Some(region) = browser
         .waveform_region_drag
-        .and_then(|drag| drag.preview_region_with_bpm(bpm_snap))
+        .and_then(|drag| zero_crossing::preview_drag_region(browser, drag))
         .or(browser.waveform_play_region)
     {
         bars = bars.child(waveform_region_overlay(
@@ -990,6 +1004,7 @@ pub(super) fn render_waveform(
                 if !bounds.contains(&event.position) {
                     return;
                 }
+                zero_crossing::cancel_for_interruption(view);
                 view.begin_waveform_pan(event.position, bounds, window, cx);
             }),
         )
@@ -1009,6 +1024,7 @@ pub(super) fn render_waveform(
                 let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
                     return;
                 };
+                zero_crossing::cancel_for_interruption(view);
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
                 view.waveform_region_drag = view
@@ -1052,6 +1068,7 @@ pub(super) fn render_waveform(
         .on_drag_move::<WaveformDragToken>(cx.listener(
             |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
                 view.update_waveform_region_drag(event.event.position);
+                zero_crossing::schedule_for_drag(view, cx);
                 cx.notify();
             },
         ))
@@ -1080,6 +1097,7 @@ pub(super) fn render_waveform(
 
 impl Browser {
     pub(super) fn clear_waveform_region(&mut self) {
+        zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
@@ -1091,11 +1109,12 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.waveform_region_drag.take().is_none() {
-            return false;
+        let had_region_drag = self.waveform_region_drag.take().is_some();
+        if had_region_drag {
+            cx.stop_active_drag(window);
         }
-        cx.stop_active_drag(window);
-        true
+        let canceled_zero_crossing = zero_crossing::cancel_for_interruption(self);
+        had_region_drag || canceled_zero_crossing
     }
 
     pub(super) fn cancel_waveform_gestures(
@@ -1106,9 +1125,13 @@ impl Browser {
         let had_region_drag = self.waveform_region_drag.take().is_some();
         let had_pan_drag = self.waveform_pan_drag.take().is_some();
         let had_scrollbar_drag = self.waveform_scrollbar_drag.take().is_some();
-        let canceled = had_region_drag || had_pan_drag || had_scrollbar_drag;
+        let canceled_zero_crossing = zero_crossing::cancel_for_interruption(self);
+        let canceled =
+            had_region_drag || had_pan_drag || had_scrollbar_drag || canceled_zero_crossing;
         if canceled {
-            cx.stop_active_drag(window);
+            if had_region_drag || had_pan_drag || had_scrollbar_drag {
+                cx.stop_active_drag(window);
+            }
         }
         canceled
     }
@@ -1128,6 +1151,7 @@ impl Browser {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        zero_crossing::cancel_for_interruption(self);
         let Some(preview) = self.waveform.as_ref() else {
             return;
         };
@@ -1220,6 +1244,7 @@ impl Browser {
         self.waveform_viewport = next;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
+        zero_crossing::cancel_for_interruption(self);
         true
     }
 
@@ -1253,6 +1278,7 @@ impl Browser {
         self.waveform_viewport = next;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
+        zero_crossing::cancel_for_interruption(self);
         true
     }
 
@@ -1267,10 +1293,12 @@ impl Browser {
         self.waveform_viewport = next;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
+        zero_crossing::cancel_for_interruption(self);
         true
     }
 
     pub(super) fn slide_waveform_region(&mut self, direction: WaveformRegionSlide) -> bool {
+        zero_crossing::cancel_for_interruption(self);
         let Some(region) = self.waveform_play_region else {
             return false;
         };
@@ -1327,11 +1355,19 @@ impl Browser {
             if drag.moved {
                 if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
                     self.waveform_play_region = Some(region);
+                    if drag.zero_crossing_applies(bpm_snap) {
+                        zero_crossing::commit_or_schedule(self, region, cx);
+                    }
                 }
             }
         } else if drag.moved {
             self.stop_playback();
-            self.waveform_play_region = drag.preview_region();
+            if let Some(region) = drag.preview_region() {
+                self.waveform_play_region = Some(region);
+                if drag.zero_crossing_applies(bpm_snap) {
+                    zero_crossing::commit_or_schedule(self, region, cx);
+                }
+            }
         } else if let Some(ratio) = drag.ratio_at(position) {
             self.waveform_play_region = None;
             self.start_playback_from_position(ratio, cx);

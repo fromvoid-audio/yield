@@ -1899,3 +1899,11 @@ The defaulted `waveform_edit_selection` theme color matches the native neutral o
 ### Windows application build follow-up
 
 Windows run `34291072626` passed the core, media and native-platform tests, including the restored-write-time revision regression. Application checking then rejected an unused non-Windows drag retry helper under `deny(warnings)`. The helper is now compiled only outside Windows or for its portable unit test. Browser tests were not reached in that run; a fresh Windows run is required for application acceptance.
+
+### Zero-crossing waveform interaction
+
+A compact transient toggle now enables native five-millisecond snapping for play-region creation, movement and resizing, including keyboard slides. It defaults off as in the native waveform. Whole-BPM snapping takes precedence for resize only. Raw pointer bounds render immediately; exact matching results refine the preview or released range. Missing context and failed reads retain the raw region.
+
+One background task and one newest queued intent bound work. Canceled tasks retain ownership until completion. New gestures, playback, keyboard navigation, source changes, help and toggle-off fence pending refinement; a new gesture uses the visible committed range. The status line reports preparation or unavailable snapping without a new polling timer or waveform-cache invalidation.
+
+Validation: the integrated UI suite passed 295 tests with one existing ignored test before the final admission correction. Independent lifecycle review found disabled keyboard nudges could retain a phantom preparing status. The corrected production admission path rejects disabled ownership; five focused state tests, UI checking and formatting passed, including a real core nudge followed by disabled admission. Primary acceptance also corrected canceled-intent reuse, missing-context preview fallback and short-circuit cleanup. Native interaction verification follows.
