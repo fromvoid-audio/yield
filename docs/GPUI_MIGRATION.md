@@ -1249,3 +1249,14 @@ A clean-tree executable build of 9c5542b1c passed. The separate macOS bundle
 `target/qa/Wavecrate Parity Preview 9c5542b.app` passed strict ad-hoc signature
 verification. It was not launched for native acceptance; existing bundles and
 application instances were preserved.
+
+### Bounded native tag input
+
+The core crate now parses tag submissions using Wavecrate's native ASCII
+normalization and newline/comma/semicolon separators. It preserves first-seen
+order while deduplicating normalized labels. Input is bounded to 64 KiB,
+individual normalized labels to 1024 bytes, and submissions to 64 distinct tags;
+failure rejects the entire submission. Trailing punctuation does not reject an
+otherwise valid label at the size boundary. All 86 core tests passed, including
+seven parser behavior and boundary tests; core compilation and formatting passed.
+The parser is a prerequisite for the tag editor, not a claim of completed tag UI.

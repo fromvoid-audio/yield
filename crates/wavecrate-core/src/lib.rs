@@ -15,6 +15,7 @@ mod playback_type_filter;
 mod rating;
 mod rating_filter;
 mod selection;
+mod tag_input;
 mod waveform_region;
 mod waveform_viewport;
 
@@ -34,6 +35,9 @@ pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackType
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};
 pub use selection::BrowserSelection;
+pub use tag_input::{
+    MAX_TAG_INPUT_BYTES, MAX_TAG_LABEL_BYTES, MAX_TAGS_PER_COMMIT, TagInputError, parse_tag_input,
+};
 pub use waveform_region::WaveformRegion;
 pub use waveform_viewport::WaveformViewport;
 
