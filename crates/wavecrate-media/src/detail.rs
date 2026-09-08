@@ -196,6 +196,10 @@ pub(super) struct FileObservation {
 }
 
 impl FileObservation {
+    pub(super) fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
     pub(super) fn strong_revision(&self) -> Option<WaveformFileRevision> {
         let (Some(open_identity), Some(path_identity), Some(change_marker)) = (
             self.open_identity.as_ref(),
