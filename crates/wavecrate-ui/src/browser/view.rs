@@ -615,6 +615,9 @@ impl Render for Browser {
                                                     .flex_none()
                                                     .w(px(last_played_width))
                                                     .px(px(list_theme.spacing.control_gap))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
                                                     .text_size(px(list_theme.typography.small_size))
                                                     .text_color(color(list_theme.colors.text_muted))
                                                     .child(last_played),
