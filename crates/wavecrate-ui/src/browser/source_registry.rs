@@ -538,6 +538,7 @@ impl Browser {
         self.browser_focus_override = None;
         self.context_menu = None;
         self.stop_playback();
+        self.playback_policy.clear_file();
         self.cancel_waveform_load();
         self.reset_catalog_metadata();
         self.scan_generation = self.scan_generation.wrapping_add(1);

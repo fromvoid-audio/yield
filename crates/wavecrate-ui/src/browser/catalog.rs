@@ -172,6 +172,7 @@ impl Browser {
             // History handoff marks the destination active before calling this method, so its
             // same-source activation preserves the reveal while keeping transport alive.
             let _ = self.view_model.clear_reveal(&self.entries);
+            self.playback_policy.clear_file();
             self.selection.clear();
             self.reset_collection_filter();
         }

@@ -453,7 +453,8 @@ impl Browser {
         let effective = self.preferences.effective();
         let autoplay_was_enabled = self.autoplay_selection;
         self.autoplay_selection = effective.autoplay_selection;
-        self.loop_enabled = effective.loop_enabled;
+        self.playback_policy
+            .apply_preference(effective.loop_enabled);
         self.apply_preference_volume(effective.output_volume);
         self.apply_preference_audio_output(
             &effective.audio_output,

@@ -20,7 +20,7 @@ use gpui::{
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
-    FolderTreeRow, PlaybackNavigationHistory, SortColumn, WaveformViewport,
+    FolderTreeRow, PlaybackLoopPolicy, PlaybackNavigationHistory, SortColumn, WaveformViewport,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_library::sample_sources::{SampleSource, SourceId};
@@ -253,7 +253,8 @@ pub(crate) struct Browser {
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
-    loop_enabled: bool,
+    playback_policy: PlaybackLoopPolicy,
+    accepted_playback_intent: Option<transport::PlaybackIntent>,
     autoplay_selection: bool,
     playback_history: PlaybackNavigationHistory,
     latest_playback_request_id: Option<PlaybackRequestId>,
@@ -398,7 +399,8 @@ impl Browser {
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
-            loop_enabled: false,
+            playback_policy: PlaybackLoopPolicy::default(),
+            accepted_playback_intent: None,
             autoplay_selection: true,
             playback_history: PlaybackNavigationHistory::default(),
             latest_playback_request_id: None,
@@ -613,6 +615,7 @@ impl Browser {
                     self.waveform_error = None;
                     self.invalidate_waveform_generation();
                 }
+                self.playback_policy.clear_file();
                 if let Some(index) = self.active_source
                     && let Some(session) = self.source_sessions.get_mut(index)
                 {
@@ -660,6 +663,9 @@ impl Browser {
         };
         self.stop_playback();
         self.clear_waveform_region();
+        if source_index != self.active_source {
+            self.playback_policy.clear_file();
+        }
         let pending_source_return_index = if source_index.is_none() {
             self.active_source.or(self.pending_source_return_index)
         } else {
@@ -835,6 +841,7 @@ impl Browser {
             self.reset_collection_filter();
             self.scan_status = error;
             self.selected = None;
+            self.playback_policy.clear_file();
             self.waveform_pending = false;
             self.waveform = None;
             self.waveform_error = None;
@@ -1229,6 +1236,8 @@ impl Browser {
         }
         let previous_id = self.selected_id();
         let next_id = entry.stable_id();
+        self.playback_policy
+            .prepare(next_id.clone(), entry.playback_type);
         self.clear_reveal_for_focus_change(&next_id);
         let autoplay = should_autoplay_selection(self.autoplay_selection, origin);
         if previous_id.as_ref() == Some(&next_id) {
@@ -1487,10 +1496,17 @@ impl Browser {
         cx.set_global(ActiveTheme::default());
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
         self.autoplay_selection = true;
-        self.loop_enabled = false;
+        self.playback_policy.reset(false);
         self.apply_preference_volume(volume::DEFAULT_VOLUME);
-        if let Some(intent) = self.playback_init_intent.as_mut() {
-            intent.looped = false;
+        if let Some(intent) = self.playback_init_intent.as_mut()
+            && intent.origin != transport::PlaybackIntentOrigin::AudioOutputResume
+        {
+            intent.looped = self.playback_policy.enabled();
+        }
+        if let Some(intent) = self.audio_output_resume.as_mut()
+            && intent.origin != transport::PlaybackIntentOrigin::AudioOutputResume
+        {
+            intent.looped = self.playback_policy.enabled();
         }
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));

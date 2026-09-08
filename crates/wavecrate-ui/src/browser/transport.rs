@@ -14,6 +14,8 @@ use reson::{
     PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest, PlaybackRuntimeSource,
     PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy,
 };
+use wavecrate_core::AudioFile;
+use wavecrate_core::PlaybackLoopPolicy;
 
 const PLAYBACK_MONITOR_INTERVAL: Duration = Duration::from_millis(80);
 const PLAYBACK_CURSOR_MAX_INTERPOLATION: Duration = PLAYBACK_MONITOR_INTERVAL;
@@ -248,18 +250,25 @@ impl Browser {
             self.mark_preferences_edit_blocked(cx);
             return;
         }
-        let enabled = !self.loop_enabled;
+        let enabled = !self.playback_policy.enabled();
         if !self.persist_loop_preference(enabled, cx) {
             return;
         }
-        self.loop_enabled = enabled;
-        if let Some(intent) = self.playback_init_intent.as_mut() {
-            intent.looped = self.loop_enabled;
+        self.playback_policy.set_manual(enabled);
+        if let Some(intent) = self.playback_init_intent.as_mut()
+            && intent.origin != PlaybackIntentOrigin::AudioOutputResume
+        {
+            intent.looped = self.playback_policy.enabled();
+        }
+        if let Some(intent) = self.audio_output_resume.as_mut()
+            && intent.origin != PlaybackIntentOrigin::AudioOutputResume
+        {
+            intent.looped = self.playback_policy.enabled();
         }
         self.playback_status = if self.playing_path.is_some() {
             format!(
                 "Loop {} — applies on next play",
-                if self.loop_enabled {
+                if self.playback_policy.enabled() {
                     "enabled"
                 } else {
                     "disabled"
@@ -268,7 +277,7 @@ impl Browser {
         } else {
             format!(
                 "Loop {}",
-                if self.loop_enabled {
+                if self.playback_policy.enabled() {
                     "enabled"
                 } else {
                     "disabled"
@@ -287,9 +296,12 @@ impl Browser {
             self.playback_status = "Select a sample first".to_string();
             return None;
         };
-        let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
+        let Some(entry) = self.entries.get(index).cloned() else {
             return None;
         };
+        let path = entry.path.clone();
+        self.playback_policy
+            .prepare(entry.stable_id(), entry.playback_type);
         if !path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -307,7 +319,7 @@ impl Browser {
         Some(PlaybackIntent {
             start,
             region,
-            looped: self.loop_enabled,
+            looped: self.playback_policy.enabled(),
             volume: super::volume::quantize_volume(self.volume),
             path,
             origin,
@@ -387,6 +399,26 @@ impl Browser {
             self.clear_playback_cursor();
             return;
         };
+        if should_cancel_pending_autoplay(self.autoplay_selection, Some(intent.origin)) {
+            self.clear_playback_cursor();
+            self.playback_status = "Selection autoplay disabled".to_string();
+            cx.notify();
+            return;
+        }
+        let selected_entry = self
+            .selected
+            .and_then(|index| self.entries.get(index))
+            .cloned();
+        let Some(intent) = resolve_queued_playback_intent(
+            &mut self.playback_policy,
+            intent,
+            selected_entry.as_ref(),
+        ) else {
+            self.clear_playback_cursor();
+            self.playback_status = "Playback request is no longer current".to_string();
+            cx.notify();
+            return;
+        };
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
             self.playback_status = "Invalid playback position".to_string();
@@ -420,6 +452,7 @@ impl Browser {
                 }
                 self.mark_volume_applied_by_play();
                 self.latest_playback_request_id = Some(request_id);
+                self.accepted_playback_intent = Some(intent.clone());
                 self.playing_path = Some(intent.path);
                 self.playback_cursor_pending = Some(start as f32);
                 self.playback_status = "Starting…".to_string();
@@ -431,6 +464,7 @@ impl Browser {
             Err(error) => {
                 self.latest_playback_request_id = None;
                 self.playing_path = None;
+                self.accepted_playback_intent = None;
                 self.clear_playback_cursor();
                 self.playback_status = format!("Could not queue playback: {error:?}");
             }
@@ -446,6 +480,7 @@ impl Browser {
         self.playback_init_intent = None;
         self.playback_waiting_for_preferences = false;
         self.audio_output_resume = None;
+        self.accepted_playback_intent = None;
         self.clear_playback_cursor();
         if let Some(runtime) = self.playback.as_ref() {
             if let Ok(request_id) = runtime.handle.try_stop() {
@@ -486,6 +521,7 @@ impl Browser {
                         self.clear_playback_cursor();
                         self.latest_playback_request_id = None;
                         self.playing_path = None;
+                        self.accepted_playback_intent = None;
                         self.playback_status = format!("Playback failed: {error}");
                     } else if progress.active {
                         self.record_playback_progress(&progress);
@@ -499,6 +535,7 @@ impl Browser {
                         self.clear_playback_cursor();
                         self.latest_playback_request_id = None;
                         self.playing_path = None;
+                        self.accepted_playback_intent = None;
                         self.playback_status = "Stopped".to_string();
                     }
                 }
@@ -509,6 +546,7 @@ impl Browser {
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
+                    self.accepted_playback_intent = None;
                     self.playback_status = "Stopped".to_string();
                 }
                 PlaybackRuntimeEvent::Failed { id, error }
@@ -518,6 +556,7 @@ impl Browser {
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
+                    self.accepted_playback_intent = None;
                     self.playback_status = format!("Playback failed: {error}");
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
@@ -527,6 +566,7 @@ impl Browser {
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
+                    self.accepted_playback_intent = None;
                     self.playback_status = "Playback cancelled".to_string();
                 }
                 _ => {}
@@ -563,24 +603,17 @@ impl Browser {
                 resume.path.as_path(),
             )
         {
-            return Some(PlaybackIntent {
-                origin: PlaybackIntentOrigin::AudioOutputResume,
-                ..resume.clone()
-            });
+            return Some(pending_resume_intent(resume, self.volume));
         }
         let playing_path = self.playing_path.as_ref()?;
         if selected_path != Some(playing_path) {
             return None;
         }
-        let region = self.waveform_play_region.filter(|region| region.is_valid());
-        Some(PlaybackIntent {
-            start: region.map_or(0.0, |region| region.start),
-            region,
-            looped: self.loop_enabled,
-            volume: super::volume::quantize_volume(self.volume),
-            path: playing_path.clone(),
-            origin: PlaybackIntentOrigin::AudioOutputResume,
-        })
+        let accepted = self.accepted_playback_intent.as_ref()?;
+        if accepted.path != *playing_path {
+            return None;
+        }
+        Some(accepted_resume_intent(accepted, self.volume))
     }
 
     pub(super) fn reconfigure_audio_output(&mut self, cx: &mut Context<Self>) {
@@ -639,6 +672,34 @@ impl Browser {
             self.playback_status = "Ready".to_string();
         }
     }
+}
+
+fn resolve_queued_playback_intent(
+    policy: &mut PlaybackLoopPolicy,
+    mut intent: PlaybackIntent,
+    selected_entry: Option<&AudioFile>,
+) -> Option<PlaybackIntent> {
+    let entry = selected_entry?;
+    (entry.path == intent.path).then(|| {
+        if intent.origin != PlaybackIntentOrigin::AudioOutputResume {
+            policy.prepare(entry.stable_id(), entry.playback_type);
+            intent.looped = policy.enabled();
+        }
+        intent
+    })
+}
+
+fn accepted_resume_intent(accepted: &PlaybackIntent, volume: f32) -> PlaybackIntent {
+    let mut resume = accepted.clone();
+    resume.origin = PlaybackIntentOrigin::AudioOutputResume;
+    resume.set_volume(volume);
+    resume
+}
+
+fn pending_resume_intent(resume: &PlaybackIntent, volume: f32) -> PlaybackIntent {
+    let mut resume = resume.clone();
+    resume.set_volume(volume);
+    resume
 }
 
 fn should_queue_initialized_playback(
@@ -789,10 +850,11 @@ fn progress_poll_is_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin,
+        PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin, accepted_resume_intent,
         audio_output_resume_is_current, authoritative_cursor_progress, cursor_interpolation,
-        normalized_playback_start, playback_mode_for_intent, playback_request_number_is_current,
-        preview_cursor_ratio, should_cancel_pending_autoplay, should_queue_initialized_playback,
+        normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
+        playback_request_number_is_current, preview_cursor_ratio, resolve_queued_playback_intent,
+        should_cancel_pending_autoplay, should_queue_initialized_playback,
         should_record_last_played, should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
@@ -800,6 +862,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::waveform::WaveformPlayRegion;
+    use wavecrate_core::{AudioFile, PlaybackLoopPolicy, PlaybackType};
 
     #[test]
     fn stale_stop_event_cannot_clear_a_replay() {
@@ -910,6 +973,96 @@ mod tests {
         assert!(!should_record_last_played(
             PlaybackIntentOrigin::AudioOutputResume
         ));
+    }
+
+    #[test]
+    fn queue_resolution_requires_the_loaded_path_and_applies_its_tagged_mode() {
+        let path = PathBuf::from("sample.wav");
+        let entry = AudioFile {
+            path: path.clone(),
+            relative_path: PathBuf::from("sample.wav"),
+            byte_len: 0,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type: Some(PlaybackType::Loop),
+            curation: None,
+        };
+        let intent = PlaybackIntent {
+            start: 0.0,
+            region: None,
+            looped: false,
+            volume: 1.0,
+            path: path.clone(),
+            origin: PlaybackIntentOrigin::Explicit,
+        };
+        let mut policy = PlaybackLoopPolicy::default();
+        let resolved = resolve_queued_playback_intent(&mut policy, intent, Some(&entry))
+            .expect("the loaded path should resolve");
+        assert!(resolved.looped);
+        assert_eq!(policy.current_file(), Some(&entry.stable_id()));
+
+        policy.set_manual(false);
+        let manual_intent = PlaybackIntent {
+            looped: true,
+            path: path.clone(),
+            ..resolved.clone()
+        };
+        let resolved_manual =
+            resolve_queued_playback_intent(&mut policy, manual_intent, Some(&entry))
+                .expect("the loaded path should keep resolving");
+        assert!(!resolved_manual.looped);
+
+        let stale = PlaybackIntent {
+            path: PathBuf::from("other.wav"),
+            ..resolved
+        };
+        assert!(resolve_queued_playback_intent(&mut policy, stale, Some(&entry)).is_none());
+
+        let resume = PlaybackIntent {
+            origin: PlaybackIntentOrigin::AudioOutputResume,
+            looped: true,
+            path,
+            ..resolved_manual
+        };
+        let captured = resolve_queued_playback_intent(&mut policy, resume, Some(&entry))
+            .expect("the loaded path should keep resolving");
+        assert!(captured.looped);
+    }
+
+    #[test]
+    fn accepted_resume_keeps_mode_and_region_but_uses_current_volume() {
+        let region = WaveformPlayRegion::new(0.2, 0.8).expect("valid region");
+        let accepted = PlaybackIntent {
+            start: region.start,
+            region: Some(region),
+            looped: true,
+            volume: 0.25,
+            path: PathBuf::from("sample.wav"),
+            origin: PlaybackIntentOrigin::HistoryReplay,
+        };
+        let resume = accepted_resume_intent(&accepted, 0.75);
+        assert_eq!(resume.origin, PlaybackIntentOrigin::AudioOutputResume);
+        assert!(resume.looped);
+        assert_eq!(resume.region, accepted.region);
+        assert_eq!(resume.start, accepted.start);
+        assert_eq!(resume.path, accepted.path);
+        assert_eq!(resume.volume, 0.75);
+    }
+
+    #[test]
+    fn pending_output_resume_keeps_origin_and_refreshes_volume() {
+        let pending = PlaybackIntent {
+            start: 0.0,
+            region: None,
+            looped: false,
+            volume: 0.25,
+            path: PathBuf::from("sample.wav"),
+            origin: PlaybackIntentOrigin::SelectionAutoplay,
+        };
+        let resume = pending_resume_intent(&pending, 0.75);
+        assert_eq!(resume.origin, PlaybackIntentOrigin::SelectionAutoplay);
+        assert_eq!(resume.volume, 0.75);
+        assert_eq!(resume.path, pending.path);
     }
 
     #[test]

@@ -143,7 +143,7 @@ impl Browser {
             return;
         }
 
-        let intent = history_playback_intent(self.loop_enabled, self.volume, &entry);
+        let intent = history_playback_intent(self.playback_policy.enabled(), self.volume, &entry);
         self.request_playback_intent(intent, cx);
     }
 
@@ -181,6 +181,7 @@ impl Browser {
         let switching_source = self.active_source != Some(source_index);
         if switching_source {
             self.deactivate_catalog_source(cx);
+            self.playback_policy.clear_file();
             self.reset_collection_filter();
         }
         let session = self.source_sessions.get(source_index)?;

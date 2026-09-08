@@ -452,6 +452,7 @@ impl Render for Browser {
         let show_last_played = column_visibility.last_played;
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
+        let loop_enabled = self.playback_policy.enabled();
         if self.view_model.rows().is_empty()
             && let Some(context) = self.catalog_metadata.context()
         {
@@ -840,18 +841,18 @@ impl Render for Browser {
                             .active(move |style| style.bg(color(toolbar_pressed)))
                             .on_click(cx.listener(Self::toggle_loop_from_toolbar))
                             .text_size(px(theme.typography.small_size))
-                            .text_color(color(if self.loop_enabled {
+                            .text_color(color(if loop_enabled {
                                 theme.colors.accent
                             } else {
                                 theme.colors.text_muted
                             }))
                             .child(if self.playing_path.is_some() {
-                                if self.loop_enabled {
+                                if loop_enabled {
                                     "Loop next: On"
                                 } else {
                                     "Loop next: Off"
                                 }
-                            } else if self.loop_enabled {
+                            } else if loop_enabled {
                                 "Loop On"
                             } else {
                                 "Loop Off"

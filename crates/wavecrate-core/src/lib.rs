@@ -10,6 +10,7 @@ mod curation;
 mod folder_tree;
 mod last_played;
 mod playback_history;
+mod playback_loop_policy;
 mod playback_type_filter;
 mod rating;
 mod rating_filter;
@@ -28,6 +29,7 @@ pub use playback_history::{
     PLAYBACK_NAVIGATION_HISTORY_LIMIT, PlaybackHistoryEntry, PlaybackNavigationHistory,
     PlaybackSpan,
 };
+pub use playback_loop_policy::PlaybackLoopPolicy;
 pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackTypeFilter};
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};

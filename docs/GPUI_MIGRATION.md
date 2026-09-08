@@ -1141,3 +1141,22 @@ one focused UI test, UI compilation, formatting, and diff checks passed. Review
 corrected early reveal removal during range navigation, same-folder refresh loss,
 selected-member context selection collapse, and passive-focus navigation. Native
 interaction acceptance remains pending; application instances were untouched.
+
+### Tagged next-play policy and output resume
+
+A pure core policy now applies Loop and OneShot classifications when preparing
+the loaded file and immediately before queue admission. Unknown files inherit
+the session mode; a manual override survives same-file metadata refresh and
+unrelated preference projections. Source changes clear file identity. Explicit
+preference reset reapplies the current tag or saved fallback.
+
+Playback admission validates the loaded path and rechecks selection autoplay.
+Output reconfiguration preserves the accepted mode and span while using current
+volume. Requests that have not started preserve their original origin across
+repeated output changes, retaining autoplay cancellation and first-play history
+semantics. Stop and current terminal events clear accepted intent. Live loop
+switching is still a separate runtime prerequisite and UI integration.
+
+Validation: six core policy tests and 18 UI transport tests passed, along with
+locked UI compilation, formatting, and diff checks. Native audible acceptance
+remains pending; existing application instances and bundles were preserved.
