@@ -8,9 +8,9 @@ use wavecrate_library::sample_sources::{
 };
 
 pub use wavecrate_library::sample_sources::{
-    ProfileTagCategory, ProfileTagVocabularyEntry, ProfileTagVocabularyInputError,
-    ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
-    ProfileTagVocabularySetReceipt,
+    ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyEntry,
+    ProfileTagVocabularyInputError, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
+    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
 };
 
 /// Maximum number of admitted profile vocabulary requests that may await terminal consumption.
@@ -187,6 +187,17 @@ pub(crate) fn set_category(
 ) -> Result<VocabularyRequest<ProfileTagVocabularySetReceipt>, VocabularySubmitError> {
     submit(slot, id, move |client| {
         client.set_profile_tag_category(expected_revision, label, category)
+    })
+}
+
+pub(crate) fn delete_profile_tag_vocabulary(
+    slot: &Arc<Mutex<VocabularySlot>>,
+    id: VocabularyRequestId,
+    expected_revision: u64,
+    label: String,
+) -> Result<VocabularyRequest<ProfileTagVocabularyDeleteReceipt>, VocabularySubmitError> {
+    submit(slot, id, move |client| {
+        client.delete_profile_tag_vocabulary(expected_revision, label)
     })
 }
 

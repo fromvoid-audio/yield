@@ -10,9 +10,10 @@ use thiserror::Error;
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
 use super::tag_vocabulary::{
-    ProfileTagCategory, ProfileTagVocabularyInputError, ProfileTagVocabularyLookup,
-    ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
-    validate_lookup_labels, validate_page_inputs, validate_set_input,
+    ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyInputError,
+    ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
+    ProfileTagVocabularySetReceipt, validate_delete_input, validate_lookup_labels,
+    validate_page_inputs, validate_set_input,
 };
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
@@ -187,6 +188,11 @@ enum WriterCommand {
         category: ProfileTagCategory,
         result: SyncSender<Result<ProfileTagVocabularySetReceipt, LibraryError>>,
     },
+    DeleteProfileTagVocabulary {
+        expected_revision: u64,
+        label: String,
+        result: SyncSender<Result<ProfileTagVocabularyDeleteReceipt, LibraryError>>,
+    },
 }
 
 enum WriterReply {
@@ -222,6 +228,10 @@ enum WriterReply {
         result: SyncSender<Result<ProfileTagVocabularySetReceipt, LibraryError>>,
         value: Result<ProfileTagVocabularySetReceipt, LibraryError>,
     },
+    DeleteProfileTagVocabulary {
+        result: SyncSender<Result<ProfileTagVocabularyDeleteReceipt, LibraryError>>,
+        value: Result<ProfileTagVocabularyDeleteReceipt, LibraryError>,
+    },
 }
 
 impl WriterReply {
@@ -251,6 +261,9 @@ impl WriterReply {
             Self::SetProfileTagCategory { result, value } => {
                 let _ = result.send(value);
             }
+            Self::DeleteProfileTagVocabulary { result, value } => {
+                let _ = result.send(value);
+            }
         }
     }
 
@@ -278,6 +291,9 @@ impl WriterReply {
                 let _ = result.send(Err(error));
             }
             Self::SetProfileTagCategory { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::DeleteProfileTagVocabulary { result, .. } => {
                 let _ = result.send(Err(error));
             }
         }
@@ -582,6 +598,19 @@ impl GlobalLibraryWriter {
             .set_profile_tag_category(expected_revision, label, category)
     }
 
+    /// Queue deletion of one exact profile vocabulary label at a matching revision.
+    pub fn delete_profile_tag_vocabulary(
+        &self,
+        expected_revision: u64,
+        label: String,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularyDeleteReceipt, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.profile_tag_vocabulary_client()
+            .delete_profile_tag_vocabulary(expected_revision, label)
+    }
+
     /// Stop new admission, drain accepted commands, close `library.db`, and join the owner.
     pub fn shutdown(&mut self) -> bool {
         let previous = self.lifecycle.swap(
@@ -691,6 +720,26 @@ impl ProfileTagVocabularyClient {
             expected_revision,
             label,
             category,
+            result: result_tx,
+        })?;
+        Ok(result_rx)
+    }
+
+    /// Queue deletion of one exact profile vocabulary label at a matching revision.
+    pub fn delete_profile_tag_vocabulary(
+        &self,
+        expected_revision: u64,
+        label: String,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularyDeleteReceipt, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        validate_delete_input(&label)?;
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::DeleteProfileTagVocabulary {
+            expected_revision,
+            label,
             result: result_tx,
         })?;
         Ok(result_rx)
@@ -970,6 +1019,14 @@ fn execute_command(command: WriterCommand, database: &mut LibraryDatabase) -> Wr
             value: database.set_profile_tag_category(expected_revision, &label, category),
             result,
         },
+        WriterCommand::DeleteProfileTagVocabulary {
+            expected_revision,
+            label,
+            result,
+        } => WriterReply::DeleteProfileTagVocabulary {
+            value: database.delete_profile_tag_vocabulary(expected_revision, &label),
+            result,
+        },
     }
 }
 
@@ -1031,6 +1088,9 @@ fn send_command_error(command: WriterCommand, error: LibraryError) {
             let _ = result.send(Err(error));
         }
         WriterCommand::SetProfileTagCategory { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::DeleteProfileTagVocabulary { result, .. } => {
             let _ = result.send(Err(error));
         }
     }
@@ -1321,6 +1381,30 @@ mod tests {
         assert_eq!(inserted.revision, 1);
         assert!(inserted.changed);
 
+        let deleted = writer
+            .delete_profile_tag_vocabulary(1, String::from("kick"))
+            .expect("delete admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delete result")
+            .expect("delete success");
+        assert_eq!(deleted.revision, 2);
+        assert_eq!(
+            deleted.removed,
+            Some(super::super::tag_vocabulary::ProfileTagVocabularyEntry {
+                label: String::from("kick"),
+                category: ProfileTagCategory::SoundType,
+            })
+        );
+
+        let missing = writer
+            .delete_profile_tag_vocabulary(2, String::from("kick"))
+            .expect("missing delete admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("missing delete result")
+            .expect("missing delete success");
+        assert_eq!(missing.revision, 2);
+        assert!(missing.removed.is_none());
+
         let oversized = "x".repeat(super::super::PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES + 1);
         assert!(matches!(
             writer.set_profile_tag_category(1, oversized, ProfileTagCategory::Character),
@@ -1328,6 +1412,33 @@ mod tests {
                 ProfileTagVocabularyInputError::LabelTooLong { .. }
             ))
         ));
+        let oversized_delete = "x".repeat(super::super::PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES + 1);
+        assert!(matches!(
+            writer.delete_profile_tag_vocabulary(2, oversized_delete),
+            Err(GlobalLibraryWriterQueueError::InvalidProfileTagVocabulary(
+                ProfileTagVocabularyInputError::LabelTooLong { .. }
+            ))
+        ));
+        assert!(matches!(
+            writer.delete_profile_tag_vocabulary(2, String::from("bad\0label")),
+            Err(GlobalLibraryWriterQueueError::InvalidProfileTagVocabulary(
+                ProfileTagVocabularyInputError::LabelContainsNul
+            ))
+        ));
+        assert!(matches!(
+            writer.delete_profile_tag_vocabulary(2, String::from("Bad-label")),
+            Err(GlobalLibraryWriterQueueError::InvalidProfileTagVocabulary(
+                ProfileTagVocabularyInputError::LabelNotCanonical
+            ))
+        ));
+        for label in ["loop", "oneshot", "one_shot", "one-shot"] {
+            assert!(matches!(
+                writer.delete_profile_tag_vocabulary(2, String::from(label)),
+                Err(GlobalLibraryWriterQueueError::InvalidProfileTagVocabulary(
+                    ProfileTagVocabularyInputError::LockedPlaybackLabelCannotBeDeleted
+                ))
+            ));
+        }
         assert!(matches!(
             writer.status(),
             GlobalLibraryWriterStatus::Available
@@ -1338,6 +1449,35 @@ mod tests {
             writer.lookup_profile_tag_categories(vec![String::from("kick")]),
             Err(GlobalLibraryWriterQueueError::Closed)
         ));
+    }
+
+    #[test]
+    fn profile_vocabulary_delete_drains_after_result_receiver_is_dropped() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let (base_guard, profile_guard, _writable_guard, mut writer) =
+            start_writer(&temp, "profile-vocabulary-delete-drain");
+        let _ = (&base_guard, &profile_guard);
+        wait_until_available(&writer);
+
+        writer
+            .set_profile_tag_category(0, String::from("drop-me"), ProfileTagCategory::Character)
+            .expect("set admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("set result")
+            .expect("set success");
+        let dropped = writer
+            .delete_profile_tag_vocabulary(1, String::from("drop-me"))
+            .expect("delete admission");
+        drop(dropped);
+        assert!(writer.shutdown());
+
+        let reopened = LibraryDatabase::open().expect("reopen library database");
+        let lookup = reopened
+            .lookup_profile_tag_categories(&[String::from("drop-me")])
+            .expect("lookup deleted label");
+        assert_eq!(lookup.revision, 2);
+        assert!(lookup.entries.is_empty());
     }
 
     #[test]

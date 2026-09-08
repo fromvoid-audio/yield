@@ -100,6 +100,18 @@ pub struct ProfileTagVocabularySetReceipt {
     pub changed: bool,
 }
 
+/// Result of one revision-fenced profile vocabulary deletion.
+///
+/// When `removed` is present it is the bounded before-image of the deleted row. A missing label
+/// is an idempotent no-op at the requested revision and leaves the revision unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileTagVocabularyDeleteReceipt {
+    /// Vocabulary revision after the deletion, or the unchanged revision for a no-op.
+    pub revision: u64,
+    /// The deleted row before the mutation, when the label existed.
+    pub removed: Option<ProfileTagVocabularyEntry>,
+}
+
 /// Input rejected before a profile vocabulary command enters the owner queue.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ProfileTagVocabularyInputError {
@@ -148,6 +160,9 @@ pub enum ProfileTagVocabularyInputError {
     /// An arbitrary label was assigned to the locked playback category.
     #[error("only locked playback labels may use the playback-type category")]
     PlaybackTypeLabelNotAllowed,
+    /// A locked playback label cannot be removed from the profile vocabulary.
+    #[error("locked playback labels cannot be deleted")]
+    LockedPlaybackLabelCannotBeDeleted,
 }
 
 impl ProfileTagVocabularyPageCursor {
@@ -186,6 +201,14 @@ pub(super) fn validate_set_input(
 ) -> Result<(), ProfileTagVocabularyInputError> {
     validate_label(label)?;
     validate_label_category(label, category)
+}
+
+pub(super) fn validate_delete_input(label: &str) -> Result<(), ProfileTagVocabularyInputError> {
+    validate_label(label)?;
+    if is_locked_playback_label(label) {
+        return Err(ProfileTagVocabularyInputError::LockedPlaybackLabelCannotBeDeleted);
+    }
+    Ok(())
 }
 
 fn validate_label(label: &str) -> Result<(), ProfileTagVocabularyInputError> {
@@ -460,6 +483,71 @@ impl LibraryDatabase {
         Ok(ProfileTagVocabularySetReceipt {
             revision: new_revision,
             changed: true,
+        })
+    }
+
+    pub(super) fn delete_profile_tag_vocabulary(
+        &mut self,
+        expected_revision: u64,
+        label: &str,
+    ) -> Result<ProfileTagVocabularyDeleteReceipt, LibraryError> {
+        validate_delete_input(label).map_err(LibraryError::from)?;
+        let transaction = self.connection.transaction().map_err(map_sql_error)?;
+        let revision = profile_tag_vocabulary_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(LibraryError::ProfileTagVocabularyStaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            });
+        }
+
+        let existing_code = transaction
+            .query_row(
+                "SELECT CASE category
+                    WHEN 'playback-type' THEN 0
+                    WHEN 'sound-type' THEN 1
+                    WHEN 'character' THEN 2
+                    WHEN 'prefix' THEN 3
+                    WHEN 'tuning-scale' THEN 4
+                    ELSE -1
+                 END
+                 FROM profile_tag_vocabulary
+                 WHERE label = ?1",
+                [label],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+        let Some(existing) = existing_code
+            .map(profile_tag_category_from_code)
+            .transpose()?
+        else {
+            transaction.rollback().map_err(map_sql_error)?;
+            return Ok(ProfileTagVocabularyDeleteReceipt {
+                revision,
+                removed: None,
+            });
+        };
+        validate_stored_entry(label, existing)?;
+        let removed = ProfileTagVocabularyEntry {
+            label: String::from(label),
+            category: existing,
+        };
+
+        transaction
+            .execute(
+                "DELETE FROM profile_tag_vocabulary WHERE label = ?1",
+                [label],
+            )
+            .map_err(map_sql_error)?;
+        let new_revision = revision
+            .checked_add(1)
+            .ok_or(LibraryError::ProfileTagVocabularyRevisionOverflow)?;
+        set_profile_tag_vocabulary_revision(&transaction, new_revision)?;
+        transaction.commit().map_err(map_sql_error)?;
+        Ok(ProfileTagVocabularyDeleteReceipt {
+            revision: new_revision,
+            removed: Some(removed),
         })
     }
 }
@@ -806,6 +894,69 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_deletion_returns_before_image_and_is_revision_fenced() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let directory = tempdir().expect("test directory");
+        let (_guard, mut database) = open_database(&directory);
+
+        let inserted = database
+            .set_profile_tag_category(0, "kick", ProfileTagCategory::SoundType)
+            .expect("insert label");
+        assert_eq!(inserted.revision, 1);
+
+        assert!(matches!(
+            database.delete_profile_tag_vocabulary(0, "kick"),
+            Err(LibraryError::ProfileTagVocabularyStaleRevision {
+                expected: 0,
+                actual: 1
+            })
+        ));
+
+        let deleted = database
+            .delete_profile_tag_vocabulary(1, "kick")
+            .expect("delete label");
+        assert_eq!(
+            deleted,
+            ProfileTagVocabularyDeleteReceipt {
+                revision: 2,
+                removed: Some(ProfileTagVocabularyEntry {
+                    label: String::from("kick"),
+                    category: ProfileTagCategory::SoundType,
+                }),
+            }
+        );
+
+        let missing = database
+            .delete_profile_tag_vocabulary(2, "kick")
+            .expect("missing delete is a no-op");
+        assert_eq!(
+            missing,
+            ProfileTagVocabularyDeleteReceipt {
+                revision: 2,
+                removed: None,
+            }
+        );
+
+        let restored = database
+            .set_profile_tag_category(
+                deleted.revision,
+                "kick",
+                deleted.removed.as_ref().expect("before image").category,
+            )
+            .expect("restore before image");
+        assert_eq!(restored.revision, 3);
+
+        drop(database);
+        let (_guard, reopened) = open_database(&directory);
+        let lookup = reopened
+            .lookup_profile_tag_categories(&[String::from("kick")])
+            .expect("reopened vocabulary");
+        assert_eq!(lookup.revision, 3);
+        assert_eq!(lookup.entries.len(), 1);
+        assert_eq!(lookup.entries[0].category, ProfileTagCategory::SoundType);
+    }
+
+    #[test]
     fn literal_prefix_pages_are_ordered_keyset_pages_and_revision_fenced() {
         let _runtime = TestRuntimeGuard::acquire();
         let directory = tempdir().expect("test directory");
@@ -900,6 +1051,14 @@ mod tests {
                 changed: true
             })
         ));
+        for label in ["loop", "oneshot", "one_shot", "one-shot"] {
+            assert!(matches!(
+                database.delete_profile_tag_vocabulary(1, label),
+                Err(LibraryError::InvalidProfileTagVocabularyInput(
+                    ProfileTagVocabularyInputError::LockedPlaybackLabelCannotBeDeleted
+                ))
+            ));
+        }
 
         let too_long = "x".repeat(PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES + 1);
         assert!(matches!(
@@ -925,6 +1084,55 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn vocabulary_deletion_rolls_back_on_revision_overflow_and_malformed_rows() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let directory = tempdir().expect("test directory");
+        let (_guard, mut database) = open_database(&directory);
+        database
+            .set_profile_tag_category(0, "kick", ProfileTagCategory::SoundType)
+            .expect("insert label");
+        database
+            .connection
+            .execute(
+                "UPDATE metadata SET value = ?1 WHERE key = ?2",
+                params![u64::MAX.to_string(), PROFILE_TAG_VOCABULARY_REVISION_KEY],
+            )
+            .expect("set maximum revision");
+
+        assert!(matches!(
+            database.delete_profile_tag_vocabulary(u64::MAX, "kick"),
+            Err(LibraryError::ProfileTagVocabularyRevisionOverflow)
+        ));
+        let unchanged = database
+            .lookup_profile_tag_categories(&[String::from("kick")])
+            .expect("lookup after rollback");
+        assert_eq!(unchanged.revision, u64::MAX);
+        assert_eq!(unchanged.entries.len(), 1);
+
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE profile_tag_vocabulary;
+                 CREATE TABLE profile_tag_vocabulary (label TEXT PRIMARY KEY COLLATE BINARY, category TEXT);
+                 INSERT INTO profile_tag_vocabulary(label, category) VALUES ('bad', 'unknown');",
+            )
+            .expect("corrupt vocabulary fixture");
+        assert!(matches!(
+            database.delete_profile_tag_vocabulary(u64::MAX, "bad"),
+            Err(LibraryError::ProfileTagVocabularyMalformedData { .. })
+        ));
+        let row_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM profile_tag_vocabulary WHERE label = 'bad'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("corrupt row remains");
+        assert_eq!(row_count, 1);
     }
 
     #[test]

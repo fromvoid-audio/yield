@@ -51,10 +51,10 @@ pub use preferences::{
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 
 pub use vocabulary::{
-    MAX_VOCABULARY_REQUESTS_IN_FLIGHT, ProfileTagCategory, ProfileTagVocabularyEntry,
-    ProfileTagVocabularyInputError, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
-    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt, VocabularyRequest,
-    VocabularyRequestId, VocabularyStatus, VocabularySubmitError,
+    MAX_VOCABULARY_REQUESTS_IN_FLIGHT, ProfileTagCategory, ProfileTagVocabularyDeleteReceipt,
+    ProfileTagVocabularyEntry, ProfileTagVocabularyInputError, ProfileTagVocabularyLookup,
+    ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
+    VocabularyRequest, VocabularyRequestId, VocabularyStatus, VocabularySubmitError,
 };
 
 /// The non-live profile used by the GPUI application session.
@@ -342,6 +342,23 @@ impl SourceRegistryService {
             expected_revision,
             label,
             category,
+        )
+    }
+
+    /// Submit deletion of one exact profile vocabulary label at a matching revision.
+    pub fn delete_profile_tag_vocabulary(
+        &self,
+        expected_revision: u64,
+        label: String,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyDeleteReceipt>, VocabularySubmitError> {
+        let request = VocabularyRequestId::from_raw(
+            self.next_vocabulary_request.fetch_add(1, Ordering::Relaxed),
+        );
+        vocabulary::delete_profile_tag_vocabulary(
+            &self.vocabulary,
+            request,
+            expected_revision,
+            label,
         )
     }
 
@@ -2451,10 +2468,12 @@ mod tests {
 
         let status = service.vocabulary_status();
         let request = service.lookup_profile_tag_categories(vec![String::from("kick")]);
+        let deletion = service.delete_profile_tag_vocabulary(0, String::from("kick"));
         // Release the worker before assertions so a failed assertion can still shut it down.
         gate.wait();
         assert_eq!(status, VocabularyStatus::Initializing);
         assert!(matches!(request, Err(VocabularySubmitError::Initializing)));
+        assert!(matches!(deletion, Err(VocabularySubmitError::Initializing)));
         wait_for_vocabulary_available(&service);
         service.shutdown().expect("shutdown");
     }
@@ -2534,6 +2553,77 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_service_deletes_profile_entry_with_before_image_and_reopens() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_vocabulary_available(&service);
+
+        let mut set = service
+            .set_profile_tag_category(0, String::from("restore-me"), ProfileTagCategory::Prefix)
+            .expect("set admission");
+        let set = receive_vocabulary(&mut set).expect("set result");
+        assert_eq!(set.revision, 1);
+
+        let mut delete = service
+            .delete_profile_tag_vocabulary(1, String::from("restore-me"))
+            .expect("delete admission");
+        let delete = receive_vocabulary(&mut delete).expect("delete result");
+        assert_eq!(delete.revision, 2);
+        assert_eq!(
+            delete.removed,
+            Some(ProfileTagVocabularyEntry {
+                label: String::from("restore-me"),
+                category: ProfileTagCategory::Prefix,
+            })
+        );
+
+        let mut missing = service
+            .delete_profile_tag_vocabulary(2, String::from("restore-me"))
+            .expect("missing delete admission");
+        let missing = receive_vocabulary(&mut missing).expect("missing delete result");
+        assert_eq!(missing.revision, 2);
+        assert!(missing.removed.is_none());
+
+        let mut stale = service
+            .delete_profile_tag_vocabulary(1, String::from("restore-me"))
+            .expect("stale delete admission");
+        assert!(matches!(
+            receive_vocabulary(&mut stale),
+            Err(LibraryError::ProfileTagVocabularyStaleRevision {
+                expected: 1,
+                actual: 2
+            })
+        ));
+
+        let mut restore = service
+            .set_profile_tag_category(2, String::from("restore-me"), ProfileTagCategory::Prefix)
+            .expect("restore admission");
+        let restore = receive_vocabulary(&mut restore).expect("restore result");
+        assert_eq!(restore.revision, 3);
+
+        service.shutdown().expect("shutdown");
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        wait_for_vocabulary_available(&reopened);
+        let mut lookup = reopened
+            .lookup_profile_tag_categories(vec![String::from("restore-me")])
+            .expect("lookup admission");
+        let lookup = receive_vocabulary(&mut lookup).expect("lookup result");
+        assert_eq!(lookup.revision, 3);
+        assert_eq!(
+            lookup.entries,
+            vec![ProfileTagVocabularyEntry {
+                label: String::from("restore-me"),
+                category: ProfileTagCategory::Prefix,
+            }]
+        );
+        reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
     fn vocabulary_service_bounds_unconsumed_handles_and_releases_permits() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -2547,6 +2637,14 @@ mod tests {
                 ProfileTagVocabularyInputError::EmptyLabel
             ))
         ));
+        for label in ["loop", "oneshot", "one_shot", "one-shot"] {
+            assert!(matches!(
+                service.delete_profile_tag_vocabulary(0, String::from(label)),
+                Err(VocabularySubmitError::Invalid(
+                    ProfileTagVocabularyInputError::LockedPlaybackLabelCannotBeDeleted
+                ))
+            ));
+        }
 
         let mut handles = Vec::new();
         for index in 0..MAX_VOCABULARY_REQUESTS_IN_FLIGHT {
@@ -2619,6 +2717,42 @@ mod tests {
         assert_eq!(restored.revision, 2);
         assert_eq!(restored.entries.len(), 2);
         final_service.shutdown().expect("final shutdown");
+    }
+
+    #[test]
+    fn vocabulary_service_shutdown_drains_dropped_delete() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_vocabulary_available(&service);
+
+        let mut set = service
+            .set_profile_tag_category(
+                0,
+                String::from("drop-delete"),
+                ProfileTagCategory::Character,
+            )
+            .expect("set admission");
+        let set = receive_vocabulary(&mut set).expect("set result");
+        assert_eq!(set.revision, 1);
+        let delete = service
+            .delete_profile_tag_vocabulary(1, String::from("drop-delete"))
+            .expect("delete admission");
+        drop(delete);
+        service.shutdown().expect("shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        wait_for_vocabulary_available(&reopened);
+        let mut lookup = reopened
+            .lookup_profile_tag_categories(vec![String::from("drop-delete")])
+            .expect("lookup admission");
+        let lookup = receive_vocabulary(&mut lookup).expect("lookup result");
+        assert_eq!(lookup.revision, 2);
+        assert!(lookup.entries.is_empty());
+        reopened.shutdown().expect("reopen shutdown");
     }
 
     #[test]
@@ -3412,6 +3546,10 @@ mod tests {
         ));
         assert!(matches!(
             service.lookup_profile_tag_categories(vec![String::from("kick")]),
+            Err(VocabularySubmitError::Unavailable(_))
+        ));
+        assert!(matches!(
+            service.delete_profile_tag_vocabulary(0, String::from("kick")),
             Err(VocabularySubmitError::Unavailable(_))
         ));
         assert!(matches!(

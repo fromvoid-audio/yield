@@ -1759,3 +1759,9 @@ A clean detached `35a451c63` snapshot built `target/qa/Wavecrate Normalized Prev
 ### Display-name projection foundation
 
 Core now exposes the native Disk/Label display mode and a pure name projection: Disk shows the filename stem, Label uses an already ordered metadata label, and unavailable/empty labels fall back to the disk stem. This changes no file identity or filename and is not yet wired to the browser. Both focused parity tests passed, including nested paths, Unicode, final-extension handling, preserved label order, and fallback. Bounded targeted label hydration follows separately.
+
+### Profile vocabulary deletion primitive
+
+The library owner and session vocabulary service now expose `delete_profile_tag_vocabulary(expected_revision, label)`. A single profile transaction validates the canonical label and locked playback aliases, checks the revision, deletes the exact dictionary entry, and returns its bounded label/category before-image. Missing entries at the expected revision are no-ops; overflow or malformed stored categories roll back. The receipt can be restored through the existing category-set API. This is dictionary-only infrastructure: source assignments remain intact, UI deletion/undo and native combined assignment deletion are not yet implemented.
+
+Validation: 13 library vocabulary tests, six session vocabulary-service tests, targeted owner/drain tests, library/session checks, formatting and diff checks passed. Coverage includes stale/no-op semantics, before-image restoration/reopen, validation before admission, overflow rollback, and accepted deletes surviving dropped result receivers through shutdown.

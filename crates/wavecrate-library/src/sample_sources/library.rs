@@ -42,9 +42,10 @@ pub use owner::{
 };
 pub use tag_vocabulary::{
     PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES, PROFILE_TAG_VOCABULARY_MAX_LOOKUP_LABELS,
-    PROFILE_TAG_VOCABULARY_PAGE_MAX_PAGE_SIZE, ProfileTagCategory, ProfileTagVocabularyEntry,
-    ProfileTagVocabularyInputError, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
-    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
+    PROFILE_TAG_VOCABULARY_PAGE_MAX_PAGE_SIZE, ProfileTagCategory,
+    ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyEntry, ProfileTagVocabularyInputError,
+    ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
+    ProfileTagVocabularySetReceipt,
 };
 
 #[cfg(test)]
