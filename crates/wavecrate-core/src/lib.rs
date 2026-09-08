@@ -6,10 +6,15 @@
 use std::path::{Path, PathBuf};
 
 mod folder_tree;
+mod playback_history;
 mod selection;
 
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
+};
+pub use playback_history::{
+    PLAYBACK_NAVIGATION_HISTORY_LIMIT, PlaybackHistoryEntry, PlaybackNavigationHistory,
+    PlaybackSpan,
 };
 pub use selection::BrowserSelection;
 

@@ -20,7 +20,7 @@ use gpui::{
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
-    FolderTreeRow, SortColumn,
+    FolderTreeRow, PlaybackNavigationHistory, SortColumn,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_library::sample_sources::{SampleSource, SourceId};
@@ -34,6 +34,7 @@ use crate::theme::ActiveTheme;
 
 mod audio_output;
 mod handoff;
+mod history;
 mod motion;
 mod preferences;
 mod sidebar;
@@ -236,6 +237,7 @@ pub(crate) struct Browser {
     playing_path: Option<PathBuf>,
     loop_enabled: bool,
     autoplay_selection: bool,
+    playback_history: PlaybackNavigationHistory,
     latest_playback_request_id: Option<PlaybackRequestId>,
     pending_progress_poll: Option<(PlaybackRequestId, u64)>,
     playback_cursor_pending: Option<f32>,
@@ -360,6 +362,7 @@ impl Browser {
             playing_path: None,
             loop_enabled: false,
             autoplay_selection: true,
+            playback_history: PlaybackNavigationHistory::default(),
             latest_playback_request_id: None,
             pending_progress_poll: None,
             playback_cursor_pending: None,
@@ -626,7 +629,7 @@ impl Browser {
                 .spawn(async move { enumerate_audio_files_with_cancel(&root, Some(&cancellation)) })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if view.scan_generation != generation {
+                if !scan_completion_is_current(generation, view.scan_generation) {
                     return;
                 }
                 view.scan_cancel = None;
@@ -1561,6 +1564,9 @@ impl Browser {
         if self.handle_audio_output_key_down(event, window, cx) {
             return;
         }
+        if self.audio_settings_open && self.audio_output_focus_handle.is_focused(window) {
+            return;
+        }
         if self.volume_focus_handle.is_focused(window) {
             if key == "escape" {
                 self.cancel_volume_drag(window, cx);
@@ -1569,6 +1575,12 @@ impl Browser {
             } else if !event.is_held || volume::is_keyboard_key(key) {
                 self.change_volume_from_key(key, shift, cx);
             }
+            return;
+        }
+        if let Some(direction) =
+            history::history_shortcut_direction(key, secondary, shift, alt, function, event.is_held)
+        {
+            self.navigate_playback_history(direction, cx);
             return;
         }
         if handoff::should_route_browser_copy(
@@ -1690,6 +1702,10 @@ fn source_label(root: &Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| root.display().to_string())
+}
+
+fn scan_completion_is_current(completion_generation: u64, current_generation: u64) -> bool {
+    completion_generation == current_generation
 }
 
 #[cfg(test)]

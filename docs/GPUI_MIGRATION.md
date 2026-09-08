@@ -547,6 +547,28 @@ that output. Tests did not change the hardware to another sample rate. Audible
 quality, other output backends, and Windows hardware acceptance remain manual
 platform checks.
 
+### Playback navigation history, 2026-09-08
+
+Cmd/Ctrl+Left and Right now navigate up to 50 accepted audition locations,
+including the file and normalized playback span. New audition requests branch
+history after going back; replay and automatic output resumption do not record
+duplicates. Navigation restores cached registered sources, reveals the containing
+folder and sample, clears a hiding filename filter, and uses the current volume
+and loop preference. Forgotten or unavailable cached sources report an error.
+Search, volume, and audio settings retain their own keyboard focus routing.
+
+Cached activation cancels obsolete source scans and advances their completion
+fence before restoring the projection. Waveform and audio initialization retain
+their existing generation and playback-epoch fences. History is session-only;
+persistent listen counts and last-played metadata remain separate parity work.
+
+Validation: locked UI check, 66 browser tests (one manual benchmark ignored),
+seven core history tests, diff checks, and signed macOS development build passed.
+An isolated two-source GUI fixture confirmed Back/Forward, same-file range
+restoration, cross-source navigation into a nested folder, search-focus isolation,
+and clearing a hiding filter when navigating from browser focus. The test app
+quit cleanly. Audible quality and Windows input acceptance remain unverified.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

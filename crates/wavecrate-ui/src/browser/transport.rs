@@ -28,6 +28,8 @@ pub(super) struct PlaybackCursorSample {
 pub(super) enum PlaybackIntentOrigin {
     Explicit,
     SelectionAutoplay,
+    HistoryReplay,
+    AudioOutputResume,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,7 +314,11 @@ impl Browser {
         })
     }
 
-    fn request_playback_intent(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
+    pub(super) fn request_playback_intent(
+        &mut self,
+        intent: PlaybackIntent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
             self.playback_status = "Invalid playback position".to_string();
@@ -406,6 +412,9 @@ impl Browser {
         self.playback_cursor_interpolation = None;
         match handle.try_play(request) {
             Ok(request_id) => {
+                if should_record_playback_history(intent.origin) {
+                    self.record_playback_history_for_intent(&intent);
+                }
                 self.mark_volume_applied_by_play();
                 self.latest_playback_request_id = Some(request_id);
                 self.playing_path = Some(intent.path);
@@ -548,7 +557,10 @@ impl Browser {
                 resume.path.as_path(),
             )
         {
-            return Some(resume.clone());
+            return Some(PlaybackIntent {
+                origin: PlaybackIntentOrigin::AudioOutputResume,
+                ..resume.clone()
+            });
         }
         let playing_path = self.playing_path.as_ref()?;
         if selected_path != Some(playing_path) {
@@ -561,7 +573,7 @@ impl Browser {
             looped: self.loop_enabled,
             volume: super::volume::quantize_volume(self.volume),
             path: playing_path.clone(),
-            origin: PlaybackIntentOrigin::Explicit,
+            origin: PlaybackIntentOrigin::AudioOutputResume,
         })
     }
 
@@ -686,6 +698,13 @@ fn should_cancel_pending_autoplay(
     !autoplay_enabled && origin == Some(PlaybackIntentOrigin::SelectionAutoplay)
 }
 
+fn should_record_playback_history(origin: PlaybackIntentOrigin) -> bool {
+    matches!(
+        origin,
+        PlaybackIntentOrigin::Explicit | PlaybackIntentOrigin::SelectionAutoplay
+    )
+}
+
 fn preview_cursor_ratio_for_browser(browser: &Browser, ratio: f32) -> Option<f32> {
     browser.waveform.as_ref()?;
     preview_cursor_ratio(ratio)
@@ -752,6 +771,7 @@ mod tests {
         audio_output_resume_is_current, authoritative_cursor_progress, cursor_interpolation,
         normalized_playback_start, playback_mode_for_intent, playback_request_number_is_current,
         preview_cursor_ratio, should_cancel_pending_autoplay, should_queue_initialized_playback,
+        should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -838,6 +858,22 @@ mod tests {
             Some(PlaybackIntentOrigin::SelectionAutoplay)
         ));
         assert!(!should_cancel_pending_autoplay(false, None));
+    }
+
+    #[test]
+    fn pending_init_origins_record_but_accepted_output_resume_does_not() {
+        assert!(should_record_playback_history(
+            PlaybackIntentOrigin::Explicit
+        ));
+        assert!(should_record_playback_history(
+            PlaybackIntentOrigin::SelectionAutoplay
+        ));
+        assert!(!should_record_playback_history(
+            PlaybackIntentOrigin::HistoryReplay
+        ));
+        assert!(!should_record_playback_history(
+            PlaybackIntentOrigin::AudioOutputResume
+        ));
     }
 
     #[test]

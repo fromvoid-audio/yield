@@ -45,6 +45,14 @@ path identities; canonicalization happens once during background scanning.
 Filtering and sorting must not probe the filesystem. UI selection follows
 sample identity, not the position of a row in the filtered list.
 
+`PlaybackNavigationHistory` owns a bounded sequence of file paths and normalized
+audition spans in the core crate. The browser records newly accepted playback
+requests; history replay and automatic audio-output resumption do not add
+entries. Back/forward navigation restores a cached registered source and its
+folder projection without filesystem work on the UI thread. Playback uses the
+current volume and loop preference. This navigation history is session-only;
+it is separate from persistent listening statistics and undo history.
+
 `BrowserSelection` owns explicit batch membership and the range anchor in the
 core crate. The focused sample remains a separate UI concern and alone drives
 waveform loading and audition. Sorting preserves selected identities; filtering
