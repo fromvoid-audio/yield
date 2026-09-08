@@ -108,8 +108,8 @@ with runtime identity checks and retain the accepted audition span. Loop and
 one-shot tags select the next-play mode automatically; a manual choice remains
 in effect for the loaded file.
 
-Full parity is not complete. Remaining workflows include tag completion,
-vocabulary management and naming, physical file operations and recovery, waveform
+Full parity is not complete. Remaining workflows include full tag-library
+management and naming, physical file operations and recovery, waveform
 editing/export, analysis and timing controls, external drag, and additional settings
 and platform acceptance.
 See the [parity register](docs/GPUI_MIGRATION.md) for detailed validation evidence
