@@ -113,16 +113,19 @@ impl TagChipsState {
 /// Mark the selected-tag page stale while retaining an in-flight same-lifecycle request.
 pub(super) fn invalidate(browser: &mut Browser) {
     browser.tag_chips.mark_dirty();
+    super::tag_library::invalidate(browser);
 }
 
 /// Drop selected-tag page state when the active source lifecycle is replaced.
 pub(super) fn cancel_for_source_change(browser: &mut Browser) {
     browser.tag_chips.cancel_for_source_change();
+    super::tag_library::cancel_for_source_change(browser);
 }
 
 /// Drop selected-tag page state after a durable curation outcome changes the revision.
 pub(super) fn invalidate_after_curation(browser: &mut Browser) {
     browser.tag_chips.invalidate_after_curation();
+    super::tag_library::invalidate_after_curation(browser);
 }
 
 /// Return whether the source poll lane has chip work to service.

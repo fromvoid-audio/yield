@@ -47,6 +47,8 @@ mod source_registry;
 mod tag_chips;
 mod tag_completion;
 mod tag_filter;
+mod tag_library;
+mod tag_pager;
 mod tags;
 mod transport;
 mod view;
@@ -298,6 +300,7 @@ pub(crate) struct Browser {
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
+    tag_library: tag_library::TagLibraryState,
     tag_filter: tag_filter::TagFilterState,
     tag_chips: tag_chips::TagChipsState,
     collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
@@ -481,6 +484,7 @@ impl Browser {
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
+            tag_library: tag_library::TagLibraryState::default(),
             tag_filter: tag_filter::TagFilterState::default(),
             tag_chips: tag_chips::TagChipsState::default(),
             collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],

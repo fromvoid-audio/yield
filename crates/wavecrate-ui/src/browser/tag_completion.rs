@@ -6,12 +6,12 @@
 use std::sync::mpsc::TryRecvError;
 
 use gpui::{ClickEvent, Context, ScrollHandle, div, prelude::*, px};
-use wavecrate_core::{DEFAULT_METADATA_TAGS, parse_tag_input};
+use wavecrate_core::parse_tag_input;
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{
-    PROFILE_TAG_VOCABULARY_PAGE_MAX_PAGE_SIZE, ProfileTagVocabularyEntry, ProfileTagVocabularyPage,
+    PROFILE_TAG_VOCABULARY_PAGE_MAX_PAGE_SIZE, ProfileTagVocabularyPage,
     ProfileTagVocabularyPageCursor, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
-    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceTagPageCursor, SourceTagPageEntry,
+    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceTagPageCursor,
 };
 use wavecrate_session::{
     CatalogCommand, CatalogEvent, CatalogSubmitError, CatalogTagPageQuery, VocabularyRequest,
@@ -23,11 +23,17 @@ use crate::theme::{color, transparent};
 use super::catalog;
 use super::curation::TagAdmissionResult;
 use super::source_registry::SourceRegistryGlobal;
+#[cfg(test)]
+use super::tag_pager::SourcePageWindow;
+use super::tag_pager::{
+    CandidateToken, MergedCandidate, ProfilePageWindow, SelectionDirection, StreamCheckpoint,
+    TagPagerState, push_page_history,
+};
 use super::{Browser, tags};
 
-const MAX_CURSOR_HISTORY: usize = 32;
-const MAX_SEEN_EXACT: usize = 128;
 const MERGED_PAGE_SIZE: usize = 6;
+#[cfg(test)]
+const MAX_CURSOR_HISTORY: usize = super::tag_pager::MAX_CURSOR_HISTORY;
 
 /// Browser-owned state for one bounded add-tag completion query.
 pub(super) struct TagCompletionState {
@@ -36,19 +42,10 @@ pub(super) struct TagCompletionState {
     source_pending: Option<PendingSourcePage>,
     source_target: Option<SourcePageTarget>,
     source_ready: bool,
-    source_page: Option<SourcePageWindow>,
     profile_pending: Option<PendingProfilePage>,
     profile_target: Option<ProfilePageTarget>,
     profile_ready: bool,
-    profile_page: Option<ProfilePageWindow>,
-    default_offset: usize,
-    merged_page: Vec<MergedCandidate>,
-    current_checkpoint: Option<StreamCheckpoint>,
-    page_history: Vec<StreamCheckpoint>,
-    seen_exact: Vec<String>,
-    page_epoch: u64,
-    page_has_next: bool,
-    selected: Option<usize>,
+    pager: TagPagerState,
     message: Option<String>,
     suppress_next_input: bool,
     pub(super) scroll_handle: ScrollHandle,
@@ -62,19 +59,10 @@ impl Default for TagCompletionState {
             source_pending: None,
             source_target: None,
             source_ready: false,
-            source_page: None,
             profile_pending: None,
             profile_target: None,
             profile_ready: false,
-            profile_page: None,
-            default_offset: 0,
-            merged_page: Vec::new(),
-            current_checkpoint: None,
-            page_history: Vec::new(),
-            seen_exact: Vec::new(),
-            page_epoch: 0,
-            page_has_next: false,
-            selected: None,
+            pager: TagPagerState::default(),
             message: None,
             suppress_next_input: false,
             scroll_handle: ScrollHandle::new(),
@@ -114,105 +102,13 @@ struct PendingProfilePage {
     request: VocabularyRequest<ProfileTagVocabularyPage>,
 }
 
-struct SourcePageWindow {
-    revision: u64,
-    entries: Vec<SourceTagPageEntry>,
-    next_cursor: Option<SourceTagPageCursor>,
-    page_start: Option<SourceTagPageCursor>,
-    offset: usize,
-}
-
-struct ProfilePageWindow {
-    revision: u64,
-    entries: Vec<ProfileTagVocabularyEntry>,
-    next_cursor: Option<ProfileTagVocabularyPageCursor>,
-    page_start: Option<ProfileTagVocabularyPageCursor>,
-    offset: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct StreamCheckpoint {
-    source_loaded: bool,
-    source_after_cursor: Option<SourceTagPageCursor>,
-    source_offset: usize,
-    profile_loaded: bool,
-    profile_revision: Option<u64>,
-    profile_after_cursor: Option<ProfileTagVocabularyPageCursor>,
-    profile_offset: usize,
-    default_offset: usize,
-    seen_exact: Vec<String>,
-}
-
-impl StreamCheckpoint {
-    fn initial() -> Self {
-        Self {
-            source_loaded: true,
-            source_after_cursor: None,
-            source_offset: 0,
-            profile_loaded: true,
-            profile_revision: None,
-            profile_after_cursor: None,
-            profile_offset: 0,
-            default_offset: 0,
-            seen_exact: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum MergedCandidate {
-    Default(&'static str),
-    Profile {
-        label: String,
-    },
-    Source {
-        tag_id: i64,
-        label: String,
-        exact_label: Option<String>,
-        revision: u64,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CandidateToken {
-    Default(&'static str),
-    Profile(String),
-    Source(i64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Lane {
-    Default,
-    Profile,
-    Source,
-}
-
-#[derive(Clone, Copy)]
-enum SelectionDirection {
-    Previous,
-    Next,
-}
-
 impl TagCompletionState {
     fn bump_generation(&mut self) {
         self.draft_generation = self.draft_generation.wrapping_add(1);
     }
 
-    fn invalidate_menu(&mut self) {
-        self.merged_page.clear();
-        self.selected = None;
-        self.page_has_next = false;
-        self.page_epoch = self.page_epoch.wrapping_add(1);
-    }
-
     fn clear_pages(&mut self) {
-        self.source_page = None;
-        self.profile_page = None;
-        self.default_offset = 0;
-        self.current_checkpoint = None;
-        self.page_history.clear();
-        self.seen_exact.clear();
-        self.invalidate_menu();
+        self.pager.clear_pages();
     }
 
     fn clear_query(&mut self, drop_pending: bool) {
@@ -246,7 +142,7 @@ impl TagCompletionState {
         self.profile_ready = false;
         self.clear_pages();
         if self.desired.is_some() {
-            self.current_checkpoint = Some(StreamCheckpoint::initial());
+            self.pager.current_checkpoint = Some(StreamCheckpoint::initial());
         }
         self.message = None;
     }
@@ -264,36 +160,15 @@ impl TagCompletionState {
     }
 
     fn snapshot(&self) -> StreamCheckpoint {
-        StreamCheckpoint {
-            source_loaded: self.source_page.is_some(),
-            source_after_cursor: self.source_page.as_ref().and_then(|page| page.page_start),
-            source_offset: self
-                .source_page
-                .as_ref()
-                .map(|page| page.offset)
-                .unwrap_or_default(),
-            profile_loaded: self.profile_page.is_some(),
-            profile_revision: self.profile_page.as_ref().map(|page| page.revision),
-            profile_after_cursor: self
-                .profile_page
-                .as_ref()
-                .and_then(|page| page.page_start.clone()),
-            profile_offset: self
-                .profile_page
-                .as_ref()
-                .map(|page| page.offset)
-                .unwrap_or_default(),
-            default_offset: self.default_offset,
-            seen_exact: self.seen_exact.clone(),
-        }
+        self.pager.snapshot()
     }
 
     fn candidate_count(&self) -> usize {
-        self.merged_page.len()
+        self.pager.candidate_count()
     }
 
     fn candidate(&self, index: usize) -> Option<MergedCandidate> {
-        self.merged_page.get(index).cloned()
+        self.pager.candidate(index)
     }
 }
 
@@ -432,7 +307,7 @@ pub(super) fn apply_catalog_event(
         } if current && *expected_revision == pending.target.query.context.revision => {
             browser.tag_completion.source_target = None;
             browser.tag_completion.source_ready = true;
-            browser.tag_completion.source_page = None;
+            browser.tag_completion.pager.source_page = None;
             browser.tag_completion.message = Some(
                 if observed_revision
                     .is_some_and(|revision| revision != pending.target.query.context.revision)
@@ -448,7 +323,7 @@ pub(super) fn apply_catalog_event(
             if current {
                 browser.tag_completion.source_target = None;
                 browser.tag_completion.source_ready = true;
-                browser.tag_completion.source_page = None;
+                browser.tag_completion.pager.source_page = None;
                 browser.tag_completion.message = Some(String::from(
                     "Source tag suggestions no longer match this source revision",
                 ));
@@ -661,7 +536,7 @@ fn apply_profile_page(
     {
         browser.tag_completion.profile_target = None;
         browser.tag_completion.profile_ready = true;
-        browser.tag_completion.profile_page = None;
+        browser.tag_completion.pager.profile_page = None;
         browser.tag_completion.message = Some(String::from(
             "Tag suggestions no longer match this vocabulary revision",
         ));
@@ -669,7 +544,7 @@ fn apply_profile_page(
         return true;
     }
     let entry_count = page.entries.len();
-    browser.tag_completion.profile_page = Some(ProfilePageWindow {
+    browser.tag_completion.pager.profile_page = Some(ProfilePageWindow {
         revision: page.revision,
         entries: page.entries,
         next_cursor: page.next_cursor,
@@ -727,13 +602,6 @@ fn queue_profile_page(
     browser.start_source_registry_poll(cx);
 }
 
-fn push_page_history(history: &mut Vec<StreamCheckpoint>, checkpoint: StreamCheckpoint) {
-    if history.len() >= MAX_CURSOR_HISTORY {
-        history.remove(0);
-    }
-    history.push(checkpoint);
-}
-
 fn merge_available_into_page(browser: &mut Browser, cx: &mut Context<Browser>) {
     let Some(query) = browser.tag_completion.desired.clone() else {
         return;
@@ -755,6 +623,7 @@ fn merge_available_into_page(browser: &mut Browser, cx: &mut Context<Browser>) {
     if let Some(cursor) = merge.profile_after {
         let revision = browser
             .tag_completion
+            .pager
             .profile_page
             .as_ref()
             .map(|page| page.revision);
@@ -765,208 +634,11 @@ fn merge_available_into_page(browser: &mut Browser, cx: &mut Context<Browser>) {
     sync_completion_ghost(browser, cx, &query.prefix);
 }
 
-struct MergePageResult {
-    source_after: Option<SourceTagPageCursor>,
-    profile_after: Option<ProfileTagVocabularyPageCursor>,
-}
-
-fn merge_ready_page(state: &mut TagCompletionState, prefix: &str) -> MergePageResult {
-    let mut source_after = None;
-    let mut profile_after = None;
-    let mut changed = false;
-    while state.merged_page.len() < MERGED_PAGE_SIZE {
-        if let Some(cursor) = source_next_cursor(state) {
-            source_after = Some(cursor);
-            break;
-        }
-        if let Some(cursor) = profile_next_cursor(state) {
-            profile_after = Some(cursor);
-            break;
-        }
-        let Some(lane) = choose_lane(state, prefix) else {
-            break;
-        };
-        let exact = lane_exact_key(state, lane, prefix);
-        let candidate = lane_candidate(state, lane, prefix);
-        advance_lane(state, lane);
-        let duplicate = exact
-            .as_deref()
-            .is_some_and(|key| state.seen_exact.iter().any(|seen| seen == key));
-        if duplicate {
-            continue;
-        }
-        if let Some(key) = exact {
-            if state.seen_exact.len() >= MAX_SEEN_EXACT {
-                state.seen_exact.remove(0);
-            }
-            state.seen_exact.push(key);
-        }
-        let Some(candidate) = candidate else {
-            break;
-        };
-        state.merged_page.push(candidate);
-        changed = true;
-    }
-
-    state.page_has_next =
-        state.merged_page.len() >= MERGED_PAGE_SIZE && has_unconsumed_candidate(state, prefix);
-    if changed {
-        state.selected = None;
-        state.page_epoch = state.page_epoch.wrapping_add(1);
-    }
-    MergePageResult {
-        source_after,
-        profile_after,
-    }
-}
-
-fn has_unconsumed_candidate(state: &TagCompletionState, prefix: &str) -> bool {
-    default_head(prefix, state.default_offset).is_some()
-        || profile_head(state, prefix).is_some()
-        || source_head(state, prefix).is_some()
-        || source_next_cursor(state).is_some()
-        || profile_next_cursor(state).is_some()
-}
-
-fn source_next_cursor(state: &TagCompletionState) -> Option<SourceTagPageCursor> {
-    state.source_page.as_ref().and_then(|page| {
-        (page.offset >= page.entries.len())
-            .then_some(page.next_cursor)
-            .flatten()
-    })
-}
-
-fn profile_next_cursor(state: &TagCompletionState) -> Option<ProfileTagVocabularyPageCursor> {
-    state.profile_page.as_ref().and_then(|page| {
-        (page.offset >= page.entries.len())
-            .then(|| page.next_cursor.clone())
-            .flatten()
-    })
-}
-
-fn default_head(prefix: &str, offset: usize) -> Option<&'static str> {
-    DEFAULT_METADATA_TAGS
-        .into_iter()
-        .filter(|label| label.starts_with(prefix))
-        .nth(offset)
-}
-
-fn profile_head<'a>(
-    state: &'a TagCompletionState,
+fn merge_ready_page(
+    state: &mut TagCompletionState,
     prefix: &str,
-) -> Option<&'a ProfileTagVocabularyEntry> {
-    state.profile_page.as_ref().and_then(|page| {
-        page.entries
-            .get(page.offset)
-            .filter(|entry| entry.label.starts_with(prefix))
-    })
-}
-
-fn source_head<'a>(state: &'a TagCompletionState, prefix: &str) -> Option<&'a SourceTagPageEntry> {
-    state.source_page.as_ref().and_then(|page| {
-        page.entries
-            .get(page.offset)
-            .filter(|entry| entry.is_preview || entry.normalized_text.starts_with(prefix))
-    })
-}
-
-fn lane_key<'a>(state: &'a TagCompletionState, lane: Lane, prefix: &str) -> Option<&'a str> {
-    match lane {
-        Lane::Default => default_head(prefix, state.default_offset),
-        Lane::Profile => profile_head(state, prefix).map(|entry| entry.label.as_str()),
-        Lane::Source => source_head(state, prefix).map(|entry| entry.normalized_text.as_str()),
-    }
-}
-
-fn lane_source_id(state: &TagCompletionState, lane: Lane, prefix: &str) -> i64 {
-    match lane {
-        Lane::Source => source_head(state, prefix)
-            .map(|entry| entry.id)
-            .unwrap_or_default(),
-        Lane::Default | Lane::Profile => 0,
-    }
-}
-
-fn lane_priority(lane: Lane) -> u8 {
-    match lane {
-        Lane::Source => 0,
-        Lane::Profile => 1,
-        Lane::Default => 2,
-    }
-}
-
-fn compare_lanes(
-    state: &TagCompletionState,
-    left: Lane,
-    right: Lane,
-    prefix: &str,
-) -> std::cmp::Ordering {
-    lane_key(state, left, prefix)
-        .cmp(&lane_key(state, right, prefix))
-        .then_with(|| lane_priority(left).cmp(&lane_priority(right)))
-        .then_with(|| {
-            lane_source_id(state, left, prefix).cmp(&lane_source_id(state, right, prefix))
-        })
-}
-
-fn choose_lane(state: &TagCompletionState, prefix: &str) -> Option<Lane> {
-    [Lane::Default, Lane::Profile, Lane::Source]
-        .into_iter()
-        .filter(|lane| lane_key(state, *lane, prefix).is_some())
-        .min_by(|left, right| compare_lanes(state, *left, *right, prefix))
-}
-
-fn lane_exact_key(state: &TagCompletionState, lane: Lane, prefix: &str) -> Option<String> {
-    match lane {
-        Lane::Default => default_head(prefix, state.default_offset).map(String::from),
-        Lane::Profile => profile_head(state, prefix).map(|entry| entry.label.clone()),
-        Lane::Source => source_head(state, prefix)
-            .filter(|entry| !entry.is_preview)
-            .map(|entry| entry.normalized_text.clone()),
-    }
-}
-
-fn lane_candidate(state: &TagCompletionState, lane: Lane, prefix: &str) -> Option<MergedCandidate> {
-    match lane {
-        Lane::Default => default_head(prefix, state.default_offset).map(MergedCandidate::Default),
-        Lane::Profile => profile_head(state, prefix).map(|entry| MergedCandidate::Profile {
-            label: entry.label.clone(),
-        }),
-        Lane::Source => source_head(state, prefix).map(|entry| MergedCandidate::Source {
-            tag_id: entry.id,
-            label: source_display_label(entry),
-            exact_label: (!entry.is_preview).then(|| entry.normalized_text.clone()),
-            revision: state
-                .source_page
-                .as_ref()
-                .map(|page| page.revision)
-                .unwrap_or_default(),
-        }),
-    }
-}
-
-fn advance_lane(state: &mut TagCompletionState, lane: Lane) {
-    match lane {
-        Lane::Default => state.default_offset = state.default_offset.saturating_add(1),
-        Lane::Profile => {
-            if let Some(page) = state.profile_page.as_mut() {
-                page.offset = page.offset.saturating_add(1);
-            }
-        }
-        Lane::Source => {
-            if let Some(page) = state.source_page.as_mut() {
-                page.offset = page.offset.saturating_add(1);
-            }
-        }
-    }
-}
-
-fn source_display_label(entry: &SourceTagPageEntry) -> String {
-    if entry.is_preview && !entry.display_label.ends_with('…') {
-        format!("{}…", entry.display_label)
-    } else {
-        entry.display_label.clone()
-    }
+) -> super::tag_pager::MergePageResult {
+    super::tag_pager::merge_ready_page(&mut state.pager, prefix, MERGED_PAGE_SIZE)
 }
 
 fn install_source_page(
@@ -975,19 +647,13 @@ fn install_source_page(
     page_start: Option<SourceTagPageCursor>,
     skip: usize,
 ) {
-    let entry_count = page.entries.len();
-    state.source_page = Some(SourcePageWindow {
-        revision: page.revision,
-        entries: page.entries,
-        next_cursor: page.next_cursor,
-        page_start,
-        offset: skip.min(entry_count),
-    });
+    super::tag_pager::install_source_page(&mut state.pager, page, page_start, skip);
 }
 
 fn sync_completion_ghost(browser: &mut Browser, cx: &mut Context<Browser>, prefix: &str) {
     let ghost = browser
         .tag_completion
+        .pager
         .merged_page
         .first()
         .and_then(|candidate| candidate.ghost_suffix(prefix))
@@ -1041,46 +707,39 @@ fn restore_checkpoint(
 }
 
 fn apply_stream_checkpoint(state: &mut TagCompletionState, checkpoint: &StreamCheckpoint) {
-    state.source_page = None;
-    state.profile_page = None;
+    super::tag_pager::apply_stream_checkpoint(&mut state.pager, checkpoint);
     state.source_ready = !checkpoint.source_loaded;
     state.profile_ready = !checkpoint.profile_loaded;
-    state.default_offset = checkpoint.default_offset;
-    state.seen_exact = checkpoint.seen_exact.clone();
-    state.merged_page.clear();
-    state.selected = None;
-    state.page_has_next = false;
-    state.page_epoch = state.page_epoch.wrapping_add(1);
-    state.current_checkpoint = Some(checkpoint.clone());
 }
 
 fn request_next(browser: &mut Browser, epoch: u64, cx: &mut Context<Browser>) {
-    if epoch != browser.tag_completion.page_epoch
+    if epoch != browser.tag_completion.pager.page_epoch
         || browser.tag_completion.source_pending.is_some()
         || browser.tag_completion.source_target.is_some()
         || browser.tag_completion.profile_pending.is_some()
         || browser.tag_completion.profile_target.is_some()
-        || !browser.tag_completion.page_has_next
+        || !browser.tag_completion.pager.page_has_next
     {
         return;
     }
-    let Some(checkpoint) = browser.tag_completion.current_checkpoint.clone() else {
+    let Some(checkpoint) = browser.tag_completion.pager.current_checkpoint.clone() else {
         return;
     };
-    push_page_history(&mut browser.tag_completion.page_history, checkpoint);
+    push_page_history(&mut browser.tag_completion.pager.page_history, checkpoint);
     let next_checkpoint = browser.tag_completion.snapshot();
-    browser.tag_completion.current_checkpoint = Some(next_checkpoint);
-    browser.tag_completion.merged_page.clear();
-    browser.tag_completion.selected = None;
-    browser.tag_completion.page_has_next = false;
-    browser.tag_completion.page_epoch = browser.tag_completion.page_epoch.wrapping_add(1);
+    browser.tag_completion.pager.current_checkpoint = Some(next_checkpoint);
+    browser.tag_completion.pager.merged_page.clear();
+    browser.tag_completion.pager.selected = None;
+    browser.tag_completion.pager.page_has_next = false;
+    browser.tag_completion.pager.page_epoch =
+        browser.tag_completion.pager.page_epoch.wrapping_add(1);
     merge_available_into_page(browser, cx);
     browser.start_source_registry_poll(cx);
     cx.notify();
 }
 
 fn request_previous(browser: &mut Browser, epoch: u64, cx: &mut Context<Browser>) {
-    if epoch != browser.tag_completion.page_epoch
+    if epoch != browser.tag_completion.pager.page_epoch
         || browser.tag_completion.source_pending.is_some()
         || browser.tag_completion.source_target.is_some()
         || browser.tag_completion.profile_pending.is_some()
@@ -1088,7 +747,7 @@ fn request_previous(browser: &mut Browser, epoch: u64, cx: &mut Context<Browser>
     {
         return;
     }
-    let Some(checkpoint) = browser.tag_completion.page_history.pop() else {
+    let Some(checkpoint) = browser.tag_completion.pager.page_history.pop() else {
         return;
     };
     restore_checkpoint(browser, checkpoint, cx);
@@ -1096,8 +755,8 @@ fn request_previous(browser: &mut Browser, epoch: u64, cx: &mut Context<Browser>
 }
 
 fn request_first(browser: &mut Browser, epoch: u64, cx: &mut Context<Browser>) {
-    if epoch != browser.tag_completion.page_epoch
-        || browser.tag_completion.page_history.is_empty()
+    if epoch != browser.tag_completion.pager.page_epoch
+        || browser.tag_completion.pager.page_history.is_empty()
         || browser.tag_completion.source_pending.is_some()
         || browser.tag_completion.source_target.is_some()
         || browser.tag_completion.profile_pending.is_some()
@@ -1105,7 +764,7 @@ fn request_first(browser: &mut Browser, epoch: u64, cx: &mut Context<Browser>) {
     {
         return;
     }
-    browser.tag_completion.page_history.clear();
+    browser.tag_completion.pager.page_history.clear();
     restore_checkpoint(browser, StreamCheckpoint::initial(), cx);
     cx.notify();
 }
@@ -1139,8 +798,8 @@ pub(super) fn handle_focused_key_down(
     match key {
         "up" | "arrowup" => {
             if count > 0 {
-                browser.tag_completion.selected = next_selection(
-                    browser.tag_completion.selected,
+                browser.tag_completion.pager.selected = next_selection(
+                    browser.tag_completion.pager.selected,
                     count,
                     SelectionDirection::Previous,
                 );
@@ -1151,8 +810,8 @@ pub(super) fn handle_focused_key_down(
         }
         "down" | "arrowdown" => {
             if count > 0 {
-                browser.tag_completion.selected = next_selection(
-                    browser.tag_completion.selected,
+                browser.tag_completion.pager.selected = next_selection(
+                    browser.tag_completion.pager.selected,
                     count,
                     SelectionDirection::Next,
                 );
@@ -1161,8 +820,8 @@ pub(super) fn handle_focused_key_down(
             }
             true
         }
-        "enter" if browser.tag_completion.selected.is_some() => {
-            let index = browser.tag_completion.selected.unwrap_or_default();
+        "enter" if browser.tag_completion.pager.selected.is_some() => {
+            let index = browser.tag_completion.pager.selected.unwrap_or_default();
             let token = browser
                 .tag_completion
                 .candidate(index)
@@ -1170,7 +829,7 @@ pub(super) fn handle_focused_key_down(
             let Some(token) = token else {
                 return false;
             };
-            let epoch = browser.tag_completion.page_epoch;
+            let epoch = browser.tag_completion.pager.page_epoch;
             activate_candidate(browser, index, query_generation, epoch, token, cx)
         }
         _ => false,
@@ -1189,7 +848,7 @@ fn hover_candidate(
     if !candidate_is_current(&browser.tag_completion, index, generation, epoch, &token) {
         return;
     }
-    browser.tag_completion.selected = Some(index);
+    browser.tag_completion.pager.selected = Some(index);
     cx.notify();
 }
 
@@ -1224,7 +883,7 @@ fn candidate_is_current(
     token: &CandidateToken,
 ) -> bool {
     generation == state.draft_generation
-        && epoch == state.page_epoch
+        && epoch == state.pager.page_epoch
         && state
             .candidate(index)
             .is_some_and(|candidate| candidate.token().eq(token))
@@ -1324,10 +983,11 @@ pub(super) fn render(
         return div().flex_none().w_full();
     };
     let generation = query.draft_generation;
-    let epoch = browser.tag_completion.page_epoch;
-    let selected = browser.tag_completion.selected;
+    let epoch = browser.tag_completion.pager.page_epoch;
+    let selected = browser.tag_completion.pager.selected;
     let rows = browser
         .tag_completion
+        .pager
         .merged_page
         .iter()
         .enumerate()
@@ -1419,8 +1079,10 @@ pub(super) fn render(
     if let Some(list) = list {
         root = root.child(list);
     }
-    if !browser.tag_completion.page_history.is_empty() || browser.tag_completion.page_has_next {
-        let first = (!browser.tag_completion.page_history.is_empty()).then(|| {
+    if !browser.tag_completion.pager.page_history.is_empty()
+        || browser.tag_completion.pager.page_has_next
+    {
+        let first = (!browser.tag_completion.pager.page_history.is_empty()).then(|| {
             div()
                 .id("tag-completion-first")
                 .flex_1()
@@ -1435,7 +1097,7 @@ pub(super) fn render(
                 }))
                 .child("First")
         });
-        let previous = (!browser.tag_completion.page_history.is_empty()).then(|| {
+        let previous = (!browser.tag_completion.pager.page_history.is_empty()).then(|| {
             div()
                 .id("tag-completion-previous")
                 .flex_1()
@@ -1450,7 +1112,7 @@ pub(super) fn render(
                 }))
                 .child("Previous")
         });
-        let next = browser.tag_completion.page_has_next.then(|| {
+        let next = browser.tag_completion.pager.page_has_next.then(|| {
             div()
                 .id("tag-completion-next")
                 .flex_1()
@@ -1491,42 +1153,6 @@ pub(super) fn render(
         );
     }
     root
-}
-
-impl MergedCandidate {
-    fn token(&self) -> CandidateToken {
-        match self {
-            Self::Default(label) => CandidateToken::Default(label),
-            Self::Profile { label } => CandidateToken::Profile(label.clone()),
-            Self::Source { tag_id, .. } => CandidateToken::Source(*tag_id),
-        }
-    }
-
-    fn display_label(&self) -> String {
-        match self {
-            Self::Default(label) => String::from(*label),
-            Self::Profile { label } => label.clone(),
-            Self::Source { label, .. } => label.clone(),
-        }
-    }
-
-    fn ghost_suffix(&self, prefix: &str) -> Option<String> {
-        let label = match self {
-            Self::Default(label) => *label,
-            Self::Profile { label } => label.as_str(),
-            Self::Source {
-                exact_label: Some(label),
-                ..
-            } => label.as_str(),
-            Self::Source {
-                exact_label: None, ..
-            } => return None,
-        };
-        label
-            .strip_prefix(prefix)
-            .filter(|suffix| !suffix.is_empty())
-            .map(String::from)
-    }
 }
 
 fn normalized_completion_prefix(input: &str) -> Option<String> {
@@ -1637,7 +1263,7 @@ mod tests {
         let mut state = TagCompletionState::default();
         state.source_ready = true;
         state.profile_ready = true;
-        state.source_page = Some(SourcePageWindow {
+        state.pager.source_page = Some(SourcePageWindow {
             revision: 7,
             entries: (0..64)
                 .map(|index| SourceTagPageEntry {
@@ -1652,7 +1278,7 @@ mod tests {
             page_start: None,
             offset: 0,
         });
-        state.profile_page = Some(super::ProfilePageWindow {
+        state.pager.profile_page = Some(super::ProfilePageWindow {
             revision: 3,
             entries: (0..64)
                 .map(|index| ProfileTagVocabularyEntry {
@@ -1669,14 +1295,15 @@ mod tests {
 
         assert_eq!(merge.source_after, None);
         assert_eq!(merge.profile_after, None);
-        assert_eq!(state.merged_page.len(), 6);
+        assert_eq!(state.pager.merged_page.len(), 6);
         assert_eq!(
-            state.merged_page[0].token(),
+            state.pager.merged_page[0].token(),
             super::CandidateToken::Source(1000)
         );
-        assert_eq!(state.merged_page[0].display_label(), "tag-000");
+        assert_eq!(state.pager.merged_page[0].display_label(), "tag-000");
         assert_eq!(
             state
+                .pager
                 .merged_page
                 .iter()
                 .map(MergedCandidate::display_label)
@@ -1685,8 +1312,8 @@ mod tests {
                 "tag-000", "tag-001", "tag-002", "tag-003", "tag-004", "tag-005"
             ]
         );
-        assert!(state.page_has_next);
-        assert!(state.merged_page.len() <= super::MERGED_PAGE_SIZE);
+        assert!(state.pager.page_has_next);
+        assert!(state.pager.merged_page.len() <= super::MERGED_PAGE_SIZE);
     }
 
     #[test]
@@ -1694,7 +1321,7 @@ mod tests {
         let mut state = TagCompletionState::default();
         state.source_ready = true;
         state.profile_ready = true;
-        state.source_page = Some(SourcePageWindow {
+        state.pager.source_page = Some(SourcePageWindow {
             revision: 7,
             entries: (0..64)
                 .map(|index| SourceTagPageEntry {
@@ -1709,7 +1336,7 @@ mod tests {
             page_start: None,
             offset: 0,
         });
-        state.profile_page = Some(super::ProfilePageWindow {
+        state.pager.profile_page = Some(super::ProfilePageWindow {
             revision: 3,
             entries: (0..64)
                 .map(|index| ProfileTagVocabularyEntry {
@@ -1724,13 +1351,15 @@ mod tests {
 
         merge_ready_page(&mut state, "tag");
         let first_page = state
+            .pager
             .merged_page
             .iter()
             .map(MergedCandidate::display_label)
             .collect::<Vec<_>>();
-        state.merged_page.clear();
+        state.pager.merged_page.clear();
         merge_ready_page(&mut state, "tag");
         let second_page = state
+            .pager
             .merged_page
             .iter()
             .map(MergedCandidate::display_label)
@@ -1747,11 +1376,11 @@ mod tests {
     fn candidate_callbacks_require_generation_epoch_and_identity_match() {
         let mut state = TagCompletionState::default();
         state.draft_generation = 4;
-        state.page_epoch = 9;
-        state.merged_page = vec![MergedCandidate::Profile {
+        state.pager.page_epoch = 9;
+        state.pager.merged_page = vec![MergedCandidate::Profile {
             label: String::from("tag-kick"),
         }];
-        let token = state.merged_page[0].token();
+        let token = state.pager.merged_page[0].token();
 
         assert!(candidate_is_current(&state, 0, 4, 9, &token));
         assert!(!candidate_is_current(&state, 0, 3, 9, &token));
@@ -1770,7 +1399,7 @@ mod tests {
         let mut state = TagCompletionState::default();
         state.source_ready = true;
         state.profile_ready = true;
-        state.source_page = Some(SourcePageWindow {
+        state.pager.source_page = Some(SourcePageWindow {
             revision: 7,
             entries: vec![SourceTagPageEntry {
                 id: 41,
@@ -1786,12 +1415,12 @@ mod tests {
 
         merge_ready_page(&mut state, "legacy-tag");
 
-        assert_eq!(state.merged_page.len(), 1);
+        assert_eq!(state.pager.merged_page.len(), 1);
         assert_eq!(
-            state.merged_page[0].token(),
+            state.pager.merged_page[0].token(),
             super::CandidateToken::Source(41)
         );
-        assert_eq!(state.merged_page[0].display_label(), "legacy-tag…");
+        assert_eq!(state.pager.merged_page[0].display_label(), "legacy-tag…");
     }
 
     #[test]
@@ -1806,7 +1435,7 @@ mod tests {
         state.source_ready = true;
         state.profile_ready = true;
         install_source_page(&mut state, first_page, None, 0);
-        state.profile_page = Some(ProfilePageWindow {
+        state.pager.profile_page = Some(ProfilePageWindow {
             revision: 3,
             entries: vec![
                 ProfileTagVocabularyEntry {
@@ -1825,7 +1454,7 @@ mod tests {
 
         let mut boundary_page = None;
         for _ in 0..32 {
-            state.merged_page.clear();
+            state.pager.merged_page.clear();
             let merge = merge_ready_page(&mut state, "tag");
             if merge.source_after.is_some() {
                 boundary_page = Some(merge);
@@ -1834,12 +1463,18 @@ mod tests {
         }
         let boundary = boundary_page.expect("the merge must request the second source page");
         assert_eq!(boundary.source_after, Some(first_cursor));
-        assert_eq!(state.merged_page.len(), 4);
-        assert_eq!(state.source_page.as_ref().map(|page| page.offset), Some(64));
-        assert_eq!(state.profile_page.as_ref().map(|page| page.offset), Some(0));
+        assert_eq!(state.pager.merged_page.len(), 4);
+        assert_eq!(
+            state.pager.source_page.as_ref().map(|page| page.offset),
+            Some(64)
+        );
+        assert_eq!(
+            state.pager.profile_page.as_ref().map(|page| page.offset),
+            Some(0)
+        );
         assert!(matches!(
-            state.merged_page.last(),
-            Some(MergedCandidate::Source { tag_id, .. }) if *tag_id == state.source_page.as_ref().unwrap().entries[63].id
+            state.pager.merged_page.last(),
+            Some(MergedCandidate::Source { tag_id, .. }) if *tag_id == state.pager.source_page.as_ref().unwrap().entries[63].id
         ));
 
         install_source_page(&mut state, second_page, Some(first_cursor), 0);
@@ -1847,6 +1482,7 @@ mod tests {
 
         assert_eq!(
             state
+                .pager
                 .merged_page
                 .iter()
                 .map(MergedCandidate::display_label)
@@ -1855,12 +1491,12 @@ mod tests {
                 "tag-060", "tag-061", "tag-062", "tag-063", "tag-063a", "tag-064"
             ]
         );
-        assert!(state.merged_page.iter().any(|candidate| matches!(
+        assert!(state.pager.merged_page.iter().any(|candidate| matches!(
             candidate,
             MergedCandidate::Source { tag_id, .. }
-                if *tag_id == state.source_page.as_ref().unwrap().entries[0].id
+                if *tag_id == state.pager.source_page.as_ref().unwrap().entries[0].id
         )));
-        assert!(!state.merged_page.iter().any(|candidate| matches!(
+        assert!(!state.pager.merged_page.iter().any(|candidate| matches!(
             candidate,
             MergedCandidate::Profile { label } if label == "tag-063"
         )));
@@ -1877,7 +1513,7 @@ mod tests {
         state.source_ready = true;
         state.profile_ready = true;
         install_source_page(&mut state, first_page.clone(), None, 0);
-        state.profile_page = Some(profile_carry_page());
+        state.pager.profile_page = Some(profile_carry_page());
 
         consume_until_source_refill(&mut state);
         install_source_page(&mut state, second_page.clone(), Some(first_cursor), 0);
@@ -1887,9 +1523,10 @@ mod tests {
         assert_eq!(checkpoint.source_offset, 1);
         assert_eq!(checkpoint.profile_offset, 2);
 
-        state.merged_page.clear();
+        state.pager.merged_page.clear();
         merge_ready_page(&mut state, "tag");
         let expected_page = state
+            .pager
             .merged_page
             .iter()
             .map(MergedCandidate::display_label)
@@ -1901,10 +1538,11 @@ mod tests {
             ]
         );
 
-        state.merged_page.clear();
+        state.pager.merged_page.clear();
         merge_ready_page(&mut state, "tag");
         assert_ne!(
             state
+                .pager
                 .merged_page
                 .iter()
                 .map(MergedCandidate::display_label)
@@ -1919,7 +1557,7 @@ mod tests {
             checkpoint.source_after_cursor,
             checkpoint.source_offset,
         );
-        state.profile_page = Some(ProfilePageWindow {
+        state.pager.profile_page = Some(ProfilePageWindow {
             revision: 3,
             entries: vec![
                 ProfileTagVocabularyEntry {
@@ -1941,6 +1579,7 @@ mod tests {
 
         assert_eq!(
             state
+                .pager
                 .merged_page
                 .iter()
                 .map(MergedCandidate::display_label)
@@ -1951,7 +1590,7 @@ mod tests {
 
     fn consume_until_source_refill(state: &mut TagCompletionState) {
         for _ in 0..32 {
-            state.merged_page.clear();
+            state.pager.merged_page.clear();
             if merge_ready_page(state, "tag").source_after.is_some() {
                 return;
             }

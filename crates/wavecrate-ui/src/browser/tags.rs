@@ -172,6 +172,26 @@ pub(super) fn render(
             cx.listener(Browser::invalidate_file_handoff_from_tag_mouse),
         )
         .child(browser.tag_input.clone());
+    let library_open = super::tag_library::is_open(browser);
+    let library_toggle = div()
+        .id("tag-library-toggle")
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(theme.spacing.control_height))
+        .px(px(theme.spacing.row_padding_x))
+        .cursor_pointer()
+        .text_size(px(theme.typography.small_size))
+        .text_color(color(if library_open {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        }))
+        .hover(|style| style.bg(color(theme.colors.selection_hover_fill)))
+        .active(|style| style.bg(color(theme.interaction.pressed_fill)))
+        .on_click(cx.listener(Browser::toggle_tag_library_from_click))
+        .child("TAGS");
     let submit_button = div()
         .id("tag-submit")
         .flex_none()
@@ -203,6 +223,7 @@ pub(super) fn render(
         .py(px(theme.spacing.control_gap))
         .border_t(px(theme.spacing.border_width))
         .border_color(input_border)
+        .child(library_toggle)
         .child(input)
         .child(submit_button);
 

@@ -16,6 +16,7 @@ use super::motion::{self, MotionFrame};
 use super::tag_chips;
 use super::tag_completion;
 use super::tag_filter;
+use super::tag_library;
 use super::tags;
 
 fn hover_rail(group: String, theme: &Theme) -> impl gpui::IntoElement {
@@ -86,6 +87,9 @@ pub(super) fn render(
     motion_frame: MotionFrame,
     cx: &mut Context<Browser>,
 ) -> impl gpui::IntoElement {
+    if tag_library::is_open(browser) {
+        return tag_library::render(browser, theme, cx).into_any_element();
+    }
     let source_rows = browser.source_rows();
     let pending_source = browser.pending_source_row();
     let source_count = source_rows.len() + usize::from(pending_source.is_some());
@@ -591,4 +595,5 @@ pub(super) fn render(
                         .child(browser.active_folder_label()),
                 ),
         )
+        .into_any_element()
 }

@@ -229,7 +229,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips,
-    tag_completion, tag_filter, tags,
+    tag_completion, tag_filter, tag_library, tags,
 };
 use gpui::Context;
 
@@ -283,6 +283,7 @@ impl Browser {
         changed |= super::source_recovery::poll(self, cx);
         changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
+        changed |= tag_library::poll(self, cx);
         if changed {
             cx.notify();
         }
@@ -294,6 +295,7 @@ impl Browser {
             || tag_chips::has_pending(self)
             || tag_completion::has_pending(self)
             || tag_filter::has_pending(self)
+            || tag_library::has_pending(self)
             || catalog::catalog_poll_needed(self)
     }
 

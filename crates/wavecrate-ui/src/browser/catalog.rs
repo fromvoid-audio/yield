@@ -529,6 +529,7 @@ impl Browser {
             CatalogEvent::TagPageReady { .. } | CatalogEvent::TagPageFailed { .. }
         ) && (super::tag_completion::apply_catalog_event(self, &event, cx)
             || super::tags::apply_catalog_event(self, &event, cx)
+            || super::tag_library::apply_catalog_event(self, &event, cx)
             || super::tag_chips::apply_catalog_event(self, &event))
         {
             return true;
