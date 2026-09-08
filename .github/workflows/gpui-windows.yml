@@ -1,0 +1,44 @@
+name: GPUI Windows checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'assets/**'
+      - 'scripts/internal/release/setup_windows_asio_sdk.ps1'
+      - '.github/workflows/gpui-windows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpui-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup show active-toolchain
+      - name: Provision ASIO SDK
+        shell: pwsh
+        run: ./scripts/internal/release/setup_windows_asio_sdk.ps1
+      - name: Test core, media and native platform
+        run: cargo test --locked -p wavecrate-core -p wavecrate-media -p wavecrate-platform --lib
+      - name: Check GPUI application
+        run: cargo check --locked -p wavecrate-gpui --tests
+      - name: Test browser state and interactions
+        run: cargo test --locked -p wavecrate-ui --lib

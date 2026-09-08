@@ -5,7 +5,7 @@
 //! absolute paths to the synchronous native drag entry point.
 
 use std::fmt;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, not(target_os = "windows"))))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -224,13 +224,13 @@ impl FileDragHandle {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, not(target_os = "windows"))))]
 #[derive(Debug)]
 struct ValidatedPaths<'a> {
     paths: &'a [PathBuf],
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, not(target_os = "windows"))))]
 fn validate_paths(paths: &[PathBuf]) -> Result<ValidatedPaths<'_>, FileDragError> {
     if paths.is_empty() {
         return Err(FileDragError::EmptyPathList);
@@ -264,7 +264,7 @@ fn validate_paths(paths: &[PathBuf]) -> Result<ValidatedPaths<'_>, FileDragError
     Ok(ValidatedPaths { paths })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, not(target_os = "windows"))))]
 fn raw_path_bytes(path: &Path) -> usize {
     #[cfg(unix)]
     {
@@ -326,7 +326,7 @@ where
     windows::start_file_drag_blocking(paths.as_ref(), cancellation)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
     use std::ffi::OsString;
