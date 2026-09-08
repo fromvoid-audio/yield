@@ -41,9 +41,12 @@ use wavecrate_source_watcher::WatchHintEvidence;
 use wavecrate_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
 mod curation;
+mod root;
 mod tags;
 mod watcher;
 mod wav_metadata;
+
+pub use root::{VerifiedSourceRoot, resolve_source_root};
 
 use watcher::{
     AuditDisposition, AuditTrigger, WatcherMode, WatcherSchedule, run_watcher_idle_work,
@@ -361,6 +364,19 @@ pub enum CatalogCommand {
         source_id: SourceId,
         /// Scanner-canonicalized absolute source root.
         canonical_root: PathBuf,
+        /// Monotonic source lifecycle generation.
+        lifecycle_generation: u64,
+    },
+    /// Register or replace one source lifecycle generation using a verified root proof.
+    ///
+    /// The proof is revalidated by the catalog before and after opening the profile database, so
+    /// a physical-root or lexical symlink-target replacement fails closed. A rejected command
+    /// still consumes its admitted lifecycle generation; callers must retry with a fresh one.
+    RegisterVerified {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Canonical source root and physical identity captured by [`resolve_source_root`].
+        root: VerifiedSourceRoot,
         /// Monotonic source lifecycle generation.
         lifecycle_generation: u64,
     },
@@ -1422,7 +1438,7 @@ fn encoded_path_len(path: &Path) -> usize {
 
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
-        CatalogCommand::Register { .. } => 2,
+        CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestTagPage { .. }
@@ -1534,6 +1550,11 @@ enum AdmissionAction {
 fn admission_action(command: &CatalogCommand) -> AdmissionAction {
     match command {
         CatalogCommand::Register {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogCommand::RegisterVerified {
             source_id,
             lifecycle_generation,
             ..
@@ -2088,6 +2109,27 @@ fn handle_command(
                 source_id,
                 canonical_root,
                 lifecycle_generation,
+                None,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+                test_gate,
+                watcher_mode,
+            );
+            false
+        }
+        CatalogCommand::RegisterVerified {
+            source_id,
+            root,
+            lifecycle_generation,
+        } => {
+            let canonical_root = root.canonical_root().to_path_buf();
+            register_source(
+                source_id,
+                canonical_root,
+                lifecycle_generation,
+                Some(root),
                 profile_guard,
                 reservation,
                 admission,
@@ -2449,6 +2491,7 @@ fn register_source(
     source_id: SourceId,
     canonical_root: PathBuf,
     lifecycle_generation: u64,
+    verified_root: Option<VerifiedSourceRoot>,
     profile_guard: &WritableProfileGuard,
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
@@ -2487,13 +2530,24 @@ fn register_source(
         );
         return;
     }
-    // The profile child lease is retained by the previous database connection. Release that
-    // connection before opening the replacement generation; the admission token has already
-    // invalidated any audit that used the old projection.
-    sources.remove(&source_id);
-    if let Some(test_gate) = test_gate {
-        test_gate.remove_watcher_signals(&source_id);
-    }
+    let expected_root = match root::capture_registration_root(
+        &source_id,
+        &canonical_root,
+        verified_root.as_ref(),
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            emit_failure(
+                reservation,
+                admission,
+                Some(source_id),
+                Some(lifecycle_generation),
+                CatalogOperation::Register,
+                error,
+            );
+            return;
+        }
+    };
     if let Err(error) = profile_guard.validate_current() {
         emit_failure(
             reservation,
@@ -2504,6 +2558,13 @@ fn register_source(
             CatalogError::ProfileUnavailable(error.to_string()),
         );
         return;
+    }
+    // The profile child lease is retained by the previous database connection. Release that
+    // connection before opening the replacement generation; the admission token has already
+    // invalidated any audit that used the old projection.
+    sources.remove(&source_id);
+    if let Some(test_gate) = test_gate {
+        test_gate.remove_watcher_signals(&source_id);
     }
     let profile_child = catalog_profile_child(&source_id);
     let database = match SourceDatabase::open_for_catalog_with_profile_guard(
@@ -2535,6 +2596,22 @@ fn register_source(
         );
         return;
     }
+    if let Err(error) = root::revalidate_registration_root(
+        &source_id,
+        &canonical_root,
+        verified_root.as_ref(),
+        Some(&expected_root),
+    ) {
+        emit_failure(
+            reservation,
+            admission,
+            Some(source_id),
+            Some(lifecycle_generation),
+            CatalogOperation::Register,
+            error,
+        );
+        return;
+    }
     if !publication_is_current(admission, &source_id, lifecycle_generation, None) {
         return;
     }
@@ -2542,7 +2619,7 @@ fn register_source(
         root: canonical_root,
         lifecycle_generation,
         database,
-        known_root_identity: None,
+        known_root_identity: Some(expected_root.identity().clone()),
         snapshot: None,
         attempt_token: None,
         curation_lineage: None,
@@ -2562,13 +2639,13 @@ fn register_source(
         );
         return;
     }
-    if let Ok(identity) = source_root_identity(&source.root)
+    if let Some(identity) = source.known_root_identity.as_ref()
         && let Ok(mut snapshot) = read_snapshot_from_database(
             &source.database,
             profile_guard,
             &source_id,
             lifecycle_generation,
-            &identity,
+            identity,
             || !publication_is_current(admission, &source_id, lifecycle_generation, None),
         )
         && attach_wav_metadata(
@@ -2577,12 +2654,11 @@ fn register_source(
             &source.database,
             profile_guard,
             &source_id,
-            &identity,
+            identity,
             || !publication_is_current(admission, &source_id, lifecycle_generation, None),
         )
         .is_ok()
     {
-        source.known_root_identity = Some(identity);
         source.snapshot = Some(snapshot);
     }
     let watcher_spec = SourceWatchSpec::new(
@@ -2605,6 +2681,25 @@ fn register_source(
             }
         }
         Err(_) => source.watcher_schedule.watcher_start_failed(Instant::now()),
+    }
+    if let Err(error) = root::revalidate_registration_root(
+        &source_id,
+        &source.root,
+        verified_root.as_ref(),
+        Some(&expected_root),
+    ) {
+        if let Some(test_gate) = test_gate {
+            test_gate.remove_watcher_signals(&source_id);
+        }
+        emit_failure(
+            reservation,
+            admission,
+            Some(source_id),
+            Some(lifecycle_generation),
+            CatalogOperation::Register,
+            error,
+        );
+        return;
     }
     sources.insert(source_id.clone(), source);
     if !publication_is_current(admission, &source_id, lifecycle_generation, None) {
@@ -5394,6 +5489,261 @@ mod tests {
         });
         assert!(matches!(event, CatalogEvent::AuditCommitted { .. }));
         service.shutdown();
+    }
+
+    #[test]
+    fn verified_root_registers_and_audits_normally() {
+        let fixture = Fixture::new("catalog-verified-root");
+        let source_id = SourceId::from_string("source-verified-root");
+        let verified = resolve_source_root(fixture.root.path()).expect("resolve source root");
+        assert_eq!(
+            verified.canonical_root(),
+            fs::canonicalize(fixture.root.path()).expect("canonical source root")
+        );
+
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        service
+            .submit(CatalogCommand::RegisterVerified {
+                source_id: source_id.clone(),
+                root: verified,
+                lifecycle_generation: 1,
+            })
+            .expect("verified register admission");
+        assert!(matches!(
+            receive_until(&service, |event| matches!(
+                event,
+                CatalogEvent::Registered {
+                    lifecycle_generation: 1,
+                    ..
+                }
+            )),
+            CatalogEvent::Registered { .. }
+        ));
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id,
+                lifecycle_generation: 1,
+            })
+            .expect("verified audit admission");
+        assert!(matches!(
+            receive_until(&service, |event| matches!(
+                event,
+                CatalogEvent::AuditCommitted { .. }
+            )),
+            CatalogEvent::AuditCommitted { .. }
+        ));
+        service.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_legacy_register_preserves_existing_profile_handle() {
+        let fixture = Fixture::new("catalog-register-missing-root");
+        let source_id = SourceId::from_string("source-register-missing-root");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let _ = register_and_audit(&service, fixture.root.path(), &source_id);
+
+        let moved_root = fixture.root.path().with_extension("moved");
+        fs::rename(fixture.root.path(), &moved_root).expect("move source root away");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("missing replacement admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Failed {
+                    operation: CatalogOperation::Register,
+                    error: CatalogError::StaleRootGeneration { .. },
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::Failed {
+                operation: CatalogOperation::Register,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            }
+        ));
+
+        fs::rename(&moved_root, fixture.root.path()).expect("restore source root");
+        let duplicate = match SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        ) {
+            Ok(_) => panic!("failed preflight must retain the old profile handle"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            duplicate,
+            SourceDbError::ProfileOwnership(
+                ProfileOwnershipError::ProfileChildAlreadyLeased { .. }
+            )
+        ));
+        service.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_register_rejects_physical_root_replacement_before_drop() {
+        let fixture = Fixture::new("catalog-verified-root-replacement");
+        let source_id = SourceId::from_string("source-verified-root-replacement");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let _ = register_and_audit(&service, fixture.root.path(), &source_id);
+        let verified = resolve_source_root(fixture.root.path()).expect("resolve source root");
+
+        let moved_root = fixture.root.path().with_extension("moved");
+        fs::rename(fixture.root.path(), &moved_root).expect("move old source root");
+        fs::create_dir(fixture.root.path()).expect("create replacement source root");
+        service
+            .submit(CatalogCommand::RegisterVerified {
+                source_id: source_id.clone(),
+                root: verified,
+                lifecycle_generation: 2,
+            })
+            .expect("replacement admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Failed {
+                    operation: CatalogOperation::Register,
+                    error: CatalogError::StaleRootGeneration { .. },
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::Failed {
+                operation: CatalogOperation::Register,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            }
+        ));
+
+        let duplicate = match SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        ) {
+            Ok(_) => panic!("failed verified preflight must retain the old profile handle"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            duplicate,
+            SourceDbError::ProfileOwnership(
+                ProfileOwnershipError::ProfileChildAlreadyLeased { .. }
+            )
+        ));
+        service.shutdown();
+        fs::remove_dir(fixture.root.path()).expect("remove replacement source root");
+        fs::rename(moved_root, fixture.root.path()).expect("restore old source root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_register_rejects_symlink_target_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("catalog-verified-symlink-replacement");
+        let source_a = tempfile::tempdir().expect("first symlink target");
+        let source_b = tempfile::tempdir().expect("replacement symlink target");
+        let link = fixture.root.path().join("source-link");
+        symlink(source_a.path(), &link).expect("create source symlink");
+        let verified = resolve_source_root(&link).expect("resolve symlink source root");
+        fs::remove_file(&link).expect("remove old source symlink");
+        symlink(source_b.path(), &link).expect("replace source symlink");
+
+        let source_id = SourceId::from_string("source-verified-symlink-replacement");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        service
+            .submit(CatalogCommand::RegisterVerified {
+                source_id,
+                root: verified,
+                lifecycle_generation: 1,
+            })
+            .expect("verified symlink admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Failed {
+                    operation: CatalogOperation::Register,
+                    error: CatalogError::StaleRootGeneration { .. },
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::Failed {
+                operation: CatalogOperation::Register,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            }
+        ));
+        service.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_audit_fences_root_when_registration_has_no_snapshot() {
+        let fixture = Fixture::new("catalog-register-root-fence");
+        let source_id = SourceId::from_string("source-register-root-fence");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register admission");
+        assert!(matches!(
+            receive_until(&service, |event| matches!(
+                event,
+                CatalogEvent::Registered {
+                    lifecycle_generation: 1,
+                    ..
+                }
+            )),
+            CatalogEvent::Registered { .. }
+        ));
+
+        let moved_root = fixture.root.path().with_extension("moved");
+        fs::rename(fixture.root.path(), &moved_root).expect("move old source root");
+        fs::create_dir(fixture.root.path()).expect("create replacement source root");
+        service
+            .submit(CatalogCommand::RequestAudit {
+                source_id,
+                lifecycle_generation: 1,
+            })
+            .expect("audit admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Failed {
+                    operation: CatalogOperation::Audit,
+                    error: CatalogError::StaleRootGeneration { .. },
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::Failed {
+                operation: CatalogOperation::Audit,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            }
+        ));
+        service.shutdown();
+        fs::remove_dir(fixture.root.path()).expect("remove replacement source root");
+        fs::rename(moved_root, fixture.root.path()).expect("restore old source root");
     }
 
     #[cfg(unix)]

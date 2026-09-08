@@ -1636,3 +1636,28 @@ including real database cursors across a 64-row refill, profile carry, source-ID
 deduplication and identical replay after restoring a composite checkpoint.
 Formatting, UI check and diff checks passed. Native visual/input acceptance is
 still separate from automated verification.
+
+`Wavecrate Completion Preview bc501c1.app` was built from clean commit `bc501c166`
+in its isolated acceptance checkout and passed strict ad-hoc signature checks.
+The agent did not launch it or alter existing previews.
+
+### Identity-checked source registration foundation
+
+The catalog exposes an opaque verified-root value and a background-only resolver
+that checks canonical target and physical identity. `RegisterVerified` rechecks
+that proof before releasing an existing source database, after opening the
+candidate, and before publication. Legacy registration also captures/rechecks its
+observed target and identity, so a missing root is refused before its old handle
+is dropped. Registration pins root identity even without a cached snapshot,
+fencing a replacement before the first audit.
+
+This is a backend foundation; automatic browser rebind remains the next slice.
+Admission still advances the lifecycle on a refused registration, requiring a
+fresh generation for retry. Exclusive profile leases mean failures after opening
+the replacement do not have atomic rollback; no lease handoff is claimed.
+
+Verification: 75 catalog tests and 43 session tests passed, alongside catalog,
+session and workspace checks. Temporary-root tests cover normal verified audit,
+missing-root handle retention, physical replacement, symlink target replacement
+and initial-audit identity fencing. Modified-file formatting and diff checks
+passed.

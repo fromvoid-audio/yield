@@ -38,7 +38,8 @@ pub use catalog::{
     SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
     SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceCurationCommitReceipt, SourceCurationOperationFailure,
     SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationUpdate,
-    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot,
+    resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use vocabulary::VocabularySlot;
