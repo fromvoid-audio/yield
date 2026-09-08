@@ -4,7 +4,7 @@
 //! Audio playback lifecycle for the browser.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::Browser;
 use super::waveform::WaveformPlayRegion;
@@ -412,6 +412,9 @@ impl Browser {
         self.playback_cursor_interpolation = None;
         match handle.try_play(request) {
             Ok(request_id) => {
+                let record_last_played = should_record_last_played(intent.origin);
+                let accepted_path = intent.path.clone();
+                let accepted_at = current_unix_epoch_seconds();
                 if should_record_playback_history(intent.origin) {
                     self.record_playback_history_for_intent(&intent);
                 }
@@ -420,6 +423,9 @@ impl Browser {
                 self.playing_path = Some(intent.path);
                 self.playback_cursor_pending = Some(start as f32);
                 self.playback_status = "Starting…".to_string();
+                if record_last_played {
+                    self.record_playback_for_intent(accepted_path.as_path(), accepted_at, cx);
+                }
                 self.ensure_playback_monitor(cx);
             }
             Err(error) => {
@@ -705,6 +711,22 @@ fn should_record_playback_history(origin: PlaybackIntentOrigin) -> bool {
     )
 }
 
+fn should_record_last_played(origin: PlaybackIntentOrigin) -> bool {
+    matches!(
+        origin,
+        PlaybackIntentOrigin::Explicit
+            | PlaybackIntentOrigin::SelectionAutoplay
+            | PlaybackIntentOrigin::HistoryReplay
+    )
+}
+
+fn current_unix_epoch_seconds() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
 fn preview_cursor_ratio_for_browser(browser: &Browser, ratio: f32) -> Option<f32> {
     browser.waveform.as_ref()?;
     preview_cursor_ratio(ratio)
@@ -771,7 +793,7 @@ mod tests {
         audio_output_resume_is_current, authoritative_cursor_progress, cursor_interpolation,
         normalized_playback_start, playback_mode_for_intent, playback_request_number_is_current,
         preview_cursor_ratio, should_cancel_pending_autoplay, should_queue_initialized_playback,
-        should_record_playback_history,
+        should_record_last_played, should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -872,6 +894,20 @@ mod tests {
             PlaybackIntentOrigin::HistoryReplay
         ));
         assert!(!should_record_playback_history(
+            PlaybackIntentOrigin::AudioOutputResume
+        ));
+    }
+
+    #[test]
+    fn accepted_playback_origins_record_last_played_but_output_resume_does_not() {
+        assert!(should_record_last_played(PlaybackIntentOrigin::Explicit));
+        assert!(should_record_last_played(
+            PlaybackIntentOrigin::SelectionAutoplay
+        ));
+        assert!(should_record_last_played(
+            PlaybackIntentOrigin::HistoryReplay
+        ));
+        assert!(!should_record_last_played(
             PlaybackIntentOrigin::AudioOutputResume
         ));
     }

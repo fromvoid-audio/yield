@@ -1049,3 +1049,23 @@ Validation: 61 core tests, 20 design tests, 15 UI curation tests, six context-me
 tests, one responsive-layout test, the UI package check, formatting, and diff
 checks passed. Native visual acceptance remains pending while open apps are left
 untouched. Automatic playback timestamp recording follows as a separate slice.
+
+### Automatic Last Played recording
+
+Accepted explicit, selection-autoplay, and history-replay requests now record the
+actual playback intent's source member. Passive preview loads, rejected audio
+admission, and output-device resume do not record a listen. Core planning preserves
+all unrelated curation fields and suppresses repeated identical timestamps.
+
+History uses immediate bounded metadata-operation admission and the same exact
+predecessor/receipt handling as rating edits. This intentionally avoids a UI-owned
+debounce buffer: every admitted update participates in the existing source-switch
+and quit drain, without unadmitted timer state that could be lost at shutdown.
+Unavailable metadata or rejected metadata admission reports a metadata failure;
+audio continues. No optimistic timestamp is shown before metadata admission.
+
+Validation: all 62 core tests and 135 UI tests passed, with one UI test ignored;
+UI checks, formatting, and diff checks passed. Coverage includes exact playback
+path targeting, accepted origin selection, timestamp no-ops, and history/rating
+pending overlays and committed receipts in both orders. Passive-focus re-sorting
+preserves the loaded preview. Native audio/interaction acceptance remains pending.

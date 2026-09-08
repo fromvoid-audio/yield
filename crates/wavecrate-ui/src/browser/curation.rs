@@ -4,7 +4,7 @@
 //! Passive curation metadata projection and source-scoped collection filters.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{ClickEvent, Context, ScrollStrategy, div, prelude::*, px};
 use wavecrate_core::{
@@ -620,6 +620,12 @@ fn updates_for_action(
                 .into_iter()
                 .collect()
         }
+        CurationAction::RecordPlayback { played_at } => {
+            vec![SourceCurationUpdate::SetLastPlayedAt {
+                path,
+                played_at: Some(played_at),
+            }]
+        }
         CurationAction::UnlockKeepRating => (current.rating().locked() != after.rating().locked())
             .then_some(SourceCurationUpdate::SetLocked {
                 path,
@@ -1026,6 +1032,26 @@ impl Browser {
         true
     }
 
+    /// Record an accepted playback against the exact active-source member that was played.
+    pub(super) fn record_playback_for_intent(
+        &mut self,
+        absolute_path: &Path,
+        played_at: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(relative_path) = self.playback_target_relative_path(absolute_path) else {
+            self.scan_status =
+                String::from("Playback history not saved: sample metadata is unavailable");
+            cx.notify();
+            return;
+        };
+        self.submit_curation_action(
+            CurationAction::RecordPlayback { played_at },
+            Some(vec![relative_path]),
+            cx,
+        );
+    }
+
     pub(super) fn submit_curation_action(
         &mut self,
         action: CurationAction,
@@ -1033,21 +1059,31 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let Some(activation) = self.catalog_activation.as_ref() else {
-            self.scan_status =
-                String::from("Curation requires a successful audited catalog projection");
+            self.scan_status = if is_playback_record_action(action) {
+                String::from("Playback history unavailable: sample metadata is not ready")
+            } else {
+                String::from("Curation requires a successful audited catalog projection")
+            };
             cx.notify();
             return;
         };
         if !activation.audit_finished || activation.audit_error.is_some() {
-            self.scan_status =
-                String::from("Curation requires a successful audited catalog projection");
+            self.scan_status = if is_playback_record_action(action) {
+                String::from("Playback history unavailable: sample metadata is not ready")
+            } else {
+                String::from("Curation requires a successful audited catalog projection")
+            };
             cx.notify();
             return;
         }
         let Some(context) = self.catalog_metadata.context() else {
-            self.scan_status = String::from(
-                "Curation metadata is still loading; try again after the catalog is ready",
-            );
+            self.scan_status = if is_playback_record_action(action) {
+                String::from("Playback history unavailable: sample metadata is not ready")
+            } else {
+                String::from(
+                    "Curation metadata is still loading; try again after the catalog is ready",
+                )
+            };
             cx.notify();
             return;
         };
@@ -1067,7 +1103,11 @@ impl Browser {
         {
             self.curation_state.set_message(
                 &key,
-                String::from("Curation authority is stale; refresh the catalog before editing"),
+                if is_playback_record_action(action) {
+                    String::from("Playback history unavailable: sample metadata is stale")
+                } else {
+                    String::from("Curation authority is stale; refresh the catalog before editing")
+                },
             );
             cx.notify();
             return;
@@ -1078,6 +1118,9 @@ impl Browser {
                 self.curation_state.set_message(&key, message);
             }
             CurationPlan::NoChange { trash_required } => {
+                if trash_required == 0 && is_playback_record_action(action) {
+                    return;
+                }
                 let message = if trash_required == 0 {
                     String::from("No curation changes")
                 } else {
@@ -1104,9 +1147,13 @@ impl Browser {
                         if !self.curation_state.accept_operation(&key, plan) {
                             self.curation_state.set_message(
                                 &key,
-                                String::from(
-                                    "Curation admission changed; refresh the catalog before editing",
-                                ),
+                                if is_playback_record_action(action) {
+                                    String::from("Playback history unavailable: metadata changed")
+                                } else {
+                                    String::from(
+                                        "Curation admission changed; refresh the catalog before editing",
+                                    )
+                                },
                             );
                         } else {
                             self.catalog_metadata.pause_for_curation();
@@ -1115,8 +1162,13 @@ impl Browser {
                         }
                     }
                     Err(error) => {
+                        let label = if is_playback_record_action(action) {
+                            "Playback history"
+                        } else {
+                            "Curation"
+                        };
                         self.curation_state
-                            .set_message(&key, format!("Curation not saved: {error}"));
+                            .set_message(&key, format!("{label} not saved: {error}"));
                     }
                 }
             }
@@ -1138,6 +1190,38 @@ impl Browser {
             .and_then(|index| self.entries.get(index))
             .map(|entry| vec![entry.relative_path.clone()])
             .unwrap_or_default()
+    }
+
+    fn playback_target_relative_path(&self, absolute_path: &Path) -> Option<PathBuf> {
+        let activation = self.catalog_activation.as_ref()?;
+        if !activation.audit_finished || activation.audit_error.is_some() {
+            return None;
+        }
+        let context = self.catalog_metadata.context()?;
+        if context.source_id != activation.source_id
+            || context.lifecycle_generation != activation.lifecycle_generation
+            || context.root != activation.root
+        {
+            return None;
+        }
+        let active_index = self.active_source?;
+        let session = self.source_sessions.get(active_index)?;
+        if session.source_id.as_ref() != Some(&activation.source_id)
+            || session.root != activation.root
+            || session.catalog_lifecycle_generation != Some(activation.lifecycle_generation)
+        {
+            return None;
+        }
+        let relative_path = explicit_playback_target_path(
+            &activation.root,
+            &context.entry_indices,
+            &self.entries,
+            absolute_path,
+        )?;
+        let entry_index = context.entry_indices.get(&relative_path).copied()?;
+        let session_entry = session.entries.get(entry_index)?;
+        (session_entry.path == absolute_path && session_entry.relative_path == relative_path)
+            .then_some(relative_path)
     }
 
     fn apply_visible_curation(
@@ -1381,6 +1465,22 @@ fn curation_matches_rating_filter(
     filter.is_disabled() || curation.is_some_and(|curation| filter.matches(curation.rating()))
 }
 
+fn is_playback_record_action(action: CurationAction) -> bool {
+    matches!(action, CurationAction::RecordPlayback { .. })
+}
+
+fn explicit_playback_target_path(
+    root: &Path,
+    entry_indices: &HashMap<PathBuf, usize>,
+    entries: &[AudioFile],
+    absolute_path: &Path,
+) -> Option<PathBuf> {
+    let relative_path = absolute_path.strip_prefix(root).ok()?.to_path_buf();
+    let entry_index = entry_indices.get(&relative_path).copied()?;
+    let entry = entries.get(entry_index)?;
+    (entry.path == absolute_path && entry.relative_path == relative_path).then_some(relative_path)
+}
+
 fn should_retain_passive_browser_focus(
     browser_focus_override: Option<&AudioFileId>,
     previous_focus_id: Option<&AudioFileId>,
@@ -1404,10 +1504,19 @@ mod tests {
     }
 
     fn curation(value: i8, locked: bool, collections: u8) -> AudioFileCuration {
+        curation_with_last_played(value, locked, collections, Some(11))
+    }
+
+    fn curation_with_last_played(
+        value: i8,
+        locked: bool,
+        collections: u8,
+        last_played_at: Option<i64>,
+    ) -> AudioFileCuration {
         AudioFileCuration::new(
             RatingState::new(value, locked).expect("valid test rating"),
             collections,
-            Some(11),
+            last_played_at,
             Some(22),
         )
         .expect("valid test curation")
@@ -1456,6 +1565,36 @@ mod tests {
             files: BTreeMap::from([(PathBuf::from(path), curation)]),
             valid: true,
         }
+    }
+
+    #[test]
+    fn playback_target_uses_intent_path_even_when_browser_focus_differs() {
+        let entries = [
+            entry("focused.wav", 0, false, 0),
+            entry("played.wav", 0, false, 0),
+        ];
+        let indices = HashMap::from([
+            (PathBuf::from("focused.wav"), 0),
+            (PathBuf::from("played.wav"), 1),
+        ]);
+        assert_eq!(
+            explicit_playback_target_path(
+                Path::new("/library"),
+                &indices,
+                &entries,
+                Path::new("/library/played.wav"),
+            ),
+            Some(PathBuf::from("played.wav"))
+        );
+        assert_eq!(
+            explicit_playback_target_path(
+                Path::new("/library"),
+                &indices,
+                &entries,
+                Path::new("/elsewhere/played.wav"),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1540,6 +1679,149 @@ mod tests {
             )
             .expect("second outcome is pending");
         assert_eq!(application.visible[&path], curation(2, false, 0));
+        assert!(!state.has_pending_outcomes());
+    }
+
+    #[test]
+    fn history_then_rating_overlay_preserves_both_fields_through_receipts() {
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[entry("kick.wav", 0, false, 0)]);
+        let history = ready_plan(
+            &state,
+            CurationAction::RecordPlayback { played_at: 33 },
+            std::slice::from_ref(&path),
+        );
+        assert!(matches!(
+            history.batches[0].as_slice(),
+            [SourceCurationUpdate::SetLastPlayedAt {
+                played_at: Some(33),
+                ..
+            }]
+        ));
+        let history_id = history.request_id;
+        state.accept_operation(&key(), history);
+
+        let rating = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        let rating_id = rating.request_id;
+        assert!(matches!(
+            rating.fence,
+            SourceCurationOperationFence::AfterOperation { request_id } if request_id == history_id
+        ));
+        state.accept_operation(&key(), rating);
+
+        let application = state
+            .apply_outcome(
+                key(),
+                history_id,
+                CurationOutcome {
+                    initial_revision: Some(10),
+                    final_revision: Some(11),
+                    committed_batches: vec![receipt(
+                        11,
+                        "kick.wav",
+                        curation_with_last_played(0, false, 0, Some(33)),
+                    )],
+                    failure: None,
+                },
+            )
+            .expect("history outcome is pending");
+        assert_eq!(
+            application.visible[&path],
+            curation_with_last_played(1, false, 0, Some(33))
+        );
+
+        let application = state
+            .apply_outcome(
+                key(),
+                rating_id,
+                CurationOutcome {
+                    initial_revision: Some(11),
+                    final_revision: Some(12),
+                    committed_batches: vec![receipt(
+                        12,
+                        "kick.wav",
+                        curation_with_last_played(1, false, 0, Some(33)),
+                    )],
+                    failure: None,
+                },
+            )
+            .expect("rating outcome is pending");
+        assert_eq!(
+            application.visible[&path],
+            curation_with_last_played(1, false, 0, Some(33))
+        );
+        assert!(!state.has_pending_outcomes());
+    }
+
+    #[test]
+    fn rating_then_history_overlay_preserves_both_fields_through_receipts() {
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[entry("kick.wav", 0, false, 0)]);
+        let rating = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        let rating_id = rating.request_id;
+        state.accept_operation(&key(), rating);
+
+        let history = ready_plan(
+            &state,
+            CurationAction::RecordPlayback { played_at: 33 },
+            std::slice::from_ref(&path),
+        );
+        let history_id = history.request_id;
+        assert!(matches!(
+            history.fence,
+            SourceCurationOperationFence::AfterOperation { request_id } if request_id == rating_id
+        ));
+        state.accept_operation(&key(), history);
+
+        let application = state
+            .apply_outcome(
+                key(),
+                rating_id,
+                CurationOutcome {
+                    initial_revision: Some(10),
+                    final_revision: Some(11),
+                    committed_batches: vec![receipt(
+                        11,
+                        "kick.wav",
+                        curation_with_last_played(1, false, 0, Some(11)),
+                    )],
+                    failure: None,
+                },
+            )
+            .expect("rating outcome is pending");
+        assert_eq!(
+            application.visible[&path],
+            curation_with_last_played(1, false, 0, Some(33))
+        );
+
+        let application = state
+            .apply_outcome(
+                key(),
+                history_id,
+                CurationOutcome {
+                    initial_revision: Some(11),
+                    final_revision: Some(12),
+                    committed_batches: vec![receipt(
+                        12,
+                        "kick.wav",
+                        curation_with_last_played(1, false, 0, Some(33)),
+                    )],
+                    failure: None,
+                },
+            )
+            .expect("history outcome is pending");
+        assert_eq!(
+            application.visible[&path],
+            curation_with_last_played(1, false, 0, Some(33))
+        );
         assert!(!state.has_pending_outcomes());
     }
 

@@ -28,6 +28,11 @@ pub enum CurationAction {
         /// Zero-based collection slot to remove.
         slot: usize,
     },
+    /// Record the accepted playback time for this row.
+    RecordPlayback {
+        /// Unix epoch seconds captured when playback was accepted.
+        played_at: i64,
+    },
     /// Unlock a locked maximum keep rating.
     UnlockKeepRating,
 }
@@ -81,6 +86,12 @@ pub fn plan_curation_action(
                 current.collection_mask() & !(1 << slot),
             ))
         }
+        CurationAction::RecordPlayback { played_at } => {
+            if current.last_played_at() == Some(played_at) {
+                return CurationTransition::Unchanged;
+            }
+            CurationTransition::Changed(with_last_played(current, played_at))
+        }
         CurationAction::UnlockKeepRating => {
             if current.rating().value() != crate::MAX_RATING || !current.rating().locked() {
                 return CurationTransition::Unchanged;
@@ -110,6 +121,16 @@ fn with_collection_mask(current: AudioFileCuration, collection_mask: u8) -> Audi
         current.last_curated_at(),
     )
     .expect("toggling a supported collection slot keeps the mask valid")
+}
+
+fn with_last_played(current: AudioFileCuration, played_at: i64) -> AudioFileCuration {
+    AudioFileCuration::new(
+        current.rating(),
+        current.collection_mask(),
+        Some(played_at),
+        current.last_curated_at(),
+    )
+    .expect("the current collection mask is valid")
 }
 
 #[cfg(test)]
@@ -248,6 +269,24 @@ mod tests {
                 CurationAction::AdjustRating { delta: -1 },
             ),
             CurationTransition::RequiresTrash
+        );
+    }
+
+    #[test]
+    fn recording_playback_preserves_curation_and_is_idempotent() {
+        let current = curation(2, true, 0b0010_0101);
+        let CurationTransition::Changed(after) =
+            plan_curation_action(current, CurationAction::RecordPlayback { played_at: 33 })
+        else {
+            panic!("new playback time should change metadata");
+        };
+        assert_eq!(after.rating(), current.rating());
+        assert_eq!(after.collection_mask(), current.collection_mask());
+        assert_eq!(after.last_played_at(), Some(33));
+        assert_eq!(after.last_curated_at(), current.last_curated_at());
+        assert_eq!(
+            plan_curation_action(after, CurationAction::RecordPlayback { played_at: 33 }),
+            CurationTransition::Unchanged
         );
     }
 }
