@@ -1266,3 +1266,8 @@ composition text before offsetting into the document. This corrects nonzero-pref
 and multibyte replacements, clamps selection to the inserted text, and clears
 stale reversed-selection state after replacement. Two focused regression tests
 passed with the UI test binary compiled; formatting and diff checks passed.
+
+Core tag categories now preserve the five native category IDs, labels, order,
+Playback Type lock, two default tags, and inference rules. Category inference
+rejects inputs above 1024 bytes before allocation. Five focused category tests
+and all 91 core tests passed, along with core compilation and formatting.
