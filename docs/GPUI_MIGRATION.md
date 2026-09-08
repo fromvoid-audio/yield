@@ -1526,3 +1526,22 @@ supersession/removal, shutdown, manifest mismatch and root replacement. Primary
 review corrected a test race between event receipt and command-input release and
 bounded a shutdown wait. The explicit SQL-path-outside-manifest guard was reviewed
 but does not yet have a catalog injection test.
+
+A clean detached checkout of `8e3796cca` passed
+`cargo check --locked -p wavecrate-gpui`, independently of the in-progress sidebar
+changes in the main worktree. Its checkout remained clean after verification.
+
+### Bounded source-watcher adapter
+
+`wavecrate-source-watcher` now owns native recursive root and nonrecursive parent
+watch handles. Callbacks perform lexical event classification and coalesce one
+lifecycle-fenced hint, with separate descendant, root-ambiguity, overflow, and
+backend-error evidence. They retain no event path queue and perform no database,
+scan, or UI work. Ordinary database/WAL and AppleDouble events are excluded;
+backend rescan flags override ordinary filtering. Closing disables acceptance
+before native teardown, including callbacks already being classified.
+
+Eight adapter tests passed, including an isolated native temporary-root smoke;
+all-targets check and package formatting passed. Adapter Clippy reached existing
+library warnings, so a clean Clippy result is not claimed. Catalog scheduling,
+retry/rewatching, and root-generation recovery remain the next integration slice.

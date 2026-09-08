@@ -8,6 +8,7 @@ members = [
     "crates/reson",
     "crates/wavecrate-analysis",
     "crates/wavecrate-library",
+    "crates/wavecrate-source-watcher",
     "crates/wavecrate-catalog",
     "crates/wavecrate-session",
     "crates/wavecrate-scan",
@@ -29,6 +30,7 @@ missing_docs = "deny"
 [workspace.dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
 hound = "3.5.1"
+notify = "6.1.1"
 unicode-segmentation = "1.12.0"
 reson = { path = "crates/reson" }
 wavecrate-analysis = { path = "crates/wavecrate-analysis" }
@@ -38,6 +40,7 @@ wavecrate-media = { path = "crates/wavecrate-media" }
 wavecrate-design = { path = "crates/wavecrate-design" }
 wavecrate-ui = { path = "crates/wavecrate-ui" }
 wavecrate-session = { path = "crates/wavecrate-session" }
+wavecrate-source-watcher = { path = "crates/wavecrate-source-watcher" }
 tempfile = "3.23.0"
 
 # Keep GPUI layout/tessellation and audio decoding optimized in development.
