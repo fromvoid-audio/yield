@@ -38,6 +38,7 @@ flowchart TD
     Media --> Analysis[wavecrate-analysis]
     UI --> Design[wavecrate-design]
     Session --> Library
+    Session --> Catalog
     Catalog[wavecrate-catalog] --> Library
     Catalog --> Scan
     Scan[wavecrate-scan] --> Library
@@ -72,8 +73,8 @@ the existing library writer and never opens a source-local database or writes a
 source folder. Persistent scanning, watcher, readiness, journal, and recovery
 contracts remain outside this slice.
 
-The catalog foundation is available separately from the current browser and
-session composition. It starts with a clone of an existing writable profile
+The session starts the catalog separately from the current browser projection.
+It uses a clone of the session's existing writable profile
 capability and retains an exclusive lease on each catalog's direct profile
 child directory. Every write phase revalidates that profile and child binding.
 An authoritative snapshot carries source identity, lifecycle generation, root
@@ -86,9 +87,13 @@ the final transaction activates the complete generation and records the audit
 identity at the committed manifest revision. Catalog maintenance reclaims
 abandoned staging and inactive generations under its exclusive child lease.
 The general scanner does not reclaim other scanners' staging generations.
-Commands and completion events both have bounded admission, and cancellation
-cannot make rejected commands invalidate accepted work. Browser composition
-and filesystem watchers remain subsequent integration work.
+Commands and completion events both have bounded admission; rejected commands
+do not invalidate accepted work. Session access exposes loading, ready,
+unavailable, and closed states without forwarding events through another queue.
+Submission and closure share a short admission lock; polling does not wait for
+catalog I/O. Catalog failure leaves the registry and preference lanes usable,
+and session shutdown joins the catalog before releasing the profile guard.
+Browser projection and filesystem watchers remain subsequent integration work.
 
 WAV waveforms use two buffered streaming passes: the first finds the global
 mono peak and the second feeds normalized frames into bounded peak and frequency

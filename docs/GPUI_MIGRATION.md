@@ -612,6 +612,22 @@ browser-focused X/Z isolation. Horizontal/middle-drag live acceptance was not
 established by the available GUI automation. Zoom currently uses the 2,048-column
 overview; finer detail decoding and the reference scrollbar remain outstanding.
 
+### Session catalog composition, 2026-09-08
+
+The session now starts the catalog from its existing writable profile guard and
+exposes nonblocking command admission, event polling, and explicit lifecycle
+status. It reuses the catalog's bounded queues directly. Catalog startup failure
+does not disable working registry or preference persistence. Closing session
+admission is ordered against submissions; startup cannot republish Ready after
+closure, and the session worker joins the catalog before releasing ownership.
+Sources are not automatically registered or audited through this interface yet.
+
+Validation: all 37 session tests, the locked root application check, formatting,
+and diff checks passed. Independent lifecycle review found no concrete defect.
+Tests cover shared profile ownership, preference independence, startup/close
+races, closed admission, and ownership release. Browser projection remains the
+next integration boundary.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

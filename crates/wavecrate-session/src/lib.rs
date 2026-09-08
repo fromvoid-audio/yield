@@ -9,9 +9,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,11 @@ use wavecrate_library::sample_sources::{
     GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceRegistrySnapshot,
 };
 
+mod catalog;
 mod preferences;
+
+pub use catalog::{CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError};
+use catalog::{CatalogService, CatalogSlot};
 
 pub use preferences::{
     AudioOutputPreferences, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
@@ -221,6 +225,7 @@ pub struct SourceRegistryService {
     next_preference_request: AtomicU64,
     events: Receiver<RegistryEvent>,
     preference_events: Receiver<PreferenceEvent>,
+    catalog: Arc<Mutex<CatalogSlot>>,
     worker: Option<JoinHandle<Result<(), SessionError>>>,
 }
 
@@ -271,9 +276,25 @@ impl SourceRegistryService {
         self.preference_events.try_recv()
     }
 
+    /// Return the current lifecycle state of the independently-owned source catalog.
+    pub fn catalog_status(&self) -> CatalogStatus {
+        catalog::status(&self.catalog)
+    }
+
+    /// Submit one typed catalog command without waiting for catalog startup or worker I/O.
+    pub fn submit_catalog(&self, command: CatalogCommand) -> Result<(), CatalogSubmitError> {
+        catalog::submit(&self.catalog, command)
+    }
+
+    /// Poll one catalog event without waiting for startup or worker I/O.
+    pub fn try_recv_catalog(&self) -> Result<CatalogEvent, TryRecvError> {
+        catalog::try_recv_event(&self.catalog)
+    }
+
     /// Close command admission, drain the final baseline/lookups/save, and synchronously join.
     pub fn shutdown(&mut self) -> Result<(), ShutdownError> {
         self.closed.store(true, Ordering::Release);
+        catalog::close(&self.catalog);
         let sender = self
             .commands
             .lock()
@@ -312,9 +333,19 @@ impl SourceRegistryService {
         let (command_tx, command_rx) = mpsc::sync_channel(SESSION_COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
         let (preference_event_tx, preference_event_rx) = mpsc::channel();
+        let catalog = Arc::new(Mutex::new(CatalogSlot::loading()));
+        let worker_catalog = Arc::clone(&catalog);
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-source-session"))
-            .spawn(move || run_worker(command_rx, event_tx, preference_event_tx, app_root_override))
+            .spawn(move || {
+                run_worker(
+                    command_rx,
+                    event_tx,
+                    preference_event_tx,
+                    app_root_override,
+                    worker_catalog,
+                )
+            })
             .map_err(StartError::ThreadSpawn)?;
         Ok(Self {
             commands: Mutex::new(Some(command_tx)),
@@ -323,6 +354,7 @@ impl SourceRegistryService {
             next_preference_request: AtomicU64::new(1),
             events: event_rx,
             preference_events: preference_event_rx,
+            catalog,
             worker: Some(worker),
         })
     }
@@ -625,6 +657,7 @@ fn sources_equal(left: &[SampleSource], right: &[SampleSource]) -> bool {
 struct Persistence {
     writable: Option<WritableProfileGuard>,
     writer: Option<GlobalLibraryWriter>,
+    catalog: Option<Arc<CatalogService>>,
     load: Option<Receiver<Result<SourceRegistrySnapshot, LibraryError>>>,
     preference_load: Option<Receiver<Result<Option<String>, LibraryError>>>,
     pending_adds: HashMap<RequestId, PendingAdd>,
@@ -639,11 +672,13 @@ struct Persistence {
 impl Persistence {
     fn start(
         app_root_override: Option<PathBuf>,
+        catalog_slot: Arc<Mutex<CatalogSlot>>,
     ) -> (Self, Option<AppRootGuard>, PersistenceProfileGuard) {
         let profile_guard = PersistenceProfileGuard::named(GPUI_DEVELOPMENT_PROFILE);
         let mut persistence = Self {
             writable: None,
             writer: None,
+            catalog: None,
             load: None,
             preference_load: None,
             pending_adds: HashMap::new(),
@@ -676,7 +711,31 @@ impl Persistence {
                 Err(error) => persistence.unavailable = Some(session_from_profile_error(error)),
             }
         }
+        persistence.start_catalog(&catalog_slot);
         (persistence, root_guard, profile_guard)
+    }
+
+    fn start_catalog(&mut self, catalog_slot: &Arc<Mutex<CatalogSlot>>) {
+        let Some(writable) = self.writable.as_ref() else {
+            let reason = self
+                .status_error()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| String::from("session profile owner unavailable"));
+            catalog::mark_unavailable(catalog_slot, reason);
+            return;
+        };
+        let service = match CatalogService::start(writable) {
+            Ok(service) => Arc::new(service),
+            Err(error) => {
+                catalog::mark_unavailable(catalog_slot, error.to_string());
+                return;
+            }
+        };
+        if !catalog::install(catalog_slot, Arc::clone(&service)) {
+            service.shutdown();
+            return;
+        }
+        self.catalog = Some(service);
     }
 
     fn status_error(&self) -> Option<SessionError> {
@@ -702,6 +761,9 @@ impl Persistence {
     }
 
     fn shutdown(&mut self) {
+        if let Some(catalog) = self.catalog.take() {
+            catalog.shutdown();
+        }
         if let Some(mut writer) = self.writer.take() {
             let _ = writer.shutdown();
         }
@@ -733,8 +795,10 @@ fn run_worker(
     event_tx: mpsc::Sender<RegistryEvent>,
     preference_event_tx: mpsc::Sender<PreferenceEvent>,
     app_root_override: Option<PathBuf>,
+    catalog_slot: Arc<Mutex<CatalogSlot>>,
 ) -> Result<(), SessionError> {
-    let (mut persistence, _root_guard, _profile_guard) = Persistence::start(app_root_override);
+    let (mut persistence, _root_guard, _profile_guard) =
+        Persistence::start(app_root_override, Arc::clone(&catalog_slot));
     let mut coordinator = Coordinator::new();
     let mut preference_coordinator = PreferenceCoordinator::new();
     let mut applied_requests = HashSet::new();
@@ -803,6 +867,7 @@ fn run_worker(
             }
         };
         let Some(command) = command else {
+            catalog::close(&catalog_slot);
             let result = drain_shutdown(
                 &mut persistence,
                 &mut coordinator,
@@ -956,6 +1021,7 @@ fn run_worker(
                 }
             }
             Command::Shutdown { acknowledgement } => {
+                catalog::close(&catalog_slot);
                 let result = drain_shutdown(
                     &mut persistence,
                     &mut coordinator,
@@ -1986,7 +2052,10 @@ mod tests {
     use std::fs;
     use std::time::Instant;
     use tempfile::TempDir;
-    use wavecrate_library::app_dirs::{AppRootGuard, ConfigBaseGuard, PROFILE_DIR_NAME};
+    use wavecrate_library::app_dirs::{
+        AppRootGuard, ConfigBaseGuard, PROFILE_DIR_NAME, ProfileOwnershipError,
+        WritableProfileGuard,
+    };
     use wavecrate_library::sample_sources::{SourceId, SourceMetadataStorage};
 
     fn root(temp: &TempDir, name: &str) -> CanonicalSourceRoot {
@@ -2064,6 +2133,49 @@ mod tests {
         ) {
             PreferenceEvent::Snapshot { preferences, .. } => preferences,
             _ => unreachable!("snapshot predicate returned a non-snapshot event"),
+        }
+    }
+
+    fn wait_for_catalog_ready(service: &SourceRegistryService) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match service.catalog_status() {
+                CatalogStatus::Ready => return,
+                CatalogStatus::Loading => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for catalog startup"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                CatalogStatus::Unavailable { reason } => {
+                    panic!("catalog startup failed: {reason}");
+                }
+                CatalogStatus::Closed => panic!("catalog closed during startup"),
+            }
+        }
+    }
+
+    fn wait_for_catalog_event(
+        service: &SourceRegistryService,
+        predicate: impl Fn(&CatalogEvent) -> bool,
+    ) -> CatalogEvent {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match service.try_recv_catalog() {
+                Ok(event) if predicate(&event) => return event,
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for catalog event"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("catalog event channel disconnected")
+                }
+            }
         }
     }
 
@@ -2187,6 +2299,111 @@ mod tests {
         });
         assert_eq!(restored.len(), 1);
         reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
+    fn catalog_shares_session_profile_owner_and_releases_after_shutdown() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_catalog_ready(&service);
+
+        let app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
+        assert!(matches!(
+            WritableProfileGuard::acquire_current(),
+            Err(ProfileOwnershipError::ProfileOwnedByAnotherProcess { .. })
+        ));
+        drop(app_root_guard);
+
+        service.shutdown().expect("session shutdown");
+
+        let app_root_guard = AppRootGuard::set(profile_root).expect("app root after shutdown");
+        let replacement =
+            WritableProfileGuard::acquire_current().expect("profile ownership released");
+        drop(replacement);
+        drop(app_root_guard);
+    }
+
+    #[test]
+    fn catalog_audit_does_not_block_preference_persistence() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let source_root = temp.path().join("catalog-source");
+        for index in 0..256 {
+            fs::create_dir_all(source_root.join(format!("folder-{index}/nested")))
+                .expect("source fixture directory");
+        }
+        let source_root = fs::canonicalize(source_root).expect("canonical source root");
+        let source_id = SourceId::from_string("session-catalog");
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        wait_for_catalog_ready(&service);
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+
+        service
+            .submit_catalog(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: source_root,
+                lifecycle_generation: 1,
+            })
+            .expect("catalog registration");
+        wait_for_catalog_event(
+            &service,
+            |event| matches!(event, CatalogEvent::Registered { source_id: registered, .. } if registered == &source_id),
+        );
+        service
+            .submit_catalog(CatalogCommand::RequestAudit {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("catalog audit");
+
+        let preference_request = service
+            .patch_preferences(PreferencePatch::SetLoopEnabled(true))
+            .expect("preference patch during audit");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == preference_request
+            )
+        });
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+        wait_for_catalog_event(
+            &service,
+            |event| matches!(event, CatalogEvent::AuditCommitted { snapshot } if snapshot.source_id == source_id),
+        );
+        service.shutdown().expect("session shutdown");
+    }
+
+    #[test]
+    fn immediate_shutdown_closes_catalog_admission() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("service start");
+        service.shutdown().expect("immediate shutdown");
+
+        assert_eq!(service.catalog_status(), CatalogStatus::Closed);
+        assert_eq!(
+            service.submit_catalog(CatalogCommand::ReadSnapshot {
+                source_id: SourceId::from_string("closed-catalog"),
+                expected_revision: None,
+            }),
+            Err(CatalogSubmitError::Closed)
+        );
+        assert!(matches!(
+            service.try_recv_catalog(),
+            Err(TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
@@ -2737,6 +2954,7 @@ mod tests {
         let mut persistence = Persistence {
             writable: None,
             writer: None,
+            catalog: None,
             load: None,
             preference_load: None,
             pending_adds: HashMap::new(),
@@ -2801,6 +3019,7 @@ mod tests {
         let mut persistence = Persistence {
             writable: None,
             writer: None,
+            catalog: None,
             load: None,
             preference_load: None,
             pending_adds: HashMap::new(),

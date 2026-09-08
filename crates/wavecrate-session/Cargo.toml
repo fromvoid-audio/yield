@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+wavecrate-catalog = { path = "../wavecrate-catalog" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
