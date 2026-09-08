@@ -1733,3 +1733,5 @@ Normalized audition now has a persisted, default-off preference and an optimisti
 Reson now accepts a precomputed gain for a specific playback request ID. The worker silently rejects stale or post-stop updates without scanning audio, and queue admission/coalescing preserves different IDs and intervening controls. Same-scope tail replacement is constant-time; existing unscoped controls retain their behavior. Admission remains best-effort and does not acknowledge application.
 
 Validation: all 186 Reson tests and its all-targets check passed. After simplifying the tail lookup, all four scoped execution/coalescing/order tests passed again.
+
+Peak requests can now capture a WAV header and strong revision directly from a normalized span, without waiting for visual overview decoding. Fractional bounds become a clamped half-open frame range; the subsequent reader still rejects changed files. Neutral visual fields in this peak-only request are explicitly not a visual-detail normalization context. Validation: all 28 media tests and its all-targets check passed.

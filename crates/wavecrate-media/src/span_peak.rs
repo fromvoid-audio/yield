@@ -1,6 +1,6 @@
 //! Exact, bounded-memory WAV peak preparation for one frame span.
 
-use std::{fs::File, io::BufReader, sync::atomic::AtomicBool};
+use std::{fs::File, io::BufReader, path::Path, sync::atomic::AtomicBool};
 
 use crate::{WaveformDetailContext, WaveformDetailRange, detail};
 
@@ -12,13 +12,84 @@ const PEAK_READ_BLOCK_SAMPLES: usize = 4_096;
 /// result is one scalar and the decoder retains only its current sample and peak accumulator.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WavSpanPeakRequest {
-    /// Context captured by the source overview read.
+    /// Header-only revision/spec context used to fence this raw peak computation.
+    ///
+    /// Requests built by [`Self::from_path_span_with_cancel`] carry neutral visual-gain fields
+    /// because the existing detail-context type stores them. Those fields are not a waveform
+    /// detail normalization context; use an overview's [`crate::WaveformDetailContext`] for
+    /// visual detail requests.
     pub context: WaveformDetailContext,
     /// Exact half-open source frame range to inspect.
     pub range: WaveformDetailRange,
 }
 
 impl WavSpanPeakRequest {
+    /// Capture a header-only, file-fenced request for a normalized WAV span.
+    ///
+    /// `start` and `end` are normalized half-open bounds. The constructor reads WAV metadata and
+    /// filesystem identity only; it does not decode the span. The returned request can be passed
+    /// to [`load_wav_span_peak_with_cancel`] on a later background task, which revalidates the
+    /// captured revision before and after its bounded-memory sample scan.
+    pub fn from_path_span_with_cancel(
+        path: &Path,
+        start: f64,
+        end: f64,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Self, String> {
+        validate_normalized_span(start, end)?;
+        if crate::is_cancelled(cancellation) {
+            return Err(String::from("WAV span peak canceled"));
+        }
+
+        let opened = detail::open_wav(path, cancellation).map_err(|error| {
+            if crate::is_cancelled(cancellation) {
+                String::from("WAV span peak canceled")
+            } else {
+                format!(
+                    "WAV span peak context failed for {}: {error}",
+                    path.display()
+                )
+            }
+        })?;
+        let after = detail::recheck_wav(
+            path,
+            &opened.file,
+            opened.spec,
+            opened.total_frames,
+            cancellation,
+        )
+        .map_err(|error| {
+            if crate::is_cancelled(cancellation) {
+                String::from("WAV span peak canceled")
+            } else {
+                format!(
+                    "WAV span peak context failed for {}: {error}",
+                    path.display()
+                )
+            }
+        })?;
+        let context = detail::context_from_observations(
+            path,
+            &opened.observation,
+            &after,
+            opened.spec,
+            opened.total_frames,
+            1.0,
+            [1.0; 3],
+        )
+        .ok_or_else(|| String::from("stale WAV span peak context"))?;
+        if crate::is_cancelled(cancellation) {
+            return Err(String::from("WAV span peak canceled"));
+        }
+        let range = normalized_span_range(start, end, context.total_frames)?;
+        Self::new(context, range)
+    }
+
+    /// Capture a header-only, file-fenced request for a normalized WAV span without cancellation.
+    pub fn from_path_span(path: &Path, start: f64, end: f64) -> Result<Self, String> {
+        Self::from_path_span_with_cancel(path, start, end, None)
+    }
+
     /// Validate and create a request for `range` in `context`.
     pub fn new(context: WaveformDetailContext, range: WaveformDetailRange) -> Result<Self, String> {
         let request = Self { context, range };
@@ -53,6 +124,39 @@ impl WavSpanPeakRequest {
         }
         Ok(())
     }
+}
+
+fn validate_normalized_span(start: f64, end: f64) -> Result<(), String> {
+    if !start.is_finite()
+        || !end.is_finite()
+        || !(0.0..=1.0).contains(&start)
+        || !(0.0..=1.0).contains(&end)
+        || start >= end
+    {
+        return Err(String::from(
+            "WAV span peak normalized range must satisfy 0 <= start < end <= 1",
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_span_range(
+    start: f64,
+    end: f64,
+    total_frames: usize,
+) -> Result<WaveformDetailRange, String> {
+    let total_frames = total_frames as f64;
+    let start_frame = (start * total_frames).floor().clamp(0.0, total_frames) as usize;
+    let end_frame = (end * total_frames).ceil().clamp(0.0, total_frames) as usize;
+    if start_frame >= end_frame {
+        return Err(String::from(
+            "WAV span peak normalized range covers no source frame",
+        ));
+    }
+    Ok(WaveformDetailRange {
+        start_frame,
+        end_frame,
+    })
 }
 
 /// Read the raw maximum absolute interleaved channel sample for one exact WAV span.
@@ -254,6 +358,86 @@ mod tests {
             .expect("WAV overview")
             .detail_context
             .expect("strong WAV context")
+    }
+
+    #[test]
+    fn path_span_constructor_captures_header_context_and_converts_normalized_bounds() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("normalized-span.wav");
+        write_float_wav(
+            &path,
+            1,
+            &[
+                [0.01, 0.0],
+                [0.02, 0.0],
+                [0.3, 0.0],
+                [0.4, 0.0],
+                [0.5, 0.0],
+                [0.6, 0.0],
+                [0.7, 0.0],
+                [0.8, 0.0],
+                [0.9, 0.0],
+                [1.0, 0.0],
+            ],
+        );
+
+        let request = WavSpanPeakRequest::from_path_span_with_cancel(&path, 0.21, 0.61, None)
+            .expect("normalized span request");
+        assert_eq!(
+            request.range,
+            WaveformDetailRange {
+                start_frame: 2,
+                end_frame: 7,
+            }
+        );
+        assert_eq!(request.context.total_frames, 10);
+        assert_eq!(request.context.global_mono_gain, 1.0);
+        assert_eq!(request.context.visual_band_gains, [1.0; 3]);
+        assert!(
+            (load_wav_span_peak(&request).expect("normalized span peak") - 0.7).abs() < 0.000_01
+        );
+    }
+
+    #[test]
+    fn path_span_constructor_rejects_invalid_normalized_bounds_before_opening() {
+        let path = Path::new("missing.wav");
+        for (start, end) in [
+            (f64::NAN, 0.5),
+            (0.0, f64::NAN),
+            (-0.1, 0.5),
+            (0.0, 1.1),
+            (0.5, 0.5),
+            (0.7, 0.2),
+        ] {
+            let error = WavSpanPeakRequest::from_path_span_with_cancel(path, start, end, None)
+                .expect_err("invalid normalized bounds");
+            assert!(error.contains("normalized range"), "{error}");
+        }
+    }
+
+    #[test]
+    fn path_span_constructor_honors_cancellation_and_peak_read_fence() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("canceled-span.wav");
+        write_float_wav(&path, 1, &[[0.25, 0.0], [0.5, 0.0], [0.75, 0.0]]);
+        let cancellation = AtomicBool::new(true);
+        assert_eq!(
+            WavSpanPeakRequest::from_path_span_with_cancel(&path, 0.0, 1.0, Some(&cancellation)),
+            Err(String::from("WAV span peak canceled"))
+        );
+
+        cancellation.store(false, Ordering::Release);
+        let request =
+            WavSpanPeakRequest::from_path_span_with_cancel(&path, 0.0, 1.0, Some(&cancellation))
+                .expect("span request");
+        let replacement = directory.path().join("replacement.wav");
+        write_float_wav(&replacement, 1, &[[0.9, 0.0], [0.9, 0.0], [0.9, 0.0]]);
+        fs::rename(replacement, &path).expect("replace WAV source");
+        let error = load_wav_span_peak(&request).expect_err("stale span request");
+        assert!(
+            error.contains("stale") || error.contains("replaced"),
+            "{error}"
+        );
     }
 
     #[test]
