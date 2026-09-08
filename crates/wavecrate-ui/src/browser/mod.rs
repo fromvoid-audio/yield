@@ -1636,6 +1636,15 @@ impl Browser {
                 }
                 return;
             }
+            if let Some(direction) =
+                waveform::waveform_region_navigation_key(key, secondary, shift, alt, function)
+            {
+                let canceled = self.cancel_waveform_gestures(window, cx);
+                if self.slide_waveform_region(direction) || canceled {
+                    cx.notify();
+                }
+                return;
+            }
         }
         if let Some(direction) =
             history::history_shortcut_direction(key, secondary, shift, alt, function, event.is_held)

@@ -10,7 +10,7 @@ use gpui::{
     Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point,
     prelude::*, px,
 };
-use wavecrate_core::WaveformViewport;
+use wavecrate_core::{WaveformRegion, WaveformViewport};
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -20,6 +20,11 @@ use super::waveform_scrollbar;
 
 const WAVEFORM_SELECTION_CLICK_SLOP_PX: f32 = 2.0;
 const WAVEFORM_SELECTION_EDGE_WIDTH: f32 = 1.0;
+const PLAY_REGION_RESIZE_HANDLE_HEIGHT: f32 = 22.0;
+const PLAY_REGION_RESIZE_HANDLE_WIDTH: f32 = 9.0;
+const PLAY_REGION_RESIZE_HIT_WIDTH: f32 = 15.0;
+const PLAY_REGION_MOVE_GRIP_HEIGHT: f32 = 7.0;
+const PLAY_REGION_MOVE_GRIP_INSET: f32 = 9.0;
 const WAVEFORM_PAN_REFERENCE_WIDTH: f64 = 1_200.0;
 const WAVEFORM_WHEEL_EPSILON: f64 = f64::EPSILON;
 
@@ -32,14 +37,7 @@ pub(super) struct WaveformPlayRegion {
 
 impl WaveformPlayRegion {
     pub(super) fn new(start: f64, end: f64) -> Option<Self> {
-        let start = normalized_waveform_position(start)?;
-        let end = normalized_waveform_position(end)?;
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        (start < end).then_some(Self { start, end })
+        WaveformRegion::new(start, end).map(Self::from_core)
     }
 
     pub(super) fn is_valid(self) -> bool {
@@ -49,6 +47,42 @@ impl WaveformPlayRegion {
             && (0.0..=1.0).contains(&self.end)
             && self.start < self.end
     }
+
+    fn from_core(region: WaveformRegion) -> Self {
+        Self {
+            start: region.start(),
+            end: region.end(),
+        }
+    }
+
+    fn core(self) -> Option<WaveformRegion> {
+        WaveformRegion::new(self.start, self.end)
+    }
+
+    fn slide_left(self) -> Option<Self> {
+        self.core()
+            .map(|region| Self::from_core(region.slide_left()))
+    }
+
+    fn slide_right(self) -> Option<Self> {
+        self.core()
+            .map(|region| Self::from_core(region.slide_right()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaveformRegionHandle {
+    ResizeStart,
+    ResizeEnd,
+    Move,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WaveformRegionDragMode {
+    Create,
+    Move { baseline: WaveformRegion },
+    ResizeStart { baseline: WaveformRegion },
+    ResizeEnd { baseline: WaveformRegion },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,6 +94,7 @@ pub(super) struct WaveformRegionDrag {
     viewport: WaveformViewport,
     moved: bool,
     generation: u64,
+    mode: WaveformRegionDragMode,
 }
 
 impl WaveformRegionDrag {
@@ -70,6 +105,49 @@ impl WaveformRegionDrag {
         viewport: WaveformViewport,
         generation: u64,
     ) -> Self {
+        Self::with_mode(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            generation,
+            WaveformRegionDragMode::Create,
+        )
+    }
+
+    fn begin_handle(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        region: WaveformPlayRegion,
+        handle: WaveformRegionHandle,
+        generation: u64,
+    ) -> Option<Self> {
+        let baseline = region.core()?;
+        let mode = match handle {
+            WaveformRegionHandle::ResizeStart => WaveformRegionDragMode::ResizeStart { baseline },
+            WaveformRegionHandle::ResizeEnd => WaveformRegionDragMode::ResizeEnd { baseline },
+            WaveformRegionHandle::Move => WaveformRegionDragMode::Move { baseline },
+        };
+        Some(Self::with_mode(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            generation,
+            mode,
+        ))
+    }
+
+    fn with_mode(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        generation: u64,
+        mode: WaveformRegionDragMode,
+    ) -> Self {
         let ratio = viewport.absolute_ratio_from_visible(visible_ratio);
         Self {
             anchor: ratio,
@@ -79,6 +157,7 @@ impl WaveformRegionDrag {
             viewport,
             moved: false,
             generation,
+            mode,
         }
     }
 
@@ -91,12 +170,37 @@ impl WaveformRegionDrag {
     }
 
     fn preview_region(self) -> Option<WaveformPlayRegion> {
-        WaveformPlayRegion::new(self.anchor, self.current)
+        if !self.moved {
+            match self.mode {
+                WaveformRegionDragMode::Create => {}
+                WaveformRegionDragMode::Move { baseline }
+                | WaveformRegionDragMode::ResizeStart { baseline }
+                | WaveformRegionDragMode::ResizeEnd { baseline } => {
+                    return Some(WaveformPlayRegion::from_core(baseline));
+                }
+            }
+        }
+        match self.mode {
+            WaveformRegionDragMode::Create => WaveformPlayRegion::new(self.anchor, self.current),
+            WaveformRegionDragMode::Move { baseline } => baseline
+                .moved_by(self.current - self.anchor)
+                .map(WaveformPlayRegion::from_core),
+            WaveformRegionDragMode::ResizeStart { baseline } => baseline
+                .resized_start_to(self.current)
+                .map(WaveformPlayRegion::from_core),
+            WaveformRegionDragMode::ResizeEnd { baseline } => baseline
+                .resized_end_to(self.current)
+                .map(WaveformPlayRegion::from_core),
+        }
     }
 
     fn ratio_at(self, position: Point<Pixels>) -> Option<f64> {
         waveform_click_ratio(position, self.bounds)
             .map(|ratio| self.viewport.absolute_ratio_from_visible(ratio))
+    }
+
+    fn is_handle_drag(self) -> bool {
+        !matches!(self.mode, WaveformRegionDragMode::Create)
     }
 }
 
@@ -578,15 +682,10 @@ pub(super) fn render_waveform(
         .waveform_region_drag
         .and_then(WaveformRegionDrag::preview_region)
         .or(browser.waveform_play_region)
-        .and_then(|region| {
-            browser
-                .waveform_viewport
-                .visible_range_from_absolute(region.start, region.end)
-                .and_then(|(start, end)| WaveformPlayRegion::new(start, end))
-        })
     {
         bars = bars.child(waveform_region_overlay(
             region,
+            browser.waveform_viewport,
             color(theme.colors.selection_fill),
             color(theme.colors.waveform_playhead),
         ));
@@ -646,13 +745,38 @@ pub(super) fn render_waveform(
                 };
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                view.waveform_region_drag = Some(WaveformRegionDrag::begin(
-                    event.position,
-                    ratio,
-                    bounds,
-                    view.waveform_viewport,
-                    view.waveform_generation,
-                ));
+                view.waveform_region_drag = view
+                    .waveform_play_region
+                    .and_then(|region| {
+                        waveform_region_handle_at(
+                            region,
+                            view.waveform_viewport,
+                            bounds,
+                            event.position,
+                        )
+                    })
+                    .and_then(|handle| {
+                        view.waveform_play_region.and_then(|region| {
+                            WaveformRegionDrag::begin_handle(
+                                event.position,
+                                ratio,
+                                bounds,
+                                view.waveform_viewport,
+                                region,
+                                handle,
+                                view.waveform_generation,
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        Some(WaveformRegionDrag::begin(
+                            event.position,
+                            ratio,
+                            bounds,
+                            view.waveform_viewport,
+                            view.waveform_generation,
+                        ))
+                    });
                 cx.notify();
             }),
         )
@@ -706,6 +830,21 @@ impl Browser {
         }
         cx.stop_active_drag(window);
         true
+    }
+
+    pub(super) fn cancel_waveform_gestures(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let had_region_drag = self.waveform_region_drag.take().is_some();
+        let had_pan_drag = self.waveform_pan_drag.take().is_some();
+        let had_scrollbar_drag = self.waveform_scrollbar_drag.take().is_some();
+        let canceled = had_region_drag || had_pan_drag || had_scrollbar_drag;
+        if canceled {
+            cx.stop_active_drag(window);
+        }
+        canceled
     }
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
@@ -865,6 +1004,38 @@ impl Browser {
         true
     }
 
+    pub(super) fn slide_waveform_region(&mut self, direction: WaveformRegionSlide) -> bool {
+        let Some(region) = self.waveform_play_region else {
+            return false;
+        };
+        let Some(next) = (match direction {
+            WaveformRegionSlide::Left => region.slide_left(),
+            WaveformRegionSlide::Right => region.slide_right(),
+        }) else {
+            return false;
+        };
+        if next == region {
+            return false;
+        }
+        self.waveform_play_region = Some(next);
+        let Some(preview) = self.waveform.as_ref() else {
+            return true;
+        };
+        let viewport = self.waveform_viewport;
+        let viewport_shift = if next.start < viewport.start {
+            next.start - viewport.start
+        } else if next.end > viewport.end {
+            next.end - viewport.end
+        } else {
+            0.0
+        };
+        if viewport_shift.abs() > WAVEFORM_WHEEL_EPSILON {
+            self.waveform_viewport = viewport
+                .pan_by_visible_fraction(preview.total_frames, viewport_shift / viewport.width());
+        }
+        true
+    }
+
     fn update_waveform_region_drag(&mut self, position: Point<Pixels>) {
         let Some(drag) = self.waveform_region_drag.as_mut() else {
             return;
@@ -885,7 +1056,13 @@ impl Browser {
         }
         let mut drag = drag;
         drag.update(position);
-        if drag.moved {
+        if drag.is_handle_drag() {
+            if drag.moved {
+                if let Some(region) = drag.preview_region() {
+                    self.waveform_play_region = Some(region);
+                }
+            }
+        } else if drag.moved {
             self.stop_playback();
             self.waveform_play_region = drag.preview_region();
         } else if let Some(ratio) = drag.ratio_at(position) {
@@ -945,8 +1122,68 @@ fn waveform_click_ratio(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Opti
     Some(((x - left) / width).clamp(0.0, 1.0) as f64)
 }
 
-fn normalized_waveform_position(position: f64) -> Option<f64> {
-    position.is_finite().then(|| position.clamp(0.0, 1.0))
+fn waveform_region_handle_at(
+    region: WaveformPlayRegion,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> Option<WaveformRegionHandle> {
+    if !bounds.contains(&position) {
+        return None;
+    }
+    let width = f32::from(bounds.size.width);
+    let left = f32::from(bounds.origin.x);
+    let x = f32::from(position.x);
+    let y = f32::from(position.y);
+    let top = f32::from(bounds.origin.y);
+    if !width.is_finite()
+        || width <= 0.0
+        || !left.is_finite()
+        || !x.is_finite()
+        || !y.is_finite()
+        || !top.is_finite()
+    {
+        return None;
+    }
+    let in_resize_strip = y >= top && y <= top + PLAY_REGION_RESIZE_HANDLE_HEIGHT;
+    if in_resize_strip {
+        let start_x = viewport
+            .visible_ratio_from_absolute(region.start)
+            .map(|ratio| left + width * ratio as f32);
+        let end_x = viewport
+            .visible_ratio_from_absolute(region.end)
+            .map(|ratio| left + width * ratio as f32);
+        let half_hit_width = PLAY_REGION_RESIZE_HIT_WIDTH * 0.5;
+        let start_distance = start_x
+            .filter(|center| (x - center).abs() <= half_hit_width)
+            .map(|center| (x - center).abs());
+        let end_distance = end_x
+            .filter(|center| (x - center).abs() <= half_hit_width)
+            .map(|center| (x - center).abs());
+        match (start_distance, end_distance) {
+            (Some(start), Some(end)) if end < start => {
+                return Some(WaveformRegionHandle::ResizeEnd);
+            }
+            (Some(_), Some(_)) | (Some(_), None) => {
+                return Some(WaveformRegionHandle::ResizeStart);
+            }
+            (None, Some(_)) => return Some(WaveformRegionHandle::ResizeEnd),
+            (None, None) => {}
+        }
+    }
+
+    if y > top + PLAY_REGION_MOVE_GRIP_HEIGHT {
+        return None;
+    }
+    let Some((visible_start, visible_end)) =
+        viewport.visible_range_from_absolute(region.start, region.end)
+    else {
+        return None;
+    };
+    let grip_left = left + width * visible_start as f32 + PLAY_REGION_MOVE_GRIP_INSET;
+    let grip_right = left + width * visible_end as f32 - PLAY_REGION_MOVE_GRIP_INSET;
+    (grip_right > grip_left && x >= grip_left && x <= grip_right)
+        .then_some(WaveformRegionHandle::Move)
 }
 
 fn waveform_drag_is_current(
@@ -957,8 +1194,32 @@ fn waveform_drag_is_current(
     waveform_loaded && drag.generation == generation
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaveformRegionSlide {
+    Left,
+    Right,
+}
+
+pub(super) fn waveform_region_navigation_key(
+    key: &str,
+    secondary: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+) -> Option<WaveformRegionSlide> {
+    if secondary || shift || alt || function {
+        return None;
+    }
+    match key {
+        "left" | "arrowleft" => Some(WaveformRegionSlide::Left),
+        "right" | "arrowright" => Some(WaveformRegionSlide::Right),
+        _ => None,
+    }
+}
+
 fn waveform_region_overlay(
     region: WaveformPlayRegion,
+    viewport: WaveformViewport,
     selection_color: gpui::Hsla,
     edge_color: gpui::Hsla,
 ) -> impl IntoElement {
@@ -970,8 +1231,13 @@ fn waveform_region_overlay(
             if !width.is_finite() || width <= 0.0 || !height.is_finite() || height <= 0.0 {
                 return;
             }
-            let start = width * region.start as f32;
-            let end = width * region.end as f32;
+            let Some((visible_start, visible_end)) =
+                viewport.visible_range_from_absolute(region.start, region.end)
+            else {
+                return;
+            };
+            let start = width * visible_start as f32;
+            let end = width * visible_end as f32;
             if !start.is_finite() || !end.is_finite() || end <= start {
                 return;
             }
@@ -981,15 +1247,55 @@ fn waveform_region_overlay(
             );
             window.paint_quad(fill(selection_bounds, selection_color));
             let edge_width = WAVEFORM_SELECTION_EDGE_WIDTH.min(width);
-            for x in [start, (end - edge_width).max(start)] {
+            for absolute in [region.start, region.end] {
+                let Some(visible) = viewport.visible_ratio_from_absolute(absolute) else {
+                    continue;
+                };
+                let center = width * visible as f32;
+                let left = (center - edge_width * 0.5).clamp(0.0, width - edge_width);
                 let edge_bounds = Bounds::from_corners(
-                    point(bounds.left() + px(x), bounds.top()),
-                    point(
-                        bounds.left() + px((x + edge_width).min(width)),
-                        bounds.bottom(),
-                    ),
+                    point(bounds.left() + px(left), bounds.top()),
+                    point(bounds.left() + px(left + edge_width), bounds.bottom()),
                 );
                 window.paint_quad(fill(edge_bounds, edge_color));
+            }
+            let move_left = viewport
+                .visible_ratio_from_absolute(region.start)
+                .unwrap_or(visible_start) as f32;
+            let move_right = viewport
+                .visible_ratio_from_absolute(region.end)
+                .unwrap_or(visible_end) as f32;
+            let grip_left = width * move_left + PLAY_REGION_MOVE_GRIP_INSET;
+            let grip_right = width * move_right - PLAY_REGION_MOVE_GRIP_INSET;
+            let grip_height = PLAY_REGION_MOVE_GRIP_HEIGHT.min(height);
+            if grip_right > grip_left && grip_height > 0.0 {
+                let grip_bounds = Bounds::from_corners(
+                    point(bounds.left() + px(grip_left), bounds.top()),
+                    point(
+                        bounds.left() + px(grip_right),
+                        bounds.top() + px(grip_height),
+                    ),
+                );
+                window.paint_quad(fill(grip_bounds, edge_color.opacity(0.75)));
+            }
+            let handle_height = PLAY_REGION_RESIZE_HANDLE_HEIGHT.min(height);
+            if handle_height > 0.0 {
+                for absolute in [region.start, region.end] {
+                    let Some(visible) = viewport.visible_ratio_from_absolute(absolute) else {
+                        continue;
+                    };
+                    let center = width * visible as f32;
+                    let handle_width = PLAY_REGION_RESIZE_HANDLE_WIDTH.min(width);
+                    let left = (center - handle_width * 0.5).clamp(0.0, width - handle_width);
+                    let handle_bounds = Bounds::from_corners(
+                        point(bounds.left() + px(left), bounds.top()),
+                        point(
+                            bounds.left() + px(left + handle_width),
+                            bounds.top() + px(handle_height),
+                        ),
+                    );
+                    window.paint_quad(fill(handle_bounds, edge_color.opacity(0.9)));
+                }
             }
         },
     )
@@ -1337,6 +1643,20 @@ mod tests {
         assert_eq!(WaveformPlayRegion::new(0.5, 0.5), None);
         assert_eq!(WaveformPlayRegion::new(f64::NAN, 0.5), None);
         assert_eq!(WaveformPlayRegion::new(0.5, f64::INFINITY), None);
+        assert!(
+            !WaveformPlayRegion {
+                start: -0.1,
+                end: 0.5,
+            }
+            .is_valid()
+        );
+        assert!(
+            !WaveformPlayRegion {
+                start: 0.8,
+                end: 0.2,
+            }
+            .is_valid()
+        );
     }
 
     #[test]
@@ -1379,6 +1699,153 @@ mod tests {
         outside_drag.update(point(px(-5.0), px(5.0)));
         assert!(outside_drag.moved);
         assert_eq!(outside_drag.current, 0.0);
+    }
+
+    #[test]
+    fn play_region_handle_hit_zones_prioritize_resize_and_respect_grip_geometry() {
+        let bounds = test_bounds(200.0, 100.0);
+        let region = WaveformPlayRegion::new(0.25, 0.75).unwrap();
+        let viewport = WaveformViewport::full();
+
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(50.0), px(10.0))),
+            Some(WaveformRegionHandle::ResizeStart)
+        );
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(150.0), px(10.0))),
+            Some(WaveformRegionHandle::ResizeEnd)
+        );
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(100.0), px(3.0))),
+            Some(WaveformRegionHandle::Move)
+        );
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(100.0), px(8.0))),
+            None
+        );
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(100.0), px(24.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn play_region_handles_follow_zoomed_coordinates_and_hide_offscreen_edges() {
+        let bounds = test_bounds(200.0, 100.0);
+        let region = WaveformPlayRegion::new(0.4, 0.6).unwrap();
+        let viewport = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(60.0), px(10.0))),
+            Some(WaveformRegionHandle::ResizeStart)
+        );
+        assert_eq!(
+            waveform_region_handle_at(region, viewport, bounds, point(px(140.0), px(10.0))),
+            Some(WaveformRegionHandle::ResizeEnd)
+        );
+
+        let clipped = WaveformPlayRegion::new(0.1, 0.9).unwrap();
+        assert_eq!(
+            waveform_region_handle_at(clipped, viewport, bounds, point(px(0.0), px(10.0))),
+            None
+        );
+        assert_eq!(
+            waveform_region_handle_at(clipped, viewport, bounds, point(px(200.0), px(10.0))),
+            None
+        );
+        assert_eq!(
+            waveform_region_handle_at(clipped, viewport, bounds, point(px(100.0), px(3.0))),
+            Some(WaveformRegionHandle::Move)
+        );
+    }
+
+    #[test]
+    fn handle_drags_preview_move_and_resize_from_the_original_baseline() {
+        let bounds = test_bounds(100.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let baseline = WaveformPlayRegion::new(0.25, 0.5).unwrap();
+
+        let mut move_drag = WaveformRegionDrag::begin_handle(
+            point(px(37.5), px(3.0)),
+            0.375,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::Move,
+            7,
+        )
+        .unwrap();
+        move_drag.update(point(px(62.5), px(3.0)));
+        let moved = move_drag.preview_region().unwrap();
+        assert!((moved.start - 0.5).abs() < 1.0e-12);
+        assert!((moved.end - 0.75).abs() < 1.0e-12);
+        assert!(move_drag.is_handle_drag());
+
+        let mut resize_drag = WaveformRegionDrag::begin_handle(
+            point(px(25.0), px(10.0)),
+            0.25,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::ResizeStart,
+            7,
+        )
+        .unwrap();
+        resize_drag.update(point(px(80.0), px(10.0)));
+        let resized = resize_drag.preview_region().unwrap();
+        assert!((resized.start - 0.5).abs() < 1.0e-6);
+        assert!((resized.end - 0.8).abs() < 1.0e-6);
+        assert!(resize_drag.moved);
+
+        let mut no_op = WaveformRegionDrag::begin_handle(
+            point(px(27.0), px(10.0)),
+            0.27,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::ResizeStart,
+            7,
+        )
+        .unwrap();
+        assert_eq!(no_op.preview_region(), Some(baseline));
+        no_op.update(point(px(28.0), px(10.0)));
+        assert!(!no_op.moved);
+        assert_eq!(no_op.preview_region(), Some(baseline));
+    }
+
+    #[test]
+    fn waveform_region_keyboard_routing_requires_an_unmodified_waveform_key() {
+        assert_eq!(
+            waveform_region_navigation_key("left", false, false, false, false),
+            Some(WaveformRegionSlide::Left)
+        );
+        assert_eq!(
+            waveform_region_navigation_key("arrowright", false, false, false, false),
+            Some(WaveformRegionSlide::Right)
+        );
+        assert_eq!(
+            waveform_region_navigation_key("left", true, false, false, false),
+            None
+        );
+        assert_eq!(
+            waveform_region_navigation_key("right", false, true, false, false),
+            None
+        );
+        assert_eq!(
+            waveform_region_navigation_key("right", false, false, true, false),
+            None
+        );
+        assert_eq!(
+            waveform_region_navigation_key("right", false, false, false, true),
+            None
+        );
+        assert_eq!(
+            waveform_region_navigation_key("up", false, false, false, false),
+            None
+        );
     }
 
     #[test]

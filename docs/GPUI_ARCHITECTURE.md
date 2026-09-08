@@ -15,7 +15,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `wavecrate-gpui` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
-| `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, waveform viewport geometry, display formatting | GPUI types, filesystem calls, audio devices, databases |
+| `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, waveform viewport/region geometry, display formatting | GPUI types, filesystem calls, audio devices, databases |
 | `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |

@@ -752,3 +752,31 @@ panning, track clicks, unchanged play region, no audition, and full-view reset.
 A subsequent review fixed capture-phase release propagation; targeted tests and
 formatting passed after that fix. Integrated gesture GUI validation will also
 cover waveform releases while this bar is visible.
+
+### Playback-region move, resize, and slide, 2026-09-08
+
+Playback regions now have the reference-style top move grip and endpoint resize
+handles. Hit testing prefers the nearest resize edge in overlapping narrow
+regions, maps through the current zoom, and ignores offscreen endpoints. Pure
+`WaveformRegion` geometry in the core crate preserves width during movement and
+whole-width keyboard slides, clamps to the audio domain, and normalizes crossing
+resize endpoints. Provisional drags retain their baseline until movement exceeds
+click slop; release applies its final position, and cancellation preserves the
+committed region.
+
+Move and resize change the next audition region without interrupting the current
+transport. Unmodified Left/Right while the waveform owns focus slides the region
+and pans to keep it visible. Sliding cancels unfinished pointer gestures before
+updating the region. Existing click-to-audition and drag-create behavior remains.
+
+Validation used a detached checkout at `b16d1d893` plus the four gesture files,
+whose bytes matched the implementation checkout. Thirty waveform UI tests and
+four core region tests passed, along with formatting, diff checks, signed build,
+and signature verification. GUI checks on the disposable 12-second fixture
+covered create, move, resize, endpoint crossing, Left/Right and framing, creation
+with the scrollbar visible, outside-waveform release, and edits while playback
+continued. Escape stopped playback; full-view reset preserved the committed
+region and hid the bar. The app quit cleanly. Mid-drag Escape was covered by
+state handling rather than a GUI injection test; audible acceptance remains
+manual. Regions extending into silence margins, edit selections, and export
+handles remain follow-on work.

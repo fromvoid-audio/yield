@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 mod folder_tree;
 mod playback_history;
 mod selection;
+mod waveform_region;
 mod waveform_viewport;
 
 pub use folder_tree::{
@@ -18,6 +19,7 @@ pub use playback_history::{
     PlaybackSpan,
 };
 pub use selection::BrowserSelection;
+pub use waveform_region::WaveformRegion;
 pub use waveform_viewport::WaveformViewport;
 
 /// A source audio file discovered by a folder scan.
