@@ -28,6 +28,10 @@ const LIBRARY_DB_SCHEMA_CONTRACT: &[TableContract] = &[
         columns: &["key", "value"],
     },
     TableContract {
+        name: "profile_tag_vocabulary",
+        columns: &["label", "category"],
+    },
+    TableContract {
         name: "sources",
         columns: &[
             "id",

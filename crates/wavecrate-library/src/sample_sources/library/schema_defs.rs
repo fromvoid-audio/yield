@@ -26,6 +26,19 @@ impl LibraryDatabase {
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                 CREATE TABLE IF NOT EXISTS profile_tag_vocabulary (
+                    label TEXT PRIMARY KEY COLLATE BINARY,
+                    category TEXT NOT NULL
+                        CHECK(category IN (
+                            'playback-type',
+                            'sound-type',
+                            'character',
+                            'prefix',
+                            'tuning-scale'
+                        )),
+                    CHECK(length(CAST(label AS BLOB)) BETWEEN 1 AND 1024),
+                    CHECK(instr(CAST(label AS TEXT), char(0)) = 0)
+                 ) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS sources (
                     id TEXT PRIMARY KEY,
                     root TEXT NOT NULL,

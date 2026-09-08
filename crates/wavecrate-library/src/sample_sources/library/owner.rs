@@ -9,6 +9,11 @@ use thiserror::Error;
 
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
+use super::tag_vocabulary::{
+    ProfileTagCategory, ProfileTagVocabularyInputError, ProfileTagVocabularyLookup,
+    ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
+    validate_lookup_labels, validate_page_inputs, validate_set_input,
+};
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
 
@@ -127,6 +132,9 @@ pub enum GlobalLibraryWriterQueueError {
         /// Supplied payload size.
         actual: usize,
     },
+    /// A profile vocabulary request was rejected before queue admission.
+    #[error("invalid profile tag vocabulary input: {0}")]
+    InvalidProfileTagVocabulary(#[from] ProfileTagVocabularyInputError),
     /// The owner is closing or has already closed.
     #[error("global library writer is closed")]
     Closed,
@@ -162,6 +170,23 @@ enum WriterCommand {
         payload: String,
         result: SyncSender<Result<(), LibraryError>>,
     },
+    LookupProfileTagCategories {
+        labels: Vec<String>,
+        result: SyncSender<Result<ProfileTagVocabularyLookup, LibraryError>>,
+    },
+    ProfileTagVocabularyPage {
+        expected_revision: Option<u64>,
+        prefix: String,
+        after_cursor: Option<ProfileTagVocabularyPageCursor>,
+        requested_limit: usize,
+        result: SyncSender<Result<ProfileTagVocabularyPage, LibraryError>>,
+    },
+    SetProfileTagCategory {
+        expected_revision: u64,
+        label: String,
+        category: ProfileTagCategory,
+        result: SyncSender<Result<ProfileTagVocabularySetReceipt, LibraryError>>,
+    },
 }
 
 enum WriterReply {
@@ -185,6 +210,18 @@ enum WriterReply {
         result: SyncSender<Result<(), LibraryError>>,
         value: Result<(), LibraryError>,
     },
+    LookupProfileTagCategories {
+        result: SyncSender<Result<ProfileTagVocabularyLookup, LibraryError>>,
+        value: Result<ProfileTagVocabularyLookup, LibraryError>,
+    },
+    ProfileTagVocabularyPage {
+        result: SyncSender<Result<ProfileTagVocabularyPage, LibraryError>>,
+        value: Result<ProfileTagVocabularyPage, LibraryError>,
+    },
+    SetProfileTagCategory {
+        result: SyncSender<Result<ProfileTagVocabularySetReceipt, LibraryError>>,
+        value: Result<ProfileTagVocabularySetReceipt, LibraryError>,
+    },
 }
 
 impl WriterReply {
@@ -205,6 +242,15 @@ impl WriterReply {
             Self::ReplaceUiPreferences { result, value } => {
                 let _ = result.send(value);
             }
+            Self::LookupProfileTagCategories { result, value } => {
+                let _ = result.send(value);
+            }
+            Self::ProfileTagVocabularyPage { result, value } => {
+                let _ = result.send(value);
+            }
+            Self::SetProfileTagCategory { result, value } => {
+                let _ = result.send(value);
+            }
         }
     }
 
@@ -223,6 +269,15 @@ impl WriterReply {
                 let _ = result.send(Err(error));
             }
             Self::ReplaceUiPreferences { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::LookupProfileTagCategories { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::ProfileTagVocabularyPage { result, .. } => {
+                let _ = result.send(Err(error));
+            }
+            Self::SetProfileTagCategory { result, .. } => {
                 let _ = result.send(Err(error));
             }
         }
@@ -472,6 +527,76 @@ impl GlobalLibraryWriter {
         Ok(result_rx)
     }
 
+    /// Queue an exact lookup of bounded profile vocabulary labels.
+    ///
+    /// Labels are validated and exact duplicates are removed before admission. The result is
+    /// bounded to 64 rows.
+    pub fn lookup_profile_tag_categories(
+        &self,
+        mut labels: Vec<String>,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularyLookup, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        validate_lookup_labels(&mut labels)?;
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::LookupProfileTagCategories {
+            labels,
+            result: result_tx,
+        })?;
+        Ok(result_rx)
+    }
+
+    /// Queue one bounded literal-prefix profile vocabulary page.
+    ///
+    /// The requested page size is clamped to `1..=64`. A continuation cursor is opaque and may
+    /// only be reused with the exact revision and literal prefix that produced it.
+    pub fn profile_tag_vocabulary_page(
+        &self,
+        expected_revision: Option<u64>,
+        prefix: String,
+        after_cursor: Option<ProfileTagVocabularyPageCursor>,
+        requested_limit: usize,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularyPage, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        validate_page_inputs(&prefix, after_cursor.as_ref())?;
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::ProfileTagVocabularyPage {
+            expected_revision,
+            prefix,
+            after_cursor,
+            requested_limit,
+            result: result_tx,
+        })?;
+        Ok(result_rx)
+    }
+
+    /// Queue one category assignment at an exact profile vocabulary revision.
+    pub fn set_profile_tag_category(
+        &self,
+        expected_revision: u64,
+        label: String,
+        category: ProfileTagCategory,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularySetReceipt, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        validate_set_input(&label, category)?;
+        self.ensure_available()?;
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.send(WriterCommand::SetProfileTagCategory {
+            expected_revision,
+            label,
+            category,
+            result: result_tx,
+        })?;
+        Ok(result_rx)
+    }
+
     /// Stop new admission, drain accepted commands, close `library.db`, and join the owner.
     pub fn shutdown(&mut self) -> bool {
         let previous = self.lifecycle.swap(
@@ -703,6 +828,36 @@ fn execute_command(command: WriterCommand, database: &mut LibraryDatabase) -> Wr
                 result,
             }
         }
+        WriterCommand::LookupProfileTagCategories { labels, result } => {
+            WriterReply::LookupProfileTagCategories {
+                value: database.lookup_profile_tag_categories(&labels),
+                result,
+            }
+        }
+        WriterCommand::ProfileTagVocabularyPage {
+            expected_revision,
+            prefix,
+            after_cursor,
+            requested_limit,
+            result,
+        } => WriterReply::ProfileTagVocabularyPage {
+            value: database.profile_tag_vocabulary_page(
+                expected_revision,
+                &prefix,
+                after_cursor.as_ref(),
+                requested_limit,
+            ),
+            result,
+        },
+        WriterCommand::SetProfileTagCategory {
+            expected_revision,
+            label,
+            category,
+            result,
+        } => WriterReply::SetProfileTagCategory {
+            value: database.set_profile_tag_category(expected_revision, &label, category),
+            result,
+        },
     }
 }
 
@@ -755,6 +910,15 @@ fn send_command_error(command: WriterCommand, error: LibraryError) {
             let _ = result.send(Err(error));
         }
         WriterCommand::ReplaceUiPreferences { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::LookupProfileTagCategories { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::ProfileTagVocabularyPage { result, .. } => {
+            let _ = result.send(Err(error));
+        }
+        WriterCommand::SetProfileTagCategory { result, .. } => {
             let _ = result.send(Err(error));
         }
     }
@@ -1016,6 +1180,52 @@ mod tests {
             .expect("payload load");
         assert_eq!(loaded.as_deref(), Some(payload.as_str()));
         assert!(writer.shutdown());
+    }
+
+    #[test]
+    fn profile_vocabulary_owner_validates_before_admission_and_drains_on_shutdown() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let (base_guard, profile_guard, _writable_guard, mut writer) =
+            start_writer(&temp, "profile-vocabulary-owner");
+        let _ = (&base_guard, &profile_guard);
+        wait_until_available(&writer);
+
+        let lookup = writer
+            .lookup_profile_tag_categories(vec![String::from("kick"), String::from("kick")])
+            .expect("lookup admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lookup result")
+            .expect("lookup success");
+        assert_eq!(lookup.revision, 0);
+        assert!(lookup.entries.is_empty());
+
+        let inserted = writer
+            .set_profile_tag_category(0, String::from("kick"), ProfileTagCategory::SoundType)
+            .expect("set admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("set result")
+            .expect("set success");
+        assert_eq!(inserted.revision, 1);
+        assert!(inserted.changed);
+
+        let oversized = "x".repeat(super::super::PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES + 1);
+        assert!(matches!(
+            writer.set_profile_tag_category(1, oversized, ProfileTagCategory::Character),
+            Err(GlobalLibraryWriterQueueError::InvalidProfileTagVocabulary(
+                ProfileTagVocabularyInputError::LabelTooLong { .. }
+            ))
+        ));
+        assert!(matches!(
+            writer.status(),
+            GlobalLibraryWriterStatus::Available
+        ));
+
+        assert!(writer.shutdown());
+        assert!(matches!(
+            writer.lookup_profile_tag_categories(vec![String::from("kick")]),
+            Err(GlobalLibraryWriterQueueError::Closed)
+        ));
     }
 
     #[test]

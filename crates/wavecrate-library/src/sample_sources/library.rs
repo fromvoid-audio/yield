@@ -15,6 +15,7 @@ mod owner;
 mod schema_checks;
 mod schema_defs;
 mod sources;
+mod tag_vocabulary;
 mod telemetry;
 
 #[cfg(test)]
@@ -39,6 +40,12 @@ pub use owner::{
     GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable,
     SourceRegistrySnapshot,
 };
+pub use tag_vocabulary::{
+    PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES, PROFILE_TAG_VOCABULARY_MAX_LOOKUP_LABELS,
+    PROFILE_TAG_VOCABULARY_PAGE_MAX_PAGE_SIZE, ProfileTagCategory, ProfileTagVocabularyEntry,
+    ProfileTagVocabularyInputError, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
+    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
+};
 
 #[cfg(test)]
 use crate::sample_sources::normalize_path;
@@ -51,6 +58,9 @@ pub const UI_PREFERENCES_KEY: &str = "ui_preferences_v1";
 
 /// Maximum UTF-8 byte length accepted for the UI preferences payload.
 pub const UI_PREFERENCES_MAX_BYTES: usize = 128 * 1024;
+
+/// Metadata key storing the monotonic profile tag vocabulary revision.
+pub const PROFILE_TAG_VOCABULARY_REVISION_KEY: &str = "profile_tag_vocabulary_revision";
 
 /// Aggregate state loaded from or written to the library database.
 #[derive(Debug, Clone, Default)]

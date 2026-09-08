@@ -4,6 +4,8 @@ use thiserror::Error;
 
 use crate::app_dirs;
 
+use super::tag_vocabulary::ProfileTagVocabularyInputError;
+
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
@@ -73,6 +75,32 @@ pub enum LibraryError {
         /// Metadata key containing invalid bytes.
         key: &'static str,
     },
+    /// Profile vocabulary input failed a canonical spelling or category policy check.
+    #[error("invalid profile tag vocabulary input: {0}")]
+    InvalidProfileTagVocabularyInput(#[from] ProfileTagVocabularyInputError),
+    /// A profile vocabulary row failed its bounded authoritative representation checks.
+    #[error("profile tag vocabulary data is malformed: {reason}")]
+    ProfileTagVocabularyMalformedData {
+        /// Stable reason for rejecting the corrupt row.
+        reason: &'static str,
+    },
+    /// The profile vocabulary revision did not contain a bounded unsigned integer.
+    #[error("profile tag vocabulary revision metadata is malformed")]
+    ProfileTagVocabularyRevisionMalformed,
+    /// A profile vocabulary write observed a different revision than requested.
+    #[error("profile tag vocabulary revision is stale: expected {expected}, actual {actual}")]
+    ProfileTagVocabularyStaleRevision {
+        /// Revision supplied by the caller.
+        expected: u64,
+        /// Revision observed in the database.
+        actual: u64,
+    },
+    /// A vocabulary continuation was used with a different revision or literal prefix.
+    #[error("profile tag vocabulary cursor does not match its revision or prefix")]
+    ProfileTagVocabularyCursorMismatch,
+    /// The monotonic profile vocabulary revision could not be incremented.
+    #[error("profile tag vocabulary revision overflowed")]
+    ProfileTagVocabularyRevisionOverflow,
     /// A retained source descriptor contained a present but unsupported enum value.
     #[error("Retained source '{root}' has invalid {field} value '{value}'")]
     InvalidRetainedSourceDescriptor {

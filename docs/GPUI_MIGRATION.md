@@ -1315,3 +1315,20 @@ full catalog suite passed 49 tests; five focused tag-page tests passed after the
 final API cleanup. Normal UI library compilation passed. Independent review found
 no actionable correctness, lifecycle, credit-accounting, fencing or bounded-query
 issues. The tag editor will consume these events in the following UI work.
+
+### Profile-owned tag vocabulary
+
+The existing global library owner now persists known tag categories separately
+from UI preferences. Its bounded APIs provide exact category lookup, literal
+prefix pages and revision-fenced single-label updates. Identical updates preserve
+the revision; changes commit the row and incremented revision atomically. Canonical
+label validation and the native Playback Type category lock apply before admission
+and at storage. SQL bounds stored text before allocation and rejects malformed
+authoritative rows. Existing owner shutdown and profile-ownership handling cover
+the new commands; no additional worker thread or whole-vocabulary snapshot is used.
+
+The full library suite passed 478 tests. Independent review found a predicate cast
+that prevented indexed exact lookup; it was removed, and a regression check now
+uses the production query to verify primary-key search. Seven focused vocabulary
+tests passed after that fix, including corrupt rows and pagination. Library
+compilation, formatting and diff checks passed. Session/editor access follows.
