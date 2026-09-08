@@ -181,6 +181,7 @@ impl Browser {
     pub(super) fn invalidate_file_handoff(&mut self) {
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
+        self.cancel_file_drag();
     }
 }
 

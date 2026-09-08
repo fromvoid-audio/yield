@@ -114,7 +114,9 @@ The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,
 play-region selection, and a playback cursor. Play regions can be moved, resized,
 or shifted with the keyboard. Playback navigation history, native file clipboard
-handoff, and Finder reveal are available. Loop changes apply to active playback
+handoff, Finder reveal, and macOS whole-file drag-out are available. Drag-out
+prepares up to 256 files in the background and rejects incomplete selections.
+Loop changes apply to active playback
 with runtime identity checks and retain the accepted audition span. Loop and
 one-shot tags select the next-play mode automatically; a manual choice remains
 in effect for the loaded file. The speaker control beside the volume slider toggles
@@ -123,7 +125,7 @@ volume setting, and saves the toggle between sessions.
 
 Full parity is not complete. Remaining workflows include full tag-library
 management and naming, physical file operations and recovery, waveform
-editing/export, analysis and timing controls, external drag, and additional settings
+editing/export, analysis and timing controls, Windows and region drag-out, and additional settings
 and platform acceptance.
 See the [parity register](docs/GPUI_MIGRATION.md) for detailed validation evidence
 and outstanding work. Inherited release workflows are disabled.

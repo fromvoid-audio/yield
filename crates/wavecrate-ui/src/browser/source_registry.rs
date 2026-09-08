@@ -253,7 +253,6 @@ impl Browser {
         if let Some(error) = cx.global::<SourceRegistryGlobal>().start_error() {
             self.source_registry_loaded = true;
             self.source_registry_status = format!("Source persistence unavailable: {error}");
-            return;
         }
         self.source_registry_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -298,6 +297,7 @@ impl Browser {
         changed |= tag_filter::poll(self, cx);
         changed |= tag_library::poll(self, cx);
         changed |= self.poll_display_labels(cx);
+        changed |= self.poll_file_drag();
         if changed {
             cx.notify();
         }
@@ -311,6 +311,7 @@ impl Browser {
             || tag_filter::has_pending(self)
             || tag_library::has_pending(self)
             || self.has_pending_display_labels()
+            || self.file_drag_poll_needed()
             || catalog::catalog_poll_needed(self)
     }
 

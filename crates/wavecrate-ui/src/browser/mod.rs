@@ -38,6 +38,7 @@ mod catalog_metadata;
 mod context_menu;
 mod curation;
 mod display_labels;
+mod file_drag;
 mod handoff;
 mod history;
 mod motion;
@@ -363,6 +364,7 @@ pub(crate) struct Browser {
     playback_monitor_generation: u64,
     playback_monitor_running: bool,
     playback: Option<PlaybackRuntime>,
+    file_drag: file_drag::FileDragState,
     handoff_task: Option<Task<()>>,
     handoff_generation: u64,
     list_scroll_handle: UniformListScrollHandle,
@@ -380,6 +382,7 @@ impl Browser {
                 view.reset_browser_focus_state();
                 view.context_menu = None;
                 let query = input.read(cx).content().to_owned();
+                view.invalidate_file_handoff();
                 view.view_model.set_query(&view.entries, query);
                 view.refresh_collection_filter_counts();
                 view.reconcile_selection();
@@ -562,6 +565,7 @@ impl Browser {
             playback_monitor_generation: 0,
             playback_monitor_running: false,
             playback: None,
+            file_drag: file_drag::FileDragState::default(),
             handoff_task: None,
             handoff_generation: 0,
             list_scroll_handle: UniformListScrollHandle::new(),
@@ -644,6 +648,7 @@ impl Browser {
         }
         let visible_ids = self.visible_selection_ids();
         if self.selection.reconcile(&visible_ids) {
+            self.invalidate_file_handoff();
             tag_chips::invalidate(self);
         }
     }
@@ -684,6 +689,7 @@ impl Browser {
         let modifiers = event.modifiers();
         let intent = sample_click_intent(modifiers.shift, modifiers.platform || modifiers.control);
         let origin = selection_origin_for_click(intent, modifiers.alt || modifiers.function);
+        self.invalidate_file_handoff();
         match intent {
             SampleClickIntent::Focus => self.selection.focus_pointer(&target_id),
             SampleClickIntent::ReplaceRange | SampleClickIntent::AddRange => {
@@ -771,6 +777,7 @@ impl Browser {
         source_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_file_handoff();
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.deactivate_catalog_source(cx);
@@ -1294,6 +1301,7 @@ impl Browser {
     }
 
     pub(super) fn toggle_folder_scope(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_file_handoff();
         self.folder_scope = self.folder_scope.toggled();
         self.update_active_folder_projection(cx);
     }
@@ -1311,6 +1319,7 @@ impl Browser {
             return;
         }
         window.focus(&self.focus_handle);
+        self.invalidate_file_handoff();
         self.selection.clear();
         self.selected_folder = path.clone();
         self.update_active_folder_projection(cx);
@@ -1337,6 +1346,7 @@ impl Browser {
     }
 
     fn update_active_folder_projection(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_file_handoff();
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
         self.reset_browser_focus_state();
@@ -1374,6 +1384,7 @@ impl Browser {
         origin: SelectionOrigin,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_file_handoff();
         tag_chips::invalidate(self);
         self.start_source_registry_poll(cx);
         self.reset_browser_focus_state();
@@ -1744,6 +1755,7 @@ impl Browser {
         if self.view_model.rows().is_empty() {
             return;
         }
+        self.invalidate_file_handoff();
         let current = self
             .browser_focus_id()
             .as_ref()
@@ -1780,6 +1792,7 @@ impl Browser {
     }
 
     fn toggle_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
+        self.invalidate_file_handoff();
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
         self.reset_browser_focus_state();
@@ -1794,6 +1807,7 @@ impl Browser {
         if tag_filter::scope_pending(self) {
             return;
         }
+        self.invalidate_file_handoff();
         let visible_ids = self.visible_selection_ids();
         self.selection.select_all(&visible_ids);
         tag_chips::invalidate(self);
@@ -1810,6 +1824,7 @@ impl Browser {
         let Some(focused_id) = self.browser_focus_id() else {
             return;
         };
+        self.invalidate_file_handoff();
         self.selection.toggle(&focused_id, Some(&focused_id));
         tag_chips::invalidate(self);
         self.start_source_registry_poll(cx);
@@ -1996,6 +2011,7 @@ impl Browser {
                 cx,
             ),
             "escape" => {
+                self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);
                 self.cancel_waveform_scrollbar_drag(window, cx);
                 self.stop_playback();
@@ -2024,6 +2040,7 @@ impl Drop for Browser {
         self.cancel_audio_output_options();
         self.audio_output_open_generation = self.audio_output_open_generation.wrapping_add(1);
         self.audio_output_open_task.take();
+        self.shutdown_file_drag();
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
         if let Some(runtime) = self.playback.as_ref() {

@@ -1541,6 +1541,7 @@ impl Browser {
         if self.active_source.is_none() {
             return;
         }
+        self.invalidate_file_handoff();
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
         self.reset_browser_focus_state();
@@ -1562,6 +1563,7 @@ impl Browser {
         if self.active_source.is_none() {
             return;
         }
+        self.invalidate_file_handoff();
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
         self.context_menu = None;
@@ -1582,6 +1584,7 @@ impl Browser {
         if self.active_source.is_none() {
             return;
         }
+        self.invalidate_file_handoff();
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
         self.reset_browser_focus_state();

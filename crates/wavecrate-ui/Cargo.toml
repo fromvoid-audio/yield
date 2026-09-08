@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 gpui.workspace = true
+raw-window-handle.workspace = true
 reson.workspace = true
 unicode-segmentation.workspace = true
 wavecrate-core.workspace = true
@@ -17,6 +18,7 @@ wavecrate-design.workspace = true
 wavecrate-media.workspace = true
 wavecrate-library.workspace = true
 wavecrate-session.workspace = true
+wavecrate-platform.workspace = true
 
 [dev-dependencies]
 wavecrate-catalog = { path = "../wavecrate-catalog" }

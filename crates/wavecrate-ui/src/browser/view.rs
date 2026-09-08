@@ -4,8 +4,8 @@
 //! Browser rendering and the compact Wavecrate application shell.
 
 use gpui::{
-    ClickEvent, Context, Div, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
-    Window, div, font, prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, DragMoveEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, Window, div, font, prelude::*, px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use wavecrate_core::{
@@ -19,6 +19,7 @@ use super::Browser;
 use super::context_menu;
 use super::curation;
 use super::display_labels;
+use super::file_drag;
 use super::motion;
 use super::normalized_audition;
 use super::tag_filter;
@@ -767,6 +768,35 @@ impl Render for Browser {
                                                 .opacity(0.0)
                                                 .group_hover(row_group, |style| style.opacity(1.0)),
                                         );
+                                        let drag = view.file_drag_row_payload(
+                                            cx.entity(),
+                                            visible_index,
+                                            &row,
+                                        );
+                                        let sample_row = sample_row.when_some(Some(drag), |this, drag| {
+                                            this.on_drag(drag, |drag, _, window, cx| {
+                                                let _ = drag.browser.update(cx, |view, browser_cx| {
+                                                    view.begin_file_drag(
+                                                        drag.clone(), window, browser_cx,
+                                                    );
+                                                });
+                                                cx.new(|_| {
+                                                    file_drag::FileDragGhost::new(drag.preview_count)
+                                                })
+                                            })
+                                            .on_drag_move::<file_drag::FileDragRowPayload>(
+                                                cx.listener(
+                                                    |view,
+                                                     event: &DragMoveEvent<
+                                                         file_drag::FileDragRowPayload,
+                                                     >,
+                                                     window,
+                                                     cx| {
+                                                        view.on_file_drag_move(event, window, cx);
+                                                    },
+                                                ),
+                                            )
+                                        });
                                         if focused {
                                             sample_row.child(
                                                 div()
@@ -812,6 +842,7 @@ impl Render for Browser {
             .text_size(px(theme.typography.body_size))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .capture_any_mouse_down(cx.listener(Self::cancel_file_drag_from_mouse_down))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
                 if view.update_waveform_pan_drag(
                     event.position,
@@ -835,6 +866,14 @@ impl Render for Browser {
                         cx.notify();
                     }
                 }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(Self::finish_file_drag_pointer),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(Self::finish_file_drag_pointer),
             )
             .child(
                 div()
