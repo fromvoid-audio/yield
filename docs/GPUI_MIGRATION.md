@@ -1288,3 +1288,14 @@ behavior. Twelve focused library tag tests passed, including the real production
 query's index-seek plan, paging, literal prefixes, revision fences and legacy
 previews. Library compilation, formatting and diff checks passed. Catalog and UI
 integration follow separately.
+
+### Reusable bounded tag text field
+
+The existing GPUI text field now supports a tag configuration with the native
+ADD TAG placeholder and core input bound. Replacement size is checked before
+building the new string; rejected edits retain existing text and composition.
+Tag paste converts line breaks (including CRLF) to tag separators while filename
+paste retains its existing behavior. A rejection event and composition-state
+query support later editor status and Enter handling. Seven focused input tests
+passed in the integrated UI test binary; the normal UI library check passed after
+session/catalog plumbing was completed. Browser tag-editor wiring remains pending.

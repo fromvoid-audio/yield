@@ -4,6 +4,7 @@
 //! Zed Industries, Inc., under Apache-2.0:
 //! <https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs>.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
@@ -14,6 +15,7 @@ use gpui::{
     fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
+use wavecrate_core::MAX_TAG_INPUT_BYTES;
 
 use crate::theme::{active, color};
 
@@ -39,6 +41,9 @@ actions!(
 /// Event emitted whenever the search text changes.
 pub(crate) struct SearchChanged;
 
+/// Event emitted when a configured input rejects an edit for exceeding its byte bound.
+pub(crate) struct SearchInputRejected;
+
 /// Install the standard GPUI editing actions used by [`SearchInput`].
 pub(crate) fn install_keybindings(cx: &mut App) {
     cx.bind_keys([
@@ -62,9 +67,45 @@ pub(crate) fn install_keybindings(cx: &mut App) {
     ]);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SearchInputOptions {
+    placeholder: &'static str,
+    max_bytes: Option<usize>,
+    paste_newlines: PasteNewlines,
+}
+
+impl SearchInputOptions {
+    pub(crate) const fn filename() -> Self {
+        Self {
+            placeholder: "Search filenames",
+            max_bytes: None,
+            paste_newlines: PasteNewlines::AsSpaces,
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "configured for the upcoming browser tag editor")
+    )]
+    pub(crate) const fn tags() -> Self {
+        Self {
+            placeholder: "ADD TAG",
+            max_bytes: Some(MAX_TAG_INPUT_BYTES),
+            paste_newlines: PasteNewlines::AsCommas,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasteNewlines {
+    AsSpaces,
+    AsCommas,
+}
+
 /// Text editing state for the browser search field.
 pub(crate) struct SearchInput {
     focus_handle: FocusHandle,
+    options: SearchInputOptions,
     content: SharedString,
     placeholder: SharedString,
     selected_range: Range<usize>,
@@ -76,13 +117,19 @@ pub(crate) struct SearchInput {
 }
 
 impl EventEmitter<SearchChanged> for SearchInput {}
+impl EventEmitter<SearchInputRejected> for SearchInput {}
 
 impl SearchInput {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+        Self::new_with_options(cx, SearchInputOptions::filename())
+    }
+
+    pub(crate) fn new_with_options(cx: &mut Context<Self>, options: SearchInputOptions) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            options,
             content: "".into(),
-            placeholder: "Search filenames".into(),
+            placeholder: options.placeholder.into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -100,9 +147,22 @@ impl SearchInput {
         &self.content
     }
 
+    #[expect(
+        dead_code,
+        reason = "the later browser tag editor slice will gate submission on composition state"
+    )]
+    pub(crate) fn is_composing(&self) -> bool {
+        self.marked_range.is_some()
+    }
+
     /// Replace the query from browser navigation and reset editing state without inserting text.
     pub(crate) fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.content = content.into();
+        let content = content.into();
+        if !input_within_limit(content.len(), self.options.max_bytes) {
+            self.reject_edit(cx);
+            return;
+        }
+        self.content = content;
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -116,6 +176,11 @@ impl SearchInput {
     pub(crate) fn theme_changed(&mut self, cx: &mut Context<Self>) {
         self.last_layout = None;
         self.last_bounds = None;
+        cx.notify();
+    }
+
+    fn reject_edit(&self, cx: &mut Context<Self>) {
+        cx.emit(SearchInputRejected);
         cx.notify();
     }
 
@@ -181,7 +246,12 @@ impl SearchInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+            if !input_within_limit(text.len(), self.options.max_bytes) {
+                self.reject_edit(cx);
+                return;
+            }
+            let replacement = paste_replacement_text(&text, self.options.paste_newlines);
+            self.replace_text_in_range(None, replacement.as_ref(), window, cx);
         }
     }
 
@@ -358,9 +428,13 @@ impl EntityInputHandler for SearchInput {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        let Some(resulting_len) =
+            plan_replacement(&self.content, &range, new_text, self.options.max_bytes)
+        else {
+            self.reject_edit(cx);
+            return;
+        };
+        self.content = replace_content(&self.content, &range, new_text, resulting_len).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range = None;
@@ -381,9 +455,13 @@ impl EntityInputHandler for SearchInput {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        let Some(resulting_len) =
+            plan_replacement(&self.content, &range, new_text, self.options.max_bytes)
+        else {
+            self.reject_edit(cx);
+            return;
+        };
+        self.content = replace_content(&self.content, &range, new_text, resulting_len).into();
         self.marked_range =
             (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
         self.selected_range =
@@ -632,6 +710,86 @@ impl Focusable for SearchInput {
     }
 }
 
+fn input_within_limit(value_len: usize, max_bytes: Option<usize>) -> bool {
+    max_bytes.is_none_or(|max_bytes| value_len <= max_bytes)
+}
+
+fn plan_replacement(
+    content: &str,
+    range: &Range<usize>,
+    replacement: &str,
+    max_bytes: Option<usize>,
+) -> Option<usize> {
+    if range.start > range.end
+        || range.end > content.len()
+        || !content.is_char_boundary(range.start)
+        || !content.is_char_boundary(range.end)
+    {
+        return None;
+    }
+    let resulting_len = content
+        .len()
+        .checked_sub(range.end - range.start)?
+        .checked_add(replacement.len())?;
+    input_within_limit(resulting_len, max_bytes).then_some(resulting_len)
+}
+
+fn replace_content(
+    content: &str,
+    range: &Range<usize>,
+    replacement: &str,
+    capacity: usize,
+) -> String {
+    let mut result = String::with_capacity(capacity);
+    result.push_str(&content[..range.start]);
+    result.push_str(replacement);
+    result.push_str(&content[range.end..]);
+    result
+}
+
+fn paste_replacement_text(text: &str, newlines: PasteNewlines) -> Cow<'_, str> {
+    match newlines {
+        PasteNewlines::AsSpaces => {
+            if text.contains('\n') {
+                Cow::Owned(text.replace('\n', " "))
+            } else {
+                Cow::Borrowed(text)
+            }
+        }
+        PasteNewlines::AsCommas => paste_tag_newlines(text),
+    }
+}
+
+fn paste_tag_newlines(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|character| character == '\r' || character == '\n')
+    {
+        return Cow::Borrowed(text);
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut copied_through = 0;
+    let mut characters = text.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if character != '\r' && character != '\n' {
+            continue;
+        }
+        normalized.push_str(&text[copied_through..index]);
+        normalized.push(',');
+        copied_through = index + character.len_utf8();
+        if character == '\r'
+            && let Some(&(next_index, next_character)) = characters.peek()
+            && next_character == '\n'
+        {
+            characters.next();
+            copied_through = next_index + next_character.len_utf8();
+        }
+    }
+    normalized.push_str(&text[copied_through..]);
+    Cow::Owned(normalized)
+}
+
 fn offset_from_utf16(text: &str, offset: usize) -> usize {
     let mut utf8_offset = 0;
     let mut utf16_count = 0;
@@ -663,7 +821,10 @@ fn marked_selection_range(
 
 #[cfg(test)]
 mod tests {
-    use super::marked_selection_range;
+    use super::{
+        MAX_TAG_INPUT_BYTES, PasteNewlines, SearchInputOptions, input_within_limit,
+        marked_selection_range, paste_replacement_text, plan_replacement,
+    };
 
     #[test]
     fn composition_selection_uses_inserted_utf16_text_at_nonzero_offset() {
@@ -676,5 +837,66 @@ mod tests {
         assert_eq!(marked_selection_range(4, "a", Some(&(0..99))), 4..5);
         assert_eq!(marked_selection_range(4, "a", None), 5..5);
         assert_eq!(marked_selection_range(4, "", Some(&(0..0))), 4..4);
+    }
+
+    #[test]
+    fn filename_and_tag_options_keep_their_distinct_defaults() {
+        let filename = SearchInputOptions::filename();
+        assert_eq!(filename.placeholder, "Search filenames");
+        assert_eq!(filename.max_bytes, None);
+        assert_eq!(filename.paste_newlines, PasteNewlines::AsSpaces);
+
+        let tags = SearchInputOptions::tags();
+        assert_eq!(tags.placeholder, "ADD TAG");
+        assert_eq!(tags.max_bytes, Some(MAX_TAG_INPUT_BYTES));
+        assert_eq!(tags.paste_newlines, PasteNewlines::AsCommas);
+    }
+
+    #[test]
+    fn replacement_plan_reclaims_selected_utf8_bytes_before_checking_bound() {
+        let content = "a😀b";
+        assert_eq!(content.len(), 6);
+        assert_eq!(plan_replacement(content, &(1..5), "é", Some(4)), Some(4));
+        assert_eq!(plan_replacement(content, &(1..5), "é", Some(3)), None);
+        assert_eq!(plan_replacement(content, &(1..5), "😀", Some(6)), Some(6));
+    }
+
+    #[test]
+    fn oversize_replacement_plan_is_atomic_and_does_not_mutate_inputs() {
+        let content = String::from("abc");
+        let range = 1..1;
+        assert_eq!(plan_replacement(&content, &range, "é", Some(3)), None);
+        assert_eq!(content, "abc");
+        assert_eq!(range, 1..1);
+    }
+
+    #[test]
+    fn tag_paste_uses_separators_without_merging_crlf_labels() {
+        assert_eq!(
+            paste_replacement_text(
+                "one\r\ntwo\nthree\rfour, five; six",
+                PasteNewlines::AsCommas
+            )
+            .as_ref(),
+            "one,two,three,four, five; six"
+        );
+        assert_eq!(
+            paste_replacement_text("one\ntwo", PasteNewlines::AsSpaces).as_ref(),
+            "one two"
+        );
+    }
+
+    #[test]
+    fn raw_clipboard_bound_is_checked_in_bytes_before_paste_translation() {
+        assert!(input_within_limit("é".len(), Some(2)));
+        assert!(!input_within_limit("é".len(), Some(1)));
+        assert!(!input_within_limit(
+            "x".len() * (MAX_TAG_INPUT_BYTES + 1),
+            Some(MAX_TAG_INPUT_BYTES)
+        ));
+        assert!(input_within_limit(
+            "x".len() * MAX_TAG_INPUT_BYTES,
+            Some(MAX_TAG_INPUT_BYTES)
+        ));
     }
 }
