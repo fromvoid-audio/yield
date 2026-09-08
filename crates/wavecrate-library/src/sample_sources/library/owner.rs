@@ -297,13 +297,25 @@ struct OwnerHooks {
 /// The handle contains only typed command and lifecycle state. The writable SQLite connection
 /// remains on one owner thread for the handle's lifetime and is never exposed to callers.
 pub struct GlobalLibraryWriter {
-    commands: Mutex<Option<SyncSender<WriterCommand>>>,
+    commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
     admission_gate: Arc<Mutex<()>>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
     unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     blocked_receiver: Option<Receiver<WriterCommand>>,
+}
+
+/// Cloneable access to the profile-owned tag vocabulary commands.
+///
+/// Clones share the writer's bounded admission gate and lifecycle. They do not own a database
+/// connection or an owner thread; the [`GlobalLibraryWriter`] remains responsible for shutdown.
+#[derive(Clone)]
+pub struct ProfileTagVocabularyClient {
+    commands: Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
+    admission_gate: Arc<Mutex<()>>,
+    lifecycle: Arc<std::sync::atomic::AtomicU8>,
+    unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
 }
 
 impl GlobalLibraryWriter {
@@ -326,6 +338,7 @@ impl GlobalLibraryWriter {
     ) -> Result<Self, GlobalLibraryWriterStartError> {
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
+        let commands = Arc::new(Mutex::new(Some(commands)));
         let lifecycle = Arc::new(std::sync::atomic::AtomicU8::new(
             WriterLifecycle::Initializing as u8,
         ));
@@ -357,7 +370,7 @@ impl GlobalLibraryWriter {
             .map_err(GlobalLibraryWriterStartError::ThreadSpawn)?;
 
         Ok(Self {
-            commands: Mutex::new(Some(commands)),
+            commands: Arc::clone(&commands),
             admission_gate,
             lifecycle,
             unavailable,
@@ -414,7 +427,7 @@ impl GlobalLibraryWriter {
         let (commands, blocked_receiver) =
             mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
         Self {
-            commands: Mutex::new(Some(commands)),
+            commands: Arc::new(Mutex::new(Some(commands))),
             admission_gate: Arc::new(Mutex::new(())),
             lifecycle: Arc::new(std::sync::atomic::AtomicU8::new(
                 WriterLifecycle::Available as u8,
@@ -427,22 +440,7 @@ impl GlobalLibraryWriter {
 
     /// Return the current owner lifecycle without waiting for initialization or I/O.
     pub fn status(&self) -> GlobalLibraryWriterStatus {
-        match WriterLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)) {
-            WriterLifecycle::Initializing => GlobalLibraryWriterStatus::Initializing,
-            WriterLifecycle::Available => GlobalLibraryWriterStatus::Available,
-            WriterLifecycle::Unavailable => GlobalLibraryWriterStatus::Unavailable {
-                reason: self
-                    .unavailable
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                    .unwrap_or_else(|| GlobalLibraryWriterUnavailable::DatabaseUnavailable {
-                        reason: String::from("global library writer is unavailable"),
-                    }),
-            },
-            WriterLifecycle::Closing => GlobalLibraryWriterStatus::Closing,
-            WriterLifecycle::Closed => GlobalLibraryWriterStatus::Closed,
-        }
+        writer_status(&self.lifecycle, &self.unavailable)
     }
 
     /// Return the retained reason for an initialization or profile-boundary failure, if any.
@@ -451,6 +449,16 @@ impl GlobalLibraryWriter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Return a cloneable client for the profile-owned tag vocabulary commands.
+    pub fn profile_tag_vocabulary_client(&self) -> ProfileTagVocabularyClient {
+        ProfileTagVocabularyClient {
+            commands: Arc::clone(&self.commands),
+            admission_gate: Arc::clone(&self.admission_gate),
+            lifecycle: Arc::clone(&self.lifecycle),
+            unavailable: Arc::clone(&self.unavailable),
+        }
     }
 
     /// Queue a load of the immutable source-registry snapshot.
@@ -533,6 +541,100 @@ impl GlobalLibraryWriter {
     /// bounded to 64 rows.
     pub fn lookup_profile_tag_categories(
         &self,
+        labels: Vec<String>,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularyLookup, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.profile_tag_vocabulary_client()
+            .lookup_profile_tag_categories(labels)
+    }
+
+    /// Queue one bounded literal-prefix profile vocabulary page.
+    ///
+    /// The requested page size is clamped to `1..=64`. A continuation cursor is opaque and may
+    /// only be reused with the exact revision and literal prefix that produced it.
+    pub fn profile_tag_vocabulary_page(
+        &self,
+        expected_revision: Option<u64>,
+        prefix: String,
+        after_cursor: Option<ProfileTagVocabularyPageCursor>,
+        requested_limit: usize,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularyPage, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.profile_tag_vocabulary_client()
+            .profile_tag_vocabulary_page(expected_revision, prefix, after_cursor, requested_limit)
+    }
+
+    /// Queue one category assignment at an exact profile vocabulary revision.
+    pub fn set_profile_tag_category(
+        &self,
+        expected_revision: u64,
+        label: String,
+        category: ProfileTagCategory,
+    ) -> Result<
+        Receiver<Result<ProfileTagVocabularySetReceipt, LibraryError>>,
+        GlobalLibraryWriterQueueError,
+    > {
+        self.profile_tag_vocabulary_client()
+            .set_profile_tag_category(expected_revision, label, category)
+    }
+
+    /// Stop new admission, drain accepted commands, close `library.db`, and join the owner.
+    pub fn shutdown(&mut self) -> bool {
+        let previous = self.lifecycle.swap(
+            WriterLifecycle::Closing as u8,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        let sender = {
+            let _admission = self
+                .admission_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        };
+        drop(sender);
+        #[cfg(test)]
+        self.blocked_receiver.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.lifecycle.store(
+            WriterLifecycle::Closed as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        WriterLifecycle::from_u8(previous) != WriterLifecycle::Closed
+    }
+
+    fn ensure_available(&self) -> Result<(), GlobalLibraryWriterQueueError> {
+        ensure_available_state(&self.lifecycle, &self.unavailable)
+    }
+
+    fn send(&self, command: WriterCommand) -> Result<(), GlobalLibraryWriterQueueError> {
+        send_command(
+            &self.commands,
+            &self.admission_gate,
+            &self.lifecycle,
+            &self.unavailable,
+            command,
+        )
+    }
+}
+
+impl ProfileTagVocabularyClient {
+    /// Return the current shared writer lifecycle without waiting for I/O.
+    pub fn status(&self) -> GlobalLibraryWriterStatus {
+        writer_status(&self.lifecycle, &self.unavailable)
+    }
+
+    /// Queue an exact lookup of bounded profile vocabulary labels.
+    pub fn lookup_profile_tag_categories(
+        &self,
         mut labels: Vec<String>,
     ) -> Result<
         Receiver<Result<ProfileTagVocabularyLookup, LibraryError>>,
@@ -549,9 +651,6 @@ impl GlobalLibraryWriter {
     }
 
     /// Queue one bounded literal-prefix profile vocabulary page.
-    ///
-    /// The requested page size is clamped to `1..=64`. A continuation cursor is opaque and may
-    /// only be reused with the exact revision and literal prefix that produced it.
     pub fn profile_tag_vocabulary_page(
         &self,
         expected_revision: Option<u64>,
@@ -597,72 +696,85 @@ impl GlobalLibraryWriter {
         Ok(result_rx)
     }
 
-    /// Stop new admission, drain accepted commands, close `library.db`, and join the owner.
-    pub fn shutdown(&mut self) -> bool {
-        let previous = self.lifecycle.swap(
-            WriterLifecycle::Closing as u8,
-            std::sync::atomic::Ordering::AcqRel,
-        );
-        let sender = {
-            let _admission = self
-                .admission_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.commands
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-        };
-        drop(sender);
-        #[cfg(test)]
-        self.blocked_receiver.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        self.lifecycle.store(
-            WriterLifecycle::Closed as u8,
-            std::sync::atomic::Ordering::Release,
-        );
-        WriterLifecycle::from_u8(previous) != WriterLifecycle::Closed
-    }
-
     fn ensure_available(&self) -> Result<(), GlobalLibraryWriterQueueError> {
-        match WriterLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)) {
-            WriterLifecycle::Initializing => Err(GlobalLibraryWriterQueueError::Initializing),
-            WriterLifecycle::Available => Ok(()),
-            WriterLifecycle::Unavailable => Err(GlobalLibraryWriterQueueError::Unavailable(
-                self.unavailable
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                    .unwrap_or_else(|| GlobalLibraryWriterUnavailable::DatabaseUnavailable {
-                        reason: String::from("global library writer is unavailable"),
-                    }),
-            )),
-            WriterLifecycle::Closing | WriterLifecycle::Closed => {
-                Err(GlobalLibraryWriterQueueError::Closed)
-            }
-        }
+        ensure_available_state(&self.lifecycle, &self.unavailable)
     }
 
     fn send(&self, command: WriterCommand) -> Result<(), GlobalLibraryWriterQueueError> {
-        let _admission = self
-            .admission_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.ensure_available()?;
-        let sender = self
-            .commands
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .cloned()
-            .ok_or(GlobalLibraryWriterQueueError::Closed)?;
-        sender.try_send(command).map_err(|error| match error {
-            TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
-            TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
-        })
+        send_command(
+            &self.commands,
+            &self.admission_gate,
+            &self.lifecycle,
+            &self.unavailable,
+            command,
+        )
     }
+}
+
+fn writer_status(
+    lifecycle: &Arc<std::sync::atomic::AtomicU8>,
+    unavailable: &Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
+) -> GlobalLibraryWriterStatus {
+    match WriterLifecycle::from_u8(lifecycle.load(std::sync::atomic::Ordering::Acquire)) {
+        WriterLifecycle::Initializing => GlobalLibraryWriterStatus::Initializing,
+        WriterLifecycle::Available => GlobalLibraryWriterStatus::Available,
+        WriterLifecycle::Unavailable => GlobalLibraryWriterStatus::Unavailable {
+            reason: unavailable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or_else(|| GlobalLibraryWriterUnavailable::DatabaseUnavailable {
+                    reason: String::from("global library writer is unavailable"),
+                }),
+        },
+        WriterLifecycle::Closing => GlobalLibraryWriterStatus::Closing,
+        WriterLifecycle::Closed => GlobalLibraryWriterStatus::Closed,
+    }
+}
+
+fn ensure_available_state(
+    lifecycle: &Arc<std::sync::atomic::AtomicU8>,
+    unavailable: &Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
+) -> Result<(), GlobalLibraryWriterQueueError> {
+    match WriterLifecycle::from_u8(lifecycle.load(std::sync::atomic::Ordering::Acquire)) {
+        WriterLifecycle::Initializing => Err(GlobalLibraryWriterQueueError::Initializing),
+        WriterLifecycle::Available => Ok(()),
+        WriterLifecycle::Unavailable => Err(GlobalLibraryWriterQueueError::Unavailable(
+            unavailable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or_else(|| GlobalLibraryWriterUnavailable::DatabaseUnavailable {
+                    reason: String::from("global library writer is unavailable"),
+                }),
+        )),
+        WriterLifecycle::Closing | WriterLifecycle::Closed => {
+            Err(GlobalLibraryWriterQueueError::Closed)
+        }
+    }
+}
+
+fn send_command(
+    commands: &Arc<Mutex<Option<SyncSender<WriterCommand>>>>,
+    admission_gate: &Arc<Mutex<()>>,
+    lifecycle: &Arc<std::sync::atomic::AtomicU8>,
+    unavailable: &Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
+    command: WriterCommand,
+) -> Result<(), GlobalLibraryWriterQueueError> {
+    let _admission = admission_gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_available_state(lifecycle, unavailable)?;
+    let sender = commands
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .cloned()
+        .ok_or(GlobalLibraryWriterQueueError::Closed)?;
+    sender.try_send(command).map_err(|error| match error {
+        TrySendError::Full(_) => GlobalLibraryWriterQueueError::Full,
+        TrySendError::Disconnected(_) => GlobalLibraryWriterQueueError::Closed,
+    })
 }
 
 impl Drop for GlobalLibraryWriter {
@@ -1224,6 +1336,35 @@ mod tests {
         assert!(writer.shutdown());
         assert!(matches!(
             writer.lookup_profile_tag_categories(vec![String::from("kick")]),
+            Err(GlobalLibraryWriterQueueError::Closed)
+        ));
+    }
+
+    #[test]
+    fn retained_profile_vocabulary_client_follows_owner_shutdown() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let (base_guard, profile_guard, _writable_guard, mut writer) =
+            start_writer(&temp, "profile-vocabulary-client");
+        let _ = (&base_guard, &profile_guard);
+        wait_until_available(&writer);
+        let client = writer.profile_tag_vocabulary_client();
+        assert!(matches!(
+            client.status(),
+            GlobalLibraryWriterStatus::Available
+        ));
+        let lookup = client
+            .lookup_profile_tag_categories(vec![String::from("kick")])
+            .expect("client lookup admission")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client lookup result")
+            .expect("client lookup success");
+        assert!(lookup.entries.is_empty());
+
+        assert!(writer.shutdown());
+        assert!(matches!(client.status(), GlobalLibraryWriterStatus::Closed));
+        assert!(matches!(
+            client.lookup_profile_tag_categories(vec![String::from("kick")]),
             Err(GlobalLibraryWriterQueueError::Closed)
         ));
     }

@@ -26,6 +26,7 @@ use wavecrate_library::sample_sources::{
 
 mod catalog;
 mod preferences;
+mod vocabulary;
 
 pub use catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogError, CatalogEvent, CatalogStatus,
@@ -39,12 +40,20 @@ pub use catalog::{
     SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
 };
 use catalog::{CatalogService, CatalogSlot};
+use vocabulary::VocabularySlot;
 
 pub use preferences::{
     AudioOutputPreferences, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
     PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
+
+pub use vocabulary::{
+    MAX_VOCABULARY_REQUESTS_IN_FLIGHT, ProfileTagCategory, ProfileTagVocabularyEntry,
+    ProfileTagVocabularyInputError, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
+    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt, VocabularyRequest,
+    VocabularyRequestId, VocabularyStatus, VocabularySubmitError,
+};
 
 /// The non-live profile used by the GPUI application session.
 pub const GPUI_DEVELOPMENT_PROFILE: &str = "gpui-development";
@@ -233,9 +242,11 @@ pub struct SourceRegistryService {
     closed: AtomicBool,
     next_request: AtomicU64,
     next_preference_request: AtomicU64,
+    next_vocabulary_request: AtomicU64,
     events: Receiver<RegistryEvent>,
     preference_events: Receiver<PreferenceEvent>,
     catalog: Arc<Mutex<CatalogSlot>>,
+    vocabulary: Arc<Mutex<VocabularySlot>>,
     worker: Option<JoinHandle<Result<(), SessionError>>>,
 }
 
@@ -276,6 +287,62 @@ impl SourceRegistryService {
         self.patch_preferences(PreferencePatch::Reset)
     }
 
+    /// Return the current lifecycle state of the session-facing profile tag vocabulary.
+    pub fn vocabulary_status(&self) -> VocabularyStatus {
+        vocabulary::status(&self.vocabulary)
+    }
+
+    /// Submit an exact lookup of bounded profile vocabulary labels.
+    pub fn lookup_profile_tag_categories(
+        &self,
+        labels: Vec<String>,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyLookup>, VocabularySubmitError> {
+        let request = VocabularyRequestId::from_raw(
+            self.next_vocabulary_request.fetch_add(1, Ordering::Relaxed),
+        );
+        vocabulary::lookup(&self.vocabulary, request, labels)
+    }
+
+    /// Submit one bounded literal-prefix profile vocabulary page.
+    pub fn profile_tag_vocabulary_page(
+        &self,
+        expected_revision: Option<u64>,
+        prefix: String,
+        after_cursor: Option<ProfileTagVocabularyPageCursor>,
+        requested_limit: usize,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyPage>, VocabularySubmitError> {
+        let request = VocabularyRequestId::from_raw(
+            self.next_vocabulary_request.fetch_add(1, Ordering::Relaxed),
+        );
+        vocabulary::page(
+            &self.vocabulary,
+            request,
+            expected_revision,
+            prefix,
+            after_cursor,
+            requested_limit,
+        )
+    }
+
+    /// Submit one category assignment at an exact profile vocabulary revision.
+    pub fn set_profile_tag_category(
+        &self,
+        expected_revision: u64,
+        label: String,
+        category: ProfileTagCategory,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularySetReceipt>, VocabularySubmitError> {
+        let request = VocabularyRequestId::from_raw(
+            self.next_vocabulary_request.fetch_add(1, Ordering::Relaxed),
+        );
+        vocabulary::set_category(
+            &self.vocabulary,
+            request,
+            expected_revision,
+            label,
+            category,
+        )
+    }
+
     /// Poll one session event without blocking the caller.
     pub fn try_recv(&self) -> Result<RegistryEvent, TryRecvError> {
         self.events.try_recv()
@@ -304,6 +371,7 @@ impl SourceRegistryService {
     /// Close command admission, drain the final baseline/lookups/save, and synchronously join.
     pub fn shutdown(&mut self) -> Result<(), ShutdownError> {
         self.closed.store(true, Ordering::Release);
+        vocabulary::close(&self.vocabulary);
         catalog::close(&self.catalog);
         let sender = self
             .commands
@@ -340,11 +408,28 @@ impl SourceRegistryService {
     }
 
     fn start_inner(app_root_override: Option<PathBuf>) -> Result<Self, StartError> {
+        Self::start_inner_with_initialization_gate(app_root_override, None)
+    }
+
+    #[cfg(test)]
+    fn start_inner_with_initialization_gate_for_test(
+        app_root_override: Option<PathBuf>,
+        initialization_gate: Arc<std::sync::Barrier>,
+    ) -> Result<Self, StartError> {
+        Self::start_inner_with_initialization_gate(app_root_override, Some(initialization_gate))
+    }
+
+    fn start_inner_with_initialization_gate(
+        app_root_override: Option<PathBuf>,
+        initialization_gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Result<Self, StartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(SESSION_COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
         let (preference_event_tx, preference_event_rx) = mpsc::channel();
         let catalog = Arc::new(Mutex::new(CatalogSlot::loading()));
         let worker_catalog = Arc::clone(&catalog);
+        let vocabulary = Arc::new(Mutex::new(VocabularySlot::loading()));
+        let worker_vocabulary = Arc::clone(&vocabulary);
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-source-session"))
             .spawn(move || {
@@ -354,6 +439,8 @@ impl SourceRegistryService {
                     preference_event_tx,
                     app_root_override,
                     worker_catalog,
+                    worker_vocabulary,
+                    initialization_gate,
                 )
             })
             .map_err(StartError::ThreadSpawn)?;
@@ -362,9 +449,11 @@ impl SourceRegistryService {
             closed: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             next_preference_request: AtomicU64::new(1),
+            next_vocabulary_request: AtomicU64::new(1),
             events: event_rx,
             preference_events: preference_event_rx,
             catalog,
+            vocabulary,
             worker: Some(worker),
         })
     }
@@ -683,6 +772,7 @@ impl Persistence {
     fn start(
         app_root_override: Option<PathBuf>,
         catalog_slot: Arc<Mutex<CatalogSlot>>,
+        vocabulary_slot: Arc<Mutex<VocabularySlot>>,
     ) -> (Self, Option<AppRootGuard>, PersistenceProfileGuard) {
         let profile_guard = PersistenceProfileGuard::named(GPUI_DEVELOPMENT_PROFILE);
         let mut persistence = Self {
@@ -713,6 +803,10 @@ impl Persistence {
             match WritableProfileGuard::acquire_current() {
                 Ok(writable) => match GlobalLibraryWriter::start(&writable) {
                     Ok(writer) => {
+                        vocabulary::install(
+                            &vocabulary_slot,
+                            writer.profile_tag_vocabulary_client(),
+                        );
                         persistence.writable = Some(writable);
                         persistence.writer = Some(writer);
                     }
@@ -720,6 +814,9 @@ impl Persistence {
                 },
                 Err(error) => persistence.unavailable = Some(session_from_profile_error(error)),
             }
+        }
+        if let Some(error) = persistence.unavailable.as_ref() {
+            vocabulary::mark_unavailable(&vocabulary_slot, error.to_string());
         }
         persistence.start_catalog(&catalog_slot);
         (persistence, root_guard, profile_guard)
@@ -806,9 +903,17 @@ fn run_worker(
     preference_event_tx: mpsc::Sender<PreferenceEvent>,
     app_root_override: Option<PathBuf>,
     catalog_slot: Arc<Mutex<CatalogSlot>>,
+    vocabulary_slot: Arc<Mutex<VocabularySlot>>,
+    initialization_gate: Option<Arc<std::sync::Barrier>>,
 ) -> Result<(), SessionError> {
-    let (mut persistence, _root_guard, _profile_guard) =
-        Persistence::start(app_root_override, Arc::clone(&catalog_slot));
+    if let Some(initialization_gate) = initialization_gate {
+        initialization_gate.wait();
+    }
+    let (mut persistence, _root_guard, _profile_guard) = Persistence::start(
+        app_root_override,
+        Arc::clone(&catalog_slot),
+        Arc::clone(&vocabulary_slot),
+    );
     let mut coordinator = Coordinator::new();
     let mut preference_coordinator = PreferenceCoordinator::new();
     let mut applied_requests = HashSet::new();
@@ -877,6 +982,7 @@ fn run_worker(
             }
         };
         let Some(command) = command else {
+            vocabulary::close(&vocabulary_slot);
             catalog::close(&catalog_slot);
             let result = drain_shutdown(
                 &mut persistence,
@@ -1031,6 +1137,7 @@ fn run_worker(
                 }
             }
             Command::Shutdown { acknowledgement } => {
+                vocabulary::close(&vocabulary_slot);
                 catalog::close(&catalog_slot);
                 let result = drain_shutdown(
                     &mut persistence,
@@ -2330,6 +2437,190 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_service_reports_initializing_before_owner_start() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let mut service = SourceRegistryService::start_inner_with_initialization_gate_for_test(
+            Some(profile_root(&temp)),
+            Arc::clone(&gate),
+        )
+        .expect("service start");
+
+        assert_eq!(service.vocabulary_status(), VocabularyStatus::Initializing);
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("kick")]),
+            Err(VocabularySubmitError::Initializing)
+        ));
+
+        gate.wait();
+        wait_for_vocabulary_available(&service);
+        service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn vocabulary_service_forwards_real_owner_requests_and_reopens() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_vocabulary_available(&service);
+
+        let mut initial = service
+            .lookup_profile_tag_categories(vec![String::from("kick"), String::from("kick")])
+            .expect("initial lookup admission");
+        assert_eq!(initial.id().get(), 1);
+        let initial = receive_vocabulary(&mut initial).expect("initial lookup");
+        assert_eq!(initial.revision, 0);
+        assert!(initial.entries.is_empty());
+
+        let mut set = service
+            .set_profile_tag_category(0, String::from("kick"), ProfileTagCategory::SoundType)
+            .expect("set admission");
+        let receipt = receive_vocabulary(&mut set).expect("set result");
+        assert_eq!(receipt.revision, 1);
+        assert!(receipt.changed);
+
+        let mut lookup = service
+            .lookup_profile_tag_categories(vec![String::from("kick")])
+            .expect("lookup admission");
+        let lookup = receive_vocabulary(&mut lookup).expect("lookup result");
+        assert_eq!(lookup.revision, 1);
+        assert_eq!(lookup.entries.len(), 1);
+        assert_eq!(lookup.entries[0].label, "kick");
+        assert_eq!(lookup.entries[0].category, ProfileTagCategory::SoundType);
+
+        let mut page = service
+            .profile_tag_vocabulary_page(Some(1), String::from("k"), None, 64)
+            .expect("page admission");
+        let page = receive_vocabulary(&mut page).expect("page result");
+        assert_eq!(page.revision, 1);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].label, "kick");
+
+        let mut stale = service
+            .set_profile_tag_category(0, String::from("snare"), ProfileTagCategory::Character)
+            .expect("stale admission");
+        assert!(matches!(
+            receive_vocabulary(&mut stale),
+            Err(LibraryError::ProfileTagVocabularyStaleRevision {
+                expected: 0,
+                actual: 1
+            })
+        ));
+
+        let oversized = "x"
+            .repeat(wavecrate_library::sample_sources::PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES + 1);
+        assert!(matches!(
+            service.set_profile_tag_category(1, oversized, ProfileTagCategory::Character),
+            Err(VocabularySubmitError::Invalid(
+                ProfileTagVocabularyInputError::LabelTooLong { .. }
+            ))
+        ));
+
+        service.shutdown().expect("shutdown");
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
+        wait_for_vocabulary_available(&reopened);
+        let mut restored = reopened
+            .lookup_profile_tag_categories(vec![String::from("kick")])
+            .expect("restored lookup admission");
+        let restored = receive_vocabulary(&mut restored).expect("restored lookup");
+        assert_eq!(restored.revision, 1);
+        assert_eq!(restored.entries[0].label, "kick");
+        reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
+    fn vocabulary_service_bounds_unconsumed_handles_and_releases_permits() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root(&temp))).expect("service start");
+        wait_for_vocabulary_available(&service);
+
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::new()]),
+            Err(VocabularySubmitError::Invalid(
+                ProfileTagVocabularyInputError::EmptyLabel
+            ))
+        ));
+
+        let mut handles = Vec::new();
+        for index in 0..MAX_VOCABULARY_REQUESTS_IN_FLIGHT {
+            handles.push(
+                service
+                    .lookup_profile_tag_categories(vec![format!("unconsumed-{index}")])
+                    .expect("bounded lookup admission"),
+            );
+        }
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("blocked")]),
+            Err(VocabularySubmitError::Full)
+        ));
+
+        receive_vocabulary(&mut handles[0]).expect("received permit result");
+        handles.remove(0);
+        let mut after_receive = service
+            .lookup_profile_tag_categories(vec![String::from("after-receive")])
+            .expect("admission after receive");
+        receive_vocabulary(&mut after_receive).expect("after receive result");
+
+        drop(handles.pop().expect("handle to drop"));
+        let mut after_drop = service
+            .lookup_profile_tag_categories(vec![String::from("after-drop")])
+            .expect("admission after drop");
+        receive_vocabulary(&mut after_drop).expect("after drop result");
+
+        for mut handle in handles {
+            receive_vocabulary(&mut handle).expect("remaining lookup result");
+        }
+        service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn vocabulary_service_shutdown_drains_admitted_and_dropped_writes() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_vocabulary_available(&service);
+
+        let mut retained = service
+            .set_profile_tag_category(0, String::from("retained"), ProfileTagCategory::Prefix)
+            .expect("retained write admission");
+        service.shutdown().expect("shutdown");
+        let retained = receive_vocabulary(&mut retained).expect("retained write result");
+        assert_eq!(retained.revision, 1);
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("retained")]),
+            Err(VocabularySubmitError::Closed)
+        ));
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("reopen service");
+        wait_for_vocabulary_available(&reopened);
+        let dropped = reopened
+            .set_profile_tag_category(1, String::from("dropped"), ProfileTagCategory::Character)
+            .expect("dropped write admission");
+        drop(dropped);
+        reopened.shutdown().expect("second shutdown");
+
+        let mut final_service =
+            SourceRegistryService::start_inner(Some(profile_root)).expect("final service start");
+        wait_for_vocabulary_available(&final_service);
+        let mut restored = final_service
+            .lookup_profile_tag_categories(vec![String::from("retained"), String::from("dropped")])
+            .expect("final lookup admission");
+        let restored = receive_vocabulary(&mut restored).expect("final lookup result");
+        assert_eq!(restored.revision, 2);
+        assert_eq!(restored.entries.len(), 2);
+        final_service.shutdown().expect("final shutdown");
+    }
+
+    #[test]
     fn catalog_shares_session_profile_owner_and_releases_after_shutdown() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -3116,6 +3407,14 @@ mod tests {
             matches!(event, RegistryEvent::PersistenceUnavailable { .. })
         });
         assert!(matches!(
+            service.vocabulary_status(),
+            VocabularyStatus::Unavailable { .. }
+        ));
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("kick")]),
+            Err(VocabularySubmitError::Unavailable(_))
+        ));
+        assert!(matches!(
             service.shutdown(),
             Err(ShutdownError::Session(SessionError::Persistence(_)))
         ));
@@ -3417,6 +3716,45 @@ mod tests {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(TryRecvError::Disconnected) => panic!("session event channel disconnected"),
+            }
+        }
+    }
+
+    fn wait_for_vocabulary_available(service: &SourceRegistryService) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match service.vocabulary_status() {
+                VocabularyStatus::Available => return,
+                VocabularyStatus::Initializing => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for vocabulary availability"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                VocabularyStatus::Unavailable { reason } => {
+                    panic!("vocabulary startup failed: {reason}");
+                }
+                VocabularyStatus::Closed => panic!("vocabulary closed during startup"),
+            }
+        }
+    }
+
+    fn receive_vocabulary<T>(request: &mut VocabularyRequest<T>) -> Result<T, LibraryError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match request.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for vocabulary result"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("vocabulary result channel disconnected")
+                }
             }
         }
     }

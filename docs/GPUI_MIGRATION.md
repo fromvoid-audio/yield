@@ -1355,3 +1355,19 @@ decodes an existing legacy display label that the receipt does not need. The leg
 API that returns full tags retains its behavior. Four focused curation-tag tests
 passed, including assignment against a one-MiB non-text legacy display payload,
 playback-type replacement, input bounds and curated timestamps.
+
+### Bounded session vocabulary access
+
+The session exposes typed nonblocking vocabulary request handles through a narrow
+client of the existing profile library owner. Eight outstanding handles cap retained
+results; consuming or dropping a handle returns its permit. Dropping an admitted
+write does not cancel persistence. Owner and client use shared admission/lifecycle
+helpers, and session shutdown closes admission before draining accepted work.
+No relay worker, extra database connection or vocabulary preference snapshot is added.
+
+All 42 session tests and two targeted owner tests passed, including reopen, stale
+revision, invalid input, permit release, retained results after shutdown and dropped
+write durability. Library/UI compilation, formatting and diff checks passed.
+Independent review found no correctness, durability, shutdown-race or permit-leak
+issues. Its startup coverage gap was closed with passing deterministic initialization
+and unavailable-profile public-API tests.

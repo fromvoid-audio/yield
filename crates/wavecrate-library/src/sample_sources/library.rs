@@ -38,7 +38,7 @@ pub use harvest::{
 pub use owner::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterQueueError,
     GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable,
-    SourceRegistrySnapshot,
+    ProfileTagVocabularyClient, SourceRegistrySnapshot,
 };
 pub use tag_vocabulary::{
     PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES, PROFILE_TAG_VOCABULARY_MAX_LOOKUP_LABELS,
