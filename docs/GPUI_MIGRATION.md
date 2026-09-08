@@ -628,6 +628,25 @@ Tests cover shared profile ownership, preference independence, startup/close
 races, closed admission, and ownership release. Browser projection remains the
 next integration boundary.
 
+### Bounded waveform detail decoder, 2026-09-08
+
+The media layer now retains optional strong file identity, revision, WAV spec,
+and normalization context with an overview. Detail requests decode an exact
+frame range with at most 8,388,608 visible frames and 65,536 output columns,
+without retaining PCM. A bounded preceding warmup reduces filter/envelope seams;
+detail reuses full-file gains rather than normalizing each viewport separately.
+Opened-file and named-path identity, change markers, length, timestamp, and spec
+are checked before and after decoding. Platforms without strong markers retain
+the overview without enabling detail.
+
+Validation: all 18 media tests and locked media/UI checks passed. Tests cover
+richer detail, overlapping ranges beyond the warmup window, stereo frame
+coordinates, request limits, cancellation, atomic replacement, same-size edits
+with restored modification time, and truncation. A final targeted test confirms
+the local macOS fixture actually exposes detail context. UI request scheduling
+and rendering are still pending; this decoder alone does not improve displayed
+zoom resolution.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

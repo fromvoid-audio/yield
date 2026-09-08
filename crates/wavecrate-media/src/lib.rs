@@ -12,7 +12,14 @@ use wavecrate_analysis::probe_metadata;
 use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
+mod detail;
 mod visual_bands;
+
+pub use detail::{
+    MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
+    WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
+    WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
+};
 
 /// Maximum number of bars generated for a selected sample's preview.
 pub const MAX_WAVEFORM_POINTS: usize = 180;
@@ -58,6 +65,9 @@ pub struct WaveformPreview {
     /// This remains a scalar even though the waveform samples themselves are reduced to bounded
     /// display columns, so viewport navigation can use frame based limits without retaining PCM.
     pub total_frames: usize,
+    /// Strongly fenced overview context for later bounded viewport refinement, when the platform
+    /// exposes stable filesystem identity and change markers.
+    pub detail_context: Option<WaveformDetailContext>,
 }
 
 /// Enumerate recognized audio files below `root` without following directory links.
@@ -207,29 +217,22 @@ pub fn load_waveform_preview_with_cancel(
             path.display()
         ));
     }
-    let mut reader = hound::WavReader::open(path)
-        .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))?;
-    let spec = reader.spec();
-    if spec.sample_rate == 0 {
-        return Err(format!(
-            "{} WAV has an invalid zero sample rate",
-            path.display(),
-        ));
-    }
-    if spec.channels == 0 {
-        return Err(format!("{} WAV has no channels", path.display()));
-    }
-    let total_frames = reader.duration() as usize;
-    if total_frames == 0 {
-        return Err(format!("{} contains no decodable samples", path.display()));
-    }
+    let mut opened = detail::open_wav(path, cancellation)?;
+    let spec = opened.spec;
+    let total_frames = opened.total_frames;
     let channels = usize::from(spec.channels);
-    let global_peak =
-        stream_global_mono_peak(&mut reader, spec, channels, total_frames, cancellation)?;
+    let global_peak = stream_global_mono_peak(
+        &mut opened.reader,
+        spec,
+        channels,
+        total_frames,
+        cancellation,
+    )?;
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    reader
+    opened
+        .reader
         .seek(0)
         .map_err(|error| format!("Failed to rewind WAV {}: {error}", path.display()))?;
     let normalization_gain = if global_peak.is_finite() && global_peak >= f32::MIN_POSITIVE {
@@ -245,13 +248,13 @@ pub fn load_waveform_preview_with_cancel(
         MAX_WAVEFORM_BAND_POINTS,
     );
     stream_wav_frames(
-        &mut reader,
+        &mut opened.reader,
         spec,
         channels,
         total_frames,
         cancellation,
         |frame_index, mono| {
-            let normalized = (mono * normalization_gain).clamp(-1.0, 1.0);
+            let normalized = sanitize_stream_sample(mono * normalization_gain);
             let peak_index = column_index(frame_index, total_frames, peak_count);
             peaks[peak_index] = peaks[peak_index].max(normalized.abs());
             bands.push(frame_index, normalized);
@@ -261,7 +264,18 @@ pub fn load_waveform_preview_with_cancel(
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let bands = bands.finish();
+    let (bands, visual_band_gains) = bands.finish();
+    let after = detail::recheck_wav(path, &opened.file, spec, total_frames, cancellation)?;
+    detail::ensure_file_unchanged(&opened.observation, &after)?;
+    let detail_context = detail::context_from_observations(
+        path,
+        &opened.observation,
+        &after,
+        spec,
+        total_frames,
+        normalization_gain,
+        visual_band_gains,
+    );
     let duration_seconds = total_frames as f64 / spec.sample_rate as f64;
     let duration_seconds = duration_seconds as f32;
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
@@ -273,6 +287,7 @@ pub fn load_waveform_preview_with_cancel(
         duration_seconds,
         sample_rate: spec.sample_rate,
         total_frames,
+        detail_context,
     })
 }
 
@@ -298,7 +313,7 @@ fn stream_global_mono_peak<R: Read>(
     Ok(global_peak)
 }
 
-fn stream_wav_frames<R: Read, F>(
+pub(crate) fn stream_wav_frames<R: Read, F>(
     reader: &mut hound::WavReader<R>,
     spec: hound::WavSpec,
     channels: usize,
@@ -387,7 +402,7 @@ fn integer_sample_scale(bits_per_sample: u16) -> f32 {
     (1_i64 << bits_per_sample.saturating_sub(1).min(31)).max(1) as f32
 }
 
-fn sanitize_stream_sample(sample: f32) -> f32 {
+pub(crate) fn sanitize_stream_sample(sample: f32) -> f32 {
     if sample.is_finite() {
         sample.clamp(-1.0, 1.0)
     } else {
@@ -401,7 +416,7 @@ fn column_index(frame_index: usize, total_frames: usize, column_count: usize) ->
     ((frame_index as u128 * column_count as u128) / total_frames as u128) as usize
 }
 
-fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
+pub(crate) fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
     cancellation.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
 }
 
@@ -416,8 +431,11 @@ mod tests {
     use super::*;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::f32::consts::TAU;
+    use std::fs::FileTimes;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
+    use wavecrate_library::filesystem_identity::filesystem_change_marker;
 
     fn write_fixture(path: &Path) {
         let spec = WavSpec {
@@ -702,5 +720,222 @@ mod tests {
         });
         assert_eq!(result, Err(String::from("waveform preview canceled")));
         assert_eq!(seen, 8);
+    }
+
+    #[test]
+    fn detail_refinement_is_richer_and_reuses_global_normalization() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("detail.wav");
+        write_fixture(&path);
+        let preview = load_waveform_preview(&path).expect("overview");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(
+            preview.detail_context.is_some(),
+            "local test fixtures must expose strong detail identity on this platform"
+        );
+        let Some(context) = preview.detail_context.clone() else {
+            return;
+        };
+
+        let request = WaveformDetailRequest::new(context.clone(), 0, 4_096, 4_096)
+            .expect("richer detail request");
+        let detail = load_waveform_detail(&request).expect("detail");
+        assert_eq!(
+            detail.range,
+            WaveformDetailRange {
+                start_frame: 0,
+                end_frame: 4_096,
+            }
+        );
+        assert_eq!(detail.bands.len(), 4_096);
+        assert!(
+            detail
+                .bands
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        );
+        assert!(detail.bands.len() > preview.bands.len());
+        assert!(context.global_mono_gain > 1.0);
+        assert!(
+            context
+                .visual_band_gains
+                .iter()
+                .all(|gain| gain.is_finite() && *gain > 0.0)
+        );
+
+        let first_request = WaveformDetailRequest::new(context.clone(), 5_000, 7_000, 2_000)
+            .expect("first overlap request");
+        let second_request = WaveformDetailRequest::new(context, 6_000, 8_000, 2_000)
+            .expect("second overlap request");
+        let first = load_waveform_detail(&first_request).expect("first detail");
+        let second = load_waveform_detail(&second_request).expect("second detail");
+        let max_overlap_difference = first.bands[1_000..]
+            .iter()
+            .zip(&second.bands[..1_000])
+            .flat_map(|(first, second)| first.iter().zip(second))
+            .map(|(first, second)| (first - second).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_overlap_difference < 0.02,
+            "warmup overlap drift was {max_overlap_difference}"
+        );
+    }
+
+    #[test]
+    fn detail_uses_frame_coordinates_for_multichannel_downmix() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("stereo-detail.wav");
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(&path, spec).expect("create stereo detail");
+        for frame in [[0.0_f32, 0.0], [0.5, 0.5], [1.0, -1.0], [0.25, 0.75]] {
+            writer.write_sample(frame[0]).expect("left detail sample");
+            writer.write_sample(frame[1]).expect("right detail sample");
+        }
+        writer.finalize().expect("finish stereo detail");
+
+        let preview = load_waveform_preview(&path).expect("stereo overview");
+        let Some(context) = preview.detail_context.clone() else {
+            return;
+        };
+        let request = WaveformDetailRequest::new(context, 0, 4, 4).expect("stereo detail request");
+        let detail = load_waveform_detail(&request).expect("stereo detail");
+        assert_eq!(detail.bands.len(), 4);
+        assert_eq!(detail.bands[0][3], 0.0);
+        assert!((detail.bands[1][3] - 1.0).abs() < 0.000_01);
+        assert_eq!(detail.bands[2][3], 0.0);
+        assert!((detail.bands[3][3] - 1.0).abs() < 0.000_01);
+    }
+
+    #[test]
+    fn detail_request_limits_reject_invalid_ranges_without_decoding() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("detail-limits.wav");
+        write_fixture(&path);
+        let preview = load_waveform_preview(&path).expect("overview");
+        let Some(context) = preview.detail_context.clone() else {
+            return;
+        };
+
+        assert!(WaveformDetailRequest::new(context.clone(), 10, 10, 1).is_err());
+        assert!(WaveformDetailRequest::new(context.clone(), 0, 10, 0).is_err());
+        assert!(WaveformDetailRequest::new(context.clone(), 0, 10, 11).is_err());
+        assert!(
+            WaveformDetailRequest::new(context.clone(), 0, context.total_frames + 1, 1).is_err()
+        );
+
+        let mut too_many_columns = context.clone();
+        too_many_columns.total_frames = MAX_WAVEFORM_DETAIL_COLUMNS + 1;
+        assert!(
+            WaveformDetailRequest::new(
+                too_many_columns,
+                0,
+                MAX_WAVEFORM_DETAIL_COLUMNS + 1,
+                MAX_WAVEFORM_DETAIL_COLUMNS + 1,
+            )
+            .is_err()
+        );
+
+        let mut too_many_frames = context;
+        too_many_frames.total_frames = MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES + 1;
+        assert!(
+            WaveformDetailRequest::new(
+                too_many_frames,
+                0,
+                MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES + 1,
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn detail_honors_cancellation_and_rejects_stale_or_truncated_sources() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("detail-fence.wav");
+        write_fixture(&path);
+        let preview = load_waveform_preview(&path).expect("overview");
+        let Some(context) = preview.detail_context.clone() else {
+            return;
+        };
+        let request =
+            WaveformDetailRequest::new(context.clone(), 0, 2_048, 2_048).expect("detail request");
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            load_waveform_detail_with_cancel(&request, Some(&cancelled)),
+            Err(String::from("waveform detail canceled"))
+        );
+
+        let replacement = directory.path().join("replacement.wav");
+        write_fixture(&replacement);
+        std::fs::rename(&replacement, &path).expect("replace detail source");
+        let stale = load_waveform_detail(&request).expect_err("replacement must stale detail");
+        assert!(stale.contains("stale") || stale.contains("replaced"));
+
+        write_fixture(&path);
+        let refreshed = load_waveform_preview(&path).expect("refreshed overview");
+        let Some(refreshed_context) = refreshed.detail_context else {
+            return;
+        };
+        let refreshed_request =
+            WaveformDetailRequest::new(refreshed_context.clone(), 0, 2_048, 2_048)
+                .expect("refreshed request");
+        let source_len = std::fs::metadata(&path).expect("detail metadata").len();
+        let original_modified = refreshed_context.file_revision.modified_time;
+        let mut source = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open detail source for in-place mutation");
+        source.seek(SeekFrom::End(-1)).expect("seek detail payload");
+        source.write_all(&[0x7f]).expect("mutate detail payload");
+        source.flush().expect("flush detail payload");
+        if let Some(original_modified) = original_modified {
+            source
+                .set_times(FileTimes::new().set_modified(original_modified))
+                .expect("restore detail modified time");
+        }
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("mutated detail metadata")
+                .len(),
+            source_len
+        );
+        if let Some(original_modified) = original_modified {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("restored detail metadata")
+                    .modified()
+                    .expect("restored modified time"),
+                original_modified
+            );
+        }
+        if let Some(marker) = filesystem_change_marker(
+            &path,
+            &std::fs::metadata(&path).expect("changed detail metadata"),
+        ) {
+            assert_ne!(marker, refreshed_context.file_revision.change_marker);
+        }
+        let in_place = load_waveform_detail(&refreshed_request)
+            .expect_err("same-sized in-place mutation must stale detail");
+        assert!(in_place.contains("stale") || in_place.contains("changed"));
+
+        write_fixture(&path);
+        let refreshed = load_waveform_preview(&path).expect("overview after mutation");
+        let Some(refreshed_context) = refreshed.detail_context else {
+            return;
+        };
+        let refreshed_request = WaveformDetailRequest::new(refreshed_context, 0, 2_048, 2_048)
+            .expect("request after mutation");
+        let mut bytes = std::fs::read(&path).expect("read detail source");
+        bytes.pop();
+        std::fs::write(&path, bytes).expect("truncate detail source");
+        let truncated = load_waveform_detail(&refreshed_request)
+            .expect_err("truncated source must reject detail");
+        assert!(!truncated.is_empty());
     }
 }

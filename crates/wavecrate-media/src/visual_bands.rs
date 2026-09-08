@@ -92,8 +92,13 @@ impl StreamingProjector {
         column_values[3] = column_values[3].max(frame[3].abs());
     }
 
-    /// Finish the projection with the same file-level visual normalization as the slice path.
-    pub(super) fn finish(mut self) -> Vec<[f32; BAND_COUNT]> {
+    /// Warm the filter and envelope state without adding a visible column.
+    pub(super) fn warmup(&mut self, sample: f32) {
+        self.processor.process(sample);
+    }
+
+    /// Finish the projection and return the gains used for its file-level normalization.
+    pub(super) fn finish(mut self) -> (Vec<[f32; BAND_COUNT]>, [f32; VISUAL_BAND_COUNT]) {
         let raw_peak = self
             .columns
             .iter()
@@ -114,13 +119,34 @@ impl StreamingProjector {
                 .fold(0.0_f32, f32::max),
         ];
         let gains = visual_band_normalization(raw_peak, peaks);
+        self.apply_gains(gains);
+        (self.columns, gains)
+    }
+
+    /// Finish the projection with previously computed file-level normalization gains.
+    pub(super) fn finish_with_gains(
+        mut self,
+        gains: [f32; VISUAL_BAND_COUNT],
+    ) -> Vec<[f32; BAND_COUNT]> {
+        let gains = if gains
+            .iter()
+            .all(|gain| gain.is_finite() && *gain > 0.0 && *gain <= 4.0)
+        {
+            gains
+        } else {
+            [1.0; VISUAL_BAND_COUNT]
+        };
+        self.apply_gains(gains);
+        self.columns
+    }
+
+    fn apply_gains(&mut self, gains: [f32; VISUAL_BAND_COUNT]) {
         for column in &mut self.columns {
             for (band, gain) in gains.into_iter().enumerate() {
                 column[band] = finite_unit(column[band] * gain);
             }
             column[3] = finite_unit(column[3]);
         }
-        self.columns
     }
 }
 
@@ -135,7 +161,7 @@ pub(super) fn project(samples: &[f32], sample_rate: u32, max_points: usize) -> V
     for (index, sample) in samples.iter().copied().enumerate() {
         projector.push(index, sample);
     }
-    projector.finish()
+    projector.finish().0
 }
 
 fn visual_band_normalization(
