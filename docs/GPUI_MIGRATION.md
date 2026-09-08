@@ -1439,3 +1439,25 @@ A clean `0a111c48f` build was packaged and signature-verified at
 fixture and isolated profile. The native input check was interrupted by detected
 concurrent user interaction, so it is not counted as passed. The running preview
 and its profile were preserved for manual testing.
+
+### Selected-tag chips and exact removal
+
+The sidebar now reads selected-tag unions in bounded 64-entry pages, labels each
+assignment All or Mixed against the complete effective selection, and retains a
+bounded 32-cursor history with a First control. Legacy label previews retain their
+numeric source tag identity for removal. Rendering borrows the stored page instead
+of cloning its label payloads each frame.
+
+Selection changes coalesce behind outstanding reads. Source, root, revision and
+request fences reject obsolete replies; source replacement drops obsolete request
+correlation. Removal rechecks the displayed page and current selection, uses the
+bounded exact-ID curation planner, and refreshes from durable receipts. Inactive
+source receipts do not invalidate active chips. Correlated stale-revision failures
+settle without repeated polling against unchanged authority.
+
+The UI suite passed 183 tests with one ignored before the final idle-loop fix.
+Five focused chip tests and normal UI compilation passed after that fix; formatting
+and diff checks passed. Primary diff review found and resolved page cloning,
+misleading empty-state text, inactive-source invalidation and stale-failure retry
+issues. Native chip interaction remains unverified; existing running previews were
+preserved. Completion and assigned-tag filtering remain in progress.

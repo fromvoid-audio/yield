@@ -50,14 +50,14 @@ impl Default for TagEditorState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct TagSubmissionContext {
-    source_id: SourceId,
-    lifecycle_generation: u64,
-    root: PathBuf,
-    root_identity: RootIdentity,
-    directory_generation: u64,
-    revision: u64,
-    paths: Vec<PathBuf>,
+pub(super) struct TagSubmissionContext {
+    pub(super) source_id: SourceId,
+    pub(super) lifecycle_generation: u64,
+    pub(super) root: PathBuf,
+    pub(super) root_identity: RootIdentity,
+    pub(super) directory_generation: u64,
+    pub(super) revision: u64,
+    pub(super) paths: Vec<PathBuf>,
 }
 
 struct PendingTagOperation {
@@ -94,6 +94,9 @@ enum TagStage {
 impl TagEditorState {
     fn next_source_request_id(&mut self) -> u64 {
         self.next_source_request_id = self.next_source_request_id.wrapping_add(1);
+        if self.next_source_request_id == 0 {
+            self.next_source_request_id = 1;
+        }
         self.next_source_request_id
     }
 
@@ -710,6 +713,11 @@ pub(super) fn apply_catalog_event(
 }
 
 impl Browser {
+    /// Allocate an identifier shared by the editor and selected-tag page requests.
+    pub(super) fn next_tag_request_id(&mut self) -> u64 {
+        self.tag_editor.next_source_request_id()
+    }
+
     /// Cancel the visible tag-editor intent while letting any admitted profile write drain.
     pub(super) fn cancel_tag_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tag_editor.pending = None;
@@ -821,7 +829,7 @@ impl Browser {
                 return;
             }
         };
-        let source_request_id = self.tag_editor.next_source_request_id();
+        let source_request_id = self.next_tag_request_id();
         let source_command = CatalogCommand::RequestTagPage {
             source_id: context.source_id.clone(),
             lifecycle_generation: context.lifecycle_generation,
@@ -1001,7 +1009,10 @@ fn finish_admission(
     cx.notify();
 }
 
-fn capture_tag_context(browser: &Browser, paths: Vec<PathBuf>) -> Option<TagSubmissionContext> {
+pub(super) fn capture_tag_context(
+    browser: &Browser,
+    paths: Vec<PathBuf>,
+) -> Option<TagSubmissionContext> {
     let activation = browser.catalog_activation.as_ref()?;
     if !activation.audit_finished || activation.audit_error.is_some() {
         return None;
@@ -1031,7 +1042,7 @@ fn capture_tag_context(browser: &Browser, paths: Vec<PathBuf>) -> Option<TagSubm
     })
 }
 
-fn tag_context_is_current(browser: &Browser, context: &TagSubmissionContext) -> bool {
+pub(super) fn tag_context_is_current(browser: &Browser, context: &TagSubmissionContext) -> bool {
     let Some(activation) = browser.catalog_activation.as_ref() else {
         return false;
     };
@@ -1059,7 +1070,7 @@ fn tag_context_is_current(browser: &Browser, context: &TagSubmissionContext) -> 
         )
 }
 
-fn source_page_reply_is_coherent(
+pub(super) fn source_page_reply_is_coherent(
     context: &TagSubmissionContext,
     source_id: &SourceId,
     lifecycle_generation: u64,

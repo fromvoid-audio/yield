@@ -43,6 +43,7 @@ mod motion;
 mod preferences;
 mod sidebar;
 mod source_registry;
+mod tag_chips;
 mod tags;
 mod transport;
 mod view;
@@ -289,6 +290,7 @@ pub(crate) struct Browser {
     catalog_metadata: catalog_metadata::CatalogMetadataState,
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
+    tag_chips: tag_chips::TagChipsState,
     collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
@@ -450,6 +452,7 @@ impl Browser {
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),
+            tag_chips: tag_chips::TagChipsState::default(),
             collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
@@ -582,7 +585,9 @@ impl Browser {
 
     fn reconcile_selection(&mut self) {
         let visible_ids = self.visible_selection_ids();
-        self.selection.reconcile(&visible_ids);
+        if self.selection.reconcile(&visible_ids) {
+            tag_chips::invalidate(self);
+        }
     }
 
     /// Highlight batch members, falling back to the focused sample for ordinary navigation.
@@ -633,6 +638,7 @@ impl Browser {
                 self.selection.toggle(&target_id, focused_id.as_ref());
             }
         }
+        tag_chips::invalidate(self);
         self.select_entry(index, Some(motion::FocusTrigger::Pointer), origin, cx);
     }
 
@@ -642,6 +648,8 @@ impl Browser {
         previous_position: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         let next = self
             .view_model
             .restore_focus(previous_id.as_ref(), previous_position);
@@ -1260,6 +1268,8 @@ impl Browser {
         origin: SelectionOrigin,
         cx: &mut Context<Self>,
     ) {
+        tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         self.reset_browser_focus_state();
         self.context_menu = None;
         let Some(entry) = self.entries.get(index).cloned() else {
@@ -1649,6 +1659,10 @@ impl Browser {
         } else {
             self.selection.move_anchor_to(&next_id);
         }
+        if extend {
+            tag_chips::invalidate(self);
+            self.start_source_registry_poll(cx);
+        }
         self.clear_reveal_for_focus_change(&next_id);
         let passive_focus = self.browser_focus_override.is_some();
         if Some(next) != self.selected || passive_focus {
@@ -1665,6 +1679,7 @@ impl Browser {
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.view_model.toggle_sort(&self.entries, column);
+        tag_chips::invalidate(self);
         self.reconcile_selection();
         self.restore_projection_focus(previous_id, previous_position, cx);
     }
@@ -1672,6 +1687,8 @@ impl Browser {
     fn select_all_visible(&mut self, cx: &mut Context<Self>) {
         let visible_ids = self.visible_selection_ids();
         self.selection.select_all(&visible_ids);
+        tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         cx.notify();
     }
 
@@ -1682,6 +1699,8 @@ impl Browser {
             return;
         };
         self.selection.toggle(&focused_id, Some(&focused_id));
+        tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         cx.notify();
     }
 

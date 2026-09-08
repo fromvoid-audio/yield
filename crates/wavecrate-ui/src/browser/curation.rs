@@ -28,7 +28,7 @@ use wavecrate_session::{
 
 use crate::theme::{color, transparent};
 
-use super::{Browser, catalog};
+use super::{Browser, catalog, tag_chips};
 
 /// The source lifecycle identity retained by curation state.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -50,6 +50,7 @@ struct PendingCurationOperation {
 enum TagMutation {
     Add,
     Remove,
+    RemoveExisting { tag_id: i64 },
 }
 
 #[derive(Clone, Debug)]
@@ -409,49 +410,60 @@ impl CurationState {
         if target_paths.is_empty() {
             return CurationPlan::NoChange { trash_required: 0 };
         }
-        if labels.is_empty() {
-            return CurationPlan::Rejected(String::from(
-                "Tag operation requires at least one label",
-            ));
-        }
         let label_capacity = labels.len().min(MAX_TAGS_PER_COMMIT);
         let mut seen_labels = HashSet::with_capacity(label_capacity);
         let mut unique_labels = Vec::with_capacity(label_capacity);
-        for label in labels {
-            if label.len() > SOURCE_CURATION_MAX_TAG_LABEL_BYTES {
-                return CurationPlan::Rejected(format!(
-                    "Tag label is {} bytes; maximum is {}",
-                    label.len(),
-                    SOURCE_CURATION_MAX_TAG_LABEL_BYTES
-                ));
-            }
-            if label.contains('\0') {
-                return CurationPlan::Rejected(String::from(
-                    "Tag labels cannot contain an embedded NUL byte",
-                ));
-            }
-            if label.split_whitespace().next().is_none() {
-                return CurationPlan::Rejected(String::from(
-                    "Tag operation requires non-empty labels",
-                ));
-            }
-            if seen_labels.insert(label.as_str()) {
-                if unique_labels.len() >= MAX_TAGS_PER_COMMIT {
-                    return CurationPlan::Rejected(format!(
-                        "Tag operation contains more than {} distinct labels",
-                        MAX_TAGS_PER_COMMIT
+        let label_count = match mutation {
+            TagMutation::RemoveExisting { tag_id } => {
+                if tag_id <= 0 {
+                    return CurationPlan::Rejected(String::from(
+                        "Existing tag id must be positive",
                     ));
                 }
-                unique_labels.push(label.as_str());
+                1
             }
-        }
-        if unique_labels.is_empty() {
-            return CurationPlan::Rejected(String::from(
-                "Tag operation requires at least one label",
-            ));
-        }
-
-        let label_count = unique_labels.len();
+            TagMutation::Add | TagMutation::Remove => {
+                if labels.is_empty() {
+                    return CurationPlan::Rejected(String::from(
+                        "Tag operation requires at least one label",
+                    ));
+                }
+                for label in labels {
+                    if label.len() > SOURCE_CURATION_MAX_TAG_LABEL_BYTES {
+                        return CurationPlan::Rejected(format!(
+                            "Tag label is {} bytes; maximum is {}",
+                            label.len(),
+                            SOURCE_CURATION_MAX_TAG_LABEL_BYTES
+                        ));
+                    }
+                    if label.contains('\0') {
+                        return CurationPlan::Rejected(String::from(
+                            "Tag labels cannot contain an embedded NUL byte",
+                        ));
+                    }
+                    if label.split_whitespace().next().is_none() {
+                        return CurationPlan::Rejected(String::from(
+                            "Tag operation requires non-empty labels",
+                        ));
+                    }
+                    if seen_labels.insert(label.as_str()) {
+                        if unique_labels.len() >= MAX_TAGS_PER_COMMIT {
+                            return CurationPlan::Rejected(format!(
+                                "Tag operation contains more than {} distinct labels",
+                                MAX_TAGS_PER_COMMIT
+                            ));
+                        }
+                        unique_labels.push(label.as_str());
+                    }
+                }
+                if unique_labels.is_empty() {
+                    return CurationPlan::Rejected(String::from(
+                        "Tag operation requires at least one label",
+                    ));
+                }
+                unique_labels.len()
+            }
+        };
         let max_distinct_paths = MAX_CURATION_OPERATION_UPDATES / label_count;
         let mut seen_paths = HashSet::with_capacity(target_paths.len().min(max_distinct_paths));
         let mut paths = Vec::with_capacity(target_paths.len().min(max_distinct_paths));
@@ -516,16 +528,19 @@ impl CurationState {
             ));
         }
 
-        let label_bytes = match unique_labels
-            .iter()
-            .try_fold(0usize, |total, label| total.checked_add(label.len()))
-        {
-            Some(label_bytes) => label_bytes,
-            None => {
-                return CurationPlan::Rejected(String::from(
-                    "Tag label payload exceeds the curation byte bound",
-                ));
-            }
+        let label_bytes = match mutation {
+            TagMutation::RemoveExisting { .. } => 0,
+            TagMutation::Add | TagMutation::Remove => match unique_labels
+                .iter()
+                .try_fold(0usize, |total, label| total.checked_add(label.len()))
+            {
+                Some(label_bytes) => label_bytes,
+                None => {
+                    return CurationPlan::Rejected(String::from(
+                        "Tag label payload exceeds the curation byte bound",
+                    ));
+                }
+            },
         };
         let label_bytes = match label_bytes.checked_mul(path_count) {
             Some(label_bytes) => label_bytes,
@@ -556,6 +571,12 @@ impl CurationState {
                     .saturating_mul(batch_count + 1),
             )
             .saturating_add(total_updates.saturating_mul(256))
+            .saturating_add(match mutation {
+                TagMutation::RemoveExisting { .. } => {
+                    total_updates.saturating_mul(std::mem::size_of::<i64>())
+                }
+                TagMutation::Add | TagMutation::Remove => 0,
+            })
             .saturating_add(label_bytes)
             .saturating_add(batch_count.saturating_mul(64));
         if estimated_payload > MAX_CURATION_OPERATION_RECEIPT_BYTES {
@@ -583,18 +604,31 @@ impl CurationState {
                 batches.push(std::mem::take(&mut batch));
                 batch.reserve(paths_per_batch * label_count);
             }
-            for label in &unique_labels {
-                let update = match mutation {
-                    TagMutation::Add => SourceCurationUpdate::AddTag {
-                        path: relative_path.clone(),
-                        label: (*label).to_owned(),
-                    },
-                    TagMutation::Remove => SourceCurationUpdate::RemoveTag {
-                        path: relative_path.clone(),
-                        label: (*label).to_owned(),
-                    },
-                };
-                batch.push(update);
+            match mutation {
+                TagMutation::RemoveExisting { tag_id } => {
+                    batch.push(SourceCurationUpdate::RemoveExistingTag {
+                        path: relative_path,
+                        tag_id,
+                    });
+                }
+                TagMutation::Add | TagMutation::Remove => {
+                    for label in &unique_labels {
+                        let update = match mutation {
+                            TagMutation::Add => SourceCurationUpdate::AddTag {
+                                path: relative_path.clone(),
+                                label: (*label).to_owned(),
+                            },
+                            TagMutation::Remove => SourceCurationUpdate::RemoveTag {
+                                path: relative_path.clone(),
+                                label: (*label).to_owned(),
+                            },
+                            TagMutation::RemoveExisting { .. } => {
+                                unreachable!("existing-tag removal was handled above")
+                            }
+                        };
+                        batch.push(update);
+                    }
+                }
             }
         }
         if !batch.is_empty() {
@@ -640,6 +674,21 @@ impl CurationState {
     ) -> CurationPlan {
         let labels = [label.to_owned()];
         self.plan_tag_operation(key, TagMutation::Remove, &labels, target_paths)
+    }
+
+    /// Plan one exact removal by the persisted source tag identifier.
+    pub(super) fn plan_remove_tag_id(
+        &self,
+        key: &CurationLifecycleKey,
+        tag_id: i64,
+        target_paths: &[PathBuf],
+    ) -> CurationPlan {
+        self.plan_tag_operation(
+            key,
+            TagMutation::RemoveExisting { tag_id },
+            &[],
+            target_paths,
+        )
     }
 
     /// Record an operation only after the catalog accepted its command.
@@ -1620,6 +1669,7 @@ impl Browser {
                             );
                         } else {
                             self.catalog_metadata.pause_for_curation();
+                            tag_chips::invalidate_after_curation(self);
                             self.apply_visible_curation(&key, &optimistic, &BTreeMap::new(), cx);
                             self.start_source_registry_poll(cx);
                         }
@@ -1659,6 +1709,21 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> TagAdmissionResult {
         self.submit_tag_operation(TagMutation::Remove, vec![label], explicit_paths, cx)
+    }
+
+    /// Submit one bounded removal for a persisted source-tag identifier.
+    pub(super) fn submit_remove_tag_id(
+        &mut self,
+        tag_id: i64,
+        explicit_paths: Option<Vec<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) -> TagAdmissionResult {
+        self.submit_tag_operation(
+            TagMutation::RemoveExisting { tag_id },
+            Vec::new(),
+            explicit_paths,
+            cx,
+        )
     }
 
     fn submit_tag_operation(
@@ -1720,6 +1785,10 @@ impl Browser {
                 labels.first().map(String::as_str).unwrap_or_default(),
                 &target_paths,
             ),
+            TagMutation::RemoveExisting { tag_id } => {
+                self.curation_state
+                    .plan_remove_tag_id(&key, tag_id, &target_paths)
+            }
         };
         let result = match plan {
             CurationPlan::Rejected(message) => {
@@ -1757,6 +1826,7 @@ impl Browser {
                             // Tag writes have no optimistic tag vector. The committed receipt is
                             // the first source of visible tag and playback-type state.
                             self.catalog_metadata.pause_for_curation();
+                            tag_chips::invalidate_after_curation(self);
                             self.start_source_registry_poll(cx);
                             TagAdmissionResult::Accepted
                         }
@@ -2079,11 +2149,9 @@ impl Browser {
             });
         self.curation_state
             .prune_completed_except(active_key.as_ref());
-        let active = self.catalog_activation.as_ref().is_some_and(|activation| {
-            activation.source_id == key.source_id
-                && activation.lifecycle_generation == key.lifecycle_generation
-        });
+        let active = curation_key_is_active(active_key.as_ref(), &key);
         if active {
+            tag_chips::invalidate_after_curation(self);
             if application.metadata_changed {
                 self.apply_visible_curation(
                     &key,
@@ -2130,6 +2198,24 @@ impl Browser {
             lifecycle_generation: activation.lifecycle_generation,
         })
     }
+
+    /// Return whether the active source has an accepted curation operation in flight.
+    pub(super) fn curation_operation_pending(&self) -> bool {
+        let Some(activation) = self.catalog_activation.as_ref() else {
+            return false;
+        };
+        self.curation_state.has_pending(&CurationLifecycleKey {
+            source_id: activation.source_id.clone(),
+            lifecycle_generation: activation.lifecycle_generation,
+        })
+    }
+}
+
+fn curation_key_is_active(
+    active_key: Option<&CurationLifecycleKey>,
+    completed_key: &CurationLifecycleKey,
+) -> bool {
+    active_key.is_some_and(|active_key| active_key == completed_key)
 }
 
 fn shortcut_action(key: &str) -> Option<CurationAction> {
@@ -2350,6 +2436,18 @@ mod tests {
         state
     }
 
+    #[test]
+    fn inactive_curation_receipt_is_not_active_for_tag_page_invalidation() {
+        let active = key();
+        let inactive = CurationLifecycleKey {
+            source_id: SourceId::from_string("other-source"),
+            lifecycle_generation: active.lifecycle_generation,
+        };
+        assert!(curation_key_is_active(Some(&active), &active));
+        assert!(!curation_key_is_active(Some(&active), &inactive));
+        assert!(!curation_key_is_active(None, &active));
+    }
+
     fn ready_plan(
         state: &CurationState,
         action: CurationAction,
@@ -2441,6 +2539,28 @@ mod tests {
                 (PathBuf::from("second.wav"), String::from("warm")),
             ]
         );
+    }
+
+    #[test]
+    fn existing_tag_plan_emits_positive_id_without_label_identity() {
+        let path = PathBuf::from("kick.wav");
+        let state = install(&[entry("kick.wav", 0, false, 0)]);
+        let plan = match state.plan_remove_tag_id(&key(), 41, std::slice::from_ref(&path)) {
+            CurationPlan::Ready(plan) => plan,
+            CurationPlan::NoChange { .. } => panic!("expected an existing-tag removal"),
+            CurationPlan::Rejected(error) => panic!("unexpected rejection: {error}"),
+        };
+        assert_eq!(plan.batches.len(), 1);
+        assert_eq!(plan.batches[0].len(), 1);
+        assert!(matches!(
+            &plan.batches[0][0],
+            SourceCurationUpdate::RemoveExistingTag { path: actual, tag_id }
+                if actual.as_path() == path.as_path() && *tag_id == 41
+        ));
+        assert!(matches!(
+            state.plan_remove_tag_id(&key(), 0, std::slice::from_ref(&path)),
+            CurationPlan::Rejected(message) if message.contains("positive")
+        ));
     }
 
     #[test]

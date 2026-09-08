@@ -11,7 +11,7 @@ use wavecrate_core::PlaybackHistoryEntry;
 
 use super::transport::{PlaybackIntent, PlaybackIntentOrigin};
 use super::waveform::WaveformPlayRegion;
-use super::{Browser, SelectionOrigin, SourceSession};
+use super::{Browser, SelectionOrigin, SourceSession, tag_chips};
 
 /// Direction used by the browser's playback history shortcuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +265,8 @@ impl Browser {
             session.folder_scope = folder_scope;
             session.selected_audio_id = None;
         }
+        tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         if switching_source || self.catalog_activation.is_none() {
             // History already owns the accepted replay request. Preserve its transport while
             // handing the newly active source to the catalog; a catalog failure keeps this

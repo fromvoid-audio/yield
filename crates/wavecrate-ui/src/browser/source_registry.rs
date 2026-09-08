@@ -212,7 +212,9 @@ fn log_shutdown_curation_failures(service: &SourceRegistryService) {
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::{Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tags};
+use super::{
+    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips, tags,
+};
 use gpui::Context;
 
 impl Browser {
@@ -260,6 +262,7 @@ impl Browser {
             changed |= self.apply_catalog_event(event, cx);
         }
         changed |= tags::poll(self, cx);
+        changed |= tag_chips::poll(self, cx);
         changed |= self.retry_catalog_commands(cx);
         if changed {
             cx.notify();
@@ -269,6 +272,7 @@ impl Browser {
             || !self.source_registry_pending_removes.is_empty()
             || catalog_events_capped
             || tags::has_pending(self)
+            || tag_chips::has_pending(self)
             || catalog::catalog_poll_needed(self)
     }
 
@@ -571,6 +575,7 @@ impl Browser {
 
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
         tags::cancel_for_source_change(self);
+        tag_chips::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.stop_playback();

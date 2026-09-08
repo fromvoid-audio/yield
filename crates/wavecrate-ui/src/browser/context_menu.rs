@@ -243,6 +243,8 @@ impl Browser {
             actions,
             selected_action: 0,
         });
+        super::tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         window.focus(&self.focus_handle);
         cx.stop_propagation();
         cx.notify();
@@ -251,6 +253,8 @@ impl Browser {
     /// Dismiss the menu while retaining the passive row focus until normal browser navigation.
     pub(super) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if dismiss_menu_state(&mut self.context_menu) {
+            super::tag_chips::invalidate(self);
+            self.start_source_registry_poll(cx);
             cx.notify();
         }
     }
@@ -332,6 +336,8 @@ impl Browser {
     fn invalidate_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
             self.clear_browser_focus_override();
+            super::tag_chips::invalidate(self);
+            self.start_source_registry_poll(cx);
             self.playback_status = String::from(STALE_CONTEXT_MESSAGE);
             cx.notify();
         }
@@ -347,6 +353,7 @@ pub(super) fn invalidate_if_stale(browser: &mut Browser) {
     {
         browser.context_menu = None;
         browser.clear_browser_focus_override();
+        super::tag_chips::invalidate(browser);
         browser.playback_status = String::from(STALE_CONTEXT_MESSAGE);
     }
 }

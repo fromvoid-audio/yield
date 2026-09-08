@@ -617,8 +617,8 @@ pub struct SourceTagPageEntry {
     /// True when either returned label is a bounded preview of legacy data.
     ///
     /// Preview text is for display only and cannot be submitted as a tag identity through the
-    /// current label-based mutation API. Callers must retain [`Self::id`] for a future id-based
-    /// mutation.
+    /// label-based mutation API. Callers must retain [`Self::id`] and the page source/revision
+    /// when submitting an identity-based assignment or removal.
     pub is_preview: bool,
 }
 

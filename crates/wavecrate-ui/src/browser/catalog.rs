@@ -141,6 +141,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         super::tags::cancel_for_source_change(self);
+        super::tag_chips::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         let Some((source_id, root, label)) = self
@@ -282,6 +283,7 @@ impl Browser {
 
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
+        super::tag_chips::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
         if let Some(activation) = activation {
@@ -360,6 +362,7 @@ impl Browser {
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
+                super::tag_chips::cancel_for_source_change(self);
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
                 self.curation_state.prune_completed_except(None);
@@ -428,12 +431,14 @@ impl Browser {
         let Some(activation) = self.catalog_activation.clone() else {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
+            super::tag_chips::cancel_for_source_change(self);
             self.reset_catalog_metadata();
             self.curation_state.prune_completed_except(None);
             return true;
         };
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
+        super::tag_chips::cancel_for_source_change(self);
         self.cancel_catalog_projection();
         self.reset_catalog_metadata();
         self.curation_state.prune_completed_except(None);
@@ -458,7 +463,8 @@ impl Browser {
         if matches!(
             &event,
             CatalogEvent::TagPageReady { .. } | CatalogEvent::TagPageFailed { .. }
-        ) && super::tags::apply_catalog_event(self, &event, cx)
+        ) && (super::tags::apply_catalog_event(self, &event, cx)
+            || super::tag_chips::apply_catalog_event(self, &event))
         {
             return true;
         }
@@ -470,6 +476,7 @@ impl Browser {
         }
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
+                super::tag_chips::cancel_for_source_change(self);
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
@@ -517,6 +524,7 @@ impl Browser {
             | CatalogEvent::TagPageReady { .. }
             | CatalogEvent::TagPageFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
+                super::tag_chips::cancel_for_source_change(self);
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
@@ -530,7 +538,10 @@ impl Browser {
                 }
                 true
             }
-            CatalogEvent::Removed { .. } => false,
+            CatalogEvent::Removed { .. } => {
+                super::tag_chips::cancel_for_source_change(self);
+                false
+            }
             CatalogEvent::Closed => false,
         }
     }
@@ -543,6 +554,7 @@ impl Browser {
         let lifecycle_generation = activation.lifecycle_generation;
         let force_reload = activation.force_reload;
         let root = activation.root.clone();
+        super::tag_chips::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -694,6 +706,8 @@ impl Browser {
         );
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
+        super::tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
         if let Some(activation) = self.catalog_activation.as_mut()
             && apply_force_reload
         {

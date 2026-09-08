@@ -13,6 +13,7 @@ use crate::theme::{color, transparent};
 use super::Browser;
 use super::curation;
 use super::motion::{self, MotionFrame};
+use super::tag_chips;
 use super::tags;
 
 fn hover_rail(group: String, theme: &Theme) -> impl gpui::IntoElement {
@@ -532,6 +533,7 @@ pub(super) fn render(
         ))
         .child(curation::render_rating_filters(browser, theme.clone(), cx))
         .child(tags::render(browser, theme.clone(), cx))
+        .child(tag_chips::render(browser, theme.clone(), cx))
         .child(
             div()
                 .flex_none()
