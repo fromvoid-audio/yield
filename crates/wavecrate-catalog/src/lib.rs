@@ -2122,9 +2122,29 @@ mod tests {
                 .expect("staging rows");
         }
 
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        admission.lock().expect("admission lock").sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: None,
+            },
+        );
+        let predicate_admission = Arc::clone(&admission);
+        let predicate_source_id = source_id.clone();
         let checks = AtomicUsize::new(0);
         let result = maintain_catalog_database(&database, &fixture.guard, None, || {
-            checks.fetch_add(1, Ordering::SeqCst) >= 2
+            if checks.fetch_add(1, Ordering::SeqCst) == 2 {
+                predicate_admission
+                    .lock()
+                    .expect("admission lock")
+                    .sources
+                    .get_mut(&predicate_source_id)
+                    .expect("registered source")
+                    .active = false;
+            }
+            !publication_is_current(&predicate_admission, &predicate_source_id, 1, None)
         });
         assert!(matches!(result, Err(CatalogError::Canceled)));
         assert_eq!(checks.load(Ordering::SeqCst), 3);
