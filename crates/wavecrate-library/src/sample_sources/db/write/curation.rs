@@ -18,6 +18,13 @@ pub const SOURCE_CURATION_BATCH_LIMIT: usize = 128;
 /// One bounded source-local curation update addressed by a validated root-relative path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceCurationUpdate {
+    /// Record or clear playback history for one live source member.
+    SetLastPlayedAt {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+        /// Epoch seconds of the accepted playback, or `None` to clear history.
+        played_at: Option<i64>,
+    },
     /// Set the keep/trash rating for one live source member.
     SetRating {
         /// Source-relative file locator.
@@ -51,7 +58,8 @@ pub enum SourceCurationUpdate {
 impl SourceCurationUpdate {
     fn path(&self) -> &RootRelativePath {
         match self {
-            Self::SetRating { path, .. }
+            Self::SetLastPlayedAt { path, .. }
+            | Self::SetRating { path, .. }
             | Self::SetLocked { path, .. }
             | Self::AddCollection { path, .. }
             | Self::RemoveCollection { path, .. } => path,
@@ -128,6 +136,10 @@ impl SourceDatabase {
 
         for update in updates {
             match update {
+                SourceCurationUpdate::SetLastPlayedAt { path, played_at } => match played_at {
+                    Some(value) => batch.set_last_played_at(path.as_path(), *value)?,
+                    None => batch.clear_last_played_at(path.as_path())?,
+                },
                 SourceCurationUpdate::SetRating { path, rating } => {
                     batch.set_tag(path.as_path(), *rating)?;
                 }

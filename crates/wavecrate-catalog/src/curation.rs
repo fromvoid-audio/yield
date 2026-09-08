@@ -40,6 +40,14 @@ pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 // bookkeeping while the input batches and aggregate receipt coexist in the worker.
 const ESTIMATED_RECEIPT_ROW_BYTES: usize = 256;
 const ESTIMATED_OPERATION_BATCH_BYTES: usize = 64;
+// Path payloads are accounted separately; collection membership is the only other variable
+// row payload and has six fixed slots. Keep scalar command additions within the row allowance.
+const _: () = assert!(
+    std::mem::size_of::<SourceCurationUpdate>()
+        + std::mem::size_of::<BrowserFileMetadata>()
+        + SampleCollection::COUNT * std::mem::size_of::<SampleCollection>()
+        <= ESTIMATED_RECEIPT_ROW_BYTES
+);
 
 /// Revision fence for a compound curation operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,7 +384,8 @@ fn validate_update(update: &SourceCurationUpdate) -> Result<(), CatalogCurationR
 
 fn update_path(update: &SourceCurationUpdate) -> &Path {
     match update {
-        SourceCurationUpdate::SetRating { path, .. }
+        SourceCurationUpdate::SetLastPlayedAt { path, .. }
+        | SourceCurationUpdate::SetRating { path, .. }
         | SourceCurationUpdate::SetLocked { path, .. }
         | SourceCurationUpdate::AddCollection { path, .. }
         | SourceCurationUpdate::RemoveCollection { path, .. } => path.as_path(),

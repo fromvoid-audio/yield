@@ -1014,3 +1014,18 @@ formatting, and diff checks passed. Tests cover K3/K4, unavailable metadata,
 combined scopes, selection restoration, and edited rows leaving and rejoining a
 filter with correct collection counts. Native visual acceptance remains pending;
 open user/QA applications were not replaced or operated for this slice.
+
+### Playback timestamp metadata continuity prerequisite
+
+The bounded source metadata transaction now accepts SetLastPlayedAt, including
+explicit clearing. It uses the existing transaction batch setters and retains
+profile/root/live-member/revision validation, directory/audit continuity, and exact
+committed receipts. Playback-history updates preserve rating, lock, collections,
+and curation timestamps. No schema or UI-trigger behavior changed.
+
+Nine library curation tests and sixteen catalog curation tests passed; the updated
+history-then-rating successor case passed again after its assertions were
+strengthened. Catalog compilation verifies a static bound covering the command,
+receipt row, and fixed collection storage within the existing row allowance.
+Playback admission/debounce and shutdown integration remain separate work; this
+backend API alone does not yet record audition history automatically.

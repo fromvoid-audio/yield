@@ -131,6 +131,64 @@ fn continuity_state(database: &SourceDatabase) -> (u64, SourceDirectoryTruthStat
 }
 
 #[test]
+fn playback_history_commits_preserve_curation_and_reject_stale_writers() {
+    let mut fixture = CurationFixture::new();
+    let initial = fixture
+        .commit(&[
+            SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("one.wav"),
+                rating: Rating::KEEP_3,
+            },
+            SourceCurationUpdate::SetLocked {
+                path: CurationFixture::path("one.wav"),
+                locked: true,
+            },
+            SourceCurationUpdate::AddCollection {
+                path: CurationFixture::path("one.wav"),
+                collection: SampleCollection::new(2).unwrap(),
+            },
+        ])
+        .unwrap();
+    fixture.revision = initial.source_revision();
+    let mut expected = initial.files()[0].clone();
+    let update = SourceCurationUpdate::SetLastPlayedAt {
+        path: CurationFixture::path("one.wav"),
+        played_at: Some(1_800_000_000),
+    };
+    let receipt = fixture.commit(&[update]).unwrap();
+    expected.last_played_at = Some(1_800_000_000);
+    assert_eq!(receipt.files(), &[expected.clone()]);
+    assert_eq!(receipt.source_revision(), fixture.revision + 1);
+    assert_eq!(
+        receipt.directory_generation(),
+        initial.directory_generation()
+    );
+    assert_eq!(receipt.root_identity(), initial.root_identity());
+    let continuity = continuity_state(&fixture.database);
+    assert_eq!(continuity.0, receipt.source_revision());
+
+    let clear = SourceCurationUpdate::SetLastPlayedAt {
+        path: CurationFixture::path("one.wav"),
+        played_at: None,
+    };
+    assert!(fixture.commit(std::slice::from_ref(&clear)).is_err());
+    assert_eq!(continuity_state(&fixture.database), continuity);
+    let snapshot = fixture.database.browser_metadata_snapshot().unwrap();
+    assert_eq!(snapshot.revision, receipt.source_revision());
+    assert_eq!(snapshot.files[0], expected);
+
+    fixture.revision = receipt.source_revision();
+    let cleared = fixture.commit(&[clear]).unwrap();
+    expected.last_played_at = None;
+    assert_eq!(cleared.files(), &[expected]);
+    assert_eq!(cleared.source_revision(), fixture.revision + 1);
+    assert_eq!(
+        continuity_state(&fixture.database).0,
+        cleared.source_revision()
+    );
+}
+
+#[test]
 fn valid_curation_commit_preserves_continuity_and_returns_bounded_rows() {
     let fixture = CurationFixture::new();
     let paths_revision = metadata_number(&fixture.database, "wav_paths_revision_v1");

@@ -4145,11 +4145,15 @@ mod tests {
                 800,
                 SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
                 vec![
-                    vec![SourceCurationUpdate::SetRating {
+                    vec![SourceCurationUpdate::SetLastPlayedAt {
                         path: path.clone(),
-                        rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                        played_at: Some(1_800_000_000),
                     }],
                     vec![
+                        SourceCurationUpdate::SetRating {
+                            path: path.clone(),
+                            rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                        },
                         SourceCurationUpdate::SetLocked {
                             path: path.clone(),
                             locked: true,
@@ -4198,11 +4202,18 @@ mod tests {
                 &snapshot.root_identity,
                 801,
                 SourceCurationOperationFence::AfterOperation { request_id: 800 },
-                vec![vec![SourceCurationUpdate::RemoveCollection {
-                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
-                        .expect("relative curation path"),
-                    collection,
-                }]],
+                vec![vec![
+                    SourceCurationUpdate::RemoveCollection {
+                        path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                            .expect("relative curation path"),
+                        collection,
+                    },
+                    SourceCurationUpdate::SetRating {
+                        path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                            .expect("relative curation path"),
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                    },
+                ]],
             ))
             .expect("successor curation admission");
         let event = receive_until(&service, |event| {
@@ -4228,6 +4239,14 @@ mod tests {
         );
         assert_eq!(outcome.committed_batches().len(), 1);
         assert!(outcome.committed_batches()[0].files()[0].locked);
+        assert_eq!(
+            outcome.committed_batches()[0].files()[0].rating,
+            wavecrate_library::sample_sources::Rating::KEEP_3
+        );
+        assert_eq!(
+            outcome.committed_batches()[0].files()[0].last_played_at,
+            Some(1_800_000_000)
+        );
         assert!(
             outcome.committed_batches()[0].files()[0]
                 .collections
