@@ -9,6 +9,7 @@ members = [
     "crates/wavecrate-analysis",
     "crates/wavecrate-library",
     "crates/wavecrate-source-watcher",
+    "crates/wavecrate-platform",
     "crates/wavecrate-catalog",
     "crates/wavecrate-session",
     "crates/wavecrate-scan",
@@ -41,6 +42,11 @@ wavecrate-design = { path = "crates/wavecrate-design" }
 wavecrate-ui = { path = "crates/wavecrate-ui" }
 wavecrate-session = { path = "crates/wavecrate-session" }
 wavecrate-source-watcher = { path = "crates/wavecrate-source-watcher" }
+wavecrate-platform = { path = "crates/wavecrate-platform" }
+raw-window-handle = "=0.6.2"
+objc2 = { version = "=0.6.4", default-features = false }
+objc2-app-kit = { version = "=0.3.2", default-features = false }
+objc2-foundation = { version = "=0.3.2", default-features = false }
 tempfile = "3.23.0"
 
 # Keep GPUI layout/tessellation and audio decoding optimized in development.

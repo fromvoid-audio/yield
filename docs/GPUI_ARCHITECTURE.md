@@ -22,6 +22,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
 | `wavecrate-catalog` | Bounded authoritative source audits, safe WAV display metadata, and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
 | `wavecrate-source-watcher` | Native root/parent watch handles, lexical event classification, and one coalesced lifecycle-fenced hint | Scanning, database access, UI publication, or audit scheduling |
+| `wavecrate-platform` | Bounded native file-drag admission and retained AppKit session lifetime | File discovery, source mutation, GPUI entities, or browser selection |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
 | `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
@@ -51,6 +52,16 @@ GPUI is a UI dependency. Core projections operate on supplied data and use pure
 path identities; canonicalization happens once during background scanning.
 Filtering and sorting must not probe the filesystem. UI selection follows
 sample identity, not the position of a row in the filtered list.
+
+The platform drag foundation accepts a borrowed window handle and prepared
+absolute paths. It requires the AppKit main thread, an originating-window mouse
+event, and a currently held primary button. Native objects remain retained until
+the session's completion callback; notification receivers do not own that lifetime.
+The adapter performs no source-file probing or mutation. Browser integration is
+still pending, and non-macOS targets currently return an unsupported-platform error.
+The foundation passed nine tests, strict all-target Clippy, and macOS/Linux-target
+checks. Independent review found a stale mouse-event admission issue, corrected by
+the current-button guard. Native drag execution has not yet been exercised.
 
 `PlaybackNavigationHistory` owns a bounded sequence of file paths and normalized
 audition spans in the core crate. The browser records newly accepted playback

@@ -7117,6 +7117,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wavecrate-platform"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "raw-window-handle",
+]
+
+[[package]]
 name = "wavecrate-scan"
 version = "0.19.1"
 dependencies = [
