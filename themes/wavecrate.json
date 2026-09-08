@@ -61,10 +61,12 @@
     "border_width": 1.0,
     "selected_marker_width": 2.0,
     "rating_column_width": 56.0,
+    "playback_type_column_width": 76.0,
     "collection_column_width": 72.0,
     "extension_column_width": 64.0,
     "size_column_width": 88.0,
     "duration_column_width": 88.0,
+    "last_played_column_width": 112.0,
     "waveform_bar_gap": 1.0,
     "waveform_min_bar_height": 3.0
   },

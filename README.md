@@ -16,7 +16,9 @@ separate crates with defined ownership:
 | `wavecrate-design` | Validated semantic theme schema and canonical design tokens |
 | `wavecrate-ui` | GPUI views, input components, UI and transport coordination |
 | `reson` | Existing audio engine |
-| `wavecrate-library` | Existing persistence and source-ownership primitives |
+| `wavecrate-library` | Persistence and source-ownership primitives |
+| `wavecrate-catalog` | Audited source projections and bounded metadata operations |
+| `wavecrate-session` | Profile, source registry, preferences, and catalog lifecycle |
 | `wavecrate-scan` | Existing persistent scanner |
 | `wavecrate-analysis` | Existing decoding and analysis |
 
@@ -29,7 +31,8 @@ palette and compact layout. Theme tokens are defined independently in
 `wavecrate-design`; the complete schema and a copyable default document are in
 [themes/wavecrate.json](themes/wavecrate.json). Open the gear settings control
 to import, reload, or reset a theme while the app is running. The same panel
-toggles animations for this session. Row hover rails remain immediate; loading
+persists animation preferences alongside theme choice, audition controls, volume,
+and audio-output settings. Row hover rails remain immediate; loading
 indicators animate only during pending work and remain static when disabled.
 Focus rails fade independently of selection, and clipped lists show directional
 scroll-edge fades. Disabling animation keeps focus feedback visible and updates
@@ -57,32 +60,41 @@ recompiles those crates; subsequent edits reuse the optimized dependencies.
 
 ## Current behavior
 
-Add one or more source folders from the Sources sidebar or toolbar, switch or
-forget them for the current session, expand the relative folder tree, and choose
-direct-only or descendant scope. Refresh keeps valid folder, search, sort, and
-sample focus state; an unavailable source reports the failed refresh and leaves
-its last successful session view available for retry. Search filenames with
-Cmd/Ctrl+F and sort by name, size, or extension. Select a row with the pointer
-or Up/Down; Space plays/stops and Escape stops playback. While searching, Space
-enters text and Escape returns browser focus. Filtering and sorting preserve the
-focused sample when it remains visible.
+Source folders and preferences persist in the isolated GPUI profile. Add, switch,
+or forget sources from the sidebar, expand the relative folder tree, and choose
+direct-only or descendant scope. Refresh preserves valid navigation state; an
+unavailable source keeps its last successful view available for retry.
 
+Search filenames with Cmd/Ctrl+F. Sort by name, rating, Type, collection, extension,
+size, or Last Played. Type and Last Played columns appear when the window has
+room. Collection, rating, and TYPE filters intersect the folder and name scope.
+TYPE recognizes Loop and 1-Shot tags; clearing both chips disables that filter.
+
+Select a row with the pointer or Up/Down; Space plays/stops and Escape stops
+playback. While searching, Space enters text and Escape returns browser focus.
 Shift-click or Shift+Up/Down selects a range. Cmd/Ctrl-click toggles a row;
 Cmd/Ctrl+Shift adds a range. Cmd/Ctrl+A selects visible files while the browser
 has focus, and X toggles the focused file. Plain arrows move preview focus while
-preserving a batch selection; a plain click starts fresh. The status bar shows
-the explicit selected count.
+preserving a batch selection; a plain click starts fresh.
 
-Audition and waveform previews currently support WAV. Other recognized audio
-formats are listed. WAV waveforms cover the full file using cancellable,
-bounded-memory streaming and show the playback cursor during audition.
-The application does not persist library state or modify
-sample files.
+Plain [ and ] adjust ratings for the explicit selection or focused file. Keys
+1–6 toggle collection membership. These edits use bounded catalog operations and
+persist across source changes and application shutdown. The sample context menu
+provides reveal, path copying, conditional unlock, and collection removal.
+Accepted audition requests update Last Played through the same metadata lane.
 
-See the [parity register](docs/GPUI_MIGRATION.md) for remaining workflows and
-validation evidence. Editing, persistent curation, recovery,
-waveform zoom/edit gestures, and DAW handoff remain outstanding. Inherited release
-workflows are disabled.
+The normal browser, audition, and waveform previews support WAV files. Waveforms
+cover the full file with cancellable, bounded-memory decoding, zoom and pan,
+play-region selection, and a playback cursor. Play regions can be moved, resized,
+or shifted with the keyboard. Playback navigation history, native file clipboard
+handoff, and Finder reveal are available. Loop changes currently apply to the
+next play; automatic tag-driven transport policy is still being integrated.
+
+Full parity is not complete. Remaining workflows include tag editing and naming,
+physical file operations and recovery, waveform editing/export, analysis and
+timing controls, external drag, and additional settings and platform acceptance.
+See the [parity register](docs/GPUI_MIGRATION.md) for detailed validation evidence
+and outstanding work. Inherited release workflows are disabled.
 
 ## Validate
 
