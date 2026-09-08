@@ -82,6 +82,12 @@ persist across source changes and application shutdown. The sample context menu
 provides reveal, path copying, conditional unlock, and collection removal.
 Accepted audition requests update Last Played through the same metadata lane.
 
+Use ADD TAG for the selection or focused file. Enter submits typed tags; a single
+new tag opens a category chooser with Up/Down, Enter, and Escape controls. Multiple
+comma-separated tags can be added together. Selected-tag chips show All or Mixed
+membership, and their × control removes that assignment from the selection.
+Larger tag unions have paging controls. Chips update after metadata is saved.
+
 The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,
 play-region selection, and a playback cursor. Play regions can be moved, resized,
@@ -91,9 +97,10 @@ with runtime identity checks and retain the accepted audition span. Loop and
 one-shot tags select the next-play mode automatically; a manual choice remains
 in effect for the loaded file.
 
-Full parity is not complete. Remaining workflows include tag editing and naming,
-physical file operations and recovery, waveform editing/export, analysis and
-timing controls, external drag, and additional settings and platform acceptance.
+Full parity is not complete. Remaining workflows include tag completion, filtering,
+vocabulary management and naming, physical file operations and recovery, waveform
+editing/export, analysis and timing controls, external drag, and additional settings
+and platform acceptance.
 See the [parity register](docs/GPUI_MIGRATION.md) for detailed validation evidence
 and outstanding work. Inherited release workflows are disabled.
 
