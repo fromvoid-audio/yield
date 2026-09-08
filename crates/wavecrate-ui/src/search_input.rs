@@ -271,16 +271,7 @@ impl SearchInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        offset_from_utf16(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -371,6 +362,7 @@ impl EntityInputHandler for SearchInput {
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selection_reversed = false;
         self.marked_range = None;
         cx.emit(SearchChanged);
         cx.notify();
@@ -394,11 +386,9 @@ impl EntityInputHandler for SearchInput {
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|new_range| self.range_from_utf16(new_range))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range =
+            marked_selection_range(range.start, new_text, new_selected_range_utf16.as_ref());
+        self.selection_reversed = false;
         cx.emit(SearchChanged);
         cx.notify();
     }
@@ -639,5 +629,52 @@ impl Render for SearchInput {
 impl Focusable for SearchInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+fn offset_from_utf16(text: &str, offset: usize) -> usize {
+    let mut utf8_offset = 0;
+    let mut utf16_count = 0;
+    for ch in text.chars() {
+        if utf16_count >= offset {
+            break;
+        }
+        utf16_count += ch.len_utf16();
+        utf8_offset += ch.len_utf8();
+    }
+    utf8_offset
+}
+
+// AppKit's selection is relative to the inserted marked text, not the document or
+// the replaced range. Convert against that text before applying its document offset.
+fn marked_selection_range(
+    insertion_start: usize,
+    text: &str,
+    selection_utf16: Option<&Range<usize>>,
+) -> Range<usize> {
+    let Some(selection) = selection_utf16 else {
+        let end = insertion_start + text.len();
+        return end..end;
+    };
+    let start = offset_from_utf16(text, selection.start);
+    let end = offset_from_utf16(text, selection.end).max(start);
+    insertion_start + start..insertion_start + end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::marked_selection_range;
+
+    #[test]
+    fn composition_selection_uses_inserted_utf16_text_at_nonzero_offset() {
+        assert_eq!(marked_selection_range(7, "é😀a", Some(&(1..3))), 9..13);
+        assert_eq!(marked_selection_range(7, "é😀a", Some(&(3..3))), 13..13);
+    }
+
+    #[test]
+    fn composition_selection_stays_within_replacement_text() {
+        assert_eq!(marked_selection_range(4, "a", Some(&(0..99))), 4..5);
+        assert_eq!(marked_selection_range(4, "a", None), 5..5);
+        assert_eq!(marked_selection_range(4, "", Some(&(0..0))), 4..4);
     }
 }

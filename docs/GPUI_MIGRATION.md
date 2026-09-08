@@ -1260,3 +1260,9 @@ failure rejects the entire submission. Trailing punctuation does not reject an
 otherwise valid label at the size boundary. All 86 core tests passed, including
 seven parser behavior and boundary tests; core compilation and formatting passed.
 The parser is a prerequisite for the tag editor, not a claim of completed tag UI.
+
+The shared text field now converts IME selection ranges relative to the inserted
+composition text before offsetting into the document. This corrects nonzero-prefix
+and multibyte replacements, clamps selection to the inserted text, and clears
+stale reversed-selection state after replacement. Two focused regression tests
+passed with the UI test binary compiled; formatting and diff checks passed.
