@@ -1607,3 +1607,7 @@ WAV files and observed automatic authoritative snapshots at revisions 2, 4, and 
 without explicit refresh commands after the initial audit. Its backend sources
 were byte-compared with the committed candidate. This validates native event to
 catalog convergence; visual/audible app acceptance remains separate.
+
+`Wavecrate Watcher Preview f334852.app` was built from the clean watcher acceptance
+checkout at `f33485214`, packaged under `target/qa`, and passed strict ad-hoc
+signature verification. The agent did not launch it or modify existing previews.
