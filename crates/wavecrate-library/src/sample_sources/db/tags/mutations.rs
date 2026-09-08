@@ -80,10 +80,59 @@ impl<'conn> SourceWriteBatch<'conn> {
             .map_err(map_sql_error)?
             .query_row([normalized_text], |row| row.get::<_, i64>(0))
             .map_err(map_sql_error)?;
-        if playback_type_for_tag_id(&self.tx, tag_id)?.is_some() {
-            remove_other_playback_type_tags(&self.tx, &path, tag_id)?;
+        self.assign_resolved_tag_for_curation(relative_path, &path, tag_id)
+    }
+
+    /// Assign one existing source-local tag identity for a curation transaction.
+    pub(crate) fn assign_existing_tag_for_curation(
+        &mut self,
+        relative_path: &Path,
+        tag_id: i64,
+    ) -> Result<(), SourceDbError> {
+        validate_tag_id(tag_id)?;
+        let path = normalize_relative_path(relative_path)?;
+        ensure_wav_path_exists(&self.tx, &path)?;
+        self.assign_resolved_tag_for_curation(relative_path, &path, tag_id)
+    }
+
+    /// Remove one existing source-local tag identity for a curation transaction.
+    pub(crate) fn remove_existing_tag_for_curation(
+        &mut self,
+        relative_path: &Path,
+        tag_id: i64,
+    ) -> Result<bool, SourceDbError> {
+        validate_tag_id(tag_id)?;
+        let path = normalize_relative_path(relative_path)?;
+        ensure_wav_path_exists(&self.tx, &path)?;
+        // Resolve existence through a scalar classification query. This never materializes the
+        // potentially unbounded legacy display label for an ID-addressed mutation.
+        let _ = playback_type_for_tag_id(&self.tx, tag_id)?;
+        let removed = self
+            .tx
+            .prepare_cached(
+                "DELETE FROM wav_file_tags
+                 WHERE path = ?1 AND tag_id = ?2",
+            )
+            .map_err(map_sql_error)?
+            .execute(params![path, tag_id])
+            .map_err(map_sql_error)?
+            > 0;
+        if removed {
+            self.touch_last_curated_at(relative_path)?;
         }
-        self.assign_resolved_tag(relative_path, &path, tag_id)
+        Ok(removed)
+    }
+
+    fn assign_resolved_tag_for_curation(
+        &mut self,
+        relative_path: &Path,
+        normalized_path: &str,
+        tag_id: i64,
+    ) -> Result<(), SourceDbError> {
+        if playback_type_for_tag_id(&self.tx, tag_id)?.is_some() {
+            remove_other_playback_type_tags(&self.tx, normalized_path, tag_id)?;
+        }
+        self.assign_resolved_tag(relative_path, normalized_path, tag_id)
     }
 
     fn assign_resolved_tag(
@@ -227,6 +276,7 @@ fn playback_type_for_tag_id(
     tx: &Transaction<'_>,
     tag_id: i64,
 ) -> Result<Option<i64>, SourceDbError> {
+    validate_tag_id(tag_id)?;
     let sql = format!(
         "SELECT ({classification}) FROM source_tags AS st WHERE st.id = ?1",
         classification = PLAYBACK_TYPE_CLASSIFICATION,
@@ -234,7 +284,9 @@ fn playback_type_for_tag_id(
     tx.prepare_cached(&sql)
         .map_err(map_sql_error)?
         .query_row([tag_id], |row| row.get::<_, Option<i64>>(0))
-        .map_err(map_sql_error)
+        .optional()
+        .map_err(map_sql_error)?
+        .ok_or(SourceDbError::TagIdNotFound { tag_id })
 }
 
 fn remove_other_playback_type_tags(
@@ -276,6 +328,14 @@ fn ensure_wav_path_exists(tx: &Transaction<'_>, path: &str) -> Result<(), Source
         return Ok(());
     }
     Err(SourceDbError::Unexpected)
+}
+
+fn validate_tag_id(tag_id: i64) -> Result<(), SourceDbError> {
+    if tag_id > 0 {
+        Ok(())
+    } else {
+        Err(SourceDbError::InvalidTagId { tag_id })
+    }
 }
 
 fn record_tag_db_event(

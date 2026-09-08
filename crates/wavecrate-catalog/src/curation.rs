@@ -45,6 +45,7 @@ pub const MAX_CURATION_TAG_LABEL_BYTES: usize =
 // label bytes are accounted separately from this fixed allowance.
 const ESTIMATED_RECEIPT_ROW_BYTES: usize = 256;
 const ESTIMATED_OPERATION_BATCH_BYTES: usize = 64;
+const ESTIMATED_EXISTING_TAG_ID_BYTES: usize = std::mem::size_of::<i64>();
 // Path payloads and tag labels are accounted separately; tag labels remain in input updates while
 // collection membership is the only variable receipt-row payload and has six fixed slots. Keep
 // scalar command additions within the row allowance.
@@ -188,6 +189,12 @@ pub enum CatalogCurationRequestError {
         /// Rejected raw collection value.
         value: u8,
     },
+    /// A source-local tag row identifier was not positive.
+    #[error("curation request contains invalid source tag id {tag_id}")]
+    InvalidTagId {
+        /// Rejected source-local tag row identifier.
+        tag_id: i64,
+    },
     /// A curation tag label was empty or contained only whitespace.
     #[error("curation request contains an empty tag label")]
     EmptyTagLabel,
@@ -325,6 +332,7 @@ fn validate_operation(
     let mut total_updates = 0usize;
     let mut path_bytes = 0usize;
     let mut label_bytes = 0usize;
+    let mut existing_tag_id_bytes = 0usize;
     for batch in batches {
         if batch.is_empty() {
             return Err(CatalogCurationRequestError::Empty);
@@ -340,6 +348,8 @@ fn validate_operation(
             validate_update(update)?;
             path_bytes = path_bytes.saturating_add(path_byte_len(update_path(update)));
             label_bytes = label_bytes.saturating_add(update_label_byte_len(update));
+            existing_tag_id_bytes =
+                existing_tag_id_bytes.saturating_add(update_existing_tag_id_bytes(update));
         }
     }
     if total_updates > MAX_CURATION_OPERATION_UPDATES {
@@ -360,6 +370,7 @@ fn validate_operation(
         total_updates,
         path_bytes,
         label_bytes,
+        existing_tag_id_bytes,
     );
     if estimated_payload_bytes > MAX_CURATION_OPERATION_RECEIPT_BYTES {
         return Err(CatalogCurationRequestError::OperationPayloadTooLarge {
@@ -401,6 +412,12 @@ fn validate_update(update: &SourceCurationUpdate) -> Result<(), CatalogCurationR
                 value: collection.index(),
             })
         }
+        SourceCurationUpdate::AssignExistingTag { tag_id, .. }
+        | SourceCurationUpdate::RemoveExistingTag { tag_id, .. }
+            if *tag_id <= 0 =>
+        {
+            Err(CatalogCurationRequestError::InvalidTagId { tag_id: *tag_id })
+        }
         SourceCurationUpdate::AddTag { label, .. }
         | SourceCurationUpdate::RemoveTag { label, .. } => validate_tag_label(label),
         _ => Ok(()),
@@ -431,7 +448,9 @@ fn update_path(update: &SourceCurationUpdate) -> &Path {
         | SourceCurationUpdate::AddCollection { path, .. }
         | SourceCurationUpdate::RemoveCollection { path, .. }
         | SourceCurationUpdate::AddTag { path, .. }
-        | SourceCurationUpdate::RemoveTag { path, .. } => path.as_path(),
+        | SourceCurationUpdate::RemoveTag { path, .. }
+        | SourceCurationUpdate::AssignExistingTag { path, .. }
+        | SourceCurationUpdate::RemoveExistingTag { path, .. } => path.as_path(),
     }
 }
 
@@ -439,6 +458,14 @@ fn update_label_byte_len(update: &SourceCurationUpdate) -> usize {
     match update {
         SourceCurationUpdate::AddTag { label, .. }
         | SourceCurationUpdate::RemoveTag { label, .. } => label.len(),
+        _ => 0,
+    }
+}
+
+fn update_existing_tag_id_bytes(update: &SourceCurationUpdate) -> usize {
+    match update {
+        SourceCurationUpdate::AssignExistingTag { .. }
+        | SourceCurationUpdate::RemoveExistingTag { .. } => ESTIMATED_EXISTING_TAG_ID_BYTES,
         _ => 0,
     }
 }
@@ -460,6 +487,7 @@ fn operation_payload_bytes_with_path_bytes(
     update_count: usize,
     path_bytes: usize,
     label_bytes: usize,
+    existing_tag_id_bytes: usize,
 ) -> usize {
     // Account for the caller-owned path spelling and the path retained in each receipt. Root
     // identity bytes are present in the operation and in every bounded receipt. Labels are
@@ -469,6 +497,7 @@ fn operation_payload_bytes_with_path_bytes(
         .saturating_add(root_identity_bytes.saturating_mul(batch_count.saturating_add(1)))
         .saturating_add(update_count.saturating_mul(ESTIMATED_RECEIPT_ROW_BYTES))
         .saturating_add(label_bytes)
+        .saturating_add(existing_tag_id_bytes)
         .saturating_add(batch_count.saturating_mul(ESTIMATED_OPERATION_BATCH_BYTES))
 }
 
@@ -480,11 +509,14 @@ pub(crate) fn operation_payload_bytes(
     let mut update_count = 0usize;
     let mut path_bytes = 0usize;
     let mut label_bytes = 0usize;
+    let mut existing_tag_id_bytes = 0usize;
     for batch in batches {
         update_count = update_count.saturating_add(batch.len());
         for update in batch {
             path_bytes = path_bytes.saturating_add(path_byte_len(update_path(update)));
             label_bytes = label_bytes.saturating_add(update_label_byte_len(update));
+            existing_tag_id_bytes =
+                existing_tag_id_bytes.saturating_add(update_existing_tag_id_bytes(update));
         }
     }
     operation_payload_bytes_with_path_bytes(
@@ -493,6 +525,7 @@ pub(crate) fn operation_payload_bytes(
         update_count,
         path_bytes,
         label_bytes,
+        existing_tag_id_bytes,
     )
 }
 

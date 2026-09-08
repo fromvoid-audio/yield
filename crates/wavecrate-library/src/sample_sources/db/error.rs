@@ -153,6 +153,18 @@ pub enum SourceDbError {
     /// A curation tag label contained an embedded NUL byte.
     #[error("Curation tag label contains an embedded NUL byte")]
     TagLabelContainsNul,
+    /// A source-local tag row identifier was not a positive database identity.
+    #[error("Source tag id {tag_id} is invalid; ids must be positive")]
+    InvalidTagId {
+        /// Invalid source-local tag row identifier.
+        tag_id: i64,
+    },
+    /// A positive source-local tag row identifier did not exist in the dictionary.
+    #[error("Source tag id {tag_id} does not exist")]
+    TagIdNotFound {
+        /// Missing source-local tag row identifier.
+        tag_id: i64,
+    },
     /// A bounded tag-page request contained too many selected paths.
     #[error("Tag page selected {actual} paths; maximum is {max}")]
     TagPageTooManyPaths {

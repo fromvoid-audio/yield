@@ -480,6 +480,18 @@ pub enum CatalogError {
     /// A source revision could not advance because it reached the integer limit.
     #[error("source revision cannot advance beyond {0}")]
     CurationRevisionOverflow(u64),
+    /// A source-local tag row identifier was not positive.
+    #[error("source tag id {tag_id} is invalid; ids must be positive")]
+    InvalidTagId {
+        /// Invalid source-local tag row identifier.
+        tag_id: i64,
+    },
+    /// A positive source-local tag row identifier was absent from the source dictionary.
+    #[error("source tag id {tag_id} does not exist")]
+    TagIdNotFound {
+        /// Missing source-local tag row identifier.
+        tag_id: i64,
+    },
     /// The directory-truth projection is not coherent with the manifest revision.
     #[error("catalog directory truth is unavailable or not revision-coherent: {0}")]
     DirectoryTruthUnavailable(String),
@@ -2840,7 +2852,11 @@ fn emit_tag_page_failure(
 }
 
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
-    CatalogError::Database(error.to_string())
+    match error {
+        SourceDbError::InvalidTagId { tag_id } => CatalogError::InvalidTagId { tag_id },
+        SourceDbError::TagIdNotFound { tag_id } => CatalogError::TagIdNotFound { tag_id },
+        error => CatalogError::Database(error.to_string()),
+    }
 }
 
 fn scan_error(
@@ -4695,6 +4711,23 @@ mod tests {
         let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
             .expect("relative curation path");
 
+        assert!(matches!(
+            service.submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 600,
+                updates: vec![SourceCurationUpdate::AssignExistingTag {
+                    path: path.clone(),
+                    tag_id: 0,
+                }],
+            }),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::InvalidTagId { tag_id: 0 }
+            ))
+        ));
+
         let submit = |label: String| {
             service.submit(CatalogCommand::ApplyCuration {
                 source_id: source_id.clone(),
@@ -4800,6 +4833,110 @@ mod tests {
                 .event_budget,
             baseline_event_budget
         );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_existing_tag_id_commits_bounded_receipt_and_releases_accounting() {
+        let fixture = Fixture::new("catalog-curation-existing-tag-id");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-existing-tag-id");
+        let seeded_database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("seed source database");
+        seeded_database
+            .upsert_file(Path::new("one.wav"), 10, 1)
+            .expect("seed source file");
+        let tag_id = seeded_database
+            .assign_tag_to_path(Path::new("one.wav"), "loop")
+            .expect("seed source tag")
+            .id;
+        drop(seeded_database);
+
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let batches = vec![vec![SourceCurationUpdate::AssignExistingTag {
+            path: path.clone(),
+            tag_id,
+        }]];
+        let expected_payload = curation::operation_payload_bytes(&snapshot.root_identity, &batches);
+        let pause = test_gate.pause_next();
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                605,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                batches,
+            ))
+            .expect("existing tag operation admission");
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(admission.curation_payload_bytes, expected_payload);
+            assert_eq!(admission.curation_update_count, 1);
+        }
+        pause.release();
+
+        let outcome = receive_curation_operation(&service, 605);
+        assert!(outcome.is_success());
+        assert_eq!(outcome.committed_batches().len(), 1);
+        assert_eq!(
+            outcome.committed_batches()[0].files()[0].playback_type,
+            Some(wavecrate_library::sample_sources::SourcePlaybackType::Loop)
+        );
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(admission.curation_payload_bytes, 0);
+            assert_eq!(admission.curation_update_count, 0);
+        }
+
+        let committed_revision = outcome.committed_batches()[0].source_revision();
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 606,
+                updates: vec![SourceCurationUpdate::AssignExistingTag {
+                    path,
+                    tag_id: tag_id + 1,
+                }],
+            })
+            .expect("missing tag operation admission");
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::CurationFailed { request_id: 606, .. }
+                )
+            }),
+            CatalogEvent::CurationFailed {
+                request_id: 606,
+                error: CatalogError::TagIdNotFound { tag_id: actual },
+                ..
+            } if actual == tag_id + 1
+        ));
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id,
+                expected_revision: Some(committed_revision),
+            })
+            .expect("unchanged revision read");
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(event, CatalogEvent::SnapshotReady { .. })
+            }),
+            CatalogEvent::SnapshotReady { snapshot }
+                if snapshot.committed_revision == committed_revision
+        ));
         service.shutdown();
     }
 

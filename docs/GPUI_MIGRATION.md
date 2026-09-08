@@ -1390,3 +1390,20 @@ focused catalog tests passed after final cleanup; publication tests wait for
 command-credit release rather than assuming it precedes event receipt. Formatting
 and diff checks passed. The initialization test also releases its worker gate before
 asserting, so assertion failure can shut down normally.
+
+### Source-local tag identity mutations
+
+Curation now supports assigning/removing existing numeric source tag IDs, with
+positive-ID admission validation and typed missing-ID failures. SQL resolves
+identity and playback classification without loading legacy label strings.
+Assignment retains native playback-type replacement; removal affects only the
+exact file assignment and leaves the source vocabulary intact. Existing source,
+root and revision fences, batch atomicity and durable operation receipts apply.
+Numeric IDs contribute to catalog payload accounting.
+
+All 16 library curation tests and all 51 catalog tests passed, along with library,
+catalog and session compilation, scoped formatting and diff checks. Tests cover
+oversized/NUL legacy labels, playback conflicts, stale/invalid IDs, preserved
+metadata and compound receipt accounting. The primary reviewed the implementation
+diff. The UI must retain source/page identity when wiring chips to these operations;
+shortened display labels are never mutation identities.

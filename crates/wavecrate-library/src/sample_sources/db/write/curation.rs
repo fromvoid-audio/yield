@@ -68,6 +68,20 @@ pub enum SourceCurationUpdate {
         /// Tag label whose normalized identity should be removed.
         label: String,
     },
+    /// Add one existing source-local tag identity to one live source member.
+    AssignExistingTag {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+        /// Positive source-local tag row identifier returned by the source tag catalog.
+        tag_id: i64,
+    },
+    /// Remove one existing source-local tag identity from one live source member.
+    RemoveExistingTag {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+        /// Positive source-local tag row identifier returned by the source tag catalog.
+        tag_id: i64,
+    },
 }
 
 impl SourceCurationUpdate {
@@ -79,7 +93,9 @@ impl SourceCurationUpdate {
             | Self::AddCollection { path, .. }
             | Self::RemoveCollection { path, .. }
             | Self::AddTag { path, .. }
-            | Self::RemoveTag { path, .. } => path,
+            | Self::RemoveTag { path, .. }
+            | Self::AssignExistingTag { path, .. }
+            | Self::RemoveExistingTag { path, .. } => path,
         }
     }
 }
@@ -175,6 +191,12 @@ impl SourceDatabase {
                 SourceCurationUpdate::RemoveTag { path, label } => {
                     batch.remove_tag_from_path(path.as_path(), label)?;
                 }
+                SourceCurationUpdate::AssignExistingTag { path, tag_id } => {
+                    batch.assign_existing_tag_for_curation(path.as_path(), *tag_id)?;
+                }
+                SourceCurationUpdate::RemoveExistingTag { path, tag_id } => {
+                    batch.remove_existing_tag_for_curation(path.as_path(), *tag_id)?;
+                }
             }
         }
 
@@ -268,6 +290,12 @@ fn validate_update_values(updates: &[SourceCurationUpdate]) -> Result<(), Source
             SourceCurationUpdate::AddTag { label, .. }
             | SourceCurationUpdate::RemoveTag { label, .. } => {
                 validate_curation_tag_label(label)?;
+            }
+            SourceCurationUpdate::AssignExistingTag { tag_id, .. }
+            | SourceCurationUpdate::RemoveExistingTag { tag_id, .. } => {
+                if *tag_id <= 0 {
+                    return Err(SourceDbError::InvalidTagId { tag_id: *tag_id });
+                }
             }
             _ => {}
         }

@@ -824,3 +824,208 @@ fn curation_tag_assignment_resolves_identity_without_decoding_legacy_display_tex
     assert_eq!(stored_length, legacy_display.len());
     assert_eq!(assignments, 1);
 }
+
+#[test]
+fn curation_existing_tag_ids_preserve_legacy_and_unrelated_assignments() {
+    let mut fixture = CurationFixture::new();
+    let one = Path::new("one.wav");
+    let two = Path::new("two.wav");
+    let legacy_display = vec![0xff_u8; 1024 * 1024];
+    let legacy_normalized = String::from("legacy\0tag");
+    fixture
+        .database
+        .connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+            rusqlite::params![&legacy_normalized, &legacy_display],
+        )
+        .expect("legacy tag");
+    let legacy_id: i64 = fixture
+        .database
+        .connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text = ?1",
+            [legacy_normalized.as_str()],
+            |row| row.get(0),
+        )
+        .expect("legacy tag id");
+    let loop_id = insert_tag(&fixture.database, "loop", "loop");
+    let one_shot_id = insert_tag(&fixture.database, "oneshot", "one-shot");
+    let unrelated_id = insert_tag(&fixture.database, "unrelated", "Unrelated");
+    fixture
+        .database
+        .connection
+        .execute(
+            "INSERT INTO wav_file_tags (path, tag_id) VALUES
+                (?1, ?3), (?1, ?4), (?2, ?4)",
+            rusqlite::params![
+                one.to_string_lossy(),
+                two.to_string_lossy(),
+                loop_id,
+                unrelated_id
+            ],
+        )
+        .expect("seed assignments");
+    let mut seed = fixture.database.write_batch().expect("timestamp batch");
+    seed.set_last_curated_at(one, 1).expect("seed timestamp");
+    seed.commit_auxiliary_state().expect("seed timestamp");
+
+    let assigned = fixture
+        .commit(&[
+            SourceCurationUpdate::AssignExistingTag {
+                path: CurationFixture::path("one.wav"),
+                tag_id: legacy_id,
+            },
+            SourceCurationUpdate::AssignExistingTag {
+                path: CurationFixture::path("one.wav"),
+                tag_id: one_shot_id,
+            },
+        ])
+        .expect("assign existing source-local tag");
+    assert_eq!(
+        assigned.files()[0].playback_type,
+        Some(SourcePlaybackType::OneShot)
+    );
+    assert!(assigned.files()[0].last_curated_at.unwrap() > 1);
+    let assigned_ids = tag_ids_for_path(&fixture.database, one);
+    assert_eq!(
+        assigned_ids,
+        BTreeSet::from([legacy_id, one_shot_id, unrelated_id])
+    );
+    assert_eq!(
+        tag_ids_for_path(&fixture.database, two),
+        BTreeSet::from([unrelated_id])
+    );
+    let (legacy_type, legacy_length): (String, usize) = fixture
+        .database
+        .connection
+        .query_row(
+            "SELECT typeof(display_label), length(CAST(display_label AS BLOB))
+             FROM source_tags WHERE id = ?1",
+            [legacy_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("legacy display payload");
+    assert_eq!(legacy_type, "blob");
+    assert_eq!(legacy_length, legacy_display.len());
+
+    fixture.revision = assigned.source_revision();
+    let removed = fixture
+        .commit(&[SourceCurationUpdate::RemoveExistingTag {
+            path: CurationFixture::path("one.wav"),
+            tag_id: legacy_id,
+        }])
+        .expect("remove existing legacy source-local tag");
+    assert_eq!(
+        removed.files()[0].playback_type,
+        Some(SourcePlaybackType::OneShot)
+    );
+    assert_eq!(
+        tag_ids_for_path(&fixture.database, one),
+        BTreeSet::from([one_shot_id, unrelated_id])
+    );
+    assert_eq!(
+        tag_ids_for_path(&fixture.database, two),
+        BTreeSet::from([unrelated_id])
+    );
+    fixture.revision = removed.source_revision();
+    let removed_playback = fixture
+        .commit(&[SourceCurationUpdate::RemoveExistingTag {
+            path: CurationFixture::path("one.wav"),
+            tag_id: one_shot_id,
+        }])
+        .expect("remove existing playback source-local tag");
+    assert_eq!(removed_playback.files()[0].playback_type, None);
+    assert_eq!(
+        tag_ids_for_path(&fixture.database, one),
+        BTreeSet::from([unrelated_id])
+    );
+    assert_eq!(
+        fixture
+            .database
+            .connection
+            .query_row("SELECT count(*) FROM source_tags", [], |row| row
+                .get::<_, usize>(0))
+            .expect("tag dictionary count"),
+        4
+    );
+}
+
+#[test]
+fn curation_existing_tag_ids_reject_invalid_missing_and_stale_without_writes() {
+    let fixture = CurationFixture::new();
+    let path = Path::new("one.wav");
+    let tag_id = insert_tag(&fixture.database, "keep", "Keep");
+    let update = |tag_id| SourceCurationUpdate::AssignExistingTag {
+        path: CurationFixture::path("one.wav"),
+        tag_id,
+    };
+
+    for tag_id in [0, -1] {
+        assert!(matches!(
+            fixture.commit(&[update(tag_id)]),
+            Err(SourceDbError::InvalidTagId { tag_id: actual }) if actual == tag_id
+        ));
+    }
+    assert!(matches!(
+        fixture.commit(&[update(tag_id + 1)]),
+        Err(SourceDbError::TagIdNotFound { tag_id: actual }) if actual == tag_id + 1
+    ));
+
+    let initial_revision = fixture.database.get_revision().expect("revision");
+    let initial_ids = tag_ids_for_path(&fixture.database, path);
+    assert!(matches!(
+        fixture.database.commit_curation_with_profile_guard(
+            &fixture.profile_guard,
+            fixture.revision - 1,
+            &fixture.root_identity,
+            &[update(tag_id)],
+        ),
+        Err(SourceDbError::DirectoryTruth(
+            crate::sample_sources::db::SourceDirectoryTruthError::StaleRevision { .. }
+        ))
+    ));
+    assert_eq!(
+        fixture.database.get_revision().expect("revision"),
+        initial_revision
+    );
+    assert_eq!(tag_ids_for_path(&fixture.database, path), initial_ids);
+
+    let mut batch = fixture.database.write_batch().expect("invalid id batch");
+    assert!(matches!(
+        batch.assign_existing_tag_for_curation(path, 0),
+        Err(SourceDbError::InvalidTagId { tag_id: 0 })
+    ));
+    drop(batch);
+}
+
+fn insert_tag(database: &SourceDatabase, normalized_text: &str, display_label: &str) -> i64 {
+    database
+        .connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+            rusqlite::params![normalized_text, display_label],
+        )
+        .expect("tag");
+    database
+        .connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text = ?1",
+            [normalized_text],
+            |row| row.get(0),
+        )
+        .expect("tag id")
+}
+
+fn tag_ids_for_path(database: &SourceDatabase, path: &Path) -> BTreeSet<i64> {
+    let raw_path = path.to_string_lossy();
+    let mut statement = database
+        .connection
+        .prepare("SELECT tag_id FROM wav_file_tags WHERE path = ?1 ORDER BY tag_id")
+        .expect("tag ids");
+    statement
+        .query_map([raw_path.as_ref()], |row| row.get(0))
+        .expect("tag ids query")
+        .collect::<Result<BTreeSet<_>, _>>()
+        .expect("tag ids rows")
+}
