@@ -140,6 +140,7 @@ impl Browser {
         fallback_to_scan: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        super::tags::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         let Some((source_id, root, label)) = self
@@ -454,6 +455,13 @@ impl Browser {
         event: CatalogEvent,
         cx: &mut Context<Self>,
     ) -> bool {
+        if matches!(
+            &event,
+            CatalogEvent::TagPageReady { .. } | CatalogEvent::TagPageFailed { .. }
+        ) && super::tags::apply_catalog_event(self, &event, cx)
+        {
+            return true;
+        }
         if matches!(event, CatalogEvent::CurationOperationCompleted { .. }) {
             // Compound outcomes belong to their source lifecycle even after the browser has
             // switched to another source. Consume them before the active projection fence so a

@@ -96,6 +96,16 @@ pub(super) enum CurationPlan {
     Rejected(String),
 }
 
+/// Admission result for a browser tag operation.
+pub(super) enum TagAdmissionResult {
+    /// The catalog accepted a durable tag operation.
+    Accepted,
+    /// The planner produced no durable updates for the captured targets.
+    NoChange,
+    /// The operation could not be admitted with the captured curation authority.
+    Rejected(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CurationReceipt {
     source_revision: u64,
@@ -933,6 +943,41 @@ fn path_byte_len(path: &Path) -> usize {
     }
 }
 
+fn consider_tag_target_path<'a>(
+    path: &'a Path,
+    label_count: usize,
+    max_distinct_paths: usize,
+    seen_paths: &mut HashSet<&'a Path>,
+    paths: &mut Vec<PathBuf>,
+    path_bytes: &mut usize,
+) -> Result<(), String> {
+    if !seen_paths.insert(path) {
+        return Ok(());
+    }
+    if paths.len() >= max_distinct_paths {
+        return Err(format!(
+            "Tag selection needs more than {} updates",
+            MAX_CURATION_OPERATION_UPDATES
+        ));
+    }
+    let path_bytes_for_row = path_byte_len(path)
+        .checked_mul(label_count)
+        .ok_or_else(|| {
+            String::from("Tag selection path payload exceeds the curation byte bound")
+        })?;
+    *path_bytes = path_bytes.checked_add(path_bytes_for_row).ok_or_else(|| {
+        String::from("Tag selection path payload exceeds the curation byte bound")
+    })?;
+    if *path_bytes > MAX_CURATION_OPERATION_PATH_BYTES {
+        return Err(format!(
+            "Selection paths exceed the {} byte curation bound",
+            MAX_CURATION_OPERATION_PATH_BYTES
+        ));
+    }
+    paths.push(path.to_path_buf());
+    Ok(())
+}
+
 fn curation_from_metadata(metadata: &BrowserFileMetadata) -> Option<AudioFileCuration> {
     let collection_mask = metadata.collections.iter().fold(0_u8, |mask, collection| {
         let slot = usize::from(collection.index());
@@ -1594,24 +1639,26 @@ impl Browser {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub(super) fn submit_add_tags(
         &mut self,
         labels: Vec<String>,
         explicit_paths: Option<Vec<PathBuf>>,
         cx: &mut Context<Self>,
-    ) {
-        self.submit_tag_operation(TagMutation::Add, labels, explicit_paths, cx);
+    ) -> TagAdmissionResult {
+        self.submit_tag_operation(TagMutation::Add, labels, explicit_paths, cx)
     }
 
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "tag-chip removal will use the typed admission result later"
+    )]
     pub(super) fn submit_remove_tag(
         &mut self,
         label: String,
         explicit_paths: Option<Vec<PathBuf>>,
         cx: &mut Context<Self>,
-    ) {
-        self.submit_tag_operation(TagMutation::Remove, vec![label], explicit_paths, cx);
+    ) -> TagAdmissionResult {
+        self.submit_tag_operation(TagMutation::Remove, vec![label], explicit_paths, cx)
     }
 
     fn submit_tag_operation(
@@ -1620,25 +1667,25 @@ impl Browser {
         labels: Vec<String>,
         explicit_paths: Option<Vec<PathBuf>>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> TagAdmissionResult {
         let Some(activation) = self.catalog_activation.as_ref() else {
             self.scan_status =
                 String::from("Tag editing requires a successful audited catalog projection");
             cx.notify();
-            return;
+            return TagAdmissionResult::Rejected(self.scan_status.clone());
         };
         if !activation.audit_finished || activation.audit_error.is_some() {
             self.scan_status =
                 String::from("Tag editing requires a successful audited catalog projection");
             cx.notify();
-            return;
+            return TagAdmissionResult::Rejected(self.scan_status.clone());
         }
         let Some(context) = self.catalog_metadata.context() else {
             self.scan_status = String::from(
                 "Curation metadata is still loading; try again after the catalog is ready",
             );
             cx.notify();
-            return;
+            return TagAdmissionResult::Rejected(self.scan_status.clone());
         };
         let key = CurationLifecycleKey {
             source_id: activation.source_id.clone(),
@@ -1659,7 +1706,9 @@ impl Browser {
                 String::from("Curation authority is stale; refresh the catalog before editing"),
             );
             cx.notify();
-            return;
+            return TagAdmissionResult::Rejected(String::from(
+                "Curation authority is stale; refresh the catalog before editing",
+            ));
         }
         let target_paths = explicit_paths.unwrap_or_else(|| self.curation_target_paths());
         let plan = match mutation {
@@ -1672,13 +1721,15 @@ impl Browser {
                 &target_paths,
             ),
         };
-        match plan {
+        let result = match plan {
             CurationPlan::Rejected(message) => {
-                self.curation_state.set_message(&key, message);
+                self.curation_state.set_message(&key, message.clone());
+                TagAdmissionResult::Rejected(message)
             }
             CurationPlan::NoChange { .. } => {
                 self.curation_state
                     .set_message(&key, String::from("No tag changes"));
+                TagAdmissionResult::NoChange
             }
             CurationPlan::Ready(plan) => {
                 let request_id = plan.request_id;
@@ -1699,21 +1750,78 @@ impl Browser {
                                     "Curation admission changed; refresh the catalog before editing",
                                 ),
                             );
+                            TagAdmissionResult::Rejected(String::from(
+                                "Curation admission changed; refresh the catalog before editing",
+                            ))
                         } else {
                             // Tag writes have no optimistic tag vector. The committed receipt is
                             // the first source of visible tag and playback-type state.
                             self.catalog_metadata.pause_for_curation();
                             self.start_source_registry_poll(cx);
+                            TagAdmissionResult::Accepted
                         }
                     }
                     Err(error) => {
-                        self.curation_state
-                            .set_message(&key, format!("Tags not saved: {error}"));
+                        let message = format!("Tags not saved: {error}");
+                        self.curation_state.set_message(&key, message.clone());
+                        TagAdmissionResult::Rejected(message)
                     }
                 }
             }
-        }
+        };
         cx.notify();
+        result
+    }
+
+    /// Capture the current tag targets while checking the curation bounds before cloning paths.
+    pub(super) fn capture_tag_target_paths(
+        &self,
+        label_count: usize,
+    ) -> Result<Vec<PathBuf>, String> {
+        if label_count == 0 {
+            return Err(String::from("Tag operation requires at least one label"));
+        }
+        let max_distinct_paths = MAX_CURATION_OPERATION_UPDATES / label_count;
+        if max_distinct_paths == 0 {
+            return Err(String::from(
+                "Tag selection exceeds the curation update bound",
+            ));
+        }
+        let seen_path_capacity = self.selection.len().min(max_distinct_paths).max(1);
+        let mut seen_paths = HashSet::with_capacity(seen_path_capacity);
+        let mut paths = Vec::new();
+        let mut path_bytes = 0usize;
+
+        if !self.selection.is_empty() {
+            for row in self.view_model.rows() {
+                if !self.selection.contains(&row.id) {
+                    continue;
+                }
+                let Some(entry) = self.entries.get(row.entry_index) else {
+                    continue;
+                };
+                consider_tag_target_path(
+                    &entry.relative_path,
+                    label_count,
+                    max_distinct_paths,
+                    &mut seen_paths,
+                    &mut paths,
+                    &mut path_bytes,
+                )?;
+            }
+        } else if let Some(index) = self.browser_focus_index()
+            && let Some(entry) = self.entries.get(index)
+        {
+            consider_tag_target_path(
+                &entry.relative_path,
+                label_count,
+                max_distinct_paths,
+                &mut seen_paths,
+                &mut paths,
+                &mut path_bytes,
+            )?;
+        }
+        Ok(paths)
     }
 
     fn curation_target_paths(&self) -> Vec<PathBuf> {

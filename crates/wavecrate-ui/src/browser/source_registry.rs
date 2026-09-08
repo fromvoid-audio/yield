@@ -6,8 +6,9 @@ use gpui::{BorrowAppContext, Global, Subscription};
 use wavecrate_library::sample_sources::SampleSource;
 use wavecrate_session::{
     CanonicalSourceRoot, CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
-    PreferenceEvent, PreferencePatch, PreferenceRequestId, RegistryEvent, RequestId,
-    SourceRegistryService, SubmitError,
+    PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
+    ProfileTagVocabularyLookup, ProfileTagVocabularySetReceipt, RegistryEvent, RequestId,
+    SourceRegistryService, SubmitError, VocabularyRequest, VocabularyStatus, VocabularySubmitError,
 };
 
 /// The app-owned source registry service.
@@ -85,6 +86,38 @@ impl SourceRegistryGlobal {
             .as_ref()
             .map(SourceRegistryService::catalog_status)
             .unwrap_or(CatalogStatus::Closed)
+    }
+
+    /// Return the current profile tag vocabulary lifecycle state.
+    pub(crate) fn vocabulary_status(&self) -> VocabularyStatus {
+        self.service
+            .as_ref()
+            .map(SourceRegistryService::vocabulary_status)
+            .unwrap_or(VocabularyStatus::Closed)
+    }
+
+    /// Submit an exact profile tag vocabulary lookup.
+    pub(crate) fn lookup_profile_tag_categories(
+        &self,
+        labels: Vec<String>,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyLookup>, VocabularySubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(VocabularySubmitError::Closed)?
+            .lookup_profile_tag_categories(labels)
+    }
+
+    /// Submit one revision-fenced profile tag category assignment.
+    pub(crate) fn set_profile_tag_category(
+        &self,
+        expected_revision: u64,
+        label: String,
+        category: ProfileTagCategory,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularySetReceipt>, VocabularySubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(VocabularySubmitError::Closed)?
+            .set_profile_tag_category(expected_revision, label, category)
     }
 
     /// Submit one typed catalog command through the profile-owned session service.
@@ -179,7 +212,7 @@ fn log_shutdown_curation_failures(service: &SourceRegistryService) {
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::{Browser, PendingRegistryMutation, SourceSession, catalog, source_label};
+use super::{Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tags};
 use gpui::Context;
 
 impl Browser {
@@ -226,6 +259,7 @@ impl Browser {
         for event in catalog_events {
             changed |= self.apply_catalog_event(event, cx);
         }
+        changed |= tags::poll(self, cx);
         changed |= self.retry_catalog_commands(cx);
         if changed {
             cx.notify();
@@ -234,6 +268,7 @@ impl Browser {
             || !self.source_registry_pending_adds.is_empty()
             || !self.source_registry_pending_removes.is_empty()
             || catalog_events_capped
+            || tags::has_pending(self)
             || catalog::catalog_poll_needed(self)
     }
 
@@ -535,6 +570,7 @@ impl Browser {
     }
 
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
+        tags::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.stop_playback();

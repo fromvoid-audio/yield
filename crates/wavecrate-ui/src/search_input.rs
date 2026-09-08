@@ -83,10 +83,6 @@ impl SearchInputOptions {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "configured for the upcoming browser tag editor")
-    )]
     pub(crate) const fn tags() -> Self {
         Self {
             placeholder: "ADD TAG",
@@ -147,10 +143,6 @@ impl SearchInput {
         &self.content
     }
 
-    #[expect(
-        dead_code,
-        reason = "the later browser tag editor slice will gate submission on composition state"
-    )]
     pub(crate) fn is_composing(&self) -> bool {
         self.marked_range.is_some()
     }

@@ -1407,3 +1407,25 @@ oversized/NUL legacy labels, playback conflicts, stale/invalid IDs, preserved
 metadata and compound receipt accounting. The primary reviewed the implementation
 diff. The UI must retain source/page identity when wiring chips to these operations;
 shortened display labels are never mutation identities.
+
+### Add-tag editor and category chooser
+
+The sidebar now exposes bounded native tag entry, add submission and a compact
+four-category chooser. Single unknown tags use revision-fenced profile category
+persistence before source assignment; known tags, playback aliases and multi-tag
+paste use the existing curation pipeline. Captured source/root/revision and target
+paths prevent delayed work from applying to a replacement source. Input generation
+checks preserve later edits and failed-admission drafts. Category choice supports
+arrows, Enter and Escape; focused input isolates browser shortcuts and respects IME
+composition. Long status text remains clipped to a compact row.
+
+Existing source polling handles outstanding requests and stops while the chooser
+is idle. A source change lets an admitted category write drain but cancels its file
+assignment, and prevents stale-write refresh retries. UI feedback distinguishes
+queued commands from durable completion; chip projections will follow receipts.
+
+The full UI suite passed 177 tests with one ignored. Four focused editor tests,
+normal UI compilation, formatting and diff checks passed after final cleanup. A
+separate peer reviewed captured intent, retry, failure and keyboard/polling behavior
+with no remaining actionable findings. Completion lists, selected-tag chips and
+tag filters remain follow-on work.

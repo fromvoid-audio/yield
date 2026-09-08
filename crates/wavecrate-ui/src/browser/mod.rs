@@ -29,7 +29,7 @@ use wavecrate_media::{
 };
 use wavecrate_session::{PreferencePatch, RegistryRevision, RequestId};
 
-use crate::search_input::{SearchChanged, SearchInput};
+use crate::search_input::{SearchChanged, SearchInput, SearchInputOptions, SearchInputRejected};
 use crate::theme::ActiveTheme;
 
 mod audio_output;
@@ -43,6 +43,7 @@ mod motion;
 mod preferences;
 mod sidebar;
 mod source_registry;
+mod tags;
 mod transport;
 mod view;
 mod volume;
@@ -213,6 +214,9 @@ pub(crate) struct Browser {
     volume_focus_handle: FocusHandle,
     search_input: gpui::Entity<SearchInput>,
     _search_subscription: gpui::Subscription,
+    tag_input: gpui::Entity<SearchInput>,
+    _tag_subscription: gpui::Subscription,
+    _tag_rejected_subscription: gpui::Subscription,
     root: Option<PathBuf>,
     entries: Vec<AudioFile>,
     source_sessions: Vec<SourceSession>,
@@ -284,6 +288,7 @@ pub(crate) struct Browser {
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
     catalog_metadata: catalog_metadata::CatalogMetadataState,
     curation_state: curation::CurationState,
+    tag_editor: tags::TagEditorState,
     collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
@@ -354,6 +359,15 @@ impl Browser {
                 view.reconcile_selection();
                 view.restore_projection_focus(previous_id, previous_position, cx);
             });
+        let tag_input = cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::tags()));
+        let tag_subscription = cx.subscribe(&tag_input, |view, input, _: &SearchChanged, cx| {
+            let content = input.read(cx).content().to_owned();
+            tags::on_changed(view, &content, cx);
+        });
+        let tag_rejected_subscription =
+            cx.subscribe(&tag_input, |view, _input, _: &SearchInputRejected, cx| {
+                tags::on_rejected(view, cx);
+            });
         let motion_settings = Motion::default();
         let mut browser = Self {
             focus_handle: cx.focus_handle(),
@@ -361,6 +375,9 @@ impl Browser {
             volume_focus_handle: cx.focus_handle(),
             search_input,
             _search_subscription: search_subscription,
+            tag_input,
+            _tag_subscription: tag_subscription,
+            _tag_rejected_subscription: tag_rejected_subscription,
             root: None,
             entries: Vec::new(),
             source_sessions: Vec::new(),
@@ -432,6 +449,7 @@ impl Browser {
             catalog_projection_cancel: None,
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
             curation_state: curation::CurationState::default(),
+            tag_editor: tags::TagEditorState::default(),
             collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
@@ -1680,6 +1698,27 @@ impl Browser {
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
         if self.handle_context_menu_key_down(event, window, cx) {
+            return;
+        }
+        if self.tag_input.read(cx).focus_handle().is_focused(window) {
+            if !event.is_held
+                && handoff::is_browser_copy_shortcut(key, secondary, shift, alt, function)
+            {
+                self.invalidate_file_handoff();
+            }
+            let is_composing = self.tag_input.read(cx).is_composing();
+            tags::handle_focused_key_down(
+                self,
+                key,
+                event.is_held,
+                is_composing,
+                secondary,
+                shift,
+                alt,
+                function,
+                window,
+                cx,
+            );
             return;
         }
         if key.eq_ignore_ascii_case("f") && secondary {
