@@ -302,7 +302,7 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
 const INPUT_ROWS: &[ShortcutRow] = &[
     ShortcutRow {
         keys: "Up / Down",
-        description: "Adjust beat-guide divisions in the focused count field",
+        description: "Adjust the focused beat count",
     },
     ShortcutRow {
         keys: "Enter",

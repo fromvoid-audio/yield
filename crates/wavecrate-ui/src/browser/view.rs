@@ -989,7 +989,9 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .tooltip(waveform::bpm_snap_tooltip)
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(waveform::bpm_snap_tooltip)
+                            })
                             .on_click(cx.listener(Self::toggle_bpm_snap_from_toolbar))
                             .child(waveform::render_bpm_snap_icon(bpm_snap_color)),
                     )
@@ -1008,7 +1010,9 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .tooltip(waveform::beat_guides_tooltip)
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(waveform::beat_guides_tooltip)
+                            })
                             .on_click(cx.listener(Self::toggle_beat_guides_from_toolbar))
                             .child(waveform::render_beat_guides_icon(beat_guides_color)),
                     )
@@ -1023,7 +1027,9 @@ impl Render for Browser {
                             .bg(color(theme.colors.surface_overlay))
                             .border(px(theme.spacing.border_width))
                             .border_color(color(theme.colors.border_emphasis))
-                            .tooltip(waveform::beat_count_tooltip)
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(waveform::beat_count_tooltip)
+                            })
                             .child(self.beat_count_input.clone()),
                     )
                     .child(
@@ -1062,7 +1068,9 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .tooltip(normalized_audition::normalized_audition_tooltip)
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(normalized_audition::normalized_audition_tooltip)
+                            })
                             .on_click(cx.listener(Self::toggle_normalized_audition_from_toolbar))
                             .child(normalized_audition::render_normalized_audition_icon(
                                 normalized_audition_color,
@@ -1159,7 +1167,9 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .tooltip(shortcut_help::shortcut_help_tooltip)
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(shortcut_help::shortcut_help_tooltip)
+                            })
                             .on_click(cx.listener(Self::toggle_shortcut_help_from_toolbar))
                             .text_size(px(theme.typography.title_size))
                             .text_color(color(theme.colors.text_muted))
