@@ -224,6 +224,30 @@ pub enum SourceDbError {
         /// Aggregate UTF-8 byte length supplied by the caller.
         actual: usize,
     },
+    /// A bounded display-label request contained too many paths.
+    #[error("Display-label request selected {actual} paths; maximum is {max}")]
+    DisplayLabelTooManyPaths {
+        /// Maximum number of paths accepted by one display-label request.
+        max: usize,
+        /// Number of raw paths supplied by the caller.
+        actual: usize,
+    },
+    /// A bounded display-label request exceeded its aggregate path-byte budget.
+    #[error("Display-label request paths use {actual} bytes; maximum is {max}")]
+    DisplayLabelPathBytesTooLarge {
+        /// Maximum aggregate raw plus normalized path-byte length accepted by one request.
+        max: usize,
+        /// Aggregate path-byte length supplied by the caller.
+        actual: usize,
+    },
+    /// A display-label request observed a source revision different from its fence.
+    #[error("Display-label request expected source revision {expected}, found {actual}")]
+    DisplayLabelStaleRevision {
+        /// Revision supplied by the caller.
+        expected: u64,
+        /// Revision observed by the read transaction.
+        actual: u64,
+    },
     /// Read-only mode requires an existing database file.
     #[error("Read-only source DB mode requires an existing database file: {0}")]
     ReadOnlyDatabaseMissing(PathBuf),

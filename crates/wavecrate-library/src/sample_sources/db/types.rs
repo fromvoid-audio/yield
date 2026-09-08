@@ -640,3 +640,24 @@ pub struct SourceTagPage {
     /// Opaque cursor to pass to the next page, or `None` when this is the final page.
     pub next_cursor: Option<SourceTagPageCursor>,
 }
+
+/// One bounded metadata display-label projection for a live supported source path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDisplayLabelEntry {
+    /// Normalized source-relative path represented by this projection.
+    pub relative_path: PathBuf,
+    /// Ordered, playback-sanitized tag label, or `None` when no nonempty tag label is available.
+    /// Callers can use the disk filename stem when this value is absent.
+    pub display_label: Option<String>,
+    /// True when legacy tag data was bounded, sanitized, or omitted from this projection.
+    pub truncated: bool,
+}
+
+/// Revision-fenced bounded metadata display-label projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDisplayLabelResult {
+    /// Exact source revision observed by the read transaction.
+    pub revision: u64,
+    /// Entries for the requested paths that were live supported rows at `revision`.
+    pub entries: Vec<SourceDisplayLabelEntry>,
+}

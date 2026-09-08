@@ -63,7 +63,8 @@ pub use open_profiles::SourceDatabaseConnectionRole;
 pub use pending_renames::{PendingRenameDiagnostics, PendingRenameEntry, PendingRenamePruneReport};
 pub use rename_metadata::RenameMetadataSnapshot;
 pub use tags::{
-    SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
+    SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
     SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SourceTagFilterResult,
 };
 pub use types::{
@@ -71,9 +72,10 @@ pub use types::{
     ExistingFileMetadataUpdate, Rating, SampleCollection, SampleSoundType, SourceDirectoryEntry,
     SourceDirectoryTruthCleanup, SourceDirectoryTruthCursor, SourceDirectoryTruthPage,
     SourceDirectoryTruthPublication, SourceDirectoryTruthState,
-    SourceDirectoryTruthUnavailableReason, SourceIndexClassification, SourceIndexDiagnostic,
-    SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag,
-    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage, WavEntry,
+    SourceDirectoryTruthUnavailableReason, SourceDisplayLabelEntry, SourceDisplayLabelResult,
+    SourceIndexClassification, SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot,
+    SourceManifestEntry, SourcePlaybackType, SourceTag, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, SourceTagUsage, WavEntry,
 };
 pub use util::normalize_relative_path;
 pub use write::{

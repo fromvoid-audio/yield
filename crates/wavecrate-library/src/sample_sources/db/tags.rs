@@ -1,5 +1,6 @@
 //! Durable source tag catalog queries and assignment mutations.
 
+mod display_labels;
 mod identity;
 mod mutations;
 mod queries;
@@ -9,12 +10,24 @@ pub(super) fn matching_tag_filter_paths_sql_for_test() -> String {
     queries::matching_tag_filter_paths_sql_for_test()
 }
 
+#[cfg(test)]
+pub(super) fn display_label_rows_sql_for_test() -> String {
+    display_labels::display_label_rows_sql_for_test()
+}
+
 /// Maximum number of required tags accepted by one source tag filter.
 pub const SOURCE_TAG_FILTER_MAX_TAGS: usize = 64;
 /// Maximum UTF-8 byte length of one required tag filter token.
 pub const SOURCE_TAG_FILTER_MAX_TOKEN_BYTES: usize = 1024;
 /// Maximum aggregate UTF-8 byte length of required tag filter input.
 pub const SOURCE_TAG_FILTER_MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Maximum number of paths accepted by one bounded display-label request.
+pub const SOURCE_DISPLAY_LABEL_MAX_PATHS: usize = 64;
+/// Maximum aggregate raw plus normalized path bytes accepted by one display-label request.
+pub const SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES: usize = 256 * 1024;
+/// Maximum UTF-8 byte length of one assembled display label.
+pub const SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES: usize = 4096;
 
 /// Counts returned by one revision-fenced source tag filter read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

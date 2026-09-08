@@ -8,9 +8,10 @@ use rusqlite::params;
 use tempfile::tempdir;
 
 use super::super::{
-    SOURCE_TAG_FILTER_MAX_TAGS, SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
-    SourceDatabase, SourceDbError,
+    SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_FILTER_MAX_TAGS, SOURCE_TAG_FILTER_MAX_TOKEN_BYTES,
+    SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
+    SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceDatabase, SourceDbError,
 };
 
 #[test]
@@ -1092,3 +1093,296 @@ fn tag_filter_ascii_casefold_does_not_truncate_embedded_nul_values() {
     .unwrap();
     assert!(matches.is_empty());
 }
+
+#[test]
+fn display_labels_preserve_native_order_playback_sanitization_and_empty_fallback() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in [
+        "one.wav",
+        "empty.wav",
+        "missing.wav",
+        "notes.txt",
+        "._sidecar.wav",
+    ] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+    for label in ["zulu", "Alpha", "loop", "one-shot", "warm"] {
+        db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
+    }
+    for path in ["missing.wav", "notes.txt", "._sidecar.wav"] {
+        db.assign_tag_to_path(Path::new(path), "hidden").unwrap();
+    }
+    db.set_missing(Path::new("missing.wav"), true).unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    let result = db
+        .display_labels_for_paths_at_revision(
+            revision,
+            &[
+                PathBuf::from("one.wav"),
+                PathBuf::from("empty.wav"),
+                PathBuf::from("one.wav"),
+                PathBuf::from("missing.wav"),
+                PathBuf::from("notes.txt"),
+                PathBuf::from("._sidecar.wav"),
+            ],
+            &cancellation,
+        )
+        .unwrap();
+
+    assert_eq!(result.revision, revision);
+    assert_eq!(
+        result
+            .entries
+            .iter()
+            .map(|entry| (
+                entry.relative_path.to_string_lossy().into_owned(),
+                entry.display_label.clone(),
+                entry.truncated,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (String::from("empty.wav"), None, false),
+            (
+                String::from("one.wav"),
+                Some(String::from("Alpha_loop_warm_zulu")),
+                false,
+            ),
+        ]
+    );
+}
+
+#[test]
+fn display_labels_bound_legacy_text_and_high_tag_cardinality() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["legacy-malformed.wav", "legacy-long.wav", "many.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+
+    let insert_legacy_tag = |path: &str, normalized: &str, display: &[u8]| {
+        db.connection
+            .execute(
+                "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+                params![normalized, display],
+            )
+            .unwrap();
+        let tag_id = db.connection.last_insert_rowid();
+        db.connection
+            .execute(
+                "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+                params![path, tag_id],
+            )
+            .unwrap();
+    };
+    insert_legacy_tag("legacy-malformed.wav", "nul-display", b"nul\0display");
+    insert_legacy_tag(
+        "legacy-malformed.wav",
+        "invalid-display",
+        &[b'i', 0xff, b'n', 0xfe],
+    );
+    let long_display = b"long".repeat(2_000);
+    insert_legacy_tag("legacy-long.wav", "long-display", &long_display);
+
+    for index in 0..=MAX_LEGACY_DISPLAY_LABEL_TAGS {
+        let normalized = format!("tag-{index:03}");
+        insert_legacy_tag("many.wav", &normalized, normalized.as_bytes());
+    }
+
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let assignments_before: i64 = db
+        .connection
+        .query_row("SELECT count(*) FROM wav_file_tags", [], |row| row.get(0))
+        .unwrap();
+    let result = db
+        .display_labels_for_paths_at_revision(
+            revision,
+            &[
+                PathBuf::from("legacy-malformed.wav"),
+                PathBuf::from("legacy-long.wav"),
+                PathBuf::from("many.wav"),
+            ],
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(result.revision, revision);
+    assert_eq!(db.get_revision().unwrap(), revision);
+    let assignments_after: i64 = db
+        .connection
+        .query_row("SELECT count(*) FROM wav_file_tags", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(assignments_after, assignments_before);
+
+    let malformed = result
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == Path::new("legacy-malformed.wav"))
+        .unwrap();
+    assert!(malformed.truncated);
+    assert!(
+        malformed
+            .display_label
+            .as_deref()
+            .is_some_and(|label| !label.contains('\0') && label.contains('\u{fffd}'))
+    );
+
+    let long = result
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == Path::new("legacy-long.wav"))
+        .unwrap();
+    assert!(long.truncated);
+    assert_eq!(
+        long.display_label.as_ref().unwrap().len(),
+        SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES
+    );
+
+    let many = result
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == Path::new("many.wav"))
+        .unwrap();
+    assert!(many.truncated);
+    assert!(many.display_label.as_ref().unwrap().len() <= SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES);
+}
+
+#[test]
+fn display_labels_reject_raw_path_bounds_and_deduplicate_normalized_paths() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("folder/one.wav"), 10, 5).unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    let duplicate = db
+        .display_labels_for_paths_at_revision(
+            revision,
+            &[
+                PathBuf::from("folder/./one.wav"),
+                PathBuf::from("folder/one.wav"),
+            ],
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(duplicate.entries.len(), 1);
+    assert_eq!(
+        duplicate.entries[0].relative_path,
+        PathBuf::from("folder/one.wav")
+    );
+
+    let too_many = (0..=SOURCE_DISPLAY_LABEL_MAX_PATHS)
+        .map(|index| PathBuf::from(format!("{index}.wav")))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        db.display_labels_for_paths_at_revision(revision, &too_many, &cancellation),
+        Err(SourceDbError::DisplayLabelTooManyPaths { .. })
+    ));
+
+    let too_many_bytes = vec![PathBuf::from(
+        "x".repeat(SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES + 1),
+    )];
+    assert!(matches!(
+        db.display_labels_for_paths_at_revision(revision, &too_many_bytes, &cancellation),
+        Err(SourceDbError::DisplayLabelPathBytesTooLarge { .. })
+    ));
+
+    let combined_bytes = vec![PathBuf::from(
+        "y".repeat(SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES / 2 + 1),
+    )];
+    assert!(matches!(
+        db.display_labels_for_paths_at_revision(revision, &combined_bytes, &cancellation),
+        Err(SourceDbError::DisplayLabelPathBytesTooLarge { .. })
+    ));
+}
+
+#[test]
+fn display_labels_fence_revision_and_cancelled_reads_recover_connection() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    db.assign_tag_to_path(Path::new("one.wav"), "warm").unwrap();
+    for index in 0..10_000 {
+        let normalized = format!("legacy-{index:05}");
+        db.connection
+            .execute(
+                "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+                params![normalized, normalized],
+            )
+            .unwrap();
+        let tag_id = db.connection.last_insert_rowid();
+        db.connection
+            .execute(
+                "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+                params!["one.wav", tag_id],
+            )
+            .unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    db.assign_tag_to_path(Path::new("one.wav"), "later")
+        .unwrap();
+    assert!(matches!(
+        db.display_labels_for_paths_at_revision(
+            revision,
+            &[PathBuf::from("one.wav")],
+            &cancellation,
+        ),
+        Err(SourceDbError::DisplayLabelStaleRevision { .. })
+    ));
+
+    let revision = db.get_revision().unwrap();
+    let canceled = Arc::new(AtomicBool::new(false));
+    let callback_cancellation = Arc::clone(&canceled);
+    let callback = Arc::new(move || {
+        callback_cancellation.store(true, Ordering::Release);
+    });
+    let result = db.display_labels_for_paths_at_revision_with_progress_callback(
+        revision,
+        &[PathBuf::from("one.wav")],
+        &canceled,
+        Some(callback),
+    );
+    assert!(matches!(result, Err(SourceDbError::Canceled)));
+
+    canceled.store(false, Ordering::Release);
+    let recovered = db
+        .display_labels_for_paths_at_revision(revision, &[PathBuf::from("one.wav")], &canceled)
+        .unwrap();
+    assert_eq!(recovered.entries.len(), 1);
+}
+
+#[test]
+fn display_label_query_uses_path_primary_key_lookup() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::display_label_rows_sql_for_test()
+    );
+    let plan = db
+        .connection
+        .prepare(&sql)
+        .unwrap()
+        .query_map(params!["one.wav", 65_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("SEARCH") && detail.contains("wav_files")),
+        "display-label plan did not seek the selected wav row: {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|detail| {
+            detail.contains("SEARCH") && detail.contains("PRIMARY KEY") && detail.contains("path")
+        }),
+        "display-label plan did not use the path primary key: {plan:?}"
+    );
+}
+
+const MAX_LEGACY_DISPLAY_LABEL_TAGS: usize = 70;

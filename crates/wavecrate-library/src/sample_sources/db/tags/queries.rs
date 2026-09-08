@@ -28,7 +28,7 @@ use super::{
 const DEFAULT_TAG_LIMIT: usize = 32;
 const TAG_PAGE_PREVIEW_CHAR_LIMIT: usize = 256;
 const TAG_PAGE_STAGING_CHUNK_SIZE: usize = 128;
-const TAG_FILTER_PROGRESS_OPS: i32 = 256;
+pub(super) const TAG_FILTER_PROGRESS_OPS: i32 = 256;
 
 impl SourceDatabase {
     /// Return the most-used persisted normal tags, ordered by usage then label.
@@ -571,7 +571,7 @@ fn visit_tag_filter_rows(
     Ok(matched_paths)
 }
 
-fn map_tag_filter_sql_error(error: rusqlite::Error) -> SourceDbError {
+pub(super) fn map_tag_filter_sql_error(error: rusqlite::Error) -> SourceDbError {
     if matches!(
         &error,
         rusqlite::Error::SqliteFailure(sql_error, _)
@@ -583,19 +583,19 @@ fn map_tag_filter_sql_error(error: rusqlite::Error) -> SourceDbError {
     }
 }
 
-struct TagFilterProgressHandlerGuard<'connection> {
+pub(super) struct TagFilterProgressHandlerGuard<'connection> {
     connection: &'connection rusqlite::Connection,
 }
 
 impl<'connection> TagFilterProgressHandlerGuard<'connection> {
-    fn install(
+    pub(super) fn install(
         connection: &'connection rusqlite::Connection,
         cancellation: &Arc<AtomicBool>,
     ) -> Self {
         Self::install_with_callback(connection, cancellation, None)
     }
 
-    fn install_with_callback(
+    pub(super) fn install_with_callback(
         connection: &'connection rusqlite::Connection,
         cancellation: &Arc<AtomicBool>,
         progress_callback: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -764,7 +764,7 @@ fn tag_page_prefix_signature(prefix: &str) -> u64 {
     hasher.finish()
 }
 
-fn source_revision(transaction: &Transaction<'_>) -> Result<u64, SourceDbError> {
+pub(super) fn source_revision(transaction: &Transaction<'_>) -> Result<u64, SourceDbError> {
     transaction
         .query_row(
             "SELECT value FROM metadata WHERE key = 'revision'",
