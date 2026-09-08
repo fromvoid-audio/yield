@@ -133,6 +133,10 @@ fn default_waveform_playhead() -> Color {
     Color::rgba(231, 229, 223, 210)
 }
 
+fn default_waveform_scrollbar_height() -> f32 {
+    6.0
+}
+
 /// Semantic colors used by the Wavecrate application.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +276,9 @@ pub struct Waveform {
     pub title_height: f32,
     /// Height of a compact waveform metadata row.
     pub metadata_height: f32,
+    /// Height of the horizontal waveform scrollbar in logical points.
+    #[serde(default = "default_waveform_scrollbar_height")]
+    pub scrollbar_height: f32,
 }
 
 /// A complete, versioned Wavecrate theme.
@@ -367,6 +374,7 @@ impl Default for Theme {
                 peak_scale: 0.78,
                 title_height: 24.0,
                 metadata_height: 20.0,
+                scrollbar_height: 6.0,
             },
         }
     }
@@ -619,6 +627,12 @@ pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         16.0,
         64.0,
     )?;
+    finite_range(
+        "waveform.scrollbar_height",
+        theme.waveform.scrollbar_height,
+        2.0,
+        12.0,
+    )?;
     if theme.spacing.row_height < theme.typography.body_size * 1.15 {
         return Err(ThemeError::Invalid(
             "spacing.row_height must leave room for body text".to_string(),
@@ -656,10 +670,14 @@ pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         ));
     }
     if theme.spacing.waveform_height
-        < theme.waveform.title_height + theme.waveform.metadata_height + 4.0
+        < theme.waveform.title_height
+            + theme.waveform.metadata_height
+            + theme.waveform.scrollbar_height
+            + 4.0
     {
         return Err(ThemeError::Invalid(
-            "spacing.waveform_height must contain waveform title and metadata rows".to_string(),
+            "spacing.waveform_height must contain waveform title, scrollbar, and metadata rows"
+                .to_string(),
         ));
     }
     const MIN_WINDOW_WIDTH: f32 = 960.0;
@@ -734,11 +752,19 @@ mod tests {
 
     #[test]
     fn legacy_theme_defaults_the_optional_waveform_playhead_token() {
-        let legacy = valid_json().replace("    \"waveform_playhead\": \"#E7E5DFD2\",\n", "");
+        let legacy = valid_json()
+            .replace("    \"waveform_playhead\": \"#E7E5DFD2\",\n", "")
+            .replace(
+                "    \"metadata_height\": 20.0,\n    \"scrollbar_height\": 6.0\n",
+                "    \"metadata_height\": 20.0\n",
+            );
+        assert!(!legacy.contains("\"waveform_playhead\""));
+        assert!(!legacy.contains("\"scrollbar_height\""));
 
         let theme = parse_theme_json(&legacy).expect("legacy theme validates");
 
         assert_eq!(theme.colors.waveform_playhead, default_waveform_playhead());
+        assert_eq!(theme.waveform.scrollbar_height, 6.0);
     }
 
     #[test]
@@ -824,6 +850,16 @@ mod tests {
             valid_json().replace("\"waveform_height\": 226.0", "\"waveform_height\": 480.0");
         let error = parse_theme_json(&too_tall).expect_err("chrome exceeds minimum height");
         assert!(error.to_string().contains("560px"));
+    }
+
+    #[test]
+    fn rejects_waveform_scrollbar_heights_outside_the_bounded_range() {
+        let too_small =
+            valid_json().replace("\"scrollbar_height\": 6.0", "\"scrollbar_height\": 1.0");
+        assert!(parse_theme_json(&too_small).is_err());
+        let too_large =
+            valid_json().replace("\"scrollbar_height\": 6.0", "\"scrollbar_height\": 13.0");
+        assert!(parse_theme_json(&too_large).is_err());
     }
 
     #[test]

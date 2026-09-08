@@ -730,3 +730,25 @@ refreshing retained the nested rows and displayed the source error; restoring
 the root and refreshing recovered the waveform and cleared the error. The
 isolated app quit cleanly. Filesystem watching and metadata enrichment beyond
 the initial bounded pass remain follow-on work.
+
+### Waveform viewport scrollbar, 2026-09-08
+
+A compact themed scrollbar now appears beneath zoomed waveforms. The thumb
+tracks the visible audio fraction, track clicks center the viewport, and thumb
+drags pan while preserving the committed playback region. Full-file reset hides
+the bar. Silence-margin views remain represented by a full-width thumb. The
+optional theme field `waveform.scrollbar_height` defaults to six logical pixels
+and is validated with the complete waveform-panel layout.
+
+GPUI drag promotion and final release both apply their pointer coordinates,
+including a release outside the bar. The scrollbar consumes only its own drag
+release, and waveform presses must lie inside the waveform bounds. This prevents
+scrollbar gestures from starting waveform selections or swallowing their release.
+
+Validation: viewport tests (5), design tests (18), and scrollbar tests (5)
+passed. The final waveform-focused suite passed 25 tests with one ignored
+benchmark. A signed isolated-profile GUI run confirmed thumb and outside-release
+panning, track clicks, unchanged play region, no audition, and full-view reset.
+A subsequent review fixed capture-phase release propagation; targeted tests and
+formatting passed after that fix. Integrated gesture GUI validation will also
+cover waveform releases while this bar is visible.

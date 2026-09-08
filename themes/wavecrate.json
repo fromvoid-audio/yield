@@ -72,6 +72,7 @@
   "waveform": {
     "peak_scale": 0.78,
     "title_height": 24.0,
-    "metadata_height": 20.0
+    "metadata_height": 20.0,
+    "scrollbar_height": 6.0
   }
 }

@@ -36,12 +36,59 @@ impl WaveformViewport {
 
     /// Return the normalized width, with a finite lower bound for malformed input.
     pub fn width(self) -> f64 {
-        (self.end - self.start).max(VIEW_EPSILON)
+        finite_or(self.end - self.start, VIEW_EPSILON).max(VIEW_EPSILON)
     }
 
     /// Return the normalized center of this viewport.
     pub fn center(self) -> f64 {
         self.start + self.width() * 0.5
+    }
+
+    /// Return whether the horizontal waveform scrollbar should be shown.
+    ///
+    /// Only the exact full-file viewport hides the scrollbar. A viewport expanded beyond the
+    /// file remains visible so the margin state is represented even though its thumb may fill the
+    /// track.
+    pub fn scrollbar_visible(self) -> bool {
+        self.start.is_finite() && self.end.is_finite() && (self.start != 0.0 || self.end != 1.0)
+    }
+
+    /// Return the fraction of the scrollbar track occupied by the viewport thumb.
+    ///
+    /// Expanded silence margins are intentionally capped at a full-track thumb, matching the
+    /// reference browser's normalized scrollbar projection.
+    pub fn scrollbar_visible_fraction(self) -> f64 {
+        finite_or(self.end - self.start, 1.0).clamp(0.0, 1.0)
+    }
+
+    /// Return the normalized scrollbar offset, clamped to the available track travel.
+    pub fn scrollbar_offset_fraction(self) -> f64 {
+        let width = finite_or(self.end - self.start, 1.0);
+        if !width.is_finite() || width >= 1.0 {
+            return 0.0;
+        }
+        let free = 1.0 - width;
+        if free <= VIEW_EPSILON {
+            return 0.0;
+        }
+        (finite_or(self.start, 0.0) / free).clamp(0.0, 1.0)
+    }
+
+    /// Set the audio viewport from a normalized scrollbar offset.
+    ///
+    /// The current viewport is first clamped to the audio domain, discarding any silence margin.
+    /// Non-finite offsets use the leading edge and finite offsets are clamped to the track.
+    pub fn with_offset_fraction(self, total_frames: usize, offset_fraction: f64) -> Self {
+        let viewport = self.clamp_to_audio(total_frames);
+        let width = viewport.width().min(1.0);
+        let free = (1.0 - width).max(0.0);
+        let offset = finite_unit(offset_fraction, 0.0);
+        let start = free * offset;
+        Self {
+            start,
+            end: start + width,
+        }
+        .clamp_to_audio(total_frames)
     }
 
     fn extends_beyond_audio(self) -> bool {
@@ -305,5 +352,89 @@ mod tests {
         let panned = viewport.pan_by_visible_ratio_drag(1_000, 0.5, 0.25);
         assert!((panned.start - 0.375).abs() < 1e-12);
         assert!((panned.end - 0.875).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scrollbar_geometry_matches_zoomed_viewport_endpoints_and_margins() {
+        assert!(!WaveformViewport::full().scrollbar_visible());
+        assert!(
+            WaveformViewport {
+                start: f64::EPSILON,
+                end: 1.0,
+            }
+            .scrollbar_visible()
+        );
+
+        let leading = WaveformViewport {
+            start: 0.0,
+            end: 0.25,
+        };
+        assert!(leading.scrollbar_visible());
+        assert_eq!(leading.scrollbar_visible_fraction(), 0.25);
+        assert_eq!(leading.scrollbar_offset_fraction(), 0.0);
+
+        let centered = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+        assert_eq!(centered.scrollbar_visible_fraction(), 0.5);
+        assert!((centered.scrollbar_offset_fraction() - 0.5).abs() < 1e-12);
+
+        let trailing = WaveformViewport {
+            start: 0.75,
+            end: 1.0,
+        };
+        assert_eq!(trailing.scrollbar_offset_fraction(), 1.0);
+
+        let margins = WaveformViewport {
+            start: -0.5,
+            end: 1.5,
+        };
+        assert!(margins.scrollbar_visible());
+        assert_eq!(margins.scrollbar_visible_fraction(), 1.0);
+        assert_eq!(margins.scrollbar_offset_fraction(), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_offset_clamps_to_audio_and_rejects_non_finite_input() {
+        let viewport = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+        assert_eq!(
+            viewport.with_offset_fraction(1_000, 0.5),
+            WaveformViewport {
+                start: 0.25,
+                end: 0.75,
+            }
+        );
+        assert_eq!(
+            viewport.with_offset_fraction(1_000, f64::NEG_INFINITY),
+            WaveformViewport {
+                start: 0.0,
+                end: 0.5,
+            }
+        );
+        assert_eq!(
+            viewport.with_offset_fraction(1_000, 2.0),
+            WaveformViewport {
+                start: 0.5,
+                end: 1.0,
+            }
+        );
+        assert_eq!(
+            WaveformViewport {
+                start: -0.5,
+                end: 1.5,
+            }
+            .with_offset_fraction(1_000, 0.5),
+            WaveformViewport::full()
+        );
+        let malformed = WaveformViewport {
+            start: f64::NAN,
+            end: f64::INFINITY,
+        };
+        assert!(malformed.with_offset_fraction(1_000, 0.5).start.is_finite());
+        assert!(malformed.with_offset_fraction(1_000, 0.5).end.is_finite());
     }
 }

@@ -45,6 +45,7 @@ mod view;
 mod volume;
 mod waveform;
 mod waveform_detail;
+mod waveform_scrollbar;
 
 /// Install the app-owned source registry and its application-quit shutdown observer.
 pub(crate) fn install_source_registry(cx: &mut App) {
@@ -235,6 +236,7 @@ pub(crate) struct Browser {
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
     waveform_pan_drag: Option<waveform::WaveformPanDrag>,
+    waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     scan_status: String,
     playback_status: String,
     volume: f32,
@@ -371,6 +373,7 @@ impl Browser {
             waveform_play_region: None,
             waveform_region_drag: None,
             waveform_pan_drag: None,
+            waveform_scrollbar_drag: None,
             scan_status: "Choose a folder or pass one on the command line".to_string(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
@@ -1679,6 +1682,7 @@ impl Browser {
             ),
             "escape" => {
                 self.cancel_waveform_region_drag(window, cx);
+                self.cancel_waveform_scrollbar_drag(window, cx);
                 self.stop_playback();
                 cx.notify();
             }

@@ -16,6 +16,7 @@ use wavecrate_design::Theme;
 use crate::theme::color;
 
 use super::Browser;
+use super::waveform_scrollbar;
 
 const WAVEFORM_SELECTION_CLICK_SLOP_PX: f32 = 2.0;
 const WAVEFORM_SELECTION_EDGE_WIDTH: f32 = 1.0;
@@ -450,7 +451,7 @@ pub(super) fn render_waveform(
         .flex()
         .items_center()
         .gap(px(theme.spacing.waveform_bar_gap))
-        .h_full()
+        .flex_1()
         .w_full()
         .overflow_hidden()
         .relative()
@@ -511,9 +512,15 @@ pub(super) fn render_waveform(
             .size_full();
             bars = bars.child(waveform);
         } else {
+            let scrollbar_height = if viewport.scrollbar_visible() {
+                theme.waveform.scrollbar_height
+            } else {
+                0.0
+            };
             let available_height = (theme.spacing.waveform_height
                 - theme.waveform.title_height
-                - theme.waveform.metadata_height)
+                - theme.waveform.metadata_height
+                - scrollbar_height)
                 .max(theme.spacing.waveform_min_bar_height);
             let bar_color = if browser.playing_path.is_some() {
                 theme.colors.waveform_played
@@ -598,7 +605,8 @@ pub(super) fn render_waveform(
     let click_bounds_for_down = Rc::clone(&click_bounds);
     let click_bounds_for_wheel = Rc::clone(&click_bounds);
     let click_bounds_for_middle = Rc::clone(&click_bounds);
-    bars.track_focus(&browser.waveform_focus_handle)
+    let bars = bars
+        .track_focus(&browser.waveform_focus_handle)
         .on_scroll_wheel(
             cx.listener(move |view, event: &ScrollWheelEvent, window, cx| {
                 let bounds = click_bounds_for_wheel.borrow().as_ref().copied();
@@ -614,6 +622,9 @@ pub(super) fn render_waveform(
                 let Some(bounds) = click_bounds_for_middle.borrow().as_ref().copied() else {
                     return;
                 };
+                if !bounds.contains(&event.position) {
+                    return;
+                }
                 view.begin_waveform_pan(event.position, bounds, window, cx);
             }),
         )
@@ -627,6 +638,9 @@ pub(super) fn render_waveform(
                 let Some(bounds) = click_bounds_for_down.borrow().as_ref().copied() else {
                     return;
                 };
+                if !bounds.contains(&event.position) {
+                    return;
+                }
                 let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
                     return;
                 };
@@ -662,7 +676,16 @@ pub(super) fn render_waveform(
             cx.listener(|view, event: &MouseUpEvent, _, cx| {
                 view.finish_waveform_region_drag(event.position, cx);
             }),
-        )
+        );
+    let scrollbar = waveform_scrollbar::render(browser, theme.clone(), cx);
+    div()
+        .id("waveform-area")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .w_full()
+        .child(bars)
+        .child(scrollbar)
 }
 
 impl Browser {
@@ -670,6 +693,7 @@ impl Browser {
         self.waveform_play_region = None;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
+        self.waveform_scrollbar_drag = None;
     }
 
     pub(super) fn cancel_waveform_region_drag(
