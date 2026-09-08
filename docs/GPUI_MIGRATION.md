@@ -1839,3 +1839,9 @@ Validation: all 39 media tests and the media check passed, including exact spans
 ### Whole-BPM resize snap calculation
 
 Core now exposes the native selection-edge snapping calculation, preserving its `f32` arithmetic, drag direction, nearest whole BPM, audio-edge constraint and invalid-input behavior. All 113 core tests passed, including eight snap tests; the core check and targeted formatting passed. The toolbar toggle, beat-count editor and waveform gesture integration follow separately.
+
+### Windows browser drag integration
+
+Prepared whole-file drags now queue an owned foreground task on Windows. A final live-window/gesture/projection check runs inside GPUI, then the blocking OLE call runs after that borrow ends. Queued and admitted phases distinguish cancellation before launch from normal button-release drop handling. A separate ghost marker survives windowless cancellation and permits only matching cleanup. Completion uses the task callback, with no Windows drag polling loop. Paths remain owned once across native admission, and teardown requests cancellation without introducing a stale HWND.
+
+Validation: the macOS UI check and all 17 focused drag tests passed; platform Windows-target checks, formatting and diff checks passed. Local full Windows UI checking is blocked by `ring` requiring the MSVC C toolchain. Independent review identified queued ghost cleanup after source invalidation; the marker correction passed focused re-review with no remaining issue. The new manually dispatched/PR Windows workflow supplies ASIO setup and actual Windows core/media/platform/browser tests plus the application check. Its first execution follows this commit; native OS interaction acceptance remains pending.

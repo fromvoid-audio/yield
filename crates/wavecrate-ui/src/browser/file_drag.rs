@@ -1,9 +1,10 @@
 //! Bounded whole-file drag preparation and native-session lifecycle.
 //!
 //! Row callbacks only capture stable row identities. Filesystem validation runs on the
-//! background executor, and the platform adapter is entered from the live window callback after
-//! the preparation and projection fences have been checked again. The resulting path handoff is
-//! still subject to the operating system's later path-open TOCTOU window.
+//! background executor, and the platform adapter is entered from a live foreground task after
+//! the preparation and projection fences have been checked again. On Windows, the final GPUI
+//! update extracts owned inputs before the blocking OLE call. The resulting path handoff is still
+//! subject to the operating system's later path-open TOCTOU window.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,6 +91,22 @@ struct NativeDrag {
     count: usize,
 }
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsNativePhase {
+    Queued,
+    Admitted,
+}
+
+#[cfg(any(target_os = "windows", test))]
+struct WindowsNativeDrag {
+    request_id: u64,
+    gesture_id: u64,
+    count: usize,
+    phase: WindowsNativePhase,
+    cancellation: Arc<AtomicBool>,
+}
+
 /// Browser-owned state for one bounded outbound native file drag.
 pub(super) struct FileDragState {
     next_request_id: u64,
@@ -98,8 +115,14 @@ pub(super) struct FileDragState {
     queued: Option<DragIntent>,
     ready: Option<PreparedDrag>,
     native: Option<NativeDrag>,
+    #[cfg(any(target_os = "windows", test))]
+    windows_native: Option<WindowsNativeDrag>,
     gesture_active: bool,
     active_gesture_id: Option<u64>,
+    /// The GPUI ghost can outlive `gesture_active` when a source invalidation has
+    /// no Window available to stop it immediately. Keep its originating gesture
+    /// fenced until a matching deferred abort or the next Window event drains it.
+    pending_ghost_gesture_id: Option<u64>,
     task: Option<gpui::Task<()>>,
 }
 
@@ -112,8 +135,11 @@ impl Default for FileDragState {
             queued: None,
             ready: None,
             native: None,
+            #[cfg(any(target_os = "windows", test))]
+            windows_native: None,
             gesture_active: false,
             active_gesture_id: None,
+            pending_ghost_gesture_id: None,
             task: None,
         }
     }
@@ -131,10 +157,62 @@ impl FileDragState {
         if let Some(running) = self.running.as_ref() {
             running.cancellation.store(true, Ordering::Release);
         }
+        #[cfg(any(target_os = "windows", test))]
+        if let Some(native) = self.windows_native.as_ref() {
+            native.cancellation.store(true, Ordering::Release);
+        }
         self.queued = None;
         self.ready = None;
         self.gesture_active = false;
         self.active_gesture_id = None;
+    }
+
+    fn has_native_drag(&self) -> bool {
+        if self.native.is_some() {
+            return true;
+        }
+        #[cfg(any(target_os = "windows", test))]
+        if self.windows_native.is_some() {
+            return true;
+        }
+        false
+    }
+
+    fn mark_pending_ghost(&mut self, gesture_id: u64) {
+        self.pending_ghost_gesture_id = Some(gesture_id);
+    }
+
+    fn pending_ghost_gesture_id(&self) -> Option<u64> {
+        self.pending_ghost_gesture_id
+    }
+
+    fn take_pending_ghost(&mut self, gesture_id: u64) -> bool {
+        if self.pending_ghost_gesture_id == Some(gesture_id) {
+            self.pending_ghost_gesture_id = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn take_windows_native(
+        &mut self,
+        request_id: u64,
+        gesture_id: u64,
+    ) -> Option<WindowsNativeDrag> {
+        let matches = self.windows_native.as_ref().is_some_and(|native| {
+            native.request_id == request_id && native.gesture_id == gesture_id
+        });
+        matches.then(|| self.windows_native.take()).flatten()
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn windows_release_should_cancel(&self) -> bool {
+        !self
+            .windows_native
+            .as_ref()
+            .is_some_and(|native| native.phase == WindowsNativePhase::Admitted)
     }
 }
 
@@ -227,7 +305,7 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.file_drag.native.is_some() {
+        if self.file_drag.has_native_drag() {
             self.playback_status = "A native file drag is still active".to_string();
             cx.notify();
             return;
@@ -246,6 +324,16 @@ impl Browser {
             self.file_drag.next_gesture_id = self.file_drag.next_gesture_id.wrapping_add(1);
             self.file_drag.active_gesture_id = Some(self.file_drag.next_gesture_id);
         }
+        let Some(gesture_id) = self.file_drag.active_gesture_id else {
+            return;
+        };
+        if let Some(previous_ghost) = self.file_drag.pending_ghost_gesture_id()
+            && previous_ghost != gesture_id
+        {
+            self.file_drag.take_pending_ghost(previous_ghost);
+            cx.stop_active_drag(window);
+        }
+        self.file_drag.mark_pending_ghost(gesture_id);
         if self.file_drag.running.is_some() {
             self.file_drag.queue_latest(intent);
             self.playback_status = "Preparing the latest file selection…".to_string();
@@ -329,14 +417,17 @@ impl Browser {
                 self.finish_canceled_file_drag(gesture_id, window, cx)
             }
             Err(error) => {
-                if self.file_drag.active_gesture_id == Some(gesture_id) {
+                let owns_gesture = self.file_drag.active_gesture_id == Some(gesture_id);
+                let owns_ghost = self.file_drag.pending_ghost_gesture_id() == Some(gesture_id);
+                if owns_gesture {
                     self.file_drag.ready = None;
                     self.file_drag.queued = None;
-                    self.file_drag.gesture_active = false;
-                    self.file_drag.active_gesture_id = None;
+                    self.clear_file_drag_gesture();
                     self.playback_status = format!("File drag unavailable: {error}");
-                    cx.stop_active_drag(window);
                     cx.notify();
+                }
+                if owns_ghost && !self.file_drag.has_native_drag() {
+                    self.stop_owned_file_drag_ghost(gesture_id, window, cx);
                 }
             }
         }
@@ -355,12 +446,13 @@ impl Browser {
             self.start_file_drag_preparation(queued, window, cx);
             return;
         }
-        if self.file_drag.active_gesture_id == Some(gesture_id) {
-            self.file_drag.gesture_active = false;
-            self.file_drag.active_gesture_id = None;
-            if self.file_drag.native.is_none() {
-                cx.stop_active_drag(window);
-            }
+        let owns_gesture = self.file_drag.active_gesture_id == Some(gesture_id);
+        let owns_ghost = self.file_drag.pending_ghost_gesture_id() == Some(gesture_id);
+        if owns_gesture {
+            self.clear_file_drag_gesture();
+        }
+        if owns_ghost && !self.file_drag.has_native_drag() {
+            self.stop_owned_file_drag_ghost(gesture_id, window, cx);
         }
     }
 
@@ -372,45 +464,225 @@ impl Browser {
             return;
         };
         if !prepared_intent_is_current(self, &prepared.intent) {
+            let gesture_id = self.file_drag.active_gesture_id;
             self.clear_file_drag_gesture();
             self.playback_status = "File drag canceled: the file list changed".to_string();
-            cx.stop_active_drag(window);
+            if let Some(gesture_id) = gesture_id {
+                self.stop_owned_file_drag_ghost(gesture_id, window, cx);
+            }
             cx.notify();
             return;
         }
 
-        let window_handle = match raw_window_handle::HasWindowHandle::window_handle(window) {
-            Ok(handle) => handle,
-            Err(_) => {
-                self.clear_file_drag_gesture();
-                self.playback_status =
-                    "File drag unavailable: window handle is unavailable".to_string();
-                cx.stop_active_drag(window);
-                cx.notify();
-                return;
-            }
-        };
-        match wavecrate_platform::start_file_drag(window_handle, &prepared.paths) {
-            Ok(handle) => {
-                let count = prepared.paths.len();
-                self.file_drag.native = Some(NativeDrag { handle, count });
-                self.clear_file_drag_gesture();
-                cx.stop_active_drag(window);
-                self.start_source_registry_poll(cx);
-                self.playback_status =
-                    format!("Dragging {count} file{}", if count == 1 { "" } else { "s" });
-                cx.notify();
-            }
-            Err(error) if retryable_platform_error(&error) && cx.has_active_drag() => {
-                self.file_drag.ready = Some(prepared);
-            }
-            Err(error) => {
-                self.clear_file_drag_gesture();
-                self.playback_status = format!("File drag unavailable: {error}");
-                cx.stop_active_drag(window);
-                cx.notify();
+        #[cfg(target_os = "windows")]
+        {
+            self.schedule_windows_file_drag(prepared, window, cx);
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let window_handle = match raw_window_handle::HasWindowHandle::window_handle(window) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    let gesture_id = self.file_drag.active_gesture_id;
+                    self.clear_file_drag_gesture();
+                    self.playback_status =
+                        "File drag unavailable: window handle is unavailable".to_string();
+                    if let Some(gesture_id) = gesture_id {
+                        self.stop_owned_file_drag_ghost(gesture_id, window, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+            };
+            match wavecrate_platform::start_file_drag(window_handle, &prepared.paths) {
+                Ok(handle) => {
+                    let count = prepared.paths.len();
+                    self.file_drag.native = Some(NativeDrag { handle, count });
+                    let gesture_id = self.file_drag.active_gesture_id;
+                    self.clear_file_drag_gesture();
+                    if let Some(gesture_id) = gesture_id {
+                        self.stop_owned_file_drag_ghost(gesture_id, window, cx);
+                    }
+                    self.start_source_registry_poll(cx);
+                    self.playback_status =
+                        format!("Dragging {count} file{}", if count == 1 { "" } else { "s" });
+                    cx.notify();
+                }
+                Err(error) if retryable_platform_error(&error) && cx.has_active_drag() => {
+                    self.file_drag.ready = Some(prepared);
+                }
+                Err(error) => {
+                    let gesture_id = self.file_drag.active_gesture_id;
+                    self.clear_file_drag_gesture();
+                    self.playback_status = format!("File drag unavailable: {error}");
+                    if let Some(gesture_id) = gesture_id {
+                        self.stop_owned_file_drag_ghost(gesture_id, window, cx);
+                    }
+                    cx.notify();
+                }
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn schedule_windows_file_drag(
+        &mut self,
+        prepared: PreparedDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_drag.windows_native.is_some() {
+            self.file_drag.ready = Some(prepared);
+            return;
+        }
+        let Some(gesture_id) = self.file_drag.active_gesture_id else {
+            return;
+        };
+        self.file_drag.next_request_id = self.file_drag.next_request_id.wrapping_add(1);
+        let request_id = self.file_drag.next_request_id;
+        let PreparedDrag { intent, paths } = prepared;
+        let count = paths.len();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.file_drag.windows_native = Some(WindowsNativeDrag {
+            request_id,
+            gesture_id,
+            count,
+            phase: WindowsNativePhase::Queued,
+            cancellation: Arc::clone(&cancellation),
+        });
+
+        // `spawn_in` schedules this future on GPUI's foreground executor. The first
+        // `update_in` is intentionally limited to a final UI fence and extraction of
+        // owned native inputs. The synchronous OLE call happens only after that borrow
+        // has ended, and therefore never runs inside an App/Window/Context callback.
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let plan = match this.update_in(cx, |view, window, cx| {
+                let Some(native) = view.file_drag.windows_native.as_ref() else {
+                    return None;
+                };
+                if native.request_id != request_id || native.gesture_id != gesture_id {
+                    return None;
+                }
+                let cancellation = Arc::clone(&native.cancellation);
+                let current = !cancellation.load(Ordering::Acquire)
+                    && view.file_drag.gesture_active
+                    && view.file_drag.active_gesture_id == Some(gesture_id)
+                    && cx.has_active_drag()
+                    && prepared_intent_is_current(view, &intent);
+                if !current {
+                    view.abort_windows_file_drag(request_id, gesture_id, window, cx);
+                    return None;
+                }
+
+                // This is the GPUI admission boundary. The native task retains
+                // `cancellation` and `paths`; no Browser or Window value crosses it.
+                if let Some(native) = view.file_drag.windows_native.as_mut() {
+                    native.phase = WindowsNativePhase::Admitted;
+                }
+                view.clear_file_drag_gesture();
+                view.stop_owned_file_drag_ghost(gesture_id, window, cx);
+                view.playback_status =
+                    format!("Dragging {count} file{}", if count == 1 { "" } else { "s" });
+                cx.notify();
+                Some((paths, cancellation))
+            }) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    let _ = this.update(cx, |view, _cx| {
+                        view.abandon_windows_file_drag(request_id, gesture_id);
+                    });
+                    return;
+                }
+            };
+            let Some((paths, cancellation)) = plan else {
+                return;
+            };
+
+            let result = wavecrate_platform::start_file_drag_blocking(paths, cancellation);
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.finish_windows_file_drag(request_id, gesture_id, result, window, cx);
+            });
+        });
+        self.file_drag.task = Some(task);
+        cx.notify();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn abandon_windows_file_drag(&mut self, request_id: u64, gesture_id: u64) {
+        if self
+            .file_drag
+            .take_windows_native(request_id, gesture_id)
+            .is_none()
+        {
+            return;
+        }
+        self.file_drag.task.take();
+        self.file_drag.take_pending_ghost(gesture_id);
+        if self.file_drag.active_gesture_id == Some(gesture_id) {
+            self.clear_file_drag_gesture();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn abort_windows_file_drag(
+        &mut self,
+        request_id: u64,
+        gesture_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .file_drag
+            .take_windows_native(request_id, gesture_id)
+            .is_none()
+        {
+            return;
+        }
+        self.file_drag.task.take();
+        let owns_ghost = self.file_drag.pending_ghost_gesture_id() == Some(gesture_id);
+        let owns_active_drag =
+            self.file_drag.gesture_active && self.file_drag.active_gesture_id == Some(gesture_id);
+        if owns_ghost {
+            self.stop_owned_file_drag_ghost(gesture_id, window, cx);
+        }
+        if owns_active_drag {
+            self.clear_file_drag_gesture();
+        }
+        if owns_ghost || owns_active_drag {
+            self.playback_status = "File drag canceled".to_string();
+            cx.notify();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_windows_file_drag(
+        &mut self,
+        request_id: u64,
+        gesture_id: u64,
+        result: Result<FileDragCompletion, FileDragError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(native) = self.file_drag.take_windows_native(request_id, gesture_id) else {
+            return;
+        };
+        let count = native.count;
+        self.file_drag.task.take();
+        self.stop_owned_file_drag_ghost(gesture_id, window, cx);
+        if self.file_drag.active_gesture_id == Some(gesture_id) {
+            self.clear_file_drag_gesture();
+        }
+        self.playback_status = match result {
+            Ok(FileDragCompletion::Copy) => format!(
+                "Copied {count} dragged file{}",
+                if count == 1 { "" } else { "s" }
+            ),
+            Ok(FileDragCompletion::Cancelled) => "File drag canceled".to_string(),
+            Ok(FileDragCompletion::Other) => "File drag finished".to_string(),
+            Err(error) => format!("File drag unavailable: {error}"),
+        };
+        cx.notify();
     }
 
     pub(super) fn on_file_drag_move(
@@ -425,8 +697,14 @@ impl Browser {
         if payload.browser.entity_id() != cx.entity().entity_id() {
             return;
         }
+        #[cfg(target_os = "windows")]
+        if self.file_drag.windows_native.is_some() {
+            return;
+        }
         if self.file_drag.gesture_active {
             self.try_admit_file_drag(window, cx);
+        } else if let Some(gesture_id) = self.file_drag.pending_ghost_gesture_id() {
+            self.stop_owned_file_drag_ghost(gesture_id, window, cx);
         } else {
             cx.stop_active_drag(window);
         }
@@ -450,6 +728,16 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(target_os = "windows")]
+        if self.file_drag.windows_native.is_some()
+            && !self.file_drag.windows_release_should_cancel()
+        {
+            // Once the Windows native task has been admitted, the platform owns
+            // button/cancellation handling. In particular, do not tear down the
+            // retained token or task merely because GPUI reports pointer release;
+            // the adapter rechecks the physical button before entering OLE.
+            return;
+        }
         self.cancel_file_drag_with_window(window, cx);
     }
 
@@ -462,15 +750,28 @@ impl Browser {
         self.file_drag.active_gesture_id = None;
     }
 
+    fn stop_owned_file_drag_ghost(
+        &mut self,
+        gesture_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.file_drag.take_pending_ghost(gesture_id) {
+            return false;
+        }
+        cx.stop_active_drag(window);
+        true
+    }
+
     pub(super) fn cancel_file_drag_with_window(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_gesture_active = self.file_drag.gesture_active;
+        let ghost_gesture_id = self.file_drag.pending_ghost_gesture_id();
         self.cancel_file_drag();
-        if was_gesture_active {
-            cx.stop_active_drag(window);
+        if let Some(gesture_id) = ghost_gesture_id {
+            self.stop_owned_file_drag_ghost(gesture_id, window, cx);
         }
     }
 
@@ -508,6 +809,11 @@ impl Browser {
         self.file_drag.task.take();
         self.file_drag.running = None;
         self.file_drag.native = None;
+        self.file_drag.pending_ghost_gesture_id = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.file_drag.windows_native = None;
+        }
     }
 }
 
@@ -1126,6 +1432,109 @@ mod tests {
         assert!(state.ready.is_none());
         assert!(!state.gesture_active);
         assert!(state.active_gesture_id.is_none());
+        assert_eq!(
+            state.running.as_ref().map(|running| running.request_id),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn cancellation_keeps_the_running_slot_for_late_completion() {
+        let entry = audio_file("/tmp/running.wav");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut state = FileDragState::default();
+        state.running = Some(RunningPreparation {
+            request_id: 11,
+            gesture_id: 8,
+            cancellation: Arc::clone(&cancellation),
+        });
+        state.gesture_active = true;
+        state.active_gesture_id = Some(8);
+        state.queue_latest(intent_for(&entry, 1));
+
+        // Release, a new press, or a source/projection invalidation all use this
+        // transition. The in-flight task remains owned until its completion callback
+        // drains it, preventing a second preparation from running concurrently.
+        state.cancel_unadmitted();
+
+        assert!(cancellation.load(Ordering::Acquire));
+        assert!(state.running.is_some());
+        assert!(state.queued.is_none());
+        assert!(!state.gesture_active);
+        assert!(state.active_gesture_id.is_none());
+    }
+
+    #[test]
+    fn source_cancel_retains_ghost_until_matching_deferred_abort() {
+        let mut state = FileDragState::default();
+        state.gesture_active = true;
+        state.active_gesture_id = Some(21);
+        state.mark_pending_ghost(21);
+
+        state.cancel_unadmitted();
+
+        assert!(!state.gesture_active);
+        assert!(state.active_gesture_id.is_none());
+        assert_eq!(state.pending_ghost_gesture_id(), Some(21));
+        assert!(state.take_pending_ghost(21));
+        assert!(state.pending_ghost_gesture_id().is_none());
+    }
+
+    #[test]
+    fn old_deferred_abort_cannot_clear_a_newer_ghost_owner() {
+        let mut state = FileDragState::default();
+        state.mark_pending_ghost(21);
+        state.cancel_unadmitted();
+        state.mark_pending_ghost(22);
+
+        assert!(!state.take_pending_ghost(21));
+        assert_eq!(state.pending_ghost_gesture_id(), Some(22));
+        assert!(state.take_pending_ghost(22));
+        assert!(state.pending_ghost_gesture_id().is_none());
+    }
+
+    #[test]
+    fn windows_release_cancels_queued_launch_but_drops_only_a_terminal_slot() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut state = FileDragState::default();
+        state.windows_native = Some(WindowsNativeDrag {
+            request_id: 12,
+            gesture_id: 9,
+            count: 1,
+            phase: WindowsNativePhase::Queued,
+            cancellation: Arc::clone(&cancellation),
+        });
+
+        assert!(state.windows_release_should_cancel());
+        state.cancel_unadmitted();
+
+        assert!(cancellation.load(Ordering::Acquire));
+        assert!(state.windows_native.is_some());
+
+        let admitted_cancellation = Arc::new(AtomicBool::new(false));
+        state.windows_native = Some(WindowsNativeDrag {
+            request_id: 13,
+            gesture_id: 10,
+            count: 1,
+            phase: WindowsNativePhase::Admitted,
+            cancellation: Arc::clone(&admitted_cancellation),
+        });
+        assert_eq!(
+            state.windows_native.as_ref().map(|native| native.count),
+            Some(1)
+        );
+        assert!(!state.windows_release_should_cancel());
+        assert!(!admitted_cancellation.load(Ordering::Acquire));
+
+        // A later left press, Escape, or source invalidation still cancels an
+        // admitted native operation through its token.
+        state.cancel_unadmitted();
+        assert!(admitted_cancellation.load(Ordering::Acquire));
+
+        assert!(state.take_windows_native(12, 9).is_none());
+        assert!(state.windows_native.is_some());
+        assert!(state.take_windows_native(13, 10).is_some());
+        assert!(state.windows_native.is_none());
     }
 
     #[test]
