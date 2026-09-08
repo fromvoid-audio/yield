@@ -46,6 +46,7 @@ mod history;
 mod motion;
 mod normalized_audition;
 mod preferences;
+mod shortcut_help;
 mod sidebar;
 mod source_recovery;
 mod source_registry;
@@ -341,6 +342,7 @@ pub(crate) struct Browser {
     theme_task: Option<Task<()>>,
     theme_settings_open: bool,
     audio_settings_open: bool,
+    shortcut_help: shortcut_help::ShortcutHelpState,
     audio_output_focus_handle: FocusHandle,
     audio_output_dropdown: Option<audio_output::AudioOutputDropdown>,
     audio_output_option_index: usize,
@@ -556,6 +558,7 @@ impl Browser {
             theme_task: None,
             theme_settings_open: false,
             audio_settings_open: false,
+            shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
             audio_output_focus_handle: cx.focus_handle(),
             audio_output_dropdown: None,
             audio_output_option_index: 0,
@@ -1898,6 +1901,32 @@ impl Browser {
         let function = event.keystroke.modifiers.function;
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
+        match shortcut_help::key_action(
+            self.shortcut_help.is_open(),
+            key,
+            secondary,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            shortcut_help::KeyAction::Open | shortcut_help::KeyAction::Close => {
+                self.toggle_shortcut_help(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            shortcut_help::KeyAction::Scroll(action) => {
+                shortcut_help::scroll(self.shortcut_help.scroll_handle(), action);
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            shortcut_help::KeyAction::Consume => {
+                cx.stop_propagation();
+                return;
+            }
+            shortcut_help::KeyAction::Ignore => {}
+        }
         if self.handle_context_menu_key_down(event, window, cx) {
             return;
         }

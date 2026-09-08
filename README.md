@@ -127,6 +127,9 @@ in effect for the loaded file. The speaker control beside the volume slider togg
 normalized audition. It prepares the active span in the background, retains your
 volume setting, and saves the toggle between sessions.
 
+Use the ? toolbar control or Cmd/Ctrl-/ to open keyboard help. The dialog
+supports arrow/page-key scrolling and restores focus when closed.
+
 Full parity is not complete. Remaining workflows include full tag-library
 management and naming, physical file operations and recovery, waveform
 editing/export, analysis and timing controls, region drag-out, and additional settings

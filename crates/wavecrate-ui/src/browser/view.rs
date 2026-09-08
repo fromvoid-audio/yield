@@ -22,6 +22,7 @@ use super::display_labels;
 use super::file_drag;
 use super::motion;
 use super::normalized_audition;
+use super::shortcut_help;
 use super::tag_filter;
 use super::volume;
 use super::waveform;
@@ -1142,6 +1143,27 @@ impl Render for Browser {
                             .text_size(px(theme.typography.small_size))
                             .on_click(cx.listener(Self::toggle_theme_settings))
                             .child("⚙"),
+                    )
+                    .child(
+                        div()
+                            .id("shortcut-help-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .tooltip(shortcut_help::shortcut_help_tooltip)
+                            .on_click(cx.listener(Self::toggle_shortcut_help_from_toolbar))
+                            .text_size(px(theme.typography.title_size))
+                            .text_color(color(theme.colors.text_muted))
+                            .child("?"),
                     ),
             )
             .when(self.theme_settings_open, |element| {
@@ -1342,6 +1364,14 @@ impl Render for Browser {
             })
             .when(self.context_menu.is_some(), |element| {
                 element.child(context_menu::render_overlay(self, &theme, cx))
+            })
+            .when(self.shortcut_help.is_open(), |element| {
+                element.child(shortcut_help::render(
+                    self,
+                    theme.clone(),
+                    window.bounds().size,
+                    cx,
+                ))
             })
     }
 }
