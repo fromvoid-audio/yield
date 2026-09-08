@@ -192,6 +192,30 @@ pub enum SourceDbError {
     /// A bounded tag-page vocabulary prefix contained an embedded NUL byte.
     #[error("Tag page prefix contains an embedded NUL byte")]
     TagPagePrefixContainsNul,
+    /// A source tag filter request contained too many required tokens.
+    #[error("Tag filter contains {actual} tokens; maximum is {max}")]
+    TagFilterTooManyTokens {
+        /// Maximum number of required tokens accepted by one filter request.
+        max: usize,
+        /// Number of tokens supplied by the caller.
+        actual: usize,
+    },
+    /// One source tag filter token exceeded its UTF-8 byte budget.
+    #[error("Tag filter token is {actual} UTF-8 bytes; maximum is {max}")]
+    TagFilterTokenTooLong {
+        /// Maximum UTF-8 byte length of one required token.
+        max: usize,
+        /// UTF-8 byte length supplied by the caller.
+        actual: usize,
+    },
+    /// A source tag filter request exceeded its aggregate UTF-8 byte budget.
+    #[error("Tag filter input is {actual} UTF-8 bytes; maximum is {max}")]
+    TagFilterInputTooLarge {
+        /// Maximum aggregate UTF-8 byte length accepted by one filter request.
+        max: usize,
+        /// Aggregate UTF-8 byte length supplied by the caller.
+        actual: usize,
+    },
     /// Read-only mode requires an existing database file.
     #[error("Read-only source DB mode requires an existing database file: {0}")]
     ReadOnlyDatabaseMissing(PathBuf),

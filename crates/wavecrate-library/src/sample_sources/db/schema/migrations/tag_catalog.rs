@@ -21,7 +21,9 @@ pub(super) fn ensure_tag_catalog_schema(connection: &Connection) -> Result<(), S
                 FOREIGN KEY(tag_id) REFERENCES source_tags(id) ON DELETE CASCADE
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS idx_wav_file_tags_tag_id
-                ON wav_file_tags(tag_id);",
+                ON wav_file_tags(tag_id);
+            CREATE INDEX IF NOT EXISTS idx_source_tags_normalized_text_nocase
+                ON source_tags(normalized_text COLLATE NOCASE);",
         )
         .map_err(map_sql_error)?;
     Ok(())

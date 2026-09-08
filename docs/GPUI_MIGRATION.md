@@ -1461,3 +1461,29 @@ and diff checks passed. Primary diff review found and resolved page cloning,
 misleading empty-state text, inactive-source invalidation and stale-failure retry
 issues. Native chip interaction remains unverified; existing running previews were
 preserved. Completion and assigned-tag filtering remain in progress.
+
+A clean detached checkout of `2e4b38c19` produced
+`target/qa/Wavecrate Chip Preview 2e4b38c.app`. Compilation and strict ad-hoc signature
+verification passed. This separate bundle was not launched by the agent; existing
+preview sessions remain untouched.
+
+### Assigned-tag filter database primitive
+
+The library now streams matching live supported relative paths at one exact source
+revision. Required tokens are bounded, trimmed, ASCII-lowercased and deduplicated;
+matching requires every distinct token and preserves punctuation. The visitor
+borrows each path and does not receive tag-label payloads or a materialized result
+set. SQLite progress cancellation and scoped cleanup cover expensive query work,
+visitor failures and normal completion.
+
+A NOCASE index supports candidate lookup, while a binary lowercase residual keeps
+embedded-NUL suffixes exact. Counting distinct required token ordinals handles
+multiple legacy IDs differing only by case. The additive index is created through
+normal writable schema repair; legacy read-only databases remain compatible but
+may use a slower query plan until repaired.
+
+All 493 library tests passed, including six focused filter tests, along with
+library compilation, formatting and diff checks. Query-plan tests require indexed
+searches on both normalized tags and tag assignments. Primary review corrected the
+initial binary-only lookup, case-variant counting and embedded-NUL equality issues.
+Catalog publication and browser filtering are separate follow-on integration.

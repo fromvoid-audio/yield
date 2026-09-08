@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
 
+use rusqlite::params;
 use tempfile::tempdir;
 
 use super::super::{
-    SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
-    SourceDatabase, SourceDbError,
+    SOURCE_TAG_FILTER_MAX_TAGS, SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceDatabase, SourceDbError,
 };
 
 #[test]
@@ -468,4 +470,392 @@ fn selected_tag_page_accepts_full_path_count_without_sqlite_bind_limit() {
     assert_eq!(page.entries[0].normalized_text, "boundary");
     assert_eq!(page.entries[0].assignment_count, Some(1));
     assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn tag_filter_visits_casefolded_and_deduplicated_punctuation_exact_matches() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["one.wav", "two.wav", "three.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+    db.assign_tag_to_path(Path::new("one.wav"), "Warm Tone")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("one.wav"), "foo%literal")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("two.wav"), "warm tone")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("two.wav"), "foo_literal")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("three.wav"), "warm tone")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("three.wav"), "foo,bar")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut matches = Vec::new();
+    let result = db
+        .visit_paths_matching_tags_at_revision(
+            revision,
+            &[
+                String::from(" WARM TONE "),
+                String::from("warm tone"),
+                String::from("FOO%LITERAL"),
+            ],
+            &cancellation,
+            |path| {
+                matches.push(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(matches, vec![String::from("one.wav")]);
+    assert_eq!(result.revision, revision);
+    assert_eq!(result.matched_paths, 1);
+
+    matches.clear();
+    let result = db
+        .visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("foo,bar")],
+            &cancellation,
+            |path| {
+                matches.push(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(matches, vec![String::from("three.wav")]);
+    assert_eq!(result.matched_paths, 1);
+
+    matches.clear();
+    let result = db
+        .visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("foo_literal")],
+            &cancellation,
+            |path| {
+                matches.push(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(matches, vec![String::from("two.wav")]);
+    assert_eq!(result.matched_paths, 1);
+}
+
+#[test]
+fn tag_filter_excludes_missing_and_unsupported_rows_and_empty_matches_live_supported() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["live.wav", "missing.wav", "notes.txt", "._sidecar.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(path), "shared").unwrap();
+    }
+    db.set_missing(Path::new("missing.wav"), true).unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut matches = Vec::new();
+    let result = db
+        .visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("SHARED")],
+            &cancellation,
+            |path| {
+                matches.push(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(matches, vec![String::from("live.wav")]);
+    assert_eq!(result.matched_paths, 1);
+
+    matches.clear();
+    let result = db
+        .visit_paths_matching_tags_at_revision(revision, &[] as &[String], &cancellation, |path| {
+            matches.push(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(matches, vec![String::from("live.wav")]);
+    assert_eq!(result.matched_paths, 1);
+}
+
+#[test]
+fn tag_filter_rejects_stale_and_overlarge_requests() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    db.assign_tag_to_path(Path::new("one.wav"), "shared")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    db.assign_tag_to_path(Path::new("one.wav"), "later")
+        .unwrap();
+    assert!(matches!(
+        db.visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("shared")],
+            &cancellation,
+            |_| Ok(())
+        ),
+        Err(SourceDbError::Unexpected)
+    ));
+
+    let too_many = (0..=SOURCE_TAG_FILTER_MAX_TAGS)
+        .map(|index| format!("tag-{index}"))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        db.visit_paths_matching_tags_at_revision(
+            revision + 1,
+            &too_many,
+            &cancellation,
+            |_| Ok(())
+        ),
+        Err(SourceDbError::TagFilterTooManyTokens { .. })
+    ));
+    let too_long = vec!["x".repeat(SOURCE_TAG_FILTER_MAX_TOKEN_BYTES + 1)];
+    assert!(matches!(
+        db.visit_paths_matching_tags_at_revision(
+            revision + 1,
+            &too_long,
+            &cancellation,
+            |_| Ok(())
+        ),
+        Err(SourceDbError::TagFilterTokenTooLong { .. })
+    ));
+}
+
+#[test]
+fn tag_filter_cancellation_and_visitor_errors_leave_no_temp_scope() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["one.wav", "two.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+        db.assign_tag_to_path(Path::new(path), "shared").unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(true));
+    let mut visited = 0;
+    assert!(matches!(
+        db.visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("shared")],
+            &cancellation,
+            |_| {
+                visited += 1;
+                Ok(())
+            }
+        ),
+        Err(SourceDbError::Canceled)
+    ));
+    assert_eq!(visited, 0);
+
+    cancellation.store(false, std::sync::atomic::Ordering::Release);
+    let cancellation_for_visitor = Arc::clone(&cancellation);
+    let mut visited = 0;
+    assert!(matches!(
+        db.visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("shared")],
+            &cancellation,
+            |_| {
+                visited += 1;
+                cancellation_for_visitor.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        ),
+        Err(SourceDbError::Canceled)
+    ));
+    assert_eq!(visited, 1);
+
+    cancellation.store(false, std::sync::atomic::Ordering::Release);
+    let mut visited = 0;
+    assert!(matches!(
+        db.visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("shared")],
+            &cancellation,
+            |_| {
+                visited += 1;
+                Err(SourceDbError::Unexpected)
+            }
+        ),
+        Err(SourceDbError::Unexpected)
+    ));
+    assert_eq!(visited, 1);
+
+    let mut matches = Vec::new();
+    let result = db
+        .visit_paths_matching_tags_at_revision(
+            revision,
+            &[String::from("shared")],
+            &cancellation,
+            |path| {
+                matches.push(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        matches,
+        vec![String::from("one.wav"), String::from("two.wav")]
+    );
+    assert_eq!(result.matched_paths, 2);
+}
+
+#[test]
+fn tag_filter_does_not_decode_legacy_display_labels_and_uses_tag_id_index() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("legacy.wav"), 10, 5).unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+            params!["legacy", "x".repeat(1_000_000)],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+            params!["LEGACY", "legacy variant"],
+        )
+        .unwrap();
+    let tag_id: i64 = db
+        .connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text = 'legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+            params!["legacy.wav", tag_id],
+        )
+        .unwrap();
+    let variant_tag_id: i64 = db
+        .connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text = 'LEGACY'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+            params!["legacy.wav", variant_tag_id],
+        )
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut matches = Vec::new();
+    db.visit_paths_matching_tags_at_revision(
+        revision,
+        &[String::from("LEGACY")],
+        &cancellation,
+        |path| {
+            matches.push(path.to_owned());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(matches, vec![String::from("legacy.wav")]);
+
+    db.connection
+        .execute_batch(
+            "CREATE TEMP TABLE tag_filter_tokens (
+                ordinal INTEGER PRIMARY KEY,
+                normalized_text TEXT NOT NULL
+            ) WITHOUT ROWID",
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO temp.tag_filter_tokens (ordinal, normalized_text) VALUES (?1, ?2)",
+            params![0_i64, "legacy"],
+        )
+        .unwrap();
+    let explain_sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::matching_tag_filter_paths_sql_for_test()
+    );
+    let plan = db
+        .connection
+        .prepare(&explain_sql)
+        .unwrap()
+        .query_map([1_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|detail| {
+            detail.contains("SEARCH") && detail.contains("idx_wav_file_tags_tag_id")
+        }),
+        "tag filter plan did not use tag-id index: {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|detail| {
+            detail.contains("SEARCH") && detail.contains("idx_source_tags_normalized_text_nocase")
+        }),
+        "tag filter plan did not use normalized-token index: {plan:?}"
+    );
+}
+
+#[test]
+fn tag_filter_ascii_casefold_does_not_truncate_embedded_nul_values() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("nul.wav"), 10, 5).unwrap();
+    let stored = "A\0x";
+    db.connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+            params![stored, "nul suffix"],
+        )
+        .unwrap();
+    let tag_id: i64 = db
+        .connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text = ?1",
+            params![stored],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+            params!["nul.wav", tag_id],
+        )
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    let mut matches = Vec::new();
+    db.visit_paths_matching_tags_at_revision(
+        revision,
+        &[String::from("a\0x")],
+        &cancellation,
+        |path| {
+            matches.push(path.to_owned());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(matches, vec![String::from("nul.wav")]);
+
+    matches.clear();
+    db.visit_paths_matching_tags_at_revision(
+        revision,
+        &[String::from("a\0y")],
+        &cancellation,
+        |path| {
+            matches.push(path.to_owned());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(matches.is_empty());
 }

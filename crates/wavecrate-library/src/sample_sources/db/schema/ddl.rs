@@ -395,6 +395,8 @@ const INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_wav_files_missing
          WHERE skip_reason IS NOT NULL;
      CREATE INDEX IF NOT EXISTS idx_wav_file_tags_tag_id
          ON wav_file_tags(tag_id);
+     CREATE INDEX IF NOT EXISTS idx_source_tags_normalized_text_nocase
+         ON source_tags(normalized_text COLLATE NOCASE);
      CREATE INDEX IF NOT EXISTS idx_wav_file_collections_collection
          ON wav_file_collections(collection);
      CREATE INDEX IF NOT EXISTS idx_pending_wav_renames_hash

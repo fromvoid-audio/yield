@@ -1,24 +1,34 @@
 use std::collections::{BTreeSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
-use rusqlite::{OptionalExtension, Transaction};
+use rusqlite::types::Type;
+use rusqlite::{OptionalExtension, Params, Transaction};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
     SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
-    SourceDatabase, SourceDbError, SourceTag, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry, SourceTagUsage,
+    SourceDatabase, SourceDbError, SourceTag, SourceTagFilterResult, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
 };
 use super::identity::normalize_tag_identity;
+use super::{
+    SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
+    SOURCE_TAG_FILTER_MAX_TOKEN_BYTES,
+};
 
 const DEFAULT_TAG_LIMIT: usize = 32;
 const TAG_PAGE_PREVIEW_CHAR_LIMIT: usize = 256;
 const TAG_PAGE_STAGING_CHUNK_SIZE: usize = 128;
+const TAG_FILTER_PROGRESS_OPS: i32 = 256;
 
 impl SourceDatabase {
     /// Return the most-used persisted normal tags, ordered by usage then label.
@@ -131,6 +141,75 @@ impl SourceDatabase {
             .collect())
     }
 
+    /// Visit live supported paths carrying every required source tag at one exact revision.
+    ///
+    /// Filter tokens are trimmed, ASCII-lowercased, and deduplicated without changing internal
+    /// punctuation. At most 64 tokens are accepted; each supplied token is limited to 1,024
+    /// UTF-8 bytes and the aggregate input is limited to 64 KiB. Empty input visits every live
+    /// supported path. The visitor receives a borrowed path that is valid only for its call and
+    /// may return a source database error to stop the read. The cancellation flag is checked
+    /// between rows and is also wired into SQLite's progress handler so a large grouped query can
+    /// stop before it produces its first row.
+    pub fn visit_paths_matching_tags_at_revision<S>(
+        &self,
+        expected_revision: u64,
+        required_tags: &[S],
+        cancellation: &Arc<AtomicBool>,
+        mut visit: impl FnMut(&str) -> Result<(), SourceDbError>,
+    ) -> Result<SourceTagFilterResult, SourceDbError>
+    where
+        S: AsRef<str>,
+    {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let required_tags = normalize_tag_filter_tokens(required_tags)?;
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let revision = source_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(SourceDbError::Unexpected);
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+
+        let matched_paths = if required_tags.is_empty() {
+            let sql = all_supported_tag_filter_paths_sql();
+            let _progress_handler =
+                TagFilterProgressHandlerGuard::install(&self.connection, cancellation);
+            visit_tag_filter_rows(&transaction, &sql, [], cancellation, &mut visit)?
+        } else {
+            stage_tag_filter_tokens(&transaction, &required_tags, cancellation)?;
+            let sql = matching_tag_filter_paths_sql();
+            let required_count = i64::try_from(required_tags.len()).unwrap_or(i64::MAX);
+            let _progress_handler =
+                TagFilterProgressHandlerGuard::install(&self.connection, cancellation);
+            visit_tag_filter_rows(
+                &transaction,
+                &sql,
+                [required_count],
+                cancellation,
+                &mut visit,
+            )?
+        };
+
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceTagFilterResult {
+            revision,
+            matched_paths: matched_paths as u64,
+        })
+    }
+
     /// Fetch tags assigned to an exact bounded set of source-relative paths at one revision.
     ///
     /// Paths are normalized and deduplicated before the single read transaction. The returned
@@ -241,6 +320,190 @@ impl SourceDatabase {
             entries,
             next_cursor,
         })
+    }
+}
+
+fn normalize_tag_filter_tokens<S>(required_tags: &[S]) -> Result<Vec<String>, SourceDbError>
+where
+    S: AsRef<str>,
+{
+    if required_tags.len() > SOURCE_TAG_FILTER_MAX_TAGS {
+        return Err(SourceDbError::TagFilterTooManyTokens {
+            max: SOURCE_TAG_FILTER_MAX_TAGS,
+            actual: required_tags.len(),
+        });
+    }
+
+    let mut input_bytes = 0usize;
+    let mut normalized = BTreeSet::new();
+    for required_tag in required_tags {
+        let raw = required_tag.as_ref();
+        let raw_bytes = raw.len();
+        if raw_bytes > SOURCE_TAG_FILTER_MAX_TOKEN_BYTES {
+            return Err(SourceDbError::TagFilterTokenTooLong {
+                max: SOURCE_TAG_FILTER_MAX_TOKEN_BYTES,
+                actual: raw_bytes,
+            });
+        }
+        input_bytes = input_bytes.saturating_add(raw_bytes);
+        if input_bytes > SOURCE_TAG_FILTER_MAX_INPUT_BYTES {
+            return Err(SourceDbError::TagFilterInputTooLarge {
+                max: SOURCE_TAG_FILTER_MAX_INPUT_BYTES,
+                actual: input_bytes,
+            });
+        }
+
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            normalized.insert(trimmed.to_ascii_lowercase());
+        }
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn stage_tag_filter_tokens(
+    transaction: &Transaction<'_>,
+    required_tags: &[String],
+    cancellation: &Arc<AtomicBool>,
+) -> Result<(), SourceDbError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(SourceDbError::Canceled);
+    }
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE tag_filter_tokens (
+                ordinal INTEGER PRIMARY KEY,
+                normalized_text TEXT NOT NULL
+            ) WITHOUT ROWID",
+        )
+        .map_err(map_sql_error)?;
+    let mut statement = transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO temp.tag_filter_tokens (ordinal, normalized_text)
+             VALUES (?1, ?2)",
+        )
+        .map_err(map_sql_error)?;
+    for (ordinal, required_tag) in required_tags.iter().enumerate() {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        statement
+            .execute(rusqlite::params![ordinal as i64, required_tag])
+            .map_err(map_sql_error)?;
+    }
+    drop(statement);
+    if cancellation.load(Ordering::Acquire) {
+        return Err(SourceDbError::Canceled);
+    }
+    Ok(())
+}
+
+fn all_supported_tag_filter_paths_sql() -> String {
+    format!(
+        "SELECT path
+         FROM wav_files
+         WHERE {filter} AND missing = 0
+         ORDER BY path COLLATE BINARY ASC",
+        filter = crate::sample_sources::supported_audio_where_clause(),
+    )
+}
+
+fn matching_tag_filter_paths_sql() -> String {
+    // Keep the indexed NOCASE candidate lookup, then use SQLite's ASCII lower() with a binary
+    // comparison so NOCASE's embedded-NUL truncation cannot turn distinct tokens into a match.
+    format!(
+        "SELECT wft.path
+         FROM temp.tag_filter_tokens AS required
+         CROSS JOIN source_tags AS st
+           ON st.normalized_text COLLATE NOCASE = required.normalized_text
+          AND lower(st.normalized_text) = required.normalized_text COLLATE BINARY
+         CROSS JOIN wav_file_tags AS wft
+           ON wft.tag_id = st.id
+         JOIN wav_files AS wf ON wf.path = wft.path
+         WHERE {filter} AND wf.missing = 0
+         GROUP BY wft.path
+         HAVING COUNT(DISTINCT required.ordinal) = ?1
+         ORDER BY wft.path COLLATE BINARY ASC",
+        filter = crate::sample_sources::supported_audio_where_clause()
+            .replace("path", "wf.path")
+            .replace("extension", "wf.extension"),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn matching_tag_filter_paths_sql_for_test() -> String {
+    matching_tag_filter_paths_sql()
+}
+
+fn visit_tag_filter_rows(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    params: impl Params,
+    cancellation: &Arc<AtomicBool>,
+    visit: &mut impl FnMut(&str) -> Result<(), SourceDbError>,
+) -> Result<usize, SourceDbError> {
+    let mut statement = transaction
+        .prepare_cached(sql)
+        .map_err(map_tag_filter_sql_error)?;
+    let mut rows = statement.query(params).map_err(map_tag_filter_sql_error)?;
+    let mut matched_paths = 0usize;
+    while let Some(row) = rows.next().map_err(map_tag_filter_sql_error)? {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let path = row
+            .get_ref(0)
+            .map_err(map_tag_filter_sql_error)?
+            .as_str()
+            .map_err(|error| {
+                map_tag_filter_sql_error(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    Type::Text,
+                    Box::new(error),
+                ))
+            })?;
+        visit(path)?;
+        matched_paths = matched_paths.saturating_add(1);
+    }
+    if cancellation.load(Ordering::Acquire) {
+        return Err(SourceDbError::Canceled);
+    }
+    Ok(matched_paths)
+}
+
+fn map_tag_filter_sql_error(error: rusqlite::Error) -> SourceDbError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(sql_error, _)
+            if sql_error.code == rusqlite::ErrorCode::OperationInterrupted
+    ) {
+        SourceDbError::Canceled
+    } else {
+        map_sql_error(error)
+    }
+}
+
+struct TagFilterProgressHandlerGuard<'connection> {
+    connection: &'connection rusqlite::Connection,
+}
+
+impl<'connection> TagFilterProgressHandlerGuard<'connection> {
+    fn install(
+        connection: &'connection rusqlite::Connection,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Self {
+        let cancellation = Arc::clone(cancellation);
+        connection.progress_handler(
+            TAG_FILTER_PROGRESS_OPS,
+            Some(move || cancellation.load(Ordering::Acquire)),
+        );
+        Self { connection }
+    }
+}
+
+impl Drop for TagFilterProgressHandlerGuard<'_> {
+    fn drop(&mut self) {
+        self.connection.progress_handler(0, None::<fn() -> bool>);
     }
 }
 

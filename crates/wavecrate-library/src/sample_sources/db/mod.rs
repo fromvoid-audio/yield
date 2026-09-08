@@ -62,6 +62,10 @@ pub use open_profiles::SourceDatabaseConnectionRole;
 /// Metadata retained for a pruned row so later scans can recover rename state.
 pub use pending_renames::{PendingRenameDiagnostics, PendingRenameEntry, PendingRenamePruneReport};
 pub use rename_metadata::RenameMetadataSnapshot;
+pub use tags::{
+    SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
+    SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SourceTagFilterResult,
+};
 pub use types::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
     ExistingFileMetadataUpdate, Rating, SampleCollection, SampleSoundType, SourceDirectoryEntry,
