@@ -36,12 +36,18 @@ pub const MAX_CURATION_OPERATION_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum estimated metadata bytes retained by one compound operation outcome.
 pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
 
-// This is deliberately conservative: it covers the bounded metadata row plus vector and batch
-// bookkeeping while the input batches and aggregate receipt coexist in the worker.
+/// Maximum UTF-8 byte length of a curation tag label before identity normalization.
+pub const MAX_CURATION_TAG_LABEL_BYTES: usize =
+    wavecrate_library::sample_sources::SOURCE_CURATION_MAX_TAG_LABEL_BYTES;
+
+// This is deliberately conservative: it covers the fixed metadata row plus vector and batch
+// bookkeeping while the input batches and aggregate receipt coexist in the worker. Variable tag
+// label bytes are accounted separately from this fixed allowance.
 const ESTIMATED_RECEIPT_ROW_BYTES: usize = 256;
 const ESTIMATED_OPERATION_BATCH_BYTES: usize = 64;
-// Path payloads are accounted separately; collection membership is the only other variable
-// row payload and has six fixed slots. Keep scalar command additions within the row allowance.
+// Path payloads and tag labels are accounted separately; tag labels remain in input updates while
+// collection membership is the only variable receipt-row payload and has six fixed slots. Keep
+// scalar command additions within the row allowance.
 const _: () = assert!(
     std::mem::size_of::<SourceCurationUpdate>()
         + std::mem::size_of::<BrowserFileMetadata>()
@@ -182,6 +188,20 @@ pub enum CatalogCurationRequestError {
         /// Rejected raw collection value.
         value: u8,
     },
+    /// A curation tag label was empty or contained only whitespace.
+    #[error("curation request contains an empty tag label")]
+    EmptyTagLabel,
+    /// A curation tag label contained an embedded NUL byte.
+    #[error("curation request tag label contains an embedded NUL byte")]
+    TagLabelContainsNul,
+    /// A curation tag label exceeded the bounded UTF-8 byte length.
+    #[error("curation request tag label is {actual} UTF-8 bytes; maximum is {max}")]
+    TagLabelTooLong {
+        /// Maximum accepted UTF-8 byte length.
+        max: usize,
+        /// Supplied UTF-8 byte length.
+        actual: usize,
+    },
     /// The source has no current desired lifecycle admission.
     #[error("source is not admitted for curation: {0}")]
     NotRegistered(SourceId),
@@ -304,6 +324,7 @@ fn validate_operation(
     }
     let mut total_updates = 0usize;
     let mut path_bytes = 0usize;
+    let mut label_bytes = 0usize;
     for batch in batches {
         if batch.is_empty() {
             return Err(CatalogCurationRequestError::Empty);
@@ -318,6 +339,7 @@ fn validate_operation(
         for update in batch {
             validate_update(update)?;
             path_bytes = path_bytes.saturating_add(path_byte_len(update_path(update)));
+            label_bytes = label_bytes.saturating_add(update_label_byte_len(update));
         }
     }
     if total_updates > MAX_CURATION_OPERATION_UPDATES {
@@ -337,6 +359,7 @@ fn validate_operation(
         batches.len(),
         total_updates,
         path_bytes,
+        label_bytes,
     );
     if estimated_payload_bytes > MAX_CURATION_OPERATION_RECEIPT_BYTES {
         return Err(CatalogCurationRequestError::OperationPayloadTooLarge {
@@ -378,8 +401,26 @@ fn validate_update(update: &SourceCurationUpdate) -> Result<(), CatalogCurationR
                 value: collection.index(),
             })
         }
+        SourceCurationUpdate::AddTag { label, .. }
+        | SourceCurationUpdate::RemoveTag { label, .. } => validate_tag_label(label),
         _ => Ok(()),
     }
+}
+
+fn validate_tag_label(label: &str) -> Result<(), CatalogCurationRequestError> {
+    if label.len() > MAX_CURATION_TAG_LABEL_BYTES {
+        return Err(CatalogCurationRequestError::TagLabelTooLong {
+            max: MAX_CURATION_TAG_LABEL_BYTES,
+            actual: label.len(),
+        });
+    }
+    if label.contains('\0') {
+        return Err(CatalogCurationRequestError::TagLabelContainsNul);
+    }
+    if label.split_whitespace().next().is_none() {
+        return Err(CatalogCurationRequestError::EmptyTagLabel);
+    }
+    Ok(())
 }
 
 fn update_path(update: &SourceCurationUpdate) -> &Path {
@@ -388,7 +429,17 @@ fn update_path(update: &SourceCurationUpdate) -> &Path {
         | SourceCurationUpdate::SetRating { path, .. }
         | SourceCurationUpdate::SetLocked { path, .. }
         | SourceCurationUpdate::AddCollection { path, .. }
-        | SourceCurationUpdate::RemoveCollection { path, .. } => path.as_path(),
+        | SourceCurationUpdate::RemoveCollection { path, .. }
+        | SourceCurationUpdate::AddTag { path, .. }
+        | SourceCurationUpdate::RemoveTag { path, .. } => path.as_path(),
+    }
+}
+
+fn update_label_byte_len(update: &SourceCurationUpdate) -> usize {
+    match update {
+        SourceCurationUpdate::AddTag { label, .. }
+        | SourceCurationUpdate::RemoveTag { label, .. } => label.len(),
+        _ => 0,
     }
 }
 
@@ -408,13 +459,16 @@ fn operation_payload_bytes_with_path_bytes(
     batch_count: usize,
     update_count: usize,
     path_bytes: usize,
+    label_bytes: usize,
 ) -> usize {
     // Account for the caller-owned path spelling and the path retained in each receipt. Root
-    // identity bytes are present in the operation and in every bounded receipt.
+    // identity bytes are present in the operation and in every bounded receipt. Labels are
+    // retained by the input updates but not by bounded receipts, so count each byte once.
     path_bytes
         .saturating_mul(2)
         .saturating_add(root_identity_bytes.saturating_mul(batch_count.saturating_add(1)))
         .saturating_add(update_count.saturating_mul(ESTIMATED_RECEIPT_ROW_BYTES))
+        .saturating_add(label_bytes)
         .saturating_add(batch_count.saturating_mul(ESTIMATED_OPERATION_BATCH_BYTES))
 }
 
@@ -425,10 +479,12 @@ pub(crate) fn operation_payload_bytes(
 ) -> usize {
     let mut update_count = 0usize;
     let mut path_bytes = 0usize;
+    let mut label_bytes = 0usize;
     for batch in batches {
         update_count = update_count.saturating_add(batch.len());
         for update in batch {
             path_bytes = path_bytes.saturating_add(path_byte_len(update_path(update)));
+            label_bytes = label_bytes.saturating_add(update_label_byte_len(update));
         }
     }
     operation_payload_bytes_with_path_bytes(
@@ -436,6 +492,7 @@ pub(crate) fn operation_payload_bytes(
         batches.len(),
         update_count,
         path_bytes,
+        label_bytes,
     )
 }
 

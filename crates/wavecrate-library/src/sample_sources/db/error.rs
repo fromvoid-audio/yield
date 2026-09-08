@@ -142,6 +142,17 @@ pub enum SourceDbError {
     /// Provided tag text cannot be normalized to a non-empty identity.
     #[error("Tag label cannot be empty")]
     EmptyTagLabel,
+    /// A curation tag label exceeded the bounded UTF-8 byte length.
+    #[error("Curation tag label is {actual} UTF-8 bytes; maximum is {max}")]
+    TagLabelTooLong {
+        /// Maximum accepted UTF-8 byte length.
+        max: usize,
+        /// Supplied UTF-8 byte length.
+        actual: usize,
+    },
+    /// A curation tag label contained an embedded NUL byte.
+    #[error("Curation tag label contains an embedded NUL byte")]
+    TagLabelContainsNul,
     /// Read-only mode requires an existing database file.
     #[error("Read-only source DB mode requires an existing database file: {0}")]
     ReadOnlyDatabaseMissing(PathBuf),

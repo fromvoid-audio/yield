@@ -167,6 +167,9 @@ pub const MAX_CURATION_OPERATION_PATH_BYTES: usize = curation::MAX_CURATION_OPER
 pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize =
     curation::MAX_CURATION_OPERATION_RECEIPT_BYTES;
 
+/// Maximum UTF-8 byte length of a curation tag label before identity normalization.
+pub const MAX_CURATION_TAG_LABEL_BYTES: usize = curation::MAX_CURATION_TAG_LABEL_BYTES;
+
 pub use curation::{
     CatalogCurationRequestError, SourceCurationOperationFailure, SourceCurationOperationFence,
     SourceCurationOperationOutcome,
@@ -800,6 +803,11 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
 
 fn command_curation_payload_bytes(command: &CatalogCommand) -> usize {
     match command {
+        CatalogCommand::ApplyCuration {
+            root_identity,
+            updates,
+            ..
+        } => curation::operation_payload_bytes(root_identity, std::slice::from_ref(updates)),
         CatalogCommand::ApplyCurationOperation {
             root_identity,
             batches,
@@ -3658,6 +3666,166 @@ mod tests {
     }
 
     #[test]
+    fn curation_tag_admission_validates_labels_and_releases_payload_credit() {
+        let fixture = Fixture::new("catalog-curation-tags");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-tags");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+
+        let submit = |label: String| {
+            service.submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 601,
+                updates: vec![SourceCurationUpdate::AddTag {
+                    path: path.clone(),
+                    label,
+                }],
+            })
+        };
+        assert!(matches!(
+            submit("x".repeat(MAX_CURATION_TAG_LABEL_BYTES + 1)),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::TagLabelTooLong { .. }
+            ))
+        ));
+        assert!(matches!(
+            submit(String::from("bad\0tag")),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::TagLabelContainsNul
+            ))
+        ));
+        assert!(matches!(
+            submit(String::from(" \t\n")),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::EmptyTagLabel
+            ))
+        ));
+        let baseline_event_budget = service
+            .admission
+            .lock()
+            .expect("admission lock")
+            .event_budget;
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_payload_bytes,
+            0
+        );
+
+        let pause = test_gate.pause_next();
+        let valid_label = String::from(" LOOP ");
+        let valid_update = SourceCurationUpdate::AddTag {
+            path,
+            label: valid_label,
+        };
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 602,
+                updates: vec![valid_update.clone()],
+            })
+            .expect("tag curation admission");
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_payload_bytes,
+            curation::operation_payload_bytes(
+                &snapshot.root_identity,
+                std::slice::from_ref(&vec![valid_update])
+            )
+        );
+        pause.release();
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: 602,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::CurationCommitted { receipt, .. } = event else {
+            unreachable!();
+        };
+        assert_eq!(
+            receipt.files()[0].playback_type,
+            Some(wavecrate_library::sample_sources::SourcePlaybackType::Loop)
+        );
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_payload_bytes,
+            0
+        );
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .event_budget,
+            baseline_event_budget
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_label_bytes_can_exceed_the_bounded_payload() {
+        let fixture = Fixture::new("catalog-curation-tag-payload");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-tag-payload");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path_len = MAX_CURATION_OPERATION_PATH_BYTES - 640;
+        let path = RootRelativePath::try_from_path(PathBuf::from("x".repeat(path_len)))
+            .expect("large relative curation path");
+        let result = service.submit(curation_operation(
+            &source_id,
+            1,
+            &snapshot.root_identity,
+            603,
+            SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+            vec![vec![SourceCurationUpdate::AddTag {
+                path,
+                label: "x".repeat(MAX_CURATION_TAG_LABEL_BYTES),
+            }]],
+        ));
+        assert!(matches!(
+            result,
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::OperationPayloadTooLarge {
+                    max: MAX_CURATION_OPERATION_RECEIPT_BYTES,
+                    actual,
+                }
+            )) if actual > MAX_CURATION_OPERATION_RECEIPT_BYTES
+        ));
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_payload_bytes,
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
     fn curation_before_remove_commits_and_remove_admission_fences_later_writes() {
         let fixture = Fixture::new("catalog-curation-remove");
         write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
@@ -4770,6 +4938,54 @@ mod tests {
                 .curation_update_count,
             0
         );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_tag_payload_credit_releases_after_terminal_receipt() {
+        let fixture = Fixture::new("catalog-curation-operation-tag-credit");
+        let source_id = SourceId::from_string("source-curation-operation-tag-credit");
+        let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let batches = vec![vec![SourceCurationUpdate::AddTag {
+            path,
+            label: String::from("loop"),
+        }]];
+        let expected_payload = curation::operation_payload_bytes(&root_identity, &batches);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register admission");
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                4,
+                SourceCurationOperationFence::ExactRevision(0),
+                batches,
+            ))
+            .expect("tag operation admission");
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(admission.curation_payload_bytes, expected_payload);
+            assert_eq!(admission.curation_update_count, 1);
+        }
+        pause.release();
+        let outcome = receive_curation_operation(&service, 4);
+        assert!(!outcome.is_success());
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(admission.curation_payload_bytes, 0);
+            assert_eq!(admission.curation_update_count, 0);
+        }
         service.shutdown();
     }
 

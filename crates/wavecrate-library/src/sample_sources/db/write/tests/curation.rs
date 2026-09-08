@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
@@ -6,8 +7,8 @@ use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileG
 use crate::sample_sources::db::SourceDirectoryTruthState;
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
-    Rating, SOURCE_CURATION_BATCH_LIMIT, SampleCollection, SourceCurationUpdate, SourceDatabase,
-    SourcePlaybackType,
+    Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
+    SourceCurationUpdate, SourceDatabase, SourceDbError, SourcePlaybackType,
 };
 
 struct CurationFixture {
@@ -330,6 +331,200 @@ fn curation_receipt_matches_browser_playback_type_projection() {
     );
     assert_eq!(exact.files[0].playback_type, expected);
     assert_eq!(receipt.files()[0].playback_type, expected);
+}
+
+#[test]
+fn curation_tag_mutations_replace_assigned_playback_types_and_preserve_locked_metadata() {
+    let mut fixture = CurationFixture::new();
+    let one = Path::new("one.wav");
+    let two = Path::new("two.wav");
+    let mut seed = fixture.database.write_batch().expect("tag batch");
+    for label in [
+        "loop",
+        "loop-",
+        "oneshot",
+        "one-shot",
+        "unrelated",
+        "embedded\0tag",
+    ] {
+        seed.assign_tag_to_path(one, label).expect("seed tag");
+    }
+    seed.commit_auxiliary_state().expect("seed tags");
+
+    let locked = fixture
+        .commit(&[
+            SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("two.wav"),
+                rating: Rating::KEEP_3,
+            },
+            SourceCurationUpdate::SetLocked {
+                path: CurationFixture::path("two.wav"),
+                locked: true,
+            },
+        ])
+        .expect("lock second file");
+    fixture.revision = locked.source_revision();
+
+    let receipt = fixture
+        .commit(&[
+            SourceCurationUpdate::AddTag {
+                path: CurationFixture::path("one.wav"),
+                label: String::from(" One\t-\tShot "),
+            },
+            SourceCurationUpdate::AddTag {
+                path: CurationFixture::path("two.wav"),
+                label: String::from(" LOOP "),
+            },
+        ])
+        .expect("tag curation");
+    assert_eq!(receipt.source_revision(), fixture.revision + 1);
+    assert_eq!(receipt.files().len(), 2);
+    assert_eq!(receipt.files()[0].relative_path, one);
+    assert_eq!(
+        receipt.files()[0].playback_type,
+        Some(SourcePlaybackType::OneShot)
+    );
+    assert!(receipt.files()[0].last_curated_at.is_some());
+    assert_eq!(receipt.files()[1].relative_path, two);
+    assert_eq!(
+        receipt.files()[1].playback_type,
+        Some(SourcePlaybackType::Loop)
+    );
+    assert_eq!(receipt.files()[1].rating, Rating::KEEP_3);
+    assert!(receipt.files()[1].locked);
+    assert!(receipt.files()[1].last_curated_at.is_some());
+
+    let normalized_tags = fixture
+        .database
+        .tags_for_path(one)
+        .expect("one tags")
+        .into_iter()
+        .map(|tag| tag.normalized_text)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        normalized_tags,
+        BTreeSet::from([
+            String::from("embedded\0tag"),
+            String::from("one - shot"),
+            String::from("unrelated"),
+        ])
+    );
+    assert_eq!(
+        fixture.database.tags_for_path(two).unwrap().len(),
+        1,
+        "the locked file receives its playback tag without inheriting another file's tags"
+    );
+
+    fixture.revision = receipt.source_revision();
+    let removed = fixture
+        .commit(&[SourceCurationUpdate::RemoveTag {
+            path: CurationFixture::path("one.wav"),
+            label: String::from(" ONE\t-\tSHOT "),
+        }])
+        .expect("remove normalized tag");
+    assert_eq!(removed.files()[0].playback_type, None);
+    assert_eq!(
+        fixture
+            .database
+            .tags_for_path(one)
+            .unwrap()
+            .into_iter()
+            .map(|tag| tag.normalized_text)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([String::from("embedded\0tag"), String::from("unrelated")])
+    );
+}
+
+#[test]
+fn curation_tag_labels_are_bounded_before_any_transaction_mutation() {
+    let fixture = CurationFixture::new();
+    let valid = SourceCurationUpdate::AddTag {
+        path: CurationFixture::path("one.wav"),
+        label: String::from("valid"),
+    };
+    let oversized = SourceCurationUpdate::AddTag {
+        path: CurationFixture::path("one.wav"),
+        label: "x".repeat(SOURCE_CURATION_MAX_TAG_LABEL_BYTES + 1),
+    };
+    assert!(matches!(
+        fixture.commit(std::slice::from_ref(&oversized)),
+        Err(SourceDbError::TagLabelTooLong { .. })
+    ));
+    assert!(
+        fixture
+            .database
+            .tags_for_path(Path::new("one.wav"))
+            .unwrap()
+            .is_empty()
+    );
+
+    let nul = SourceCurationUpdate::RemoveTag {
+        path: CurationFixture::path("one.wav"),
+        label: String::from("bad\0tag"),
+    };
+    assert!(matches!(
+        fixture.commit(&[valid.clone(), nul]),
+        Err(SourceDbError::TagLabelContainsNul)
+    ));
+    assert!(
+        fixture
+            .database
+            .tags_for_path(Path::new("one.wav"))
+            .unwrap()
+            .is_empty()
+    );
+
+    let whitespace = SourceCurationUpdate::AddTag {
+        path: CurationFixture::path("one.wav"),
+        label: String::from(" \t\n"),
+    };
+    assert!(matches!(
+        fixture.commit(std::slice::from_ref(&whitespace)),
+        Err(SourceDbError::EmptyTagLabel)
+    ));
+    assert!(
+        fixture
+            .database
+            .tags_for_path(Path::new("one.wav"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.database.get_revision().unwrap(), fixture.revision);
+}
+
+#[test]
+fn curation_tag_timestamp_semantics_match_existing_tag_primitives() {
+    let mut fixture = CurationFixture::new();
+    let path = Path::new("one.wav");
+    let mut seed = fixture.database.write_batch().expect("tag batch");
+    seed.assign_tag_to_path(path, "Kick").expect("seed tag");
+    seed.set_last_curated_at(path, 1).expect("seed timestamp");
+    seed.commit_auxiliary_state().expect("seed tag timestamp");
+
+    let duplicate = fixture
+        .commit(&[SourceCurationUpdate::AddTag {
+            path: CurationFixture::path("one.wav"),
+            label: String::from(" kICK "),
+        }])
+        .expect("duplicate curation tag");
+    assert!(duplicate.files()[0].last_curated_at.unwrap() > 1);
+    fixture.revision = duplicate.source_revision();
+
+    let mut reset = fixture.database.write_batch().expect("timestamp batch");
+    reset.set_last_curated_at(path, 2).expect("reset timestamp");
+    reset.commit_auxiliary_state().expect("reset timestamp");
+
+    let absent = fixture
+        .commit(&[SourceCurationUpdate::RemoveTag {
+            path: CurationFixture::path("one.wav"),
+            label: String::from("missing"),
+        }])
+        .expect("absent curation tag");
+    assert_eq!(absent.files()[0].last_curated_at, Some(2));
+    assert_eq!(
+        fixture.database.last_curated_at_for_path(path).unwrap(),
+        Some(2)
+    );
 }
 
 #[test]

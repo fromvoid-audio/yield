@@ -21,8 +21,9 @@ pub use db::normalize_relative_path;
 pub use db::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
     DB_FILE_NAME, ExistingFileMetadataUpdate, ManifestCommitResult, Rating,
-    SOURCE_CURATION_BATCH_LIMIT, SampleCollection, SourceAuditMetadata, SourceCollectionWrite,
-    SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate, SourceDatabase,
+    SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
+    SourceAuditMetadata, SourceCollectionWrite, SourceContentHashWrite,
+    SourceCurationCommitReceipt, SourceCurationUpdate, SourceDatabase,
     SourceDatabaseConnectionRole, SourceDbError, SourceFileWrite, SourceIndexClassification,
     SourceIndexCommitResult, SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot,
     SourceManifestEntry, SourcePlaybackType, SourceTag, SourceTagUsage, SourceTagWrite,

@@ -6,6 +6,7 @@ use crate::app_dirs::WritableProfileGuard;
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 
 use super::super::read::browser_metadata_rows_for_paths;
+use super::super::tags::validate_curation_tag_label;
 use super::super::util::map_sql_error;
 use super::super::{
     META_LAST_AUTHORITATIVE_AUDIT_REVISION, Rating, SampleCollection, SourceDatabase,
@@ -53,6 +54,20 @@ pub enum SourceCurationUpdate {
         /// Collection slot to remove.
         collection: SampleCollection,
     },
+    /// Add one normalized tag assignment for one live source member.
+    AddTag {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+        /// Tag label to normalize and assign.
+        label: String,
+    },
+    /// Remove one normalized tag assignment for one live source member.
+    RemoveTag {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+        /// Tag label whose normalized identity should be removed.
+        label: String,
+    },
 }
 
 impl SourceCurationUpdate {
@@ -62,7 +77,9 @@ impl SourceCurationUpdate {
             | Self::SetRating { path, .. }
             | Self::SetLocked { path, .. }
             | Self::AddCollection { path, .. }
-            | Self::RemoveCollection { path, .. } => path,
+            | Self::RemoveCollection { path, .. }
+            | Self::AddTag { path, .. }
+            | Self::RemoveTag { path, .. } => path,
         }
     }
 }
@@ -151,6 +168,12 @@ impl SourceDatabase {
                 }
                 SourceCurationUpdate::RemoveCollection { path, collection } => {
                     batch.remove_collection(path.as_path(), *collection)?;
+                }
+                SourceCurationUpdate::AddTag { path, label } => {
+                    batch.assign_tag_for_curation(path.as_path(), label)?;
+                }
+                SourceCurationUpdate::RemoveTag { path, label } => {
+                    batch.remove_tag_from_path(path.as_path(), label)?;
                 }
             }
         }
@@ -241,6 +264,10 @@ fn validate_update_values(updates: &[SourceCurationUpdate]) -> Result<(), Source
                 if usize::from(collection.index()) >= SampleCollection::COUNT =>
             {
                 return Err(SourceDbError::Unexpected);
+            }
+            SourceCurationUpdate::AddTag { label, .. }
+            | SourceCurationUpdate::RemoveTag { label, .. } => {
+                validate_curation_tag_label(label)?;
             }
             _ => {}
         }

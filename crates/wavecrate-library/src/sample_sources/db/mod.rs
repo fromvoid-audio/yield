@@ -118,6 +118,8 @@ pub const SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT: usize = 256;
 pub const SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT: usize = 8;
 /// Maximum encoded length of one persisted stable directory identity.
 pub const SOURCE_DIRECTORY_TRUTH_MAX_IDENTITY_BYTES: usize = 1024;
+/// Maximum UTF-8 byte length of a curation tag label before identity normalization.
+pub const SOURCE_CURATION_MAX_TAG_LABEL_BYTES: usize = 1024;
 /// Env var that enables read-only source DB opening by default.
 pub const SOURCE_DB_READ_ONLY_ENV: &str = "WAVECRATE_SOURCE_DB_READ_ONLY";
 

@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{SourceDatabase, SourceDbError, SourceTag, SourceWriteBatch};
+use super::PLAYBACK_TYPE_CLASSIFICATION;
 use super::identity::normalize_tag_identity;
 use crate::diagnostics::{DbDebugEvent, emit_db_debug_event};
 
@@ -55,9 +56,31 @@ impl<'conn> SourceWriteBatch<'conn> {
         relative_path: &Path,
         label: &str,
     ) -> Result<SourceTag, SourceDbError> {
+        self.assign_tag_to_path_inner(relative_path, label, false)
+    }
+
+    /// Assign one tag for a curation transaction, replacing conflicting playback tags atomically.
+    pub(crate) fn assign_tag_for_curation(
+        &mut self,
+        relative_path: &Path,
+        label: &str,
+    ) -> Result<(), SourceDbError> {
+        self.assign_tag_to_path_inner(relative_path, label, true)
+            .map(|_| ())
+    }
+
+    fn assign_tag_to_path_inner(
+        &mut self,
+        relative_path: &Path,
+        label: &str,
+        replace_playback_type: bool,
+    ) -> Result<SourceTag, SourceDbError> {
         let path = normalize_relative_path(relative_path)?;
         ensure_wav_path_exists(&self.tx, &path)?;
         let tag = resolve_or_create_tag(&self.tx, label)?;
+        if replace_playback_type && playback_type_for_tag_id(&self.tx, tag.id)?.is_some() {
+            remove_other_playback_type_tags(&self.tx, &path, tag.id)?;
+        }
         self.tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO wav_file_tags (path, tag_id)
@@ -182,6 +205,45 @@ fn tag_by_normalized_text(
         },
     )
     .map_err(map_sql_error)
+}
+
+fn playback_type_for_tag_id(
+    tx: &Transaction<'_>,
+    tag_id: i64,
+) -> Result<Option<i64>, SourceDbError> {
+    let sql = format!(
+        "SELECT ({classification}) FROM source_tags AS st WHERE st.id = ?1",
+        classification = PLAYBACK_TYPE_CLASSIFICATION,
+    );
+    tx.prepare_cached(&sql)
+        .map_err(map_sql_error)?
+        .query_row([tag_id], |row| row.get::<_, Option<i64>>(0))
+        .map_err(map_sql_error)
+}
+
+fn remove_other_playback_type_tags(
+    tx: &Transaction<'_>,
+    path: &str,
+    incoming_tag_id: i64,
+) -> Result<(), SourceDbError> {
+    let sql = format!(
+        "DELETE FROM wav_file_tags
+         WHERE path = ?1
+           AND tag_id <> ?2
+           AND tag_id IN (
+               SELECT st.id
+               FROM source_tags AS st
+               JOIN wav_file_tags AS assigned
+                 ON assigned.path = ?1 AND assigned.tag_id = st.id
+               WHERE ({classification}) IS NOT NULL
+           )",
+        classification = PLAYBACK_TYPE_CLASSIFICATION,
+    );
+    tx.prepare_cached(&sql)
+        .map_err(map_sql_error)?
+        .execute(params![path, incoming_tag_id])
+        .map_err(map_sql_error)?;
+    Ok(())
 }
 
 fn ensure_wav_path_exists(tx: &Transaction<'_>, path: &str) -> Result<(), SourceDbError> {

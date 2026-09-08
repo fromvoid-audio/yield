@@ -1188,3 +1188,32 @@ retarget watermark; known stale IDs are discarded before consuming preflight
 errors. Both queued arrival orders and delayed lower-ID current commands have
 regression coverage. All 34 runtime tests passed after correction; independent
 re-review found no remaining meaningful issues.
+
+### Bounded audited tag-mutation backend
+
+The existing catalog curation lane now accepts AddTag and RemoveTag updates.
+Labels are validated before admission and transaction mutation: at most 1024
+UTF-8 bytes, nonempty after whitespace normalization, and no embedded NUL.
+Existing library tag APIs retain their prior normalization behavior.
+
+Adding a recognized playback-type tag atomically removes other assigned type
+identities, including synonyms, while preserving unrelated assignments and
+locked curation metadata. Projection and mutation share the canonical SQL
+classifier; the mutation queries only the addressed file's assigned tags.
+Existing revision, profile, root, and directory-generation fences still govern
+the whole transaction. Receipts remain fixed browser metadata records.
+
+Label bytes count toward saturating payload estimates for both ordinary and
+compound commands and remain reserved until their terminal event is consumed.
+This backend prerequisite does not yet expose the tag editor or full tag lists
+in the GPUI browser.
+
+Validation: all 465 library tests and 43 catalog tests passed with no default
+features, including normalized multi-file mutation, type replacement, legacy
+NUL exclusion, invalid labels, and payload refusal/release. Backend formatting
+and diff checks passed. Dependent UI verification follows its concurrent
+transport-state integration; native interaction acceptance remains pending.
+
+Independent review found no correctness, atomicity, or admission-accounting
+defect. Two additional focused tests passed for duplicate/absent-tag timestamp
+semantics and compound tag-operation payload credit release at terminal receipt.

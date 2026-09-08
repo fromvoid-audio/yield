@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::Path};
 
 use rusqlite::{OptionalExtension, Transaction};
 
+use super::super::tags::PLAYBACK_TYPE_CLASSIFICATION;
 use super::super::util::map_sql_error;
 use super::super::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
@@ -18,24 +19,6 @@ struct BrowserMetadataCapabilities {
     metadata_revision: bool,
     playback_type_catalog: bool,
 }
-
-const PLAYBACK_TYPE_CLASSIFICATION: &str = "CASE
-    WHEN instr(st.normalized_text, char(0)) > 0 THEN NULL
-    WHEN trim(st.normalized_text, ' -_') = 'loop' THEN 1
-    WHEN trim(st.normalized_text, ' -_') = 'oneshot' THEN 2
-    WHEN length(trim(st.normalized_text, ' -_')) > 7
-         AND substr(trim(st.normalized_text, ' -_'), 1, 3) = 'one'
-         AND substr(trim(st.normalized_text, ' -_'), -4) = 'shot'
-         AND trim(
-                 substr(
-                     trim(st.normalized_text, ' -_'),
-                     4,
-                     length(trim(st.normalized_text, ' -_')) - 7
-                 ),
-                 ' -_'
-             ) = ''
-        THEN 2
-END";
 
 fn playback_type_select_expr(available: bool, path_expr: &str) -> String {
     if !available {
