@@ -37,6 +37,7 @@ mod catalog;
 mod catalog_metadata;
 mod context_menu;
 mod curation;
+mod directory_open;
 mod display_labels;
 mod file_drag;
 mod handoff;
@@ -365,6 +366,7 @@ pub(crate) struct Browser {
     playback_monitor_running: bool,
     playback: Option<PlaybackRuntime>,
     file_drag: file_drag::FileDragState,
+    directory_open: directory_open::DirectoryOpenState,
     handoff_task: Option<Task<()>>,
     handoff_generation: u64,
     list_scroll_handle: UniformListScrollHandle,
@@ -566,6 +568,7 @@ impl Browser {
             playback_monitor_running: false,
             playback: None,
             file_drag: file_drag::FileDragState::default(),
+            directory_open: directory_open::DirectoryOpenState::default(),
             handoff_task: None,
             handoff_generation: 0,
             list_scroll_handle: UniformListScrollHandle::new(),
@@ -2041,6 +2044,7 @@ impl Drop for Browser {
         self.audio_output_open_generation = self.audio_output_open_generation.wrapping_add(1);
         self.audio_output_open_task.take();
         self.shutdown_file_drag();
+        self.shutdown_directory_open();
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
         if let Some(runtime) = self.playback.as_ref() {

@@ -31,6 +31,7 @@ enum ContextMenuAction {
     CopyPath,
     Unlock,
     RemoveFromCollection { slot: usize },
+    OpenDirectory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +50,7 @@ enum MenuKeyEffect {
 }
 
 #[derive(Clone, Debug)]
-struct ContextMenuTarget {
+struct SampleContextMenuTarget {
     source_id: SourceId,
     lifecycle_generation: u64,
     root: PathBuf,
@@ -78,13 +79,19 @@ struct ContextMenuTarget {
 }
 
 #[derive(Clone, Debug)]
+enum ContextMenuTarget {
+    Sample(SampleContextMenuTarget),
+    Directory(super::directory_open::DirectoryOpenTarget),
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct ContextMenuState {
     target: ContextMenuTarget,
     actions: Vec<ContextMenuAction>,
     selected_action: usize,
 }
 
-impl ContextMenuTarget {
+impl SampleContextMenuTarget {
     fn is_current(&self, browser: &Browser) -> bool {
         if tag_filter::scope_pending(browser) {
             return false;
@@ -141,6 +148,44 @@ impl ContextMenuTarget {
                     && entry.path == self.absolute_path
             })
             && self.entry_indices.get(&self.relative_path).copied() == Some(self.entry_index)
+    }
+}
+
+impl ContextMenuTarget {
+    fn is_current(&self, browser: &Browser) -> bool {
+        match self {
+            Self::Sample(target) => target.is_current(browser),
+            Self::Directory(target) => {
+                super::directory_open::directory_target_is_current(browser, target)
+            }
+        }
+    }
+
+    fn anchor(&self) -> Point<Pixels> {
+        match self {
+            Self::Sample(target) => target.anchor,
+            Self::Directory(target) => target.anchor,
+        }
+    }
+
+    fn heading(&self) -> &'static str {
+        match self {
+            Self::Sample(_) => "SAMPLE ROW",
+            Self::Directory(target) => match target.kind {
+                super::directory_open::DirectoryOpenKind::Source => "SOURCE",
+                super::directory_open::DirectoryOpenKind::Folder => "FOLDER",
+            },
+        }
+    }
+
+    fn label(&self) -> String {
+        let path = match self {
+            Self::Sample(target) => &target.relative_path,
+            Self::Directory(target) => target.folder.as_ref().unwrap_or(&target.root),
+        };
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
     }
 }
 
@@ -216,7 +261,7 @@ impl Browser {
             .collect::<Vec<_>>();
         let actions = context_menu_actions(entry.curation, self.view_model.collection_filter());
         self.context_menu = Some(ContextMenuState {
-            target: ContextMenuTarget {
+            target: ContextMenuTarget::Sample(SampleContextMenuTarget {
                 source_id: activation.source_id.clone(),
                 lifecycle_generation: activation.lifecycle_generation,
                 root: activation.root.clone(),
@@ -242,11 +287,29 @@ impl Browser {
                 selected_paths,
                 in_explicit_selection,
                 anchor: event.position,
-            },
+            }),
             actions,
             selected_action: 0,
         });
         super::tag_chips::invalidate(self);
+        self.start_source_registry_poll(cx);
+        window.focus(&self.focus_handle);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Open a source or folder context menu without changing browser focus or selection.
+    pub(super) fn open_directory_context_menu(
+        &mut self,
+        target: super::directory_open::DirectoryOpenTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Directory(target),
+            actions: vec![ContextMenuAction::OpenDirectory],
+            selected_action: 0,
+        });
         self.start_source_registry_poll(cx);
         window.focus(&self.focus_handle);
         cx.stop_propagation();
@@ -313,25 +376,37 @@ impl Browser {
         };
         let target = menu.target.clone();
         self.close_context_menu(cx);
-        match action {
-            ContextMenuAction::Reveal => self.reveal_context_file(target.absolute_path, cx),
-            ContextMenuAction::CopyPath => {
+        match (action, target) {
+            (ContextMenuAction::Reveal, ContextMenuTarget::Sample(target)) => {
+                self.reveal_context_file(target.absolute_path, cx)
+            }
+            (ContextMenuAction::CopyPath, ContextMenuTarget::Sample(target)) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(format_copy_path(
                     &target.absolute_path,
                 )));
                 self.playback_status = String::from("Copied path");
                 cx.notify();
             }
-            ContextMenuAction::Unlock => {
+            (ContextMenuAction::Unlock, ContextMenuTarget::Sample(target)) => {
                 let paths = unlock_target_paths(&target);
                 self.submit_curation_action(CurationAction::UnlockKeepRating, Some(paths), cx);
             }
-            ContextMenuAction::RemoveFromCollection { slot } => {
+            (
+                ContextMenuAction::RemoveFromCollection { slot },
+                ContextMenuTarget::Sample(target),
+            ) => {
                 self.submit_curation_action(
                     CurationAction::RemoveCollection { slot },
                     Some(vec![target.relative_path]),
                     cx,
                 );
+            }
+            (ContextMenuAction::OpenDirectory, ContextMenuTarget::Directory(target)) => {
+                self.start_directory_open(target, cx)
+            }
+            _ => {
+                self.playback_status = String::from("Context menu action is unavailable");
+                cx.notify();
             }
         }
     }
@@ -420,7 +495,7 @@ fn context_menu_actions(
     actions
 }
 
-fn unlock_target_paths(target: &ContextMenuTarget) -> Vec<PathBuf> {
+fn unlock_target_paths(target: &SampleContextMenuTarget) -> Vec<PathBuf> {
     unlock_paths(
         target.in_explicit_selection,
         &target.selected_paths,
@@ -472,7 +547,7 @@ fn next_action_index(current: usize, action_count: usize) -> usize {
     }
 }
 
-/// Render the full-window dismiss layer and compact sample menu.
+/// Render the full-window dismiss layer and compact browser context menu.
 pub(super) fn render_overlay(
     browser: &Browser,
     theme: &Theme,
@@ -481,12 +556,8 @@ pub(super) fn render_overlay(
     let Some(menu) = browser.context_menu.as_ref() else {
         return div().into_any_element();
     };
-    let target_label = menu
-        .target
-        .relative_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| menu.target.relative_path.display().to_string());
+    let target_label = menu.target.label();
+    let target_heading = menu.target.heading();
     let hover_fill = color(theme.interaction.hover_fill);
     let pressed_fill = color(theme.interaction.pressed_fill);
     let selected_fill = color(theme.colors.selection_hover_fill);
@@ -550,7 +621,7 @@ pub(super) fn render_overlay(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .child(format!("SAMPLE ROW · {target_label}")),
+                .child(format!("{target_heading} · {target_label}")),
         )
         .children(action_rows);
     let dismiss = div()
@@ -570,7 +641,7 @@ pub(super) fn render_overlay(
         .child(dismiss)
         .child(deferred(
             anchored()
-                .position(menu.target.anchor)
+                .position(menu.target.anchor())
                 .snap_to_window_with_margin(Edges::all(px(8.0)))
                 .child(panel),
         ))
@@ -583,6 +654,7 @@ fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
         ContextMenuAction::CopyPath => "Copy Path",
         ContextMenuAction::Unlock => "Unlock",
         ContextMenuAction::RemoveFromCollection { .. } => "Remove from collection",
+        ContextMenuAction::OpenDirectory => directory_open_label(),
     }
 }
 
@@ -593,6 +665,16 @@ fn file_manager_reveal_label() -> &'static str {
         "Reveal in Finder"
     } else {
         "Reveal in File Manager"
+    }
+}
+
+fn directory_open_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Open in Explorer"
+    } else if cfg!(target_os = "macos") {
+        "Open in Finder"
+    } else {
+        "Open in File Manager"
     }
 }
 

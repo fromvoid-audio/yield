@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{ClickEvent, Context, div, prelude::*, px, uniform_list};
+use gpui::{ClickEvent, Context, MouseButton, MouseDownEvent, div, prelude::*, px, uniform_list};
 use wavecrate_design::Theme;
 
 use crate::theme::{color, transparent};
@@ -173,6 +173,19 @@ pub(super) fn render(
                                                         view.select_source(index, window, cx);
                                                     },
                                                 ))
+                                                .on_mouse_down(
+                                                    MouseButton::Right,
+                                                    cx.listener(
+                                                        move |view,
+                                                              event: &MouseDownEvent,
+                                                              window,
+                                                              cx| {
+                                                            view.open_source_context_menu(
+                                                                index, event, window, cx,
+                                                            );
+                                                        },
+                                                    ),
+                                                )
                                                 .child(
                                                     div()
                                                         .flex_none()
@@ -315,6 +328,7 @@ pub(super) fn render(
                                     let row = folder_rows.get(visible_index).cloned()?;
                                     let path_for_select = row.path.clone();
                                     let path_for_toggle = row.path.clone();
+                                    let path_for_context = row.path.clone();
                                     let selected = view.selected_folder == row.path;
                                     let focused = motion_frame.focus_alpha > 0
                                         && view.focus_matches_folder(&row.path);
@@ -384,6 +398,19 @@ pub(super) fn render(
                                                 );
                                             },
                                         ))
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(
+                                                move |view, event: &MouseDownEvent, window, cx| {
+                                                    view.open_folder_context_menu(
+                                                        path_for_context.clone(),
+                                                        event,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        )
                                         .child(
                                             div()
                                                 .flex_none()

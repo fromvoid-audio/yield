@@ -114,7 +114,8 @@ The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,
 play-region selection, and a playback cursor. Play regions can be moved, resized,
 or shifted with the keyboard. Playback navigation history, native file clipboard
-handoff, Finder reveal, and macOS whole-file drag-out are available. Drag-out
+handoff, Finder reveal, source/folder context-menu opening, and macOS whole-file
+drag-out are available. Drag-out
 prepares up to 256 files in the background and rejects incomplete selections.
 Loop changes apply to active playback
 with runtime identity checks and retain the accepted audition span. Loop and

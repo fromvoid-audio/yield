@@ -1823,3 +1823,9 @@ Capture-phase presses, pointer release, Escape, and source/selection/projection 
 Validation: the broader UI suite passed 262 tests with one existing ignored test before the final review corrections. After correcting retry allocations and replacement-link acceptance, all 13 focused drag tests, the UI check, formatting and diff checks passed. Independent re-review confirmed both findings resolved with no new issue. Native macOS drag acceptance remains pending.
 
 A clean detached `ed4f6fcc0` snapshot built `target/qa/Wavecrate Drag Preview ed4f6fc.app` in 43.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
+
+### Source and folder directory opening
+
+Source and folder rows now expose a themed right-click Open action using the existing context-menu keyboard and dismissal behavior. Directory targets remain distinct from sample mutation targets. Inactive registered sources and nonselected folders can be opened without navigation or audition. Preparation checks directory type, canonical containment and root identity off-thread, retains one running task plus one newest queued request, and rejects stale targets before requesting the system file manager. Status reports the launch request rather than claiming OS completion.
+
+Validation: eight directory-open tests, seven context-menu tests, the locked UI check, formatting and diff checks passed. Primary review corrected unbounded preflight replacement, an unnecessary tag refresh, and rejection of nonselected folders. No OS application was launched during validation; the later OS path open remains subject to path replacement.
