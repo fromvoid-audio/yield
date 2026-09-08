@@ -98,6 +98,10 @@ selects a suggestion; Enter otherwise submits the text you typed. Existing sourc
 tags retain their database identity when selected. Selected-tag chips show All or Mixed
 membership, and their × control removes that assignment from the selection.
 Larger tag unions have paging controls. Chips update after metadata is saved.
+The ADD TAG arrow opens a paged Tag Editor with five collapsible categories.
+Click a tag to toggle its assignment across the selection; drag supported tags
+to another category to update the profile dictionary. Legacy tags keep their
+source identity, and playback-type categories stay locked.
 
 The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,
