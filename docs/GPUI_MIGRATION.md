@@ -1572,3 +1572,9 @@ transition/provenance helpers covering fast edits, invalid toggles, focus
 priority, stale/partial reuse rejection, and metadata-sort mask identity. Package
 formatting and diff whitespace checks passed. Native visual/input acceptance of
 this slice remains separate from these automated checks.
+
+The filter acceptance checkout was advanced to clean commit `092c97c74` and the
+GPUI executable rebuilt there. `Wavecrate Filter Preview 092c97c.app` was packaged
+under `target/qa` and passed strict ad-hoc signature verification. It was not
+launched or used for native acceptance by the agent; existing previews remain
+untouched.
