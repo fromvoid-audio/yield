@@ -89,11 +89,12 @@ pub(crate) fn read_page(
     let page = match query {
         CatalogTagPageQuery::SelectedPaths { relative_paths } => source
             .database
-            .tags_for_paths_page_at_revision(
+            .tags_for_paths_page_at_revision_with_cancellation(
                 expected_revision,
                 relative_paths,
                 after_cursor,
                 page_limit,
+                || token.load(Ordering::Acquire),
             )
             .map_err(super::catalog_error_from_db)?,
         CatalogTagPageQuery::VocabularyPrefix { prefix } => source

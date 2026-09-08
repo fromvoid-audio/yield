@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
-use rusqlite::{OptionalExtension, Transaction, types::ToSql};
+use rusqlite::{OptionalExtension, Transaction};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
@@ -18,6 +18,7 @@ use super::identity::normalize_tag_identity;
 
 const DEFAULT_TAG_LIMIT: usize = 32;
 const TAG_PAGE_PREVIEW_CHAR_LIMIT: usize = 256;
+const TAG_PAGE_STAGING_CHUNK_SIZE: usize = 128;
 
 impl SourceDatabase {
     /// Return the most-used persisted normal tags, ordered by usage then label.
@@ -143,6 +144,29 @@ impl SourceDatabase {
         after_cursor: Option<&SourceTagPageCursor>,
         requested_limit: usize,
     ) -> Result<SourceTagPage, SourceDbError> {
+        self.tags_for_paths_page_at_revision_with_cancellation(
+            expected_revision,
+            paths,
+            after_cursor,
+            requested_limit,
+            || false,
+        )
+    }
+
+    /// Fetch tags for an exact bounded set of source-relative paths with cancellation checks.
+    ///
+    /// This is the cancellation-aware form used by the catalog worker while it stages a large
+    /// selection. The callback is checked between bounded staging chunks and before the grouped
+    /// read. A canceled operation rolls back the read transaction, including its temporary
+    /// selection table.
+    pub fn tags_for_paths_page_at_revision_with_cancellation(
+        &self,
+        expected_revision: u64,
+        paths: &[PathBuf],
+        after_cursor: Option<&SourceTagPageCursor>,
+        requested_limit: usize,
+        mut is_canceled: impl FnMut() -> bool,
+    ) -> Result<SourceTagPage, SourceDbError> {
         let paths = normalize_tag_page_paths(paths)?;
         let query_signature = tag_page_paths_signature(&paths);
         let limit = tag_page_limit(requested_limit);
@@ -159,7 +183,8 @@ impl SourceDatabase {
         let mut entries = if paths.is_empty() {
             Vec::new()
         } else {
-            query_tags_for_paths(&transaction, &paths, cursor_id, limit)?
+            stage_selected_paths(&transaction, &paths, &mut is_canceled)?;
+            query_tags_for_paths(&transaction, cursor_id, limit)?
         };
         let has_more = entries.len() > limit;
         if has_more {
@@ -398,23 +423,67 @@ fn tag_preview_sql() -> String {
     )
 }
 
-fn query_tags_for_paths(
+fn stage_selected_paths(
     transaction: &Transaction<'_>,
     paths: &[String],
+    is_canceled: &mut impl FnMut() -> bool,
+) -> Result<(), SourceDbError> {
+    if is_canceled() {
+        return Err(SourceDbError::Canceled);
+    }
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE selected_paths (
+                path TEXT PRIMARY KEY
+            ) WITHOUT ROWID",
+        )
+        .map_err(map_sql_error)?;
+    let mut statement = transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO temp.selected_paths (path)
+             VALUES (?1)",
+        )
+        .map_err(map_sql_error)?;
+    for chunk in paths.chunks(TAG_PAGE_STAGING_CHUNK_SIZE) {
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+        for path in chunk {
+            statement.execute([path]).map_err(map_sql_error)?;
+        }
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+    }
+    drop(statement);
+    Ok(())
+}
+
+fn query_tags_for_paths(
+    transaction: &Transaction<'_>,
     cursor_id: Option<i64>,
     limit: usize,
 ) -> Result<Vec<SourceTagPageEntry>, SourceDbError> {
-    let values = (0..paths.len())
-        .map(|index| format!("(?{})", index + 2))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let limit_parameter = paths.len() + 2;
-    let sql = format!(
-        "WITH selected_paths(path) AS (VALUES {values}),
-              selected_tags AS (
-                  SELECT wft.tag_id, COUNT(DISTINCT wft.path) AS assignment_count
-                  FROM wav_file_tags AS wft
-                  JOIN selected_paths AS selected ON selected.path = wft.path
+    let sql = selected_tag_page_sql();
+    let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
+    statement
+        .query_map(
+            rusqlite::params![cursor_id, fetch_limit],
+            tag_page_entry_with_count,
+        )
+        .map_err(map_sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sql_error)
+}
+
+fn selected_tag_page_sql() -> String {
+    format!(
+        "WITH selected_tags AS (
+                  SELECT wft.tag_id, COUNT(*) AS assignment_count
+                  FROM temp.selected_paths AS selected
+                  CROSS JOIN wav_file_tags AS wft
+                  WHERE wft.path = selected.path
                   GROUP BY wft.tag_id
               )
          SELECT st.id,
@@ -427,27 +496,11 @@ fn query_tags_for_paths(
          WHERE (?1 IS NULL OR (st.normalized_text, st.id) >
                 (SELECT normalized_text, id FROM source_tags WHERE id = ?1))
          ORDER BY st.normalized_text COLLATE BINARY ASC, st.id ASC
-         LIMIT ?{limit_parameter}",
+         LIMIT ?2",
         display_label = bounded_tag_text_sql("st.display_label"),
         normalized_text = bounded_tag_text_sql("st.normalized_text"),
         preview = tag_preview_sql(),
-    );
-    let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-    let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
-    let mut parameters: Vec<&dyn ToSql> = Vec::with_capacity(paths.len() + 2);
-    parameters.push(&cursor_id);
-    for path in paths {
-        parameters.push(path);
-    }
-    parameters.push(&fetch_limit);
-    statement
-        .query_map(
-            rusqlite::params_from_iter(parameters),
-            tag_page_entry_with_count,
-        )
-        .map_err(map_sql_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_sql_error)
+    )
 }
 
 fn query_tag_vocabulary(
@@ -606,7 +659,9 @@ mod plan_tests {
 
     use tempfile::tempdir;
 
-    use super::{SourceDatabase, tag_prefix_upper_bound, tag_vocabulary_sql};
+    use super::{
+        SourceDatabase, selected_tag_page_sql, tag_prefix_upper_bound, tag_vocabulary_sql,
+    };
 
     #[test]
     fn vocabulary_prefix_range_plans_include_an_index_seek() {
@@ -633,6 +688,44 @@ mod plan_tests {
             rusqlite::params![upper_bound, "a", 1_i64, 2_i64],
         );
         assert!(cursor_opcodes.iter().any(|opcode| opcode == "SeekGE"));
+    }
+
+    #[test]
+    fn selected_tag_page_plan_uses_wav_file_tag_primary_key_lookup() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+        database
+            .assign_tag_to_path(Path::new("one.wav"), "shared")
+            .unwrap();
+        let transaction = database.connection.unchecked_transaction().unwrap();
+        transaction
+            .execute_batch(
+                "CREATE TEMP TABLE selected_paths (
+                    path TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                INSERT INTO temp.selected_paths (path) VALUES ('one.wav');",
+            )
+            .unwrap();
+        let mut statement = transaction
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", selected_tag_page_sql()))
+            .unwrap();
+        let details = statement
+            .query_map(rusqlite::params![Option::<i64>::None, 2_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("SEARCH wft USING PRIMARY KEY")
+                    && detail.contains("path=?")),
+            "selected tag query plan did not use the wav tag primary key: {details:?}"
+        );
+        drop(statement);
+        transaction.rollback().unwrap();
     }
 
     fn explain_opcodes<P: rusqlite::Params>(

@@ -173,6 +173,13 @@ pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize =
 /// Maximum UTF-8 byte length of a curation tag label before identity normalization.
 pub const MAX_CURATION_TAG_LABEL_BYTES: usize = curation::MAX_CURATION_TAG_LABEL_BYTES;
 
+/// Maximum estimated selected-path input retained by admitted catalog commands.
+///
+/// The estimate includes each path's encoded bytes and its in-memory `PathBuf` container. It is
+/// borrowed while a command remains queued or is being processed, then released when processing
+/// ends so tag-page input retention is independent of event and durable-curation credits.
+pub const MAX_TAG_PAGE_INPUT_BYTES: usize = 32 * 1024 * 1024;
+
 pub use curation::{
     CatalogCurationRequestError, SourceCurationOperationFailure, SourceCurationOperationFence,
     SourceCurationOperationOutcome,
@@ -702,6 +709,7 @@ struct AdmissionState {
     event_budget: usize,
     curation_payload_bytes: usize,
     curation_update_count: usize,
+    tag_page_input_bytes: usize,
     sources: HashMap<SourceId, DesiredSource>,
 }
 
@@ -713,6 +721,7 @@ impl AdmissionState {
             event_budget: 1,
             curation_payload_bytes: 0,
             curation_update_count: 0,
+            tag_page_input_bytes: 0,
             sources: HashMap::new(),
         }
     }
@@ -736,6 +745,24 @@ struct QueuedEvent {
     event: CatalogEvent,
     curation_payload_bytes: usize,
     curation_update_count: usize,
+}
+
+struct CommandInputReservation<'a> {
+    admission: &'a Arc<Mutex<AdmissionState>>,
+    bytes: usize,
+}
+
+impl Drop for CommandInputReservation<'_> {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admission.tag_page_input_bytes = admission.tag_page_input_bytes.saturating_sub(self.bytes);
+    }
 }
 
 struct EventHub {
@@ -1035,6 +1062,27 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
         }
         _ => 0,
     }
+}
+
+fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
+    let CatalogCommand::RequestTagPage { query, .. } = command else {
+        return 0;
+    };
+    let CatalogTagPageQuery::SelectedPaths { relative_paths } = query else {
+        return 0;
+    };
+    selected_paths_input_bytes(relative_paths)
+}
+
+fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
+    let raw_bytes = relative_paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(encoded_path_len(path))
+    });
+    raw_bytes.saturating_add(
+        relative_paths
+            .len()
+            .saturating_mul(std::mem::size_of::<PathBuf>()),
+    )
 }
 
 #[derive(Clone)]
@@ -1348,6 +1396,14 @@ impl CatalogService {
         }
         let curation_payload_bytes = command_curation_payload_bytes(&command);
         let curation_update_count = command_curation_update_count(&command);
+        let tag_page_input_bytes = command_tag_page_input_bytes(&command);
+        if admission
+            .tag_page_input_bytes
+            .saturating_add(tag_page_input_bytes)
+            > MAX_TAG_PAGE_INPUT_BYTES
+        {
+            return Err(CatalogSubmitError::Full);
+        }
         if admission
             .curation_update_count
             .saturating_add(curation_update_count)
@@ -1362,6 +1418,9 @@ impl CatalogService {
         {
             return Err(CatalogSubmitError::Full);
         }
+        admission.tag_page_input_bytes = admission
+            .tag_page_input_bytes
+            .saturating_add(tag_page_input_bytes);
         match self.commands.try_send(command) {
             Ok(()) => {
                 admission.event_budget += event_budget;
@@ -1370,8 +1429,16 @@ impl CatalogService {
                 apply_admission_action(&mut admission, action);
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => Err(CatalogSubmitError::Full),
+            Err(TrySendError::Full(_)) => {
+                admission.tag_page_input_bytes = admission
+                    .tag_page_input_bytes
+                    .saturating_sub(tag_page_input_bytes);
+                Err(CatalogSubmitError::Full)
+            }
             Err(TrySendError::Disconnected(_)) => {
+                admission.tag_page_input_bytes = admission
+                    .tag_page_input_bytes
+                    .saturating_sub(tag_page_input_bytes);
                 admission.closed = true;
                 Err(CatalogSubmitError::Closed)
             }
@@ -1463,6 +1530,10 @@ fn run_worker(
         };
         let Some(command) = command else {
             break;
+        };
+        let _tag_page_input_reservation = CommandInputReservation {
+            admission: &admission,
+            bytes: command_tag_page_input_bytes(&command),
         };
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         let reserved_events = command_event_budget(&command);
@@ -2874,6 +2945,20 @@ mod tests {
         }
     }
 
+    fn wait_for_tag_page_input_release(service: &CatalogService) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if admission_state(&service.admission, |state| state.tag_page_input_bytes) == 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tag-page input reservation was not released"
+            );
+            thread::yield_now();
+        }
+    }
+
     fn register_and_audit(
         service: &CatalogService,
         root: &Path,
@@ -3037,6 +3122,7 @@ mod tests {
             }
             _ => unreachable!(),
         };
+        wait_for_tag_page_input_release(&service);
         let first_ids = first
             .entries
             .iter()
@@ -3305,6 +3391,58 @@ mod tests {
     }
 
     #[test]
+    fn tag_page_input_admission_accounts_path_container_overhead_and_releases_after_failure() {
+        let fixture = Fixture::new("catalog-tag-page-input-budget");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-page-input-budget");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        let giant_path = PathBuf::from("x".repeat(SOURCE_TAG_PAGE_MAX_PATH_BYTES));
+        let request = |request_id| CatalogCommand::RequestTagPage {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: snapshot.committed_revision,
+            request_id,
+            query: CatalogTagPageQuery::SelectedPaths {
+                relative_paths: vec![giant_path.clone()],
+            },
+            after_cursor: None,
+            page_limit: 1,
+        };
+        service
+            .submit(request(750))
+            .expect("first input reservation");
+        let expected_bytes = selected_paths_input_bytes(std::slice::from_ref(&giant_path));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_page_input_bytes),
+            expected_bytes
+        );
+        assert!(expected_bytes > SOURCE_TAG_PAGE_MAX_PATH_BYTES);
+        assert_eq!(service.submit(request(751)), Err(CatalogSubmitError::Full));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_page_input_bytes),
+            expected_bytes
+        );
+        pause.release();
+
+        let event = service
+            .recv_event_timeout(Duration::from_secs(5))
+            .expect("tag page failure");
+        assert!(matches!(
+            event,
+            CatalogEvent::TagPageFailed {
+                request_id: 750,
+                error: CatalogError::TagPagePathMissing { .. },
+                ..
+            }
+        ));
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    #[test]
     fn obsolete_tag_page_generation_is_discarded_and_event_credit_is_released() {
         let fixture = Fixture::new("catalog-tag-page-generation");
         write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
@@ -3319,13 +3457,16 @@ mod tests {
                 lifecycle_generation: 1,
                 expected_revision: snapshot.committed_revision,
                 request_id: 730,
-                query: CatalogTagPageQuery::VocabularyPrefix {
-                    prefix: String::new(),
+                query: CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: vec![PathBuf::from("one.wav")],
                 },
                 after_cursor: None,
                 page_limit: 1,
             })
             .expect("tag page admission");
+        assert!(admission_state(&service.admission, |state| {
+            state.tag_page_input_bytes > 0
+        }));
         service
             .submit(CatalogCommand::Register {
                 source_id: source_id.clone(),
@@ -3353,6 +3494,7 @@ mod tests {
         let _ = receive_until(&service, |event| {
             matches!(event, CatalogEvent::SnapshotReady { .. })
         });
+        wait_for_tag_page_input_release(&service);
         service
             .submit(CatalogCommand::RequestTagPage {
                 source_id: source_id.clone(),
@@ -3401,13 +3543,16 @@ mod tests {
                 lifecycle_generation: 1,
                 expected_revision: snapshot.committed_revision,
                 request_id: 740,
-                query: CatalogTagPageQuery::VocabularyPrefix {
-                    prefix: String::new(),
+                query: CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: vec![PathBuf::from("one.wav")],
                 },
                 after_cursor: None,
                 page_limit: 1,
             })
             .expect("tag page admission");
+        assert!(admission_state(&service.admission, |state| {
+            state.tag_page_input_bytes > 0
+        }));
         let service = Arc::new(service);
         let shutdown_service = Arc::clone(&service);
         let shutdown_thread = thread::spawn(move || shutdown_service.shutdown());
@@ -3416,6 +3561,7 @@ mod tests {
         }
         pause.release();
         shutdown_thread.join().expect("catalog shutdown");
+        wait_for_tag_page_input_release(&service);
 
         let mut saw_closed = false;
         while let Ok(event) = service.try_recv_event() {

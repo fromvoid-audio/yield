@@ -121,9 +121,9 @@ pub const SOURCE_DIRECTORY_TRUTH_MAX_IDENTITY_BYTES: usize = 1024;
 /// Maximum UTF-8 byte length of a curation tag label before identity normalization.
 pub const SOURCE_CURATION_MAX_TAG_LABEL_BYTES: usize = 1024;
 /// Maximum number of selected paths accepted by one bounded source-tag page request.
-pub const SOURCE_TAG_PAGE_MAX_PATHS: usize = 128;
+pub const SOURCE_TAG_PAGE_MAX_PATHS: usize = 65_536;
 /// Maximum aggregate encoded byte length of selected paths in one tag-page request.
-pub const SOURCE_TAG_PAGE_MAX_PATH_BYTES: usize = 512 * 1024;
+pub const SOURCE_TAG_PAGE_MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum UTF-8 byte length of a source-tag vocabulary prefix.
 pub const SOURCE_TAG_PAGE_MAX_PREFIX_BYTES: usize = 1024;
 /// Maximum number of entries returned by one bounded source-tag page request.

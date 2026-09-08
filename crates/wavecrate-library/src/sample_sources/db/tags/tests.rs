@@ -270,6 +270,85 @@ fn selected_tag_page_unions_paths_and_counts_distinct_selected_paths() {
 }
 
 #[test]
+fn selected_tag_page_handles_large_selection_mixed_counts_dedup_and_cursor() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let paths = (0..129)
+        .map(|index| PathBuf::from(format!("sample-{index:03}.wav")))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        db.upsert_file(path, 10, 5).unwrap();
+        db.assign_tag_to_path(path, "shared").unwrap();
+    }
+    for (index, path) in paths.iter().enumerate() {
+        if index % 2 == 0 {
+            db.assign_tag_to_path(path, "even-only").unwrap();
+        }
+    }
+    db.assign_tag_to_path(&paths[128], "late").unwrap();
+    let revision = db.get_revision().unwrap();
+
+    let mut selected = paths.clone();
+    selected.extend([paths[0].clone(), paths[128].clone()]);
+    let first = db
+        .tags_for_paths_page_at_revision(revision, &selected, None, 2)
+        .unwrap();
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| (entry.normalized_text.as_str(), entry.assignment_count))
+            .collect::<Vec<_>>(),
+        vec![("even-only", Some(65)), ("late", Some(1))]
+    );
+    let cursor = first.next_cursor.expect("large selection continuation");
+
+    let mut continuation = selected;
+    continuation.reverse();
+    continuation.push(paths[0].clone());
+    let second = db
+        .tags_for_paths_page_at_revision(revision, &continuation, Some(&cursor), 2)
+        .unwrap();
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        second
+            .entries
+            .iter()
+            .map(|entry| (entry.normalized_text.as_str(), entry.assignment_count))
+            .collect::<Vec<_>>(),
+        vec![("shared", Some(129))]
+    );
+}
+
+#[test]
+fn canceled_tag_staging_rolls_back_temporary_selection_scope() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    db.assign_tag_to_path(Path::new("one.wav"), "shared")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let paths = (0..129)
+        .map(|index| PathBuf::from(format!("sample-{index:03}.wav")))
+        .collect::<Vec<_>>();
+    let mut callback_checks = 0;
+    assert!(matches!(
+        db.tags_for_paths_page_at_revision_with_cancellation(revision, &paths, None, 1, || {
+            callback_checks += 1;
+            callback_checks >= 3
+        },),
+        Err(SourceDbError::Canceled)
+    ));
+
+    let page = db
+        .tags_for_paths_page_at_revision(revision, &[PathBuf::from("one.wav")], None, 1)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].normalized_text, "shared");
+    assert_eq!(page.entries[0].assignment_count, Some(1));
+}
+
+#[test]
 fn tag_pages_reject_overlarge_inputs_before_querying() {
     let dir = tempdir().unwrap();
     let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
@@ -369,4 +448,24 @@ fn tag_page_bounds_legacy_long_multibyte_and_nul_labels_while_advancing() {
             .all(|entry| entry.normalized_text.len() <= SOURCE_TAG_PAGE_MAX_PREFIX_BYTES)
     );
     assert_eq!(entries.iter().filter(|entry| entry.is_preview).count(), 3);
+}
+
+#[test]
+fn selected_tag_page_accepts_full_path_count_without_sqlite_bind_limit() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let paths = (0..SOURCE_TAG_PAGE_MAX_PATHS)
+        .map(|index| PathBuf::from(format!("sample-{index:05}.wav")))
+        .collect::<Vec<_>>();
+    let last = paths.last().unwrap();
+    db.upsert_file(last, 10, 5).unwrap();
+    db.assign_tag_to_path(last, "boundary").unwrap();
+    let revision = db.get_revision().unwrap();
+    let page = db
+        .tags_for_paths_page_at_revision(revision, &paths, None, 1)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].normalized_text, "boundary");
+    assert_eq!(page.entries[0].assignment_count, Some(1));
+    assert!(page.next_cursor.is_none());
 }

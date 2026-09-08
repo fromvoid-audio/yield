@@ -1371,3 +1371,22 @@ write durability. Library/UI compilation, formatting and diff checks passed.
 Independent review found no correctness, durability, shutdown-race or permit-leak
 issues. Its startup coverage gap was closed with passing deterministic initialization
 and unavailable-profile public-API tests.
+
+### Large-selection tag union pages
+
+Selected-tag pages now accept up to 65,536 paths and 16 MiB of encoded path data.
+Each revision-fenced read stages its deduplicated selection in a transaction-local
+temporary table, uses indexed assignment lookups, and returns bounded pages with
+exact selected-file counts. Transaction rollback removes the temporary scope on
+success and failure; staging checks cancellation in bounded chunks. The catalog
+limits retained selection commands to an estimated 32 MiB including path containers,
+releasing that credit after processing independently of result-event consumption.
+
+The architecture was independently reviewed and the implementation diff reviewed
+by the primary agent. Library tag tests, all 50 catalog tests, session tests and
+compilation passed. A further positive 65,536-path boundary test passed, confirming
+the last selected path participates without exceeding SQLite bind limits. Six
+focused catalog tests passed after final cleanup; publication tests wait for
+command-credit release rather than assuming it precedes event receipt. Formatting
+and diff checks passed. The initialization test also releases its worker gate before
+asserting, so assertion failure can shut down normally.
