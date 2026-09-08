@@ -56,7 +56,11 @@ impl<'conn> SourceWriteBatch<'conn> {
         relative_path: &Path,
         label: &str,
     ) -> Result<SourceTag, SourceDbError> {
-        self.assign_tag_to_path_inner(relative_path, label, false)
+        let path = normalize_relative_path(relative_path)?;
+        ensure_wav_path_exists(&self.tx, &path)?;
+        let tag = resolve_or_create_tag(&self.tx, label)?;
+        self.assign_resolved_tag(relative_path, &path, tag.id)?;
+        Ok(tag)
     }
 
     /// Assign one tag for a curation transaction, replacing conflicting playback tags atomically.
@@ -65,32 +69,39 @@ impl<'conn> SourceWriteBatch<'conn> {
         relative_path: &Path,
         label: &str,
     ) -> Result<(), SourceDbError> {
-        self.assign_tag_to_path_inner(relative_path, label, true)
-            .map(|_| ())
-    }
-
-    fn assign_tag_to_path_inner(
-        &mut self,
-        relative_path: &Path,
-        label: &str,
-        replace_playback_type: bool,
-    ) -> Result<SourceTag, SourceDbError> {
         let path = normalize_relative_path(relative_path)?;
         ensure_wav_path_exists(&self.tx, &path)?;
-        let tag = resolve_or_create_tag(&self.tx, label)?;
-        if replace_playback_type && playback_type_for_tag_id(&self.tx, tag.id)?.is_some() {
-            remove_other_playback_type_tags(&self.tx, &path, tag.id)?;
+        // Existing legacy display labels can be arbitrarily large. Curation only needs identity,
+        // so never materialize those strings while resolving a bounded incoming label.
+        let normalized_text = insert_tag_identity(&self.tx, label)?;
+        let tag_id = self
+            .tx
+            .prepare_cached("SELECT id FROM source_tags WHERE normalized_text = ?1")
+            .map_err(map_sql_error)?
+            .query_row([normalized_text], |row| row.get::<_, i64>(0))
+            .map_err(map_sql_error)?;
+        if playback_type_for_tag_id(&self.tx, tag_id)?.is_some() {
+            remove_other_playback_type_tags(&self.tx, &path, tag_id)?;
         }
+        self.assign_resolved_tag(relative_path, &path, tag_id)
+    }
+
+    fn assign_resolved_tag(
+        &mut self,
+        relative_path: &Path,
+        normalized_path: &str,
+        tag_id: i64,
+    ) -> Result<(), SourceDbError> {
         self.tx
             .prepare_cached(
                 "INSERT OR IGNORE INTO wav_file_tags (path, tag_id)
                  VALUES (?1, ?2)",
             )
             .map_err(map_sql_error)?
-            .execute(params![path, tag.id])
+            .execute(params![normalized_path, tag_id])
             .map_err(map_sql_error)?;
         self.touch_last_curated_at(relative_path)?;
-        Ok(tag)
+        Ok(())
     }
 
     /// Remove a normal tag assignment from one wav path inside the active batch.
@@ -175,6 +186,11 @@ impl<'conn> SourceWriteBatch<'conn> {
 }
 
 fn resolve_or_create_tag(tx: &Transaction<'_>, label: &str) -> Result<SourceTag, SourceDbError> {
+    let normalized_text = insert_tag_identity(tx, label)?;
+    tag_by_normalized_text(tx, &normalized_text)
+}
+
+fn insert_tag_identity(tx: &Transaction<'_>, label: &str) -> Result<String, SourceDbError> {
     let identity = normalize_tag_identity(label)?;
     tx.prepare_cached(
         "INSERT INTO source_tags (normalized_text, display_label)
@@ -184,7 +200,7 @@ fn resolve_or_create_tag(tx: &Transaction<'_>, label: &str) -> Result<SourceTag,
     .map_err(map_sql_error)?
     .execute(params![identity.normalized_text, identity.display_label])
     .map_err(map_sql_error)?;
-    tag_by_normalized_text(tx, &identity.normalized_text)
+    Ok(identity.normalized_text)
 }
 
 fn tag_by_normalized_text(

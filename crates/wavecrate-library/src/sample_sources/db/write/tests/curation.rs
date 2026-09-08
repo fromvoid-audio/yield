@@ -785,3 +785,42 @@ fn profile_bound_curation_rejects_replaced_database_child_atomically() {
     assert_eq!(continuity_state(&fixture.database), initial_continuity);
     assert!(child_path.join("sentinel").is_file());
 }
+
+#[test]
+fn curation_tag_assignment_resolves_identity_without_decoding_legacy_display_text() {
+    let fixture = CurationFixture::new();
+    // A legacy row can contain non-text bytes despite the TEXT column affinity. The bounded
+    // curation path only needs its numeric identity and must not decode this unused payload.
+    let legacy_display = vec![0xff_u8; 1024 * 1024];
+    fixture
+        .database
+        .connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES ('loop', ?1)",
+            [&legacy_display],
+        )
+        .expect("legacy tag");
+    let receipt = fixture
+        .commit(&[SourceCurationUpdate::AddTag {
+            path: CurationFixture::path("one.wav"),
+            label: String::from("loop"),
+        }])
+        .expect("assign existing identity without decoding its display label");
+    assert_eq!(
+        receipt.files()[0].playback_type,
+        Some(SourcePlaybackType::Loop)
+    );
+    let (stored_length, assignments): (usize, usize) = fixture
+        .database
+        .connection
+        .query_row(
+            "SELECT length(display_label),
+            (SELECT count(*) FROM wav_file_tags WHERE tag_id = source_tags.id)
+         FROM source_tags WHERE normalized_text = 'loop'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("stored legacy identity");
+    assert_eq!(stored_length, legacy_display.len());
+    assert_eq!(assignments, 1);
+}

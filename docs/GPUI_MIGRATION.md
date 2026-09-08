@@ -1347,3 +1347,11 @@ retains its existing behavior. The full UI suite passed 173 tests with one ignor
 and normal UI compilation, formatting and diff checks passed. Independent review
 identified the original passive-focus playback interruption; the fix was re-reviewed
 with no remaining actionable findings. Tag editor controls follow separately.
+
+### Bounded tag identity resolution
+
+Curation tag assignment now resolves only the numeric stored identity. It no longer
+decodes an existing legacy display label that the receipt does not need. The legacy
+API that returns full tags retains its behavior. Four focused curation-tag tests
+passed, including assignment against a one-MiB non-text legacy display payload,
+playback-type replacement, input bounds and curated timestamps.
