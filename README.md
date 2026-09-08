@@ -18,6 +18,7 @@ separate crates with defined ownership:
 | `reson` | Existing audio engine |
 | `wavecrate-library` | Persistence and source-ownership primitives |
 | `wavecrate-catalog` | Audited source projections and bounded metadata operations |
+| `wavecrate-source-watcher` | Native watch handles and bounded lifecycle-fenced change hints |
 | `wavecrate-session` | Profile, source registry, preferences, and catalog lifecycle |
 | `wavecrate-scan` | Existing persistent scanner |
 | `wavecrate-analysis` | Existing decoding and analysis |

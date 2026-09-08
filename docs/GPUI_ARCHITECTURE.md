@@ -21,6 +21,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
 | `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
 | `wavecrate-catalog` | Bounded authoritative source audits, safe WAV display metadata, and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
+| `wavecrate-source-watcher` | Native root/parent watch handles, lexical event classification, and one coalesced lifecycle-fenced hint | Scanning, database access, UI publication, or audit scheduling |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
 | `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
@@ -41,6 +42,7 @@ flowchart TD
     Session --> Catalog
     Catalog[wavecrate-catalog] --> Library
     Catalog --> Scan
+    Watcher[wavecrate-source-watcher] --> Library
     Scan[wavecrate-scan] --> Library
 ```
 
@@ -93,7 +95,14 @@ unavailable, and closed states without forwarding events through another queue.
 Submission and closure share a short admission lock; polling does not wait for
 catalog I/O. Catalog failure leaves the registry and preference lanes usable,
 and session shutdown joins the catalog before releasing the profile guard.
-Browser projection and filesystem watchers remain subsequent integration work.
+Browser projections are built from catalog snapshots on background tasks. The
+standalone `wavecrate-source-watcher` adapter now captures filesystem hints; its
+catalog scheduling integration is in progress. Each handle owns a distinct
+signal, and shutdown closes callback acceptance before dropping the backend.
+Callbacks retain no event paths and perform no filesystem probes or database
+work. Root-only ambiguous events remain distinguishable from descendant
+changes so the owner can avoid database-write feedback loops. Backend overflow
+always requires authoritative reconciliation.
 
 WAV waveforms use two buffered streaming passes: the first finds the global
 mono peak and the second feeds normalized frames into bounded peak and frequency
