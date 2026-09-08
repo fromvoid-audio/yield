@@ -636,6 +636,13 @@ impl PlaybackRuntimeCommandQueue {
             {
                 return Err(PlaybackRuntimeSubmitError::QueueFull);
             }
+            if let (Some(queued_id), Some(incoming_id)) = (
+                state.commands.get(index).and_then(span_retarget_id),
+                span_retarget_id(&command),
+            ) && incoming_id <= queued_id
+            {
+                return Ok(());
+            }
             let replaced = std::mem::replace(
                 state
                     .commands
@@ -663,9 +670,11 @@ impl PlaybackRuntimeCommandQueue {
                 );
             if can_evict {
                 let eviction = match &command {
-                    PlaybackRuntimeCommand::Play { .. }
-                    | PlaybackRuntimeCommand::RetargetSpan { .. } => {
-                        find_disposable_command(&state.commands)
+                    PlaybackRuntimeCommand::Play { .. } => {
+                        find_disposable_command(&state.commands, true)
+                    }
+                    PlaybackRuntimeCommand::RetargetSpan { .. } => {
+                        find_disposable_command(&state.commands, false)
                     }
                     PlaybackRuntimeCommand::Stop { .. }
                     | PlaybackRuntimeCommand::CancelPendingPlayback
@@ -809,14 +818,24 @@ fn same_coalescing_class(
     queued: &PlaybackRuntimeCommand,
     incoming: &PlaybackRuntimeCommand,
 ) -> bool {
+    if let (
+        PlaybackRuntimeCommand::RetargetSpan {
+            expected_playback_id: queued_play,
+            ..
+        },
+        PlaybackRuntimeCommand::RetargetSpan {
+            expected_playback_id: incoming_play,
+            ..
+        },
+    ) = (queued, incoming)
+    {
+        return queued_play == incoming_play;
+    }
     matches!(
         (queued, incoming),
         (
             PlaybackRuntimeCommand::Play { .. },
             PlaybackRuntimeCommand::Play { .. }
-        ) | (
-            PlaybackRuntimeCommand::RetargetSpan { .. },
-            PlaybackRuntimeCommand::RetargetSpan { .. }
         ) | (
             PlaybackRuntimeCommand::PollProgress { .. },
             PlaybackRuntimeCommand::PollProgress { .. }
@@ -839,15 +858,17 @@ fn same_coalescing_class(
     )
 }
 
-fn find_disposable_command(commands: &VecDeque<PlaybackRuntimeCommand>) -> Option<usize> {
+fn find_disposable_command(
+    commands: &VecDeque<PlaybackRuntimeCommand>,
+    allow_retarget: bool,
+) -> Option<usize> {
     commands.iter().position(|command| {
         matches!(
             command,
             PlaybackRuntimeCommand::PollProgress { .. }
-                | PlaybackRuntimeCommand::RetargetSpan { .. }
                 | PlaybackRuntimeCommand::SetVolume { .. }
                 | PlaybackRuntimeCommand::SetPlaybackGain { .. }
-        )
+        ) || (allow_retarget && matches!(command, PlaybackRuntimeCommand::RetargetSpan { .. }))
     })
 }
 
@@ -1187,17 +1208,18 @@ fn run_playback_runtime(
                 expected_playback_id,
                 mut update,
             } => {
+                if expected_playback_id.is_some() && expected_playback_id != current_playback_id {
+                    send_cancelled(id, PlaybackRuntimeCancellation::Superseded, &events);
+                    continue;
+                }
                 if latest_span_retarget_id.is_some_and(|latest| id <= latest) {
                     continue;
                 }
-                latest_span_retarget_id = Some(id);
+                if expected_playback_id.is_none() {
+                    latest_span_retarget_id = Some(id);
+                }
 
-                if let Some(expected_playback_id) = expected_playback_id {
-                    if current_playback_id != Some(expected_playback_id) {
-                        send_cancelled(id, PlaybackRuntimeCancellation::Superseded, &events);
-                        continue;
-                    }
-
+                if expected_playback_id.is_some() {
                     let progress = authoritative_progress(&mut executor, current_playback_id);
                     if !progress.active || progress.error.is_some() {
                         send_runtime_event(
@@ -1206,6 +1228,7 @@ fn run_playback_runtime(
                         );
                         continue;
                     }
+                    latest_span_retarget_id = Some(id);
                     if !update.seek_to_offset {
                         if let Some(progress_ratio) =
                             progress.progress.filter(|ratio| ratio.is_finite())
@@ -1399,7 +1422,10 @@ fn coalesce_span_retarget_command(
 ) -> PlaybackRuntimeCommand {
     loop {
         match pending.front() {
-            Some(PlaybackRuntimeCommand::RetargetSpan { .. }) => {
+            Some(next @ PlaybackRuntimeCommand::RetargetSpan { .. }) => {
+                if !same_coalescing_class(&current, next) {
+                    return current;
+                }
                 let next = pending.pop_front().expect("pending span retarget");
                 let current_id = span_retarget_id(&current).expect("current span retarget");
                 let next_id = span_retarget_id(&next).expect("next span retarget");
@@ -2792,42 +2818,153 @@ mod tests {
     }
 
     #[test]
-    fn playback_runtime_coalesces_active_retargets_to_newest_expected_play() {
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let executor = FakeExecutor::new(vec![]).with_play_gate(entered_tx, release_rx);
-        let retargeted = executor.retargeted();
-        let runtime =
-            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+    fn stale_play_retarget_cannot_suppress_current_play_in_either_queue_order() {
+        for stale_first in [true, false] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let executor = FakeExecutor::new(vec![]).with_play_gate(entered_tx, release_rx);
+            let retargeted = executor.retargeted();
+            let runtime =
+                spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn");
+            let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("entered play");
+            let current_update = span_update(0.3, 0.9, false);
+            for stale in [stale_first, !stale_first] {
+                runtime
+                    .handle
+                    .try_retarget_active_span(
+                        if stale {
+                            PlaybackRequestId(100)
+                        } else {
+                            playback_id
+                        },
+                        if stale {
+                            span_update(0.1, 0.4, true)
+                        } else {
+                            current_update
+                        },
+                    )
+                    .expect("retarget");
+            }
+            release_tx.send(()).expect("release");
+            let mut cancelled = 0;
+            let mut progressed = 0;
+            for _ in 0..3 {
+                match runtime
+                    .events
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("event")
+                {
+                    PlaybackRuntimeEvent::Started(_) => {}
+                    PlaybackRuntimeEvent::Cancelled { .. } => cancelled += 1,
+                    PlaybackRuntimeEvent::Progress { progress, .. } => {
+                        assert_eq!(progress.playback_request_id, Some(playback_id));
+                        progressed += 1;
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            assert_eq!((cancelled, progressed), (1, 1));
+            assert_eq!(
+                retargeted.lock().expect("retargeted").as_slice(),
+                &[current_update]
+            );
+        }
+    }
 
-        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
-        entered_rx.recv().expect("executor entered play");
-        let discarded_update = span_update(0.1, 0.4, true);
-        let newest_update = span_update(0.3, 0.9, false);
-        let discarded_id = runtime
-            .handle
-            .try_retarget_active_span(PlaybackRequestId(playback_id.get() + 100), discarded_update)
-            .expect("discarded retarget");
-        let newest_id = runtime
-            .handle
-            .try_retarget_active_span(playback_id, newest_update)
-            .expect("newest retarget");
-        release_tx.send(()).expect("release executor");
-
+    #[test]
+    fn guarded_retarget_queue_preserves_other_identities_and_newest_same_identity() {
+        let queue = PlaybackRuntimeCommandQueue::new(1);
+        let play = PlaybackRequestId(1);
+        queue
+            .try_submit(active_retarget_command(
+                PlaybackRequestId(3),
+                play,
+                0.2,
+                0.8,
+            ))
+            .expect("current");
         assert!(matches!(
-            runtime.events.recv().expect("started event"),
-            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+            queue.try_submit(active_retarget_command(
+                PlaybackRequestId(4),
+                PlaybackRequestId(99),
+                0.1,
+                0.4
+            )),
+            Err(PlaybackRuntimeSubmitError::QueueFull)
         ));
-        assert!(matches!(
-            runtime.events.recv().expect("newest retarget event"),
-            PlaybackRuntimeEvent::Progress { id, progress }
-                if id == newest_id && progress.playback_request_id == Some(playback_id)
-        ));
-        assert_ne!(discarded_id, newest_id);
-        assert_eq!(
-            retargeted.lock().expect("retargeted").as_slice(),
-            &[newest_update]
+        queue
+            .try_submit(active_retarget_command(
+                PlaybackRequestId(2),
+                play,
+                0.1,
+                0.4,
+            ))
+            .expect("old same play");
+        assert!(
+            matches!(queue.try_recv().expect("retained"), PlaybackRuntimeCommand::RetargetSpan { id, .. } if id == PlaybackRequestId(3))
         );
+        let (coalesced, pending, _) = coalesce_for_test(
+            active_retarget_command(PlaybackRequestId(3), play, 0.2, 0.8),
+            vec![active_retarget_command(
+                PlaybackRequestId(4),
+                PlaybackRequestId(99),
+                0.1,
+                0.4,
+            )],
+        );
+        assert!(
+            matches!(coalesced, CoalescedCommand::RetargetSpan { id, .. } if id == PlaybackRequestId(3))
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn rejected_guard_does_not_advance_retarget_watermark() {
+        let executor = FakeExecutor::new(vec![]);
+        let retargeted = executor.retargeted();
+        let runtime = spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn");
+        let play = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime
+                .events
+                .recv_timeout(Duration::from_secs(2))
+                .expect("started"),
+            PlaybackRuntimeEvent::Started(_)
+        ));
+        runtime
+            .handle
+            .commands
+            .try_submit(active_retarget_command(
+                PlaybackRequestId(4),
+                PlaybackRequestId(99),
+                0.1,
+                0.4,
+            ))
+            .expect("stale identity");
+        assert!(matches!(
+            runtime
+                .events
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cancelled"),
+            PlaybackRuntimeEvent::Cancelled { .. }
+        ));
+        runtime
+            .handle
+            .commands
+            .try_submit(active_retarget_command(
+                PlaybackRequestId(3),
+                play,
+                0.2,
+                0.8,
+            ))
+            .expect("delayed current");
+        assert!(
+            matches!(runtime.events.recv_timeout(Duration::from_secs(2)).expect("progress"), PlaybackRuntimeEvent::Progress { id, .. } if id == PlaybackRequestId(3))
+        );
+        assert_eq!(retargeted.lock().expect("retargeted").len(), 1);
     }
 
     #[test]
@@ -2835,7 +2972,7 @@ mod tests {
         let first_id = PlaybackRequestId(1);
         let second_id = PlaybackRequestId(2);
         let first_expected = PlaybackRequestId(7);
-        let second_expected = PlaybackRequestId(8);
+        let second_expected = first_expected;
         let (coalesced, pending, events) = coalesce_for_test(
             active_retarget_command(first_id, first_expected, 0.1, 0.5),
             vec![active_retarget_command(

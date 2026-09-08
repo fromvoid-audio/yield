@@ -1179,3 +1179,12 @@ Validation: all 32 Reson runtime tests passed, including actual dispatch and
 coalescing, completed/stale plays, consumed preflight errors, failed replacement
 and stop, identity retention, and offset semantics. Locked UI compilation,
 formatting, and diff checks passed. Application instances were untouched.
+
+Independent review identified and corrected cross-play retarget suppression:
+guarded commands now coalesce only for the same expected play identity, and
+saturation cannot evict a different identity's retarget. Queue replacement
+retains the newer command ID. A rejected guard does not advance the runtime's
+retarget watermark; known stale IDs are discarded before consuming preflight
+errors. Both queued arrival orders and delayed lower-ID current commands have
+regression coverage. All 34 runtime tests passed after correction; independent
+re-review found no remaining meaningful issues.
