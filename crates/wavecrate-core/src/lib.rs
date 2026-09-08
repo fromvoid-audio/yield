@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 mod folder_tree;
 mod playback_history;
+mod rating;
 mod selection;
 mod waveform_region;
 mod waveform_viewport;
@@ -18,6 +19,7 @@ pub use playback_history::{
     PLAYBACK_NAVIGATION_HISTORY_LIMIT, PlaybackHistoryEntry, PlaybackNavigationHistory,
     PlaybackSpan,
 };
+pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use selection::BrowserSelection;
 pub use waveform_region::WaveformRegion;
 pub use waveform_viewport::WaveformViewport;

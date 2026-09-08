@@ -856,3 +856,17 @@ library suite passed 459 tests before the lock/replacement additions; all ten
 curation-filtered tests passed on the final transaction implementation. Catalog
 admission, shutdown draining, and visible curation controls are separate
 follow-on work.
+
+### Rating rules and curation colors, 2026-09-08
+
+The core crate now models the reference rating transitions without UI or
+persistence dependencies: ratings span -3 through +3, direction changes skip
+neutral, a fourth positive step locks +3, and locked states ignore adjustments.
+A fourth negative step produces an explicit trash request for the filesystem
+transaction layer; the helper itself performs no file operation.
+
+Themes include semantic keep, trash, and neutral indicators plus six collection
+swatches matching the reference defaults. These additive fields default when
+loading older themes and preserve explicit overrides. Four focused rating tests
+and all nineteen design tests passed. Visible controls and trash transaction
+integration remain follow-on work.

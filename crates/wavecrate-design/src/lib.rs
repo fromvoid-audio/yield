@@ -133,6 +133,29 @@ fn default_waveform_playhead() -> Color {
     Color::rgba(231, 229, 223, 210)
 }
 
+fn default_rating_keep() -> Color {
+    Color::rgba(122, 226, 96, 235)
+}
+
+fn default_rating_trash() -> Color {
+    Color::rgba(238, 77, 67, 235)
+}
+
+fn default_rating_neutral() -> Color {
+    Color::rgba(184, 188, 194, 235)
+}
+
+fn default_collection_slots() -> [Color; 6] {
+    [
+        Color::rgba(242, 100, 79, 232),
+        Color::rgba(210, 158, 81, 224),
+        Color::rgba(199, 188, 92, 224),
+        Color::rgba(112, 172, 111, 224),
+        Color::rgba(83, 161, 194, 224),
+        Color::rgba(149, 116, 185, 224),
+    ]
+}
+
 fn default_waveform_scrollbar_height() -> f32 {
     6.0
 }
@@ -165,6 +188,18 @@ pub struct Colors {
     pub danger: Color,
     /// Warning and loading color.
     pub warning: Color,
+    /// Keep rating indicator color.
+    #[serde(default = "default_rating_keep")]
+    pub rating_keep: Color,
+    /// Trash rating indicator color.
+    #[serde(default = "default_rating_trash")]
+    pub rating_trash: Color,
+    /// Neutral or unrated indicator color.
+    #[serde(default = "default_rating_neutral")]
+    pub rating_neutral: Color,
+    /// Fixed collection swatch colors, in displayed slots one through six.
+    #[serde(default = "default_collection_slots")]
+    pub collection_slots: [Color; 6],
     /// Faint selected-row fill.
     pub selection_fill: Color,
     /// Selected-row hover fill.
@@ -322,6 +357,10 @@ impl Default for Theme {
                 accent: Color::rgb(233, 88, 67),
                 danger: Color::rgb(239, 76, 61),
                 warning: Color::rgb(217, 151, 95),
+                rating_keep: default_rating_keep(),
+                rating_trash: default_rating_trash(),
+                rating_neutral: default_rating_neutral(),
+                collection_slots: default_collection_slots(),
                 selection_fill: Color::rgba(233, 88, 67, 8),
                 selection_hover_fill: Color::rgba(233, 88, 67, 16),
                 control_disabled_fill: Color::rgb(36, 40, 41),
@@ -736,6 +775,10 @@ mod tests {
         assert_eq!(theme.colors.accent, Color::rgb(233, 88, 67));
         assert_eq!(theme.colors.text_primary, Color::rgb(216, 215, 211));
         assert_eq!(theme.colors.text_muted, Color::rgb(153, 155, 154));
+        assert_eq!(theme.colors.rating_keep, default_rating_keep());
+        assert_eq!(theme.colors.rating_trash, default_rating_trash());
+        assert_eq!(theme.colors.rating_neutral, default_rating_neutral());
+        assert_eq!(theme.colors.collection_slots, default_collection_slots());
         assert_eq!(theme.spacing.sidebar_width, 260.0);
         assert_eq!(theme.spacing.waveform_height, 226.0);
         assert_eq!(theme.spacing.row_height, 22.0);
@@ -751,20 +794,95 @@ mod tests {
     }
 
     #[test]
-    fn legacy_theme_defaults_the_optional_waveform_playhead_token() {
-        let legacy = valid_json()
-            .replace("    \"waveform_playhead\": \"#E7E5DFD2\",\n", "")
-            .replace(
-                "    \"metadata_height\": 20.0,\n    \"scrollbar_height\": 6.0\n",
-                "    \"metadata_height\": 20.0\n",
-            );
-        assert!(!legacy.contains("\"waveform_playhead\""));
-        assert!(!legacy.contains("\"scrollbar_height\""));
+    fn legacy_theme_defaults_additive_waveform_and_curation_tokens() {
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&valid_json()).expect("default theme is JSON");
+        let object = legacy.as_object_mut().expect("theme object");
+        let colors = object
+            .get_mut("colors")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("colors object");
+        for field in [
+            "rating_keep",
+            "rating_trash",
+            "rating_neutral",
+            "collection_slots",
+            "waveform_playhead",
+        ] {
+            colors.remove(field);
+        }
+        let waveform = object
+            .get_mut("waveform")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("waveform object");
+        waveform.remove("scrollbar_height");
+        let legacy = serde_json::to_string(&legacy).expect("legacy theme serializes");
 
         let theme = parse_theme_json(&legacy).expect("legacy theme validates");
 
+        assert_eq!(theme.colors.rating_keep, default_rating_keep());
+        assert_eq!(theme.colors.rating_trash, default_rating_trash());
+        assert_eq!(theme.colors.rating_neutral, default_rating_neutral());
+        assert_eq!(theme.colors.collection_slots, default_collection_slots());
         assert_eq!(theme.colors.waveform_playhead, default_waveform_playhead());
         assert_eq!(theme.waveform.scrollbar_height, 6.0);
+    }
+
+    #[test]
+    fn explicit_rating_and_collection_tokens_survive_theme_loading() {
+        let mut custom: serde_json::Value =
+            serde_json::from_str(&valid_json()).expect("default theme is JSON");
+        let colors = custom
+            .get_mut("colors")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("colors object");
+        colors.insert(
+            "rating_keep".to_string(),
+            serde_json::Value::String("#01020304".to_string()),
+        );
+        colors.insert(
+            "rating_trash".to_string(),
+            serde_json::Value::String("#05060708".to_string()),
+        );
+        colors.insert(
+            "rating_neutral".to_string(),
+            serde_json::Value::String("#090A0B0C".to_string()),
+        );
+        colors.insert(
+            "collection_slots".to_string(),
+            serde_json::Value::Array(
+                [
+                    "#10111213",
+                    "#14151617",
+                    "#18191A1B",
+                    "#1C1D1E1F",
+                    "#20212223",
+                    "#24252627",
+                ]
+                .into_iter()
+                .map(|color| serde_json::Value::String(color.to_string()))
+                .collect(),
+            ),
+        );
+
+        let parsed =
+            parse_theme_json(&serde_json::to_string(&custom).expect("custom theme serializes"))
+                .expect("custom theme validates");
+
+        assert_eq!(parsed.colors.rating_keep, Color::rgba(1, 2, 3, 4));
+        assert_eq!(parsed.colors.rating_trash, Color::rgba(5, 6, 7, 8));
+        assert_eq!(parsed.colors.rating_neutral, Color::rgba(9, 10, 11, 12));
+        assert_eq!(
+            parsed.colors.collection_slots,
+            [
+                Color::rgba(16, 17, 18, 19),
+                Color::rgba(20, 21, 22, 23),
+                Color::rgba(24, 25, 26, 27),
+                Color::rgba(28, 29, 30, 31),
+                Color::rgba(32, 33, 34, 35),
+                Color::rgba(36, 37, 38, 39),
+            ]
+        );
     }
 
     #[test]

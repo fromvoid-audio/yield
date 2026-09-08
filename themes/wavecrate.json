@@ -14,6 +14,17 @@
     "accent": "#E95843FF",
     "danger": "#EF4C3DFF",
     "warning": "#D9975FFF",
+    "rating_keep": "#7AE260EB",
+    "rating_trash": "#EE4D43EB",
+    "rating_neutral": "#B8BCC2EB",
+    "collection_slots": [
+      "#F2644FE8",
+      "#D29E51E0",
+      "#C7BC5CE0",
+      "#70AC6FE0",
+      "#53A1C2E0",
+      "#9574B9E0"
+    ],
     "selection_fill": "#E9584308",
     "selection_hover_fill": "#E9584310",
     "control_disabled_fill": "#242829FF",
