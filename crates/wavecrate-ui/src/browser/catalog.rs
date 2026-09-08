@@ -171,6 +171,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        self.display_labels.cancel_for_source_change();
         self.reset_browser_focus_state();
         self.context_menu = None;
         let Some((source_id, root, label)) = self
@@ -328,6 +329,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        self.display_labels.cancel_for_source_change();
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
         if let Some(activation) = activation {
@@ -410,6 +412,7 @@ impl Browser {
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
+                self.display_labels.cancel_for_source_change();
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
                 self.curation_state.prune_completed_except(None);
@@ -495,6 +498,7 @@ impl Browser {
             super::source_recovery::cancel_for_source_change(self);
             super::tag_chips::cancel_for_source_change(self);
             super::tag_completion::cancel_for_source_change(self, cx);
+            self.display_labels.cancel_for_source_change();
             self.reset_catalog_metadata();
             self.curation_state.prune_completed_except(None);
             return true;
@@ -505,6 +509,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        self.display_labels.cancel_for_source_change();
         self.cancel_catalog_projection();
         self.reset_catalog_metadata();
         self.curation_state.prune_completed_except(None);
@@ -533,6 +538,13 @@ impl Browser {
             || super::tags::apply_catalog_event(self, &event, cx)
             || super::tag_library::apply_catalog_event(self, &event, cx)
             || super::tag_chips::apply_catalog_event(self, &event))
+        {
+            return true;
+        }
+        if matches!(
+            &event,
+            CatalogEvent::DisplayLabelsReady { .. } | CatalogEvent::DisplayLabelsFailed { .. }
+        ) && self.apply_display_labels_event(&event)
         {
             return true;
         }
@@ -569,6 +581,7 @@ impl Browser {
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
+                self.display_labels.cancel_for_source_change();
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
@@ -631,6 +644,7 @@ impl Browser {
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
+                self.display_labels.cancel_for_source_change();
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
@@ -744,6 +758,16 @@ impl Browser {
             );
             self.catalog_metadata
                 .install_projection(catalog_metadata::CatalogMetadataContext {
+                    source_id: projection.source_id.clone(),
+                    lifecycle_generation: projection.lifecycle_generation,
+                    root: projection.root.clone(),
+                    root_identity: projection.root_identity.clone(),
+                    directory_generation: projection.directory_generation,
+                    revision: projection.committed_revision,
+                    entry_indices: Arc::clone(&projection.entry_indices),
+                });
+            self.display_labels
+                .install_projection(super::display_labels::DisplayLabelsContext {
                     source_id: projection.source_id.clone(),
                     lifecycle_generation: projection.lifecycle_generation,
                     root: projection.root.clone(),

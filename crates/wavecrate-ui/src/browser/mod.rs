@@ -37,6 +37,7 @@ mod catalog;
 mod catalog_metadata;
 mod context_menu;
 mod curation;
+mod display_labels;
 mod handoff;
 mod history;
 mod motion;
@@ -243,6 +244,7 @@ pub(crate) struct Browser {
     restore_selection_id: Option<AudioFileId>,
     restore_selection_position: Option<usize>,
     view_model: BrowserViewModel,
+    sample_name_view_mode: wavecrate_core::SampleNameViewMode,
     selected: Option<usize>,
     selection: BrowserSelection,
     browser_focus_override: Option<AudioFileId>,
@@ -299,6 +301,7 @@ pub(crate) struct Browser {
     catalog_projection_task: Option<Task<()>>,
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
     catalog_metadata: catalog_metadata::CatalogMetadataState,
+    display_labels: display_labels::DisplayLabelsState,
     source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
@@ -434,6 +437,7 @@ impl Browser {
             restore_selection_id: None,
             restore_selection_position: None,
             view_model: BrowserViewModel::new(&[]),
+            sample_name_view_mode: wavecrate_core::SampleNameViewMode::default(),
             selected: None,
             selection: BrowserSelection::new(),
             browser_focus_override: None,
@@ -490,6 +494,7 @@ impl Browser {
             catalog_projection_task: None,
             catalog_projection_cancel: None,
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
+            display_labels: display_labels::DisplayLabelsState::default(),
             source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),

@@ -19,6 +19,7 @@ separate crates with defined ownership:
 | `wavecrate-library` | Persistence and source-ownership primitives |
 | `wavecrate-catalog` | Audited source projections and bounded metadata operations |
 | `wavecrate-source-watcher` | Native watch handles and bounded lifecycle-fenced change hints |
+| `wavecrate-platform` | Native file-drag foundation with explicit platform-session ownership |
 | `wavecrate-session` | Profile, source registry, preferences, and catalog lifecycle |
 | `wavecrate-scan` | Existing persistent scanner |
 | `wavecrate-analysis` | Existing decoding and analysis |
@@ -101,7 +102,13 @@ Larger tag unions have paging controls. Chips update after metadata is saved.
 The ADD TAG arrow opens a paged Tag Editor with five collapsible categories.
 Click a tag to toggle its assignment across the selection; drag supported tags
 to another category to update the profile dictionary. Legacy tags keep their
-source identity, and playback-type categories stay locked.
+source identity, and playback-type categories stay locked. Profile definitions
+can be removed without removing file assignments; Undo removal restores the last
+definition if no later dictionary edit has changed its revision.
+
+The Name header's Disk/Label control switches between filename stems and ordered
+tag labels. Labels load for visible rows and fall back to the filename when absent.
+This display choice does not rename files or change their selection or sort order.
 
 The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,

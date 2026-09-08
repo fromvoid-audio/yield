@@ -1789,3 +1789,13 @@ The catalog and session now expose targeted `RequestDisplayLabels` reads with ty
 Validation: all 84 catalog tests passed, including seven display-label tests, and catalog/session checks and formatting passed. The new UI loader is still being implemented; this delivery layer does not change the browser display by itself.
 
 Independent review found no actionable lifecycle, cancellation, or result-credit issue. The supersession test was strengthened to reject any label event encountered before the replacement snapshot; that focused regression passed after the assertion change.
+
+### Disk/Label browser mode
+
+The Name header now toggles Disk and Label display. Disk shows the filename stem; Label uses the bounded ordered metadata projection, with filename fallback and an ellipsis for truncated labels. Sorting, selection, and playback continue to use the existing file identities. Visible rows defer demand to the catalog lane; no database or filesystem work runs during rendering.
+
+The loader retains at most 256 visible-demand paths, with separate 1 MiB label/path budgets, and submits at most 64 paths within the combined raw/normalized byte limit. Offscreen cache and fallback keys are removed together. Same-lifecycle projection changes retain admitted requests until stale replies drain; source changes cancel the old lane. Tag-changing or uncertain curation clears projected labels. Confirmed non-tag receipts, including playback-history and no-op writes, preserve and rebase the cache. Pending writes in another source do not pause the current source. Disk mode stops queued work while draining admitted work. Context comparison uses the shared manifest-map identity rather than comparing the full manifest.
+
+Validation: all 12 display-label UI tests, 36 curation-focused UI tests, the UI check, formatting and diff checks passed. Tests cover successive windows over 320 files with maximum-sized labels, byte-counter reclamation, long-path batching, stale replies, missing-label fallback, invalid payloads and mode cancellation. Native interaction acceptance remains pending.
+
+Independent review found playback-history cache flicker and unrelated-source curation blocking. Both were corrected with exact non-tag receipt rebasing and lifecycle-scoped pending checks. Focused re-review approved the fixes with no introduced lifecycle or request-gating issue.

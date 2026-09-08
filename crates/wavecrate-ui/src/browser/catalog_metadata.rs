@@ -458,6 +458,7 @@ impl Browser {
 
     pub(super) fn reset_catalog_metadata(&mut self) {
         self.catalog_metadata.reset();
+        self.display_labels.reset_for_projection();
     }
 }
 

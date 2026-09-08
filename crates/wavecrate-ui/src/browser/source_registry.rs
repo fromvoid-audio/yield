@@ -275,6 +275,7 @@ impl Browser {
     }
 
     fn poll_source_registry(&mut self, cx: &mut Context<Self>) -> bool {
+        self.sync_display_labels_projection();
         let mut events = Vec::new();
         let _ = cx
             .update_global::<SourceRegistryGlobal, _>(|global, _| global.drain_events(&mut events));
@@ -296,6 +297,7 @@ impl Browser {
         changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
         changed |= tag_library::poll(self, cx);
+        changed |= self.poll_display_labels(cx);
         if changed {
             cx.notify();
         }
@@ -308,6 +310,7 @@ impl Browser {
             || tag_completion::has_pending(self)
             || tag_filter::has_pending(self)
             || tag_library::has_pending(self)
+            || self.has_pending_display_labels()
             || catalog::catalog_poll_needed(self)
     }
 
@@ -613,6 +616,7 @@ impl Browser {
         tag_chips::cancel_for_source_change(self);
         tag_completion::cancel_for_source_change(self, cx);
         tag_filter::cancel_for_source_change(self);
+        self.display_labels.cancel_for_source_change();
         super::source_recovery::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;

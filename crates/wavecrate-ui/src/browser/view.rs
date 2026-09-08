@@ -18,6 +18,7 @@ use crate::theme::{active, color, transparent};
 use super::Browser;
 use super::context_menu;
 use super::curation;
+use super::display_labels;
 use super::motion;
 use super::normalized_audition;
 use super::tag_filter;
@@ -260,6 +261,35 @@ impl Browser {
         }))
     }
 
+    fn render_sample_name_view_mode_button(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + 'static {
+        let hover_fill = color(theme.interaction.hover_fill);
+        let pressed_fill = color(theme.interaction.pressed_fill);
+        let mode = self.sample_name_view_mode;
+        div()
+            .id("sample-name-view-mode")
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(theme.spacing.control_height))
+            .px(px(theme.spacing.control_gap))
+            .cursor_pointer()
+            .bg(color(theme.colors.surface_overlay))
+            .border(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .hover(move |style| style.bg(hover_fill))
+            .active(move |style| style.bg(pressed_fill))
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(theme.colors.text_muted))
+            .child(mode.label())
+            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                view.toggle_sample_name_view_mode(cx);
+            }))
+    }
+
     fn render_theme_settings(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let reload_pending = self.theme_load.pending_path.is_some();
         let settings_editable = self.preferences_editable();
@@ -442,6 +472,7 @@ impl Render for Browser {
         let curation_status = self.active_curation_status();
         let selected_count = self.selected_count_label();
         let metadata_status = self.catalog_metadata.status_label();
+        let display_labels_status = self.display_labels.status_label();
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
@@ -472,6 +503,14 @@ impl Render for Browser {
         {
             cx.defer_in(window, move |view, _, cx| {
                 view.observe_catalog_metadata(context, Vec::new(), cx);
+            });
+        }
+        if self.view_model.rows().is_empty()
+            && self.sample_name_view_mode == wavecrate_core::SampleNameViewMode::MetadataLabel
+            && let Some(context) = self.display_labels.context()
+        {
+            cx.defer_in(window, move |view, _, cx| {
+                view.observe_display_labels(context, Vec::new(), cx);
             });
         }
         let list = if self.view_model.rows().is_empty() {
@@ -517,12 +556,31 @@ impl Render for Browser {
                                         view.observe_catalog_metadata(context, metadata_paths, cx);
                                     });
                                 }
+                                if view.sample_name_view_mode
+                                    == wavecrate_core::SampleNameViewMode::MetadataLabel
+                                    && let Some(context) = view.display_labels.context()
+                                {
+                                    let label_paths = range
+                                        .clone()
+                                        .take(display_labels::MAX_VISIBLE_DEMAND_PATHS)
+                                        .filter_map(|visible_index| {
+                                            let row = view.view_model.rows().get(visible_index)?;
+                                            let entry = view.entries.get(row.entry_index)?;
+                                            Some(entry.relative_path.clone())
+                                        })
+                                        .collect::<Vec<_>>();
+                                    cx.defer_in(window, move |view, _, cx| {
+                                        view.observe_display_labels(context, label_paths, cx);
+                                    });
+                                }
                                 let browser_focus_id = view.browser_focus_id();
                                 range
                                     .map(|visible_index| {
                                         let row = view.view_model.rows()[visible_index].clone();
                                         let index = row.entry_index;
                                         let entry = view.entries[index].clone();
+                                        let (sample_name, _) =
+                                            view.sample_name_display(&entry.relative_path);
                                         let selected = view.sample_row_is_selected_with_focus(
                                             &row.id,
                                             browser_focus_id.as_ref(),
@@ -620,7 +678,7 @@ impl Render for Browser {
                                                         color(list_theme.colors.text_primary)
                                                     })
                                                     .child(
-                                                        entry.relative_path.display().to_string(),
+                                                        sample_name,
                                                     ),
                                             )
                                             .child(curation::rating_cell(
@@ -1038,6 +1096,10 @@ impl Render for Browser {
                                                 None,
                                                 theme.spacing.row_padding_x,
                                             ))
+                                            .child(self.render_sample_name_view_mode_button(
+                                                theme.clone(),
+                                                cx,
+                                            ))
                                             .child(self.render_column_header(
                                                 "Rating",
                                                 SortColumn::Rating,
@@ -1143,6 +1205,9 @@ impl Render for Browser {
                     })
                     .when(metadata_status.is_some(), move |element| {
                         element.child(metadata_status.clone().unwrap_or_default())
+                    })
+                    .when(display_labels_status.is_some(), move |element| {
+                        element.child(display_labels_status.clone().unwrap_or_default())
                     })
                     .when(selected_count.is_some(), move |element| {
                         element.child(selected_count.unwrap_or_default())

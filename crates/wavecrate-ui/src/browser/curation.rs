@@ -1744,6 +1744,7 @@ impl Browser {
                             );
                         } else {
                             self.catalog_metadata.pause_for_curation();
+                            self.display_labels.pause_for_curation(tags_may_change);
                             tag_chips::invalidate_after_curation(self);
                             if tags_may_change
                                 || (reusable_tag_mask.is_none()
@@ -1943,6 +1944,7 @@ impl Browser {
                             // Tag writes have no optimistic tag vector. The committed receipt is
                             // the first source of visible tag and playback-type state.
                             self.catalog_metadata.pause_for_curation();
+                            self.display_labels.pause_for_curation(true);
                             tag_chips::invalidate_after_curation(self);
                             tag_filter::invalidate_after_curation(
                                 self,
@@ -2374,6 +2376,27 @@ impl Browser {
                 self.catalog_metadata
                     .advance_projection_revision(application.revision);
             }
+            let display_curation_pending = self.curation_state.has_pending_for_lifecycle(&key);
+            let display_context = self
+                .catalog_metadata
+                .context()
+                .map(super::display_labels::display_context_from_metadata);
+            let display_labels_rebased = !application.failed
+                && !application.tags_may_change
+                && display_context.clone().is_some_and(|context| {
+                    self.display_labels.rebase_after_curation(
+                        context,
+                        application.prior_revision,
+                        application.revision,
+                        &application.root_identity,
+                        application.directory_generation,
+                        display_curation_pending,
+                    )
+                });
+            if !display_labels_rebased {
+                self.display_labels
+                    .invalidate_after_curation(display_context, display_curation_pending);
+            }
             if reused_tag_mask {
                 if !tag_filter::rebase_ready_context(
                     self,
@@ -2642,6 +2665,72 @@ mod tests {
             entries,
         );
         state
+    }
+
+    #[test]
+    fn display_label_reuse_classifies_real_curation_actions_conservatively() {
+        let path = PathBuf::from("kick.wav");
+        let state = install(&[entry("kick.wav", 0, false, 0)]);
+        let playback = ready_plan(
+            &state,
+            CurationAction::RecordPlayback { played_at: 33 },
+            std::slice::from_ref(&path),
+        );
+        assert!(!playback.tags_may_change());
+        let rating = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        assert!(!rating.tags_may_change());
+
+        let add = ready_tag_plan(&state, &[String::from("loop")], std::slice::from_ref(&path));
+        assert!(add.tags_may_change());
+        let remove = match state.plan_remove_tag(&key(), "loop", std::slice::from_ref(&path)) {
+            CurationPlan::Ready(plan) => plan,
+            CurationPlan::NoChange { .. } => panic!("expected a changing tag operation"),
+            CurationPlan::Rejected(error) => panic!("unexpected rejection: {error}"),
+        };
+        assert!(remove.tags_may_change());
+
+        // Any update outside the explicitly known metadata-only set remains conservative.
+        let future_tag_update = SourceCurationUpdate::AddTag {
+            path: RootRelativePath::try_from_path(path).expect("valid relative path"),
+            label: String::from("future-tag"),
+        };
+        assert!(source_update_may_change_tags(&future_tag_update));
+    }
+
+    #[test]
+    fn display_label_curation_gate_is_scoped_to_context_lifecycle() {
+        let active_key = key();
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[entry("kick.wav", 0, false, 0)]);
+        let plan = ready_plan(
+            &state,
+            CurationAction::RecordPlayback { played_at: 33 },
+            std::slice::from_ref(&path),
+        );
+        assert!(state.accept_operation(&active_key, plan));
+        let active_context = super::super::display_labels::DisplayLabelsContext {
+            source_id: active_key.source_id.clone(),
+            lifecycle_generation: active_key.lifecycle_generation,
+            root: PathBuf::from("/library"),
+            root_identity: RootIdentity::from_bytes(b"root".to_vec()),
+            directory_generation: 2,
+            revision: 10,
+            entry_indices: std::sync::Arc::new(HashMap::from([(path.clone(), 0)])),
+        };
+        assert!(super::super::display_labels::curation_pending_for_context(
+            &state,
+            &active_context,
+        ));
+        let mut unrelated_context = active_context.clone();
+        unrelated_context.source_id = SourceId::from_string("other-source");
+        assert!(!super::super::display_labels::curation_pending_for_context(
+            &state,
+            &unrelated_context,
+        ));
     }
 
     #[test]
