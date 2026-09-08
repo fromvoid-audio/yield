@@ -15,12 +15,12 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | Crate | Owns | Must not own |
 | --- | --- | --- |
 | `wavecrate-gpui` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
-| `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, display formatting | GPUI types, filesystem calls, audio devices, databases |
+| `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, waveform viewport geometry, display formatting | GPUI types, filesystem calls, audio devices, databases |
 | `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
 | `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
-| `wavecrate-catalog` | Bounded authoritative source audits and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
+| `wavecrate-catalog` | Bounded authoritative source audits, safe WAV display metadata, and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
 | `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
@@ -172,13 +172,23 @@ scope, and scan results in an in-memory session registry. An app-owned
 after a scan succeeds. Restored roots receive their durable IDs and empty
 session data; they do not trigger an automatic scan or audition. Forgetting a
 source stages removal in the same service and keeps it hidden until the command
-and durable snapshot are acknowledged. No source-local database or source
-folder is opened or changed. The UI schedules filesystem and decoding work off
+and durable snapshot are acknowledged. No source-local database is opened and
+source folders are read without mutation. The UI schedules filesystem and decoding work off
 its event thread and consumes results only if their request identity is still
 current. Replacing a scan cancels the prior traversal. Playback initialization
 and progress events retain their intent/request fences through module moves.
 Audio processing remains in Reson; moving a control into a UI module does not
 move DSP into the UI.
+
+Known source IDs activate the session-owned catalog. The browser registers only
+the active source lifecycle, applies cached and audited snapshots through a
+cancellable background projection, and retires old registrations on switching.
+Snapshot projection never reopens file paths: membership and directories come
+from the authoritative snapshot, and optional duration/sample-rate fields come
+from bounded descriptor-checked WAV headers in the catalog worker. The existing
+source-service timer drains bounded catalog events while work is pending.
+Failures retain the last coherent rows. Profile-owned catalog children remain
+leased until the session has closed catalog admission and joined its worker.
 
 Audition output routing is split between the UI and the existing Reson output
 boundary. `wavecrate-session` stores only the optional host, device, sample
