@@ -496,6 +496,12 @@ impl Render for Browser {
         } else {
             theme.colors.text_muted
         });
+        let beat_guides_enabled = self.beat_guides_enabled;
+        let beat_guides_color = color(if beat_guides_enabled {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
         let normalized_audition_enabled = self.normalized_audition.enabled();
         let normalized_audition_preparing = self.normalized_audition_is_preparing();
         let normalized_audition_color = color(if normalized_audition_preparing {
@@ -985,6 +991,25 @@ impl Render for Browser {
                             .tooltip(waveform::bpm_snap_tooltip)
                             .on_click(cx.listener(Self::toggle_bpm_snap_from_toolbar))
                             .child(waveform::render_bpm_snap_icon(bpm_snap_color)),
+                    )
+                    .child(
+                        div()
+                            .id("beat-guides-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .tooltip(waveform::beat_guides_tooltip)
+                            .on_click(cx.listener(Self::toggle_beat_guides_from_toolbar))
+                            .child(waveform::render_beat_guides_icon(beat_guides_color)),
                     )
                     .child(
                         div()

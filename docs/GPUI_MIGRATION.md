@@ -1851,3 +1851,11 @@ Validation: the macOS UI check and all 17 focused drag tests passed; platform Wi
 The toolbar now exposes the transient native-default BPM snap toggle and a 2–32 beat-count editor, initially four beats. Resize previews and committed regions use the core calculation; moves and new selections retain their existing behavior. The numeric field supports bounded ASCII-digit paste, UTF-16 composition selection, click-select-all, arrow/wheel stepping and Enter/blur clamping. Focused editing does not trigger browser transport shortcuts. Rendering adds no file reads, waveform-cache invalidation or continuous animation.
 
 Validation: the integrated UI suite passed 285 tests with one existing ignored test; focused waveform and numeric-input tests, the UI check, formatting and diff checks passed. Primary acceptance corrected an unbounded numeric-filter input scan and duplicate focus ownership before integration. Native visual and interaction acceptance remains pending.
+
+A clean detached `e5fb7b212` snapshot built `target/qa/Wavecrate BPM Preview e5fb7b2.app` in 19.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
+
+### Selection beat guides
+
+A separate transient toolbar toggle now paints the internal beat divisions of the current play region using the shared beat count. The bounded projection follows live selection changes and clips through the waveform viewport, without invalidating waveform caches. It remains independent from BPM snapping. Separate edit-selection guides await the edit-selection workflow.
+
+Validation: 35 focused waveform tests passed with one existing ignored test, and the UI check, formatting and diff checks passed. Primary inspection corrected guide-height clamping for subpixel-height canvases. Native visual acceptance remains pending.

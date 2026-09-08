@@ -5,6 +5,7 @@
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
+use crate::beat_count_input::MAX_BEAT_COUNT;
 use gpui::{
     AnyView, App, Bounds, Context, DragMoveEvent, Hsla, MouseButton, MouseDownEvent, MouseUpEvent,
     Path, PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div,
@@ -28,6 +29,8 @@ const PLAY_REGION_MOVE_GRIP_INSET: f32 = 9.0;
 const WAVEFORM_PAN_REFERENCE_WIDTH: f64 = 1_200.0;
 const WAVEFORM_WHEEL_EPSILON: f64 = f64::EPSILON;
 const BPM_SNAP_ICON_SIZE: f32 = 16.0;
+const BEAT_GUIDE_WIDTH: f32 = 1.0;
+const BEAT_GUIDE_HEIGHT_FRACTION: f32 = 0.72;
 
 /// The transient BPM snap settings used by one waveform resize gesture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,6 +120,35 @@ pub(super) fn render_bpm_snap_icon(icon_color: Hsla) -> impl IntoElement {
     .h(px(BPM_SNAP_ICON_SIZE))
 }
 
+/// Render the fixed 16×16 beat-guide glyph used by the compact toolbar control.
+pub(super) fn render_beat_guides_icon(icon_color: Hsla) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            if !width.is_finite() || width <= 0.0 || !height.is_finite() || height <= 0.0 {
+                return;
+            }
+            for (left, top, right, bottom) in [
+                (2.0, 3.0, 3.5, 13.0),
+                (5.5, 5.0, 6.5, 11.0),
+                (9.5, 5.0, 10.5, 11.0),
+                (12.5, 3.0, 14.0, 13.0),
+                (2.0, 7.25, 14.0, 8.75),
+            ] {
+                let guide = Bounds::from_corners(
+                    bpm_snap_icon_point(bounds, left, top),
+                    bpm_snap_icon_point(bounds, right, bottom),
+                );
+                window.paint_quad(fill(guide, icon_color));
+            }
+        },
+    )
+    .w(px(BPM_SNAP_ICON_SIZE))
+    .h(px(BPM_SNAP_ICON_SIZE))
+}
+
 struct BpmSnapTooltip;
 
 impl Render for BpmSnapTooltip {
@@ -154,12 +186,34 @@ impl Render for BeatCountTooltip {
             .border_color(crate::theme::color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
-            .child("Beats in the snapped selection.")
+            .child("Beat guide divisions.")
     }
 }
 
 pub(super) fn beat_count_tooltip(_: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|_| BeatCountTooltip).into()
+}
+
+struct BeatGuidesTooltip;
+
+impl Render for BeatGuidesTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(crate::theme::color(theme.colors.surface_raised))
+            .border(px(theme.spacing.border_width))
+            .border_color(crate::theme::color(theme.colors.border_emphasis))
+            .text_size(px(theme.typography.small_size))
+            .text_color(crate::theme::color(theme.colors.text_primary))
+            .child("Show beat guide lines inside the play selection.")
+    }
+}
+
+/// Build the beat-guide tooltip view for the compact toolbar control.
+pub(super) fn beat_guides_tooltip(_: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| BeatGuidesTooltip).into()
 }
 
 /// One normalized, ordered playback region in the selected waveform.
@@ -357,6 +411,57 @@ fn snapped_resize_edge(fixed_ratio: f64, moving_ratio: f64, bpm_snap: BpmSnapSet
         bpm_snap.beat_count,
         bpm_snap.constrain_to_audio,
     ))
+}
+
+/// Iterate the internal beat-guide positions that are visible in a waveform viewport.
+///
+/// The iterator is bounded by [`MAX_BEAT_COUNT`]. Guide positions at the selection edges are
+/// intentionally omitted; only the divisions inside the selected region are returned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BeatGuideProjection {
+    region: WaveformPlayRegion,
+    viewport: WaveformViewport,
+    beat_count: u8,
+    next_index: u8,
+}
+
+impl BeatGuideProjection {
+    fn new(region: WaveformPlayRegion, viewport: WaveformViewport, beat_count: u8) -> Self {
+        Self {
+            region,
+            viewport,
+            beat_count: beat_count.min(MAX_BEAT_COUNT),
+            next_index: 1,
+        }
+    }
+}
+
+impl Iterator for BeatGuideProjection {
+    type Item = f64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_index < self.beat_count {
+            let index = self.next_index;
+            self.next_index = self.next_index.saturating_add(1);
+            let fraction = f64::from(index) / f64::from(self.beat_count);
+            let absolute_ratio =
+                self.region.start + (self.region.end - self.region.start) * fraction;
+            let Some(visible_ratio) = self.viewport.visible_ratio_from_absolute(absolute_ratio)
+            else {
+                continue;
+            };
+            return Some(visible_ratio);
+        }
+        None
+    }
+}
+
+fn beat_guide_projection(
+    region: WaveformPlayRegion,
+    viewport: WaveformViewport,
+    beat_count: u8,
+) -> BeatGuideProjection {
+    BeatGuideProjection::new(region, viewport, beat_count)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -834,6 +939,10 @@ pub(super) fn render_waveform(
         .right_0(),
     );
     let bpm_snap = browser.bpm_snap_settings();
+    let beat_guides = browser.beat_guides_enabled.then_some((
+        browser.beat_guide_count,
+        color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
+    ));
     if let Some(region) = browser
         .waveform_region_drag
         .and_then(|drag| drag.preview_region_with_bpm(bpm_snap))
@@ -844,6 +953,7 @@ pub(super) fn render_waveform(
             browser.waveform_viewport,
             color(theme.colors.selection_fill),
             color(theme.colors.waveform_playhead),
+            beat_guides,
         ));
     }
     if let Some(ratio) = playback_cursor_ratio.and_then(|ratio| {
@@ -1379,6 +1489,7 @@ fn waveform_region_overlay(
     viewport: WaveformViewport,
     selection_color: gpui::Hsla,
     edge_color: gpui::Hsla,
+    beat_guides: Option<(u8, gpui::Hsla)>,
 ) -> impl IntoElement {
     canvas(
         move |_, _, _| (),
@@ -1403,6 +1514,26 @@ fn waveform_region_overlay(
                 point(bounds.left() + px(end), bounds.bottom()),
             );
             window.paint_quad(fill(selection_bounds, selection_color));
+            if let Some((beat_count, guide_color)) = beat_guides {
+                let guide_width = BEAT_GUIDE_WIDTH.min(width);
+                let guide_height = (height * BEAT_GUIDE_HEIGHT_FRACTION)
+                    .round()
+                    .clamp(guide_width.min(height), height);
+                let guide_top = (height - guide_height) * 0.5;
+                for visible_ratio in beat_guide_projection(region, viewport, beat_count) {
+                    let center = width * visible_ratio as f32;
+                    let left =
+                        (center - guide_width * 0.5).clamp(0.0, (width - guide_width).max(0.0));
+                    let guide_bounds = Bounds::from_corners(
+                        point(bounds.left() + px(left), bounds.top() + px(guide_top)),
+                        point(
+                            bounds.left() + px(left + guide_width),
+                            bounds.top() + px(guide_top + guide_height),
+                        ),
+                    );
+                    window.paint_quad(fill(guide_bounds, guide_color));
+                }
+            }
             let edge_width = WAVEFORM_SELECTION_EDGE_WIDTH.min(width);
             for absolute in [region.start, region.end] {
                 let Some(visible) = viewport.visible_ratio_from_absolute(absolute) else {
@@ -2004,6 +2135,67 @@ mod tests {
         let snapped_duration = (resized.end - resized.start) * 10.0;
         let bpm = 4.0 * 60.0 / snapped_duration;
         assert!((bpm - bpm.round()).abs() < 0.001);
+    }
+
+    #[test]
+    fn beat_guide_projection_returns_bounded_internal_divisions() {
+        let region = WaveformPlayRegion::new(0.0, 1.0).unwrap();
+        let viewport = WaveformViewport::full();
+
+        let guides = beat_guide_projection(region, viewport, 4).collect::<Vec<_>>();
+        assert_eq!(guides, vec![0.25, 0.5, 0.75]);
+        assert_eq!(beat_guide_projection(region, viewport, 1).count(), 0);
+        assert_eq!(
+            beat_guide_projection(region, viewport, u8::MAX).count(),
+            usize::from(MAX_BEAT_COUNT - 1)
+        );
+    }
+
+    #[test]
+    fn beat_guide_projection_clips_to_the_visible_viewport() {
+        let region = WaveformPlayRegion::new(0.0, 1.0).unwrap();
+        let viewport = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+
+        let guides = beat_guide_projection(region, viewport, 4).collect::<Vec<_>>();
+        assert_eq!(guides, vec![0.0, 0.5, 1.0]);
+
+        let outside_region = WaveformPlayRegion::new(0.0, 0.2).unwrap();
+        assert_eq!(
+            beat_guide_projection(outside_region, viewport, 4).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn beat_guide_projection_tracks_the_live_resize_region() {
+        let bounds = test_bounds(100.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let baseline = WaveformPlayRegion::new(0.2, 0.6).unwrap();
+        let committed = beat_guide_projection(baseline, viewport, 4).collect::<Vec<_>>();
+        let mut drag = WaveformRegionDrag::begin_handle(
+            point(px(60.0), px(10.0)),
+            0.6,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::ResizeEnd,
+            13,
+        )
+        .expect("valid resize handle");
+        drag.update(point(px(80.0), px(10.0)));
+        let live_region = drag.preview_region().expect("valid live region");
+        let live = beat_guide_projection(live_region, viewport, 4).collect::<Vec<_>>();
+
+        for (actual, expected) in committed.iter().zip([0.3, 0.4, 0.5]) {
+            assert!((actual - expected).abs() < 1.0e-9);
+        }
+        for (actual, expected) in live.iter().zip([0.35, 0.5, 0.65]) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert_ne!(committed, live);
     }
 
     #[test]

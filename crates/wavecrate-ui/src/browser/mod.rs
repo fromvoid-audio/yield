@@ -260,6 +260,7 @@ pub(crate) struct Browser {
     waveform_render_cache: waveform::WaveformRenderCache,
     waveform_detail: waveform_detail::WaveformDetailState,
     bpm_snap_enabled: bool,
+    beat_guides_enabled: bool,
     beat_guide_count: u8,
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
@@ -468,6 +469,7 @@ impl Browser {
             waveform_render_cache: waveform::WaveformRenderCache::default(),
             waveform_detail: waveform_detail::WaveformDetailState::default(),
             bpm_snap_enabled: false,
+            beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
@@ -1656,6 +1658,16 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.bpm_snap_enabled = !self.bpm_snap_enabled;
+        cx.notify();
+    }
+
+    fn toggle_beat_guides_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.beat_guides_enabled = !self.beat_guides_enabled;
         cx.notify();
     }
 
