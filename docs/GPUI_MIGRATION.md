@@ -1160,3 +1160,22 @@ switching is still a separate runtime prerequisite and UI integration.
 Validation: six core policy tests and 18 UI transport tests passed, along with
 locked UI compilation, formatting, and diff checks. Native audible acceptance
 remains pending; existing application instances and bundles were preserved.
+
+### Guarded active-span runtime retarget
+
+Reson now offers an additive retarget API bound to the last successfully started
+play request. Mismatched, inactive, or failed preflight state cannot invoke the
+retarget executor. Non-seeking updates use finite dispatch-time progress; explicit
+seeking and the existing unguarded API retain their offset semantics. Progress
+reports runtime-owned play identity, retained through natural completion and
+cleared by stop or failed replacement. Cancelling queued playback retains it.
+
+The bounded command/event queues remain unchanged: acknowledgements are
+best-effort, so the subsequent UI integration must reconcile using fresh polls.
+This prerequisite alone does not change toolbar behavior or claim native audible
+acceptance. Mode changes may replace the source within the existing output.
+
+Validation: all 32 Reson runtime tests passed, including actual dispatch and
+coalescing, completed/stale plays, consumed preflight errors, failed replacement
+and stop, identity retention, and offset semantics. Locked UI compilation,
+formatting, and diff checks passed. Application instances were untouched.

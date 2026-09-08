@@ -293,6 +293,11 @@ pub struct PlaybackRuntimeProgress {
     pub looping: bool,
     pub progress: Option<f32>,
     pub error: Option<String>,
+    /// The last successfully started current play request, if one exists.
+    ///
+    /// The runtime retains this identity after natural completion; inspect [`Self::active`] to
+    /// determine whether the identified play is still running.
+    pub playback_request_id: Option<PlaybackRequestId>,
 }
 
 /// Reason a playback command was cancelled before execution.
@@ -418,8 +423,37 @@ impl PlaybackRuntimeHandle {
         update: PlaybackRuntimeSpanUpdate,
     ) -> Result<PlaybackRequestId, PlaybackRuntimeSubmitError> {
         let id = self.next_request_id();
-        self.submit(PlaybackRuntimeCommand::RetargetSpan { id, update })
-            .map(|()| id)
+        self.submit(PlaybackRuntimeCommand::RetargetSpan {
+            id,
+            expected_playback_id: None,
+            update,
+        })
+        .map(|()| id)
+    }
+
+    /// Submit a span-retarget request only while the expected play request is current.
+    ///
+    /// The runtime compares `expected_playback` with its last successfully started play at
+    /// dispatch. A mismatch emits a best-effort [`PlaybackRuntimeEvent::Cancelled`] response
+    /// with [`PlaybackRuntimeCancellation::Superseded`] and never calls the audio executor. A
+    /// matching play that is inactive, or whose authoritative preflight snapshot reports an
+    /// error, emits a best-effort [`PlaybackRuntimeEvent::Progress`] response without retargeting.
+    /// For an active non-seeking update, a finite runtime dispatch-time position replaces the
+    /// caller's offset; seeking updates retain their requested offset. Responses are
+    /// disposable runtime events, so callers must reconcile with a later progress poll rather
+    /// than rely on a retained acknowledgement.
+    pub fn try_retarget_active_span(
+        &self,
+        expected_playback: PlaybackRequestId,
+        update: PlaybackRuntimeSpanUpdate,
+    ) -> Result<PlaybackRequestId, PlaybackRuntimeSubmitError> {
+        let id = self.next_request_id();
+        self.submit(PlaybackRuntimeCommand::RetargetSpan {
+            id,
+            expected_playback_id: Some(expected_playback),
+            update,
+        })
+        .map(|()| id)
     }
 
     /// Request runtime shutdown without waiting for the runtime thread.
@@ -522,6 +556,7 @@ enum PlaybackRuntimeCommand {
     CancelPendingPlayback,
     RetargetSpan {
         id: PlaybackRequestId,
+        expected_playback_id: Option<PlaybackRequestId>,
         update: PlaybackRuntimeSpanUpdate,
     },
     PollProgress {
@@ -1075,8 +1110,18 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             looping: self.player.is_looping(),
             progress: self.player.progress(),
             error: self.player.take_error(),
+            playback_request_id: None,
         }
     }
+}
+
+fn authoritative_progress(
+    executor: &mut impl PlaybackRuntimeExecutor,
+    playback_request_id: Option<PlaybackRequestId>,
+) -> PlaybackRuntimeProgress {
+    let mut progress = executor.progress();
+    progress.playback_request_id = playback_request_id;
+    progress
 }
 
 fn spawn_executor(
@@ -1107,36 +1152,73 @@ fn run_playback_runtime(
 ) {
     let mut pending = VecDeque::new();
     let mut latest_span_retarget_id = None;
+    let mut current_playback_id = None;
     while let Some(command) = next_runtime_command(&commands, &mut pending) {
         match coalesce_command(command, &commands, &events, &mut pending) {
             CoalescedCommand::Play { id, request } => {
                 let event = match executor.play(request) {
-                    Ok(started) => PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted {
-                        id,
-                        output: started.output,
-                        playback_start: started.playback_start,
-                    }),
-                    Err(error) => PlaybackRuntimeEvent::Failed { id, error },
+                    Ok(started) => {
+                        current_playback_id = Some(id);
+                        PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted {
+                            id,
+                            output: started.output,
+                            playback_start: started.playback_start,
+                        })
+                    }
+                    Err(error) => {
+                        current_playback_id = None;
+                        PlaybackRuntimeEvent::Failed { id, error }
+                    }
                 };
                 send_runtime_event(&events, event);
             }
             CoalescedCommand::Stop { id } => {
-                let event = match executor.stop() {
+                let result = executor.stop();
+                current_playback_id = None;
+                let event = match result {
                     Ok(()) => PlaybackRuntimeEvent::Stopped { id },
                     Err(error) => PlaybackRuntimeEvent::Failed { id, error },
                 };
                 send_runtime_event(&events, event);
             }
             CoalescedCommand::CancelPendingPlayback => {}
-            CoalescedCommand::RetargetSpan { id, update } => {
+            CoalescedCommand::RetargetSpan {
+                id,
+                expected_playback_id,
+                mut update,
+            } => {
                 if latest_span_retarget_id.is_some_and(|latest| id <= latest) {
                     continue;
                 }
                 latest_span_retarget_id = Some(id);
+
+                if let Some(expected_playback_id) = expected_playback_id {
+                    if current_playback_id != Some(expected_playback_id) {
+                        send_cancelled(id, PlaybackRuntimeCancellation::Superseded, &events);
+                        continue;
+                    }
+
+                    let progress = authoritative_progress(&mut executor, current_playback_id);
+                    if !progress.active || progress.error.is_some() {
+                        send_runtime_event(
+                            &events,
+                            PlaybackRuntimeEvent::Progress { id, progress },
+                        );
+                        continue;
+                    }
+                    if !update.seek_to_offset {
+                        if let Some(progress_ratio) =
+                            progress.progress.filter(|ratio| ratio.is_finite())
+                        {
+                            update.offset = f64::from(progress_ratio);
+                        }
+                    }
+                }
+
                 let event = match executor.retarget_span(update) {
                     Ok(_) => PlaybackRuntimeEvent::Progress {
                         id,
-                        progress: executor.progress(),
+                        progress: authoritative_progress(&mut executor, current_playback_id),
                     },
                     Err(error) => PlaybackRuntimeEvent::Failed { id, error },
                 };
@@ -1147,7 +1229,7 @@ fn run_playback_runtime(
                     &events,
                     PlaybackRuntimeEvent::Progress {
                         id,
-                        progress: executor.progress(),
+                        progress: authoritative_progress(&mut executor, current_playback_id),
                     },
                 );
             }
@@ -1161,6 +1243,7 @@ fn run_playback_runtime(
                 executor.set_playback_gain(gain, normalization);
             }
             CoalescedCommand::Shutdown => {
+                let _ = current_playback_id.take();
                 commands.close();
                 break;
             }
@@ -1191,6 +1274,7 @@ enum CoalescedCommand {
     CancelPendingPlayback,
     RetargetSpan {
         id: PlaybackRequestId,
+        expected_playback_id: Option<PlaybackRequestId>,
         update: PlaybackRuntimeSpanUpdate,
     },
     PollProgress {
@@ -1397,9 +1481,15 @@ fn command_to_coalesced(command: PlaybackRuntimeCommand) -> CoalescedCommand {
         PlaybackRuntimeCommand::Play { id, request } => CoalescedCommand::Play { id, request },
         PlaybackRuntimeCommand::Stop { id } => CoalescedCommand::Stop { id },
         PlaybackRuntimeCommand::CancelPendingPlayback => CoalescedCommand::CancelPendingPlayback,
-        PlaybackRuntimeCommand::RetargetSpan { id, update } => {
-            CoalescedCommand::RetargetSpan { id, update }
-        }
+        PlaybackRuntimeCommand::RetargetSpan {
+            id,
+            expected_playback_id,
+            update,
+        } => CoalescedCommand::RetargetSpan {
+            id,
+            expected_playback_id,
+            update,
+        },
         PlaybackRuntimeCommand::PollProgress { id } => CoalescedCommand::PollProgress { id },
         PlaybackRuntimeCommand::SetVolume { volume } => CoalescedCommand::SetVolume { volume },
         PlaybackRuntimeCommand::SetPlaybackGain {
@@ -1648,8 +1738,16 @@ mod tests {
         played: Arc<Mutex<Vec<PlaybackRuntimeMode>>>,
         retargeted: Arc<Mutex<Vec<PlaybackRuntimeSpanUpdate>>>,
         stopped: Arc<Mutex<usize>>,
+        stop_error: Option<&'static str>,
+        progress: Arc<Mutex<PlaybackRuntimeProgress>>,
         dropped: Arc<AtomicBool>,
+        play_gate: Option<PlayGate>,
         drop_gate: Option<DropGate>,
+    }
+
+    struct PlayGate {
+        entered_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
     }
 
     struct DropGate {
@@ -1664,7 +1762,17 @@ mod tests {
                 played: Arc::new(Mutex::new(Vec::new())),
                 retargeted: Arc::new(Mutex::new(Vec::new())),
                 stopped: Arc::new(Mutex::new(0)),
+                stop_error: None,
+                progress: Arc::new(Mutex::new(PlaybackRuntimeProgress {
+                    active: true,
+                    elapsed: Some(Duration::from_millis(10)),
+                    looping: false,
+                    progress: Some(0.25),
+                    error: None,
+                    playback_request_id: None,
+                })),
                 dropped: Arc::new(AtomicBool::new(false)),
+                play_gate: None,
                 drop_gate: None,
             }
         }
@@ -1679,6 +1787,27 @@ mod tests {
 
         fn dropped(&self) -> Arc<AtomicBool> {
             Arc::clone(&self.dropped)
+        }
+
+        fn progress_state(&self) -> Arc<Mutex<PlaybackRuntimeProgress>> {
+            Arc::clone(&self.progress)
+        }
+
+        fn with_stop_error(mut self, error: &'static str) -> Self {
+            self.stop_error = Some(error);
+            self
+        }
+
+        fn with_play_gate(
+            mut self,
+            entered_tx: mpsc::Sender<()>,
+            release_rx: mpsc::Receiver<()>,
+        ) -> Self {
+            self.play_gate = Some(PlayGate {
+                entered_tx,
+                release_rx,
+            });
+            self
         }
     }
 
@@ -1762,6 +1891,10 @@ mod tests {
             request: PlaybackRuntimeRequest,
         ) -> Result<PlaybackRuntimeStartedData, String> {
             self.played.lock().expect("played lock").push(request.mode);
+            if let Some(gate) = self.play_gate.take() {
+                let _ = gate.entered_tx.send(());
+                gate.release_rx.recv().expect("release blocking play");
+            }
             match self.outcomes.pop().unwrap_or(FakeOutcome::Started(0.0)) {
                 FakeOutcome::Started(playback_start) => Ok(PlaybackRuntimeStartedData {
                     output: ResolvedOutput::default(),
@@ -1773,7 +1906,9 @@ mod tests {
 
         fn stop(&mut self) -> Result<(), String> {
             *self.stopped.lock().expect("stopped lock") += 1;
-            Ok(())
+            self.stop_error
+                .take()
+                .map_or(Ok(()), |error| Err(String::from(error)))
         }
 
         fn retarget_span(&mut self, update: PlaybackRuntimeSpanUpdate) -> Result<f32, String> {
@@ -1794,13 +1929,7 @@ mod tests {
         }
 
         fn progress(&mut self) -> PlaybackRuntimeProgress {
-            PlaybackRuntimeProgress {
-                active: true,
-                elapsed: Some(Duration::from_millis(10)),
-                looping: false,
-                progress: Some(0.25),
-                error: None,
-            }
+            self.progress.lock().expect("progress lock").clone()
         }
     }
 
@@ -2037,6 +2166,7 @@ mod tests {
         queue
             .try_submit(PlaybackRuntimeCommand::RetargetSpan {
                 id: PlaybackRequestId(2),
+                expected_playback_id: None,
                 update: span_update(0.1, 0.4, true),
             })
             .expect("retarget evicts disposable poll");
@@ -2365,18 +2495,367 @@ mod tests {
     }
 
     #[test]
+    fn playback_runtime_guarded_retarget_uses_fresh_progress_for_non_seeking_updates() {
+        let executor = FakeExecutor::new(vec![]);
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let mut non_seeking = span_update(0.1, 0.6, true);
+        non_seeking.offset = 0.9;
+        non_seeking.seek_to_offset = false;
+        let non_seeking_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, non_seeking)
+            .expect("non-seeking retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("non-seeking event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == non_seeking_id
+                    && progress.active
+                    && progress.progress == Some(0.25)
+                    && progress.playback_request_id == Some(playback_id)
+        ));
+
+        let mut explicit_seek = span_update(0.1, 0.6, true);
+        explicit_seek.offset = 0.4;
+        let explicit_seek_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, explicit_seek)
+            .expect("explicit-seek retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("explicit-seek event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == explicit_seek_id
+                    && progress.active
+                    && progress.playback_request_id == Some(playback_id)
+        ));
+
+        assert_eq!(
+            retargeted.lock().expect("retargeted").as_slice(),
+            &[
+                PlaybackRuntimeSpanUpdate {
+                    offset: 0.25,
+                    ..non_seeking
+                },
+                explicit_seek
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_runtime_guarded_retarget_rejects_wrong_and_completed_plays() {
+        let executor = FakeExecutor::new(vec![]);
+        let progress_state = executor.progress_state();
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let wrong_id = runtime
+            .handle
+            .try_retarget_active_span(
+                PlaybackRequestId(playback_id.get() + 100),
+                span_update(0.2, 0.8, true),
+            )
+            .expect("wrong-play retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("wrong-play event"),
+            PlaybackRuntimeEvent::Cancelled { id, reason }
+                if id == wrong_id && reason == PlaybackRuntimeCancellation::Superseded
+        ));
+        assert!(retargeted.lock().expect("retargeted").is_empty());
+
+        progress_state.lock().expect("progress lock").active = false;
+        let completed_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, span_update(0.2, 0.8, true))
+            .expect("completed-play retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("completed-play event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == completed_id
+                    && !progress.active
+                    && progress.playback_request_id == Some(playback_id)
+        ));
+        assert!(retargeted.lock().expect("retargeted").is_empty());
+    }
+
+    #[test]
+    fn playback_runtime_guarded_retarget_preserves_preflight_errors() {
+        let executor = FakeExecutor::new(vec![]);
+        let progress_state = executor.progress_state();
+        let retargeted = executor.retargeted();
+        progress_state.lock().expect("progress lock").error = Some(String::from("decoder error"));
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, span_update(0.2, 0.8, true))
+            .expect("retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("error progress event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == retarget_id
+                    && progress.active
+                    && progress.playback_request_id == Some(playback_id)
+                    && progress.error.as_deref() == Some("decoder error")
+        ));
+        assert!(retargeted.lock().expect("retargeted").is_empty());
+    }
+
+    #[test]
+    fn playback_runtime_clears_guarded_retarget_identity_on_stop_and_failed_replacement() {
+        let executor = FakeExecutor::new(vec![
+            FakeOutcome::Failed("replacement failed"),
+            FakeOutcome::Started(0.4),
+            FakeOutcome::Started(0.0),
+        ]);
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let first_play = runtime
+            .handle
+            .try_play(test_request(0.0))
+            .expect("first play");
+        assert!(matches!(
+            runtime.events.recv().expect("first started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == first_play
+        ));
+        let stop_id = runtime.handle.try_stop().expect("stop");
+        assert!(matches!(
+            runtime.events.recv().expect("stop event"),
+            PlaybackRuntimeEvent::Stopped { id } if id == stop_id
+        ));
+
+        let after_stop = runtime
+            .handle
+            .try_retarget_active_span(first_play, span_update(0.2, 0.8, true))
+            .expect("after-stop retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("after-stop event"),
+            PlaybackRuntimeEvent::Cancelled { id, reason }
+                if id == after_stop && reason == PlaybackRuntimeCancellation::Superseded
+        ));
+
+        let replacement_play = runtime
+            .handle
+            .try_play(test_request(0.4))
+            .expect("replacement play");
+        assert!(matches!(
+            runtime.events.recv().expect("replacement started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. })
+                if id == replacement_play
+        ));
+        let failed_play = runtime
+            .handle
+            .try_play(test_request(0.6))
+            .expect("failed replacement");
+        assert!(matches!(
+            runtime.events.recv().expect("failed play event"),
+            PlaybackRuntimeEvent::Failed { id, error }
+                if id == failed_play && error == "replacement failed"
+        ));
+        let after_failure = runtime
+            .handle
+            .try_retarget_active_span(replacement_play, span_update(0.2, 0.8, true))
+            .expect("after-failure retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("after-failure event"),
+            PlaybackRuntimeEvent::Cancelled { id, reason }
+                if id == after_failure && reason == PlaybackRuntimeCancellation::Superseded
+        ));
+        let poll_id = runtime
+            .handle
+            .try_poll_progress()
+            .expect("poll after failure");
+        assert!(matches!(
+            runtime.events.recv().expect("poll after failure event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == poll_id && progress.playback_request_id.is_none()
+        ));
+        assert!(retargeted.lock().expect("retargeted").is_empty());
+    }
+
+    #[test]
+    fn playback_runtime_clears_guarded_retarget_identity_when_stop_fails() {
+        let executor = FakeExecutor::new(vec![]).with_stop_error("stop failed");
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        let stop_id = runtime.handle.try_stop().expect("stop");
+        assert!(matches!(
+            runtime.events.recv().expect("failed stop event"),
+            PlaybackRuntimeEvent::Failed { id, error }
+                if id == stop_id && error == "stop failed"
+        ));
+
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, span_update(0.2, 0.8, true))
+            .expect("retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("retarget event"),
+            PlaybackRuntimeEvent::Cancelled { id, reason }
+                if id == retarget_id && reason == PlaybackRuntimeCancellation::Superseded
+        ));
+        assert!(retargeted.lock().expect("retargeted").is_empty());
+    }
+
+    #[test]
+    fn playback_runtime_cancel_pending_retains_active_play_identity() {
+        let executor = FakeExecutor::new(vec![]);
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        runtime
+            .handle
+            .try_cancel_pending_playback()
+            .expect("cancel pending");
+
+        let update = span_update(0.2, 0.8, true);
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, update)
+            .expect("retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("retarget event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == retarget_id
+                    && progress.active
+                    && progress.playback_request_id == Some(playback_id)
+        ));
+        assert_eq!(retargeted.lock().expect("retargeted").as_slice(), &[update]);
+    }
+
+    #[test]
+    fn playback_runtime_poll_identity_tracks_successful_play_through_completion() {
+        let executor = FakeExecutor::new(vec![]);
+        let progress_state = executor.progress_state();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        assert!(matches!(
+            runtime.events.recv().expect("poll event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == poll_id
+                    && progress.active
+                    && progress.playback_request_id == Some(playback_id)
+        ));
+
+        progress_state.lock().expect("progress lock").active = false;
+        let completed_poll_id = runtime.handle.try_poll_progress().expect("completed poll");
+        assert!(matches!(
+            runtime.events.recv().expect("completed poll event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == completed_poll_id
+                    && !progress.active
+                    && progress.playback_request_id == Some(playback_id)
+        ));
+    }
+
+    #[test]
+    fn playback_runtime_coalesces_active_retargets_to_newest_expected_play() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let executor = FakeExecutor::new(vec![]).with_play_gate(entered_tx, release_rx);
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        entered_rx.recv().expect("executor entered play");
+        let discarded_update = span_update(0.1, 0.4, true);
+        let newest_update = span_update(0.3, 0.9, false);
+        let discarded_id = runtime
+            .handle
+            .try_retarget_active_span(PlaybackRequestId(playback_id.get() + 100), discarded_update)
+            .expect("discarded retarget");
+        let newest_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, newest_update)
+            .expect("newest retarget");
+        release_tx.send(()).expect("release executor");
+
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        assert!(matches!(
+            runtime.events.recv().expect("newest retarget event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == newest_id && progress.playback_request_id == Some(playback_id)
+        ));
+        assert_ne!(discarded_id, newest_id);
+        assert_eq!(
+            retargeted.lock().expect("retargeted").as_slice(),
+            &[newest_update]
+        );
+    }
+
+    #[test]
     fn coalescing_span_retarget_keeps_latest_update() {
         let first_id = PlaybackRequestId(1);
         let second_id = PlaybackRequestId(2);
+        let first_expected = PlaybackRequestId(7);
+        let second_expected = PlaybackRequestId(8);
         let (coalesced, pending, events) = coalesce_for_test(
-            retarget_command(first_id, 0.1, 0.5),
-            vec![retarget_command(second_id, 0.2, 0.7)],
+            active_retarget_command(first_id, first_expected, 0.1, 0.5),
+            vec![active_retarget_command(
+                second_id,
+                second_expected,
+                0.2,
+                0.7,
+            )],
         );
 
         assert!(matches!(
             coalesced,
-            CoalescedCommand::RetargetSpan { id, update }
-                if id == second_id && update.start == 0.2 && update.end == 0.7
+            CoalescedCommand::RetargetSpan {
+                id,
+                expected_playback_id,
+                update,
+            } if id == second_id
+                && expected_playback_id == Some(second_expected)
+                && update.start == 0.2
+                && update.end == 0.7
         ));
         assert!(pending.is_empty());
         assert!(events.is_empty());
@@ -2393,8 +2872,14 @@ mod tests {
 
         assert!(matches!(
             coalesced,
-            CoalescedCommand::RetargetSpan { id, update }
-                if id == latest_id && update.start == 0.2 && update.end == 0.7
+            CoalescedCommand::RetargetSpan {
+                id,
+                expected_playback_id,
+                update,
+            } if id == latest_id
+                && expected_playback_id.is_none()
+                && update.start == 0.2
+                && update.end == 0.7
         ));
         assert!(pending.is_empty());
         assert!(events.is_empty());
@@ -2435,6 +2920,7 @@ mod tests {
             .commands
             .try_submit(PlaybackRuntimeCommand::RetargetSpan {
                 id: PlaybackRequestId(9),
+                expected_playback_id: None,
                 update: latest,
             })
             .expect("latest retarget");
@@ -2450,6 +2936,7 @@ mod tests {
             .commands
             .try_submit(PlaybackRuntimeCommand::RetargetSpan {
                 id: PlaybackRequestId(8),
+                expected_playback_id: None,
                 update: stale,
             })
             .expect("stale retarget");
@@ -2539,6 +3026,20 @@ mod tests {
     fn retarget_command(id: PlaybackRequestId, start: f64, end: f64) -> PlaybackRuntimeCommand {
         PlaybackRuntimeCommand::RetargetSpan {
             id,
+            expected_playback_id: None,
+            update: span_update(start, end, true),
+        }
+    }
+
+    fn active_retarget_command(
+        id: PlaybackRequestId,
+        expected_playback_id: PlaybackRequestId,
+        start: f64,
+        end: f64,
+    ) -> PlaybackRuntimeCommand {
+        PlaybackRuntimeCommand::RetargetSpan {
+            id,
+            expected_playback_id: Some(expected_playback_id),
             update: span_update(start, end, true),
         }
     }
