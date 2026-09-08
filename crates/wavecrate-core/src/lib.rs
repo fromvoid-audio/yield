@@ -16,6 +16,7 @@ mod rating;
 mod rating_filter;
 mod selection;
 mod tag_category;
+mod tag_filter;
 mod tag_input;
 mod waveform_region;
 mod waveform_viewport;
@@ -39,6 +40,11 @@ pub use selection::BrowserSelection;
 pub use tag_category::{
     DEFAULT_METADATA_TAGS, MAX_TAG_CATEGORY_INPUT_BYTES, TAG_CATEGORIES, TagCategory,
     TagCategoryError, infer_tag_category,
+};
+pub use tag_filter::{
+    MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_FILTER_TOKEN_BYTES, MAX_TAG_FILTER_TOKENS,
+    TagFilterApplyError, TagFilterError, TagFilterMask, TagFilterMaskError, TagFilterQuery,
+    TagFilterState, parse_tag_filter,
 };
 pub use tag_input::{
     MAX_TAG_INPUT_BYTES, MAX_TAG_LABEL_BYTES, MAX_TAGS_PER_COMMIT, TagInputError, parse_tag_input,
@@ -238,6 +244,7 @@ pub struct BrowserViewModel {
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
     playback_type_filter: PlaybackTypeFilter,
+    tag_filter: TagFilterState,
     reveal_id: Option<AudioFileId>,
     rows: Vec<BrowserRow>,
 }
@@ -253,6 +260,7 @@ impl BrowserViewModel {
             collection_filter: None,
             rating_filter: RatingFilter::disabled(),
             playback_type_filter: PlaybackTypeFilter::disabled(),
+            tag_filter: TagFilterState::disabled(),
             reveal_id: None,
             rows: Vec::new(),
         };
@@ -296,6 +304,11 @@ impl BrowserViewModel {
         self.playback_type_filter
     }
 
+    /// Return the active external tag-filter result state.
+    pub fn tag_filter(&self) -> &TagFilterState {
+        &self.tag_filter
+    }
+
     /// Return the single file identity temporarily included in the projection despite another
     /// active filter.
     pub fn reveal_id(&self) -> Option<&AudioFileId> {
@@ -316,8 +329,69 @@ impl BrowserViewModel {
 
     /// Replace the scan while preserving the current query and sort choice.
     pub fn set_entries(&mut self, entries: &[AudioFile]) {
+        self.invalidate_tag_filter_result();
         self.clear_reveal_if_missing(entries);
         self.rebuild(entries);
+    }
+
+    /// Begin an enabled tag filter while its external positional result is being computed.
+    ///
+    /// The temporary reveal is cleared because this is an explicit filter edit. Until a
+    /// validated mask is applied, an enabled filter contributes no matching rows.
+    pub fn begin_tag_filter(&mut self, entries: &[AudioFile]) -> bool {
+        let changed =
+            !matches!(self.tag_filter, TagFilterState::Pending) || self.reveal_id.is_some();
+        self.reveal_id = None;
+        self.tag_filter = TagFilterState::Pending;
+        if changed {
+            self.rebuild(entries);
+        }
+        changed
+    }
+
+    /// Disable tag filtering and rebuild the projection without its external match mask.
+    pub fn disable_tag_filter(&mut self, entries: &[AudioFile]) -> bool {
+        let changed =
+            !matches!(self.tag_filter, TagFilterState::Disabled) || self.reveal_id.is_some();
+        self.reveal_id = None;
+        self.tag_filter = TagFilterState::Disabled;
+        if changed {
+            self.rebuild(entries);
+        }
+        changed
+    }
+
+    /// Apply a validated positional tag-filter result while the filter is enabled.
+    ///
+    /// The mask must address exactly `entries.len()` entries. Applying a result preserves any
+    /// existing reveal and rebuilds the projection; a disabled filter or mismatched mask leaves
+    /// the current state untouched.
+    pub fn apply_tag_filter(
+        &mut self,
+        entries: &[AudioFile],
+        mask: TagFilterMask,
+    ) -> Result<(), TagFilterApplyError> {
+        if !self.tag_filter.is_enabled() {
+            return Err(TagFilterApplyError::Disabled);
+        }
+        if mask.entry_count() != entries.len() {
+            return Err(TagFilterApplyError::EntryCountMismatch {
+                expected: entries.len(),
+                actual: mask.entry_count(),
+            });
+        }
+        self.tag_filter = TagFilterState::Ready(mask);
+        self.rebuild(entries);
+        Ok(())
+    }
+
+    /// Invalidate an enabled tag-filter result while preserving its reveal and enabled state.
+    pub fn invalidate_tag_filter(&mut self, entries: &[AudioFile]) -> bool {
+        let changed = self.invalidate_tag_filter_result();
+        if changed {
+            self.rebuild(entries);
+        }
+        changed
     }
 
     /// Set the selected folder and whether descendants are included, preserving search and sort.
@@ -449,7 +523,8 @@ impl BrowserViewModel {
         self.set_playback_type_filter(entries, next)
     }
 
-    /// Count each collection across the current name, folder, rating, and playback-type scope.
+    /// Count each collection across the current name, folder, rating, playback-type, and tag
+    /// scope.
     ///
     /// The active collection filter is intentionally ignored so sidebar counts remain useful
     /// while a different collection is selected. Callers should cache this result and refresh it
@@ -458,8 +533,9 @@ impl BrowserViewModel {
     pub fn collection_counts(&self, entries: &[AudioFile]) -> [usize; COLLECTION_COUNT] {
         let query = self.query.trim().to_ascii_lowercase();
         let mut counts = [0; COLLECTION_COUNT];
-        for entry in entries {
-            if !self.entry_matches_scope(entry, &query)
+        for (entry_index, entry) in entries.iter().enumerate() {
+            if !self.entry_matches_tag_filter(entry_index)
+                || !self.entry_matches_scope(entry, &query)
                 || !self.entry_matches_rating(entry)
                 || !self.entry_matches_playback_type(entry)
             {
@@ -523,19 +599,30 @@ impl BrowserViewModel {
         self.rebuild_with_now(entries, current_unix_epoch_seconds());
     }
 
+    fn invalidate_tag_filter_result(&mut self) -> bool {
+        match self.tag_filter {
+            TagFilterState::Disabled | TagFilterState::Pending => false,
+            TagFilterState::Ready(_) => {
+                self.tag_filter = TagFilterState::Pending;
+                true
+            }
+        }
+    }
+
     fn rebuild_with_now(&mut self, entries: &[AudioFile], now_epoch_seconds: i64) {
         let query = self.query.trim().to_ascii_lowercase();
         let reveal_id = self.reveal_id.as_ref();
         let mut projected = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
+            .filter(|(entry_index, entry)| {
                 let in_folder = self.folder.as_deref().is_none_or(|folder| {
                     folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
                 });
                 in_folder
                     && (reveal_id.is_some_and(|reveal_id| entry.path.as_path() == reveal_id.path())
-                        || (audio_file_matches_name_query(entry, &query)
+                        || (self.entry_matches_tag_filter(*entry_index)
+                            && audio_file_matches_name_query(entry, &query)
                             && self.collection_filter.is_none_or(|slot| {
                                 entry
                                     .curation
@@ -599,6 +686,14 @@ impl BrowserViewModel {
 
     fn entry_matches_playback_type(&self, entry: &AudioFile) -> bool {
         self.playback_type_filter.matches(entry.playback_type)
+    }
+
+    fn entry_matches_tag_filter(&self, entry_index: usize) -> bool {
+        match &self.tag_filter {
+            TagFilterState::Disabled => true,
+            TagFilterState::Pending => false,
+            TagFilterState::Ready(mask) => mask.contains(entry_index),
+        }
     }
 }
 
@@ -1039,6 +1134,176 @@ mod tests {
             vec![1]
         );
         assert_eq!(model.collection_counts(&entries), [0, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn tag_filter_intersects_name_folder_rating_playback_and_collection_scopes() {
+        let curation =
+            |collections| AudioFileCuration::from_parts(-1, false, collections, None, None);
+        let entries = vec![
+            typed_entry(
+                "kit/kick-loop-a.wav",
+                Some(PlaybackType::Loop),
+                curation(0b0000_0001),
+            ),
+            typed_entry(
+                "kit/kick-loop-b.wav",
+                Some(PlaybackType::Loop),
+                curation(0b0000_0001),
+            ),
+            typed_entry(
+                "kit/kick-one.wav",
+                Some(PlaybackType::OneShot),
+                curation(0b0000_0001),
+            ),
+            typed_entry(
+                "other/kick-loop.wav",
+                Some(PlaybackType::Loop),
+                curation(0b0000_0001),
+            ),
+            typed_entry(
+                "kit/pad-loop.wav",
+                Some(PlaybackType::Loop),
+                curation(0b0000_0001),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "kick");
+        assert!(model.set_collection_filter(&entries, Some(0)));
+        assert!(model.toggle_rating_filter(&entries, -1));
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::Loop));
+        assert!(model.begin_tag_filter(&entries));
+        assert!(model.tag_filter().is_pending());
+        assert!(model.rows().is_empty());
+
+        let mask = TagFilterMask::try_from_vec(entries.len(), vec![1u64 << 1]).unwrap();
+        model.apply_tag_filter(&entries, mask).unwrap();
+        assert!(matches!(model.tag_filter(), TagFilterState::Ready(_)));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn tag_filter_pending_and_disabled_states_have_distinct_projection_behavior() {
+        let entries = vec![model_entry("/tmp/a.wav", 1), model_entry("/tmp/b.wav", 2)];
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(matches!(model.tag_filter(), TagFilterState::Disabled));
+        assert_eq!(model.rows().len(), entries.len());
+
+        assert!(model.begin_tag_filter(&entries));
+        assert!(model.tag_filter().is_enabled());
+        assert!(model.tag_filter().is_pending());
+        assert!(model.rows().is_empty());
+
+        assert!(model.disable_tag_filter(&entries));
+        assert!(matches!(model.tag_filter(), TagFilterState::Disabled));
+        assert_eq!(model.rows().len(), entries.len());
+    }
+
+    #[test]
+    fn tag_filter_reveal_bypasses_tag_mask_but_keeps_folder_boundary() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/source/kit/inside.wav"),
+                relative_path: PathBuf::from("kit/inside.wav"),
+                ..model_entry("/source/kit/inside.wav", 1)
+            },
+            AudioFile {
+                path: PathBuf::from("/source/other/outside.wav"),
+                relative_path: PathBuf::from("other/outside.wav"),
+                ..model_entry("/source/other/outside.wav", 2)
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        assert!(model.begin_tag_filter(&entries));
+
+        let outside_id = entries[1].stable_id();
+        assert!(model.set_reveal(&entries, Some(outside_id)));
+        assert!(model.rows().is_empty());
+
+        let inside_id = entries[0].stable_id();
+        assert!(model.set_reveal(&entries, Some(inside_id.clone())));
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        assert_eq!(model.reveal_id(), Some(&inside_id));
+    }
+
+    #[test]
+    fn same_length_entry_replacement_invalidates_positional_tag_mask() {
+        let entries = vec![model_entry("/tmp/a.wav", 1), model_entry("/tmp/b.wav", 2)];
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.begin_tag_filter(&entries));
+        model
+            .apply_tag_filter(
+                &entries,
+                TagFilterMask::try_from_vec(entries.len(), vec![1]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(model.rows()[0].entry_index, 0);
+
+        let replacement = vec![entries[1].clone(), entries[0].clone()];
+        model.set_entries(&replacement);
+        assert!(model.tag_filter().is_pending());
+        assert!(model.rows().is_empty());
+    }
+
+    #[test]
+    fn sorting_reorders_ready_tag_rows_without_reinterpreting_mask_positions() {
+        let entries = vec![
+            model_entry("/tmp/zulu.wav", 1),
+            model_entry("/tmp/alpha.wav", 2),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.begin_tag_filter(&entries);
+        model
+            .apply_tag_filter(
+                &entries,
+                TagFilterMask::try_from_vec(entries.len(), vec![1]).unwrap(),
+            )
+            .unwrap();
+        let selected_id = entries[0].stable_id();
+        model.toggle_sort(&entries, SortColumn::Name);
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        assert_eq!(model.rows()[0].id, selected_id);
+    }
+
+    #[test]
+    fn tag_filter_apply_rejects_disabled_and_mismatched_results() {
+        let entries = vec![model_entry("/tmp/a.wav", 1)];
+        let mut model = BrowserViewModel::new(&entries);
+        let mask = TagFilterMask::try_from_vec(1, vec![1]).unwrap();
+        assert_eq!(
+            model.apply_tag_filter(&entries, mask.clone()),
+            Err(TagFilterApplyError::Disabled)
+        );
+        model.begin_tag_filter(&entries);
+        let mismatched = TagFilterMask::try_from_vec(2, vec![1]).unwrap();
+        assert_eq!(
+            model.apply_tag_filter(&entries, mismatched),
+            Err(TagFilterApplyError::EntryCountMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert!(model.tag_filter().is_pending());
+        assert!(model.apply_tag_filter(&entries, mask).is_ok());
     }
 
     #[test]

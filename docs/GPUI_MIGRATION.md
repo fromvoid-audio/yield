@@ -1487,3 +1487,20 @@ library compilation, formatting and diff checks. Query-plan tests require indexe
 searches on both normalized tags and tag assignments. Primary review corrected the
 initial binary-only lookup, case-variant counting and embedded-NUL equality issues.
 Catalog publication and browser filtering are separate follow-on integration.
+
+### Core tag-filter projection
+
+The dependency-free core now parses comma-only filter requirements with atomic
+input bounds and retains validated immutable positional masks. Disabled, Pending
+and Ready states distinguish an inactive filter from an enabled filter awaiting
+results. Matching intersects existing browser predicates and collection counts;
+exact history reveals still bypass filters within their folder boundary.
+
+Entry replacement invalidates ready masks even when the entry count is unchanged.
+Mask validation rejects wrong word counts and set tail bits, and application
+rejects disabled or differently sized projections. The catalog/UI integration must
+still bind each result to its source, revision and manifest order.
+
+All 103 core tests passed, with core compilation, formatting and diff checks. The
+primary reviewed the parser, mask validation and projection integration. This is a
+backend prerequisite; the sidebar filter is not exposed yet.
