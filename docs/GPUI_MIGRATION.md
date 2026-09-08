@@ -1715,3 +1715,13 @@ query-plan/cancellation tests passed, along with the catalog check and diff chec
 A deterministic SQL-progress test cancels before the grouped read emits its first
 row, then successfully reuses the same database connection. The backend is ready
 for the native Tag Editor library panel; that panel remains follow-on UI work.
+
+`Wavecrate Recovery Preview ba50dab.app` was built from the clean detached
+`ba50dabf1` acceptance checkout and passed strict ad-hoc signature verification.
+The agent did not launch it; existing previews remain preserved.
+
+### Exact WAV span peak preparation
+
+Added a cancellable, bounded-memory media reader for raw interleaved WAV peaks over an exact half-open frame span. Requests retain the overview file revision and reject replacement, modification, or truncation before returning a result. This is normalization infrastructure; the audition toggle is not wired yet. Cancellation checks are bounded by 4,096 samples independent of channel count.
+
+Validation: media suite passed 24 tests before the cancellation refinement; all seven focused span-peak tests and the media all-targets check passed after it. Fixtures cover PCM/float amplitude, channel maxima, silence/nonfinite values, span bounds, stale files, and cancellation with high channel counts.

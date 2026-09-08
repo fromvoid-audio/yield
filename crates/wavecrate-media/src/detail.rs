@@ -47,7 +47,7 @@ impl WaveformSpec {
         }
     }
 
-    fn is_valid(self) -> bool {
+    pub(super) fn is_valid(self) -> bool {
         self.channels > 0 && self.sample_rate > 0 && (1..=32).contains(&self.bits_per_sample)
     }
 }
@@ -196,7 +196,7 @@ pub(super) struct FileObservation {
 }
 
 impl FileObservation {
-    fn strong_revision(&self) -> Option<WaveformFileRevision> {
+    pub(super) fn strong_revision(&self) -> Option<WaveformFileRevision> {
         let (Some(open_identity), Some(path_identity), Some(change_marker)) = (
             self.open_identity.as_ref(),
             self.path_identity.as_ref(),
@@ -364,7 +364,7 @@ pub(super) fn context_from_observations(
 }
 
 impl WaveformDetailContext {
-    fn is_valid(&self) -> bool {
+    pub(super) fn is_valid(&self) -> bool {
         !self.path.as_os_str().is_empty()
             && !self.file_revision.filesystem_identity.is_empty()
             && !self.file_revision.change_marker.is_empty()
