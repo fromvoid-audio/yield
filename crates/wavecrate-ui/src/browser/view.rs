@@ -78,6 +78,8 @@ impl Browser {
             .flex()
             .flex_col()
             .flex_none()
+            .w_full()
+            .min_w_0()
             .h(px(theme.spacing.waveform_height))
             .bg(color(theme.colors.surface))
             .border_b(px(theme.spacing.border_width))
@@ -87,11 +89,21 @@ impl Browser {
                     .flex()
                     .flex_none()
                     .items_center()
+                    .w_full()
+                    .min_w_0()
                     .h(px(theme.waveform.title_height))
                     .px(px(theme.spacing.panel_padding))
                     .bg(color(theme.colors.waveform_label))
                     .text_size(px(theme.typography.waveform_title_size))
-                    .child(title),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(title),
+                    ),
             )
             .child(waveform::render_waveform(
                 self,
@@ -104,14 +116,25 @@ impl Browser {
                     .flex()
                     .flex_none()
                     .items_center()
+                    .w_full()
+                    .min_w_0()
                     .h(px(theme.waveform.metadata_height))
                     .gap(px(theme.spacing.control_gap))
                     .px(px(theme.spacing.panel_padding))
                     .text_size(px(theme.typography.small_size))
                     .text_color(color(theme.colors.text_muted))
                     .child(metadata)
-                    .child(div().flex_1())
-                    .child(div().text_color(color(message.1)).child(message.0)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_right()
+                            .text_color(color(message.1))
+                            .child(message.0),
+                    ),
             )
     }
 
@@ -343,11 +366,19 @@ impl Render for Browser {
             self.scan_status.clone()
         };
         let selected_count = self.selected_count_label();
+        let metadata_status = self.catalog_metadata.status_label();
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
+        if self.view_model.rows().is_empty()
+            && let Some(context) = self.catalog_metadata.context()
+        {
+            cx.defer_in(window, move |view, _, cx| {
+                view.observe_catalog_metadata(context, Vec::new(), cx);
+            });
+        }
         let list = if self.view_model.rows().is_empty() {
             div()
                 .flex()
@@ -373,7 +404,22 @@ impl Render for Browser {
                         self.view_model.rows().len(),
                         cx.processor({
                             let list_theme = theme.clone();
-                            move |view, range: std::ops::Range<usize>, _window, cx| {
+                            move |view, range: std::ops::Range<usize>, window, cx| {
+                                if let Some(context) = view.catalog_metadata.context() {
+                                    let metadata_paths = range
+                                        .clone()
+                                        .filter_map(|visible_index| {
+                                            let row = view.view_model.rows().get(visible_index)?;
+                                            let entry = view.entries.get(row.entry_index)?;
+                                            (entry.duration_seconds.is_none()
+                                                || entry.sample_rate.is_none())
+                                            .then(|| entry.relative_path.clone())
+                                        })
+                                        .collect::<Vec<_>>();
+                                    cx.defer_in(window, move |view, _, cx| {
+                                        view.observe_catalog_metadata(context, metadata_paths, cx);
+                                    });
+                                }
                                 range
                                     .map(|visible_index| {
                                         let row = view.view_model.rows()[visible_index].clone();
@@ -763,6 +809,7 @@ impl Render for Browser {
                     .flex()
                     .flex_1()
                     .h_full()
+                    .min_w_0()
                     .child(super::sidebar::render(
                         self,
                         theme.clone(),
@@ -775,6 +822,7 @@ impl Render for Browser {
                             .flex_col()
                             .flex_1()
                             .h_full()
+                            .min_w_0()
                             .child(self.render_waveform_panel(
                                 theme.clone(),
                                 playback_cursor_ratio,
@@ -849,6 +897,9 @@ impl Render for Browser {
                     .flex()
                     .flex_none()
                     .items_center()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
                     .h(px(theme.spacing.status_height))
                     .gap(px(theme.spacing.control_gap))
                     .px(px(theme.spacing.panel_padding))
@@ -863,6 +914,9 @@ impl Render for Browser {
                     })
                     .child(list_status)
                     .child(self.source_registry_status.clone())
+                    .when(metadata_status.is_some(), move |element| {
+                        element.child(metadata_status.clone().unwrap_or_default())
+                    })
                     .when(selected_count.is_some(), move |element| {
                         element.child(selected_count.unwrap_or_default())
                     })

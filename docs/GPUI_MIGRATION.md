@@ -806,3 +806,29 @@ revision mismatch, cancellation, and removal fencing. Independent backend
 review found no remaining meaningful issues in admission, authority checks,
 cache patching, or event accounting. Visible-row scheduling and integrated
 large-library GUI validation remain the next slice.
+
+### Visible-row catalog metadata loading, 2026-09-08
+
+The virtual file list now requests missing WAV metadata for visible rows after
+a 45-ms delay, with one sixteen-path request in flight. Requests start only
+after a successful catalog audit and projection. Source, lifecycle, root,
+revision, projection identity, and request identifiers fence completion; source
+switches and refreshes reset the lane. Empty filters clear demand, and omitted
+malformed paths remain terminal until the next projection. Metadata errors are
+separate from source audit errors.
+
+An index built during background projection lets each response patch the
+browser and retained source entries directly. Completion does not rebuild the
+folder tree or list model, change selection, or request animation frames.
+Polling ends when the bounded metadata lane is idle. Poll task retirement is
+atomic with its stop decision, preventing deferred admission from losing its
+poller.
+
+Validation: 109 UI tests passed with one ignored, including six focused metadata
+cases; the signed macOS build succeeded. A disposable 4,202-file source verified
+metadata loading beyond the initial 4,096-file budget, further batches after
+scrolling, empty filters, and a malformed WAV beside a valid three-second,
+22,050-Hz WAV. A long preview-error layout issue found during this check was
+fixed with shrinkable, clipped status and pane boundaries. A fresh signed build
+verified that the malformed-file error preserves all table columns and that
+selecting a valid file restores the normal preview status. The app quit cleanly.

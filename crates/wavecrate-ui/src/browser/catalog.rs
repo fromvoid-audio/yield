@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{BorrowAppContext, Context};
 use wavecrate_core::{AudioFile, AudioFileId, FolderTree};
-use wavecrate_library::sample_sources::SourceId;
+use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
 use wavecrate_session::{CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError};
 
 use super::source_registry::SourceRegistryGlobal;
-use super::{Browser, SourceSession};
+use super::{Browser, SourceSession, catalog_metadata};
 
 /// Filesystem facts retained with a catalog projection for playback invalidation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,9 +119,12 @@ struct CatalogProjection {
     source_id: SourceId,
     lifecycle_generation: u64,
     root: PathBuf,
+    root_identity: RootIdentity,
+    committed_revision: u64,
     entries: Vec<AudioFile>,
     tree: FolderTree,
     facts: HashMap<PathBuf, CatalogFileFacts>,
+    entry_indices: Arc<HashMap<PathBuf, usize>>,
 }
 
 impl Browser {
@@ -260,6 +263,7 @@ impl Browser {
 
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
+        self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
         if let Some(activation) = activation {
             if activation.registration_admitted {
@@ -337,6 +341,7 @@ impl Browser {
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
                 self.cancel_catalog_projection();
+                self.reset_catalog_metadata();
                 return changed;
             }
             CatalogStatus::Ready => {}
@@ -359,48 +364,50 @@ impl Browser {
                 }
             }
         }
-        let Some(intent) = self.catalog_pending_command.clone() else {
-            return false;
-        };
-        let register_identity = match &intent {
-            CatalogCommandIntent::Register {
-                source_id,
-                lifecycle_generation,
-                ..
-            } => Some((source_id.clone(), *lifecycle_generation)),
-            CatalogCommandIntent::Audit { .. } | CatalogCommandIntent::Remove { .. } => None,
-        };
-        match submit_catalog(intent, cx) {
-            Ok(()) => {
-                if let Some((source_id, lifecycle_generation)) = register_identity
-                    && let Some(activation) = self.catalog_activation.as_mut()
-                    && activation.source_id == source_id
-                    && activation.lifecycle_generation == lifecycle_generation
-                {
-                    activation.registration_admitted = true;
+        if let Some(intent) = self.catalog_pending_command.clone() {
+            let register_identity = match &intent {
+                CatalogCommandIntent::Register {
+                    source_id,
+                    lifecycle_generation,
+                    ..
+                } => Some((source_id.clone(), *lifecycle_generation)),
+                CatalogCommandIntent::Audit { .. } | CatalogCommandIntent::Remove { .. } => None,
+            };
+            match submit_catalog(intent, cx) {
+                Ok(()) => {
+                    if let Some((source_id, lifecycle_generation)) = register_identity
+                        && let Some(activation) = self.catalog_activation.as_mut()
+                        && activation.source_id == source_id
+                        && activation.lifecycle_generation == lifecycle_generation
+                    {
+                        activation.registration_admitted = true;
+                    }
+                    self.catalog_pending_command = None;
+                    return true;
                 }
-                self.catalog_pending_command = None;
-                true
-            }
-            Err(CatalogSubmitError::Full | CatalogSubmitError::NotReady) => false,
-            Err(CatalogSubmitError::Unavailable(reason)) => {
-                self.handle_catalog_unavailable(reason, cx)
-            }
-            Err(CatalogSubmitError::Closed | CatalogSubmitError::InvalidWavMetadataRequest(_)) => {
-                false
+                Err(CatalogSubmitError::Full | CatalogSubmitError::NotReady) => return false,
+                Err(CatalogSubmitError::Unavailable(reason)) => {
+                    return self.handle_catalog_unavailable(reason, cx);
+                }
+                Err(
+                    CatalogSubmitError::Closed | CatalogSubmitError::InvalidWavMetadataRequest(_),
+                ) => return false,
             }
         }
+        self.retry_catalog_metadata(cx)
     }
 
     fn handle_catalog_unavailable(&mut self, reason: String, cx: &mut Context<Self>) -> bool {
         let Some(activation) = self.catalog_activation.clone() else {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
+            self.reset_catalog_metadata();
             return true;
         };
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
         self.cancel_catalog_projection();
+        self.reset_catalog_metadata();
         self.catalog_activation = None;
         if activation.fallback_to_scan {
             self.scan_status = format!(
@@ -425,6 +432,7 @@ impl Browser {
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
                 self.cancel_catalog_projection();
+                self.reset_catalog_metadata();
                 self.scan_status = "Source catalog closed".to_string();
                 return true;
             }
@@ -458,8 +466,11 @@ impl Browser {
                 self.start_catalog_projection(event, cx);
                 true
             }
-            CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => false,
+            CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
+                self.apply_catalog_metadata_event(&event)
+            }
             CatalogEvent::Failed { error, .. } => {
+                self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = Some(error.to_string());
@@ -485,6 +496,7 @@ impl Browser {
         let lifecycle_generation = activation.lifecycle_generation;
         let force_reload = activation.force_reload;
         let root = activation.root.clone();
+        self.reset_catalog_metadata();
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
@@ -542,6 +554,22 @@ impl Browser {
         }) else {
             return;
         };
+        let audit_ready = self.catalog_activation.as_ref().is_some_and(|activation| {
+            activation.audit_finished && activation.audit_error.is_none()
+        });
+        if audit_ready {
+            self.catalog_metadata
+                .install_projection(catalog_metadata::CatalogMetadataContext {
+                    source_id: projection.source_id.clone(),
+                    lifecycle_generation: projection.lifecycle_generation,
+                    root: projection.root.clone(),
+                    root_identity: projection.root_identity.clone(),
+                    revision: projection.committed_revision,
+                    entry_indices: Arc::clone(&projection.entry_indices),
+                });
+        } else {
+            self.reset_catalog_metadata();
+        }
         let previous_id = self.selected_id();
         let previous_position = self.selected_visible_position();
         let restore_id = self.restore_selection_id.take().or(previous_id.clone());
@@ -635,12 +663,17 @@ fn submit_catalog(
     intent: CatalogCommandIntent,
     cx: &mut Context<Browser>,
 ) -> Result<(), CatalogSubmitError> {
+    submit_catalog_command(intent.into_command(), cx)
+}
+
+pub(super) fn submit_catalog_command(
+    command: CatalogCommand,
+    cx: &mut Context<Browser>,
+) -> Result<(), CatalogSubmitError> {
     if !cx.has_global::<SourceRegistryGlobal>() {
         return Err(CatalogSubmitError::Closed);
     }
-    cx.update_global::<SourceRegistryGlobal, _>(|global, _| {
-        global.submit_catalog(intent.into_command())
-    })
+    cx.update_global::<SourceRegistryGlobal, _>(|global, _| global.submit_catalog(command))
 }
 
 fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
@@ -691,16 +724,21 @@ fn project_catalog_event(
     }
     let source_id = snapshot.source_id;
     let lifecycle_generation = snapshot.lifecycle_generation;
+    let root_identity = snapshot.root_identity;
+    let committed_revision = snapshot.committed_revision;
     let manifest = snapshot.manifest;
     let directories = snapshot.directories;
     let wav_metadata = snapshot.wav_metadata;
     let mut entries = Vec::with_capacity(manifest.len());
     let mut facts = HashMap::with_capacity(manifest.len());
+    let mut entry_indices = HashMap::with_capacity(manifest.len());
     for manifest in manifest {
         if cancellation.load(Ordering::Acquire) {
             return Err("catalog projection canceled".to_string());
         }
         validate_relative_path(&manifest.relative_path)?;
+        let entry_index = entries.len();
+        entry_indices.insert(manifest.relative_path.clone(), entry_index);
         let path = root.join(&manifest.relative_path);
         let (duration_seconds, sample_rate) = wav_metadata
             .get(&manifest.relative_path)
@@ -747,9 +785,12 @@ fn project_catalog_event(
         source_id,
         lifecycle_generation,
         root,
+        root_identity,
+        committed_revision,
         entries,
         tree,
         facts,
+        entry_indices: Arc::new(entry_indices),
     })
 }
 
@@ -826,7 +867,7 @@ pub(super) fn is_catalog_busy(browser: &Browser) -> bool {
 }
 
 pub(super) fn catalog_poll_needed(browser: &Browser) -> bool {
-    is_catalog_busy(browser)
+    is_catalog_busy(browser) || browser.catalog_metadata.poll_needed()
 }
 
 #[cfg(test)]
@@ -841,6 +882,7 @@ mod tests {
     };
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use wavecrate_catalog::CatalogWavMetadata;
     use wavecrate_core::{AudioFile, FolderTree};
     use wavecrate_library::sample_sources::{SourceId, db::SourceDirectoryEntry};
@@ -1054,6 +1096,11 @@ mod tests {
             source_id: SourceId::from_string("source"),
             lifecycle_generation: 1,
             root,
+            root_identity:
+                wavecrate_library::sample_sources::reconciliation::RootIdentity::from_bytes(
+                    b"root".to_vec(),
+                ),
+            committed_revision: 1,
             entries: vec![AudioFile {
                 path: id.path().to_path_buf(),
                 relative_path: PathBuf::from("kick.wav"),
@@ -1063,6 +1110,7 @@ mod tests {
             }],
             tree: FolderTree::default(),
             facts: projection_facts,
+            entry_indices: Arc::new(HashMap::from([(PathBuf::from("kick.wav"), 0)])),
         };
         assert!(!focused_manifest_changed(&id, &projection, &session));
         let mut changed = projection;

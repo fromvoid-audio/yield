@@ -34,6 +34,7 @@ use crate::theme::ActiveTheme;
 
 mod audio_output;
 mod catalog;
+mod catalog_metadata;
 mod handoff;
 mod history;
 mod motion;
@@ -274,6 +275,7 @@ pub(crate) struct Browser {
     catalog_pending_removes: HashMap<SourceId, catalog::CatalogCommandIntent>,
     catalog_projection_task: Option<Task<()>>,
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
+    catalog_metadata: catalog_metadata::CatalogMetadataState,
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
@@ -411,6 +413,7 @@ impl Browser {
             catalog_pending_removes: HashMap::new(),
             catalog_projection_task: None,
             catalog_projection_cancel: None,
+            catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
             waveform_task: None,
@@ -1711,6 +1714,7 @@ impl Drop for Browser {
         }
         self.catalog_projection_task.take();
         self.waveform_detail.reset();
+        self.reset_catalog_metadata();
         self.cancel_waveform_load();
         self.cancel_audio_output_options();
         self.audio_output_open_generation = self.audio_output_open_generation.wrapping_add(1);

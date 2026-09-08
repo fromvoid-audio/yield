@@ -171,10 +171,15 @@ impl Browser {
             loop {
                 gpui::Timer::after(std::time::Duration::from_millis(100)).await;
                 let keep_polling = this
-                    .update(cx, |view, cx| view.poll_source_registry(cx))
+                    .update(cx, |view, cx| {
+                        let keep_polling = view.poll_source_registry(cx);
+                        if !keep_polling {
+                            view.source_registry_task = None;
+                        }
+                        keep_polling
+                    })
                     .unwrap_or(false);
                 if !keep_polling {
-                    let _ = this.update(cx, |view, _| view.source_registry_task = None);
                     break;
                 }
             }
@@ -507,6 +512,7 @@ impl Browser {
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
         self.stop_playback();
         self.cancel_waveform_load();
+        self.reset_catalog_metadata();
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.invalidate_waveform_generation();
         self.active_source = None;
