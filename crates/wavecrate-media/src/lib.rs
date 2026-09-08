@@ -16,6 +16,7 @@ mod detail;
 mod span_export;
 mod span_peak;
 mod visual_bands;
+mod zero_crossing;
 
 pub use detail::{
     MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
@@ -24,6 +25,10 @@ pub use detail::{
 };
 pub use span_export::{WavSpanExportRequest, export_wav_span, export_wav_span_with_cancel};
 pub use span_peak::{WavSpanPeakRequest, load_wav_span_peak, load_wav_span_peak_with_cancel};
+pub use zero_crossing::{
+    WavZeroCrossingSnapRange, WavZeroCrossingSnapRequest, snap_wav_range_to_zero_crossings,
+    snap_wav_range_to_zero_crossings_with_cancel,
+};
 
 /// Maximum number of bars generated for a selected sample's preview.
 pub const MAX_WAVEFORM_POINTS: usize = 180;

@@ -1883,3 +1883,9 @@ The second Windows run (`34289070619`) passed 41 media tests but exposed the rem
 Validation: 40 media tests passed on macOS, including raw fingerprint, rewind and same-length mutation coverage. The portable fingerprint check also passed against the full expected digest. Actual Windows CI remains required; local cross-checking cannot complete without the MSVC C toolchain.
 
 Independent review approved fingerprint ownership, reuse and reader offsets. Windows refinements perform one full raw source read per distinct request; the work remains off-thread and cancellable. This is the cost of detecting metadata-preserving writes with this design. [Microsoft documents the ChangeTime distinction](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info).
+
+### Zero-crossing snap media foundation
+
+Media now exposes precise normalized/frame requests for the native five-millisecond zero-crossing search. It streams channel means using the native playback conversion, preserves candidate distance/level/boundary ordering, and fences source identity and revision before and after decoding. Invalid edges and reversed results preserve native no-op behavior. No sample vector or file mutation is introduced. On Windows, the shared revision fence additionally hashes the full raw file once at admission under the read lease.
+
+Validation: temporary module registration passed 51 media tests and doc tests; final registration passed the UI dependency check and formatting. UI gesture integration follows separately.
