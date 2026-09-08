@@ -16,8 +16,8 @@ use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
     SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
-    SourceDatabase, SourceDbError, SourceTag, SourceTagFilterResult, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
+    SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceDatabase, SourceDbError, SourceTag, SourceTagFilterResult,
+    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
 };
 use super::identity::normalize_tag_identity;
 use super::{
@@ -285,6 +285,106 @@ impl SourceDatabase {
         })
     }
 
+    /// Fetch requested source tags for an exact bounded set of source-relative paths at one
+    /// revision.
+    ///
+    /// The returned page includes every existing requested tag, including tags with zero
+    /// assignments in the selected paths. Positive requested ids are deduplicated and sorted
+    /// before staging. Unknown ids are omitted. Paths and ids are staged in temporary tables
+    /// inside one read transaction, which is rolled back on success, failure, or cancellation.
+    /// The cancellation flag is checked between staging chunks and is installed as SQLite's
+    /// progress handler while the grouped query runs.
+    pub fn tags_for_paths_and_ids_page_at_revision(
+        &self,
+        expected_revision: u64,
+        paths: &[PathBuf],
+        tag_ids: &[i64],
+        after_cursor: Option<&SourceTagPageCursor>,
+        requested_limit: usize,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<SourceTagPage, SourceDbError> {
+        self.tags_for_paths_and_ids_page_at_revision_with_progress_callback(
+            expected_revision,
+            paths,
+            tag_ids,
+            after_cursor,
+            requested_limit,
+            cancellation,
+            None,
+        )
+    }
+
+    fn tags_for_paths_and_ids_page_at_revision_with_progress_callback(
+        &self,
+        expected_revision: u64,
+        paths: &[PathBuf],
+        tag_ids: &[i64],
+        after_cursor: Option<&SourceTagPageCursor>,
+        requested_limit: usize,
+        cancellation: &Arc<AtomicBool>,
+        progress_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<SourceTagPage, SourceDbError> {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let tag_ids = normalize_tag_page_ids(tag_ids)?;
+        let paths = normalize_tag_page_paths(paths)?;
+        if cancellation.load(Ordering::Acquire) {
+            return Err(SourceDbError::Canceled);
+        }
+        let query_signature = tag_page_paths_and_ids_signature(&paths, &tag_ids);
+        let limit = tag_page_limit(requested_limit);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let revision = source_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(SourceDbError::Unexpected);
+        }
+        let mut is_canceled = || cancellation.load(Ordering::Acquire);
+        stage_selected_paths(&transaction, &paths, &mut is_canceled)?;
+        stage_selected_tag_ids(&transaction, &tag_ids, &mut is_canceled)?;
+        let cursor_id = validate_selected_tag_ids_cursor(
+            &transaction,
+            revision,
+            query_signature,
+            after_cursor,
+        )?;
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+        let mut entries = {
+            let _progress_handler = TagFilterProgressHandlerGuard::install_with_callback(
+                &self.connection,
+                cancellation,
+                progress_callback,
+            );
+            query_tags_for_paths_and_ids(&transaction, cursor_id, limit)?
+        };
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+        let has_more = entries.len() > limit;
+        if has_more {
+            entries.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| SourceTagPageCursor {
+            revision,
+            query_signature,
+            last_tag_id: entries
+                .last()
+                .expect("a page with continuation has a last entry")
+                .id,
+        });
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceTagPage {
+            revision,
+            entries,
+            next_cursor,
+        })
+    }
+
     /// Fetch source vocabulary tags matching a literal normalized prefix at one revision.
     ///
     /// Empty or whitespace-only prefixes return the whole vocabulary in canonical order. The
@@ -492,10 +592,23 @@ impl<'connection> TagFilterProgressHandlerGuard<'connection> {
         connection: &'connection rusqlite::Connection,
         cancellation: &Arc<AtomicBool>,
     ) -> Self {
+        Self::install_with_callback(connection, cancellation, None)
+    }
+
+    fn install_with_callback(
+        connection: &'connection rusqlite::Connection,
+        cancellation: &Arc<AtomicBool>,
+        progress_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let cancellation = Arc::clone(cancellation);
         connection.progress_handler(
             TAG_FILTER_PROGRESS_OPS,
-            Some(move || cancellation.load(Ordering::Acquire)),
+            Some(move || {
+                if let Some(progress_callback) = progress_callback.as_ref() {
+                    progress_callback();
+                }
+                cancellation.load(Ordering::Acquire)
+            }),
         );
         Self { connection }
     }
@@ -579,6 +692,26 @@ fn normalize_tag_page_paths(paths: &[PathBuf]) -> Result<Vec<String>, SourceDbEr
         .map(|paths| paths.into_iter().collect())
 }
 
+fn normalize_tag_page_ids(tag_ids: &[i64]) -> Result<Vec<i64>, SourceDbError> {
+    if tag_ids.len() > SOURCE_TAG_PAGE_MAX_TAG_IDS {
+        return Err(SourceDbError::TagPageTooManyTagIds {
+            max: SOURCE_TAG_PAGE_MAX_TAG_IDS,
+            actual: tag_ids.len(),
+        });
+    }
+    tag_ids
+        .iter()
+        .map(|tag_id| {
+            if *tag_id <= 0 {
+                Err(SourceDbError::InvalidTagId { tag_id: *tag_id })
+            } else {
+                Ok(*tag_id)
+            }
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|tag_ids| tag_ids.into_iter().collect())
+}
+
 #[cfg(unix)]
 fn encoded_path_len(path: &Path) -> usize {
     path.as_os_str().as_bytes().len()
@@ -611,6 +744,15 @@ fn tag_page_paths_signature(paths: &[String]) -> u64 {
     "wavecrate-source-tag-page-v1".hash(&mut hasher);
     "paths".hash(&mut hasher);
     paths.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn tag_page_paths_and_ids_signature(paths: &[String], tag_ids: &[i64]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "wavecrate-source-tag-page-v1".hash(&mut hasher);
+    "selected-tag-ids".hash(&mut hasher);
+    paths.hash(&mut hasher);
+    tag_ids.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -660,6 +802,29 @@ fn validate_tag_page_cursor(
         .then_some(cursor.last_tag_id)
         .ok_or(SourceDbError::Unexpected)
         .map(Some)
+}
+
+fn validate_selected_tag_ids_cursor(
+    transaction: &Transaction<'_>,
+    revision: u64,
+    query_signature: u64,
+    cursor: Option<&SourceTagPageCursor>,
+) -> Result<Option<i64>, SourceDbError> {
+    let cursor_id = validate_tag_page_cursor(transaction, revision, query_signature, cursor)?;
+    if let Some(cursor_id) = cursor_id {
+        let requested = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.selected_tag_ids WHERE tag_id = ?1)",
+                [cursor_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sql_error)?
+            != 0;
+        if !requested {
+            return Err(SourceDbError::Unexpected);
+        }
+    }
+    Ok(cursor_id)
 }
 
 fn bounded_tag_text_sql(column: &str) -> String {
@@ -722,6 +887,42 @@ fn stage_selected_paths(
     Ok(())
 }
 
+fn stage_selected_tag_ids(
+    transaction: &Transaction<'_>,
+    tag_ids: &[i64],
+    is_canceled: &mut impl FnMut() -> bool,
+) -> Result<(), SourceDbError> {
+    if is_canceled() {
+        return Err(SourceDbError::Canceled);
+    }
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE selected_tag_ids (
+                tag_id INTEGER PRIMARY KEY
+            ) WITHOUT ROWID",
+        )
+        .map_err(map_sql_error)?;
+    let mut statement = transaction
+        .prepare_cached(
+            "INSERT OR IGNORE INTO temp.selected_tag_ids (tag_id)
+             VALUES (?1)",
+        )
+        .map_err(map_sql_error)?;
+    for chunk in tag_ids.chunks(TAG_PAGE_STAGING_CHUNK_SIZE) {
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+        for tag_id in chunk {
+            statement.execute([tag_id]).map_err(map_sql_error)?;
+        }
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+    }
+    drop(statement);
+    Ok(())
+}
+
 fn query_tags_for_paths(
     transaction: &Transaction<'_>,
     cursor_id: Option<i64>,
@@ -740,6 +941,26 @@ fn query_tags_for_paths(
         .map_err(map_sql_error)
 }
 
+fn query_tags_for_paths_and_ids(
+    transaction: &Transaction<'_>,
+    cursor_id: Option<i64>,
+    limit: usize,
+) -> Result<Vec<SourceTagPageEntry>, SourceDbError> {
+    let sql = selected_tag_ids_page_sql();
+    let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = transaction
+        .prepare_cached(&sql)
+        .map_err(map_tag_filter_sql_error)?;
+    statement
+        .query_map(
+            rusqlite::params![cursor_id, fetch_limit],
+            tag_page_entry_with_count,
+        )
+        .map_err(map_tag_filter_sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_tag_filter_sql_error)
+}
+
 fn selected_tag_page_sql() -> String {
     format!(
         "WITH selected_tags AS (
@@ -756,6 +977,35 @@ fn selected_tag_page_sql() -> String {
                 selected_tags.assignment_count
          FROM source_tags AS st
          JOIN selected_tags ON selected_tags.tag_id = st.id
+         WHERE (?1 IS NULL OR (st.normalized_text, st.id) >
+                (SELECT normalized_text, id FROM source_tags WHERE id = ?1))
+         ORDER BY st.normalized_text COLLATE BINARY ASC, st.id ASC
+         LIMIT ?2",
+        display_label = bounded_tag_text_sql("st.display_label"),
+        normalized_text = bounded_tag_text_sql("st.normalized_text"),
+        preview = tag_preview_sql(),
+    )
+}
+
+fn selected_tag_ids_page_sql() -> String {
+    format!(
+        "WITH selected_counts AS (
+                  SELECT wft.tag_id, COUNT(*) AS assignment_count
+                  FROM temp.selected_paths AS selected
+                  CROSS JOIN wav_file_tags AS wft
+                    ON wft.path = selected.path
+                  JOIN temp.selected_tag_ids AS requested
+                    ON requested.tag_id = wft.tag_id
+                  GROUP BY wft.tag_id
+              )
+         SELECT st.id,
+                {display_label},
+                {normalized_text},
+                {preview},
+                COALESCE(selected_counts.assignment_count, 0)
+         FROM temp.selected_tag_ids AS requested
+         JOIN source_tags AS st ON st.id = requested.tag_id
+         LEFT JOIN selected_counts ON selected_counts.tag_id = st.id
          WHERE (?1 IS NULL OR (st.normalized_text, st.id) >
                 (SELECT normalized_text, id FROM source_tags WHERE id = ?1))
          ORDER BY st.normalized_text COLLATE BINARY ASC, st.id ASC
@@ -918,12 +1168,17 @@ fn split_tag_page_entries(
 
 #[cfg(test)]
 mod plan_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use tempfile::tempdir;
 
     use super::{
-        SourceDatabase, selected_tag_page_sql, tag_prefix_upper_bound, tag_vocabulary_sql,
+        SourceDatabase, SourceDbError, selected_tag_ids_page_sql, selected_tag_page_sql,
+        tag_prefix_upper_bound, tag_vocabulary_sql,
     };
 
     #[test]
@@ -989,6 +1244,117 @@ mod plan_tests {
         );
         drop(statement);
         transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn selected_tag_ids_page_plan_uses_bounded_path_and_id_lookups() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+        let tag = database
+            .assign_tag_to_path(Path::new("one.wav"), "shared")
+            .unwrap();
+        let transaction = database.connection.unchecked_transaction().unwrap();
+        transaction
+            .execute_batch(
+                "CREATE TEMP TABLE selected_paths (
+                    path TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                 CREATE TEMP TABLE selected_tag_ids (
+                    tag_id INTEGER PRIMARY KEY
+                ) WITHOUT ROWID;
+                INSERT INTO temp.selected_paths (path) VALUES ('one.wav');
+                INSERT INTO temp.selected_tag_ids (tag_id) VALUES (1);",
+            )
+            .unwrap();
+        let mut statement = transaction
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                selected_tag_ids_page_sql()
+            ))
+            .unwrap();
+        let details = statement
+            .query_map(rusqlite::params![Option::<i64>::None, 2_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("SEARCH wft USING PRIMARY KEY")
+                    && detail.contains("path=?")),
+            "selected tag-id query plan did not use the wav tag primary key: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("SEARCH requested USING PRIMARY KEY")),
+            "selected tag-id query plan did not use the requested-id primary key: {details:?}"
+        );
+        assert_eq!(tag.id, 1);
+        drop(statement);
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn selected_tag_ids_page_cancels_during_grouped_query_and_cleans_temp_scope() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let paths = (0..4096)
+            .map(|index| PathBuf::from(format!("sample-{index:04}.wav")))
+            .collect::<Vec<_>>();
+        for path in &paths {
+            database.upsert_file(path, 10, 5).unwrap();
+        }
+        let tag = database.assign_tag_to_path(&paths[0], "shared").unwrap();
+        let transaction = database.connection.unchecked_transaction().unwrap();
+        for path in &paths[1..] {
+            transaction
+                .execute(
+                    "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+                    rusqlite::params![path.to_str().unwrap(), tag.id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let revision = database.get_revision().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let progress_seen = Arc::new(AtomicBool::new(false));
+        let cancellation_for_progress = Arc::clone(&cancellation);
+        let progress_seen_for_callback = Arc::clone(&progress_seen);
+        let progress_callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            progress_seen_for_callback.store(true, Ordering::Release);
+            cancellation_for_progress.store(true, Ordering::Release);
+        });
+
+        let result = database.tags_for_paths_and_ids_page_at_revision_with_progress_callback(
+            revision,
+            &paths,
+            &[tag.id],
+            None,
+            1,
+            &cancellation,
+            Some(progress_callback),
+        );
+        assert!(matches!(result, Err(SourceDbError::Canceled)));
+        assert!(progress_seen.load(Ordering::Acquire));
+
+        cancellation.store(false, Ordering::Release);
+        let page = database
+            .tags_for_paths_and_ids_page_at_revision(
+                revision,
+                &paths[..1],
+                &[tag.id],
+                None,
+                1,
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, tag.id);
+        assert_eq!(page.entries[0].assignment_count, Some(1));
     }
 
     fn explain_opcodes<P: rusqlite::Params>(

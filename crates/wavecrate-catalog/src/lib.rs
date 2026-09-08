@@ -27,8 +27,9 @@ use wavecrate_library::sample_sources::db::{
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use wavecrate_library::sample_sources::{
     BrowserFileMetadata, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceCurationCommitReceipt,
-    SourceCurationUpdate, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
+    SourceCurationCommitReceipt, SourceCurationUpdate, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry,
 };
 use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId};
 use wavecrate_scan::sample_sources::scanner::{
@@ -513,6 +514,17 @@ pub enum CatalogTagPageQuery {
         /// Source-relative paths to inspect.
         relative_paths: Vec<PathBuf>,
     },
+    /// Return requested source tags and their assignment counts for this exact set of paths.
+    ///
+    /// Existing requested ids with no selected-path assignments are returned with count zero;
+    /// unknown positive ids are omitted. Paths and ids are canonicalized by the library query
+    /// inside one revision-fenced read transaction.
+    SelectedTagIds {
+        /// Source-relative paths to inspect.
+        relative_paths: Vec<PathBuf>,
+        /// Positive source-local tag ids to return.
+        tag_ids: Vec<i64>,
+    },
     /// Return vocabulary tags whose normalized identity starts with this literal prefix.
     VocabularyPrefix {
         /// Literal UTF-8 prefix to match.
@@ -538,6 +550,20 @@ pub enum CatalogTagPageRequestError {
         max: usize,
         /// Supplied aggregate raw path bytes.
         actual: usize,
+    },
+    /// The selected-tag query exceeded the bounded tag-id count limit.
+    #[error("tag-page request contains {actual} tag ids; maximum is {max}")]
+    TooManyTagIds {
+        /// Maximum admitted tag-id count.
+        max: usize,
+        /// Supplied tag-id count.
+        actual: usize,
+    },
+    /// A selected-tag query contained a non-positive source-local tag id.
+    #[error("tag-page request tag id {tag_id} is invalid; ids must be positive")]
+    InvalidTagId {
+        /// Rejected source-local tag id.
+        tag_id: i64,
     },
     /// One selected path could not be represented as a safe source-relative path.
     #[error("invalid tag-page path {path}: {reason}")]
@@ -1375,35 +1401,26 @@ fn validate_tag_page_request(
     }
     match query {
         CatalogTagPageQuery::SelectedPaths { relative_paths } => {
-            if relative_paths.len() > SOURCE_TAG_PAGE_MAX_PATHS {
+            validate_tag_page_paths(relative_paths)?;
+        }
+        CatalogTagPageQuery::SelectedTagIds {
+            relative_paths,
+            tag_ids,
+        } => {
+            if tag_ids.len() > wavecrate_library::sample_sources::SOURCE_TAG_PAGE_MAX_TAG_IDS {
                 return Err(CatalogSubmitError::InvalidTagPageRequest(
-                    CatalogTagPageRequestError::TooManyPaths {
-                        max: SOURCE_TAG_PAGE_MAX_PATHS,
-                        actual: relative_paths.len(),
+                    CatalogTagPageRequestError::TooManyTagIds {
+                        max: wavecrate_library::sample_sources::SOURCE_TAG_PAGE_MAX_TAG_IDS,
+                        actual: tag_ids.len(),
                     },
                 ));
             }
-            let path_bytes = relative_paths.iter().fold(0usize, |total, path| {
-                total.saturating_add(encoded_path_len(path))
-            });
-            if path_bytes > SOURCE_TAG_PAGE_MAX_PATH_BYTES {
+            if let Some(tag_id) = tag_ids.iter().copied().find(|tag_id| *tag_id <= 0) {
                 return Err(CatalogSubmitError::InvalidTagPageRequest(
-                    CatalogTagPageRequestError::PathBytesTooLarge {
-                        max: SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-                        actual: path_bytes,
-                    },
+                    CatalogTagPageRequestError::InvalidTagId { tag_id },
                 ));
             }
-            for path in relative_paths {
-                if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
-                    return Err(CatalogSubmitError::InvalidTagPageRequest(
-                        CatalogTagPageRequestError::InvalidPath {
-                            path: path.clone(),
-                            reason,
-                        },
-                    ));
-                }
-            }
+            validate_tag_page_paths(relative_paths)?;
         }
         CatalogTagPageQuery::VocabularyPrefix { prefix } => {
             if prefix.len() > SOURCE_TAG_PAGE_MAX_PREFIX_BYTES {
@@ -1419,6 +1436,39 @@ fn validate_tag_page_request(
                     CatalogTagPageRequestError::PrefixContainsNul,
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tag_page_paths(relative_paths: &[PathBuf]) -> Result<(), CatalogSubmitError> {
+    if relative_paths.len() > SOURCE_TAG_PAGE_MAX_PATHS {
+        return Err(CatalogSubmitError::InvalidTagPageRequest(
+            CatalogTagPageRequestError::TooManyPaths {
+                max: SOURCE_TAG_PAGE_MAX_PATHS,
+                actual: relative_paths.len(),
+            },
+        ));
+    }
+    let path_bytes = relative_paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(encoded_path_len(path))
+    });
+    if path_bytes > SOURCE_TAG_PAGE_MAX_PATH_BYTES {
+        return Err(CatalogSubmitError::InvalidTagPageRequest(
+            CatalogTagPageRequestError::PathBytesTooLarge {
+                max: SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+                actual: path_bytes,
+            },
+        ));
+    }
+    for path in relative_paths {
+        if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
+            return Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::InvalidPath {
+                    path: path.clone(),
+                    reason,
+                },
+            ));
         }
     }
     Ok(())
@@ -1478,12 +1528,17 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
     match command {
-        CatalogCommand::RequestTagPage { query, .. } => {
-            let CatalogTagPageQuery::SelectedPaths { relative_paths } = query else {
-                return 0;
-            };
-            selected_paths_input_bytes(relative_paths)
-        }
+        CatalogCommand::RequestTagPage { query, .. } => match query {
+            CatalogTagPageQuery::SelectedPaths { relative_paths } => {
+                selected_paths_input_bytes(relative_paths)
+            }
+            CatalogTagPageQuery::SelectedTagIds {
+                relative_paths,
+                tag_ids,
+            } => selected_paths_input_bytes(relative_paths)
+                .saturating_add(tag_ids.len().saturating_mul(std::mem::size_of::<i64>())),
+            CatalogTagPageQuery::VocabularyPrefix { .. } => 0,
+        },
         CatalogCommand::RequestTagFilter { required_tags, .. } => {
             let raw_bytes = required_tags
                 .iter()
@@ -4016,6 +4071,206 @@ mod tests {
         assert_eq!(vocabulary.entries.len(), 1);
         assert_eq!(vocabulary.entries[0].normalized_text, "foo%literal");
         assert_eq!(vocabulary.entries[0].assignment_count, None);
+        service.shutdown();
+    }
+
+    #[test]
+    fn bounded_selected_tag_id_page_publishes_zero_and_mixed_counts() {
+        let fixture = Fixture::new("catalog-selected-tag-ids");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        write_test_wav(&fixture.root.path().join("two.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-selected-tag-ids");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let one =
+            RootRelativePath::try_from_path(PathBuf::from("one.wav")).expect("relative one path");
+        let two =
+            RootRelativePath::try_from_path(PathBuf::from("two.wav")).expect("relative two path");
+        let receipt = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            810,
+            vec![
+                SourceCurationUpdate::AddTag {
+                    path: one.clone(),
+                    label: String::from("shared"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: two.clone(),
+                    label: String::from("shared"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: one,
+                    label: String::from("only-one"),
+                },
+            ],
+        );
+        let revision = receipt.source_revision();
+
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 811,
+                query: CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                after_cursor: None,
+                page_limit: 64,
+            })
+            .expect("tag vocabulary request");
+        let vocabulary = match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 811,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::TagPageReady { page, .. } => page,
+            _ => unreachable!(),
+        };
+        let shared_id = vocabulary
+            .entries
+            .iter()
+            .find(|entry| entry.normalized_text == "shared")
+            .expect("shared tag id")
+            .id;
+        let only_one_id = vocabulary
+            .entries
+            .iter()
+            .find(|entry| entry.normalized_text == "only-one")
+            .expect("only-one tag id")
+            .id;
+        wait_for_tag_page_input_release(&service);
+
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 812,
+                query: CatalogTagPageQuery::SelectedTagIds {
+                    relative_paths: vec![PathBuf::from("two.wav"), PathBuf::from("two.wav")],
+                    tag_ids: vec![only_one_id, shared_id, shared_id, 999_999],
+                },
+                after_cursor: None,
+                page_limit: 64,
+            })
+            .expect("selected tag-id request");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 812,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::TagPageReady {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                revision: event_revision,
+                root_identity,
+                page,
+                ..
+            } if event_source == source_id
+                && event_revision == revision
+                && root_identity == snapshot.root_identity
+                && page.revision == revision
+                && page.entries.iter().map(|entry| (
+                    entry.normalized_text.as_str(),
+                    entry.assignment_count,
+                )).collect::<Vec<_>>()
+                    == vec![("only-one", Some(0)), ("shared", Some(1))]
+        ));
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    #[test]
+    fn selected_tag_id_page_admission_bounds_ids_and_retains_id_overhead() {
+        let fixture = Fixture::new("catalog-selected-tag-id-admission");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-selected-tag-id-admission");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        let tag_ids = (1..=SOURCE_TAG_PAGE_MAX_TAG_IDS as i64).collect::<Vec<_>>();
+        let relative_paths = vec![PathBuf::from("one.wav")];
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 820,
+                query: CatalogTagPageQuery::SelectedTagIds {
+                    relative_paths: relative_paths.clone(),
+                    tag_ids: tag_ids.clone(),
+                },
+                after_cursor: None,
+                page_limit: 1,
+            })
+            .expect("selected tag-id admission");
+        let expected_bytes = selected_paths_input_bytes(&relative_paths)
+            + tag_ids.len() * std::mem::size_of::<i64>();
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_page_input_bytes),
+            expected_bytes
+        );
+        pause.release();
+        let _ = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 820,
+                    ..
+                }
+            )
+        });
+        wait_for_tag_page_input_release(&service);
+
+        let too_many_ids = (1..=(SOURCE_TAG_PAGE_MAX_TAG_IDS as i64 + 1)).collect::<Vec<_>>();
+        assert!(matches!(
+            service.submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 821,
+                query: CatalogTagPageQuery::SelectedTagIds {
+                    relative_paths: vec![PathBuf::from("one.wav")],
+                    tag_ids: too_many_ids,
+                },
+                after_cursor: None,
+                page_limit: 1,
+            }),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::TooManyTagIds { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(CatalogCommand::RequestTagPage {
+                source_id,
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 822,
+                query: CatalogTagPageQuery::SelectedTagIds {
+                    relative_paths: vec![PathBuf::from("one.wav")],
+                    tag_ids: vec![0],
+                },
+                after_cursor: None,
+                page_limit: 1,
+            }),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::InvalidTagId { tag_id: 0 }
+            ))
+        ));
         service.shutdown();
     }
 

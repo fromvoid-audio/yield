@@ -128,6 +128,8 @@ pub const SOURCE_CURATION_MAX_TAG_LABEL_BYTES: usize = 1024;
 pub const SOURCE_TAG_PAGE_MAX_PATHS: usize = 65_536;
 /// Maximum aggregate encoded byte length of selected paths in one tag-page request.
 pub const SOURCE_TAG_PAGE_MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of source-tag ids accepted by one bounded selected-tag page request.
+pub const SOURCE_TAG_PAGE_MAX_TAG_IDS: usize = 64;
 /// Maximum UTF-8 byte length of a source-tag vocabulary prefix.
 pub const SOURCE_TAG_PAGE_MAX_PREFIX_BYTES: usize = 1024;
 /// Maximum number of entries returned by one bounded source-tag page request.

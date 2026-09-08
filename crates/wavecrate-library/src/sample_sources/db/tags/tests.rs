@@ -1,12 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use rusqlite::params;
 use tempfile::tempdir;
 
 use super::super::{
     SOURCE_TAG_FILTER_MAX_TAGS, SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceDatabase, SourceDbError,
+    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
+    SourceDatabase, SourceDbError,
 };
 
 #[test]
@@ -470,6 +474,235 @@ fn selected_tag_page_accepts_full_path_count_without_sqlite_bind_limit() {
     assert_eq!(page.entries[0].normalized_text, "boundary");
     assert_eq!(page.entries[0].assignment_count, Some(1));
     assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn selected_tag_ids_page_returns_zero_mixed_and_all_counts() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["one.wav", "two.wav", "three.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+    let alpha = db
+        .assign_tag_to_path(Path::new("one.wav"), "alpha")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("two.wav"), "alpha")
+        .unwrap();
+    let beta = db.assign_tag_to_path(Path::new("one.wav"), "beta").unwrap();
+    let gamma = db
+        .assign_tag_to_path(Path::new("three.wav"), "gamma")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+
+    let page = db
+        .tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[
+                PathBuf::from("one.wav"),
+                PathBuf::from("two.wav"),
+                PathBuf::from("one.wav"),
+            ],
+            &[gamma.id, beta.id, alpha.id, alpha.id, 999_999],
+            None,
+            64,
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| (
+                entry.id,
+                entry.normalized_text.as_str(),
+                entry.assignment_count
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (alpha.id, "alpha", Some(2)),
+            (beta.id, "beta", Some(1)),
+            (gamma.id, "gamma", Some(0)),
+        ]
+    );
+
+    let empty_selection = db
+        .tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[],
+            &[gamma.id, beta.id, alpha.id],
+            None,
+            64,
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(
+        empty_selection
+            .entries
+            .iter()
+            .map(|entry| (entry.normalized_text.as_str(), entry.assignment_count))
+            .collect::<Vec<_>>(),
+        vec![("alpha", Some(0)), ("beta", Some(0)), ("gamma", Some(0)),]
+    );
+}
+
+#[test]
+fn selected_tag_ids_page_cursor_fences_paths_ids_and_revision() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["one.wav", "two.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+    let alpha = db
+        .assign_tag_to_path(Path::new("one.wav"), "alpha")
+        .unwrap();
+    let beta = db.assign_tag_to_path(Path::new("one.wav"), "beta").unwrap();
+    let gamma = db
+        .assign_tag_to_path(Path::new("one.wav"), "gamma")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let first = db
+        .tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("one.wav")],
+            &[gamma.id, alpha.id, beta.id],
+            None,
+            1,
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(first.entries[0].id, alpha.id);
+    let cursor = first.next_cursor.as_ref().expect("tag page continuation");
+
+    let second = db
+        .tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("one.wav")],
+            &[beta.id, alpha.id, beta.id, gamma.id],
+            Some(cursor),
+            1,
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(second.entries[0].id, beta.id);
+
+    assert!(matches!(
+        db.tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("one.wav")],
+            &[alpha.id, gamma.id],
+            Some(cursor),
+            1,
+            &cancellation,
+        ),
+        Err(SourceDbError::Unexpected)
+    ));
+    assert!(matches!(
+        db.tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("two.wav")],
+            &[alpha.id, beta.id, gamma.id],
+            Some(cursor),
+            1,
+            &cancellation,
+        ),
+        Err(SourceDbError::Unexpected)
+    ));
+
+    db.assign_tag_to_path(Path::new("two.wav"), "later")
+        .unwrap();
+    assert!(matches!(
+        db.tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("one.wav")],
+            &[alpha.id, beta.id, gamma.id],
+            Some(cursor),
+            1,
+            &cancellation,
+        ),
+        Err(SourceDbError::Unexpected)
+    ));
+}
+
+#[test]
+fn selected_tag_ids_page_bounds_ids_legacy_labels_and_cancellation() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("legacy.wav"), 10, 5).unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO source_tags (normalized_text, display_label) VALUES (?1, ?2)",
+            params!["legacy\0suffix", "x".repeat(1_000_000)],
+        )
+        .unwrap();
+    let legacy_id: i64 = db
+        .connection
+        .query_row(
+            "SELECT id FROM source_tags WHERE normalized_text = ?1",
+            params!["legacy\0suffix"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO wav_file_tags (path, tag_id) VALUES (?1, ?2)",
+            params!["legacy.wav", legacy_id],
+        )
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+    let cancellation = Arc::new(AtomicBool::new(true));
+    assert!(matches!(
+        db.tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("legacy.wav")],
+            &[legacy_id],
+            None,
+            1,
+            &cancellation,
+        ),
+        Err(SourceDbError::Canceled)
+    ));
+    cancellation.store(false, Ordering::Release);
+    let page = db
+        .tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[PathBuf::from("legacy.wav")],
+            &[legacy_id],
+            None,
+            1,
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].id, legacy_id);
+    assert_eq!(page.entries[0].assignment_count, Some(1));
+    assert!(page.entries[0].is_preview);
+    assert!(page.entries[0].display_label.len() <= 256);
+    assert!(page.entries[0].normalized_text.len() <= 256);
+
+    let too_many_ids = (1..=(SOURCE_TAG_PAGE_MAX_TAG_IDS as i64 + 1)).collect::<Vec<_>>();
+    assert!(matches!(
+        db.tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[],
+            &too_many_ids,
+            None,
+            1,
+            &cancellation,
+        ),
+        Err(SourceDbError::TagPageTooManyTagIds { .. })
+    ));
+    assert!(matches!(
+        db.tags_for_paths_and_ids_page_at_revision(
+            revision,
+            &[],
+            &[legacy_id, 0],
+            None,
+            1,
+            &cancellation,
+        ),
+        Err(SourceDbError::InvalidTagId { tag_id: 0 })
+    ));
 }
 
 #[test]

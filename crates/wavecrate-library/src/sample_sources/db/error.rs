@@ -181,6 +181,14 @@ pub enum SourceDbError {
         /// Aggregate path byte length supplied by the caller.
         actual: usize,
     },
+    /// A bounded selected-tag page request contained too many source-tag ids.
+    #[error("Tag page selected {actual} tag ids; maximum is {max}")]
+    TagPageTooManyTagIds {
+        /// Maximum number of source-tag ids accepted by one request.
+        max: usize,
+        /// Number of source-tag ids supplied by the caller.
+        actual: usize,
+    },
     /// A bounded tag-page vocabulary prefix exceeded its UTF-8 byte budget.
     #[error("Tag page prefix is {actual} UTF-8 bytes; maximum is {max}")]
     TagPagePrefixTooLong {
