@@ -1299,3 +1299,19 @@ paste retains its existing behavior. A rejection event and composition-state
 query support later editor status and Enter handling. Seven focused input tests
 passed in the integrated UI test binary; the normal UI library check passed after
 session/catalog plumbing was completed. Browser tag-editor wiring remains pending.
+
+### Catalog-owned tag reads
+
+The catalog worker now accepts bounded selected-path or vocabulary-prefix tag
+requests and publishes ready/failed events with source lifecycle, request and
+revision fences. Reads validate profile ownership, physical source-root identity
+before/after, the retained revision and selected paths against the live manifest.
+Missing selected paths fail explicitly; an empty selection returns an empty page.
+Superseded ephemeral requests release their reserved event credit without
+publishing. No tag vectors are added to retained file metadata or snapshots.
+
+Session exports and UI exhaustive event/admission handling are integrated. The
+full catalog suite passed 49 tests; five focused tag-page tests passed after the
+final API cleanup. Normal UI library compilation passed. Independent review found
+no actionable correctness, lifecycle, credit-accounting, fencing or bounded-query
+issues. The tag editor will consume these events in the following UI work.

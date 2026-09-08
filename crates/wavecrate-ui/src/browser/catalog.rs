@@ -380,7 +380,8 @@ impl Browser {
                 Err(
                     CatalogSubmitError::Closed
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
-                    | CatalogSubmitError::InvalidCurationRequest(_),
+                    | CatalogSubmitError::InvalidCurationRequest(_)
+                    | CatalogSubmitError::InvalidTagPageRequest(_),
                 ) => {
                     return false;
                 }
@@ -414,7 +415,8 @@ impl Browser {
                 Err(
                     CatalogSubmitError::Closed
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
-                    | CatalogSubmitError::InvalidCurationRequest(_),
+                    | CatalogSubmitError::InvalidCurationRequest(_)
+                    | CatalogSubmitError::InvalidTagPageRequest(_),
                 ) => return false,
             }
         }
@@ -503,7 +505,9 @@ impl Browser {
             }
             CatalogEvent::CurationCommitted { .. }
             | CatalogEvent::CurationFailed { .. }
-            | CatalogEvent::CurationOperationCompleted { .. } => false,
+            | CatalogEvent::CurationOperationCompleted { .. }
+            | CatalogEvent::TagPageReady { .. }
+            | CatalogEvent::TagPageFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
@@ -744,6 +748,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::WavMetadataFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::TagPageReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::TagPageFailed {
             source_id,
             lifecycle_generation,
             ..

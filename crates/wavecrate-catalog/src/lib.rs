@@ -26,7 +26,9 @@ use wavecrate_library::sample_sources::db::{
 };
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use wavecrate_library::sample_sources::{
-    BrowserFileMetadata, SourceCurationCommitReceipt, SourceCurationUpdate,
+    BrowserFileMetadata, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceCurationCommitReceipt,
+    SourceCurationUpdate, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
 };
 use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId};
 use wavecrate_scan::sample_sources::scanner::{
@@ -36,6 +38,7 @@ use wavecrate_scan::sample_sources::scanner::{
 };
 
 mod curation;
+mod tags;
 mod wav_metadata;
 
 const COMMAND_CAPACITY: usize = 32;
@@ -211,6 +214,26 @@ pub enum CatalogCommand {
         /// [`MAX_WAV_METADATA_REQUEST_PATHS`] paths per request.
         relative_paths: Vec<PathBuf>,
     },
+    /// Read one bounded page of source tags at an exact retained revision.
+    ///
+    /// Tag pages are ephemeral reads. A superseded, removed, or canceled lifecycle may discard
+    /// the request without publishing a completion event.
+    RequestTagPage {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Generation that must still own the source when the request publishes.
+        lifecycle_generation: u64,
+        /// Retained catalog revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Bounded tag query.
+        query: CatalogTagPageQuery,
+        /// Opaque cursor returned by the preceding page, if any.
+        after_cursor: Option<SourceTagPageCursor>,
+        /// Requested page size. Values outside the library bound are rejected at admission.
+        page_limit: usize,
+    },
     /// Apply one durable, revision-fenced source curation batch.
     ///
     /// Once admitted, this command is drained to a terminal completion even when a later remove,
@@ -269,6 +292,72 @@ pub enum CatalogCommand {
     Shutdown,
 }
 
+/// Bounded source-tag query accepted by [`CatalogCommand::RequestTagPage`].
+#[derive(Debug)]
+pub enum CatalogTagPageQuery {
+    /// Return tags assigned to this exact set of source-relative paths.
+    ///
+    /// An empty set is valid and returns an empty page. Each supplied path is validated for safe
+    /// source-relative use before the command enters the worker queue.
+    SelectedPaths {
+        /// Source-relative paths to inspect.
+        relative_paths: Vec<PathBuf>,
+    },
+    /// Return vocabulary tags whose normalized identity starts with this literal prefix.
+    VocabularyPrefix {
+        /// Literal UTF-8 prefix to match.
+        prefix: String,
+    },
+}
+
+/// Why a lazy tag-page request could not be admitted.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogTagPageRequestError {
+    /// The selected-path query exceeded the bounded path-count admission limit.
+    #[error("tag-page request contains {actual} paths; maximum is {max}")]
+    TooManyPaths {
+        /// Maximum admitted path count.
+        max: usize,
+        /// Supplied path count.
+        actual: usize,
+    },
+    /// The selected-path query exceeded its aggregate raw path-byte limit.
+    #[error("tag-page request paths contain {actual} bytes; maximum is {max}")]
+    PathBytesTooLarge {
+        /// Maximum aggregate raw path bytes.
+        max: usize,
+        /// Supplied aggregate raw path bytes.
+        actual: usize,
+    },
+    /// One selected path could not be represented as a safe source-relative path.
+    #[error("invalid tag-page path {path}: {reason}")]
+    InvalidPath {
+        /// Rejected path spelling.
+        path: PathBuf,
+        /// Validation failure reported by the shared root-relative path type.
+        reason: wavecrate_library::sample_sources::reconciliation::RootRelativePathError,
+    },
+    /// The vocabulary prefix exceeded the bounded UTF-8 byte limit.
+    #[error("tag-page prefix is {actual} UTF-8 bytes; maximum is {max}")]
+    PrefixTooLong {
+        /// Maximum accepted UTF-8 prefix bytes.
+        max: usize,
+        /// Supplied UTF-8 prefix bytes.
+        actual: usize,
+    },
+    /// The vocabulary prefix contained an embedded NUL.
+    #[error("tag-page prefix contains an embedded NUL byte")]
+    PrefixContainsNul,
+    /// The requested page size was outside the bounded library range.
+    #[error("tag-page limit {actual} is outside 1..={max}")]
+    InvalidPageLimit {
+        /// Maximum accepted page size.
+        max: usize,
+        /// Supplied page size.
+        actual: usize,
+    },
+}
+
 /// Why a lazy WAV metadata request could not be admitted.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogWavMetadataRequestError {
@@ -305,6 +394,9 @@ pub enum CatalogSubmitError {
     /// A lazy WAV metadata request failed input admission.
     #[error("invalid WAV metadata request: {0}")]
     InvalidWavMetadataRequest(#[from] CatalogWavMetadataRequestError),
+    /// A lazy tag-page request failed bounded input admission.
+    #[error("invalid tag-page request: {0}")]
+    InvalidTagPageRequest(#[from] CatalogTagPageRequestError),
     /// A durable curation request failed bounded or lifecycle admission.
     #[error("invalid source curation request: {0}")]
     InvalidCurationRequest(#[from] CatalogCurationRequestError),
@@ -362,6 +454,14 @@ pub enum CatalogError {
     /// The database has no complete authoritative catalog snapshot.
     #[error("catalog snapshot is unavailable until a complete audit commits")]
     SnapshotUnavailable,
+    /// A selected-path tag query named a path outside the retained live manifest.
+    #[error("tag-page path is not a live source member for {source_id}: {path}")]
+    TagPagePathMissing {
+        /// Source whose retained manifest was queried.
+        source_id: SourceId,
+        /// Missing source-relative path.
+        path: PathBuf,
+    },
     /// A compound curation operation named a predecessor that is not the latest full success.
     #[error("curation predecessor operation {request_id} is unavailable for {source_id}")]
     CurationPredecessorUnavailable {
@@ -482,6 +582,36 @@ pub enum CatalogEvent {
         /// Revision required by the request.
         expected_revision: u64,
         /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
+    },
+    /// A bounded source-tag page completed.
+    TagPageReady {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the page.
+        lifecycle_generation: u64,
+        /// Physical source-root identity checked by the tag read.
+        root_identity: RootIdentity,
+        /// Catalog revision represented by the page.
+        revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Bounded page of tag rows.
+        page: SourceTagPage,
+    },
+    /// A bounded source-tag page failed after admission.
+    TagPageFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Revision required by the request.
+        expected_revision: u64,
+        /// Revision observed before a typed failure, when available.
+        observed_revision: Option<u64>,
+        /// Caller-assigned query identifier.
         request_id: u64,
         /// Typed failure.
         error: CatalogError,
@@ -759,33 +889,113 @@ impl EventReservation<'_> {
 }
 
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
-    let CatalogCommand::RequestWavMetadata { relative_paths, .. } = command else {
-        return Ok(());
-    };
-    if relative_paths.is_empty() {
-        return Err(CatalogSubmitError::InvalidWavMetadataRequest(
-            CatalogWavMetadataRequestError::Empty,
-        ));
+    match command {
+        CatalogCommand::RequestWavMetadata { relative_paths, .. } => {
+            if relative_paths.is_empty() {
+                return Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                    CatalogWavMetadataRequestError::Empty,
+                ));
+            }
+            if relative_paths.len() > MAX_WAV_METADATA_REQUEST_PATHS {
+                return Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                    CatalogWavMetadataRequestError::TooManyPaths {
+                        max: MAX_WAV_METADATA_REQUEST_PATHS,
+                        actual: relative_paths.len(),
+                    },
+                ));
+            }
+            for path in relative_paths {
+                if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
+                    return Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                        CatalogWavMetadataRequestError::InvalidPath {
+                            path: path.clone(),
+                            reason,
+                        },
+                    ));
+                }
+            }
+        }
+        CatalogCommand::RequestTagPage {
+            query, page_limit, ..
+        } => validate_tag_page_request(query, *page_limit)?,
+        _ => {}
     }
-    if relative_paths.len() > MAX_WAV_METADATA_REQUEST_PATHS {
-        return Err(CatalogSubmitError::InvalidWavMetadataRequest(
-            CatalogWavMetadataRequestError::TooManyPaths {
-                max: MAX_WAV_METADATA_REQUEST_PATHS,
-                actual: relative_paths.len(),
+    Ok(())
+}
+
+fn validate_tag_page_request(
+    query: &CatalogTagPageQuery,
+    page_limit: usize,
+) -> Result<(), CatalogSubmitError> {
+    if !(1..=SOURCE_TAG_PAGE_MAX_PAGE_SIZE).contains(&page_limit) {
+        return Err(CatalogSubmitError::InvalidTagPageRequest(
+            CatalogTagPageRequestError::InvalidPageLimit {
+                max: SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+                actual: page_limit,
             },
         ));
     }
-    for path in relative_paths {
-        if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
-            return Err(CatalogSubmitError::InvalidWavMetadataRequest(
-                CatalogWavMetadataRequestError::InvalidPath {
-                    path: path.clone(),
-                    reason,
-                },
-            ));
+    match query {
+        CatalogTagPageQuery::SelectedPaths { relative_paths } => {
+            if relative_paths.len() > SOURCE_TAG_PAGE_MAX_PATHS {
+                return Err(CatalogSubmitError::InvalidTagPageRequest(
+                    CatalogTagPageRequestError::TooManyPaths {
+                        max: SOURCE_TAG_PAGE_MAX_PATHS,
+                        actual: relative_paths.len(),
+                    },
+                ));
+            }
+            let path_bytes = relative_paths.iter().fold(0usize, |total, path| {
+                total.saturating_add(encoded_path_len(path))
+            });
+            if path_bytes > SOURCE_TAG_PAGE_MAX_PATH_BYTES {
+                return Err(CatalogSubmitError::InvalidTagPageRequest(
+                    CatalogTagPageRequestError::PathBytesTooLarge {
+                        max: SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+                        actual: path_bytes,
+                    },
+                ));
+            }
+            for path in relative_paths {
+                if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
+                    return Err(CatalogSubmitError::InvalidTagPageRequest(
+                        CatalogTagPageRequestError::InvalidPath {
+                            path: path.clone(),
+                            reason,
+                        },
+                    ));
+                }
+            }
+        }
+        CatalogTagPageQuery::VocabularyPrefix { prefix } => {
+            if prefix.len() > SOURCE_TAG_PAGE_MAX_PREFIX_BYTES {
+                return Err(CatalogSubmitError::InvalidTagPageRequest(
+                    CatalogTagPageRequestError::PrefixTooLong {
+                        max: SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
+                        actual: prefix.len(),
+                    },
+                ));
+            }
+            if prefix.contains('\0') {
+                return Err(CatalogSubmitError::InvalidTagPageRequest(
+                    CatalogTagPageRequestError::PrefixContainsNul,
+                ));
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn encoded_path_len(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(not(unix))]
+fn encoded_path_len(path: &Path) -> usize {
+    path.to_string_lossy().len()
 }
 
 fn command_event_budget(command: &CatalogCommand) -> usize {
@@ -793,6 +1003,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         CatalogCommand::Register { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
+        | CatalogCommand::RequestTagPage { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
         | CatalogCommand::ReadSnapshot { .. }
@@ -834,6 +1045,7 @@ enum AdmissionAction {
     },
     RequestAudit,
     RequestWavMetadata,
+    RequestTagPage,
     ApplyCuration,
     ApplyCurationOperation {
         source_id: SourceId,
@@ -859,6 +1071,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         },
         CatalogCommand::RequestAudit { .. } => AdmissionAction::RequestAudit,
         CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
+        CatalogCommand::RequestTagPage { .. } => AdmissionAction::RequestTagPage,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
             source_id,
@@ -938,6 +1151,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         }
         AdmissionAction::RequestAudit
         | AdmissionAction::RequestWavMetadata
+        | AdmissionAction::RequestTagPage
         | AdmissionAction::ApplyCuration
         | AdmissionAction::ReadSnapshot => {}
         AdmissionAction::ApplyCurationOperation {
@@ -1347,6 +1561,30 @@ fn handle_command(
             );
             false
         }
+        CatalogCommand::RequestTagPage {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            query,
+            after_cursor,
+            page_limit,
+        } => {
+            request_tag_page(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                query,
+                after_cursor,
+                page_limit,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
         CatalogCommand::ApplyCuration {
             source_id,
             lifecycle_generation,
@@ -1424,6 +1662,99 @@ fn handle_command(
             state.invalidate_all();
             true
         }
+    }
+}
+
+fn request_tag_page(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    query: CatalogTagPageQuery,
+    after_cursor: Option<SourceTagPageCursor>,
+    page_limit: usize,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let Some(current_generation) = sources
+        .get(&source_id)
+        .map(|source| source.lifecycle_generation)
+    else {
+        let error = CatalogError::NotRegistered(source_id.clone());
+        emit_tag_page_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            error,
+        );
+        return;
+    };
+    if let Err(error) = ensure_generation(&source_id, current_generation, lifecycle_generation) {
+        emit_tag_page_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            error,
+        );
+        return;
+    }
+    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+        return;
+    };
+    let Some(source) = sources.get_mut(&source_id) else {
+        return;
+    };
+    source.attempt_token = Some(Arc::clone(&token));
+    let result = tags::read_page(
+        source,
+        &source_id,
+        lifecycle_generation,
+        expected_revision,
+        &query,
+        after_cursor.as_ref(),
+        page_limit,
+        &token,
+        admission,
+        profile_guard,
+    );
+    match result {
+        Ok(patch) => {
+            let _ = publish_if_current(
+                admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                Some(&token),
+                CatalogEvent::TagPageReady {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    root_identity: patch.root_identity,
+                    revision: patch.revision,
+                    request_id,
+                    page: patch.page,
+                },
+            );
+        }
+        Err(error) => emit_tag_page_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            Some(&token),
+            error,
+        ),
     }
 }
 
@@ -2406,6 +2737,37 @@ fn emit_metadata_failure(
     );
 }
 
+fn emit_tag_page_failure(
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    token: Option<&Arc<AtomicBool>>,
+    error: CatalogError,
+) {
+    let observed_revision = match &error {
+        CatalogError::StaleRevision { actual, .. } => Some(*actual),
+        _ => None,
+    };
+    let _ = publish_if_current(
+        admission,
+        reservation,
+        &source_id,
+        lifecycle_generation,
+        token,
+        CatalogEvent::TagPageFailed {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            observed_revision,
+            request_id,
+            error,
+        },
+    );
+}
+
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
     CatalogError::Database(error.to_string())
 }
@@ -2555,6 +2917,517 @@ mod tests {
                 .expect("write test WAV sample");
         }
         writer.finalize().expect("finalize test WAV");
+    }
+
+    fn apply_curation_updates(
+        service: &CatalogService,
+        source_id: &SourceId,
+        snapshot: &CatalogSnapshot,
+        request_id: u64,
+        updates: Vec<SourceCurationUpdate>,
+    ) -> SourceCurationCommitReceipt {
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: snapshot.lifecycle_generation,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id,
+                updates,
+            })
+            .expect("curation admission");
+        match receive_until(service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: received,
+                    ..
+                } if *received == request_id
+            )
+        }) {
+            CatalogEvent::CurationCommitted { receipt, .. } => receipt,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn bounded_tag_pages_publish_selected_and_literal_vocabulary_results() {
+        let fixture = Fixture::new("catalog-tag-pages");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        write_test_wav(&fixture.root.path().join("two.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-pages");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let one =
+            RootRelativePath::try_from_path(PathBuf::from("one.wav")).expect("relative one path");
+        let two =
+            RootRelativePath::try_from_path(PathBuf::from("two.wav")).expect("relative two path");
+        let receipt = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            700,
+            vec![
+                SourceCurationUpdate::AddTag {
+                    path: one.clone(),
+                    label: String::from("shared"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: two.clone(),
+                    label: String::from("shared"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: one.clone(),
+                    label: String::from("only-one"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: one,
+                    label: String::from("foo%literal"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: two,
+                    label: String::from("foo_other"),
+                },
+            ],
+        );
+        let revision = receipt.source_revision();
+
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 701,
+                query: CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: vec![PathBuf::from("one.wav"), PathBuf::from("two.wav")],
+                },
+                after_cursor: None,
+                page_limit: 2,
+            })
+            .expect("selected tag page request");
+        let first = match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 701,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::TagPageReady {
+                source_id: event_source,
+                lifecycle_generation,
+                root_identity,
+                revision: event_revision,
+                request_id: 701,
+                page,
+            } => {
+                assert_eq!(event_source, source_id);
+                assert_eq!(lifecycle_generation, 1);
+                assert_eq!(root_identity, snapshot.root_identity);
+                assert_eq!(event_revision, revision);
+                assert_eq!(page.revision, revision);
+                assert_eq!(page.entries.len(), 2);
+                assert!(
+                    page.entries
+                        .iter()
+                        .all(|entry| entry.assignment_count.is_some())
+                );
+                page
+            }
+            _ => unreachable!(),
+        };
+        let first_ids = first
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let first_cursor = first.next_cursor.expect("selected continuation");
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 702,
+                query: CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: vec![PathBuf::from("two.wav"), PathBuf::from("one.wav")],
+                },
+                after_cursor: Some(first_cursor),
+                page_limit: 2,
+            })
+            .expect("selected continuation request");
+        let second = match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 702,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::TagPageReady { page, .. } => page,
+            _ => unreachable!(),
+        };
+        assert_eq!(second.revision, revision);
+        assert!(second.next_cursor.is_none());
+        assert_eq!(second.entries.len(), 2);
+        assert!(
+            second
+                .entries
+                .iter()
+                .all(|entry| !first_ids.contains(&entry.id))
+        );
+
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 703,
+                query: CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::from("foo%"),
+                },
+                after_cursor: None,
+                page_limit: SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+            })
+            .expect("literal vocabulary page request");
+        let vocabulary = match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 703,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::TagPageReady { page, .. } => page,
+            _ => unreachable!(),
+        };
+        assert_eq!(vocabulary.revision, revision);
+        assert_eq!(vocabulary.entries.len(), 1);
+        assert_eq!(vocabulary.entries[0].normalized_text, "foo%literal");
+        assert_eq!(vocabulary.entries[0].assignment_count, None);
+        service.shutdown();
+    }
+
+    #[test]
+    fn tag_page_stale_revision_reports_observed_revision() {
+        let fixture = Fixture::new("catalog-tag-page-stale");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-page-stale");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let receipt = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            710,
+            vec![SourceCurationUpdate::AddTag {
+                path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                    .expect("relative path"),
+                label: String::from("stale-check"),
+            }],
+        );
+        let current_revision = receipt.source_revision();
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 711,
+                query: CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                after_cursor: None,
+                page_limit: 1,
+            })
+            .expect("stale tag page request");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageFailed {
+                    request_id: 711,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::TagPageFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                expected_revision,
+                observed_revision: Some(observed),
+                request_id: 711,
+                error: CatalogError::StaleRevision { expected, actual },
+            } if event_source == source_id
+                && expected_revision == snapshot.committed_revision
+                && expected == snapshot.committed_revision
+                && observed == current_revision
+                && actual == current_revision
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn tag_page_admission_rejects_unbounded_or_unsafe_input_but_allows_empty_selection() {
+        let fixture = Fixture::new("catalog-tag-page-admission");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-page-admission");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let request = |query, page_limit| CatalogCommand::RequestTagPage {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: snapshot.committed_revision,
+            request_id: 720,
+            query,
+            after_cursor: None,
+            page_limit,
+        };
+
+        let too_many = (0..=SOURCE_TAG_PAGE_MAX_PATHS)
+            .map(|index| PathBuf::from(format!("{index}.wav")))
+            .collect();
+        assert_eq!(
+            service.submit(request(
+                CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: too_many,
+                },
+                1,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::TooManyPaths {
+                    max: SOURCE_TAG_PAGE_MAX_PATHS,
+                    actual: SOURCE_TAG_PAGE_MAX_PATHS + 1,
+                }
+            ))
+        );
+        let too_many_bytes = vec![PathBuf::from(
+            "x".repeat(SOURCE_TAG_PAGE_MAX_PATH_BYTES + 1),
+        )];
+        assert!(matches!(
+            service.submit(request(
+                CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: too_many_bytes,
+                },
+                1,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::PathBytesTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(request(
+                CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: vec![PathBuf::from("../escape.wav")],
+                },
+                1,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::InvalidPath {
+                    reason: wavecrate_library::sample_sources::reconciliation::RootRelativePathError::ParentTraversal,
+                    ..
+                }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(request(
+                CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: "p".repeat(SOURCE_TAG_PAGE_MAX_PREFIX_BYTES + 1),
+                },
+                1,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::PrefixTooLong { .. }
+            ))
+        ));
+        assert_eq!(
+            service.submit(request(
+                CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::from("tag\0prefix"),
+                },
+                1,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::PrefixContainsNul
+            ))
+        );
+        assert!(matches!(
+            service.submit(request(
+                CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                0,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::InvalidPageLimit { actual: 0, .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(request(
+                CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                SOURCE_TAG_PAGE_MAX_PAGE_SIZE + 1,
+            )),
+            Err(CatalogSubmitError::InvalidTagPageRequest(
+                CatalogTagPageRequestError::InvalidPageLimit { .. }
+            ))
+        ));
+
+        service
+            .submit(request(
+                CatalogTagPageQuery::SelectedPaths {
+                    relative_paths: Vec::new(),
+                },
+                1,
+            ))
+            .expect("empty selected query admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagPageReady {
+                    request_id: 720,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::TagPageReady {
+                source_id: event_source,
+                page,
+                ..
+            } if event_source == source_id && page.entries.is_empty()
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn obsolete_tag_page_generation_is_discarded_and_event_credit_is_released() {
+        let fixture = Fixture::new("catalog-tag-page-generation");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-page-generation");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 730,
+                query: CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                after_cursor: None,
+                page_limit: 1,
+            })
+            .expect("tag page admission");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("replacement registration admission");
+        pause.release();
+
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::Registered {
+                        source_id: event_source,
+                        lifecycle_generation: 2,
+                    } if event_source == &source_id
+                )
+            }),
+            CatalogEvent::Registered {
+                lifecycle_generation: 2,
+                ..
+            }
+        ));
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id: source_id.clone(),
+                lifecycle_generation: 2,
+                expected_revision: snapshot.committed_revision,
+                request_id: 731,
+                query: CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                after_cursor: None,
+                page_limit: 1,
+            })
+            .expect("post-discard tag page admission proves credit release");
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::TagPageReady {
+                        request_id: 731,
+                        ..
+                    }
+                )
+            }),
+            CatalogEvent::TagPageReady {
+                request_id: 731,
+                ..
+            }
+        ));
+        service.shutdown();
+        // The superseded request had no completion event; only the replacement request can
+        // produce a page after generation 2 becomes current.
+    }
+
+    #[test]
+    fn queued_tag_page_is_dropped_during_shutdown_and_worker_closes() {
+        let fixture = Fixture::new("catalog-tag-page-shutdown");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-page-shutdown");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestTagPage {
+                source_id,
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 740,
+                query: CatalogTagPageQuery::VocabularyPrefix {
+                    prefix: String::new(),
+                },
+                after_cursor: None,
+                page_limit: 1,
+            })
+            .expect("tag page admission");
+        let service = Arc::new(service);
+        let shutdown_service = Arc::clone(&service);
+        let shutdown_thread = thread::spawn(move || shutdown_service.shutdown());
+        while !admission_state(&service.admission, |state| state.shutdown) {
+            thread::yield_now();
+        }
+        pause.release();
+        shutdown_thread.join().expect("catalog shutdown");
+
+        let mut saw_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            match event {
+                CatalogEvent::Closed => saw_closed = true,
+                CatalogEvent::TagPageReady { .. } | CatalogEvent::TagPageFailed { .. } => {
+                    panic!("shutdown dropped tag page must not publish: {event:?}")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_closed);
     }
 
     fn curation_operation(

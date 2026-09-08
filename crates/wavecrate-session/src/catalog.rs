@@ -6,12 +6,14 @@ pub(crate) use wavecrate_catalog::CatalogService;
 use wavecrate_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
 pub use wavecrate_catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogError, CatalogEvent,
-    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogCommand, CatalogCurationRequestError, CatalogError, CatalogEvent, CatalogTagPageQuery,
+    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_WAV_METADATA_REQUEST_PATHS,
-    SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
-    SourceCurationOperationOutcome, SourceCurationUpdate,
+    SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
+    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceCurationCommitReceipt, SourceCurationOperationFailure,
+    SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationUpdate,
+    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
@@ -48,6 +50,9 @@ pub enum CatalogSubmitError {
     /// A lazy WAV metadata request failed input admission.
     #[error("invalid source catalog WAV metadata request: {0}")]
     InvalidWavMetadataRequest(CatalogWavMetadataRequestError),
+    /// A lazy tag-page request failed bounded input admission.
+    #[error("invalid source catalog tag-page request: {0}")]
+    InvalidTagPageRequest(CatalogTagPageRequestError),
     /// A durable source curation request failed bounded or lifecycle admission.
     #[error("invalid source catalog curation request: {0}")]
     InvalidCurationRequest(CatalogCurationRequestError),
@@ -164,6 +169,9 @@ fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
         CatalogWorkerSubmitError::Closed => CatalogSubmitError::Closed,
         CatalogWorkerSubmitError::InvalidWavMetadataRequest(error) => {
             CatalogSubmitError::InvalidWavMetadataRequest(error)
+        }
+        CatalogWorkerSubmitError::InvalidTagPageRequest(error) => {
+            CatalogSubmitError::InvalidTagPageRequest(error)
         }
         CatalogWorkerSubmitError::InvalidCurationRequest(error) => {
             CatalogSubmitError::InvalidCurationRequest(error)
