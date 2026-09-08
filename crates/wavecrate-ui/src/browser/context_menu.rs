@@ -65,6 +65,7 @@ struct ContextMenuTarget {
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
     playback_type_filter: PlaybackTypeFilter,
+    reveal_id: Option<AudioFileId>,
     sort: SortSpec,
     entry_index: usize,
     visible_position: usize,
@@ -125,6 +126,7 @@ impl ContextMenuTarget {
                 browser.view_model.playback_type_filter(),
                 browser.view_model.sort(),
             )
+            && browser.view_model.reveal_id() == self.reveal_id.as_ref()
             && browser
                 .view_model
                 .rows()
@@ -154,7 +156,7 @@ impl Browser {
         let Some(entry) = self.entries.get(entry_index).cloned() else {
             return;
         };
-        let Some(activation) = self.catalog_activation.as_ref() else {
+        let Some(activation) = self.catalog_activation.clone() else {
             self.scan_status =
                 String::from("Context menu requires a successful audited catalog projection");
             cx.notify();
@@ -174,6 +176,13 @@ impl Browser {
             return;
         };
         let id = entry.stable_id();
+        let has_explicit_selection = !self.selection.is_empty();
+        let in_explicit_selection = has_explicit_selection && self.selection.contains(&id);
+        let selection_effect =
+            context_selection_effect(has_explicit_selection, in_explicit_selection);
+        if selection_effect == ContextSelectionEffect::FocusClicked || in_explicit_selection {
+            self.clear_reveal_for_focus_change(&id);
+        }
         let Some(visible_position) = self
             .view_model
             .rows()
@@ -182,9 +191,7 @@ impl Browser {
         else {
             return;
         };
-        let has_explicit_selection = !self.selection.is_empty();
-        let in_explicit_selection = has_explicit_selection && self.selection.contains(&id);
-        match context_selection_effect(has_explicit_selection, in_explicit_selection) {
+        match selection_effect {
             ContextSelectionEffect::FocusClicked => {
                 self.selection.focus_pointer(&id);
                 self.browser_focus_override = Some(id.clone());
@@ -222,6 +229,7 @@ impl Browser {
                 collection_filter: self.view_model.collection_filter(),
                 rating_filter: self.view_model.rating_filter(),
                 playback_type_filter: self.view_model.playback_type_filter(),
+                reveal_id: self.view_model.reveal_id().cloned(),
                 sort: self.view_model.sort(),
                 entry_index,
                 visible_position,
@@ -377,9 +385,9 @@ fn view_filter_fence_matches(
 
 fn context_selection_effect(
     has_explicit_selection: bool,
-    clicked_is_selected: bool,
+    _clicked_is_selected: bool,
 ) -> ContextSelectionEffect {
-    if !has_explicit_selection || clicked_is_selected {
+    if !has_explicit_selection {
         ContextSelectionEffect::FocusClicked
     } else {
         ContextSelectionEffect::PreserveSelection
@@ -622,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             context_selection_effect(true, true),
-            ContextSelectionEffect::FocusClicked
+            ContextSelectionEffect::PreserveSelection
         );
         assert_eq!(
             context_selection_effect(true, false),

@@ -512,6 +512,14 @@ impl Browser {
             .position(|entry| entry.stable_id() == focus_id)
     }
 
+    fn clear_reveal_for_focus_change(&mut self, next_id: &AudioFileId) {
+        if reveal_should_clear_for_focus_change(self.view_model.reveal_id(), next_id)
+            && self.view_model.clear_reveal(&self.entries)
+        {
+            self.reconcile_selection();
+        }
+    }
+
     fn cancel_waveform_load(&mut self) {
         self.waveform_detail.cancel();
         if let Some(cancellation) = self.waveform_cancel.take() {
@@ -1221,6 +1229,7 @@ impl Browser {
         }
         let previous_id = self.selected_id();
         let next_id = entry.stable_id();
+        self.clear_reveal_for_focus_change(&next_id);
         let autoplay = should_autoplay_selection(self.autoplay_selection, origin);
         if previous_id.as_ref() == Some(&next_id) {
             self.selected = Some(index);
@@ -1587,7 +1596,9 @@ impl Browser {
         } else {
             self.selection.move_anchor_to(&next_id);
         }
-        if Some(next) != self.selected {
+        self.clear_reveal_for_focus_change(&next_id);
+        let passive_focus = self.browser_focus_override.is_some();
+        if Some(next) != self.selected || passive_focus {
             let origin = selection_origin_for_navigation(extend, suppress_autoplay);
             self.select_entry(next, Some(motion::FocusTrigger::Keyboard), origin, cx);
         } else {
@@ -1845,14 +1856,23 @@ fn scan_completion_is_current(completion_generation: u64, current_generation: u6
     completion_generation == current_generation
 }
 
+fn reveal_should_clear_for_focus_change(
+    reveal_id: Option<&AudioFileId>,
+    next_id: &AudioFileId,
+) -> bool {
+    reveal_id.is_some_and(|reveal_id| reveal_id != next_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
-        resolve_scan_source_index, sample_click_intent, scan_source_index_for_error,
-        selection_origin_for_click, selection_origin_for_navigation, should_autoplay_selection,
+        resolve_scan_source_index, reveal_should_clear_for_focus_change, sample_click_intent,
+        scan_source_index_for_error, selection_origin_for_click, selection_origin_for_navigation,
+        should_autoplay_selection,
     };
     use std::path::PathBuf;
+    use wavecrate_core::{AudioFile, AudioFileId};
     use wavecrate_library::sample_sources::{SampleSource, SourceId};
 
     #[test]
@@ -2001,5 +2021,38 @@ mod tests {
                 !extend && !modifier
             );
         }
+    }
+
+    #[test]
+    fn focus_change_clears_only_a_reveal_for_another_identity() {
+        let first = AudioFile {
+            path: PathBuf::from("/source/first.wav"),
+            relative_path: PathBuf::from("first.wav"),
+            byte_len: 1,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type: None,
+            curation: None,
+        };
+        let second = AudioFile {
+            path: PathBuf::from("/source/second.wav"),
+            relative_path: PathBuf::from("second.wav"),
+            byte_len: 1,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type: None,
+            curation: None,
+        };
+        let first_id: AudioFileId = first.stable_id();
+        let second_id = second.stable_id();
+        assert!(!reveal_should_clear_for_focus_change(
+            Some(&first_id),
+            &first_id
+        ));
+        assert!(reveal_should_clear_for_focus_change(
+            Some(&first_id),
+            &second_id
+        ));
+        assert!(!reveal_should_clear_for_focus_change(None, &second_id));
     }
 }

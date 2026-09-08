@@ -30,9 +30,8 @@ The current GPUI frontend uses the original Wavecrate editorial-terminal
 palette and compact layout. Theme tokens are defined independently in
 `wavecrate-design`; the complete schema and a copyable default document are in
 [themes/wavecrate.json](themes/wavecrate.json). Open the gear settings control
-to import, reload, or reset a theme while the app is running. The same panel
-persists animation preferences alongside theme choice, audition controls, volume,
-and audio-output settings. Row hover rails remain immediate; loading
+to import, reload, or reset a theme while the app is running. Theme choice and
+animation, audition, volume, and audio-output preferences persist across launches. Row hover rails remain immediate; loading
 indicators animate only during pending work and remain static when disabled.
 Focus rails fade independently of selection, and clipped lists show directional
 scroll-edge fades. Disabling animation keeps focus feedback visible and updates

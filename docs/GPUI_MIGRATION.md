@@ -1120,3 +1120,24 @@ visual acceptance remains pending; open application bundles were not changed.
 A clean-tree executable build of de963d4c9 also passed. A separate revision-named
 macOS preview bundle was assembled and passed strict ad-hoc signature verification;
 it was not launched for native acceptance, and existing bundles were preserved.
+
+### History reveal under active filters
+
+History navigation now temporarily includes its exact target row when rating,
+TYPE, collection, or name filters would hide it. The exception remains confined
+to the selected folder scope, uses normal sorting, and does not inflate collection
+counts. It survives same-scope catalog replacement while the file still exists;
+filter/navigation changes, a different focused row, or disappearance clear it.
+
+Pointer and keyboard ranges are calculated before removing the temporary row.
+Context menus include reveal identity in their validity checks, preserve focus
+when targeting outside a multi-selection, and preserve the remaining visible
+selection when a selected member receives focus. Arrow navigation also clears
+passive context focus when reaching the already-loaded file, using the existing
+same-file path without restarting playback. History still submits one replay.
+
+Validation: all 73 core tests passed. Seven context-menu tests, six history tests,
+one focused UI test, UI compilation, formatting, and diff checks passed. Review
+corrected early reveal removal during range navigation, same-folder refresh loss,
+selected-member context selection collapse, and passive-focus navigation. Native
+interaction acceptance remains pending; application instances were untouched.

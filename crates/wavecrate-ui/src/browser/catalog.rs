@@ -157,11 +157,21 @@ impl Browser {
             return false;
         }
 
-        let same_active_source = self.active_source == Some(index);
+        let same_active_source = self.active_source == Some(index)
+            && self.root.as_deref() == Some(root.as_path())
+            && self
+                .active_source
+                .and_then(|active| self.source_sessions.get(active))
+                .and_then(|session| session.source_id.as_ref())
+                == Some(&source_id);
         if self.catalog_activation.is_some() {
             self.deactivate_catalog_source(cx);
         }
         if !same_active_source {
+            // A catalog source change invalidates a reveal captured from the previous source.
+            // History handoff marks the destination active before calling this method, so its
+            // same-source activation preserves the reveal while keeping transport alive.
+            let _ = self.view_model.clear_reveal(&self.entries);
             self.selection.clear();
             self.reset_collection_filter();
         }

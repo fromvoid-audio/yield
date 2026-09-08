@@ -244,6 +244,15 @@ impl Browser {
         self.view_model.set_query(&self.entries, "");
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
+        let target_id = self.entries.get(target_index)?.stable_id();
+        if self.view_model.visible_position_for(&target_id).is_none() {
+            self.view_model
+                .set_reveal(&self.entries, Some(target_id.clone()));
+        }
+        if self.view_model.visible_position_for(&target_id).is_none() {
+            return None;
+        }
+        self.reconcile_selection();
         let count = self.entries.len();
         self.scan_status = format!(
             "{count} audio file{} · cached",

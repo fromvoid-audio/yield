@@ -227,6 +227,7 @@ pub struct BrowserViewModel {
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
     playback_type_filter: PlaybackTypeFilter,
+    reveal_id: Option<AudioFileId>,
     rows: Vec<BrowserRow>,
 }
 
@@ -241,6 +242,7 @@ impl BrowserViewModel {
             collection_filter: None,
             rating_filter: RatingFilter::disabled(),
             playback_type_filter: PlaybackTypeFilter::disabled(),
+            reveal_id: None,
             rows: Vec::new(),
         };
         model.rebuild(entries);
@@ -283,6 +285,12 @@ impl BrowserViewModel {
         self.playback_type_filter
     }
 
+    /// Return the single file identity temporarily included in the projection despite another
+    /// active filter.
+    pub fn reveal_id(&self) -> Option<&AudioFileId> {
+        self.reveal_id.as_ref()
+    }
+
     /// Return visible rows in display order.
     pub fn rows(&self) -> &[BrowserRow] {
         &self.rows
@@ -290,25 +298,69 @@ impl BrowserViewModel {
 
     /// Replace the search query and rebuild visible rows.
     pub fn set_query(&mut self, entries: &[AudioFile], query: impl Into<String>) {
+        self.reveal_id = None;
         self.query = query.into();
         self.rebuild(entries);
     }
 
     /// Replace the scan while preserving the current query and sort choice.
     pub fn set_entries(&mut self, entries: &[AudioFile]) {
+        self.clear_reveal_if_missing(entries);
         self.rebuild(entries);
     }
 
     /// Set the selected folder and whether descendants are included, preserving search and sort.
+    /// A changed folder or scope clears the temporary reveal; an unchanged scope preserves it for
+    /// metadata refreshes.
     pub fn set_folder_scope(
         &mut self,
         entries: &[AudioFile],
         folder: Option<PathBuf>,
         scope: FolderScope,
     ) {
+        if self.folder.as_deref() != folder.as_deref() || self.folder_scope != scope {
+            self.reveal_id = None;
+        }
+        self.clear_reveal_if_missing(entries);
         self.folder = folder;
         self.folder_scope = scope;
         self.rebuild(entries);
+    }
+
+    /// Temporarily include one exact entry while retaining the current folder and filters.
+    ///
+    /// The identity must belong to `entries`; an invalid identity leaves the projection and
+    /// existing reveal unchanged. The entry is still subject to the selected folder scope, so a
+    /// reveal cannot expose a file from another folder.
+    pub fn set_reveal(&mut self, entries: &[AudioFile], reveal_id: Option<AudioFileId>) -> bool {
+        if let Some(reveal_id) = reveal_id.as_ref()
+            && !entries
+                .iter()
+                .any(|entry| entry.path.as_path() == reveal_id.path())
+        {
+            return false;
+        }
+        if self.reveal_id == reveal_id {
+            return false;
+        }
+        self.reveal_id = reveal_id;
+        self.rebuild(entries);
+        true
+    }
+
+    /// Clear the temporary single-entry reveal.
+    pub fn clear_reveal(&mut self, entries: &[AudioFile]) -> bool {
+        self.set_reveal(entries, None)
+    }
+
+    fn clear_reveal_if_missing(&mut self, entries: &[AudioFile]) {
+        if self.reveal_id.as_ref().is_some_and(|reveal_id| {
+            !entries
+                .iter()
+                .any(|entry| entry.path.as_path() == reveal_id.path())
+        }) {
+            self.reveal_id = None;
+        }
     }
 
     /// Set the active collection filter while preserving query, folder, and sort state.
@@ -324,6 +376,7 @@ impl BrowserViewModel {
         {
             return false;
         }
+        self.reveal_id = None;
         self.collection_filter = collection;
         self.rebuild(entries);
         true
@@ -343,6 +396,7 @@ impl BrowserViewModel {
         if self.rating_filter == filter {
             return false;
         }
+        self.reveal_id = None;
         self.rating_filter = filter;
         self.rebuild(entries);
         true
@@ -368,6 +422,7 @@ impl BrowserViewModel {
         if self.playback_type_filter == filter {
             return false;
         }
+        self.reveal_id = None;
         self.playback_type_filter = filter;
         self.rebuild(entries);
         true
@@ -459,20 +514,24 @@ impl BrowserViewModel {
 
     fn rebuild_with_now(&mut self, entries: &[AudioFile], now_epoch_seconds: i64) {
         let query = self.query.trim().to_ascii_lowercase();
+        let reveal_id = self.reveal_id.as_ref();
         let mut projected = entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                self.folder.as_deref().is_none_or(|folder| {
+                let in_folder = self.folder.as_deref().is_none_or(|folder| {
                     folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
-                }) && audio_file_matches_name_query(entry, &query)
-                    && self.collection_filter.is_none_or(|slot| {
-                        entry
-                            .curation
-                            .is_some_and(|curation| curation.has_collection(slot))
-                    })
-                    && self.entry_matches_rating(entry)
-                    && self.entry_matches_playback_type(entry)
+                });
+                in_folder
+                    && (reveal_id.is_some_and(|reveal_id| entry.path.as_path() == reveal_id.path())
+                        || (audio_file_matches_name_query(entry, &query)
+                            && self.collection_filter.is_none_or(|slot| {
+                                entry
+                                    .curation
+                                    .is_some_and(|curation| curation.has_collection(slot))
+                            })
+                            && self.entry_matches_rating(entry)
+                            && self.entry_matches_playback_type(entry)))
             })
             .map(|(entry_index, entry)| {
                 (
@@ -969,6 +1028,141 @@ mod tests {
             vec![1]
         );
         assert_eq!(model.collection_counts(&entries), [0, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn reveal_includes_one_filtered_row_in_scope_without_inflating_counts() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/source/kit/visible.wav"),
+                relative_path: PathBuf::from("kit/visible.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: Some(PlaybackType::OneShot),
+                curation: AudioFileCuration::from_parts(3, false, 0b0000_0001, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/source/kit/hidden.wav"),
+                relative_path: PathBuf::from("kit/hidden.wav"),
+                byte_len: 2,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: Some(PlaybackType::Loop),
+                curation: AudioFileCuration::from_parts(0, false, 0b0000_0010, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/source/other/hidden.wav"),
+                relative_path: PathBuf::from("other/hidden.wav"),
+                byte_len: 3,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: Some(PlaybackType::Loop),
+                curation: AudioFileCuration::from_parts(0, false, 0b0000_0010, None, None),
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "visible");
+        assert!(model.set_collection_filter(&entries, Some(0)));
+        assert!(model.toggle_rating_filter(&entries, 3));
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::OneShot));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(model.collection_counts(&entries), [1, 0, 0, 0, 0, 0]);
+
+        let target_id = entries[1].stable_id();
+        assert!(model.set_reveal(&entries, Some(target_id.clone())));
+        assert_eq!(model.reveal_id(), Some(&target_id));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(model.collection_counts(&entries), [1, 0, 0, 0, 0, 0]);
+
+        model.toggle_sort(&entries, SortColumn::Rating);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        let before_invalid_reveal = model.clone();
+        let missing_id = model_entry("/source/missing.wav", 4).stable_id();
+        assert!(!model.set_reveal(&entries, Some(missing_id)));
+        assert_eq!(model, before_invalid_reveal);
+
+        assert!(model.set_collection_filter(&entries, Some(1)));
+        assert!(model.reveal_id().is_none());
+        assert!(model.set_reveal(&entries, Some(target_id.clone())));
+        model.set_query(&entries, "visible");
+        assert!(model.reveal_id().is_none());
+        assert!(model.set_collection_filter(&entries, Some(0)));
+
+        let outside_id = entries[2].stable_id();
+        assert!(model.set_reveal(&entries, Some(outside_id)));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(model.clear_reveal(&entries));
+        assert!(model.reveal_id().is_none());
+        model.set_query(&entries, "hidden");
+        assert_eq!(model.rows().len(), 0);
+    }
+
+    #[test]
+    fn reveal_survives_metadata_replacement_and_clears_when_entry_disappears() {
+        let entries = vec![
+            model_entry("/source/a.wav", 1),
+            model_entry("/source/b.wav", 2),
+        ];
+        let target_id = entries[1].stable_id();
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(&entries, Some(PathBuf::from(".")), FolderScope::DirectOnly);
+        assert!(model.set_reveal(&entries, Some(target_id.clone())));
+
+        model.set_folder_scope(&entries, Some(PathBuf::from(".")), FolderScope::DirectOnly);
+        assert_eq!(model.reveal_id(), Some(&target_id));
+
+        let mut replacement = entries.clone();
+        replacement[1].byte_len = 99;
+        model.set_entries(&replacement);
+        assert_eq!(model.reveal_id(), Some(&target_id));
+        assert!(model.visible_position_for(&target_id).is_some());
+
+        model.set_folder_scope(
+            &replacement[..1],
+            Some(PathBuf::from(".")),
+            FolderScope::DirectOnly,
+        );
+        assert!(model.reveal_id().is_none());
+        assert_eq!(model.rows().len(), 1);
+
+        model.set_entries(&replacement[..1]);
+        assert!(model.reveal_id().is_none());
+        assert_eq!(model.rows().len(), 1);
     }
 
     #[test]
