@@ -72,6 +72,7 @@ pub(crate) struct SearchInputOptions {
     placeholder: &'static str,
     max_bytes: Option<usize>,
     paste_newlines: PasteNewlines,
+    underlined: bool,
 }
 
 impl SearchInputOptions {
@@ -80,6 +81,7 @@ impl SearchInputOptions {
             placeholder: "Search filenames",
             max_bytes: None,
             paste_newlines: PasteNewlines::AsSpaces,
+            underlined: false,
         }
     }
 
@@ -88,6 +90,7 @@ impl SearchInputOptions {
             placeholder: "ADD TAG",
             max_bytes: Some(MAX_TAG_INPUT_BYTES),
             paste_newlines: PasteNewlines::AsCommas,
+            underlined: true,
         }
     }
 }
@@ -651,6 +654,7 @@ impl Element for TextElement {
 impl Render for SearchInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = active(cx);
+        let underlined = self.options.underlined;
         div()
             .flex()
             .key_context("SearchInput")
@@ -673,16 +677,30 @@ impl Render for SearchInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(color(theme.colors.surface_overlay))
+            .when(!underlined, |style| {
+                style.bg(color(theme.colors.surface_overlay))
+            })
             .line_height(px(theme.typography.line_height))
             .text_size(px(theme.typography.body_size))
             .text_color(color(theme.colors.text_primary))
-            .border(px(theme.spacing.border_width))
+            .when(underlined, |style| {
+                style.border_b(px(theme.spacing.border_width))
+            })
+            .when(!underlined, |style| {
+                style.border(px(theme.spacing.border_width))
+            })
             .border_color(color(theme.colors.border))
             .focus({
                 let focus_color = color(theme.interaction.focus_outline);
                 let focus_width = theme.interaction.focus_outline_width;
-                move |style| style.border(px(focus_width)).border_color(focus_color)
+                move |style| {
+                    let style = if underlined {
+                        style.border_b(px(focus_width))
+                    } else {
+                        style.border(px(focus_width))
+                    };
+                    style.border_color(focus_color)
+                }
             })
             .child(
                 div()

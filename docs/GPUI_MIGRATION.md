@@ -1429,3 +1429,13 @@ normal UI compilation, formatting and diff checks passed after final cleanup. A
 separate peer reviewed captured intent, retry, failure and keyboard/polling behavior
 with no remaining actionable findings. Completion lists, selected-tag chips and
 tag filters remain follow-on work.
+
+The tag field uses the reference's transparent, underlined treatment and the
+existing theme focus tokens; filename search retains its boxed appearance. UI
+compilation, formatting and diff checks passed for this appearance adjustment.
+
+A clean `0a111c48f` build was packaged and signature-verified at
+`target/qa/Wavecrate Tag Preview 0a111c4.app`, then opened against a fresh three-file
+fixture and isolated profile. The native input check was interrupted by detected
+concurrent user interaction, so it is not counted as passed. The running preview
+and its profile were preserved for manual testing.
