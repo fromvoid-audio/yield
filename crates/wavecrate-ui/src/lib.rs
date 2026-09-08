@@ -11,6 +11,8 @@ use gpui::{
     WindowBounds, WindowOptions, actions, point, px, size,
 };
 
+#[allow(dead_code)]
+pub(crate) mod beat_count_input;
 mod browser;
 pub(crate) mod external_clipboard;
 mod search_input;

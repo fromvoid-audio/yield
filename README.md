@@ -113,7 +113,8 @@ This display choice does not rename files or change their selection or sort orde
 The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,
 play-region selection, and a playback cursor. Play regions can be moved, resized,
-or shifted with the keyboard. Playback navigation history, native file clipboard
+or shifted with the keyboard. The BPM toggle snaps resized regions to whole BPM
+values, using the adjacent beat-count field (2–32 beats). Playback navigation history, native file clipboard
 handoff, Finder reveal, source/folder context-menu opening, and macOS/Windows whole-file
 drag-out are implemented. Windows build and native interaction acceptance are pending. Drag-out
 prepares up to 256 files in the background and rejects incomplete selections.

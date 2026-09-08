@@ -490,6 +490,12 @@ impl Render for Browser {
         let toolbar_pressed = theme.interaction.pressed_fill;
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
+        let bpm_snap_enabled = self.bpm_snap_enabled;
+        let bpm_snap_color = color(if bpm_snap_enabled {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
         let normalized_audition_enabled = self.normalized_audition.enabled();
         let normalized_audition_preparing = self.normalized_audition_is_preparing();
         let normalized_audition_color = color(if normalized_audition_preparing {
@@ -960,6 +966,39 @@ impl Render for Browser {
                                 theme.colors.text_muted
                             }))
                             .child(loop_label),
+                    )
+                    .child(
+                        div()
+                            .id("bpm-snap-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .tooltip(waveform::bpm_snap_tooltip)
+                            .on_click(cx.listener(Self::toggle_bpm_snap_from_toolbar))
+                            .child(waveform::render_bpm_snap_icon(bpm_snap_color)),
+                    )
+                    .child(
+                        div()
+                            .id("bpm-beat-count-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(theme.spacing.control_height))
+                            .w(px(34.0))
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .tooltip(waveform::beat_count_tooltip)
+                            .child(self.beat_count_input.clone()),
                     )
                     .child(
                         div()

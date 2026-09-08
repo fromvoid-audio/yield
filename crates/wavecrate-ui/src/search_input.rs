@@ -19,6 +19,9 @@ use wavecrate_core::{MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES};
 
 use crate::theme::{active, color};
 
+const MAX_NUMERIC_INPUT_BYTES: usize = 64 * 1024;
+const MAX_NUMERIC_DIGITS: usize = 3;
+
 actions!(
     search_input,
     [
@@ -73,6 +76,7 @@ pub(crate) struct SearchInputOptions {
     max_bytes: Option<usize>,
     paste_newlines: PasteNewlines,
     underlined: bool,
+    ascii_digits_only: bool,
 }
 
 impl SearchInputOptions {
@@ -82,6 +86,7 @@ impl SearchInputOptions {
             max_bytes: None,
             paste_newlines: PasteNewlines::AsSpaces,
             underlined: false,
+            ascii_digits_only: false,
         }
     }
 
@@ -91,6 +96,7 @@ impl SearchInputOptions {
             max_bytes: Some(MAX_TAG_INPUT_BYTES),
             paste_newlines: PasteNewlines::AsCommas,
             underlined: true,
+            ascii_digits_only: false,
         }
     }
 
@@ -100,6 +106,17 @@ impl SearchInputOptions {
             max_bytes: Some(MAX_TAG_FILTER_INPUT_BYTES),
             paste_newlines: PasteNewlines::Preserve,
             underlined: true,
+            ascii_digits_only: false,
+        }
+    }
+
+    pub(crate) const fn beat_count() -> Self {
+        Self {
+            placeholder: "",
+            max_bytes: Some(3),
+            paste_newlines: PasteNewlines::Preserve,
+            underlined: false,
+            ascii_digits_only: true,
         }
     }
 }
@@ -135,10 +152,27 @@ impl SearchInput {
     }
 
     pub(crate) fn new_with_options(cx: &mut Context<Self>, options: SearchInputOptions) -> Self {
+        Self::new_with_options_and_content(cx, options, "")
+    }
+
+    pub(crate) fn new_with_options_and_content(
+        cx: &mut Context<Self>,
+        options: SearchInputOptions,
+        content: impl Into<SharedString>,
+    ) -> Self {
+        let content = content.into();
+        let content = if options.ascii_digits_only {
+            filter_ascii_digits(&content)
+                .unwrap_or_default()
+                .into_owned()
+                .into()
+        } else {
+            content
+        };
         Self {
             focus_handle: cx.focus_handle(),
             options,
-            content: "".into(),
+            content,
             placeholder: options.placeholder.into(),
             ghost: "".into(),
             selected_range: 0..0,
@@ -177,6 +211,15 @@ impl SearchInput {
     /// Replace the query from browser navigation and reset editing state without inserting text.
     pub(crate) fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
         let content = content.into();
+        let content = if self.options.ascii_digits_only {
+            let Ok(content) = filter_ascii_digits(&content) else {
+                self.reject_edit(cx);
+                return;
+            };
+            content.into_owned().into()
+        } else {
+            content
+        };
         if !input_within_limit(content.len(), self.options.max_bytes) {
             self.reject_edit(cx);
             return;
@@ -190,6 +233,13 @@ impl SearchInput {
         self.last_bounds = None;
         self.is_selecting = false;
         cx.emit(SearchChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn select_all_content(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
         cx.notify();
     }
 
@@ -266,6 +316,22 @@ impl SearchInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if self.options.ascii_digits_only {
+                if text.len() > MAX_NUMERIC_INPUT_BYTES {
+                    self.reject_edit(cx);
+                    return;
+                }
+                let replacement = paste_replacement_text(&text, self.options.paste_newlines);
+                let Ok(replacement) = filter_ascii_digits(replacement.as_ref()) else {
+                    self.reject_edit(cx);
+                    return;
+                };
+                if replacement.is_empty() {
+                    return;
+                }
+                self.replace_text_in_range(None, replacement.as_ref(), window, cx);
+                return;
+            }
             if !input_within_limit(text.len(), self.options.max_bytes) {
                 self.reject_edit(cx);
                 return;
@@ -449,15 +515,31 @@ impl EntityInputHandler for SearchInput {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        let Some(resulting_len) =
-            plan_replacement(&self.content, &range, new_text, self.options.max_bytes)
-        else {
+        let replacement = if self.options.ascii_digits_only {
+            let Ok(replacement) = filter_ascii_digits(new_text) else {
+                self.reject_edit(cx);
+                return;
+            };
+            if !new_text.is_empty() && replacement.is_empty() {
+                return;
+            }
+            replacement
+        } else {
+            Cow::Borrowed(new_text)
+        };
+        let Some(resulting_len) = plan_replacement(
+            &self.content,
+            &range,
+            replacement.as_ref(),
+            self.options.max_bytes,
+        ) else {
             self.reject_edit(cx);
             return;
         };
-        self.content = replace_content(&self.content, &range, new_text, resulting_len).into();
+        self.content =
+            replace_content(&self.content, &range, replacement.as_ref(), resulting_len).into();
         self.ghost = "".into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selected_range = range.start + replacement.len()..range.start + replacement.len();
         self.selection_reversed = false;
         self.marked_range = None;
         cx.emit(SearchChanged);
@@ -477,18 +559,41 @@ impl EntityInputHandler for SearchInput {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        let Some(resulting_len) =
-            plan_replacement(&self.content, &range, new_text, self.options.max_bytes)
-        else {
+        let replacement = if self.options.ascii_digits_only {
+            let Ok(replacement) = filter_ascii_digits(new_text) else {
+                self.reject_edit(cx);
+                return;
+            };
+            if !new_text.is_empty() && replacement.is_empty() {
+                return;
+            }
+            replacement
+        } else {
+            Cow::Borrowed(new_text)
+        };
+        let Some(resulting_len) = plan_replacement(
+            &self.content,
+            &range,
+            replacement.as_ref(),
+            self.options.max_bytes,
+        ) else {
             self.reject_edit(cx);
             return;
         };
-        self.content = replace_content(&self.content, &range, new_text, resulting_len).into();
+        self.content =
+            replace_content(&self.content, &range, replacement.as_ref(), resulting_len).into();
         self.ghost = "".into();
         self.marked_range =
-            (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
+            (!replacement.is_empty()).then_some(range.start..range.start + replacement.len());
+        let selected_range = if self.options.ascii_digits_only {
+            new_selected_range_utf16
+                .as_ref()
+                .map(|selection| filtered_selection_range_utf16(new_text, selection))
+        } else {
+            new_selected_range_utf16.clone()
+        };
         self.selected_range =
-            marked_selection_range(range.start, new_text, new_selected_range_utf16.as_ref());
+            marked_selection_range(range.start, replacement.as_ref(), selected_range.as_ref());
         self.selection_reversed = false;
         cx.emit(SearchChanged);
         cx.notify();
@@ -877,6 +982,56 @@ fn paste_tag_newlines(text: &str) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NumericFilterError {
+    InputTooLarge,
+    TooManyDigits,
+}
+
+fn filter_ascii_digits(text: &str) -> Result<Cow<'_, str>, NumericFilterError> {
+    if text.len() > MAX_NUMERIC_INPUT_BYTES {
+        return Err(NumericFilterError::InputTooLarge);
+    }
+
+    let mut filtered = String::with_capacity(text.len().min(MAX_NUMERIC_DIGITS));
+    let mut has_non_digit = false;
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            if filtered.len() == MAX_NUMERIC_DIGITS {
+                return Err(NumericFilterError::TooManyDigits);
+            }
+            filtered.push(character);
+        } else {
+            has_non_digit = true;
+        }
+    }
+    if has_non_digit {
+        Ok(Cow::Owned(filtered))
+    } else {
+        Ok(Cow::Borrowed(text))
+    }
+}
+
+fn filtered_selection_range_utf16(text: &str, selection: &Range<usize>) -> Range<usize> {
+    filtered_offset_from_utf16(text, selection.start)
+        ..filtered_offset_from_utf16(text, selection.end)
+}
+
+fn filtered_offset_from_utf16(text: &str, offset: usize) -> usize {
+    let mut filtered_offset = 0;
+    let mut utf16_offset = 0;
+    for character in text.chars() {
+        if utf16_offset >= offset {
+            break;
+        }
+        utf16_offset += character.len_utf16();
+        if character.is_ascii_digit() {
+            filtered_offset += character.len_utf16();
+        }
+    }
+    filtered_offset
+}
+
 fn offset_from_utf16(text: &str, offset: usize) -> usize {
     let mut utf8_offset = 0;
     let mut utf16_count = 0;
@@ -909,8 +1064,10 @@ fn marked_selection_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES, PasteNewlines, SearchInputOptions,
-        input_within_limit, marked_selection_range, paste_replacement_text, plan_replacement,
+        MAX_NUMERIC_INPUT_BYTES, MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES,
+        NumericFilterError, PasteNewlines, SearchInputOptions, filter_ascii_digits,
+        filtered_selection_range_utf16, input_within_limit, marked_selection_range,
+        paste_replacement_text, plan_replacement,
     };
 
     #[test]
@@ -943,6 +1100,12 @@ mod tests {
         assert_eq!(tag_filter.max_bytes, Some(MAX_TAG_FILTER_INPUT_BYTES));
         assert_eq!(tag_filter.paste_newlines, PasteNewlines::Preserve);
         assert!(tag_filter.underlined);
+
+        let beat_count = SearchInputOptions::beat_count();
+        assert_eq!(beat_count.placeholder, "");
+        assert_eq!(beat_count.max_bytes, Some(3));
+        assert_eq!(beat_count.paste_newlines, PasteNewlines::Preserve);
+        assert!(beat_count.ascii_digits_only);
     }
 
     #[test]
@@ -995,5 +1158,38 @@ mod tests {
             "x".len() * MAX_TAG_INPUT_BYTES,
             Some(MAX_TAG_INPUT_BYTES)
         ));
+    }
+
+    #[test]
+    fn beat_count_text_filters_non_ascii_digits_before_the_byte_bound() {
+        assert_eq!(filter_ascii_digits("a1٢2\n3").unwrap().as_ref(), "123");
+        assert_eq!(filter_ascii_digits("abc").unwrap().as_ref(), "");
+        assert_eq!(filter_ascii_digits("123").unwrap().as_ref(), "123");
+    }
+
+    #[test]
+    fn beat_count_large_or_overfull_paste_is_rejected_before_collection() {
+        let oversized = "x".repeat(MAX_NUMERIC_INPUT_BYTES + 1);
+        assert_eq!(
+            filter_ascii_digits(&oversized),
+            Err(NumericFilterError::InputTooLarge)
+        );
+
+        let too_many_digits = format!("x1x2x3x4{}", "x".repeat(MAX_NUMERIC_INPUT_BYTES));
+        assert_eq!(
+            filter_ascii_digits(&too_many_digits),
+            Err(NumericFilterError::InputTooLarge)
+        );
+        assert_eq!(
+            filter_ascii_digits("x1x2x3x4"),
+            Err(NumericFilterError::TooManyDigits)
+        );
+    }
+
+    #[test]
+    fn beat_count_filter_maps_marked_utf16_selection() {
+        assert_eq!(filtered_selection_range_utf16("a1😀2", &(1..4)), 0..1);
+        assert_eq!(filtered_selection_range_utf16("a1😀2", &(2..3)), 1..1);
+        assert_eq!(filtered_selection_range_utf16("abc", &(1..2)), 0..0);
     }
 }

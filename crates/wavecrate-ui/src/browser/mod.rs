@@ -29,6 +29,7 @@ use wavecrate_media::{
 };
 use wavecrate_session::{PreferencePatch, RegistryRevision, RequestId};
 
+use crate::beat_count_input::{BeatCountChanged, BeatCountInput, DEFAULT_BEAT_COUNT};
 use crate::search_input::{SearchChanged, SearchInput, SearchInputOptions, SearchInputRejected};
 use crate::theme::ActiveTheme;
 
@@ -225,6 +226,8 @@ pub(crate) struct Browser {
     volume_focus_handle: FocusHandle,
     search_input: gpui::Entity<SearchInput>,
     _search_subscription: gpui::Subscription,
+    beat_count_input: gpui::Entity<BeatCountInput>,
+    _beat_count_subscription: gpui::Subscription,
     tag_input: gpui::Entity<SearchInput>,
     _tag_subscription: gpui::Subscription,
     _tag_rejected_subscription: gpui::Subscription,
@@ -256,6 +259,8 @@ pub(crate) struct Browser {
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
     waveform_detail: waveform_detail::WaveformDetailState,
+    bpm_snap_enabled: bool,
+    beat_guide_count: u8,
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
     waveform_zoom_anchor_ratio: f64,
@@ -390,6 +395,14 @@ impl Browser {
                 view.reconcile_selection();
                 view.restore_explicit_projection_focus(previous_id, previous_position, cx);
             });
+        let beat_count_input = cx.new(BeatCountInput::new);
+        let beat_count_subscription = cx.subscribe(
+            &beat_count_input,
+            |view, _input, event: &BeatCountChanged, cx| {
+                view.beat_guide_count = event.count;
+                cx.notify();
+            },
+        );
         let tag_input = cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::tags()));
         let tag_subscription = cx.subscribe(&tag_input, |view, input, _: &SearchChanged, cx| {
             let content = input.read(cx).content().to_owned();
@@ -421,6 +434,8 @@ impl Browser {
             volume_focus_handle: cx.focus_handle(),
             search_input,
             _search_subscription: search_subscription,
+            beat_count_input,
+            _beat_count_subscription: beat_count_subscription,
             tag_input,
             _tag_subscription: tag_subscription,
             _tag_rejected_subscription: tag_rejected_subscription,
@@ -452,6 +467,8 @@ impl Browser {
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
             waveform_detail: waveform_detail::WaveformDetailState::default(),
+            bpm_snap_enabled: false,
+            beat_guide_count: DEFAULT_BEAT_COUNT,
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
             waveform_zoom_anchor_ratio: 0.5,
@@ -584,6 +601,19 @@ impl Browser {
         self.selected
             .and_then(|index| self.entries.get(index))
             .map(AudioFile::stable_id)
+    }
+
+    fn bpm_snap_settings(&self) -> waveform::BpmSnapSettings {
+        waveform::BpmSnapSettings {
+            enabled: self.bpm_snap_enabled,
+            beat_count: self.beat_guide_count,
+            audio_duration_seconds: self
+                .waveform
+                .as_ref()
+                .map(|preview| preview.duration_seconds)
+                .unwrap_or_default(),
+            constrain_to_audio: true,
+        }
     }
 
     /// Return the browser row focus, keeping it independent from the loaded waveform selection.
@@ -1619,6 +1649,16 @@ impl Browser {
         self.toggle_loop(cx);
     }
 
+    fn toggle_bpm_snap_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bpm_snap_enabled = !self.bpm_snap_enabled;
+        cx.notify();
+    }
+
     fn reload_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
@@ -1910,6 +1950,17 @@ impl Browser {
             {
                 self.invalidate_file_handoff();
             }
+            if key == "escape" {
+                window.focus(&self.focus_handle);
+            }
+            return;
+        }
+        if self
+            .beat_count_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
             if key == "escape" {
                 window.focus(&self.focus_handle);
             }

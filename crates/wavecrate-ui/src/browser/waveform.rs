@@ -6,11 +6,11 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use gpui::{
-    Bounds, Context, DragMoveEvent, MouseButton, MouseDownEvent, MouseUpEvent, Path, PathBuilder,
-    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point,
-    prelude::*, px,
+    AnyView, App, Bounds, Context, DragMoveEvent, Hsla, MouseButton, MouseDownEvent, MouseUpEvent,
+    Path, PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div,
+    fill, point, prelude::*, px,
 };
-use wavecrate_core::{WaveformRegion, WaveformViewport};
+use wavecrate_core::{WaveformRegion, WaveformViewport, snap_resize_ratio_to_whole_bpm};
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -27,6 +27,140 @@ const PLAY_REGION_MOVE_GRIP_HEIGHT: f32 = 7.0;
 const PLAY_REGION_MOVE_GRIP_INSET: f32 = 9.0;
 const WAVEFORM_PAN_REFERENCE_WIDTH: f64 = 1_200.0;
 const WAVEFORM_WHEEL_EPSILON: f64 = f64::EPSILON;
+const BPM_SNAP_ICON_SIZE: f32 = 16.0;
+
+/// The transient BPM snap settings used by one waveform resize gesture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct BpmSnapSettings {
+    /// Whether resize snapping is active.
+    pub(super) enabled: bool,
+    /// Number of beats represented by the snapped span.
+    pub(super) beat_count: u8,
+    /// Duration of the currently loaded audio file in seconds.
+    pub(super) audio_duration_seconds: f32,
+    /// Whether snapping must keep the resulting edge inside the audio file.
+    pub(super) constrain_to_audio: bool,
+}
+
+impl BpmSnapSettings {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            beat_count: 0,
+            audio_duration_seconds: 0.0,
+            constrain_to_audio: true,
+        }
+    }
+}
+
+fn bpm_snap_icon_point(bounds: Bounds<Pixels>, x: f32, y: f32) -> Point<Pixels> {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    let scale = (width / BPM_SNAP_ICON_SIZE)
+        .min(height / BPM_SNAP_ICON_SIZE)
+        .max(0.0);
+    let left = f32::from(bounds.origin.x) + (width - BPM_SNAP_ICON_SIZE * scale) / 2.0;
+    let top = f32::from(bounds.origin.y) + (height - BPM_SNAP_ICON_SIZE * scale) / 2.0;
+    point(px(left + x * scale), px(top + y * scale))
+}
+
+/// Render the fixed 16×16 BPM snap glyph used by the compact toolbar control.
+pub(super) fn render_bpm_snap_icon(icon_color: Hsla) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            if !width.is_finite() || width <= 0.0 || !height.is_finite() || height <= 0.0 {
+                return;
+            }
+            let rail_width = 1.5;
+            for left in [1.5, 13.0] {
+                let rail = Bounds::from_corners(
+                    bpm_snap_icon_point(bounds, left, 2.5),
+                    bpm_snap_icon_point(bounds, left + rail_width, 13.5),
+                );
+                window.paint_quad(fill(rail, icon_color));
+            }
+
+            let mut glyph = PathBuilder::fill();
+            glyph.move_to(bpm_snap_icon_point(bounds, 5.0, 4.0));
+            glyph.line_to(bpm_snap_icon_point(bounds, 8.0, 4.0));
+            glyph.cubic_bezier_to(
+                bpm_snap_icon_point(bounds, 9.8, 4.0),
+                bpm_snap_icon_point(bounds, 10.7, 4.8),
+                bpm_snap_icon_point(bounds, 10.7, 6.1),
+            );
+            glyph.cubic_bezier_to(
+                bpm_snap_icon_point(bounds, 10.7, 6.9),
+                bpm_snap_icon_point(bounds, 10.2, 7.4),
+                bpm_snap_icon_point(bounds, 9.4, 7.7),
+            );
+            glyph.cubic_bezier_to(
+                bpm_snap_icon_point(bounds, 10.4, 8.0),
+                bpm_snap_icon_point(bounds, 11.0, 8.8),
+                bpm_snap_icon_point(bounds, 11.0, 9.9),
+            );
+            glyph.cubic_bezier_to(
+                bpm_snap_icon_point(bounds, 11.0, 11.4),
+                bpm_snap_icon_point(bounds, 9.9, 12.0),
+                bpm_snap_icon_point(bounds, 8.2, 12.0),
+            );
+            glyph.line_to(bpm_snap_icon_point(bounds, 5.0, 12.0));
+            glyph.close();
+            if let Ok(path) = glyph.build() {
+                window.paint_path(path, icon_color);
+            }
+        },
+    )
+    .w(px(BPM_SNAP_ICON_SIZE))
+    .h(px(BPM_SNAP_ICON_SIZE))
+}
+
+struct BpmSnapTooltip;
+
+impl Render for BpmSnapTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(crate::theme::color(theme.colors.surface_raised))
+            .border(px(theme.spacing.border_width))
+            .border_color(crate::theme::color(theme.colors.border_emphasis))
+            .text_size(px(theme.typography.small_size))
+            .text_color(crate::theme::color(theme.colors.text_primary))
+            .child(
+                "Snap resized play and edit marks to whole BPM values using the beat guide count.",
+            )
+    }
+}
+
+/// Build the BPM snap tooltip view for the compact toolbar control.
+pub(super) fn bpm_snap_tooltip(_: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| BpmSnapTooltip).into()
+}
+
+struct BeatCountTooltip;
+
+impl Render for BeatCountTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(crate::theme::color(theme.colors.surface_raised))
+            .border(px(theme.spacing.border_width))
+            .border_color(crate::theme::color(theme.colors.border_emphasis))
+            .text_size(px(theme.typography.small_size))
+            .text_color(crate::theme::color(theme.colors.text_primary))
+            .child("Beats in the snapped selection.")
+    }
+}
+
+pub(super) fn beat_count_tooltip(_: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| BeatCountTooltip).into()
+}
 
 /// One normalized, ordered playback region in the selected waveform.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -170,6 +304,10 @@ impl WaveformRegionDrag {
     }
 
     fn preview_region(self) -> Option<WaveformPlayRegion> {
+        self.preview_region_with_bpm(BpmSnapSettings::disabled())
+    }
+
+    fn preview_region_with_bpm(self, bpm_snap: BpmSnapSettings) -> Option<WaveformPlayRegion> {
         if !self.moved {
             match self.mode {
                 WaveformRegionDragMode::Create => {}
@@ -186,10 +324,14 @@ impl WaveformRegionDrag {
                 .moved_by(self.current - self.anchor)
                 .map(WaveformPlayRegion::from_core),
             WaveformRegionDragMode::ResizeStart { baseline } => baseline
-                .resized_start_to(self.current)
+                .resized_start_to(snapped_resize_edge(baseline.end(), self.current, bpm_snap))
                 .map(WaveformPlayRegion::from_core),
             WaveformRegionDragMode::ResizeEnd { baseline } => baseline
-                .resized_end_to(self.current)
+                .resized_end_to(snapped_resize_edge(
+                    baseline.start(),
+                    self.current,
+                    bpm_snap,
+                ))
                 .map(WaveformPlayRegion::from_core),
         }
     }
@@ -202,6 +344,19 @@ impl WaveformRegionDrag {
     fn is_handle_drag(self) -> bool {
         !matches!(self.mode, WaveformRegionDragMode::Create)
     }
+}
+
+fn snapped_resize_edge(fixed_ratio: f64, moving_ratio: f64, bpm_snap: BpmSnapSettings) -> f64 {
+    if !bpm_snap.enabled {
+        return moving_ratio;
+    }
+    f64::from(snap_resize_ratio_to_whole_bpm(
+        fixed_ratio as f32,
+        moving_ratio as f32,
+        bpm_snap.audio_duration_seconds,
+        bpm_snap.beat_count,
+        bpm_snap.constrain_to_audio,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -678,9 +833,10 @@ pub(super) fn render_waveform(
         .left_0()
         .right_0(),
     );
+    let bpm_snap = browser.bpm_snap_settings();
     if let Some(region) = browser
         .waveform_region_drag
-        .and_then(WaveformRegionDrag::preview_region)
+        .and_then(|drag| drag.preview_region_with_bpm(bpm_snap))
         .or(browser.waveform_play_region)
     {
         bars = bars.child(waveform_region_overlay(
@@ -1056,9 +1212,10 @@ impl Browser {
         }
         let mut drag = drag;
         drag.update(position);
+        let bpm_snap = self.bpm_snap_settings();
         if drag.is_handle_drag() {
             if drag.moved {
-                if let Some(region) = drag.preview_region() {
+                if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
                     self.waveform_play_region = Some(region);
                 }
             }
@@ -1814,6 +1971,93 @@ mod tests {
         no_op.update(point(px(28.0), px(10.0)));
         assert!(!no_op.moved);
         assert_eq!(no_op.preview_region(), Some(baseline));
+    }
+
+    #[test]
+    fn bpm_snap_resize_uses_a_whole_bpm_result() {
+        let bounds = test_bounds(100.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let baseline = WaveformPlayRegion::new(0.2, 0.4).unwrap();
+        let bpm_snap = BpmSnapSettings {
+            enabled: true,
+            beat_count: 4,
+            audio_duration_seconds: 10.0,
+            constrain_to_audio: true,
+        };
+        let mut drag = WaveformRegionDrag::begin_handle(
+            point(px(40.0), px(10.0)),
+            0.4,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::ResizeEnd,
+            11,
+        )
+        .expect("valid resize handle");
+        drag.update(point(px(61.0), px(10.0)));
+
+        let resized = drag
+            .preview_region_with_bpm(bpm_snap)
+            .expect("snapped region remains valid");
+
+        assert!(resized.end > baseline.end);
+        let snapped_duration = (resized.end - resized.start) * 10.0;
+        let bpm = 4.0 * 60.0 / snapped_duration;
+        assert!((bpm - bpm.round()).abs() < 0.001);
+    }
+
+    #[test]
+    fn bpm_snap_preserves_fixed_edge_direction_and_leaves_moves_unchanged() {
+        let bounds = test_bounds(100.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let baseline = WaveformPlayRegion::new(0.6, 0.8).unwrap();
+        let bpm_snap = BpmSnapSettings {
+            enabled: true,
+            beat_count: 8,
+            audio_duration_seconds: 12.0,
+            constrain_to_audio: true,
+        };
+        let mut resize_start = WaveformRegionDrag::begin_handle(
+            point(px(60.0), px(10.0)),
+            0.6,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::ResizeStart,
+            12,
+        )
+        .expect("valid resize handle");
+        resize_start.update(point(px(30.0), px(10.0)));
+        let resized = resize_start
+            .preview_region_with_bpm(bpm_snap)
+            .expect("snapped region remains valid");
+        assert!(resized.start < baseline.start);
+        assert_eq!(resized.end, baseline.end);
+
+        let mut move_drag = WaveformRegionDrag::begin_handle(
+            point(px(70.0), px(10.0)),
+            0.7,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::Move,
+            12,
+        )
+        .expect("valid move handle");
+        move_drag.update(point(px(80.0), px(10.0)));
+        let moved_with_snap = move_drag
+            .preview_region_with_bpm(bpm_snap)
+            .expect("move remains valid");
+        let moved_without_snap = move_drag.preview_region().expect("move remains valid");
+        assert_eq!(moved_with_snap, moved_without_snap);
+    }
+
+    #[test]
+    fn bpm_snap_defaults_to_disabled_without_a_loaded_waveform() {
+        let settings = BpmSnapSettings::disabled();
+        assert!(!settings.enabled);
+        assert_eq!(settings.beat_count, 0);
+        assert_eq!(settings.audio_duration_seconds, 0.0);
     }
 
     #[test]
