@@ -1799,3 +1799,11 @@ The loader retains at most 256 visible-demand paths, with separate 1 MiB label/p
 Validation: all 12 display-label UI tests, 36 curation-focused UI tests, the UI check, formatting and diff checks passed. Tests cover successive windows over 320 files with maximum-sized labels, byte-counter reclamation, long-path batching, stale replies, missing-label fallback, invalid payloads and mode cancellation. Native interaction acceptance remains pending.
 
 Independent review found playback-history cache flicker and unrelated-source curation blocking. Both were corrected with exact non-tag receipt rebasing and lifecycle-scoped pending checks. Focused re-review approved the fixes with no introduced lifecycle or request-gating issue.
+
+A clean detached `ac4344fc7` snapshot built `target/qa/Wavecrate Label Preview ac4344f.app` in 15.01 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
+
+### Native file-drag platform foundation
+
+`wavecrate-platform` now provides bounded AppKit copy-drag admission for up to 256 prepared absolute UTF-8 paths and 1 MiB of path data. It borrows the actual window handle, checks the originating mouse event and current primary-button state, and retains native view/source/items/URLs/session objects until completion. Rejected resources are released outside the session-state borrow; completion notifications are nonblocking. File URLs explicitly represent files, and generic drag images require no source-file probing.
+
+Validation: nine platform tests, strict all-target Clippy, macOS checking and checking against the already installed `x86_64-unknown-linux-gnu` target passed. Independent review identified the stale-event/late-start issue; the current-button guard fixed it. Browser integration and native OS drag acceptance are still pending, and other platforms currently return a typed unsupported error.
