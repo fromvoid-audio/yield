@@ -291,7 +291,7 @@ where
     D: FnMut(T) -> f32,
 {
     let mut peak = 0.0_f32;
-    let mut samples_read = 0usize;
+    let mut samples_since_cancel_check = 0usize;
     for _ in 0..frame_count {
         if crate::is_cancelled(cancellation) {
             return Err(String::from("WAV span peak canceled"));
@@ -303,11 +303,12 @@ where
                 .map_err(|error| format!("failed to read {sample_kind} WAV sample: {error}"))?
                 .ok_or_else(|| String::from("WAV ended before declared frame count"))?;
             peak = peak.max(decode(sample).abs());
-            samples_read = samples_read.saturating_add(1);
-            if samples_read.is_multiple_of(PEAK_READ_BLOCK_SAMPLES)
-                && crate::is_cancelled(cancellation)
-            {
-                return Err(String::from("WAV span peak canceled"));
+            samples_since_cancel_check += 1;
+            if samples_since_cancel_check == PEAK_READ_BLOCK_SAMPLES {
+                samples_since_cancel_check = 0;
+                if crate::is_cancelled(cancellation) {
+                    return Err(String::from("WAV span peak canceled"));
+                }
             }
         }
     }
