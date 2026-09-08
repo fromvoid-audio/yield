@@ -363,20 +363,14 @@ pub fn export_wav_span_with_cancel<W: Write + Seek>(
         return Err(String::from("WAV span export canceled"));
     }
 
-    let after_header = detail::recheck_wav(
-        &context.path,
-        &opened.file,
-        opened.spec,
-        opened.total_frames,
-        cancellation,
-    )
-    .map_err(|error| {
-        if is_cancelled(cancellation) {
-            String::from("WAV span export canceled")
-        } else {
-            format!("stale WAV span export request: {error}")
-        }
-    })?;
+    let after_header =
+        detail::recheck_wav(&context.path, &opened, cancellation).map_err(|error| {
+            if is_cancelled(cancellation) {
+                String::from("WAV span export canceled")
+            } else {
+                format!("stale WAV span export request: {error}")
+            }
+        })?;
     if after_header.strong_revision().as_ref() != Some(&context.file_revision) {
         return Err(String::from("stale WAV span export request"));
     }
@@ -409,20 +403,14 @@ pub fn export_wav_span_with_cancel<W: Write + Seek>(
     if is_cancelled(cancellation) {
         return Err(String::from("WAV span export canceled"));
     }
-    let after_read = detail::recheck_wav(
-        &context.path,
-        &opened.file,
-        opened.spec,
-        opened.total_frames,
-        cancellation,
-    )
-    .map_err(|error| {
-        if is_cancelled(cancellation) {
-            String::from("WAV span export canceled")
-        } else {
-            format!("stale WAV span export result: {error}")
-        }
-    })?;
+    let after_read =
+        detail::recheck_wav(&context.path, &opened, cancellation).map_err(|error| {
+            if is_cancelled(cancellation) {
+                String::from("WAV span export canceled")
+            } else {
+                format!("stale WAV span export result: {error}")
+            }
+        })?;
     detail::ensure_file_unchanged(&opened.observation, &after_read)
         .map_err(|_| String::from("stale WAV span export result"))?;
     if after_read.strong_revision().as_ref() != Some(&context.file_revision) {

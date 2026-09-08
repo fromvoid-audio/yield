@@ -7109,6 +7109,7 @@ dependencies = [
 name = "wavecrate-media"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "hound",
  "tempfile",
  "wavecrate-analysis",

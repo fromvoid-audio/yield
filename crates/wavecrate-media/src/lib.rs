@@ -271,7 +271,7 @@ pub fn load_waveform_preview_with_cancel(
         return Err(String::from("waveform preview canceled"));
     }
     let (bands, visual_band_gains) = bands.finish();
-    let after = detail::recheck_wav(path, &opened.file, spec, total_frames, cancellation)?;
+    let after = detail::recheck_wav(path, &opened, cancellation)?;
     detail::ensure_file_unchanged(&opened.observation, &after)?;
     let detail_context = detail::context_from_observations(
         path,
@@ -441,7 +441,6 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
-    use wavecrate_library::filesystem_identity::filesystem_change_marker;
 
     fn write_fixture(path: &Path) {
         let spec = WavSpec {
@@ -923,12 +922,14 @@ mod tests {
                 original_modified
             );
         }
-        if let Some(marker) = filesystem_change_marker(
-            &path,
-            &std::fs::metadata(&path).expect("changed detail metadata"),
-        ) {
-            assert_ne!(marker, refreshed_context.file_revision.change_marker);
-        }
+        let changed_context = load_waveform_preview(&path)
+            .expect("overview after same-sized mutation")
+            .detail_context
+            .expect("changed source must expose a strong detail context");
+        assert_ne!(
+            changed_context.file_revision,
+            refreshed_context.file_revision
+        );
         let in_place = load_waveform_detail(&refreshed_request)
             .expect_err("same-sized in-place mutation must stale detail");
         assert!(in_place.contains("stale") || in_place.contains("changed"));

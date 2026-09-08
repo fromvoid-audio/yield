@@ -51,14 +51,7 @@ impl WavSpanPeakRequest {
                 )
             }
         })?;
-        let after = detail::recheck_wav(
-            path,
-            &opened.file,
-            opened.spec,
-            opened.total_frames,
-            cancellation,
-        )
-        .map_err(|error| {
+        let after = detail::recheck_wav(path, &opened, cancellation).map_err(|error| {
             if crate::is_cancelled(cancellation) {
                 String::from("WAV span peak canceled")
             } else {
@@ -211,14 +204,7 @@ pub fn load_wav_span_peak_with_cancel(
         return Err(String::from("WAV span peak canceled"));
     }
 
-    let after = detail::recheck_wav(
-        &context.path,
-        &opened.file,
-        opened.spec,
-        opened.total_frames,
-        cancellation,
-    )
-    .map_err(|error| {
+    let after = detail::recheck_wav(&context.path, &opened, cancellation).map_err(|error| {
         format!(
             "WAV span peak failed for {}: {error}",
             context.path.display()

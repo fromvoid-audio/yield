@@ -1873,3 +1873,13 @@ The themed shortcut dialog is available from the ? toolbar control and Cmd/Ctrl-
 Validation: the UI suite passed 290 tests with one existing ignored test before final review adjustments. The three focused routing tests and UI check passed after adding gesture cancellation, modifier-specific toggle routing and keyboard scrolling. Primary inspection made sections retain their natural height within the scroll area. Native focus/pointer acceptance follows separately.
 
 The clean `355db7cef` help preview built in 19.33 seconds and passed strict ad-hoc signature verification. Native validation used a new isolated profile and silent test WAV: toolbar/Command-/ opening, End scrolling, Space suppression, Escape dismissal and restoration of search editing all worked. The test app exited cleanly. A clipped description was shortened and toolbar tooltips are now suppressed while help is open; the isolated UI check passed after these visual corrections.
+
+The corrected clean `06867f2f6` preview built in 21.23 seconds and passed strict signature verification. Native checks confirmed the shortened help row fits, toolbar tooltips remain suppressed over the modal, the close button works, and changing the beat count from four to five changes the selection from three to four internal guide lines. The isolated app exited cleanly; screenshots are retained in `target/qa/help-native-355db7c/`.
+
+### Windows content revisions
+
+The second Windows run (`34289070619`) passed 41 media tests but exposed the remaining same-size/restored-write-time case: Windows `ChangeTime` covers metadata, not data-stream writes. Media revisions now incorporate a raw BLAKE3 fingerprint on Windows. Admission validates the WAV header, hashes once in cancellable 64 KiB blocks under the retained write-excluding read lease, rewinds and reconstructs the decoder. Rechecks accept the leased `OpenWav` and reuse the fingerprint only after a fresh open proves matching identity. Scanner markers and the public revision shape remain unchanged.
+
+Validation: 40 media tests passed on macOS, including raw fingerprint, rewind and same-length mutation coverage. The portable fingerprint check also passed against the full expected digest. Actual Windows CI remains required; local cross-checking cannot complete without the MSVC C toolchain.
+
+Independent review approved fingerprint ownership, reuse and reader offsets. Windows refinements perform one full raw source read per distinct request; the work remains off-thread and cancellable. This is the cost of detecting metadata-preserving writes with this design. [Microsoft documents the ChangeTime distinction](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_basic_info).

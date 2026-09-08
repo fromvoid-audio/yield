@@ -2,11 +2,14 @@
 
 use std::{
     fs::{self, File},
-    io::BufReader,
+    io::{BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
     time::SystemTime,
 };
+
+#[cfg(any(windows, test))]
+use std::io::Read;
 
 use wavecrate_library::filesystem_identity::{
     filesystem_change_marker, stable_filesystem_identity, stable_filesystem_identity_from_open_file,
@@ -57,7 +60,7 @@ impl WaveformSpec {
 pub struct WaveformFileRevision {
     /// Stable identity of the opened filesystem object.
     pub filesystem_identity: String,
-    /// Platform change marker captured from the named path.
+    /// Filesystem change marker, combined with a raw content fingerprint on Windows.
     pub change_marker: String,
     /// Byte length captured with the revision.
     pub byte_len: u64,
@@ -191,6 +194,10 @@ pub(super) struct FileObservation {
     open_identity: Option<String>,
     path_identity: Option<String>,
     change_marker: Option<String>,
+    #[cfg(windows)]
+    // Windows ChangeTime covers metadata rather than data-stream writes. This is populated
+    // only while the read lease owns the source and becomes part of the detail revision.
+    content_fingerprint: Option<String>,
     byte_len: u64,
     modified_time: Option<SystemTime>,
 }
@@ -208,9 +215,19 @@ impl FileObservation {
         ) else {
             return None;
         };
-        (open_identity == path_identity).then(|| WaveformFileRevision {
+        if open_identity != path_identity {
+            return None;
+        }
+        #[cfg(windows)]
+        let change_marker = format!(
+            "{change_marker}:content:blake3:{}",
+            self.content_fingerprint.as_ref()?
+        );
+        #[cfg(not(windows))]
+        let change_marker = change_marker.clone();
+        Some(WaveformFileRevision {
             filesystem_identity: open_identity.clone(),
-            change_marker: change_marker.clone(),
+            change_marker,
             byte_len: self.byte_len,
             modified_time: self.modified_time,
         })
@@ -252,18 +269,15 @@ pub(super) fn open_wav(path: &Path, cancellation: Option<&AtomicBool>) -> Result
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let file = open_wav_source(path)
+    #[allow(unused_mut)]
+    let mut file = open_wav_source(path)
         .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))?;
-    let observation = observe_file(path, &file)?;
+    #[allow(unused_mut)]
+    let mut observation = observe_file(path, &file)?;
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let reader_file = file
-        .try_clone()
-        .map_err(|error| format!("WAV preview failed to retain {}: {error}", path.display()))?;
-    let reader = hound::WavReader::new(BufReader::new(reader_file))
-        .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))?;
-    let spec = reader.spec();
+    let (spec, total_frames) = read_wav_header(path, &file)?;
     if spec.sample_rate == 0 {
         return Err(format!(
             "{} WAV has an invalid zero sample rate",
@@ -273,12 +287,23 @@ pub(super) fn open_wav(path: &Path, cancellation: Option<&AtomicBool>) -> Result
     if spec.channels == 0 {
         return Err(format!("{} WAV has no channels", path.display()));
     }
-    let total_frames = reader.duration() as usize;
     if total_frames == 0 {
         return Err(format!("{} contains no decodable samples", path.display()));
     }
     let after_header = observe_file(path, &file)?;
     ensure_file_unchanged(&observation, &after_header)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind WAV source after header probe: {error}"))?;
+    #[cfg(windows)]
+    {
+        observation.content_fingerprint = Some(fingerprint_open_source(&mut file, cancellation)?);
+        let after_fingerprint = observe_file(path, &file)?;
+        ensure_file_unchanged(&observation, &after_fingerprint)?;
+    }
+    let reader = reader_from_open_file(path, &file)?;
+    if reader.spec() != spec || reader.duration() as usize != total_frames {
+        return Err(String::from("waveform source changed while opening"));
+    }
     Ok(OpenWav {
         file,
         reader,
@@ -305,6 +330,8 @@ pub(super) fn observe_file(path: &Path, file: &File) -> Result<FileObservation, 
         open_identity,
         path_identity,
         change_marker: filesystem_change_marker(path, &metadata),
+        #[cfg(windows)]
+        content_fingerprint: None,
         byte_len: metadata.len(),
         modified_time: metadata.modified().ok(),
     })
@@ -312,35 +339,80 @@ pub(super) fn observe_file(path: &Path, file: &File) -> Result<FileObservation, 
 
 pub(super) fn recheck_wav(
     path: &Path,
-    retained_file: &File,
-    expected_spec: hound::WavSpec,
-    expected_total_frames: usize,
+    opened: &OpenWav,
     cancellation: Option<&AtomicBool>,
 ) -> Result<FileObservation, String> {
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let retained_observation = observe_file(path, retained_file)?;
+    let retained_observation = observe_file(path, &opened.file)?;
     let file = open_wav_source(path)
         .map_err(|error| format!("failed to revalidate WAV {}: {error}", path.display()))?;
     let observation = observe_file(path, &file)?;
-    let reader_file = file
-        .try_clone()
-        .map_err(|error| format!("failed to revalidate WAV {}: {error}", path.display()))?;
-    let reader = hound::WavReader::new(BufReader::new(reader_file))
-        .map_err(|error| format!("failed to revalidate WAV {}: {error}", path.display()))?;
-    let actual_spec = reader.spec();
-    let actual_total_frames = reader.duration() as usize;
-    if actual_spec != expected_spec || actual_total_frames != expected_total_frames {
+    let (actual_spec, actual_total_frames) = read_wav_header(path, &file)?;
+    if actual_spec != opened.spec || actual_total_frames != opened.total_frames {
         return Err(String::from("waveform source changed while reading"));
     }
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let after_header = observe_file(path, &file)?;
+    #[allow(unused_mut)]
+    let mut after_header = observe_file(path, &file)?;
     ensure_file_unchanged(&retained_observation, &after_header)?;
     ensure_file_unchanged(&observation, &after_header)?;
+    #[cfg(windows)]
+    if opened.observation.open_identity.is_some()
+        && opened.observation.open_identity == after_header.open_identity
+        && opened.observation.path_identity.is_some()
+        && opened.observation.path_identity == after_header.path_identity
+    {
+        // The original open holds the deny-WRITE lease. Once this independently reopened path
+        // binds to that same object, its bytes are the already fingerprinted source.
+        after_header.content_fingerprint = opened.observation.content_fingerprint.clone();
+    }
     Ok(after_header)
+}
+
+fn read_wav_header(path: &Path, file: &File) -> Result<(hound::WavSpec, usize), String> {
+    let reader = reader_from_open_file(path, file)?;
+    Ok((reader.spec(), reader.duration() as usize))
+}
+
+fn reader_from_open_file(
+    path: &Path,
+    file: &File,
+) -> Result<hound::WavReader<BufReader<File>>, String> {
+    let reader_file = file
+        .try_clone()
+        .map_err(|error| format!("WAV preview failed to retain {}: {error}", path.display()))?;
+    hound::WavReader::new(BufReader::new(reader_file))
+        .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))
+}
+
+#[cfg(any(windows, test))]
+fn fingerprint_open_source(
+    file: &mut File,
+    cancellation: Option<&AtomicBool>,
+) -> Result<String, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind WAV source for fingerprinting: {error}"))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if is_cancelled(cancellation) {
+            return Err(String::from("waveform preview canceled"));
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to fingerprint WAV source: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind WAV source after fingerprinting: {error}"))?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub(super) fn ensure_file_unchanged(
@@ -473,13 +545,7 @@ pub fn load_waveform_detail_with_cancel(
     if is_cancelled(cancellation) {
         return Err(String::from("waveform detail canceled"));
     }
-    let after = recheck_wav(
-        &context.path,
-        &opened.file,
-        opened.spec,
-        opened.total_frames,
-        cancellation,
-    )?;
+    let after = recheck_wav(&context.path, &opened, cancellation)?;
     ensure_file_unchanged(&opened.observation, &after)
         .map_err(|_| String::from("stale waveform detail result"))?;
     if after.strong_revision().as_ref() != Some(&context.file_revision) {
@@ -494,4 +560,48 @@ pub fn load_waveform_detail_with_cancel(
         range,
         bands,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn content_fingerprint_rewinds_detects_same_length_writes_and_honors_cancellation() {
+        let directory = tempfile::tempdir().expect("create fingerprint fixture directory");
+        let path = directory.path().join("source.wav");
+        let original = vec![0x11_u8; 64 * 1024 + 3];
+        fs::write(&path, &original).expect("write fingerprint fixture");
+
+        let mut source = File::open(&path).expect("open fingerprint fixture");
+        let fingerprint = fingerprint_open_source(&mut source, None).expect("fingerprint source");
+        assert_eq!(fingerprint, blake3::hash(&original).to_hex().to_string());
+        assert_eq!(source.stream_position().expect("read source offset"), 0);
+        let mut prefix = [0_u8; 3];
+        source.read_exact(&mut prefix).expect("read rewound source");
+        assert_eq!(prefix, [0x11; 3]);
+        drop(source);
+
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open same-length writer");
+        writer
+            .seek(SeekFrom::Start(1))
+            .expect("seek same-length payload");
+        writer.write_all(&[0x22]).expect("overwrite payload byte");
+        drop(writer);
+
+        let mut changed = File::open(&path).expect("open changed fingerprint fixture");
+        assert_ne!(
+            fingerprint_open_source(&mut changed, None).expect("fingerprint changed source"),
+            fingerprint
+        );
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            fingerprint_open_source(&mut changed, Some(&cancelled)),
+            Err(String::from("waveform preview canceled"))
+        );
+    }
 }

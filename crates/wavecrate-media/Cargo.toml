@@ -15,7 +15,9 @@ wavecrate-core.workspace = true
 wavecrate-library.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+blake3 = "1.6.1"
 windows = { version = "=0.62.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+blake3 = "1.6.1"
 tempfile.workspace = true
