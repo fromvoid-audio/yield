@@ -1727,3 +1727,9 @@ Added a cancellable, bounded-memory media reader for raw interleaved WAV peaks o
 Validation: media suite passed 24 tests before the cancellation refinement; all seven focused span-peak tests and the media all-targets check passed after it. Fixtures cover PCM/float amplitude, channel maxima, silence/nonfinite values, span bounds, stale files, and cancellation with high channel counts.
 
 Normalized audition now has a persisted, default-off preference and an optimistic session patch. Legacy documents omit the field safely, reset restores the disabled default, and the setting round-trips without changing output volume. All 16 focused session preference tests passed. The toolbar/playback integration remains in progress.
+
+### Playback-scoped asynchronous gain updates
+
+Reson now accepts a precomputed gain for a specific playback request ID. The worker silently rejects stale or post-stop updates without scanning audio, and queue admission/coalescing preserves different IDs and intervening controls. Same-scope tail replacement is constant-time; existing unscoped controls retain their behavior. Admission remains best-effort and does not acknowledge application.
+
+Validation: all 186 Reson tests and its all-targets check passed. After simplifying the tail lookup, all four scoped execution/coalescing/order tests passed again.

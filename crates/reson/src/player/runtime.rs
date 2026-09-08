@@ -417,6 +417,25 @@ impl PlaybackRuntimeHandle {
         })
     }
 
+    /// Submit a precomputed playback-gain update for one specific play request.
+    ///
+    /// The runtime applies the scalar only when `expected_playback_id` is still the current
+    /// successfully started play. A stale result, a result arriving after stop, or a result
+    /// superseded by another play is silently discarded. This command never performs file I/O or
+    /// a normalization prepass on the runtime control thread.
+    /// `Ok(())` confirms queue admission only; the bounded queue may coalesce or evict the command,
+    /// and no application acknowledgement event is emitted.
+    pub fn try_set_playback_gain_for(
+        &self,
+        expected_playback_id: PlaybackRequestId,
+        gain: f32,
+    ) -> Result<(), PlaybackRuntimeSubmitError> {
+        self.submit(PlaybackRuntimeCommand::SetPlaybackGainFor {
+            expected_playback_id,
+            gain,
+        })
+    }
+
     /// Submit an in-place span-retarget request without waiting for the runtime thread.
     pub fn try_retarget_span(
         &self,
@@ -569,6 +588,10 @@ enum PlaybackRuntimeCommand {
         gain: f32,
         normalization: Option<PlaybackRuntimeGainNormalization>,
     },
+    SetPlaybackGainFor {
+        expected_playback_id: PlaybackRequestId,
+        gain: f32,
+    },
     Shutdown,
 }
 
@@ -624,11 +647,17 @@ impl PlaybackRuntimeCommandQueue {
             return Err(PlaybackRuntimeSubmitError::Closed);
         }
 
-        if let Some(index) = state
-            .commands
-            .iter()
-            .position(|queued| same_coalescing_class(queued, &command))
-        {
+        let coalescing_index = match &command {
+            PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id,
+                ..
+            } => find_scoped_playback_gain_coalescing_index(&state.commands, *expected_playback_id),
+            _ => state
+                .commands
+                .iter()
+                .position(|queued| same_coalescing_class(queued, &command)),
+        };
+        if let Some(index) = coalescing_index {
             if matches!(
                 state.commands.get(index),
                 Some(PlaybackRuntimeCommand::Play { .. })
@@ -831,6 +860,19 @@ fn same_coalescing_class(
     {
         return queued_play == incoming_play;
     }
+    if let (
+        PlaybackRuntimeCommand::SetPlaybackGainFor {
+            expected_playback_id: queued_play,
+            ..
+        },
+        PlaybackRuntimeCommand::SetPlaybackGainFor {
+            expected_playback_id: incoming_play,
+            ..
+        },
+    ) = (queued, incoming)
+    {
+        return queued_play == incoming_play;
+    }
     matches!(
         (queued, incoming),
         (
@@ -858,6 +900,20 @@ fn same_coalescing_class(
     )
 }
 
+fn find_scoped_playback_gain_coalescing_index(
+    commands: &VecDeque<PlaybackRuntimeCommand>,
+    expected_playback_id: PlaybackRequestId,
+) -> Option<usize> {
+    matches!(
+        commands.back(),
+        Some(PlaybackRuntimeCommand::SetPlaybackGainFor {
+            expected_playback_id: queued_id,
+            ..
+        }) if *queued_id == expected_playback_id
+    )
+    .then(|| commands.len() - 1)
+}
+
 fn find_disposable_command(
     commands: &VecDeque<PlaybackRuntimeCommand>,
     allow_retarget: bool,
@@ -868,6 +924,7 @@ fn find_disposable_command(
             PlaybackRuntimeCommand::PollProgress { .. }
                 | PlaybackRuntimeCommand::SetVolume { .. }
                 | PlaybackRuntimeCommand::SetPlaybackGain { .. }
+                | PlaybackRuntimeCommand::SetPlaybackGainFor { .. }
         ) || (allow_retarget && matches!(command, PlaybackRuntimeCommand::RetargetSpan { .. }))
     })
 }
@@ -885,6 +942,7 @@ fn find_noncritical_command(
                     | PlaybackRuntimeCommand::RetargetSpan { .. }
                     | PlaybackRuntimeCommand::SetVolume { .. }
                     | PlaybackRuntimeCommand::SetPlaybackGain { .. }
+                    | PlaybackRuntimeCommand::SetPlaybackGainFor { .. }
             )
         })
         .or_else(|| {
@@ -1265,6 +1323,14 @@ fn run_playback_runtime(
             } => {
                 executor.set_playback_gain(gain, normalization);
             }
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id,
+                gain,
+            } => {
+                if current_playback_id == Some(expected_playback_id) {
+                    executor.set_playback_gain(gain, None);
+                }
+            }
             CoalescedCommand::Shutdown => {
                 let _ = current_playback_id.take();
                 commands.close();
@@ -1309,6 +1375,10 @@ enum CoalescedCommand {
     SetPlaybackGain {
         gain: f32,
         normalization: Option<PlaybackRuntimeGainNormalization>,
+    },
+    SetPlaybackGainFor {
+        expected_playback_id: PlaybackRequestId,
+        gain: f32,
     },
     Shutdown,
 }
@@ -1361,6 +1431,9 @@ fn coalesce_pending_command(
         current @ PlaybackRuntimeCommand::SetPlaybackGain { .. } => {
             coalesce_repeated_playback_gain_command(current, pending)
         }
+        current @ PlaybackRuntimeCommand::SetPlaybackGainFor { .. } => {
+            coalesce_repeated_scoped_playback_gain_command(current, pending)
+        }
         PlaybackRuntimeCommand::Shutdown => {
             cancel_pending_commands(pending, PlaybackRuntimeCancellation::Shutdown, events);
             PlaybackRuntimeCommand::Shutdown
@@ -1411,6 +1484,7 @@ fn coalesce_play_command(
             Some(PlaybackRuntimeCommand::RetargetSpan { .. })
             | Some(PlaybackRuntimeCommand::SetVolume { .. })
             | Some(PlaybackRuntimeCommand::SetPlaybackGain { .. })
+            | Some(PlaybackRuntimeCommand::SetPlaybackGainFor { .. })
             | None => return current,
         }
     }
@@ -1451,7 +1525,8 @@ fn coalesce_span_retarget_command(
                 let _ = pending.pop_front();
             }
             Some(PlaybackRuntimeCommand::SetVolume { .. }) | None => return current,
-            Some(PlaybackRuntimeCommand::SetPlaybackGain { .. }) => return current,
+            Some(PlaybackRuntimeCommand::SetPlaybackGain { .. })
+            | Some(PlaybackRuntimeCommand::SetPlaybackGainFor { .. }) => return current,
         }
     }
 }
@@ -1502,6 +1577,21 @@ fn coalesce_repeated_playback_gain_command(
     current
 }
 
+fn coalesce_repeated_scoped_playback_gain_command(
+    mut current: PlaybackRuntimeCommand,
+    pending: &mut VecDeque<PlaybackRuntimeCommand>,
+) -> PlaybackRuntimeCommand {
+    while let Some(next) = pending.front() {
+        if !same_coalescing_class(&current, next) {
+            break;
+        }
+        current = pending
+            .pop_front()
+            .expect("pending scoped playback gain command");
+    }
+    current
+}
+
 fn command_to_coalesced(command: PlaybackRuntimeCommand) -> CoalescedCommand {
     match command {
         PlaybackRuntimeCommand::Play { id, request } => CoalescedCommand::Play { id, request },
@@ -1524,6 +1614,13 @@ fn command_to_coalesced(command: PlaybackRuntimeCommand) -> CoalescedCommand {
         } => CoalescedCommand::SetPlaybackGain {
             gain,
             normalization,
+        },
+        PlaybackRuntimeCommand::SetPlaybackGainFor {
+            expected_playback_id,
+            gain,
+        } => CoalescedCommand::SetPlaybackGainFor {
+            expected_playback_id,
+            gain,
         },
         PlaybackRuntimeCommand::Shutdown => CoalescedCommand::Shutdown,
     }
@@ -1763,6 +1860,7 @@ mod tests {
         outcomes: Vec<FakeOutcome>,
         played: Arc<Mutex<Vec<PlaybackRuntimeMode>>>,
         retargeted: Arc<Mutex<Vec<PlaybackRuntimeSpanUpdate>>>,
+        playback_gains: Arc<Mutex<Vec<(f32, Option<PlaybackRuntimeGainNormalization>)>>>,
         stopped: Arc<Mutex<usize>>,
         stop_error: Option<&'static str>,
         progress: Arc<Mutex<PlaybackRuntimeProgress>>,
@@ -1787,6 +1885,7 @@ mod tests {
                 outcomes,
                 played: Arc::new(Mutex::new(Vec::new())),
                 retargeted: Arc::new(Mutex::new(Vec::new())),
+                playback_gains: Arc::new(Mutex::new(Vec::new())),
                 stopped: Arc::new(Mutex::new(0)),
                 stop_error: None,
                 progress: Arc::new(Mutex::new(PlaybackRuntimeProgress {
@@ -1809,6 +1908,12 @@ mod tests {
 
         fn retargeted(&self) -> Arc<Mutex<Vec<PlaybackRuntimeSpanUpdate>>> {
             Arc::clone(&self.retargeted)
+        }
+
+        fn playback_gains(
+            &self,
+        ) -> Arc<Mutex<Vec<(f32, Option<PlaybackRuntimeGainNormalization>)>>> {
+            Arc::clone(&self.playback_gains)
         }
 
         fn dropped(&self) -> Arc<AtomicBool> {
@@ -1949,14 +2054,313 @@ mod tests {
 
         fn set_playback_gain(
             &mut self,
-            _gain: f32,
-            _normalization: Option<PlaybackRuntimeGainNormalization>,
+            gain: f32,
+            normalization: Option<PlaybackRuntimeGainNormalization>,
         ) {
+            self.playback_gains
+                .lock()
+                .expect("playback gains lock")
+                .push((gain, normalization));
         }
 
         fn progress(&mut self) -> PlaybackRuntimeProgress {
             self.progress.lock().expect("progress lock").clone()
         }
+    }
+
+    #[test]
+    fn playback_runtime_applies_scoped_gain_only_for_current_playback() {
+        let executor = FakeExecutor::new(vec![]);
+        let playback_gains = executor.playback_gains();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        runtime
+            .handle
+            .try_set_playback_gain_for(playback_id, 0.5)
+            .expect("scoped gain");
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        assert!(matches!(
+            runtime.events.recv().expect("poll event"),
+            PlaybackRuntimeEvent::Progress { id, .. } if id == poll_id
+        ));
+
+        assert_eq!(
+            playback_gains.lock().expect("playback gains").as_slice(),
+            &[(0.5, None)]
+        );
+    }
+
+    #[test]
+    fn playback_runtime_discards_scoped_gain_after_replacement_or_stop() {
+        let executor = FakeExecutor::new(vec![]);
+        let playback_gains = executor.playback_gains();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let first_playback_id = runtime
+            .handle
+            .try_play(test_request(0.0))
+            .expect("first play");
+        assert!(matches!(
+            runtime.events.recv().expect("first started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. })
+                if id == first_playback_id
+        ));
+        let second_playback_id = runtime
+            .handle
+            .try_play(test_request(0.2))
+            .expect("second play");
+        assert!(matches!(
+            runtime.events.recv().expect("second started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. })
+                if id == second_playback_id
+        ));
+
+        runtime
+            .handle
+            .try_set_playback_gain_for(first_playback_id, 0.5)
+            .expect("stale scoped gain");
+        let replacement_poll_id = runtime
+            .handle
+            .try_poll_progress()
+            .expect("replacement poll");
+        assert!(matches!(
+            runtime.events.recv().expect("replacement poll event"),
+            PlaybackRuntimeEvent::Progress { id, .. } if id == replacement_poll_id
+        ));
+        assert!(playback_gains.lock().expect("playback gains").is_empty());
+
+        let stop_id = runtime.handle.try_stop().expect("stop");
+        assert!(matches!(
+            runtime.events.recv().expect("stop event"),
+            PlaybackRuntimeEvent::Stopped { id } if id == stop_id
+        ));
+        runtime
+            .handle
+            .try_set_playback_gain_for(second_playback_id, 0.75)
+            .expect("post-stop scoped gain");
+        let stopped_poll_id = runtime.handle.try_poll_progress().expect("stopped poll");
+        assert!(matches!(
+            runtime.events.recv().expect("stopped poll event"),
+            PlaybackRuntimeEvent::Progress { id, .. } if id == stopped_poll_id
+        ));
+        assert!(playback_gains.lock().expect("playback gains").is_empty());
+    }
+
+    #[test]
+    fn coalescing_scoped_playback_gain_preserves_identity_and_barriers() {
+        let expected_playback_id = PlaybackRequestId(7);
+        let newer_playback_id = PlaybackRequestId(8);
+        let (coalesced, pending, events) = coalesce_for_test(
+            scoped_playback_gain_command(expected_playback_id, 0.5),
+            vec![scoped_playback_gain_command(expected_playback_id, 0.75)],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            } if id == expected_playback_id && gain == 0.75
+        ));
+        assert!(pending.is_empty());
+        assert!(events.is_empty());
+
+        let (coalesced, pending, events) = coalesce_for_test(
+            scoped_playback_gain_command(expected_playback_id, 0.5),
+            vec![scoped_playback_gain_command(newer_playback_id, 0.75)],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            } if id == expected_playback_id && gain == 0.5
+        ));
+        assert!(matches!(
+            pending.as_slice(),
+            [PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            }] if *id == newer_playback_id && *gain == 0.75
+        ));
+        assert!(events.is_empty());
+
+        let (coalesced, pending, events) = coalesce_for_test(
+            scoped_playback_gain_command(expected_playback_id, 0.5),
+            vec![PlaybackRuntimeCommand::SetPlaybackGain {
+                gain: 0.75,
+                normalization: None,
+            }],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            } if id == expected_playback_id && gain == 0.5
+        ));
+        assert!(matches!(
+            pending.as_slice(),
+            [PlaybackRuntimeCommand::SetPlaybackGain { gain, normalization: None }]
+                if *gain == 0.75
+        ));
+        assert!(events.is_empty());
+
+        let (coalesced, pending, events) = coalesce_for_test(
+            scoped_playback_gain_command(expected_playback_id, 0.5),
+            vec![play_command(PlaybackRequestId(9), 0.4)],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            } if id == expected_playback_id && gain == 0.5
+        ));
+        assert!(matches!(
+            pending.as_slice(),
+            [PlaybackRuntimeCommand::Play { id, .. }] if *id == PlaybackRequestId(9)
+        ));
+        assert!(events.is_empty());
+
+        let (coalesced, pending, events) = coalesce_for_test(
+            scoped_playback_gain_command(expected_playback_id, 0.5),
+            vec![PlaybackRuntimeCommand::Stop {
+                id: PlaybackRequestId(10),
+            }],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            } if id == expected_playback_id && gain == 0.5
+        ));
+        assert!(matches!(
+            pending.as_slice(),
+            [PlaybackRuntimeCommand::Stop { id }] if *id == PlaybackRequestId(10)
+        ));
+        assert!(events.is_empty());
+
+        let (coalesced, pending, events) = coalesce_for_test(
+            scoped_playback_gain_command(expected_playback_id, 0.5),
+            vec![retarget_command(PlaybackRequestId(11), 0.1, 0.6)],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            } if id == expected_playback_id && gain == 0.5
+        ));
+        assert!(matches!(
+            pending.as_slice(),
+            [PlaybackRuntimeCommand::RetargetSpan { id, .. }] if *id == PlaybackRequestId(11)
+        ));
+        assert!(events.is_empty());
+
+        let (coalesced, pending, events) = coalesce_for_test(
+            play_command(PlaybackRequestId(12), 0.0),
+            vec![scoped_playback_gain_command(expected_playback_id, 0.5)],
+        );
+        assert!(matches!(
+            coalesced,
+            CoalescedCommand::Play { id, .. } if id == PlaybackRequestId(12)
+        ));
+        assert!(matches!(
+            pending.as_slice(),
+            [PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: id,
+                gain,
+            }] if *id == expected_playback_id && *gain == 0.5
+        ));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn playback_runtime_queue_preserves_scoped_gain_order_across_scopes_and_barriers() {
+        let queue = PlaybackRuntimeCommandQueue::new(3);
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(1), 0.5))
+            .expect("first scoped gain");
+        queue
+            .try_submit(play_command(PlaybackRequestId(2), 0.0))
+            .expect("play barrier");
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(1), 0.75))
+            .expect("scoped gain after play barrier");
+        assert!(matches!(
+            queue.try_recv().expect("first scoped gain"),
+            PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: PlaybackRequestId(1),
+                gain: 0.5,
+            }
+        ));
+        assert!(matches!(
+            queue.try_recv().expect("play barrier"),
+            PlaybackRuntimeCommand::Play {
+                id: PlaybackRequestId(2),
+                ..
+            }
+        ));
+        assert!(matches!(
+            queue.try_recv().expect("second scoped gain"),
+            PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: PlaybackRequestId(1),
+                gain: 0.75,
+            }
+        ));
+
+        let queue = PlaybackRuntimeCommandQueue::new(3);
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(1), 0.5))
+            .expect("first scoped gain");
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(2), 0.75))
+            .expect("different scoped gain");
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(1), 1.0))
+            .expect("scoped gain after different scope");
+        assert!(matches!(
+            queue.try_recv().expect("first scoped gain"),
+            PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: PlaybackRequestId(1),
+                gain: 0.5,
+            }
+        ));
+        assert!(matches!(
+            queue.try_recv().expect("different scoped gain"),
+            PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: PlaybackRequestId(2),
+                gain: 0.75,
+            }
+        ));
+        assert!(matches!(
+            queue.try_recv().expect("second scoped gain"),
+            PlaybackRuntimeCommand::SetPlaybackGainFor {
+                expected_playback_id: PlaybackRequestId(1),
+                gain: 1.0,
+            }
+        ));
+
+        let queue = PlaybackRuntimeCommandQueue::new(2);
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(1), 0.5))
+            .expect("first scoped gain");
+        queue
+            .try_submit(scoped_playback_gain_command(PlaybackRequestId(2), 0.75))
+            .expect("different scoped gain");
+        assert_eq!(
+            queue.try_submit(scoped_playback_gain_command(PlaybackRequestId(1), 1.0)),
+            Err(PlaybackRuntimeSubmitError::QueueFull)
+        );
     }
 
     #[test]
@@ -2250,6 +2654,10 @@ mod tests {
                 gain: 0.5,
                 normalization: None,
             }),
+            Err(PlaybackRuntimeSubmitError::QueueFull)
+        );
+        assert_eq!(
+            queue.try_submit(scoped_playback_gain_command(PlaybackRequestId(5), 0.5)),
             Err(PlaybackRuntimeSubmitError::QueueFull)
         );
     }
@@ -3157,6 +3565,16 @@ mod tests {
         PlaybackRuntimeCommand::Play {
             id,
             request: test_request(start),
+        }
+    }
+
+    fn scoped_playback_gain_command(
+        expected_playback_id: PlaybackRequestId,
+        gain: f32,
+    ) -> PlaybackRuntimeCommand {
+        PlaybackRuntimeCommand::SetPlaybackGainFor {
+            expected_playback_id,
+            gain,
         }
     }
 
