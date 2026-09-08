@@ -173,12 +173,21 @@ pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize =
 /// Maximum UTF-8 byte length of a curation tag label before identity normalization.
 pub const MAX_CURATION_TAG_LABEL_BYTES: usize = curation::MAX_CURATION_TAG_LABEL_BYTES;
 
-/// Maximum estimated selected-path input retained by admitted catalog commands.
+/// Maximum estimated tag-query input retained by admitted catalog commands.
 ///
-/// The estimate includes each path's encoded bytes and its in-memory `PathBuf` container. It is
-/// borrowed while a command remains queued or is being processed, then released when processing
-/// ends so tag-page input retention is independent of event and durable-curation credits.
+/// The estimate includes selected paths' encoded bytes and in-memory `PathBuf` containers, or
+/// required tag tokens' raw bytes and in-memory `String` containers. It is borrowed while a
+/// command remains queued or is being processed, then released when processing ends so tag-query
+/// input retention is independent of event and durable-curation credits.
 pub const MAX_TAG_PAGE_INPUT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum mask storage admitted for one source tag-filter result.
+pub const MAX_TAG_FILTER_MASK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum aggregate source tag-filter result payload retained across queued outcomes.
+pub const MAX_TAG_FILTER_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+const TAG_FILTER_PAYLOAD_METADATA_BYTES: usize = 1024;
 
 pub use curation::{
     CatalogCurationRequestError, SourceCurationOperationFailure, SourceCurationOperationFence,
@@ -240,6 +249,26 @@ pub enum CatalogCommand {
         after_cursor: Option<SourceTagPageCursor>,
         /// Requested page size. Values outside the library bound are rejected at admission.
         page_limit: usize,
+    },
+    /// Read a compact positional mask of source paths carrying every required tag.
+    ///
+    /// Tag filters are ephemeral reads. A superseded, removed, or canceled lifecycle may discard
+    /// the request without publishing a completion event. The expected manifest length binds the
+    /// returned words to one retained snapshot. The mask allocation bound is checked before
+    /// admission; the retained manifest length and source identity are fenced by the worker.
+    RequestTagFilter {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Generation that must still own the source when the request publishes.
+        lifecycle_generation: u64,
+        /// Retained catalog revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Exact retained manifest length addressed by the result mask.
+        expected_manifest_len: usize,
+        /// Required source-tag identities before library normalization.
+        required_tags: Vec<String>,
     },
     /// Apply one durable, revision-fenced source curation batch.
     ///
@@ -365,6 +394,53 @@ pub enum CatalogTagPageRequestError {
     },
 }
 
+/// Why a source tag-filter request could not be admitted.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogTagFilterRequestError {
+    /// The request contained more required tags than the bounded library query accepts.
+    #[error("tag-filter request contains {actual} tokens; maximum is {max}")]
+    TooManyTokens {
+        /// Maximum admitted required-token count.
+        max: usize,
+        /// Supplied required-token count.
+        actual: usize,
+    },
+    /// One required tag exceeded the bounded raw UTF-8 byte limit.
+    #[error("tag-filter token is {actual} UTF-8 bytes; maximum is {max}")]
+    TokenTooLong {
+        /// Maximum admitted raw token bytes.
+        max: usize,
+        /// Supplied raw token bytes.
+        actual: usize,
+    },
+    /// Aggregate raw required-tag input exceeded the bounded byte limit.
+    #[error("tag-filter input is {actual} UTF-8 bytes; maximum is {max}")]
+    InputBytesTooLarge {
+        /// Maximum aggregate raw input bytes.
+        max: usize,
+        /// Supplied aggregate raw input bytes.
+        actual: usize,
+    },
+    /// The result mask for the requested manifest would exceed its per-request allocation bound.
+    #[error(
+        "tag-filter mask for {manifest_len} manifest entries uses {actual_bytes} bytes; maximum is {max_bytes}"
+    )]
+    MaskTooLarge {
+        /// Manifest length used to derive the mask size.
+        manifest_len: usize,
+        /// Checked mask byte size.
+        actual_bytes: usize,
+        /// Maximum admitted mask bytes.
+        max_bytes: usize,
+    },
+    /// The requested manifest length could not be converted to a checked mask word count.
+    #[error("tag-filter manifest length {manifest_len} cannot be represented safely")]
+    ManifestLengthOverflow {
+        /// Unrepresentable manifest length supplied by the caller.
+        manifest_len: usize,
+    },
+}
+
 /// Why a lazy WAV metadata request could not be admitted.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogWavMetadataRequestError {
@@ -404,6 +480,9 @@ pub enum CatalogSubmitError {
     /// A lazy tag-page request failed bounded input admission.
     #[error("invalid tag-page request: {0}")]
     InvalidTagPageRequest(#[from] CatalogTagPageRequestError),
+    /// A source tag-filter request failed bounded input admission.
+    #[error("invalid tag-filter request: {0}")]
+    InvalidTagFilterRequest(#[from] CatalogTagFilterRequestError),
     /// A durable curation request failed bounded or lifecycle admission.
     #[error("invalid source curation request: {0}")]
     InvalidCurationRequest(#[from] CatalogCurationRequestError),
@@ -468,6 +547,24 @@ pub enum CatalogError {
         source_id: SourceId,
         /// Missing source-relative path.
         path: PathBuf,
+    },
+    /// A tag-filter result contained a live source path outside the retained manifest snapshot.
+    #[error("tag-filter result is not coherent with the retained snapshot for {source_id}")]
+    TagFilterSnapshotMismatch {
+        /// Source whose retained manifest was queried.
+        source_id: SourceId,
+        /// Manifest length captured by the request.
+        expected_manifest_len: usize,
+    },
+    /// A source tag-filter request named a manifest length different from the retained snapshot.
+    #[error(
+        "tag-filter manifest length mismatch: expected {expected}, retained snapshot has {actual}"
+    )]
+    TagFilterManifestLengthMismatch {
+        /// Manifest length supplied by the caller.
+        expected: usize,
+        /// Manifest length retained by the catalog worker.
+        actual: usize,
     },
     /// A compound curation operation named a predecessor that is not the latest full success.
     #[error("curation predecessor operation {request_id} is unavailable for {source_id}")]
@@ -635,6 +732,40 @@ pub enum CatalogEvent {
         /// Typed failure.
         error: CatalogError,
     },
+    /// A bounded source-tag filter completed with a positional match mask.
+    TagFilterReady {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the mask.
+        lifecycle_generation: u64,
+        /// Physical source-root identity checked by the tag read.
+        root_identity: RootIdentity,
+        /// Active directory generation represented by the retained snapshot.
+        directory_generation: u64,
+        /// Catalog revision represented by the mask.
+        revision: u64,
+        /// Exact manifest length addressed by `mask`.
+        manifest_len: usize,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// One bit per manifest entry, in retained manifest order.
+        mask: Vec<u64>,
+    },
+    /// A bounded source-tag filter failed after admission.
+    TagFilterFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Revision required by the request.
+        expected_revision: u64,
+        /// Revision observed before a typed failure, when available.
+        observed_revision: Option<u64>,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
+    },
     /// A durable curation batch committed and returned its bounded metadata patch.
     CurationCommitted {
         /// Stable source identifier.
@@ -722,6 +853,7 @@ struct AdmissionState {
     curation_payload_bytes: usize,
     curation_update_count: usize,
     tag_page_input_bytes: usize,
+    tag_filter_payload_bytes: usize,
     sources: HashMap<SourceId, DesiredSource>,
 }
 
@@ -734,6 +866,7 @@ impl AdmissionState {
             curation_payload_bytes: 0,
             curation_update_count: 0,
             tag_page_input_bytes: 0,
+            tag_filter_payload_bytes: 0,
             sources: HashMap::new(),
         }
     }
@@ -757,6 +890,7 @@ struct QueuedEvent {
     event: CatalogEvent,
     curation_payload_bytes: usize,
     curation_update_count: usize,
+    tag_filter_payload_bytes: usize,
 }
 
 struct CommandInputReservation<'a> {
@@ -798,6 +932,7 @@ impl EventHub {
         event: CatalogEvent,
         curation_payload_bytes: usize,
         curation_update_count: usize,
+        tag_filter_payload_bytes: usize,
     ) -> bool {
         let mut queue = self
             .queue
@@ -810,6 +945,7 @@ impl EventHub {
             event,
             curation_payload_bytes,
             curation_update_count,
+            tag_filter_payload_bytes,
         });
         self.wake.notify_one();
         true
@@ -824,7 +960,7 @@ impl EventHub {
         self.wake.notify_all();
     }
 
-    fn try_recv(&self) -> Result<(CatalogEvent, usize, usize), TryRecvError> {
+    fn try_recv(&self) -> Result<(CatalogEvent, usize, usize, usize), TryRecvError> {
         let mut queue = self
             .queue
             .lock()
@@ -834,6 +970,7 @@ impl EventHub {
                 event.event,
                 event.curation_payload_bytes,
                 event.curation_update_count,
+                event.tag_filter_payload_bytes,
             ));
         }
         if queue.closed {
@@ -846,7 +983,7 @@ impl EventHub {
     fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<(CatalogEvent, usize, usize), mpsc::RecvTimeoutError> {
+    ) -> Result<(CatalogEvent, usize, usize, usize), mpsc::RecvTimeoutError> {
         let mut queue = self
             .queue
             .lock()
@@ -856,6 +993,7 @@ impl EventHub {
                 event.event,
                 event.curation_payload_bytes,
                 event.curation_update_count,
+                event.tag_filter_payload_bytes,
             ));
         }
         if queue.closed {
@@ -870,6 +1008,7 @@ impl EventHub {
                 event.event,
                 event.curation_payload_bytes,
                 event.curation_update_count,
+                event.tag_filter_payload_bytes,
             ));
         }
         if queue.closed {
@@ -889,6 +1028,7 @@ struct EventReservation<'a> {
     remaining: usize,
     curation_payload_bytes: usize,
     curation_update_count: usize,
+    tag_filter_payload_bytes: usize,
 }
 
 impl EventReservation<'_> {
@@ -898,18 +1038,21 @@ impl EventReservation<'_> {
                 event,
                 self.curation_payload_bytes,
                 self.curation_update_count,
+                self.tag_filter_payload_bytes,
             ),
             "catalog event capacity accounting invariant violated"
         );
         self.remaining = self.remaining.saturating_sub(1);
         self.curation_payload_bytes = 0;
         self.curation_update_count = 0;
+        self.tag_filter_payload_bytes = 0;
     }
 
     fn finish(self) {
         if self.remaining == 0
             && self.curation_payload_bytes == 0
             && self.curation_update_count == 0
+            && self.tag_filter_payload_bytes == 0
         {
             return;
         }
@@ -924,6 +1067,9 @@ impl EventReservation<'_> {
         state.curation_update_count = state
             .curation_update_count
             .saturating_sub(self.curation_update_count);
+        state.tag_filter_payload_bytes = state
+            .tag_filter_payload_bytes
+            .saturating_sub(self.tag_filter_payload_bytes);
     }
 }
 
@@ -957,9 +1103,76 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
         CatalogCommand::RequestTagPage {
             query, page_limit, ..
         } => validate_tag_page_request(query, *page_limit)?,
+        CatalogCommand::RequestTagFilter {
+            expected_manifest_len,
+            required_tags,
+            ..
+        } => validate_tag_filter_request(*expected_manifest_len, required_tags)?,
         _ => {}
     }
     Ok(())
+}
+
+fn validate_tag_filter_request(
+    expected_manifest_len: usize,
+    required_tags: &[String],
+) -> Result<(), CatalogSubmitError> {
+    if required_tags.len() > wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_TAGS {
+        return Err(CatalogSubmitError::InvalidTagFilterRequest(
+            CatalogTagFilterRequestError::TooManyTokens {
+                max: wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_TAGS,
+                actual: required_tags.len(),
+            },
+        ));
+    }
+    let mut input_bytes = 0usize;
+    for required_tag in required_tags {
+        let actual = required_tag.len();
+        if actual > wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_TOKEN_BYTES {
+            return Err(CatalogSubmitError::InvalidTagFilterRequest(
+                CatalogTagFilterRequestError::TokenTooLong {
+                    max: wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_TOKEN_BYTES,
+                    actual,
+                },
+            ));
+        }
+        input_bytes = input_bytes.saturating_add(actual);
+        if input_bytes > wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_INPUT_BYTES {
+            return Err(CatalogSubmitError::InvalidTagFilterRequest(
+                CatalogTagFilterRequestError::InputBytesTooLarge {
+                    max: wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_INPUT_BYTES,
+                    actual: input_bytes,
+                },
+            ));
+        }
+    }
+    checked_tag_filter_mask_words(expected_manifest_len)
+        .map(|_| ())
+        .map_err(CatalogSubmitError::InvalidTagFilterRequest)
+}
+
+fn checked_tag_filter_mask_words(
+    expected_manifest_len: usize,
+) -> Result<usize, CatalogTagFilterRequestError> {
+    let words = expected_manifest_len
+        .checked_add(63)
+        .map(|rounded| rounded / 64)
+        .ok_or_else(|| CatalogTagFilterRequestError::ManifestLengthOverflow {
+            manifest_len: expected_manifest_len,
+        })?;
+    let actual_bytes = words.checked_mul(std::mem::size_of::<u64>()).ok_or(
+        CatalogTagFilterRequestError::ManifestLengthOverflow {
+            manifest_len: expected_manifest_len,
+        },
+    )?;
+    if actual_bytes > MAX_TAG_FILTER_MASK_BYTES {
+        return Err(CatalogTagFilterRequestError::MaskTooLarge {
+            manifest_len: expected_manifest_len,
+            actual_bytes,
+            max_bytes: MAX_TAG_FILTER_MASK_BYTES,
+        });
+    }
+    Ok(words)
 }
 
 fn validate_tag_page_request(
@@ -1043,6 +1256,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestTagPage { .. }
+        | CatalogCommand::RequestTagFilter { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
         | CatalogCommand::ReadSnapshot { .. }
@@ -1077,13 +1291,25 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
 }
 
 fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
-    let CatalogCommand::RequestTagPage { query, .. } = command else {
-        return 0;
-    };
-    let CatalogTagPageQuery::SelectedPaths { relative_paths } = query else {
-        return 0;
-    };
-    selected_paths_input_bytes(relative_paths)
+    match command {
+        CatalogCommand::RequestTagPage { query, .. } => {
+            let CatalogTagPageQuery::SelectedPaths { relative_paths } = query else {
+                return 0;
+            };
+            selected_paths_input_bytes(relative_paths)
+        }
+        CatalogCommand::RequestTagFilter { required_tags, .. } => {
+            let raw_bytes = required_tags
+                .iter()
+                .fold(0usize, |total, tag| total.saturating_add(tag.len()));
+            raw_bytes.saturating_add(
+                required_tags
+                    .len()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+        }
+        _ => 0,
+    }
 }
 
 fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
@@ -1097,6 +1323,21 @@ fn selected_paths_input_bytes(relative_paths: &[PathBuf]) -> usize {
     )
 }
 
+fn command_tag_filter_payload_bytes(command: &CatalogCommand) -> Result<usize, CatalogSubmitError> {
+    let CatalogCommand::RequestTagFilter {
+        expected_manifest_len,
+        ..
+    } = command
+    else {
+        return Ok(0);
+    };
+    let words = checked_tag_filter_mask_words(*expected_manifest_len)
+        .map_err(CatalogSubmitError::InvalidTagFilterRequest)?;
+    Ok(words
+        .saturating_mul(std::mem::size_of::<u64>())
+        .saturating_add(TAG_FILTER_PAYLOAD_METADATA_BYTES))
+}
+
 #[derive(Clone)]
 enum AdmissionAction {
     Register {
@@ -1106,6 +1347,7 @@ enum AdmissionAction {
     RequestAudit,
     RequestWavMetadata,
     RequestTagPage,
+    RequestTagFilter,
     ApplyCuration,
     ApplyCurationOperation {
         source_id: SourceId,
@@ -1132,6 +1374,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestAudit { .. } => AdmissionAction::RequestAudit,
         CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::RequestTagPage { .. } => AdmissionAction::RequestTagPage,
+        CatalogCommand::RequestTagFilter { .. } => AdmissionAction::RequestTagFilter,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
             source_id,
@@ -1212,6 +1455,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         AdmissionAction::RequestAudit
         | AdmissionAction::RequestWavMetadata
         | AdmissionAction::RequestTagPage
+        | AdmissionAction::RequestTagFilter
         | AdmissionAction::ApplyCuration
         | AdmissionAction::ReadSnapshot => {}
         AdmissionAction::ApplyCurationOperation {
@@ -1409,6 +1653,7 @@ impl CatalogService {
         let curation_payload_bytes = command_curation_payload_bytes(&command);
         let curation_update_count = command_curation_update_count(&command);
         let tag_page_input_bytes = command_tag_page_input_bytes(&command);
+        let tag_filter_payload_bytes = command_tag_filter_payload_bytes(&command)?;
         if admission
             .tag_page_input_bytes
             .saturating_add(tag_page_input_bytes)
@@ -1430,9 +1675,19 @@ impl CatalogService {
         {
             return Err(CatalogSubmitError::Full);
         }
+        if admission
+            .tag_filter_payload_bytes
+            .saturating_add(tag_filter_payload_bytes)
+            > MAX_TAG_FILTER_PAYLOAD_BYTES
+        {
+            return Err(CatalogSubmitError::Full);
+        }
         admission.tag_page_input_bytes = admission
             .tag_page_input_bytes
             .saturating_add(tag_page_input_bytes);
+        admission.tag_filter_payload_bytes = admission
+            .tag_filter_payload_bytes
+            .saturating_add(tag_filter_payload_bytes);
         match self.commands.try_send(command) {
             Ok(()) => {
                 admission.event_budget += event_budget;
@@ -1445,12 +1700,18 @@ impl CatalogService {
                 admission.tag_page_input_bytes = admission
                     .tag_page_input_bytes
                     .saturating_sub(tag_page_input_bytes);
+                admission.tag_filter_payload_bytes = admission
+                    .tag_filter_payload_bytes
+                    .saturating_sub(tag_filter_payload_bytes);
                 Err(CatalogSubmitError::Full)
             }
             Err(TrySendError::Disconnected(_)) => {
                 admission.tag_page_input_bytes = admission
                     .tag_page_input_bytes
                     .saturating_sub(tag_page_input_bytes);
+                admission.tag_filter_payload_bytes = admission
+                    .tag_filter_payload_bytes
+                    .saturating_sub(tag_filter_payload_bytes);
                 admission.closed = true;
                 Err(CatalogSubmitError::Closed)
             }
@@ -1459,8 +1720,13 @@ impl CatalogService {
 
     /// Read the next worker event without blocking.
     pub fn try_recv_event(&self) -> Result<CatalogEvent, TryRecvError> {
-        let (event, curation_payload_bytes, curation_update_count) = self.events.try_recv()?;
-        self.release_event_credit(curation_payload_bytes, curation_update_count);
+        let (event, curation_payload_bytes, curation_update_count, tag_filter_payload_bytes) =
+            self.events.try_recv()?;
+        self.release_event_credit(
+            curation_payload_bytes,
+            curation_update_count,
+            tag_filter_payload_bytes,
+        );
         Ok(event)
     }
 
@@ -1469,13 +1735,22 @@ impl CatalogService {
         &self,
         timeout: Duration,
     ) -> Result<CatalogEvent, mpsc::RecvTimeoutError> {
-        let (event, curation_payload_bytes, curation_update_count) =
+        let (event, curation_payload_bytes, curation_update_count, tag_filter_payload_bytes) =
             self.events.recv_timeout(timeout)?;
-        self.release_event_credit(curation_payload_bytes, curation_update_count);
+        self.release_event_credit(
+            curation_payload_bytes,
+            curation_update_count,
+            tag_filter_payload_bytes,
+        );
         Ok(event)
     }
 
-    fn release_event_credit(&self, curation_payload_bytes: usize, curation_update_count: usize) {
+    fn release_event_credit(
+        &self,
+        curation_payload_bytes: usize,
+        curation_update_count: usize,
+        tag_filter_payload_bytes: usize,
+    ) {
         let mut admission = self
             .admission
             .lock()
@@ -1487,6 +1762,9 @@ impl CatalogService {
         admission.curation_update_count = admission
             .curation_update_count
             .saturating_sub(curation_update_count);
+        admission.tag_filter_payload_bytes = admission
+            .tag_filter_payload_bytes
+            .saturating_sub(tag_filter_payload_bytes);
     }
 
     /// Request cancellation and synchronously join the worker.
@@ -1555,6 +1833,8 @@ fn run_worker(
             remaining: reserved_events,
             curation_payload_bytes: command_curation_payload_bytes(&command),
             curation_update_count: command_curation_update_count(&command),
+            tag_filter_payload_bytes: command_tag_filter_payload_bytes(&command)
+                .expect("validated tag-filter command has a bounded mask"),
         };
         if closing && !curation::is_durable(&command) {
             reservation.finish();
@@ -1580,7 +1860,7 @@ fn run_worker(
         state.closed = true;
     }
     assert!(
-        events.send(CatalogEvent::Closed, 0, 0),
+        events.send(CatalogEvent::Closed, 0, 0, 0),
         "catalog event capacity accounting invariant violated while closing"
     );
     events.close();
@@ -1661,6 +1941,28 @@ fn handle_command(
                 query,
                 after_cursor,
                 page_limit,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::RequestTagFilter {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            expected_manifest_len,
+            required_tags,
+        } => {
+            request_tag_filter(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                expected_manifest_len,
+                required_tags,
                 profile_guard,
                 reservation,
                 admission,
@@ -1829,6 +2131,98 @@ fn request_tag_page(
             );
         }
         Err(error) => emit_tag_page_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            Some(&token),
+            error,
+        ),
+    }
+}
+
+fn request_tag_filter(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    expected_manifest_len: usize,
+    required_tags: Vec<String>,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let Some(current_generation) = sources
+        .get(&source_id)
+        .map(|source| source.lifecycle_generation)
+    else {
+        emit_tag_filter_failure(
+            reservation,
+            admission,
+            source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            CatalogError::NotRegistered(source_id.clone()),
+        );
+        return;
+    };
+    if let Err(error) = ensure_generation(&source_id, current_generation, lifecycle_generation) {
+        emit_tag_filter_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            error,
+        );
+        return;
+    }
+    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+        return;
+    };
+    let Some(source) = sources.get_mut(&source_id) else {
+        return;
+    };
+    source.attempt_token = Some(Arc::clone(&token));
+    let result = tags::read_filter(
+        source,
+        &source_id,
+        lifecycle_generation,
+        expected_revision,
+        expected_manifest_len,
+        &required_tags,
+        &token,
+        admission,
+        profile_guard,
+    );
+    match result {
+        Ok(patch) => {
+            let _ = publish_if_current(
+                admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                Some(&token),
+                CatalogEvent::TagFilterReady {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    root_identity: patch.root_identity,
+                    directory_generation: patch.directory_generation,
+                    revision: patch.revision,
+                    manifest_len: patch.manifest_len,
+                    request_id,
+                    mask: patch.mask,
+                },
+            );
+        }
+        Err(error) => emit_tag_filter_failure(
             reservation,
             admission,
             source_id,
@@ -2851,6 +3245,37 @@ fn emit_tag_page_failure(
     );
 }
 
+fn emit_tag_filter_failure(
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    token: Option<&Arc<AtomicBool>>,
+    error: CatalogError,
+) {
+    let observed_revision = match &error {
+        CatalogError::StaleRevision { actual, .. } => Some(*actual),
+        _ => None,
+    };
+    let _ = publish_if_current(
+        admission,
+        reservation,
+        &source_id,
+        lifecycle_generation,
+        token,
+        CatalogEvent::TagFilterFailed {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            observed_revision,
+            request_id,
+            error,
+        },
+    );
+}
+
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
     match error {
         SourceDbError::InvalidTagId { tag_id } => CatalogError::InvalidTagId { tag_id },
@@ -3404,6 +3829,540 @@ mod tests {
             } if event_source == source_id && page.entries.is_empty()
         ));
         service.shutdown();
+    }
+
+    #[test]
+    fn tag_filter_publishes_exact_manifest_mask_and_fences_metadata() {
+        let fixture = Fixture::new("catalog-tag-filter-mask");
+        for index in 0..130 {
+            write_test_wav(
+                &fixture.root.path().join(format!("{index:03}.wav")),
+                16_000,
+                4,
+            );
+        }
+        let source_id = SourceId::from_string("source-tag-filter-mask");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        assert_eq!(snapshot.manifest.len(), 130);
+
+        let tagged_indices = [1_usize, 65, 129];
+        let updates = tagged_indices
+            .iter()
+            .map(|index| SourceCurationUpdate::AddTag {
+                path: RootRelativePath::try_from_path(PathBuf::from(format!("{index:03}.wav")))
+                    .expect("relative tag path"),
+                label: String::from("DrUm"),
+            })
+            .collect();
+        let receipt = apply_curation_updates(&service, &source_id, &snapshot, 1_401, updates);
+        let revision = receipt.source_revision();
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 1_402,
+                expected_manifest_len: snapshot.manifest.len(),
+                required_tags: vec![String::from("dRuM")],
+            })
+            .expect("tag-filter request");
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagFilterReady {
+                    request_id: 1_402,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::TagFilterReady {
+            source_id: event_source,
+            lifecycle_generation,
+            root_identity,
+            directory_generation,
+            revision: event_revision,
+            manifest_len,
+            request_id: 1_402,
+            mask,
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(event_source, source_id);
+        assert_eq!(lifecycle_generation, 1);
+        assert_eq!(root_identity, snapshot.root_identity);
+        assert_eq!(directory_generation, snapshot.directory_generation);
+        assert_eq!(event_revision, revision);
+        assert_eq!(manifest_len, snapshot.manifest.len());
+        assert_eq!(mask.len(), 3);
+
+        for index in 0..snapshot.manifest.len() {
+            let actual = (mask[index / 64] >> (index % 64)) & 1;
+            let expected = if tagged_indices.contains(&index) {
+                1
+            } else {
+                0
+            };
+            assert_eq!(actual, expected, "unexpected tag-filter bit at {index}");
+        }
+        let valid_tail = (1_u64 << (snapshot.manifest.len() % 64)) - 1;
+        assert_eq!(mask[2] & !valid_tail, 0);
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                state.tag_filter_payload_bytes
+            }),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn tag_filter_admission_bounds_mask_and_retains_payload_until_consumed() {
+        let fixture = Fixture::new("catalog-tag-filter-admission");
+        let source_id = SourceId::from_string("source-tag-filter-admission");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+
+        let too_many =
+            vec![String::new(); wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_TAGS + 1];
+        assert!(matches!(
+            service.submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: 0,
+                request_id: 1_410,
+                expected_manifest_len: 0,
+                required_tags: too_many,
+            }),
+            Err(CatalogSubmitError::InvalidTagFilterRequest(
+                CatalogTagFilterRequestError::TooManyTokens { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: 0,
+                request_id: 1_410 + 1,
+                expected_manifest_len: 0,
+                required_tags: vec!["x".repeat(
+                    wavecrate_library::sample_sources::SOURCE_TAG_FILTER_MAX_TOKEN_BYTES + 1
+                )],
+            }),
+            Err(CatalogSubmitError::InvalidTagFilterRequest(
+                CatalogTagFilterRequestError::TokenTooLong { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: 0,
+                request_id: 1_411,
+                expected_manifest_len: MAX_TAG_FILTER_MASK_BYTES * 8 + 1,
+                required_tags: Vec::new(),
+            }),
+            Err(CatalogSubmitError::InvalidTagFilterRequest(
+                CatalogTagFilterRequestError::MaskTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: 0,
+                request_id: 1_412,
+                expected_manifest_len: usize::MAX,
+                required_tags: Vec::new(),
+            }),
+            Err(CatalogSubmitError::InvalidTagFilterRequest(
+                CatalogTagFilterRequestError::ManifestLengthOverflow { .. }
+            ))
+        ));
+
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register admission");
+        let expected_manifest_len = MAX_TAG_FILTER_MASK_BYTES * 8;
+        let request = |request_id| CatalogCommand::RequestTagFilter {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: 0,
+            request_id,
+            expected_manifest_len,
+            required_tags: Vec::new(),
+        };
+        let expected_payload = MAX_TAG_FILTER_MASK_BYTES + TAG_FILTER_PAYLOAD_METADATA_BYTES;
+        for request_id in 0..7 {
+            service
+                .submit(request(1_420 + request_id))
+                .expect("bounded tag-filter payload admission");
+        }
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            expected_payload * 7
+        );
+        assert_eq!(
+            service.submit(request(1_427)),
+            Err(CatalogSubmitError::Full)
+        );
+        pause.release();
+
+        let _ = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagFilterFailed {
+                    request_id: 1_420,
+                    ..
+                }
+            )
+        });
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            expected_payload * 6
+        );
+        for request_id in 1_421..1_427 {
+            let _ = receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::TagFilterFailed {
+                        request_id: received,
+                        ..
+                    } if *received == request_id
+                )
+            });
+        }
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn tag_filter_stale_revision_failure_reports_observed_revision() {
+        let fixture = Fixture::new("catalog-tag-filter-stale-revision");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-filter-stale-revision");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let expected_revision = snapshot.committed_revision + 1;
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision,
+                request_id: 1_430,
+                expected_manifest_len: snapshot.manifest.len(),
+                required_tags: Vec::new(),
+            })
+            .expect("stale tag-filter request admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagFilterFailed {
+                    request_id: 1_430,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::TagFilterFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                expected_revision: received_expected,
+                observed_revision: Some(observed_revision),
+                request_id: 1_430,
+                error: CatalogError::StaleRevision { expected, actual },
+            } if event_source == source_id
+                && received_expected == expected_revision
+                && expected == expected_revision
+                && actual == snapshot.committed_revision
+                && observed_revision == snapshot.committed_revision
+        ));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_filter_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn superseded_queued_tag_filter_discards_and_releases_both_credits() {
+        let fixture = Fixture::new("catalog-tag-filter-superseded");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-filter-superseded");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 1_440,
+                expected_manifest_len: snapshot.manifest.len(),
+                required_tags: vec![String::from("drum")],
+            })
+            .expect("tag-filter admission");
+        assert!(admission_state(&service.admission, |state| {
+            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+        }));
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("replacement admission");
+        pause.release();
+
+        let _ = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: event_source,
+                    lifecycle_generation: 2,
+                } if event_source == &source_id
+            )
+        });
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { snapshot: received } if
+                received.source_id == source_id && received.lifecycle_generation == 2
+            )
+        });
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+            }),
+            (0, 0)
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn removed_queued_tag_filter_discards_and_releases_both_credits() {
+        let fixture = Fixture::new("catalog-tag-filter-removed");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-filter-removed");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 1_450,
+                expected_manifest_len: snapshot.manifest.len(),
+                required_tags: vec![String::from("drum")],
+            })
+            .expect("tag-filter admission");
+        assert!(admission_state(&service.admission, |state| {
+            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+        }));
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("remove admission");
+        pause.release();
+
+        let _ = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed {
+                    source_id: event_source,
+                    lifecycle_generation: 1,
+                } if event_source == &source_id
+            )
+        });
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+            }),
+            (0, 0)
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn shutdown_releases_queued_tag_filter_credits_without_publishing() {
+        let fixture = Fixture::new("catalog-tag-filter-shutdown");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-filter-shutdown");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id,
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 1_460,
+                expected_manifest_len: snapshot.manifest.len(),
+                required_tags: vec![String::from("drum")],
+            })
+            .expect("tag-filter admission");
+        assert!(admission_state(&service.admission, |state| {
+            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+        }));
+        let service = Arc::new(service);
+        let shutdown_service = Arc::clone(&service);
+        let shutdown_thread = thread::spawn(move || shutdown_service.shutdown());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !admission_state(&service.admission, |state| state.shutdown) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown was not admitted"
+            );
+            thread::yield_now();
+        }
+        pause.release();
+        shutdown_thread.join().expect("catalog shutdown");
+
+        let mut saw_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            match event {
+                CatalogEvent::Closed => saw_closed = true,
+                CatalogEvent::TagFilterReady { .. } | CatalogEvent::TagFilterFailed { .. } => {
+                    panic!("shutdown dropped tag filter must not publish: {event:?}")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_closed);
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+            }),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn audited_tag_filter_wrong_manifest_count_fails_with_typed_error() {
+        let fixture = Fixture::new("catalog-tag-filter-manifest-count");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-filter-manifest-count");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let expected_manifest_len = snapshot.manifest.len() + 1;
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 1_470,
+                expected_manifest_len,
+                required_tags: Vec::new(),
+            })
+            .expect("wrong manifest count admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagFilterFailed {
+                    request_id: 1_470,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::TagFilterFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                expected_revision,
+                observed_revision: None,
+                request_id: 1_470,
+                error: CatalogError::TagFilterManifestLengthMismatch { expected, actual },
+            } if event_source == source_id
+                && expected_revision == snapshot.committed_revision
+                && expected == expected_manifest_len
+                && actual == snapshot.manifest.len()
+        ));
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+            }),
+            (0, 0)
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn tag_filter_root_replacement_fails_closed_before_publication() {
+        let fixture = Fixture::new("catalog-tag-filter-root-replacement");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-tag-filter-root-replacement");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestTagFilter {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 1_480,
+                expected_manifest_len: snapshot.manifest.len(),
+                required_tags: vec![String::from("drum")],
+            })
+            .expect("tag-filter admission");
+        assert!(admission_state(&service.admission, |state| {
+            state.tag_page_input_bytes > 0 && state.tag_filter_payload_bytes > 0
+        }));
+
+        let root = fixture.root.path().to_path_buf();
+        let displaced_root = root.with_extension("old");
+        assert!(!displaced_root.exists());
+        fs::rename(&root, &displaced_root).expect("displace source root");
+        fs::create_dir(&root).expect("replace source root");
+        pause.release();
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::TagFilterFailed {
+                    request_id: 1_480,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::TagFilterFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                request_id: 1_480,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            } if event_source == source_id
+        ));
+        // The event may arrive before the worker drops its command-input reservation.
+        wait_for_tag_page_input_release(&service);
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_filter_payload_bytes)
+            }),
+            (0, 0)
+        );
+        service.shutdown();
+        fs::remove_dir_all(displaced_root).expect("remove displaced source root");
     }
 
     #[test]

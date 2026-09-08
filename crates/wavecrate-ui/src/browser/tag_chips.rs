@@ -220,7 +220,8 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
         }
         Err(
             CatalogSubmitError::InvalidWavMetadataRequest(_)
-            | CatalogSubmitError::InvalidCurationRequest(_),
+            | CatalogSubmitError::InvalidCurationRequest(_)
+            | CatalogSubmitError::InvalidTagFilterRequest(_),
         ) => {
             browser.tag_chips.dirty = false;
             browser.tag_chips.page = None;

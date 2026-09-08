@@ -1504,3 +1504,25 @@ still bind each result to its source, revision and manifest order.
 All 103 core tests passed, with core compilation, formatting and diff checks. The
 primary reviewed the parser, mask validation and projection integration. This is a
 backend prerequisite; the sidebar filter is not exposed yet.
+
+### Catalog tag-filter publication
+
+The catalog now admits revision-fenced tag-filter requests and publishes a compact
+mask in retained-manifest order. Source/root/lifecycle checks bracket the database
+read, and the requested manifest length must match the retained snapshot. Matching
+paths are streamed into mask bits without copying path sets or tag labels.
+
+Admission caps each mask at 4 MiB and reserves a separate aggregate 32 MiB result
+budget. Result credits remain held until event consumption; input credits last
+through command processing. Failed, discarded and shutdown requests release their
+reservations. Session exports and compatibility event arms are included while the
+sidebar integration proceeds separately.
+
+Catalog and session suites passed before the final regression additions. After
+hardening, all eight focused filter tests passed (51 other catalog tests filtered
+out), with catalog compilation, formatting and diff checks. Coverage includes mask
+positions/tail bits, typed bounds and stale revision, retained result credits,
+supersession/removal, shutdown, manifest mismatch and root replacement. Primary
+review corrected a test race between event receipt and command-input release and
+bounded a shutdown wait. The explicit SQL-path-outside-manifest guard was reviewed
+but does not yet have a catalog injection test.

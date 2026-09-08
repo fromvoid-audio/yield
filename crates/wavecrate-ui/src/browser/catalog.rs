@@ -385,7 +385,8 @@ impl Browser {
                     CatalogSubmitError::Closed
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
                     | CatalogSubmitError::InvalidCurationRequest(_)
-                    | CatalogSubmitError::InvalidTagPageRequest(_),
+                    | CatalogSubmitError::InvalidTagPageRequest(_)
+                    | CatalogSubmitError::InvalidTagFilterRequest(_),
                 ) => {
                     return false;
                 }
@@ -420,7 +421,8 @@ impl Browser {
                     CatalogSubmitError::Closed
                     | CatalogSubmitError::InvalidWavMetadataRequest(_)
                     | CatalogSubmitError::InvalidCurationRequest(_)
-                    | CatalogSubmitError::InvalidTagPageRequest(_),
+                    | CatalogSubmitError::InvalidTagPageRequest(_)
+                    | CatalogSubmitError::InvalidTagFilterRequest(_),
                 ) => return false,
             }
         }
@@ -522,7 +524,9 @@ impl Browser {
             | CatalogEvent::CurationFailed { .. }
             | CatalogEvent::CurationOperationCompleted { .. }
             | CatalogEvent::TagPageReady { .. }
-            | CatalogEvent::TagPageFailed { .. } => false,
+            | CatalogEvent::TagPageFailed { .. }
+            | CatalogEvent::TagFilterReady { .. }
+            | CatalogEvent::TagFilterFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 super::tag_chips::cancel_for_source_change(self);
                 self.reset_catalog_metadata();
@@ -780,6 +784,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::TagPageFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::TagFilterReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::TagFilterFailed {
             source_id,
             lifecycle_generation,
             ..

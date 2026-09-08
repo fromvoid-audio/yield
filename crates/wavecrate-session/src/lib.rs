@@ -30,14 +30,15 @@ mod vocabulary;
 
 pub use catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogError, CatalogEvent, CatalogStatus,
-    CatalogSubmitError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogSubmitError, CatalogTagFilterRequestError, CatalogTagPageQuery,
+    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
-    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_PAGE_INPUT_BYTES,
-    MAX_WAV_METADATA_REQUEST_PATHS, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
-    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceCurationCommitReceipt,
-    SourceCurationOperationFailure, SourceCurationOperationFence, SourceCurationOperationOutcome,
-    SourceCurationUpdate, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
+    MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
+    SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
+    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SourceCurationCommitReceipt, SourceCurationOperationFailure,
+    SourceCurationOperationFence, SourceCurationOperationOutcome, SourceCurationUpdate,
+    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
 };
 use catalog::{CatalogService, CatalogSlot};
 use vocabulary::VocabularySlot;
