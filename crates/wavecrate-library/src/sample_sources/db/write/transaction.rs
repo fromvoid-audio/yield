@@ -56,6 +56,29 @@ enum DirectoryTruthActivationMode {
 }
 
 impl SourceWriteBatch<'_> {
+    /// Borrow the active SQLite transaction for the narrow curation commit path.
+    pub(super) fn curation_transaction(&self) -> &rusqlite::Transaction<'_> {
+        &self.tx
+    }
+
+    /// Commit a transaction whose caller already applied its exact revision policy.
+    pub(super) fn commit_curation_prepared(self) -> Result<(), SourceDbError> {
+        if self.paths_revision_dirty
+            || self.identities_revision_dirty
+            || self.index_revision_dirty
+            || !self.manifest_touched_paths.is_empty()
+            || !self.source_index_changes.is_empty()
+            || self.manifest_audit_completed
+        {
+            return Err(SourceDbError::Unexpected);
+        }
+        let db_path = self.db_path.clone();
+        let telemetry_label = self.telemetry_label;
+        self.tx.commit().map_err(map_sql_error)?;
+        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
+        Ok(())
+    }
+
     pub(crate) fn begin_next_source_directory_truth_generation(
         &mut self,
         expected_entry_count: u64,

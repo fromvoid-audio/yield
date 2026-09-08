@@ -1,4 +1,5 @@
 mod command;
+mod curation;
 mod helpers;
 mod remap;
 mod revision;

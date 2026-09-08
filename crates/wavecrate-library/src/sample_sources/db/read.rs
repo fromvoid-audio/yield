@@ -8,6 +8,7 @@ mod file_queries;
 mod metadata_queries;
 
 pub use self::file_queries::{SearchEntryMetadata, SearchEntryRow};
+pub(crate) use self::metadata_queries::browser_metadata_rows_for_paths;
 
 #[cfg(test)]
 mod tests;

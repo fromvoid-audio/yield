@@ -73,7 +73,8 @@ pub use types::{
 };
 pub use util::normalize_relative_path;
 pub use write::{
-    ManifestCommitResult, SourceCollectionWrite, SourceContentHashWrite,
+    ManifestCommitResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite,
+    SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
     SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult, SourceTagWrite,
     SourceWriteCommand,
 };

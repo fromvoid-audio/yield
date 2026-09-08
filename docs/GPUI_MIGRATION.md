@@ -832,3 +832,27 @@ scrolling, empty filters, and a malformed WAV beside a valid three-second,
 fixed with shrinkable, clipped status and pane boundaries. A fresh signed build
 verified that the malformed-file error preserves all table columns and that
 selecting a valid file restores the normal preview status. The app quit cleanly.
+
+### Bounded curation continuity transactions, 2026-09-08
+
+The library now exposes a dedicated profile-guarded curation transaction for
+ratings, keep locks, and fixed collection memberships. It accepts at most 128
+allowlisted updates, checks every requested path is a live supported manifest
+member, and requires the exact audited root and source revision. Invalid values
+constructed through deserialization are rejected before mutation.
+
+The transaction advances the generic source revision, active directory
+publication revision, and retained authoritative-audit revision together. It
+does not change directory entries, manifest membership, path/identity/index
+revisions, or issue scanner audit authority. Validation uses the existing
+complete active-generation header rather than rescanning directory entries for
+each edit. A private receipt returns the exact committed revision and only the
+requested browser metadata rows, read inside the write transaction. The internal
+commit helper rejects batches carrying manifest or index changes.
+
+Independent review found no correctness or authority issue and requested a
+profile-child replacement regression test, which was added and passed. The full
+library suite passed 459 tests before the lock/replacement additions; all ten
+curation-filtered tests passed on the final transaction implementation. Catalog
+admission, shutdown draining, and visible curation controls are separate
+follow-on work.
