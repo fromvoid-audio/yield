@@ -24,7 +24,7 @@ use wavecrate_library::sample_sources::db::{
     SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT, SourceDirectoryEntry,
     SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceManifestEntry,
 };
-use wavecrate_library::sample_sources::reconciliation::RootIdentity;
+use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId};
 use wavecrate_scan::sample_sources::scanner::{
     ScanError, ScanWritePhase, ScanWriter,
@@ -32,11 +32,20 @@ use wavecrate_scan::sample_sources::scanner::{
     read_wav_display_metadata_for_manifest,
 };
 
+mod wav_metadata;
+
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(25);
 const DIRECTORY_PAGE_LIMIT: usize = 256;
 const CATALOG_CHILD_PREFIX: &str = "wavecrate-catalog-";
+
+/// Maximum number of exact source paths admitted by one lazy WAV metadata request.
+///
+/// The scanner performs two bounded one-megabyte header passes per entry. Keeping the request
+/// below the scanner's aggregate 64 MiB budget guarantees that every admitted path is attempted
+/// in one operation and that an omitted result is terminal for the request.
+pub const MAX_WAV_METADATA_REQUEST_PATHS: usize = 16;
 
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
@@ -57,6 +66,23 @@ pub enum CatalogCommand {
         /// Generation that must still own the source when the audit publishes.
         lifecycle_generation: u64,
     },
+    /// Read bounded WAV header metadata for exact paths in the retained source snapshot.
+    ///
+    /// A request whose lifecycle has no current admission, including a superseded, removed, or
+    /// never-registered source, is discarded by the worker's fence without a completion event.
+    RequestWavMetadata {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Generation that must still own the source when the request publishes.
+        lifecycle_generation: u64,
+        /// Retained catalog revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Source-relative paths to attempt. The worker admits at most
+        /// [`MAX_WAV_METADATA_REQUEST_PATHS`] paths per request.
+        relative_paths: Vec<PathBuf>,
+    },
     /// Read the last coherent persisted snapshot for one source.
     ReadSnapshot {
         /// Stable source identifier.
@@ -75,8 +101,32 @@ pub enum CatalogCommand {
     Shutdown,
 }
 
+/// Why a lazy WAV metadata request could not be admitted.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogWavMetadataRequestError {
+    /// No source-relative paths were supplied.
+    #[error("WAV metadata request is empty")]
+    Empty,
+    /// The request exceeded the bounded exact-path admission limit.
+    #[error("WAV metadata request contains {actual} paths; maximum is {max}")]
+    TooManyPaths {
+        /// Maximum admitted path count.
+        max: usize,
+        /// Supplied path count.
+        actual: usize,
+    },
+    /// One path could not be represented as a safe source-relative path.
+    #[error("invalid WAV metadata path {path}: {reason}")]
+    InvalidPath {
+        /// Rejected path spelling.
+        path: PathBuf,
+        /// Validation failure reported by the shared root-relative path type.
+        reason: wavecrate_library::sample_sources::reconciliation::RootRelativePathError,
+    },
+}
+
 /// A bounded admission failure from the catalog command queue.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogSubmitError {
     /// The worker command queue is full.
     #[error("catalog command queue is full")]
@@ -84,6 +134,9 @@ pub enum CatalogSubmitError {
     /// The catalog worker has closed or is shutting down.
     #[error("catalog worker is closed")]
     Closed,
+    /// A lazy WAV metadata request failed input admission.
+    #[error("invalid WAV metadata request: {0}")]
+    InvalidWavMetadataRequest(#[from] CatalogWavMetadataRequestError),
 }
 
 /// Startup failures for the profile-owned catalog worker.
@@ -214,6 +267,40 @@ pub enum CatalogEvent {
     AuditCommitted {
         /// Revision-fenced catalog snapshot.
         snapshot: CatalogSnapshot,
+    },
+    /// A bounded exact-path WAV metadata request completed.
+    ///
+    /// `requested_paths` is the terminal set for this request. Paths absent from `metadata`
+    /// were attempted and intentionally omitted by the scanner because they were missing,
+    /// malformed, changed, or not WAV files.
+    WavMetadataReady {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the patch.
+        lifecycle_generation: u64,
+        /// Physical source-root identity checked by the metadata read.
+        root_identity: RootIdentity,
+        /// Catalog revision represented by the patch.
+        revision: u64,
+        /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Exact paths that reached terminal completion, including omitted paths.
+        requested_paths: Vec<PathBuf>,
+        /// Successfully parsed WAV metadata keyed by source-relative path.
+        metadata: BTreeMap<PathBuf, CatalogWavMetadata>,
+    },
+    /// A bounded exact-path WAV metadata request failed after admission.
+    WavMetadataFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
     },
     /// One source was removed from the active worker projection.
     Removed {
@@ -393,10 +480,41 @@ impl EventReservation<'_> {
     }
 }
 
+fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
+    let CatalogCommand::RequestWavMetadata { relative_paths, .. } = command else {
+        return Ok(());
+    };
+    if relative_paths.is_empty() {
+        return Err(CatalogSubmitError::InvalidWavMetadataRequest(
+            CatalogWavMetadataRequestError::Empty,
+        ));
+    }
+    if relative_paths.len() > MAX_WAV_METADATA_REQUEST_PATHS {
+        return Err(CatalogSubmitError::InvalidWavMetadataRequest(
+            CatalogWavMetadataRequestError::TooManyPaths {
+                max: MAX_WAV_METADATA_REQUEST_PATHS,
+                actual: relative_paths.len(),
+            },
+        ));
+    }
+    for path in relative_paths {
+        if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
+            return Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                CatalogWavMetadataRequestError::InvalidPath {
+                    path: path.clone(),
+                    reason,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
         CatalogCommand::Register { .. } => 2,
         CatalogCommand::RequestAudit { .. }
+        | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::ReadSnapshot { .. }
         | CatalogCommand::Remove { .. }
         | CatalogCommand::Shutdown => 1,
@@ -410,6 +528,7 @@ enum AdmissionAction {
         lifecycle_generation: u64,
     },
     RequestAudit,
+    RequestWavMetadata,
     ReadSnapshot,
     Remove {
         source_id: SourceId,
@@ -429,6 +548,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
             lifecycle_generation: *lifecycle_generation,
         },
         CatalogCommand::RequestAudit { .. } => AdmissionAction::RequestAudit,
+        CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::ReadSnapshot { .. } => AdmissionAction::ReadSnapshot,
         CatalogCommand::Remove {
             source_id,
@@ -495,7 +615,9 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
             state.shutdown = true;
             state.invalidate_all();
         }
-        AdmissionAction::RequestAudit | AdmissionAction::ReadSnapshot => {}
+        AdmissionAction::RequestAudit
+        | AdmissionAction::RequestWavMetadata
+        | AdmissionAction::ReadSnapshot => {}
     }
 }
 
@@ -509,7 +631,7 @@ fn admission_state<T>(
     read(&state)
 }
 
-fn begin_audit_attempt(
+fn begin_source_attempt(
     admission: &Arc<Mutex<AdmissionState>>,
     source_id: &SourceId,
     lifecycle_generation: u64,
@@ -655,6 +777,7 @@ impl CatalogService {
         if admission.closed || admission.shutdown {
             return Err(CatalogSubmitError::Closed);
         }
+        validate_command(&command)?;
         let event_budget = command_event_budget(&command);
         if admission.event_budget.saturating_add(event_budget) > EVENT_CAPACITY {
             return Err(CatalogSubmitError::Full);
@@ -807,6 +930,26 @@ fn handle_command(
             request_audit(
                 source_id,
                 lifecycle_generation,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::RequestWavMetadata {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            relative_paths,
+        } => {
+            request_wav_metadata(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                relative_paths,
                 profile_guard,
                 reservation,
                 admission,
@@ -1047,7 +1190,7 @@ fn request_audit(
         );
         return;
     }
-    let Some(token) = begin_audit_attempt(admission, &source_id, lifecycle_generation) else {
+    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
         return;
     };
     let Some(source) = sources.get_mut(&source_id) else {
@@ -1084,6 +1227,117 @@ fn request_audit(
                     operation: CatalogOperation::Audit,
                     error,
                 },
+            );
+        }
+    }
+}
+
+fn request_wav_metadata(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    requested_paths: Vec<PathBuf>,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let Some(current_generation) = sources
+        .get(&source_id)
+        .map(|source| source.lifecycle_generation)
+    else {
+        let error = CatalogError::NotRegistered(source_id.clone());
+        emit_metadata_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            error,
+        );
+        return;
+    };
+    if let Err(error) = ensure_generation(&source_id, current_generation, lifecycle_generation) {
+        emit_metadata_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            error,
+        );
+        return;
+    }
+    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+        return;
+    };
+    let Some(source) = sources.get_mut(&source_id) else {
+        return;
+    };
+    source.attempt_token = Some(Arc::clone(&token));
+    let result = wav_metadata::read_patch(
+        source,
+        &source_id,
+        lifecycle_generation,
+        expected_revision,
+        requested_paths,
+        &token,
+        admission,
+        profile_guard,
+    );
+    match result {
+        Ok(patch) => {
+            if !publication_is_current(admission, &source_id, lifecycle_generation, Some(&token)) {
+                return;
+            }
+            let Some(snapshot) = source.snapshot.as_mut() else {
+                emit_metadata_failure(
+                    reservation,
+                    admission,
+                    source_id,
+                    lifecycle_generation,
+                    expected_revision,
+                    request_id,
+                    CatalogError::SnapshotUnavailable,
+                );
+                return;
+            };
+            for path in &patch.requested_paths {
+                snapshot.wav_metadata.remove(path);
+            }
+            for path in &patch.manifest_paths {
+                snapshot.wav_metadata.remove(path);
+            }
+            snapshot.wav_metadata.extend(patch.metadata.clone());
+            let _ = publish_if_current(
+                admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                Some(&token),
+                CatalogEvent::WavMetadataReady {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    root_identity: patch.root_identity,
+                    revision: patch.revision,
+                    request_id,
+                    requested_paths: patch.requested_paths,
+                    metadata: patch.metadata,
+                },
+            );
+        }
+        Err(error) => {
+            emit_metadata_failure(
+                reservation,
+                admission,
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                error,
             );
         }
     }
@@ -1519,7 +1773,7 @@ fn read_snapshot_from_database(
             detail: String::from("persisted catalog root identity does not match source root"),
         });
     }
-    let (revision, manifest) = database
+    let (revision, mut manifest) = database
         .manifest_snapshot_with_revision()
         .map_err(catalog_error_from_db)?;
     if audit_metadata.source_revision != revision {
@@ -1528,6 +1782,11 @@ fn read_snapshot_from_database(
             audit_metadata.source_revision
         )));
     }
+    // Keep the retained projection ordered by the native path comparator so bounded exact-path
+    // patches can validate their subset with binary search. The database query is ordered by its
+    // UTF-8 text key, whose punctuation order differs from component-aware Path ordering for
+    // cases such as `a.wav` and `a/file.wav`.
+    manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let first_page = database
         .source_directory_truth_page(None, DIRECTORY_PAGE_LIMIT)
         .map_err(catalog_error_from_db)?;
@@ -1667,6 +1926,31 @@ fn emit_failure(
     }
 }
 
+fn emit_metadata_failure(
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    error: CatalogError,
+) {
+    let _ = publish_if_current(
+        admission,
+        reservation,
+        &source_id,
+        lifecycle_generation,
+        None,
+        CatalogEvent::WavMetadataFailed {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            error,
+        },
+    );
+}
+
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
     CatalogError::Database(error.to_string())
 }
@@ -1800,6 +2084,290 @@ mod tests {
             CatalogEvent::AuditCommitted { snapshot, .. } => snapshot,
             _ => unreachable!(),
         }
+    }
+
+    fn write_test_wav(path: &Path, sample_rate: u32, frames: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create test WAV");
+        for sample in 0..frames {
+            writer
+                .write_sample(sample as i16)
+                .expect("write test WAV sample");
+        }
+        writer.finalize().expect("finalize test WAV");
+    }
+
+    #[test]
+    fn bounded_metadata_request_publishes_exact_patch_with_terminal_paths() {
+        let fixture = Fixture::new("catalog-wav-metadata-patch");
+        let valid = fixture.root.path().join("visible.wav");
+        let malformed = fixture.root.path().join("malformed.wav");
+        let punctuation = fixture.root.path().join("a.wav");
+        let nested = fixture.root.path().join("a").join("file.wav");
+        fs::create_dir_all(nested.parent().expect("nested parent")).expect("create nested dir");
+        write_test_wav(&valid, 16_000, 9);
+        fs::write(&malformed, b"not a wave").expect("write malformed WAV");
+        write_test_wav(&punctuation, 22_050, 4);
+        write_test_wav(&nested, 44_100, 5);
+
+        let source_id = SourceId::from_string("source-wav-metadata-patch");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let requested_paths = vec![
+            PathBuf::from("visible.wav"),
+            PathBuf::from("malformed.wav"),
+            PathBuf::from("a.wav"),
+            PathBuf::from("a/file.wav"),
+            PathBuf::from("missing.wav"),
+        ];
+        service
+            .submit(CatalogCommand::RequestWavMetadata {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 41,
+                relative_paths: requested_paths.clone(),
+            })
+            .expect("metadata request");
+
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::WavMetadataReady { request_id: 41, .. })
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::WavMetadataReady {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                root_identity,
+                revision,
+                request_id: 41,
+                requested_paths: event_paths,
+                metadata,
+            } if event_source == source_id
+                && root_identity == snapshot.root_identity
+                && revision == snapshot.committed_revision
+                && event_paths == requested_paths
+                && metadata.get(Path::new("visible.wav")) == Some(&CatalogWavMetadata {
+                    frames: 9,
+                    sample_rate: 16_000,
+                })
+                && metadata.get(Path::new("a.wav")) == Some(&CatalogWavMetadata {
+                    frames: 4,
+                    sample_rate: 22_050,
+                })
+                && metadata.get(Path::new("a/file.wav")) == Some(&CatalogWavMetadata {
+                    frames: 5,
+                    sample_rate: 44_100,
+                })
+                && !metadata.contains_key(Path::new("malformed.wav"))
+                && !metadata.contains_key(Path::new("missing.wav"))
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn metadata_revision_mismatch_is_a_distinct_request_failure() {
+        let fixture = Fixture::new("catalog-wav-metadata-stale-revision");
+        let path = fixture.root.path().join("stale.wav");
+        write_test_wav(&path, 8_000, 3);
+
+        let source_id = SourceId::from_string("source-wav-metadata-stale-revision");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        service
+            .submit(CatalogCommand::RequestWavMetadata {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision + 1,
+                request_id: 42,
+                relative_paths: vec![PathBuf::from("stale.wav")],
+            })
+            .expect("metadata request");
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::WavMetadataFailed { request_id: 42, .. }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::WavMetadataFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                expected_revision,
+                request_id: 42,
+                error: CatalogError::StaleRevision { expected, actual },
+            } if event_source == source_id
+                && expected_revision == snapshot.committed_revision + 1
+                && expected == snapshot.committed_revision + 1
+                && actual == snapshot.committed_revision
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn stale_metadata_lifecycle_is_fenced_without_a_completion_event() {
+        let fixture = Fixture::new("catalog-wav-metadata-stale-lifecycle");
+        let path = fixture.root.path().join("stale-lifecycle.wav");
+        write_test_wav(&path, 8_000, 3);
+
+        let source_id = SourceId::from_string("source-wav-metadata-stale-lifecycle");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        service
+            .submit(CatalogCommand::RequestWavMetadata {
+                source_id,
+                lifecycle_generation: 0,
+                expected_revision: snapshot.committed_revision,
+                request_id: 43,
+                relative_paths: vec![PathBuf::from("stale-lifecycle.wav")],
+            })
+            .expect("stale metadata request admission");
+        thread::sleep(Duration::from_millis(50));
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
+    }
+
+    #[test]
+    fn metadata_request_admission_rejects_empty_invalid_and_oversized_batches() {
+        let fixture = Fixture::new("catalog-wav-metadata-admission");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let source_id = SourceId::from_string("source-wav-metadata-admission");
+        let request = |relative_paths| CatalogCommand::RequestWavMetadata {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: 1,
+            request_id: 44,
+            relative_paths,
+        };
+
+        assert_eq!(
+            service.submit(request(Vec::new())),
+            Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                CatalogWavMetadataRequestError::Empty
+            ))
+        );
+        assert!(matches!(
+            service.submit(request(vec![PathBuf::from("../escape.wav")])),
+            Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                CatalogWavMetadataRequestError::InvalidPath {
+                    reason: wavecrate_library::sample_sources::reconciliation::RootRelativePathError::ParentTraversal,
+                    ..
+                }
+            ))
+        ));
+        let oversized = (0..=MAX_WAV_METADATA_REQUEST_PATHS)
+            .map(|index| PathBuf::from(format!("{index}.wav")))
+            .collect();
+        assert_eq!(
+            service.submit(request(oversized)),
+            Err(CatalogSubmitError::InvalidWavMetadataRequest(
+                CatalogWavMetadataRequestError::TooManyPaths {
+                    max: MAX_WAV_METADATA_REQUEST_PATHS,
+                    actual: MAX_WAV_METADATA_REQUEST_PATHS + 1,
+                }
+            ))
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn removal_fences_queued_metadata_completion() {
+        let fixture = Fixture::new("catalog-wav-metadata-remove");
+        let path = fixture.root.path().join("removed.wav");
+        write_test_wav(&path, 8_000, 3);
+
+        let source_id = SourceId::from_string("source-wav-metadata-remove");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        service
+            .submit(CatalogCommand::RequestWavMetadata {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 45,
+                relative_paths: vec![PathBuf::from("removed.wav")],
+            })
+            .expect("metadata request");
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("remove request");
+
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::Removed { .. })
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::Removed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+            } if event_source == source_id
+        ));
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
+    }
+
+    #[test]
+    fn canceled_metadata_token_fences_before_filesystem_read() {
+        let fixture = Fixture::new("catalog-wav-metadata-canceled");
+        let source_id = SourceId::from_string("source-wav-metadata-canceled");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("profile catalog database");
+        let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
+        let token = Arc::new(AtomicBool::new(true));
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        admission.lock().expect("admission lock").sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: Some(Arc::clone(&token)),
+            },
+        );
+        let source = RegisteredSource {
+            root: fixture.root.path().to_path_buf(),
+            lifecycle_generation: 1,
+            database,
+            known_root_identity: Some(root_identity.clone()),
+            snapshot: Some(CatalogSnapshot {
+                source_id: source_id.clone(),
+                root_identity,
+                lifecycle_generation: 1,
+                committed_revision: 0,
+                directory_generation: 0,
+                manifest: Vec::new(),
+                directories: Vec::new(),
+                wav_metadata: BTreeMap::new(),
+            }),
+            attempt_token: Some(Arc::clone(&token)),
+        };
+
+        assert!(matches!(
+            wav_metadata::read_patch(
+                &source,
+                &source_id,
+                1,
+                0,
+                vec![PathBuf::from("canceled.wav")],
+                &token,
+                &admission,
+                &fixture.guard,
+            ),
+            Err(CatalogError::Canceled)
+        ));
     }
 
     #[test]

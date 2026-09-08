@@ -352,7 +352,11 @@ impl Browser {
                 Err(CatalogSubmitError::Unavailable(reason)) => {
                     return self.handle_catalog_unavailable(reason, cx);
                 }
-                Err(CatalogSubmitError::Closed) => return false,
+                Err(
+                    CatalogSubmitError::Closed | CatalogSubmitError::InvalidWavMetadataRequest(_),
+                ) => {
+                    return false;
+                }
             }
         }
         let Some(intent) = self.catalog_pending_command.clone() else {
@@ -382,7 +386,9 @@ impl Browser {
             Err(CatalogSubmitError::Unavailable(reason)) => {
                 self.handle_catalog_unavailable(reason, cx)
             }
-            Err(CatalogSubmitError::Closed) => false,
+            Err(CatalogSubmitError::Closed | CatalogSubmitError::InvalidWavMetadataRequest(_)) => {
+                false
+            }
         }
     }
 
@@ -452,6 +458,7 @@ impl Browser {
                 self.start_catalog_projection(event, cx);
                 true
             }
+            CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
@@ -649,6 +656,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
         CatalogEvent::SnapshotReady { snapshot } | CatalogEvent::AuditCommitted { snapshot } => {
             Some((snapshot.source_id.clone(), snapshot.lifecycle_generation))
         }
+        CatalogEvent::WavMetadataReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::WavMetadataFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        } => Some((source_id.clone(), *lifecycle_generation)),
         CatalogEvent::Failed {
             source_id: Some(source_id),
             lifecycle_generation: Some(lifecycle_generation),

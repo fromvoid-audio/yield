@@ -5,7 +5,9 @@ use thiserror::Error;
 pub(crate) use wavecrate_catalog::CatalogService;
 use wavecrate_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
-pub use wavecrate_catalog::{CatalogCommand, CatalogEvent};
+pub use wavecrate_catalog::{
+    CatalogCommand, CatalogEvent, CatalogWavMetadataRequestError, MAX_WAV_METADATA_REQUEST_PATHS,
+};
 
 /// Lifecycle state of the independently-owned source catalog worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +40,9 @@ pub enum CatalogSubmitError {
     /// Catalog command admission has been closed.
     #[error("source catalog command admission is closed")]
     Closed,
+    /// A lazy WAV metadata request failed input admission.
+    #[error("invalid source catalog WAV metadata request: {0}")]
+    InvalidWavMetadataRequest(CatalogWavMetadataRequestError),
 }
 
 pub(crate) struct CatalogSlot {
@@ -151,5 +156,8 @@ fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
     match error {
         CatalogWorkerSubmitError::Full => CatalogSubmitError::Full,
         CatalogWorkerSubmitError::Closed => CatalogSubmitError::Closed,
+        CatalogWorkerSubmitError::InvalidWavMetadataRequest(error) => {
+            CatalogSubmitError::InvalidWavMetadataRequest(error)
+        }
     }
 }

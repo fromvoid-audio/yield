@@ -27,7 +27,10 @@ use wavecrate_library::sample_sources::{
 mod catalog;
 mod preferences;
 
-pub use catalog::{CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError};
+pub use catalog::{
+    CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
+    CatalogWavMetadataRequestError, MAX_WAV_METADATA_REQUEST_PATHS,
+};
 use catalog::{CatalogService, CatalogSlot};
 
 pub use preferences::{

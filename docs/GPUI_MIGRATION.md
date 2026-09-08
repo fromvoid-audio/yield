@@ -780,3 +780,29 @@ region and hid the bar. The app quit cleanly. Mid-drag Escape was covered by
 state handling rather than a GUI injection test; audible acceptance remains
 manual. Regions extending into silence margins, edit selections, and export
 handles remain follow-on work.
+
+### Bounded catalog metadata patch service, 2026-09-08
+
+The catalog accepts exact-path WAV metadata requests for at most sixteen paths.
+Each request carries source, lifecycle, revision, and caller request identity;
+its response is a metadata patch with terminal requested paths, including
+malformed or missing entries that have no metadata result. Failures are separate
+from audit failures. Obsolete or unregistered lifecycle requests are discarded
+by the existing publication fence.
+
+The worker uses a bounded exact-path database query, checks it against the
+retained snapshot, and reuses descriptor-checked scanner reads. Profile, root,
+and revision checks surround the operation. The sixteen-path cap keeps the two
+1-MiB header passes per file below the scanner's 64-MiB aggregate budget, avoiding
+unattempted paths masquerading as terminal omissions. Snapshot manifests are
+sorted once by Rust path ordering for bounded binary lookups; SQLite text order
+is not assumed to match nested path ordering. Successful patches update only
+the retained optional metadata, without source mutation or another audit.
+
+Validation: 25 catalog tests and 37 session tests passed, along with workspace
+check, formatting, and diff checks. Cases include exact and nested punctuation
+paths, malformed/missing terminal omissions, invalid and oversized admission,
+revision mismatch, cancellation, and removal fencing. Independent backend
+review found no remaining meaningful issues in admission, authority checks,
+cache patching, or event accounting. Visible-row scheduling and integrated
+large-library GUI validation remain the next slice.
