@@ -19,6 +19,7 @@ use super::Browser;
 use super::context_menu;
 use super::curation;
 use super::motion;
+use super::tag_filter;
 use super::volume;
 use super::waveform;
 
@@ -426,6 +427,8 @@ impl Render for Browser {
             .and_then(|session| session.last_error.as_deref());
         let list_status = if let Some(error) = source_error {
             format!("Source error: {error}")
+        } else if tag_filter::scope_pending(self) {
+            tag_filter::status_label(self).unwrap_or_else(|| "Filtering tags…".to_string())
         } else if !self.entries.is_empty() && self.view_model.rows().len() != self.entries.len() {
             format!(
                 "{} of {} audio files visible",
@@ -469,11 +472,13 @@ impl Render for Browser {
                 .items_center()
                 .text_size(px(theme.typography.small_size))
                 .text_color(color(theme.colors.text_muted))
-                .child(if self.entries.is_empty() {
-                    list_status.clone()
-                } else {
-                    "No matching audio files".to_string()
-                })
+                .child(
+                    if self.entries.is_empty() || tag_filter::scope_pending(self) {
+                        list_status.clone()
+                    } else {
+                        "No matching audio files".to_string()
+                    },
+                )
         } else {
             div()
                 .flex_1()

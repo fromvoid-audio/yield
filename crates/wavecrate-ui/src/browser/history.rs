@@ -11,7 +11,7 @@ use wavecrate_core::PlaybackHistoryEntry;
 
 use super::transport::{PlaybackIntent, PlaybackIntentOrigin};
 use super::waveform::WaveformPlayRegion;
-use super::{Browser, SelectionOrigin, SourceSession, tag_chips};
+use super::{Browser, SelectionOrigin, SourceSession, tag_chips, tag_filter};
 
 /// Direction used by the browser's playback history shortcuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,11 +233,13 @@ impl Browser {
         self.waveform = None;
         self.waveform_error = None;
         self.invalidate_waveform_generation();
+        self.view_model.set_entries(&self.entries);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        tag_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.search_input

@@ -15,7 +15,7 @@ use gpui::{
     fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
-use wavecrate_core::MAX_TAG_INPUT_BYTES;
+use wavecrate_core::{MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES};
 
 use crate::theme::{active, color};
 
@@ -93,12 +93,22 @@ impl SearchInputOptions {
             underlined: true,
         }
     }
+
+    pub(crate) const fn tag_filter() -> Self {
+        Self {
+            placeholder: "ANY",
+            max_bytes: Some(MAX_TAG_FILTER_INPUT_BYTES),
+            paste_newlines: PasteNewlines::Preserve,
+            underlined: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PasteNewlines {
     AsSpaces,
     AsCommas,
+    Preserve,
 }
 
 /// Text editing state for the browser search field.
@@ -767,6 +777,7 @@ fn paste_replacement_text(text: &str, newlines: PasteNewlines) -> Cow<'_, str> {
             }
         }
         PasteNewlines::AsCommas => paste_tag_newlines(text),
+        PasteNewlines::Preserve => Cow::Borrowed(text),
     }
 }
 
@@ -832,8 +843,8 @@ fn marked_selection_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TAG_INPUT_BYTES, PasteNewlines, SearchInputOptions, input_within_limit,
-        marked_selection_range, paste_replacement_text, plan_replacement,
+        MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES, PasteNewlines, SearchInputOptions,
+        input_within_limit, marked_selection_range, paste_replacement_text, plan_replacement,
     };
 
     #[test]
@@ -860,6 +871,12 @@ mod tests {
         assert_eq!(tags.placeholder, "ADD TAG");
         assert_eq!(tags.max_bytes, Some(MAX_TAG_INPUT_BYTES));
         assert_eq!(tags.paste_newlines, PasteNewlines::AsCommas);
+
+        let tag_filter = SearchInputOptions::tag_filter();
+        assert_eq!(tag_filter.placeholder, "ANY");
+        assert_eq!(tag_filter.max_bytes, Some(MAX_TAG_FILTER_INPUT_BYTES));
+        assert_eq!(tag_filter.paste_newlines, PasteNewlines::Preserve);
+        assert!(tag_filter.underlined);
     }
 
     #[test]
@@ -893,6 +910,10 @@ mod tests {
         assert_eq!(
             paste_replacement_text("one\ntwo", PasteNewlines::AsSpaces).as_ref(),
             "one two"
+        );
+        assert_eq!(
+            paste_replacement_text("one\ntwo", PasteNewlines::Preserve).as_ref(),
+            "one\ntwo"
         );
     }
 

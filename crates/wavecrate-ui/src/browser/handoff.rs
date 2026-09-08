@@ -9,7 +9,7 @@ use crate::external_clipboard::{
     FileClipboardError, PreparedFilePaths, copy_file_paths, prepare_file_paths,
 };
 
-use super::Browser;
+use super::{Browser, tag_filter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HandoffCommand {
@@ -57,6 +57,12 @@ impl Browser {
     }
 
     fn start_file_handoff(&mut self, command: HandoffCommand, cx: &mut Context<Self>) {
+        if tag_filter::scope_pending(self) {
+            self.playback_status =
+                String::from("File handoff is waiting for the visible tag-filter scope");
+            cx.notify();
+            return;
+        }
         let paths = match command {
             HandoffCommand::Copy => file_handoff_paths(
                 &self.entries,
@@ -77,6 +83,12 @@ impl Browser {
         paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        if tag_filter::scope_pending(self) {
+            self.playback_status =
+                String::from("File handoff is waiting for the visible tag-filter scope");
+            cx.notify();
+            return;
+        }
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         let generation = self.handoff_generation;
         self.handoff_task.take();

@@ -142,6 +142,7 @@ impl Browser {
     ) -> bool {
         super::tags::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_filter::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         let Some((source_id, root, label)) = self
@@ -223,11 +224,21 @@ impl Browser {
         self.expanded_folders = self.source_sessions[index].expanded_folders.clone();
         self.folder_scope = self.source_sessions[index].folder_scope;
         self.rebuild_folder_rows_cache();
+        let focus_id = self.selected_id();
+        let focus_position = self.selected_visible_position();
+        super::tag_filter::preserve_focus_for_projection(
+            self,
+            focus_id,
+            focus_position,
+            super::tag_filter::FilterOrigin::PassiveMetadata,
+        );
+        self.view_model.set_entries(&self.entries);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        super::tag_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
 
@@ -284,6 +295,7 @@ impl Browser {
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_filter::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
         if let Some(activation) = activation {
@@ -363,6 +375,7 @@ impl Browser {
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_filter::cancel_for_source_change(self);
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
                 self.curation_state.prune_completed_except(None);
@@ -441,6 +454,7 @@ impl Browser {
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_filter::cancel_for_source_change(self);
         self.cancel_catalog_projection();
         self.reset_catalog_metadata();
         self.curation_state.prune_completed_except(None);
@@ -470,6 +484,12 @@ impl Browser {
         {
             return true;
         }
+        if matches!(
+            &event,
+            CatalogEvent::TagFilterReady { .. } | CatalogEvent::TagFilterFailed { .. }
+        ) {
+            return super::tag_filter::apply_catalog_event(self, event, cx);
+        }
         if matches!(event, CatalogEvent::CurationOperationCompleted { .. }) {
             // Compound outcomes belong to their source lifecycle even after the browser has
             // switched to another source. Consume them before the active projection fence so a
@@ -479,6 +499,7 @@ impl Browser {
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_filter::cancel_for_source_change(self);
                 self.catalog_activation = None;
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
@@ -529,6 +550,7 @@ impl Browser {
             | CatalogEvent::TagFilterFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_filter::cancel_for_source_change(self);
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
@@ -544,6 +566,7 @@ impl Browser {
             }
             CatalogEvent::Removed { .. } => {
                 super::tag_chips::cancel_for_source_change(self);
+                super::tag_filter::cancel_for_source_change(self);
                 false
             }
             CatalogEvent::Closed => false,
@@ -559,6 +582,7 @@ impl Browser {
         let force_reload = activation.force_reload;
         let root = activation.root.clone();
         super::tag_chips::cancel_for_source_change(self);
+        super::tag_filter::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -650,6 +674,12 @@ impl Browser {
         let previous_position = self.selected_visible_position();
         let restore_id = self.restore_selection_id.take().or(previous_id.clone());
         let restore_position = self.restore_selection_position.take().or(previous_position);
+        super::tag_filter::preserve_focus_for_projection(
+            self,
+            restore_id.clone(),
+            restore_position,
+            super::tag_filter::FilterOrigin::PassiveMetadata,
+        );
         let focused_changed = restore_id.as_ref().is_some_and(|id| {
             focused_manifest_changed(id, &projection, &self.source_sessions[index])
         });
@@ -703,11 +733,13 @@ impl Browser {
         self.expanded_folders = state.expanded;
         self.folder_scope = previous_scope;
         self.rebuild_folder_rows_cache();
+        self.view_model.set_entries(&self.entries);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        super::tag_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         super::tag_chips::invalidate(self);

@@ -213,7 +213,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips, tags,
+    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips, tag_filter,
+    tags,
 };
 use gpui::Context;
 
@@ -264,6 +265,7 @@ impl Browser {
         changed |= tags::poll(self, cx);
         changed |= tag_chips::poll(self, cx);
         changed |= self.retry_catalog_commands(cx);
+        changed |= tag_filter::poll(self, cx);
         if changed {
             cx.notify();
         }
@@ -273,6 +275,7 @@ impl Browser {
             || catalog_events_capped
             || tags::has_pending(self)
             || tag_chips::has_pending(self)
+            || tag_filter::has_pending(self)
             || catalog::catalog_poll_needed(self)
     }
 
@@ -576,6 +579,7 @@ impl Browser {
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
         tags::cancel_for_source_change(self);
         tag_chips::cancel_for_source_change(self);
+        tag_filter::cancel_for_source_change(self);
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.stop_playback();
@@ -588,6 +592,7 @@ impl Browser {
         self.root = None;
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        tag_filter::reinstall_after_projection(self, cx);
         self.reset_collection_filter();
         self.selected = None;
         self.folder_tree = None;

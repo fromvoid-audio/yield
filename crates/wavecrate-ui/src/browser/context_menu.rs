@@ -20,7 +20,7 @@ use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
 
 use crate::theme::{color, transparent};
 
-use super::Browser;
+use super::{Browser, tag_filter};
 
 const STALE_CONTEXT_MESSAGE: &str =
     "Context menu target is stale; refresh the catalog before editing";
@@ -86,6 +86,9 @@ pub(super) struct ContextMenuState {
 
 impl ContextMenuTarget {
     fn is_current(&self, browser: &Browser) -> bool {
+        if tag_filter::scope_pending(browser) {
+            return false;
+        }
         let Some(activation) = browser.catalog_activation.as_ref() else {
             return false;
         };

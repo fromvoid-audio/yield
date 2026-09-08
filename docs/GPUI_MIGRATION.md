@@ -1545,3 +1545,30 @@ Eight adapter tests passed, including an isolated native temporary-root smoke;
 all-targets check and package formatting passed. Adapter Clippy reached existing
 library warnings, so a clean Clippy result is not claimed. Catalog scheduling,
 retry/rewatching, and root-generation recovery remain the next integration slice.
+
+### Runtime assigned-tag filter and metadata-only mask reuse
+
+The compact TAGS row now edits comma-separated exact AND requirements and toggles
+without discarding the draft. Invalid input remains blocked across off/on; the
+input rejects oversized edits without replacing the prior valid text. Active
+queries coalesce subsequent edits and passive revisions behind one correlated
+request. Source lifecycle, root identity, directory generation, revision, draft,
+manifest length, and entry-index allocation identity fence accepted masks.
+
+Unknown active scope stays pending; selection and file mutation/handoff actions
+wait for authoritative matches. Explicit projection changes retain priority over
+passive refreshes, while passive tag/metadata updates preserve loaded transport.
+Confirmed non-tag curation receipts reuse masks after validating their prior
+context and complete receipt chain. Synchronous metadata sorting reapplies the
+positional mask before selection reconciliation, avoiding a blank/refetch cycle
+for Last Played writes. Tags, failed/partial receipts, and changed provenance
+invalidate instead.
+
+Final UI sources were copied to the isolated acceptance checkout based on
+`74dbf9a3a`, excluding concurrent watcher-catalog edits, and byte-compared with the
+working UI sources. Its full UI library suite passed: 192 passed, 1 ignored.
+Focused evidence includes eight filter and 32 curation tests, with production
+transition/provenance helpers covering fast edits, invalid toggles, focus
+priority, stale/partial reuse rejection, and metadata-sort mask identity. Package
+formatting and diff whitespace checks passed. Native visual/input acceptance of
+this slice remains separate from these automated checks.

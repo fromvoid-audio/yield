@@ -12,7 +12,7 @@ use gpui::{ClickEvent, Context, ScrollStrategy, div, prelude::*, px};
 use wavecrate_core::{
     AudioFile, AudioFileCuration, AudioFileId, BrowserViewModel, COLLECTION_COUNT, CurationAction,
     CurationTransition, MAX_TAGS_PER_COMMIT, PLAYBACK_TYPE_FILTERS, PlaybackType,
-    PlaybackTypeFilter, RATING_FILTER_LEVELS, RatingFilter, plan_curation_action,
+    PlaybackTypeFilter, RATING_FILTER_LEVELS, RatingFilter, TagFilterMask, plan_curation_action,
 };
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{
@@ -28,7 +28,7 @@ use wavecrate_session::{
 
 use crate::theme::{color, transparent};
 
-use super::{Browser, catalog, tag_chips};
+use super::{Browser, catalog, tag_chips, tag_filter};
 
 /// The source lifecycle identity retained by curation state.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -41,6 +41,7 @@ pub(super) struct CurationLifecycleKey {
 struct PendingCurationOperation {
     request_id: u64,
     batch_count: usize,
+    tags_may_change: bool,
     overlays: BTreeMap<PathBuf, AudioFileCuration>,
     active_overlay: bool,
     trash_required: usize,
@@ -86,6 +87,15 @@ pub(super) struct CurationOperationPlan {
     trash_required: usize,
 }
 
+impl CurationOperationPlan {
+    fn tags_may_change(&self) -> bool {
+        self.batches
+            .iter()
+            .flatten()
+            .any(source_update_may_change_tags)
+    }
+}
+
 /// Pure result of planning one browser action across its selected target paths.
 pub(super) enum CurationPlan {
     /// Every target was unchanged; `trash_required` records fourth-negative rows that need a
@@ -129,10 +139,12 @@ struct CurationOutcome {
 pub(super) struct CurationOutcomeApplication {
     pub(super) root_identity: RootIdentity,
     pub(super) directory_generation: u64,
+    pub(super) prior_revision: u64,
     pub(super) revision: u64,
     pub(super) visible: BTreeMap<PathBuf, AudioFileCuration>,
     pub(super) playback_types: BTreeMap<PathBuf, Option<PlaybackType>>,
     pub(super) metadata_changed: bool,
+    pub(super) tags_may_change: bool,
     pub(super) failed: bool,
 }
 
@@ -708,10 +720,12 @@ impl CurationState {
             return false;
         }
         self.next_request_id = plan.request_id;
+        let tags_may_change = plan.tags_may_change();
         lineage.message = None;
         lineage.pending.push(PendingCurationOperation {
             request_id: plan.request_id,
             batch_count: plan.batches.len(),
+            tags_may_change,
             overlays: plan.overlays,
             active_overlay: true,
             trash_required: plan.trash_required,
@@ -738,10 +752,17 @@ impl CurationState {
             self.retired_pending.remove(&(key, request_id));
             return None;
         };
-        let (batch_count, operation_trash_required, operation_active, operation_paths) = {
+        let (
+            batch_count,
+            operation_tags_may_change,
+            operation_trash_required,
+            operation_active,
+            operation_paths,
+        ) = {
             let operation = &lineage.pending[operation_index];
             (
                 operation.batch_count,
+                operation.tags_may_change,
                 operation.trash_required,
                 operation.active_overlay,
                 operation.overlays.keys().cloned().collect::<HashSet<_>>(),
@@ -749,6 +770,7 @@ impl CurationState {
         };
         let expected_initial = outcome.initial_revision;
         let mut next_revision = lineage.revision;
+        let prior_revision = lineage.revision;
         let mut valid =
             operation_active && expected_initial.is_none_or(|revision| revision == next_revision);
         let mut receipt_updates = Vec::new();
@@ -850,10 +872,12 @@ impl CurationState {
         Some(CurationOutcomeApplication {
             root_identity: lineage.root_identity.clone(),
             directory_generation: lineage.directory_generation,
+            prior_revision,
             revision: lineage.revision,
             visible,
             playback_types,
             metadata_changed,
+            tags_may_change: operation_tags_may_change,
             failed: failed.is_some(),
         })
     }
@@ -919,6 +943,17 @@ fn effective_curation(lineage: &CurationLineage, path: &PathBuf) -> Option<Audio
         .filter(|operation| operation.active_overlay)
         .find_map(|operation| operation.overlays.get(path).copied())
         .or_else(|| lineage.confirmed.get(path).copied())
+}
+
+fn source_update_may_change_tags(update: &SourceCurationUpdate) -> bool {
+    !matches!(
+        update,
+        SourceCurationUpdate::SetLastPlayedAt { .. }
+            | SourceCurationUpdate::SetRating { .. }
+            | SourceCurationUpdate::SetLocked { .. }
+            | SourceCurationUpdate::AddCollection { .. }
+            | SourceCurationUpdate::RemoveCollection { .. }
+    )
 }
 
 fn updates_for_action(
@@ -1487,7 +1522,7 @@ impl Browser {
         }
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.restore_projection_focus(previous_id, previous_position, cx);
+        self.restore_explicit_projection_focus(previous_id, previous_position, cx);
         cx.notify();
     }
 
@@ -1511,7 +1546,7 @@ impl Browser {
         self.reset_browser_focus_state();
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.restore_projection_focus(previous_id, previous_position, cx);
+        self.restore_explicit_projection_focus(previous_id, previous_position, cx);
         cx.notify();
     }
 
@@ -1531,7 +1566,7 @@ impl Browser {
         }
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.restore_projection_focus(previous_id, previous_position, cx);
+        self.restore_explicit_projection_focus(previous_id, previous_position, cx);
         cx.notify();
     }
 
@@ -1624,6 +1659,14 @@ impl Browser {
             cx.notify();
             return;
         }
+        if tag_filter::scope_pending(self) && !is_playback_record_action(action) {
+            self.curation_state.set_message(
+                &key,
+                String::from("Tag filtering is still loading; wait for the visible scope"),
+            );
+            cx.notify();
+            return;
+        }
         let target_paths = explicit_paths.unwrap_or_else(|| self.curation_target_paths());
         match self.curation_state.plan_action(&key, action, &target_paths) {
             CurationPlan::Rejected(message) => {
@@ -1645,6 +1688,10 @@ impl Browser {
             }
             CurationPlan::Ready(plan) => {
                 let request_id = plan.request_id;
+                let tags_may_change = plan.tags_may_change();
+                let reusable_tag_mask = (!tags_may_change)
+                    .then(|| tag_filter::capture_ready_mask(self))
+                    .flatten();
                 let optimistic = plan.overlays.clone();
                 let command = wavecrate_session::CatalogCommand::ApplyCurationOperation {
                     source_id: key.source_id.clone(),
@@ -1670,7 +1717,23 @@ impl Browser {
                         } else {
                             self.catalog_metadata.pause_for_curation();
                             tag_chips::invalidate_after_curation(self);
-                            self.apply_visible_curation(&key, &optimistic, &BTreeMap::new(), cx);
+                            if tags_may_change
+                                || (reusable_tag_mask.is_none()
+                                    && self.view_model.tag_filter().is_enabled())
+                            {
+                                tag_filter::invalidate_after_curation(
+                                    self,
+                                    tag_filter::FilterOrigin::PassiveMetadata,
+                                    cx,
+                                );
+                            }
+                            self.apply_visible_curation(
+                                &key,
+                                &optimistic,
+                                &BTreeMap::new(),
+                                reusable_tag_mask,
+                                cx,
+                            );
                             self.start_source_registry_poll(cx);
                         }
                     }
@@ -1775,6 +1838,13 @@ impl Browser {
                 "Curation authority is stale; refresh the catalog before editing",
             ));
         }
+        if tag_filter::scope_pending(self) {
+            let message =
+                String::from("Tag filtering is still loading; wait for the visible scope");
+            self.curation_state.set_message(&key, message.clone());
+            cx.notify();
+            return TagAdmissionResult::Rejected(message);
+        }
         let target_paths = explicit_paths.unwrap_or_else(|| self.curation_target_paths());
         let plan = match mutation {
             TagMutation::Add => self
@@ -1827,6 +1897,11 @@ impl Browser {
                             // the first source of visible tag and playback-type state.
                             self.catalog_metadata.pause_for_curation();
                             tag_chips::invalidate_after_curation(self);
+                            tag_filter::invalidate_after_curation(
+                                self,
+                                tag_filter::FilterOrigin::PassiveMetadata,
+                                cx,
+                            );
                             self.start_source_registry_poll(cx);
                             TagAdmissionResult::Accepted
                         }
@@ -1848,6 +1923,11 @@ impl Browser {
         &self,
         label_count: usize,
     ) -> Result<Vec<PathBuf>, String> {
+        if tag_filter::scope_pending(self) {
+            return Err(String::from(
+                "Tag filtering is still loading; wait for the visible scope",
+            ));
+        }
         if label_count == 0 {
             return Err(String::from("Tag operation requires at least one label"));
         }
@@ -1895,6 +1975,9 @@ impl Browser {
     }
 
     fn curation_target_paths(&self) -> Vec<PathBuf> {
+        if tag_filter::scope_pending(self) {
+            return Vec::new();
+        }
         let visible_rows = self.view_model.rows();
         if !self.selection.is_empty() {
             return visible_rows
@@ -1947,6 +2030,7 @@ impl Browser {
         key: &CurationLifecycleKey,
         patches: &BTreeMap<PathBuf, AudioFileCuration>,
         playback_types: &BTreeMap<PathBuf, Option<PlaybackType>>,
+        reusable_tag_mask: Option<TagFilterMask>,
         cx: &mut Context<Self>,
     ) {
         let Some(active_index) = self.active_source.filter(|index| {
@@ -1957,8 +2041,7 @@ impl Browser {
         }) else {
             return;
         };
-        let previous_id = self.browser_focus_id();
-        let previous_position = self.selected_visible_position();
+        let (previous_id, previous_position) = tag_filter::projection_focus(self);
         let collection_filter = self.view_model.collection_filter();
         let rating_filter = self.view_model.rating_filter();
         let playback_type_filter = self.view_model.playback_type_filter();
@@ -2021,6 +2104,19 @@ impl Browser {
             || playback_type_filter_membership_changed
         {
             self.view_model.set_entries(&self.entries);
+            if let Some(mask) = reusable_tag_mask {
+                if !tag_filter::apply_reusable_mask(self, mask) {
+                    tag_filter::invalidate_after_curation(
+                        self,
+                        tag_filter::FilterOrigin::PassiveMetadata,
+                        cx,
+                    );
+                    return;
+                }
+            }
+            if tag_filter::scope_pending(self) {
+                return;
+            }
             self.reconcile_selection();
             if preserve_passive_focus {
                 self.restore_playback_type_projection_focus(previous_id, previous_position, cx);
@@ -2030,7 +2126,7 @@ impl Browser {
         }
     }
 
-    fn restore_metadata_projection_focus(
+    pub(super) fn restore_metadata_projection_focus(
         &mut self,
         previous_id: Option<AudioFileId>,
         previous_position: Option<usize>,
@@ -2055,7 +2151,7 @@ impl Browser {
         self.restore_projection_focus(previous_id, previous_position, cx);
     }
 
-    fn restore_playback_type_projection_focus(
+    pub(super) fn restore_playback_type_projection_focus(
         &mut self,
         previous_id: Option<AudioFileId>,
         previous_position: Option<usize>,
@@ -2128,6 +2224,14 @@ impl Browser {
         else {
             return false;
         };
+        let reusable_candidate = self
+            .catalog_activation
+            .as_ref()
+            .filter(|activation| {
+                activation.source_id == *source_id
+                    && activation.lifecycle_generation == *lifecycle_generation
+            })
+            .and_then(|_| tag_filter::capture_reusable_candidate(self));
         let key = CurationLifecycleKey {
             source_id: source_id.clone(),
             lifecycle_generation: *lifecycle_generation,
@@ -2151,12 +2255,53 @@ impl Browser {
             .prune_completed_except(active_key.as_ref());
         let active = curation_key_is_active(active_key.as_ref(), &key);
         if active {
+            let tag_filter_revision_changed = !application.failed
+                && self.catalog_metadata.context().is_some_and(|context| {
+                    context.source_id == key.source_id
+                        && context.lifecycle_generation == key.lifecycle_generation
+                        && context.root_identity == application.root_identity
+                        && context.directory_generation == application.directory_generation
+                        && application.revision > context.revision
+                });
+            let reusable_tag_mask = if tag_filter_revision_changed {
+                tag_filter::validate_reusable_candidate(
+                    self,
+                    reusable_candidate,
+                    application.prior_revision,
+                    application.revision,
+                    &application.root_identity,
+                    application.directory_generation,
+                    application.tags_may_change,
+                    !application.failed,
+                )
+            } else {
+                None
+            };
+            let reused_tag_mask = reusable_tag_mask.is_some();
+            if application.failed {
+                let origin =
+                    if !application.playback_types.is_empty() || self.browser_focus_detached {
+                        tag_filter::FilterOrigin::PassivePlayback
+                    } else {
+                        tag_filter::FilterOrigin::PassiveMetadata
+                    };
+                tag_filter::invalidate_after_curation(self, origin, cx);
+            } else if tag_filter_revision_changed && reusable_tag_mask.is_none() {
+                let origin =
+                    if !application.playback_types.is_empty() || self.browser_focus_detached {
+                        tag_filter::FilterOrigin::PassivePlayback
+                    } else {
+                        tag_filter::FilterOrigin::PassiveMetadata
+                    };
+                tag_filter::invalidate_after_curation(self, origin, cx);
+            }
             tag_chips::invalidate_after_curation(self);
             if application.metadata_changed {
                 self.apply_visible_curation(
                     &key,
                     &application.visible,
                     &application.playback_types,
+                    reusable_tag_mask,
                     cx,
                 );
             }
@@ -2181,6 +2326,22 @@ impl Browser {
             {
                 self.catalog_metadata
                     .advance_projection_revision(application.revision);
+            }
+            if reused_tag_mask {
+                if !tag_filter::rebase_ready_context(
+                    self,
+                    application.revision,
+                    &application.root_identity,
+                    application.directory_generation,
+                ) {
+                    let origin =
+                        if !application.playback_types.is_empty() || self.browser_focus_detached {
+                            tag_filter::FilterOrigin::PassivePlayback
+                        } else {
+                            tag_filter::FilterOrigin::PassiveMetadata
+                        };
+                    tag_filter::invalidate_after_curation(self, origin, cx);
+                }
             }
             if let Some(message) = self.curation_state.status_for(&key)
                 && message.starts_with("Curation failed:")
@@ -2656,6 +2817,9 @@ mod tests {
                 },
             )
             .expect("tag outcome is pending");
+        assert_eq!(tag_application.prior_revision, 10);
+        assert_eq!(tag_application.revision, 11);
+        assert!(tag_application.tags_may_change);
         assert_eq!(
             tag_application.playback_types[&path],
             Some(PlaybackType::Loop)
@@ -2682,6 +2846,9 @@ mod tests {
                 },
             )
             .expect("rating outcome is pending");
+        assert_eq!(rating_application.prior_revision, 11);
+        assert_eq!(rating_application.revision, 12);
+        assert!(!rating_application.tags_may_change);
         assert_eq!(
             rating_application.visible[&path],
             curation_with_last_played(1, false, 1, Some(33))
@@ -2704,6 +2871,9 @@ mod tests {
                 },
             )
             .expect("collection outcome is pending");
+        assert_eq!(collection_application.prior_revision, 12);
+        assert_eq!(collection_application.revision, 13);
+        assert!(!collection_application.tags_may_change);
         assert_eq!(
             collection_application.visible[&path],
             curation_with_last_played(1, false, 1, Some(33))
@@ -2726,6 +2896,9 @@ mod tests {
                 },
             )
             .expect("history outcome is pending");
+        assert_eq!(history_application.prior_revision, 13);
+        assert_eq!(history_application.revision, 14);
+        assert!(!history_application.tags_may_change);
         assert_eq!(
             history_application.visible[&path],
             curation_with_last_played(1, false, 1, Some(33))
@@ -2966,6 +3139,7 @@ mod tests {
                 ..
             }]
         ));
+        assert!(!history.tags_may_change());
         let history_id = history.request_id;
         state.accept_operation(&key(), history);
 
@@ -2997,6 +3171,9 @@ mod tests {
                 },
             )
             .expect("history outcome is pending");
+        assert_eq!(application.prior_revision, 10);
+        assert_eq!(application.revision, 11);
+        assert!(!application.tags_may_change);
         assert_eq!(
             application.visible[&path],
             curation_with_last_played(1, false, 0, Some(33))
@@ -3018,6 +3195,9 @@ mod tests {
                 },
             )
             .expect("rating outcome is pending");
+        assert_eq!(application.prior_revision, 11);
+        assert_eq!(application.revision, 12);
+        assert!(!application.tags_may_change);
         assert_eq!(
             application.visible[&path],
             curation_with_last_played(1, false, 0, Some(33))

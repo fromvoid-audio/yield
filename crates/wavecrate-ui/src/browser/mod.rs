@@ -44,6 +44,7 @@ mod preferences;
 mod sidebar;
 mod source_registry;
 mod tag_chips;
+mod tag_filter;
 mod tags;
 mod transport;
 mod view;
@@ -218,6 +219,9 @@ pub(crate) struct Browser {
     tag_input: gpui::Entity<SearchInput>,
     _tag_subscription: gpui::Subscription,
     _tag_rejected_subscription: gpui::Subscription,
+    tag_filter_input: gpui::Entity<SearchInput>,
+    _tag_filter_subscription: gpui::Subscription,
+    _tag_filter_rejected_subscription: gpui::Subscription,
     root: Option<PathBuf>,
     entries: Vec<AudioFile>,
     source_sessions: Vec<SourceSession>,
@@ -290,6 +294,7 @@ pub(crate) struct Browser {
     catalog_metadata: catalog_metadata::CatalogMetadataState,
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
+    tag_filter: tag_filter::TagFilterState,
     tag_chips: tag_chips::TagChipsState,
     collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
     preferences: preferences::PreferenceState,
@@ -359,7 +364,7 @@ impl Browser {
                 view.view_model.set_query(&view.entries, query);
                 view.refresh_collection_filter_counts();
                 view.reconcile_selection();
-                view.restore_projection_focus(previous_id, previous_position, cx);
+                view.restore_explicit_projection_focus(previous_id, previous_position, cx);
             });
         let tag_input = cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::tags()));
         let tag_subscription = cx.subscribe(&tag_input, |view, input, _: &SearchChanged, cx| {
@@ -370,6 +375,19 @@ impl Browser {
             cx.subscribe(&tag_input, |view, _input, _: &SearchInputRejected, cx| {
                 tags::on_rejected(view, cx);
             });
+        let tag_filter_input =
+            cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::tag_filter()));
+        let tag_filter_subscription =
+            cx.subscribe(&tag_filter_input, |view, input, _: &SearchChanged, cx| {
+                let content = input.read(cx).content().to_owned();
+                tag_filter::on_changed(view, &content, cx);
+            });
+        let tag_filter_rejected_subscription = cx.subscribe(
+            &tag_filter_input,
+            |view, _input, _: &SearchInputRejected, cx| {
+                tag_filter::on_rejected(view, cx);
+            },
+        );
         let motion_settings = Motion::default();
         let mut browser = Self {
             focus_handle: cx.focus_handle(),
@@ -380,6 +398,9 @@ impl Browser {
             tag_input,
             _tag_subscription: tag_subscription,
             _tag_rejected_subscription: tag_rejected_subscription,
+            tag_filter_input,
+            _tag_filter_subscription: tag_filter_subscription,
+            _tag_filter_rejected_subscription: tag_filter_rejected_subscription,
             root: None,
             entries: Vec::new(),
             source_sessions: Vec::new(),
@@ -452,6 +473,7 @@ impl Browser {
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),
+            tag_filter: tag_filter::TagFilterState::default(),
             tag_chips: tag_chips::TagChipsState::default(),
             collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],
             preferences: preferences::PreferenceState::new(),
@@ -584,6 +606,9 @@ impl Browser {
     }
 
     fn reconcile_selection(&mut self) {
+        if tag_filter::scope_pending(self) {
+            return;
+        }
         let visible_ids = self.visible_selection_ids();
         if self.selection.reconcile(&visible_ids) {
             tag_chips::invalidate(self);
@@ -615,6 +640,9 @@ impl Browser {
         event: &ClickEvent,
         cx: &mut Context<Self>,
     ) {
+        if tag_filter::scope_pending(self) {
+            return;
+        }
         let Some(entry) = self.entries.get(index) else {
             return;
         };
@@ -648,6 +676,10 @@ impl Browser {
         previous_position: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        if tag_filter::scope_pending(self) {
+            self.start_source_registry_poll(cx);
+            return;
+        }
         tag_chips::invalidate(self);
         self.start_source_registry_poll(cx);
         let next = self
@@ -675,6 +707,25 @@ impl Browser {
                 cx.notify();
             }
         }
+    }
+
+    /// Restore focus after an explicit projection change, recording its priority while a
+    /// tag-filter result is still pending.
+    fn restore_explicit_projection_focus(
+        &mut self,
+        previous_id: Option<AudioFileId>,
+        previous_position: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if tag_filter::scope_pending(self) {
+            tag_filter::preserve_focus_for_projection(
+                self,
+                previous_id.clone(),
+                previous_position,
+                tag_filter::FilterOrigin::Explicit,
+            );
+        }
+        self.restore_projection_focus(previous_id, previous_position, cx);
     }
 
     pub(crate) fn start_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -824,11 +875,21 @@ impl Browser {
         self.expanded_folders = state.expanded;
         self.rebuild_folder_rows_cache();
         self.folder_scope = previous_scope;
+        tag_filter::preserve_focus_for_projection(
+            self,
+            self.restore_selection_id
+                .clone()
+                .or(previous_selected.clone()),
+            self.restore_selection_position,
+            tag_filter::FilterOrigin::PassiveMetadata,
+        );
+        self.view_model.set_entries(&self.entries);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        tag_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.scan_status = format!(
@@ -888,6 +949,7 @@ impl Browser {
             self.folder_tree = None;
             self.folder_rows_cache.clear();
             self.view_model.set_entries(&self.entries);
+            tag_filter::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
             self.scan_status = error;
             self.selected = None;
@@ -913,11 +975,19 @@ impl Browser {
         self.expanded_folders = self.source_sessions[index].expanded_folders.clone();
         self.rebuild_folder_rows_cache();
         self.folder_scope = self.source_sessions[index].folder_scope;
+        tag_filter::preserve_focus_for_projection(
+            self,
+            self.restore_selection_id.clone(),
+            self.restore_selection_position,
+            tag_filter::FilterOrigin::PassiveMetadata,
+        );
+        self.view_model.set_entries(&self.entries);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        tag_filter::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.scan_status = if is_refresh {
@@ -1250,7 +1320,7 @@ impl Browser {
             session.folder_scope = self.folder_scope;
             session.selected_audio_id = previous_id.clone();
         }
-        self.restore_projection_focus(previous_id, previous_position, cx);
+        self.restore_explicit_projection_focus(previous_id, previous_position, cx);
     }
 
     fn rebuild_folder_rows_cache(&mut self) {
@@ -1681,10 +1751,13 @@ impl Browser {
         self.view_model.toggle_sort(&self.entries, column);
         tag_chips::invalidate(self);
         self.reconcile_selection();
-        self.restore_projection_focus(previous_id, previous_position, cx);
+        self.restore_explicit_projection_focus(previous_id, previous_position, cx);
     }
 
     fn select_all_visible(&mut self, cx: &mut Context<Self>) {
+        if tag_filter::scope_pending(self) {
+            return;
+        }
         let visible_ids = self.visible_selection_ids();
         self.selection.select_all(&visible_ids);
         tag_chips::invalidate(self);
@@ -1695,6 +1768,9 @@ impl Browser {
     /// Toggle explicit membership for the focused row. This is the reference browser's `X`
     /// action; focused-row fallback still makes an empty explicit set auditionable as one item.
     fn toggle_focused_selection(&mut self, cx: &mut Context<Self>) {
+        if tag_filter::scope_pending(self) {
+            return;
+        }
         let Some(focused_id) = self.browser_focus_id() else {
             return;
         };
@@ -1738,6 +1814,22 @@ impl Browser {
                 window,
                 cx,
             );
+            return;
+        }
+        if self
+            .tag_filter_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            if !event.is_held
+                && handoff::is_browser_copy_shortcut(key, secondary, shift, alt, function)
+            {
+                self.invalidate_file_handoff();
+            }
+            if key == "escape" {
+                window.focus(&self.focus_handle);
+            }
             return;
         }
         if key.eq_ignore_ascii_case("f") && secondary {
