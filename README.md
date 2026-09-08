@@ -110,7 +110,9 @@ or shifted with the keyboard. Playback navigation history, native file clipboard
 handoff, and Finder reveal are available. Loop changes apply to active playback
 with runtime identity checks and retain the accepted audition span. Loop and
 one-shot tags select the next-play mode automatically; a manual choice remains
-in effect for the loaded file.
+in effect for the loaded file. The speaker control beside the volume slider toggles
+normalized audition. It prepares the active span in the background, retains your
+volume setting, and saves the toggle between sessions.
 
 Full parity is not complete. Remaining workflows include full tag-library
 management and naming, physical file operations and recovery, waveform

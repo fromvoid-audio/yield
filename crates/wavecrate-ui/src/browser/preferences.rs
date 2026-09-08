@@ -112,6 +112,10 @@ impl PreferenceState {
         preferences
     }
 
+    pub(super) fn normalized_audition_enabled(&self) -> bool {
+        self.effective().normalized_audition_enabled
+    }
+
     pub(super) fn queue(&mut self, request: PreferenceRequestId, patch: PreferencePatch) {
         self.pending.push(PendingPreferencePatch {
             request: request.get(),
@@ -464,6 +468,10 @@ impl Browser {
             self.preferences.has_pending_reset(),
             cx,
         );
+        self.reconcile_normalized_audition_preference(
+            self.preferences.normalized_audition_enabled(),
+            cx,
+        );
         if autoplay_was_enabled && !self.autoplay_selection {
             self.cancel_pending_selection_autoplay();
         }
@@ -546,6 +554,14 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         self.submit_preference_patch(PreferencePatch::SetLoopEnabled(enabled), cx)
+    }
+
+    pub(super) fn persist_normalized_audition_preference(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.submit_preference_patch(PreferencePatch::SetNormalizedAuditionEnabled(enabled), cx)
     }
 
     pub(super) fn preference_status(&self) -> &str {
@@ -661,5 +677,13 @@ mod tests {
         state.queue_for_test(2, PreferencePatch::Reset);
         assert!(state.has_pending_reset());
         assert_eq!(state.effective().audio_output, Default::default());
+    }
+
+    #[test]
+    fn normalized_audition_patch_is_optimistic_and_defaults_off() {
+        let mut state = PreferenceState::new();
+        assert!(!state.normalized_audition_enabled());
+        state.queue_for_test(1, PreferencePatch::SetNormalizedAuditionEnabled(true));
+        assert!(state.normalized_audition_enabled());
     }
 }

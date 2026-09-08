@@ -112,7 +112,8 @@ impl PlaybackCursorInterpolation {
 }
 
 impl Browser {
-    fn ensure_playback_monitor(&mut self, cx: &mut Context<Self>) {
+    /// Start the bounded playback monitor when live runtime work needs polling.
+    pub(super) fn ensure_playback_monitor(&mut self, cx: &mut Context<Self>) {
         if self.playback_monitor_running {
             return;
         }
@@ -174,6 +175,7 @@ impl Browser {
         self.playing_path.is_some()
             || self.pending_progress_poll.is_some()
             || self.pending_loop_retarget.is_some()
+            || self.normalized_gain_runtime_pending.is_some()
     }
 
     /// Return the preview-relative cursor ratio for the current playback sample.
@@ -285,10 +287,12 @@ impl Browser {
         let origin = self
             .playback_init_intent
             .as_ref()
-            .map(|intent| intent.origin);
+            .map(|intent| intent.origin)
+            .or_else(|| self.normalized_audition_pending_play_origin());
         if !should_cancel_pending_autoplay(self.autoplay_selection, origin) {
             return false;
         }
+        self.cancel_normalized_audition();
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.playback_init_intent = None;
         self.playback_waiting_for_preferences = false;
@@ -307,9 +311,11 @@ impl Browser {
             self.accepted_playback_intent
                 .as_ref()
                 .map(|intent| intent.looped),
-            self.pending_loop_retarget
-                .as_ref()
-                .map(|pending| pending.desired_looped),
+            self.normalized_audition_pending_loop_target().or_else(|| {
+                self.pending_loop_retarget
+                    .as_ref()
+                    .map(|pending| pending.desired_looped)
+            }),
         );
         if !self.persist_loop_preference(enabled, cx) {
             return;
@@ -321,6 +327,9 @@ impl Browser {
 
     /// Apply a changed loop choice to pending playback and, when possible, the accepted play.
     pub(super) fn apply_loop_mode_change(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.playback_init_intent.is_some() {
+            self.cancel_normalized_audition();
+        }
         if let Some(intent) = self.playback_init_intent.as_mut()
             && intent.origin != PlaybackIntentOrigin::AudioOutputResume
         {
@@ -363,6 +372,20 @@ impl Browser {
         desired_looped: bool,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
+        if self.normalized_audition.enabled()
+            && self.schedule_normalized_loop_retarget(desired_looped, cx)
+        {
+            return Some(Ok(()));
+        }
+        self.submit_live_loop_retarget_with_gain(desired_looped, 1.0, cx)
+    }
+
+    pub(super) fn submit_live_loop_retarget_with_gain(
+        &mut self,
+        desired_looped: bool,
+        playback_gain: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
         let accepted_playback_id = self.latest_playback_request_id?;
         let path = self.playing_path.clone()?;
         let accepted = self.accepted_playback_intent.as_ref()?;
@@ -384,7 +407,7 @@ impl Browser {
             offset: span.start,
             seek_to_offset: false,
             looped: desired_looped,
-            playback_gain: 1.0,
+            playback_gain,
             playback_gain_normalization: None,
             metronome: None,
         };
@@ -565,6 +588,25 @@ impl Browser {
     }
 
     fn queue_playback_intent(&mut self, intent: PlaybackIntent, cx: &mut Context<Self>) {
+        self.queue_playback_intent_with_gain_and_span(intent, None, None, cx);
+    }
+
+    pub(super) fn queue_playback_intent_with_gain(
+        &mut self,
+        intent: PlaybackIntent,
+        precomputed_gain: Option<f32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue_playback_intent_with_gain_and_span(intent, precomputed_gain, None, cx);
+    }
+
+    pub(super) fn queue_playback_intent_with_gain_and_span(
+        &mut self,
+        intent: PlaybackIntent,
+        precomputed_gain: Option<f32>,
+        expected_span: Option<WaveformPlayRegion>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
             self.clear_playback_cursor();
             return;
@@ -589,6 +631,23 @@ impl Browser {
             cx.notify();
             return;
         };
+        if let Some(expected_span) = expected_span
+            && !playback_span_matches_preparation(&intent, expected_span)
+        {
+            if self.normalized_audition.enabled() && self.schedule_normalized_playback(intent, cx) {
+                return;
+            }
+            self.clear_playback_cursor();
+            self.playback_status = "Playback normalization is no longer current".to_string();
+            cx.notify();
+            return;
+        }
+        if precomputed_gain.is_none()
+            && self.normalized_audition.enabled()
+            && self.schedule_normalized_playback(intent.clone(), cx)
+        {
+            return;
+        }
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
             self.playback_status = "Invalid playback position".to_string();
@@ -602,12 +661,13 @@ impl Browser {
             mode,
             stream_policy: PlaybackRuntimeStreamPolicy::transient_navigation(),
             volume: super::volume::quantize_volume(intent.volume),
-            playback_gain: 1.0,
+            playback_gain: precomputed_gain.unwrap_or(1.0),
             playback_gain_normalization: None,
             replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
             edit_fade: None,
             metronome: None,
         };
+        self.normalized_gain_runtime_pending = None;
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.pending_loop_retarget = None;
         self.pending_progress_poll = None;
@@ -645,6 +705,7 @@ impl Browser {
     }
 
     pub(super) fn stop_playback(&mut self) {
+        self.cancel_normalized_audition();
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.playback_monitor_generation = self.playback_monitor_generation.wrapping_add(1);
         self.playback_monitor_running = false;
@@ -759,6 +820,7 @@ impl Browser {
                 }
             }
         }
+        self.retry_pending_normalized_gain();
     }
 
     fn handle_playback_progress(
@@ -894,6 +956,7 @@ impl Browser {
     }
 
     fn clear_current_playback(&mut self, status: &str) {
+        self.cancel_normalized_audition();
         self.pending_progress_poll = None;
         self.pending_loop_retarget = None;
         self.clear_playback_cursor();
@@ -1098,7 +1161,8 @@ fn playback_mode_for_intent(intent: &PlaybackIntent) -> PlaybackRuntimeMode {
     }
 }
 
-fn playback_span_for_intent(intent: &PlaybackIntent) -> Option<WaveformPlayRegion> {
+/// Resolve the exact normalized span represented by a playback intent.
+pub(super) fn playback_span_for_intent(intent: &PlaybackIntent) -> Option<WaveformPlayRegion> {
     if let Some(region) = intent.region.filter(|region| region.is_valid()) {
         return Some(region);
     }
@@ -1108,6 +1172,14 @@ fn playback_span_for_intent(intent: &PlaybackIntent) -> Option<WaveformPlayRegio
     } else {
         WaveformPlayRegion::new(start, 1.0)
     }
+}
+
+/// Return whether a prepared normalized span still matches a resolved playback intent.
+pub(super) fn playback_span_matches_preparation(
+    intent: &PlaybackIntent,
+    prepared_span: WaveformPlayRegion,
+) -> bool {
+    playback_span_for_intent(intent) == Some(prepared_span)
 }
 
 fn reconcile_playback_intent_mode(intent: Option<&mut PlaybackIntent>, looped: bool) {
@@ -1376,11 +1448,12 @@ mod tests {
         authoritative_cursor_progress, cursor_interpolation, next_loop_toggle_target,
         normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
         playback_progress_disposition, playback_request_number_is_current,
-        playback_span_for_intent, preview_cursor_ratio, progress_poll_has_expired,
-        progress_poll_is_current, reconcile_playback_intent_mode, reduce_loop_retarget_progress,
-        resolve_queued_playback_intent, retain_pending_loop_retarget_after_failed_admission,
-        should_cancel_pending_autoplay, should_queue_initialized_playback,
-        should_record_last_played, should_record_playback_history,
+        playback_span_for_intent, playback_span_matches_preparation, preview_cursor_ratio,
+        progress_poll_has_expired, progress_poll_is_current, reconcile_playback_intent_mode,
+        reduce_loop_retarget_progress, resolve_queued_playback_intent,
+        retain_pending_loop_retarget_after_failed_admission, should_cancel_pending_autoplay,
+        should_queue_initialized_playback, should_record_last_played,
+        should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -1875,6 +1948,26 @@ mod tests {
             Some(false),
             Some(true)
         ));
+    }
+
+    #[test]
+    fn normalized_pending_loop_target_inverts_the_latest_request() {
+        assert!(!next_loop_toggle_target(
+            true,
+            false,
+            Some(false),
+            Some(true)
+        ));
+        assert!(next_loop_toggle_target(true, true, Some(true), Some(false)));
+    }
+
+    #[test]
+    fn prepared_normalized_span_must_match_resolved_loop_mode() {
+        let mut intent = sample_intent(Path::new("sample.wav"), false);
+        let full_track = WaveformPlayRegion::new(0.0, 1.0).expect("valid span");
+        assert!(!playback_span_matches_preparation(&intent, full_track));
+        intent.looped = true;
+        assert!(playback_span_matches_preparation(&intent, full_track));
     }
 
     #[test]

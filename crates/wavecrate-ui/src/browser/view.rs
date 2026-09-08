@@ -19,6 +19,7 @@ use super::Browser;
 use super::context_menu;
 use super::curation;
 use super::motion;
+use super::normalized_audition;
 use super::tag_filter;
 use super::volume;
 use super::waveform;
@@ -457,6 +458,15 @@ impl Render for Browser {
         let toolbar_pressed = theme.interaction.pressed_fill;
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
+        let normalized_audition_enabled = self.normalized_audition.enabled();
+        let normalized_audition_preparing = self.normalized_audition_is_preparing();
+        let normalized_audition_color = color(if normalized_audition_preparing {
+            theme.colors.warning
+        } else if normalized_audition_enabled {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
         if self.view_model.rows().is_empty()
             && let Some(context) = self.catalog_metadata.context()
         {
@@ -875,6 +885,27 @@ impl Render for Browser {
                             .child(root_label),
                     )
                     .child(volume::render_slider(self, theme.clone(), cx))
+                    .child(
+                        div()
+                            .id("normalized-audition-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .tooltip(normalized_audition::normalized_audition_tooltip)
+                            .on_click(cx.listener(Self::toggle_normalized_audition_from_toolbar))
+                            .child(normalized_audition::render_normalized_audition_icon(
+                                normalized_audition_color,
+                            )),
+                    )
                     .child(
                         div()
                             .id("audio-output-settings-toolbar")

@@ -40,6 +40,7 @@ mod curation;
 mod handoff;
 mod history;
 mod motion;
+mod normalized_audition;
 mod preferences;
 mod sidebar;
 mod source_recovery;
@@ -250,6 +251,7 @@ pub(crate) struct Browser {
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
     waveform_detail: waveform_detail::WaveformDetailState,
+    normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
@@ -307,6 +309,11 @@ pub(crate) struct Browser {
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
+    normalized_audition_task: Option<Task<()>>,
+    normalized_audition_queued: Option<normalized_audition::PendingNormalizedAudition>,
+    normalized_audition_deferred_play: Option<normalized_audition::PendingNormalizedAudition>,
+    normalized_audition_pending_loop_target: Option<bool>,
+    normalized_gain_runtime_pending: Option<normalized_audition::PendingNormalizedGain>,
     waveform_pending: bool,
     motion_started_at: Option<Instant>,
     motion_clock_origin: Instant,
@@ -434,6 +441,7 @@ impl Browser {
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
             waveform_detail: waveform_detail::WaveformDetailState::default(),
+            normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
@@ -491,6 +499,11 @@ impl Browser {
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
             waveform_task: None,
+            normalized_audition_task: None,
+            normalized_audition_queued: None,
+            normalized_audition_deferred_play: None,
+            normalized_audition_pending_loop_target: None,
+            normalized_gain_runtime_pending: None,
             waveform_pending: false,
             motion_started_at: None,
             motion_clock_origin: Instant::now(),
@@ -1995,6 +2008,8 @@ impl Drop for Browser {
             cancellation.store(true, Ordering::Release);
         }
         self.catalog_projection_task.take();
+        self.cancel_normalized_audition();
+        self.normalized_audition_task.take();
         self.waveform_detail.reset();
         self.reset_catalog_metadata();
         self.cancel_waveform_load();
