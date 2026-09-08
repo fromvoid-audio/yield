@@ -133,6 +133,10 @@ fn default_waveform_playhead() -> Color {
     Color::rgba(231, 229, 223, 210)
 }
 
+fn default_waveform_edit_selection() -> Color {
+    Color::rgb(174, 176, 173)
+}
+
 fn default_rating_keep() -> Color {
     Color::rgba(122, 226, 96, 235)
 }
@@ -235,6 +239,9 @@ pub struct Colors {
     /// Pale playback cursor drawn over the bounded waveform preview.
     #[serde(default = "default_waveform_playhead")]
     pub waveform_playhead: Color,
+    /// Neutral edit-selection color, independent of the playback selection accent.
+    #[serde(default = "default_waveform_edit_selection")]
+    pub waveform_edit_selection: Color,
     /// Subtle raw waveform carrier layer.
     pub waveform_raw: Color,
     /// Played waveform bars.
@@ -398,6 +405,7 @@ impl Default for Theme {
                 waveform_mid: Color::rgba(224, 71, 47, 235),
                 waveform_high: Color::rgba(232, 236, 237, 209),
                 waveform_playhead: default_waveform_playhead(),
+                waveform_edit_selection: default_waveform_edit_selection(),
                 waveform_raw: Color::rgba(236, 232, 223, 13),
                 waveform_played: Color::rgb(98, 102, 106),
                 waveform_grid: Color::rgb(54, 57, 57),
@@ -881,6 +889,7 @@ mod tests {
             "rating_neutral",
             "collection_slots",
             "waveform_playhead",
+            "waveform_edit_selection",
         ] {
             colors.remove(field);
         }
@@ -906,6 +915,10 @@ mod tests {
         assert_eq!(theme.colors.rating_neutral, default_rating_neutral());
         assert_eq!(theme.colors.collection_slots, default_collection_slots());
         assert_eq!(theme.colors.waveform_playhead, default_waveform_playhead());
+        assert_eq!(
+            theme.colors.waveform_edit_selection,
+            default_waveform_edit_selection()
+        );
         assert_eq!(theme.waveform.scrollbar_height, 6.0);
         assert_eq!(
             theme.spacing.rating_column_width,

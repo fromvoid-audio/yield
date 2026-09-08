@@ -1889,3 +1889,9 @@ Independent review approved fingerprint ownership, reuse and reader offsets. Win
 Media now exposes precise normalized/frame requests for the native five-millisecond zero-crossing search. It streams channel means using the native playback conversion, preserves candidate distance/level/boundary ordering, and fences source identity and revision before and after decoding. Invalid edges and reversed results preserve native no-op behavior. No sample vector or file mutation is introduced. On Windows, the shared revision fence additionally hashes the full raw file once at admission under the read lease.
 
 Validation: temporary module registration passed 51 media tests and doc tests; final registration passed the UI dependency check and formatting. UI gesture integration follows separately.
+
+### Edit-selection geometry and theme foundation
+
+Core now has a separate `WaveformEditRegion` that preserves finite bounds outside the audio interval for silence-margin gestures. Movement and crossing resizes derive from the unchanged baseline; nonfinite, overflowing and collapsed results are rejected. Conversion to a playback region explicitly intersects the audio interval. Existing playback-region behavior is unchanged.
+
+The defaulted `waveform_edit_selection` theme color matches the native neutral overlay and is included in the example theme. Existing theme files remain compatible. Five focused core tests, the core check, 21 design tests, the updated example check and scoped formatting passed. Browser edit-selection interaction follows separately.
