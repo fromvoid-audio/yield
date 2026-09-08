@@ -327,16 +327,21 @@ impl Render for Browser {
             .as_ref()
             .map(|root| root.display().to_string())
             .unwrap_or_else(|| "No source folder".to_string());
-        let list_status =
-            if !self.entries.is_empty() && self.view_model.rows().len() != self.entries.len() {
-                format!(
-                    "{} of {} audio files visible",
-                    self.view_model.rows().len(),
-                    self.entries.len()
-                )
-            } else {
-                self.scan_status.clone()
-            };
+        let source_error = self
+            .active_source
+            .and_then(|index| self.source_sessions.get(index))
+            .and_then(|session| session.last_error.as_deref());
+        let list_status = if let Some(error) = source_error {
+            format!("Source error: {error}")
+        } else if !self.entries.is_empty() && self.view_model.rows().len() != self.entries.len() {
+            format!(
+                "{} of {} audio files visible",
+                self.view_model.rows().len(),
+                self.entries.len()
+            )
+        } else {
+            self.scan_status.clone()
+        };
         let selected_count = self.selected_count_label();
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;

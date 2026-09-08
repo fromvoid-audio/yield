@@ -5,8 +5,9 @@ use std::sync::mpsc::TryRecvError;
 use gpui::{BorrowAppContext, Global, Subscription};
 use wavecrate_library::sample_sources::SampleSource;
 use wavecrate_session::{
-    CanonicalSourceRoot, PreferenceEvent, PreferencePatch, PreferenceRequestId, RegistryEvent,
-    RequestId, SourceRegistryService, SubmitError,
+    CanonicalSourceRoot, CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
+    PreferenceEvent, PreferencePatch, PreferenceRequestId, RegistryEvent, RequestId,
+    SourceRegistryService, SubmitError,
 };
 
 /// The app-owned source registry service.
@@ -78,6 +79,37 @@ impl SourceRegistryGlobal {
             .reset_preferences()
     }
 
+    /// Return the current state of the independently-owned source catalog.
+    pub(crate) fn catalog_status(&self) -> CatalogStatus {
+        self.service
+            .as_ref()
+            .map(SourceRegistryService::catalog_status)
+            .unwrap_or(CatalogStatus::Closed)
+    }
+
+    /// Submit one typed catalog command through the profile-owned session service.
+    pub(crate) fn submit_catalog(&self, command: CatalogCommand) -> Result<(), CatalogSubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(CatalogSubmitError::Closed)?
+            .submit_catalog(command)
+    }
+
+    /// Drain catalog events without waiting for the background worker.
+    pub(crate) fn drain_catalog_events(&self, events: &mut Vec<CatalogEvent>) -> bool {
+        let Some(service) = self.service.as_ref() else {
+            return false;
+        };
+        const MAX_EVENTS_PER_TICK: usize = 64;
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            match service.try_recv_catalog() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
+            }
+        }
+        true
+    }
+
     /// Drain all currently available worker events without waiting.
     pub(crate) fn drain_events(&self, events: &mut Vec<RegistryEvent>) {
         let Some(service) = self.service.as_ref() else {
@@ -122,7 +154,7 @@ impl SourceRegistryGlobal {
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::{Browser, PendingRegistryMutation, SourceSession, source_label};
+use super::{Browser, PendingRegistryMutation, SourceSession, catalog, source_label};
 use gpui::Context;
 
 impl Browser {
@@ -157,12 +189,22 @@ impl Browser {
         for event in events {
             changed |= self.apply_source_registry_event(event, cx);
         }
+        let mut catalog_events = Vec::new();
+        let catalog_events_capped = cx.update_global::<SourceRegistryGlobal, _>(|global, _| {
+            global.drain_catalog_events(&mut catalog_events)
+        });
+        for event in catalog_events {
+            changed |= self.apply_catalog_event(event, cx);
+        }
+        changed |= self.retry_catalog_commands(cx);
         if changed {
             cx.notify();
         }
         !self.source_registry_loaded
             || !self.source_registry_pending_adds.is_empty()
             || !self.source_registry_pending_removes.is_empty()
+            || catalog_events_capped
+            || catalog::catalog_poll_needed(self)
     }
 
     fn apply_source_registry_event(
@@ -316,6 +358,7 @@ impl Browser {
         else {
             return;
         };
+        self.deactivate_catalog_for_session(index, cx);
         if self.active_source == Some(index) {
             self.clear_active_source_projection(cx);
         }
@@ -370,9 +413,16 @@ impl Browser {
             let mut session = previous_index
                 .map(|index| previous.remove(index))
                 .unwrap_or_else(|| SourceSession::from_source(source));
+            let root_changed = session.root != source.root;
             session.source_id = Some(source.id.clone());
             session.root = source.root.clone();
             session.label = source_label(&source.root);
+            if root_changed {
+                session.entries.clear();
+                session.tree = wavecrate_core::FolderTree::default();
+                session.catalog_facts.clear();
+                session.selected_audio_id = None;
+            }
             sessions.push(session);
         }
 
@@ -433,6 +483,7 @@ impl Browser {
                 })
             });
         if self.active_source.is_some() && next_active.is_none() {
+            self.deactivate_catalog_source(cx);
             self.clear_active_source_projection(cx);
         } else {
             self.active_source = next_active;
@@ -450,6 +501,7 @@ impl Browser {
             self.source_sessions
                 .retain(|session| !removed_roots.contains(&session.root));
         }
+        self.ensure_active_catalog_activation(cx);
     }
 
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {

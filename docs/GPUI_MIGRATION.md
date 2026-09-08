@@ -701,3 +701,32 @@ Build success is not audible or DAW handoff acceptance; those need explicit
 manual results. Remove Radiant reference code and legacy release wiring only
 after the register is satisfied and the GPUI application is the verified release
 path.
+
+### Browser catalog adapter, 2026-09-08
+
+Known sources now activate the session-owned catalog with a fresh lifecycle
+generation. The browser consumes bounded completion batches on its existing
+source-service timer and projects manifests and directory evidence in a
+cancellable background task. Projection performs no filesystem probes; optional
+WAV display fields come from the catalog snapshot. Newly added roots retain the
+initial read-only scan until their durable source identifier is acknowledged.
+
+Source switches retire admitted registrations and reject stale completions by
+source, lifecycle, and cancellation-token identity. Passive updates preserve
+playback when the focused file facts match; explicit refresh reloads it. Failed
+audits preserve the last good rows and show the source error, including in a
+filtered folder view. Restored sources do not automatically scan or audition on
+startup. Navigation history reactivates the catalog without restarting accepted
+playback.
+
+Validation so far: nine catalog adapter tests passed, and the integrated UI
+suite passed 99 tests with one ignored benchmark. Independent review identified
+a path-based metadata probe and an aggregate header-work budget gap; both were
+fixed by the bounded catalog-owned metadata path documented above. Earlier
+isolated-profile GUI checks covered refresh after file addition and rename,
+nested WAV metadata, and empty directories. Final signed-bundle GUI checks confirmed 2-second/16-kHz and nested
+3-second/22.05-kHz metadata. Moving the disposable source root offline and
+refreshing retained the nested rows and displayed the source error; restoring
+the root and refreshing recovered the waveform and cleared the error. The
+isolated app quit cleanly. Filesystem watching and metadata enrichment beyond
+the initial bounded pass remain follow-on work.

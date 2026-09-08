@@ -19,6 +19,7 @@ wavecrate-library.workspace = true
 wavecrate-session.workspace = true
 
 [dev-dependencies]
+wavecrate-catalog = { path = "../wavecrate-catalog" }
 tempfile.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

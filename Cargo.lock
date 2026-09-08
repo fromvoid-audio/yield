@@ -7064,6 +7064,7 @@ dependencies = [
  "reson",
  "tempfile",
  "unicode-segmentation",
+ "wavecrate-catalog",
  "wavecrate-core",
  "wavecrate-design",
  "wavecrate-library",

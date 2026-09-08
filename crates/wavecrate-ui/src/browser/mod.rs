@@ -33,6 +33,7 @@ use crate::search_input::{SearchChanged, SearchInput};
 use crate::theme::ActiveTheme;
 
 mod audio_output;
+mod catalog;
 mod handoff;
 mod history;
 mod motion;
@@ -70,6 +71,8 @@ struct SourceSession {
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
     selected_audio_id: Option<AudioFileId>,
+    catalog_facts: HashMap<PathBuf, catalog::CatalogFileFacts>,
+    catalog_lifecycle_generation: Option<u64>,
     last_error: Option<String>,
 }
 
@@ -96,6 +99,8 @@ impl SourceSession {
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
             selected_audio_id: None,
+            catalog_facts: HashMap::new(),
+            catalog_lifecycle_generation: None,
             last_error: None,
         }
     }
@@ -261,6 +266,12 @@ pub(crate) struct Browser {
     source_registry_pending_removes: HashMap<RequestId, PendingRegistryMutation>,
     source_registry_removed_roots: BTreeSet<PathBuf>,
     source_registry_status: String,
+    catalog_next_generation: u64,
+    catalog_activation: Option<catalog::CatalogActivation>,
+    catalog_pending_command: Option<catalog::CatalogCommandIntent>,
+    catalog_pending_removes: HashMap<SourceId, catalog::CatalogCommandIntent>,
+    catalog_projection_task: Option<Task<()>>,
+    catalog_projection_cancel: Option<Arc<AtomicBool>>,
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
@@ -391,6 +402,12 @@ impl Browser {
             source_registry_pending_removes: HashMap::new(),
             source_registry_removed_roots: BTreeSet::new(),
             source_registry_status: "Loading sources…".to_string(),
+            catalog_next_generation: 0,
+            catalog_activation: None,
+            catalog_pending_command: None,
+            catalog_pending_removes: HashMap::new(),
+            catalog_projection_task: None,
+            catalog_projection_cancel: None,
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
             waveform_task: None,
@@ -572,6 +589,7 @@ impl Browser {
         source_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        self.deactivate_catalog_source(cx);
         if source_index != self.active_source {
             self.selection.clear();
         }
@@ -684,6 +702,7 @@ impl Browser {
         session.label = source_label(&root);
         session.entries = entries.clone();
         session.tree = tree.clone();
+        session.catalog_facts.clear();
         session.selected_folder = state.selected.clone();
         session.expanded_folders = state.expanded.clone();
         session.folder_scope = previous_scope;
@@ -844,12 +863,13 @@ impl Browser {
     }
 
     pub(super) fn source_scan_is_pending(&self, root: &Path) -> bool {
-        self.scan_cancel.is_some() && self.root.as_deref() == Some(root)
+        (self.scan_cancel.is_some() && self.root.as_deref() == Some(root))
+            || catalog::is_catalog_pending(self, root)
     }
 
     pub(super) fn motion_pending(&self) -> motion::PendingWork {
         motion::pending_work(
-            self.scan_cancel.is_some(),
+            self.scan_cancel.is_some() || catalog::is_catalog_busy(self),
             self.waveform_pending || self.waveform_detail.is_pending(),
             self.audio_output_open_task.is_some(),
             self.playback_init_intent.is_some(),
@@ -975,7 +995,9 @@ impl Browser {
             return;
         };
         window.focus(&self.focus_handle);
-        self.begin_source_scan(root.clone(), Some(index), cx);
+        if !self.begin_catalog_activation(index, false, false, true, cx) {
+            self.begin_source_scan(root.clone(), Some(index), cx);
+        }
         self.start_focus(
             motion::FocusTarget::Source(root),
             motion::FocusTrigger::Pointer,
@@ -992,6 +1014,7 @@ impl Browser {
             return;
         }
         let root = self.source_sessions[index].root.clone();
+        self.deactivate_catalog_for_session(index, cx);
         let has_registry_identity = self.source_sessions[index].source_id.is_some()
             || self
                 .source_registry_pending_adds
@@ -1050,7 +1073,9 @@ impl Browser {
         else {
             return;
         };
-        self.begin_source_scan(root, Some(index), cx);
+        if !self.begin_catalog_activation(index, true, false, true, cx) {
+            self.begin_source_scan(root, Some(index), cx);
+        }
     }
 
     pub(super) fn toggle_folder_scope(&mut self, cx: &mut Context<Self>) {
@@ -1668,6 +1693,10 @@ impl Drop for Browser {
             cancellation.store(true, Ordering::Release);
         }
         self.source_registry_task.take();
+        if let Some(cancellation) = self.catalog_projection_cancel.take() {
+            cancellation.store(true, Ordering::Release);
+        }
+        self.catalog_projection_task.take();
         self.waveform_detail.reset();
         self.cancel_waveform_load();
         self.cancel_audio_output_options();

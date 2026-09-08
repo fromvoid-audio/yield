@@ -176,6 +176,10 @@ impl Browser {
         target_path: &Path,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
+        let switching_source = self.active_source != Some(source_index);
+        if switching_source {
+            self.deactivate_catalog_source(cx);
+        }
         let session = self.source_sessions.get(source_index)?;
         let target = session.entries.get(entry_index)?;
         if target.path != target_path {
@@ -245,6 +249,12 @@ impl Browser {
             session.expanded_folders = expanded;
             session.folder_scope = folder_scope;
             session.selected_audio_id = None;
+        }
+        if switching_source || self.catalog_activation.is_none() {
+            // History already owns the accepted replay request. Preserve its transport while
+            // handing the newly active source to the catalog; a catalog failure keeps this
+            // cached projection usable through the existing fallback path.
+            let _ = self.begin_catalog_activation(source_index, false, true, false, cx);
         }
         Some(target_index)
     }
