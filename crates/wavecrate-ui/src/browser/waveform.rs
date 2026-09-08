@@ -7,8 +7,10 @@ use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
     Bounds, Context, DragMoveEvent, MouseButton, MouseDownEvent, MouseUpEvent, Path, PathBuilder,
-    Pixels, Point, Render, Window, canvas, div, fill, point, prelude::*, px,
+    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point,
+    prelude::*, px,
 };
+use wavecrate_core::WaveformViewport;
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -17,6 +19,8 @@ use super::Browser;
 
 const WAVEFORM_SELECTION_CLICK_SLOP_PX: f32 = 2.0;
 const WAVEFORM_SELECTION_EDGE_WIDTH: f32 = 1.0;
+const WAVEFORM_PAN_REFERENCE_WIDTH: f64 = 1_200.0;
+const WAVEFORM_WHEEL_EPSILON: f64 = f64::EPSILON;
 
 /// One normalized, ordered playback region in the selected waveform.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,17 +56,26 @@ pub(super) struct WaveformRegionDrag {
     current: f64,
     anchor_x: f32,
     bounds: Bounds<Pixels>,
+    viewport: WaveformViewport,
     moved: bool,
     generation: u64,
 }
 
 impl WaveformRegionDrag {
-    fn begin(position: Point<Pixels>, ratio: f64, bounds: Bounds<Pixels>, generation: u64) -> Self {
+    fn begin(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        generation: u64,
+    ) -> Self {
+        let ratio = viewport.absolute_ratio_from_visible(visible_ratio);
         Self {
             anchor: ratio,
             current: ratio,
             anchor_x: f32::from(position.x),
             bounds,
+            viewport,
             moved: false,
             generation,
         }
@@ -70,7 +83,7 @@ impl WaveformRegionDrag {
 
     fn update(&mut self, position: Point<Pixels>) {
         if let Some(ratio) = waveform_click_ratio(position, self.bounds) {
-            self.current = ratio;
+            self.current = self.viewport.absolute_ratio_from_visible(ratio);
         }
         self.moved |=
             (f32::from(position.x) - self.anchor_x).abs() > WAVEFORM_SELECTION_CLICK_SLOP_PX;
@@ -78,6 +91,47 @@ impl WaveformRegionDrag {
 
     fn preview_region(self) -> Option<WaveformPlayRegion> {
         WaveformPlayRegion::new(self.anchor, self.current)
+    }
+
+    fn ratio_at(self, position: Point<Pixels>) -> Option<f64> {
+        waveform_click_ratio(position, self.bounds)
+            .map(|ratio| self.viewport.absolute_ratio_from_visible(ratio))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct WaveformPanDrag {
+    anchor_visible_ratio: f64,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    total_frames: usize,
+    generation: u64,
+}
+
+impl WaveformPanDrag {
+    fn begin(
+        position: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        total_frames: usize,
+        generation: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            anchor_visible_ratio: waveform_click_ratio(position, bounds)?,
+            viewport,
+            bounds,
+            total_frames,
+            generation,
+        })
+    }
+
+    fn update(self, position: Point<Pixels>) -> Option<WaveformViewport> {
+        let current = waveform_click_ratio(position, self.bounds)?;
+        Some(self.viewport.pan_by_visible_ratio_drag(
+            self.total_frames,
+            self.anchor_visible_ratio,
+            current,
+        ))
     }
 }
 
@@ -127,7 +181,8 @@ fn build_waveform_path(
 ///
 /// GPUI canvas closures are recreated with the surrounding view, so this cache owns the paths
 /// independently of an individual canvas element. The key includes every input that changes the
-/// path coordinates or shaped envelope.
+/// path coordinates or shaped envelope. Viewport zoom currently resamples the bounded full-file
+/// projection; decoding finer per-viewport detail remains a separate follow-up.
 #[derive(Clone, Default)]
 pub(super) struct WaveformRenderCache {
     state: Rc<RefCell<WaveformRenderCacheState>>,
@@ -146,6 +201,8 @@ struct WaveformCacheKey {
     generation: u64,
     bounds: Bounds<Pixels>,
     peak_scale_bits: u32,
+    viewport_start_bits: u64,
+    viewport_end_bits: u64,
 }
 
 impl WaveformRenderCache {
@@ -156,15 +213,18 @@ impl WaveformRenderCache {
         bands: &[[f32; 4]],
         peak_scale: f32,
         bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
     ) -> Vec<(usize, Path<Pixels>)> {
         let key = WaveformCacheKey {
             generation,
             bounds,
             peak_scale_bits: peak_scale.to_bits(),
+            viewport_start_bits: viewport.start.to_bits(),
+            viewport_end_bits: viewport.end.to_bits(),
         };
         let mut state = self.state.borrow_mut();
         if state.key != Some(key) {
-            state.paths = build_waveform_paths(bands, peak_scale, bounds);
+            state.paths = build_waveform_paths(bands, peak_scale, bounds, viewport);
             state.key = Some(key);
             #[cfg(test)]
             {
@@ -184,9 +244,10 @@ fn build_waveform_paths(
     bands: &[[f32; 4]],
     peak_scale: f32,
     bounds: Bounds<Pixels>,
+    viewport: WaveformViewport,
 ) -> Vec<(usize, Path<Pixels>)> {
     let point_count = drawable_point_count(bounds.size.width, bands.len());
-    let extents = resample_extents(bands, point_count, peak_scale);
+    let extents = resample_extents(bands, point_count, peak_scale, viewport);
     let center = bounds.origin.y + bounds.size.height / 2.0;
     let half_height = (bounds.size.height / 2.0 - px(2.0)).max(px(1.0));
     let width = bounds.size.width;
@@ -211,20 +272,81 @@ fn drawable_point_count(width: Pixels, available_points: usize) -> usize {
 ///
 /// Taking each lane's maximum shaped extent preserves every bucket's visual peak while avoiding
 /// sub-pixel path segments the panel cannot display.
-fn resample_extents(bands: &[[f32; 4]], point_count: usize, peak_scale: f32) -> Vec<[f32; 4]> {
+fn resample_extents(
+    bands: &[[f32; 4]],
+    point_count: usize,
+    peak_scale: f32,
+    viewport: WaveformViewport,
+) -> Vec<[f32; 4]> {
     if bands.is_empty() || point_count == 0 {
         return Vec::new();
     }
     let point_count = point_count.min(bands.len());
     let mut extents = vec![[0.0_f32; 4]; point_count];
+    let viewport_start = viewport.start;
+    let viewport_width = viewport.width();
+    let band_count = bands.len() as f64;
     for (index, column) in bands.iter().copied().enumerate() {
-        let bucket = index * point_count / bands.len();
-        for lane in 0..4 {
-            extents[bucket][lane] =
-                extents[bucket][lane].max(waveform_extent(column, lane, peak_scale));
+        let band_start = index as f64 / band_count;
+        let band_end = (index + 1) as f64 / band_count;
+        let overlap_start = band_start.max(viewport_start);
+        let overlap_end = band_end.min(viewport_start + viewport_width);
+        if overlap_end <= overlap_start {
+            continue;
+        }
+        let first_bucket = (((overlap_start - viewport_start) / viewport_width)
+            * point_count as f64)
+            .floor()
+            .clamp(0.0, (point_count - 1) as f64) as usize;
+        let last_bucket = ((((overlap_end - viewport_start) / viewport_width) * point_count as f64)
+            .ceil()
+            .max((first_bucket + 1) as f64)
+            .min(point_count as f64)) as usize;
+        let values = [
+            waveform_extent(column, 0, peak_scale),
+            waveform_extent(column, 1, peak_scale),
+            waveform_extent(column, 2, peak_scale),
+            waveform_extent(column, 3, peak_scale),
+        ];
+        for bucket in first_bucket..last_bucket {
+            for (lane, value) in values.into_iter().enumerate() {
+                extents[bucket][lane] = extents[bucket][lane].max(value);
+            }
         }
     }
     extents
+}
+
+fn visible_peak_values(peaks: &[f32], viewport: WaveformViewport) -> Vec<f32> {
+    if peaks.is_empty() {
+        return Vec::new();
+    }
+    let point_count =
+        ((peaks.len() as f64 * viewport.width()).ceil() as usize).clamp(1, peaks.len());
+    let mut visible = vec![0.0_f32; point_count];
+    let peak_count = peaks.len() as f64;
+    for (index, peak) in peaks.iter().copied().enumerate() {
+        let peak_start = index as f64 / peak_count;
+        let peak_end = (index + 1) as f64 / peak_count;
+        let overlap_start = peak_start.max(viewport.start);
+        let overlap_end = peak_end.min(viewport.end);
+        if overlap_end <= overlap_start {
+            continue;
+        }
+        let first_bucket = (((overlap_start - viewport.start) / viewport.width())
+            * point_count as f64)
+            .floor()
+            .clamp(0.0, (point_count - 1) as f64) as usize;
+        let last_bucket = ((((overlap_end - viewport.start) / viewport.width())
+            * point_count as f64)
+            .ceil()
+            .max((first_bucket + 1) as f64)
+            .min(point_count as f64)) as usize;
+        for bucket in first_bucket..last_bucket {
+            visible[bucket] = visible[bucket].max(peak);
+        }
+    }
+    visible
 }
 
 fn waveform_extent(column: [f32; 4], lane: usize, peak_scale: f32) -> f32 {
@@ -319,6 +441,7 @@ pub(super) fn render_waveform(
         .relative()
         .bg(color(theme.colors.waveform_background));
     if let Some(preview) = browser.waveform.as_ref() {
+        let viewport = browser.waveform_viewport;
         if !preview.bands.is_empty() {
             let bands = preview.bands.clone();
             let lane_colors = [
@@ -334,7 +457,7 @@ pub(super) fn render_waveform(
                 move |_, _, _| (),
                 move |bounds, _, window, _| {
                     for (lane, path) in cache
-                        .paths_for(generation, &bands, peak_scale, bounds)
+                        .paths_for(generation, &bands, peak_scale, bounds, viewport)
                         .into_iter()
                     {
                         window.paint_path(path, lane_colors[lane]);
@@ -353,7 +476,7 @@ pub(super) fn render_waveform(
             } else {
                 theme.colors.waveform_unplayed
             };
-            for peak in &preview.peaks {
+            for peak in visible_peak_values(&preview.peaks, viewport) {
                 bars = bars.child(
                     div()
                         .flex_1()
@@ -389,6 +512,12 @@ pub(super) fn render_waveform(
         .waveform_region_drag
         .and_then(WaveformRegionDrag::preview_region)
         .or(browser.waveform_play_region)
+        .and_then(|region| {
+            browser
+                .waveform_viewport
+                .visible_range_from_absolute(region.start, region.end)
+                .and_then(|(start, end)| WaveformPlayRegion::new(start, end))
+        })
     {
         bars = bars.child(waveform_region_overlay(
             region,
@@ -396,62 +525,92 @@ pub(super) fn render_waveform(
             color(theme.colors.waveform_playhead),
         ));
     }
-    if let Some(ratio) = playback_cursor_ratio {
+    if let Some(ratio) = playback_cursor_ratio.and_then(|ratio| {
+        browser
+            .waveform_viewport
+            .visible_ratio_from_absolute(f64::from(ratio))
+            .map(|ratio| ratio as f32)
+    }) {
         bars = bars.child(playback_cursor_overlay(
             ratio,
             color(theme.colors.waveform_playhead),
         ));
     }
     let click_bounds_for_down = Rc::clone(&click_bounds);
-    bars.on_mouse_down(
-        MouseButton::Left,
-        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            window.focus(&view.focus_handle);
-            if view.waveform.is_none() {
-                return;
-            }
-            let Some(bounds) = click_bounds_for_down.borrow().as_ref().copied() else {
-                return;
-            };
-            let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
-                return;
-            };
-            view.waveform_region_drag = Some(WaveformRegionDrag::begin(
-                event.position,
-                ratio,
-                bounds,
-                view.waveform_generation,
-            ));
-            cx.notify();
-        }),
-    )
-    .on_drag(WaveformDragToken, |_, _, _, cx| {
-        cx.new(|_| WaveformDragGhost)
-    })
-    .on_drag_move::<WaveformDragToken>(cx.listener(
-        |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
-            view.update_waveform_region_drag(event.event.position);
-            cx.notify();
-        },
-    ))
-    .on_mouse_up(
-        MouseButton::Left,
-        cx.listener(|view, event: &MouseUpEvent, _, cx| {
-            view.finish_waveform_region_drag(event.position, cx);
-        }),
-    )
-    .on_mouse_up_out(
-        MouseButton::Left,
-        cx.listener(|view, event: &MouseUpEvent, _, cx| {
-            view.finish_waveform_region_drag(event.position, cx);
-        }),
-    )
+    let click_bounds_for_wheel = Rc::clone(&click_bounds);
+    let click_bounds_for_middle = Rc::clone(&click_bounds);
+    bars.track_focus(&browser.waveform_focus_handle)
+        .on_scroll_wheel(
+            cx.listener(move |view, event: &ScrollWheelEvent, window, cx| {
+                let bounds = click_bounds_for_wheel.borrow().as_ref().copied();
+                window.focus(&view.waveform_focus_handle);
+                if view.handle_waveform_wheel(event, bounds) {
+                    cx.notify();
+                }
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                let Some(bounds) = click_bounds_for_middle.borrow().as_ref().copied() else {
+                    return;
+                };
+                view.begin_waveform_pan(event.position, bounds, window, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                window.focus(&view.waveform_focus_handle);
+                if view.waveform.is_none() {
+                    return;
+                }
+                let Some(bounds) = click_bounds_for_down.borrow().as_ref().copied() else {
+                    return;
+                };
+                let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
+                    return;
+                };
+                view.waveform_zoom_anchor_ratio =
+                    view.waveform_viewport.absolute_ratio_from_visible(ratio);
+                view.waveform_region_drag = Some(WaveformRegionDrag::begin(
+                    event.position,
+                    ratio,
+                    bounds,
+                    view.waveform_viewport,
+                    view.waveform_generation,
+                ));
+                cx.notify();
+            }),
+        )
+        .on_drag(WaveformDragToken, |_, _, _, cx| {
+            cx.new(|_| WaveformDragGhost)
+        })
+        .on_drag_move::<WaveformDragToken>(cx.listener(
+            |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
+                view.update_waveform_region_drag(event.event.position);
+                cx.notify();
+            },
+        ))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|view, event: &MouseUpEvent, _, cx| {
+                view.finish_waveform_region_drag(event.position, cx);
+            }),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|view, event: &MouseUpEvent, _, cx| {
+                view.finish_waveform_region_drag(event.position, cx);
+            }),
+        )
 }
 
 impl Browser {
     pub(super) fn clear_waveform_region(&mut self) {
         self.waveform_play_region = None;
         self.waveform_region_drag = None;
+        self.waveform_pan_drag = None;
     }
 
     pub(super) fn cancel_waveform_region_drag(
@@ -468,7 +627,158 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.waveform_viewport = WaveformViewport::full();
+        self.waveform_zoom_anchor_ratio = 0.5;
         self.clear_waveform_region();
+    }
+
+    fn begin_waveform_pan(
+        &mut self,
+        position: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self.waveform.as_ref() else {
+            return;
+        };
+        window.focus(&self.waveform_focus_handle);
+        if let Some(visible_ratio) = waveform_click_ratio(position, bounds) {
+            self.waveform_zoom_anchor_ratio = self
+                .waveform_viewport
+                .absolute_ratio_from_visible(visible_ratio);
+        }
+        self.waveform_pan_drag = WaveformPanDrag::begin(
+            position,
+            bounds,
+            self.waveform_viewport,
+            preview.total_frames,
+            self.waveform_generation,
+        );
+    }
+
+    pub(super) fn update_waveform_pan_drag(
+        &mut self,
+        position: Point<Pixels>,
+        middle_button_pressed: bool,
+    ) -> bool {
+        if !middle_button_pressed {
+            return false;
+        }
+        let Some(drag) = self.waveform_pan_drag else {
+            return false;
+        };
+        if drag.generation != self.waveform_generation || self.waveform.is_none() {
+            self.waveform_pan_drag = None;
+            return false;
+        }
+        let Some(viewport) = drag.update(position) else {
+            return false;
+        };
+        if self.waveform_viewport.is_effectively_equal(viewport) {
+            return false;
+        }
+        self.waveform_viewport = viewport;
+        true
+    }
+
+    pub(super) fn finish_waveform_pan_drag(&mut self) -> bool {
+        self.waveform_pan_drag.take().is_some()
+    }
+
+    fn handle_waveform_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        bounds: Option<Bounds<Pixels>>,
+    ) -> bool {
+        let Some(preview) = self.waveform.as_ref() else {
+            return false;
+        };
+        let Some(bounds) = bounds else {
+            return false;
+        };
+        let Some(anchor_ratio) = waveform_click_ratio(event.position, bounds) else {
+            return false;
+        };
+        let Some(action) = waveform_wheel_action(event.delta, event.modifiers.shift) else {
+            return false;
+        };
+        self.waveform_zoom_anchor_ratio = self
+            .waveform_viewport
+            .absolute_ratio_from_visible(anchor_ratio);
+        let next = match action {
+            WaveformWheelAction::Pan(fraction) => self
+                .waveform_viewport
+                .pan_by_visible_fraction(preview.total_frames, fraction),
+            WaveformWheelAction::ZoomIn => self.waveform_viewport.zoom_around_visible_anchor(
+                preview.total_frames,
+                anchor_ratio,
+                true,
+                true,
+            ),
+            WaveformWheelAction::ZoomOut {
+                expand_silence_margin,
+            } => self.waveform_viewport.zoom_around_visible_anchor(
+                preview.total_frames,
+                anchor_ratio,
+                false,
+                expand_silence_margin,
+            ),
+        };
+        if self.waveform_viewport.is_effectively_equal(next) {
+            return false;
+        }
+        self.waveform_viewport = next;
+        self.waveform_region_drag = None;
+        self.waveform_pan_drag = None;
+        true
+    }
+
+    pub(super) fn zoom_waveform_to_selection(&mut self) -> bool {
+        let Some(preview) = self.waveform.as_ref() else {
+            return false;
+        };
+        let next = if let Some(region) =
+            self.waveform_play_region.filter(|region| region.is_valid())
+        {
+            self.waveform_viewport
+                .zoom_to_region(preview.total_frames, region.start, region.end)
+        } else {
+            let anchor = self
+                .playback_cursor_sample
+                .map(|sample| f64::from(sample.ratio))
+                .filter(|ratio| {
+                    ratio.is_finite()
+                        && self
+                            .waveform_viewport
+                            .visible_ratio_from_absolute(*ratio)
+                            .is_some()
+                })
+                .unwrap_or(self.waveform_zoom_anchor_ratio);
+            self.waveform_viewport
+                .zoom_around_absolute_anchor(preview.total_frames, anchor)
+        };
+        if self.waveform_viewport.is_effectively_equal(next) {
+            return false;
+        }
+        self.waveform_viewport = next;
+        self.waveform_region_drag = None;
+        self.waveform_pan_drag = None;
+        true
+    }
+
+    pub(super) fn reset_waveform_viewport(&mut self) -> bool {
+        if self.waveform.is_none() {
+            return false;
+        }
+        let next = WaveformViewport::full();
+        if self.waveform_viewport.is_effectively_equal(next) {
+            return false;
+        }
+        self.waveform_viewport = next;
+        self.waveform_region_drag = None;
+        self.waveform_pan_drag = None;
+        true
     }
 
     fn update_waveform_region_drag(&mut self, position: Point<Pixels>) {
@@ -489,19 +799,55 @@ impl Browser {
         if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
             return;
         }
-        let Some(ratio) = waveform_click_ratio(position, drag.bounds) else {
-            return;
-        };
         let mut drag = drag;
         drag.update(position);
         if drag.moved {
             self.stop_playback();
             self.waveform_play_region = drag.preview_region();
-        } else {
+        } else if let Some(ratio) = drag.ratio_at(position) {
             self.waveform_play_region = None;
             self.start_playback_from_position(ratio, cx);
         }
         cx.notify();
+    }
+}
+
+/// Translate GPUI's native scroll delta into waveform gesture coordinates.
+///
+/// GPUI preserves the platform's macOS content-direction delta. Convert both axes to the
+/// reference's logical scroll-offset direction here: positive offset movement reveals later
+/// content, and the viewport therefore advances toward a positive normalized position.
+fn scroll_delta(delta: ScrollDelta) -> (f64, f64) {
+    match delta {
+        ScrollDelta::Pixels(delta) => (-f64::from(delta.x), -f64::from(delta.y)),
+        ScrollDelta::Lines(delta) => (-f64::from(delta.x), -f64::from(delta.y)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WaveformWheelAction {
+    Pan(f64),
+    ZoomIn,
+    ZoomOut { expand_silence_margin: bool },
+}
+
+fn waveform_wheel_action(delta: ScrollDelta, shift: bool) -> Option<WaveformWheelAction> {
+    let (delta_x, delta_y) = scroll_delta(delta);
+    if !delta_x.is_finite() || !delta_y.is_finite() {
+        return None;
+    }
+    if delta_x.abs() > delta_y.abs() && delta_x.abs() > WAVEFORM_WHEEL_EPSILON {
+        Some(WaveformWheelAction::Pan(
+            delta_x / WAVEFORM_PAN_REFERENCE_WIDTH,
+        ))
+    } else if delta_y < -WAVEFORM_WHEEL_EPSILON {
+        Some(WaveformWheelAction::ZoomIn)
+    } else if delta_y > WAVEFORM_WHEEL_EPSILON {
+        Some(WaveformWheelAction::ZoomOut {
+            expand_silence_margin: shift,
+        })
+    } else {
+        None
     }
 }
 
@@ -619,7 +965,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let extents = resample_extents(&bands, drawable_point_count(px(320.0), bands.len()), 1.0);
+        let extents = resample_extents(
+            &bands,
+            drawable_point_count(px(320.0), bands.len()),
+            1.0,
+            WaveformViewport::full(),
+        );
 
         assert_eq!(extents.len(), 320);
         for lane in 0..4 {
@@ -636,35 +987,84 @@ mod tests {
     }
 
     #[test]
+    fn resampling_leaves_silence_margin_columns_blank() {
+        let bands = vec![[1.0, 1.0, 1.0, 1.0]; 16];
+        let viewport = WaveformViewport {
+            start: -0.5,
+            end: 1.5,
+        };
+        let extents = resample_extents(&bands, 8, 1.0, viewport);
+        assert!(extents[0].iter().all(|value| *value == 0.0));
+        assert!(extents[1].iter().all(|value| *value == 0.0));
+        assert!(extents[6].iter().all(|value| *value == 0.0));
+        assert!(extents[7].iter().all(|value| *value == 0.0));
+        assert!(
+            extents[2..6]
+                .iter()
+                .flat_map(|column| column.iter())
+                .any(|value| *value > 0.0)
+        );
+
+        let peaks = visible_peak_values(&[1.0; 8], viewport);
+        assert!(peaks[0] == 0.0 && peaks[1] == 0.0);
+        assert!(peaks[6] == 0.0 && peaks[7] == 0.0);
+        assert!(peaks[2..6].iter().any(|peak| *peak > 0.0));
+    }
+
+    #[test]
     fn render_cache_reuses_an_exact_key_and_invalidates_layout_or_preview_changes() {
         let cache = WaveformRenderCache::default();
+        let viewport = WaveformViewport::full();
         let first = WaveformCacheKey {
             generation: 7,
             bounds: test_bounds(320.0, 180.0),
             peak_scale_bits: 1.0_f32.to_bits(),
+            viewport_start_bits: viewport.start.to_bits(),
+            viewport_end_bits: viewport.end.to_bits(),
         };
         let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
-        let initial_paths = cache.paths_for(7, &bands, 1.0, first.bounds);
+        let initial_paths = cache.paths_for(7, &bands, 1.0, first.bounds, viewport);
         assert_eq!(initial_paths.len(), 4);
         assert_eq!(cache.rebuild_count(), 1);
-        assert_eq!(cache.paths_for(7, &bands, 1.0, first.bounds).len(), 4);
+        assert_eq!(
+            cache
+                .paths_for(7, &bands, 1.0, first.bounds, viewport)
+                .len(),
+            4
+        );
         assert_eq!(cache.rebuild_count(), 1);
-        assert_eq!(cache.paths_for(8, &bands, 1.0, first.bounds).len(), 4);
+        assert_eq!(
+            cache
+                .paths_for(8, &bands, 1.0, first.bounds, viewport)
+                .len(),
+            4
+        );
         assert_eq!(cache.rebuild_count(), 2);
         assert_eq!(
             cache
-                .paths_for(8, &bands, 1.0, test_bounds(321.0, 180.0))
+                .paths_for(8, &bands, 1.0, test_bounds(321.0, 180.0), viewport)
                 .len(),
             4
         );
         assert_eq!(cache.rebuild_count(), 3);
         assert_eq!(
             cache
-                .paths_for(8, &bands, 1.1, test_bounds(321.0, 180.0))
+                .paths_for(8, &bands, 1.1, test_bounds(321.0, 180.0), viewport)
                 .len(),
             4
         );
         assert_eq!(cache.rebuild_count(), 4);
+        let zoomed = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+        assert_eq!(
+            cache
+                .paths_for(8, &bands, 1.1, test_bounds(321.0, 180.0), zoomed)
+                .len(),
+            4
+        );
+        assert_eq!(cache.rebuild_count(), 5);
     }
 
     #[test]
@@ -686,9 +1086,76 @@ mod tests {
     }
 
     #[test]
+    fn gpui_native_wheel_sign_routes_up_to_zoom_in_and_down_to_zoom_out() {
+        assert_eq!(
+            waveform_wheel_action(ScrollDelta::Lines(point(0.0, 1.0)), false),
+            Some(WaveformWheelAction::ZoomIn)
+        );
+        assert_eq!(
+            waveform_wheel_action(ScrollDelta::Lines(point(0.0, -1.0)), false),
+            Some(WaveformWheelAction::ZoomOut {
+                expand_silence_margin: false,
+            })
+        );
+        assert_eq!(
+            waveform_wheel_action(ScrollDelta::Lines(point(0.0, -1.0)), true),
+            Some(WaveformWheelAction::ZoomOut {
+                expand_silence_margin: true,
+            })
+        );
+        assert_eq!(
+            waveform_wheel_action(ScrollDelta::Lines(point(-1.0, 0.0)), false),
+            Some(WaveformWheelAction::Pan(1.0 / WAVEFORM_PAN_REFERENCE_WIDTH))
+        );
+        assert_eq!(
+            waveform_wheel_action(ScrollDelta::Lines(point(1.0, 0.0)), false),
+            Some(WaveformWheelAction::Pan(
+                -1.0 / WAVEFORM_PAN_REFERENCE_WIDTH
+            ))
+        );
+    }
+
+    #[test]
     fn waveform_click_position_rejects_empty_bounds() {
         let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(0.0), px(20.0)));
         assert_eq!(waveform_click_ratio(point(px(5.0), px(5.0)), bounds), None);
+    }
+
+    #[test]
+    fn region_drag_translates_visible_pointer_to_absolute_file_ratio() {
+        let bounds = test_bounds(100.0, 20.0);
+        let viewport = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+        let mut drag =
+            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, viewport, 4);
+        drag.update(point(px(75.0), px(5.0)));
+        assert_eq!(
+            drag.preview_region(),
+            Some(WaveformPlayRegion {
+                start: 0.375,
+                end: 0.625,
+            })
+        );
+        assert_eq!(drag.ratio_at(point(px(100.0), px(5.0))), Some(0.75));
+    }
+
+    #[test]
+    fn middle_pan_drag_uses_captured_viewport_and_generation() {
+        let bounds = test_bounds(100.0, 20.0);
+        let viewport = WaveformViewport {
+            start: 0.25,
+            end: 0.75,
+        };
+        let drag = WaveformPanDrag::begin(point(px(50.0), px(5.0)), bounds, viewport, 1_000, 12)
+            .expect("inside waveform bounds");
+        assert_eq!(drag.generation, 12);
+        let panned = drag
+            .update(point(px(25.0), px(5.0)))
+            .expect("inside waveform bounds");
+        assert!((panned.start - 0.375).abs() < 1e-12);
+        assert!((panned.end - 0.875).abs() < 1e-12);
     }
 
     #[test]
@@ -715,7 +1182,9 @@ mod tests {
     #[test]
     fn region_drag_uses_logical_pixel_slop_and_clamped_release_position() {
         let bounds = test_bounds(100.0, 20.0);
-        let mut drag = WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, 9);
+        let viewport = WaveformViewport::full();
+        let mut drag =
+            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, viewport, 9);
 
         drag.update(point(px(27.0), px(5.0)));
         assert!(!drag.moved);
@@ -724,7 +1193,7 @@ mod tests {
         assert!((preview.end - 0.27).abs() < 1e-6);
 
         let mut vertical_drag =
-            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, 9);
+            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, viewport, 9);
         vertical_drag.update(point(px(25.0), px(80.0)));
         assert!(!vertical_drag.moved);
         assert_eq!(vertical_drag.preview_region(), None);
@@ -741,11 +1210,12 @@ mod tests {
         assert_eq!(drag.generation, 9);
 
         let mut threshold_drag =
-            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, 9);
+            WaveformRegionDrag::begin(point(px(25.0), px(5.0)), 0.25, bounds, viewport, 9);
         threshold_drag.update(point(px(27.01), px(5.0)));
         assert!(threshold_drag.moved);
 
-        let mut outside_drag = WaveformRegionDrag::begin(point(px(50.0), px(5.0)), 0.5, bounds, 9);
+        let mut outside_drag =
+            WaveformRegionDrag::begin(point(px(50.0), px(5.0)), 0.5, bounds, viewport, 9);
         outside_drag.update(point(px(-5.0), px(5.0)));
         assert!(outside_drag.moved);
         assert_eq!(outside_drag.current, 0.0);
@@ -753,8 +1223,13 @@ mod tests {
 
     #[test]
     fn stale_or_unloaded_region_drags_cannot_commit() {
-        let drag =
-            WaveformRegionDrag::begin(point(px(20.0), px(5.0)), 0.2, test_bounds(100.0, 20.0), 9);
+        let drag = WaveformRegionDrag::begin(
+            point(px(20.0), px(5.0)),
+            0.2,
+            test_bounds(100.0, 20.0),
+            WaveformViewport::full(),
+            9,
+        );
 
         assert!(waveform_drag_is_current(drag, 9, true));
         assert!(!waveform_drag_is_current(drag, 10, true));
@@ -769,14 +1244,15 @@ mod tests {
         let cache = WaveformRenderCache::default();
         let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
         let bounds = test_bounds(640.0, 180.0);
+        let viewport = WaveformViewport::full();
         let cold_start = Instant::now();
         for generation in 0..100 {
-            let _ = cache.paths_for(generation, &bands, 1.0, bounds);
+            let _ = cache.paths_for(generation, &bands, 1.0, bounds, viewport);
         }
         let cold = cold_start.elapsed();
         let warm_start = Instant::now();
         for _ in 0..100 {
-            let _ = cache.paths_for(99, &bands, 1.0, bounds);
+            let _ = cache.paths_for(99, &bands, 1.0, bounds, viewport);
         }
         let warm = warm_start.elapsed();
         eprintln!("waveform geometry: 100 misses {cold:?}; 100 hits {warm:?}");

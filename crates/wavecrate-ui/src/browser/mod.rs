@@ -20,7 +20,7 @@ use gpui::{
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
-    FolderTreeRow, PlaybackNavigationHistory, SortColumn,
+    FolderTreeRow, PlaybackNavigationHistory, SortColumn, WaveformViewport,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_library::sample_sources::{SampleSource, SourceId};
@@ -199,6 +199,7 @@ impl ThemeLoadState {
 
 pub(crate) struct Browser {
     focus_handle: FocusHandle,
+    waveform_focus_handle: FocusHandle,
     volume_focus_handle: FocusHandle,
     search_input: gpui::Entity<SearchInput>,
     _search_subscription: gpui::Subscription,
@@ -222,8 +223,11 @@ pub(crate) struct Browser {
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
+    waveform_viewport: WaveformViewport,
+    waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
+    waveform_pan_drag: Option<waveform::WaveformPanDrag>,
     scan_status: String,
     playback_status: String,
     volume: f32,
@@ -324,6 +328,7 @@ impl Browser {
         let motion_settings = Motion::default();
         let mut browser = Self {
             focus_handle: cx.focus_handle(),
+            waveform_focus_handle: cx.focus_handle(),
             volume_focus_handle: cx.focus_handle(),
             search_input,
             _search_subscription: search_subscription,
@@ -347,8 +352,11 @@ impl Browser {
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
+            waveform_viewport: WaveformViewport::full(),
+            waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
             waveform_region_drag: None,
+            waveform_pan_drag: None,
             scan_status: "Choose a folder or pass one on the command line".to_string(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
@@ -1576,6 +1584,26 @@ impl Browser {
                 self.change_volume_from_key(key, shift, cx);
             }
             return;
+        }
+        if self.waveform_focus_handle.is_focused(window)
+            && !secondary
+            && !shift
+            && !alt
+            && !function
+            && self.waveform.is_some()
+        {
+            if key.eq_ignore_ascii_case("z") {
+                if self.zoom_waveform_to_selection() {
+                    cx.notify();
+                }
+                return;
+            }
+            if key.eq_ignore_ascii_case("x") {
+                if self.reset_waveform_viewport() {
+                    cx.notify();
+                }
+                return;
+            }
         }
         if let Some(direction) =
             history::history_shortcut_direction(key, secondary, shift, alt, function, event.is_held)

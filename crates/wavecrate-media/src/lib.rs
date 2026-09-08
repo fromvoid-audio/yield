@@ -44,11 +44,20 @@ pub struct WaveformPreview {
     /// lane is the raw peak magnitude. A renderer should paint the lanes in this order so low
     /// frequency content is the back layer, high frequency content remains visible above it, and
     /// the raw lane is the front detail layer.
+    ///
+    /// The projection is intentionally bounded to [`MAX_WAVEFORM_BAND_POINTS`]. Viewport zoom
+    /// resamples these columns for the first navigation slice; finer per-viewport decoding is a
+    /// separate follow-up.
     pub bands: Vec<[f32; 4]>,
     /// Duration represented by the decoded preview buffer.
     pub duration_seconds: f32,
     /// Sample rate used for the preview buffer.
     pub sample_rate: u32,
+    /// Exact number of interleaved audio frames represented by the preview.
+    ///
+    /// This remains a scalar even though the waveform samples themselves are reduced to bounded
+    /// display columns, so viewport navigation can use frame based limits without retaining PCM.
+    pub total_frames: usize,
 }
 
 /// Enumerate recognized audio files below `root` without following directory links.
@@ -263,6 +272,7 @@ pub fn load_waveform_preview_with_cancel(
         bands,
         duration_seconds,
         sample_rate: spec.sample_rate,
+        total_frames,
     })
 }
 
@@ -480,6 +490,7 @@ mod tests {
                 .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
         );
         assert_eq!(preview.sample_rate, 16_000);
+        assert_eq!(preview.total_frames, 16_000);
         assert!((preview.duration_seconds - 1.0).abs() < 0.02);
     }
 
@@ -503,6 +514,7 @@ mod tests {
 
         let preview = load_waveform_preview(&path).expect("full preview");
         assert!((preview.duration_seconds - 8.0).abs() < 0.001);
+        assert_eq!(preview.total_frames, frames);
         assert_eq!(preview.peaks.len(), MAX_WAVEFORM_POINTS);
         assert_eq!(preview.bands.len(), MAX_WAVEFORM_BAND_POINTS);
         assert!(preview.peaks.last().copied().unwrap_or_default() > 0.99);
@@ -558,6 +570,7 @@ mod tests {
         let stereo_preview = load_waveform_preview(&stereo_path).expect("stereo preview");
         assert!((stereo_preview.duration_seconds - 4.0 / 48_000.0).abs() < 1e-6);
         assert_eq!(stereo_preview.sample_rate, 48_000);
+        assert_eq!(stereo_preview.total_frames, 4);
         assert_eq!(stereo_preview.peaks.len(), 4);
 
         let wide_path = directory.path().join("wide.wav");

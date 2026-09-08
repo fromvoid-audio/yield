@@ -97,6 +97,13 @@ retaining PCM for the entire file. Cancellation is checked during both passes;
 the UI also fences completion by selection generation. Waveform loading has no
 source-write authority and shares no connection with persistent scanning.
 
+`WaveformViewport` in the core crate owns normalized zoom, anchor preservation,
+panning, and the minimum 256-frame visible span. The media preview retains the
+exact frame count as a scalar. UI gestures translate visible coordinates back
+into file coordinates; viewport changes never rewrite audition or history spans.
+Waveform geometry caches include the viewport, and overlays clip to it. Current
+zoom resamples the bounded overview; finer detail decoding remains separate.
+
 ## UI organization
 
 The UI crate separates browser state/lifecycle, rendering, transport coordination,

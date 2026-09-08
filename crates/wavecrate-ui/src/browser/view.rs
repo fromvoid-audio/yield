@@ -4,7 +4,8 @@
 //! Browser rendering and the compact Wavecrate application shell.
 
 use gpui::{
-    ClickEvent, Context, Div, MouseButton, Render, Window, div, font, prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, MouseButton, MouseMoveEvent, MouseUpEvent, Render, Window, div, font,
+    prelude::*, px, uniform_list,
 };
 use wavecrate_core::{SortColumn, SortDirection, format_duration};
 use wavecrate_design::Theme;
@@ -531,6 +532,30 @@ impl Render for Browser {
             .text_size(px(theme.typography.body_size))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, _, cx| {
+                if view.update_waveform_pan_drag(
+                    event.position,
+                    event.pressed_button == Some(MouseButton::Middle),
+                ) {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| {
+                    if view.finish_waveform_pan_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| {
+                    if view.finish_waveform_pan_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .flex()

@@ -593,6 +593,25 @@ replacement, bounded admission, shutdown, orphan recovery, and repeated-audit
 retention. The foundation is not yet composed into the browser; watcher
 convergence and persistent browser projection remain integration work.
 
+### Waveform zoom and pan navigation, 2026-09-08
+
+Implemented pointer-anchored wheel zoom, horizontal wheel pan, middle-button
+drag pan, and waveform-focused Z/X framing/reset. Z frames the play region or
+zooms around the current anchor; X restores the full file. Shift zoom-out can
+expose bounded silence margins. The pure core viewport uses an exact frame-count
+scalar and a 256-frame minimum. Geometry caches include viewport coordinates;
+out-of-file columns stay blank and off-screen markers are hidden. Regions and
+history retain their full-file positions.
+
+Validation: 29 core, 14 media, and 75 UI tests passed (one manual benchmark
+ignored), followed by 12 targeted waveform tests after correcting native GPUI
+wheel signs. Locked UI check, formatting, diff checks, and signed macOS build
+passed. An isolated timeline fixture confirmed vertical wheel direction and
+pointer anchoring, Z/X framing/reset, range creation within a zoomed view, and
+browser-focused X/Z isolation. Horizontal/middle-drag live acceptance was not
+established by the available GUI automation. Zoom currently uses the 2,048-column
+overview; finer detail decoding and the reference scrollbar remain outstanding.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.
