@@ -7124,6 +7124,8 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "raw-window-handle",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

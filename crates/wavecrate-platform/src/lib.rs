@@ -9,24 +9,33 @@ use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
+#[cfg(target_os = "windows")]
+use std::sync::{Arc, atomic::AtomicBool};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "windows", test))]
+mod utf16_paths;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// Maximum number of files admitted to one native drag session.
 pub const MAX_FILE_DRAG_FILES: usize = 256;
 
-/// Maximum combined raw path bytes admitted to one native drag session.
+/// Maximum combined path bytes admitted to one native drag session.
+///
+/// The Windows adapter counts exact UTF-16 path bytes; the macOS adapter
+/// counts the platform's raw path bytes.
 pub const MAX_FILE_DRAG_PATH_BYTES: usize = 1024 * 1024;
 
-/// The bounded result sent when AppKit ends a file drag session.
+/// The bounded result returned when a native file drag session ends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileDragCompletion {
     /// The destination accepted the files with the copy operation.
     Copy,
     /// The drag ended without an operation.
     Cancelled,
-    /// AppKit reported an operation other than copy or no operation.
+    /// The native platform reported an operation other than copy or no operation.
     Other,
 }
 
@@ -48,15 +57,15 @@ pub enum FileDragError {
         /// Number of paths supplied by the caller.
         actual: usize,
     },
-    /// The request's raw path bytes exceed the adapter's retained input cap.
+    /// The request's encoded path bytes exceed the adapter's retained input cap.
     PathBytesTooLarge {
-        /// Maximum aggregate raw path bytes accepted by the adapter.
+        /// Maximum aggregate encoded path bytes accepted by the adapter.
         limit: usize,
-        /// Aggregate raw path bytes supplied by the caller.
+        /// Aggregate encoded path bytes supplied by the caller.
         actual: usize,
     },
-    /// A path contains an embedded NUL, which cannot be represented by an
-    /// Objective-C file URL path.
+    /// A path contains an embedded NUL, which cannot be represented by native
+    /// file-drag path formats.
     PathContainsNul {
         /// Zero-based path position in the rejected request.
         index: usize,
@@ -90,7 +99,7 @@ pub enum FileDragError {
     /// The current event is historical, but the primary mouse button is no
     /// longer pressed.
     PrimaryButtonNotPressed {
-        /// AppKit's current pressed-button bit mask.
+        /// The platform's current primary-button state or pressed-button mask.
         mask: u64,
     },
     /// The current event belongs to a different window than the source view.
@@ -100,6 +109,17 @@ pub enum FileDragError {
         /// Identity of the retained in-flight session.
         identity: u64,
     },
+    /// A Windows native API or COM operation failed.
+    #[cfg(target_os = "windows")]
+    WindowsApi {
+        /// The native operation that failed.
+        operation: &'static str,
+        /// The failing HRESULT value.
+        code: i32,
+    },
+    /// A Windows native drag is already running on this thread.
+    #[cfg(target_os = "windows")]
+    WindowsDragAlreadyActive,
 }
 
 impl fmt::Display for FileDragError {
@@ -117,7 +137,7 @@ impl fmt::Display for FileDragError {
             }
             Self::PathBytesTooLarge { limit, actual } => write!(
                 formatter,
-                "file drag paths contain {actual} raw bytes; limit is {limit}"
+                "file drag paths contain {actual} encoded bytes; limit is {limit}"
             ),
             Self::PathContainsNul { index } => {
                 write!(formatter, "file drag path {index} contains an embedded NUL")
@@ -152,13 +172,24 @@ impl fmt::Display for FileDragError {
             }
             Self::PrimaryButtonNotPressed { mask } => write!(
                 formatter,
-                "AppKit primary mouse button is not pressed (mask {mask})"
+                "native primary mouse button is not pressed (state {mask})"
             ),
             Self::EventWindowMismatch => {
                 formatter.write_str("the current mouse event belongs to a different window")
             }
             Self::AlreadyActive { identity } => {
                 write!(formatter, "native file drag {identity} is already active")
+            }
+            #[cfg(target_os = "windows")]
+            Self::WindowsApi { operation, code } => {
+                write!(
+                    formatter,
+                    "Windows {operation} failed (HRESULT 0x{code:08X})"
+                )
+            }
+            #[cfg(target_os = "windows")]
+            Self::WindowsDragAlreadyActive => {
+                formatter.write_str("a Windows native file drag is already active")
             }
         }
     }
@@ -268,6 +299,31 @@ pub fn start_file_drag(
         let _ = paths;
         Err(FileDragError::UnsupportedPlatform)
     }
+}
+
+/// Starts a synchronous Windows copy-only file drag.
+///
+/// This entry point intentionally has a separate, explicitly blocking API.
+/// It must be called by the GPUI foreground/OLE thread after all GPUI,
+/// entity, and window borrows have ended. The call enters Windows' nested OLE
+/// drag loop and returns only after the target accepts or cancels the drag.
+/// The adapter does not need or retain an HWND. `paths` may be an owned
+/// `Vec<PathBuf>` or a borrowed slice; every path is copied into the native
+/// data object before the call enters OLE.
+///
+/// The cancellation token is checked before admission and while the native
+/// drag is active. Setting it to `true` requests cancellation through the OLE
+/// callback; if the target completes the drag first, the completion result can
+/// win that race.
+#[cfg(target_os = "windows")]
+pub fn start_file_drag_blocking<P>(
+    paths: P,
+    cancellation: Arc<AtomicBool>,
+) -> Result<FileDragCompletion, FileDragError>
+where
+    P: AsRef<[PathBuf]>,
+{
+    windows::start_file_drag_blocking(paths.as_ref(), cancellation)
 }
 
 #[cfg(test)]
