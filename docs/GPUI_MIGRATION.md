@@ -1725,3 +1725,5 @@ The agent did not launch it; existing previews remain preserved.
 Added a cancellable, bounded-memory media reader for raw interleaved WAV peaks over an exact half-open frame span. Requests retain the overview file revision and reject replacement, modification, or truncation before returning a result. This is normalization infrastructure; the audition toggle is not wired yet. Cancellation checks are bounded by 4,096 samples independent of channel count.
 
 Validation: media suite passed 24 tests before the cancellation refinement; all seven focused span-peak tests and the media all-targets check passed after it. Fixtures cover PCM/float amplitude, channel maxima, silence/nonfinite values, span bounds, stale files, and cancellation with high channel counts.
+
+Normalized audition now has a persisted, default-off preference and an optimistic session patch. Legacy documents omit the field safely, reset restores the disabled default, and the setting round-trips without changing output volume. All 16 focused session preference tests passed. The toolbar/playback integration remains in progress.

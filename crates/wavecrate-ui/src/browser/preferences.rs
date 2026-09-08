@@ -316,6 +316,9 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = *enabled,
         PreferencePatch::SetAutoplaySelection(enabled) => preferences.autoplay_selection = *enabled,
         PreferencePatch::SetLoopEnabled(enabled) => preferences.loop_enabled = *enabled,
+        PreferencePatch::SetNormalizedAuditionEnabled(enabled) => {
+            preferences.normalized_audition_enabled = *enabled;
+        }
         PreferencePatch::SetOutputVolume(volume) => {
             preferences.output_volume = *volume;
         }
