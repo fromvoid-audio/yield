@@ -1332,3 +1332,18 @@ that prevented indexed exact lookup; it was removed, and a regression check now
 uses the production query to verify primary-key search. Seven focused vocabulary
 tests passed after that fix, including corrupt rows and pagination. Library
 compilation, formatting and diff checks passed. Session/editor access follows.
+
+### Browser tag mutation integration
+
+Bounded add/remove tag planning now uses the existing durable curation operation
+pipeline. Planning checks path, label and Cartesian update budgets before building
+updates. Confirmed receipts carry playback-type changes separately from curation
+metadata and refresh filtering/sorting without guessing optimistic tag state.
+
+A passive type change that hides the loaded sample preserves its transport and
+manual loop policy. Browser focus can detach from the loaded sample, including
+across later metadata receipts and context-menu cleanup; explicit user navigation
+retains its existing behavior. The full UI suite passed 173 tests with one ignored,
+and normal UI compilation, formatting and diff checks passed. Independent review
+identified the original passive-focus playback interruption; the fix was re-reviewed
+with no remaining actionable findings. Tag editor controls follow separately.

@@ -231,6 +231,7 @@ pub(crate) struct Browser {
     selected: Option<usize>,
     selection: BrowserSelection,
     browser_focus_override: Option<AudioFileId>,
+    browser_focus_detached: bool,
     context_menu: Option<context_menu::ContextMenuState>,
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
@@ -345,7 +346,7 @@ impl Browser {
             cx.subscribe(&search_input, |view, input, _: &SearchChanged, cx| {
                 let previous_id = view.browser_focus_id();
                 let previous_position = view.selected_visible_position();
-                view.browser_focus_override = None;
+                view.reset_browser_focus_state();
                 view.context_menu = None;
                 let query = input.read(cx).content().to_owned();
                 view.view_model.set_query(&view.entries, query);
@@ -378,6 +379,7 @@ impl Browser {
             selected: None,
             selection: BrowserSelection::new(),
             browser_focus_override: None,
+            browser_focus_detached: false,
             context_menu: None,
             waveform: None,
             waveform_error: None,
@@ -503,9 +505,29 @@ impl Browser {
 
     /// Return the browser row focus, keeping it independent from the loaded waveform selection.
     fn browser_focus_id(&self) -> Option<AudioFileId> {
-        self.browser_focus_override
-            .clone()
-            .or_else(|| self.selected_id())
+        browser_focus_from_state(
+            self.browser_focus_override.as_ref(),
+            self.browser_focus_detached,
+            self.selected_id(),
+        )
+    }
+
+    fn clear_browser_focus_override(&mut self) {
+        self.browser_focus_override = None;
+    }
+
+    fn reset_browser_focus_state(&mut self) {
+        self.browser_focus_override = None;
+        self.browser_focus_detached = false;
+    }
+
+    fn set_browser_focus_override(&mut self, id: AudioFileId) {
+        self.browser_focus_override = Some(id);
+    }
+
+    fn detach_browser_focus(&mut self) {
+        self.browser_focus_override = None;
+        self.browser_focus_detached = true;
     }
 
     /// Resolve browser focus to the current scan index without changing the loaded preview.
@@ -639,7 +661,7 @@ impl Browser {
         source_index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         self.deactivate_catalog_source(cx);
         if source_index != self.active_source {
@@ -1185,7 +1207,7 @@ impl Browser {
     fn update_active_folder_projection(&mut self, cx: &mut Context<Self>) {
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         self.view_model.set_folder_scope(
             &self.entries,
@@ -1220,7 +1242,7 @@ impl Browser {
         origin: SelectionOrigin,
         cx: &mut Context<Self>,
     ) {
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         let Some(entry) = self.entries.get(index).cloned() else {
             return;
@@ -1622,7 +1644,7 @@ impl Browser {
     fn toggle_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
         let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         self.view_model.toggle_sort(&self.entries, column);
         self.reconcile_selection();
@@ -1876,13 +1898,24 @@ fn reveal_should_clear_for_focus_change(
     reveal_id.is_some_and(|reveal_id| reveal_id != next_id)
 }
 
+fn browser_focus_from_state(
+    browser_focus_override: Option<&AudioFileId>,
+    browser_focus_detached: bool,
+    selected_id: Option<AudioFileId>,
+) -> Option<AudioFileId> {
+    if let Some(browser_focus_override) = browser_focus_override {
+        return Some(browser_focus_override.clone());
+    }
+    (!browser_focus_detached).then_some(selected_id).flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
-        resolve_scan_source_index, reveal_should_clear_for_focus_change, sample_click_intent,
-        scan_source_index_for_error, selection_origin_for_click, selection_origin_for_navigation,
-        should_autoplay_selection,
+        browser_focus_from_state, resolve_scan_source_index, reveal_should_clear_for_focus_change,
+        sample_click_intent, scan_source_index_for_error, selection_origin_for_click,
+        selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
     use wavecrate_core::{AudioFile, AudioFileId};
@@ -2067,5 +2100,35 @@ mod tests {
             &second_id
         ));
         assert!(!reveal_should_clear_for_focus_change(None, &second_id));
+    }
+
+    #[test]
+    fn detached_loaded_focus_stays_hidden_after_a_context_override_is_cleared() {
+        let loaded = AudioFile {
+            path: PathBuf::from("/source/loaded.wav"),
+            relative_path: PathBuf::from("loaded.wav"),
+            byte_len: 1,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type: None,
+            curation: None,
+        };
+        let context_row = AudioFile {
+            path: PathBuf::from("/source/context.wav"),
+            relative_path: PathBuf::from("context.wav"),
+            byte_len: 1,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type: None,
+            curation: None,
+        };
+        let loaded_id = loaded.stable_id();
+        let context_id = context_row.stable_id();
+
+        assert_eq!(
+            browser_focus_from_state(Some(&context_id), true, Some(loaded_id.clone())),
+            Some(context_id)
+        );
+        assert_eq!(browser_focus_from_state(None, true, Some(loaded_id)), None);
     }
 }

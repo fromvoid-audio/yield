@@ -140,7 +140,7 @@ impl Browser {
         fallback_to_scan: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         let Some((source_id, root, label)) = self
             .source_sessions
@@ -584,7 +584,7 @@ impl Browser {
         force_reload: bool,
         cx: &mut Context<Self>,
     ) {
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         let Some(index) = self.active_source.filter(|index| {
             self.source_sessions.get(*index).is_some_and(|session| {

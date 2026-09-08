@@ -194,12 +194,12 @@ impl Browser {
         match selection_effect {
             ContextSelectionEffect::FocusClicked => {
                 self.selection.focus_pointer(&id);
-                self.browser_focus_override = Some(id.clone());
+                self.set_browser_focus_override(id.clone());
             }
             ContextSelectionEffect::PreserveSelection => {
                 if in_explicit_selection {
                     self.selection.move_anchor_to(&id);
-                    self.browser_focus_override = Some(id.clone());
+                    self.set_browser_focus_override(id.clone());
                 }
             }
         }
@@ -331,7 +331,7 @@ impl Browser {
 
     fn invalidate_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
-            self.browser_focus_override = None;
+            self.clear_browser_focus_override();
             self.playback_status = String::from(STALE_CONTEXT_MESSAGE);
             cx.notify();
         }
@@ -346,7 +346,7 @@ pub(super) fn invalidate_if_stale(browser: &mut Browser) {
         .is_some_and(|menu| !menu.target.is_current(browser))
     {
         browser.context_menu = None;
-        browser.browser_focus_override = None;
+        browser.clear_browser_focus_override();
         browser.playback_status = String::from(STALE_CONTEXT_MESSAGE);
     }
 }

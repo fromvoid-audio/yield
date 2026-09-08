@@ -535,7 +535,7 @@ impl Browser {
     }
 
     pub(super) fn clear_active_source_projection(&mut self, cx: &mut Context<Self>) {
-        self.browser_focus_override = None;
+        self.reset_browser_focus_state();
         self.context_menu = None;
         self.stop_playback();
         self.playback_policy.clear_file();
