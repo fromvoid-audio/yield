@@ -1244,3 +1244,8 @@ opposing toggles, admission failure, stale responses, dropped acknowledgements,
 resume snapshots, poll timeout, error fallback, and preserved spans/offsets. UI
 compilation and formatting passed. Native audible/interaction acceptance remains
 pending; running instances and existing application bundles were preserved.
+
+A clean-tree executable build of 9c5542b1c passed. The separate macOS bundle
+`target/qa/Wavecrate Parity Preview 9c5542b.app` passed strict ad-hoc signature
+verification. It was not launched for native acceptance; existing bundles and
+application instances were preserved.
