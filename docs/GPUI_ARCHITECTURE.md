@@ -42,6 +42,7 @@ flowchart TD
     Session --> Catalog
     Catalog[wavecrate-catalog] --> Library
     Catalog --> Scan
+    Catalog --> Watcher
     Watcher[wavecrate-source-watcher] --> Library
     Scan[wavecrate-scan] --> Library
 ```
@@ -96,8 +97,10 @@ Submission and closure share a short admission lock; polling does not wait for
 catalog I/O. Catalog failure leaves the registry and preference lanes usable,
 and session shutdown joins the catalog before releasing the profile guard.
 Browser projections are built from catalog snapshots on background tasks. The
-standalone `wavecrate-source-watcher` adapter now captures filesystem hints; its
-catalog scheduling integration is in progress. Each handle owns a distinct
+`wavecrate-source-watcher` adapter captures filesystem hints for catalog-owned
+scheduling. Automatic audits run only when queued commands and retained events
+have drained. Changes during a scan retain a follow-up obligation; watcher
+outages use bounded retries and periodic fallback audits. Each handle owns a distinct
 signal, and shutdown closes callback acceptance before dropping the backend.
 Callbacks retain no event paths and perform no filesystem probes or database
 work. Root-only ambiguous events remain distinguishable from descendant

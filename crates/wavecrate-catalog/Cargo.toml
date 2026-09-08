@@ -12,6 +12,7 @@ blake3 = "1.6.1"
 thiserror = "2.0.17"
 wavecrate-library = { path = "../wavecrate-library" }
 wavecrate-scan = { path = "../wavecrate-scan" }
+wavecrate-source-watcher = { path = "../wavecrate-source-watcher" }
 
 [dev-dependencies]
 hound.workspace = true

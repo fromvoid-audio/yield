@@ -82,7 +82,8 @@ impl WatchHintEvidence {
         self.0 & required.0 == required.0
     }
 
-    fn union(self, other: Self) -> Self {
+    /// Merge two evidence sets while retaining every conservative flag.
+    pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 }

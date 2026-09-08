@@ -1046,7 +1046,10 @@ pub(super) fn is_catalog_busy(browser: &Browser) -> bool {
 }
 
 pub(super) fn catalog_poll_needed(browser: &Browser) -> bool {
-    is_catalog_busy(browser)
+    // Native watcher audits can publish after the browser becomes idle. Keep draining the
+    // bounded event queue; unchanged polls do not notify GPUI or mark the catalog busy.
+    browser.catalog_activation.is_some()
+        || is_catalog_busy(browser)
         || browser.catalog_metadata.poll_needed()
         || browser.curation_state.has_pending_outcomes()
 }

@@ -1578,3 +1578,32 @@ GPUI executable rebuilt there. `Wavecrate Filter Preview 092c97c.app` was packag
 under `target/qa` and passed strict ad-hoc signature verification. It was not
 launched or used for native acceptance by the agent; existing previews remain
 untouched.
+
+### Native watcher convergence through the catalog
+
+The catalog now owns watcher lifecycles and a separate scheduling module.
+Callbacks coalesce evidence; the worker debounces for 400 ms with a 2 s maximum
+burst delay and reserves the existing event budget before an automatic audit.
+Queued commands and retained results take priority. Changes received during an
+audit survive for a follow-up; failure backoff starts after audit completion.
+Watcher outages retain continuity loss, use bounded restart retries and 30 s
+fallback audits, and require an audit after watching resumes. Root identity is
+probed periodically; an unchanged missing/replaced-root failure is reported once
+until root state changes. A replaced physical root remains fenced until a fresh
+source lifecycle is established; automatic new-lifecycle recovery is follow-on.
+
+Registered catalog sources keep the UI's existing nonblocking event poll alive.
+Unchanged polls do not notify GPUI or mark loading animations busy. Source removal
+and shutdown close native handles before terminal publication. The final Closed
+event and queue closure now occur under one lock; late sends are rejected. The
+session shutdown test waits for that terminal event instead of assuming it is
+immediately adjacent in time to a curation receipt.
+
+Verification: 70 catalog tests and 43 session tests passed, with catalog/session
+checks, owned formatting and diff checks. The isolated watcher acceptance checkout
+based on `10f4e504b` also passed 192 UI tests with 1 existing ignored test. A
+standalone native production-mode smoke harness created then removed temporary
+WAV files and observed automatic authoritative snapshots at revisions 2, 4, and 6,
+without explicit refresh commands after the initial audit. Its backend sources
+were byte-compared with the committed candidate. This validates native event to
+catalog convergence; visual/audible app acceptance remains separate.

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use wavecrate_library::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
@@ -36,10 +36,18 @@ use wavecrate_scan::sample_sources::scanner::{
     audit_manifest_for_catalog_with_budget_and_progress_and_writer,
     read_wav_display_metadata_for_manifest,
 };
+#[cfg(test)]
+use wavecrate_source_watcher::WatchHintEvidence;
+use wavecrate_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
 mod curation;
 mod tags;
+mod watcher;
 mod wav_metadata;
+
+use watcher::{
+    AuditDisposition, AuditTrigger, WatcherMode, WatcherSchedule, run_watcher_idle_work,
+};
 
 const COMMAND_CAPACITY: usize = 32;
 const EVENT_CAPACITY: usize = 64;
@@ -51,10 +59,18 @@ const CATALOG_CHILD_PREFIX: &str = "wavecrate-catalog-";
 struct CatalogTestGate {
     state: Mutex<CatalogTestGateState>,
     wake: Condvar,
+    audit_state: Mutex<CatalogTestAuditState>,
+    watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
 }
 
 #[cfg(test)]
 struct CatalogTestGateState {
+    paused: bool,
+    at_boundary: bool,
+}
+
+#[cfg(test)]
+struct CatalogTestAuditState {
     paused: bool,
     at_boundary: bool,
 }
@@ -71,6 +87,11 @@ impl CatalogTestGate {
                 at_boundary: false,
             }),
             wake: Condvar::new(),
+            audit_state: Mutex::new(CatalogTestAuditState {
+                paused: false,
+                at_boundary: false,
+            }),
+            watcher_signals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -117,12 +138,135 @@ impl CatalogTestGate {
         state.paused = false;
         self.wake.notify_all();
     }
+
+    fn before_audit(&self) {
+        let mut state = self
+            .audit_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.at_boundary = true;
+        self.wake.notify_all();
+        while state.paused {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.at_boundary = false;
+        self.wake.notify_all();
+    }
+
+    fn arm_next_audit(&self) -> CatalogTestAuditPause<'_> {
+        let mut state = self
+            .audit_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.paused = true;
+        CatalogTestAuditPause {
+            gate: self,
+            released: false,
+        }
+    }
+
+    fn wait_until_audit_entered(&self) {
+        let mut state = self
+            .audit_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.at_boundary {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release_audit(&self) {
+        let mut state = self
+            .audit_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.paused = false;
+        self.wake.notify_all();
+    }
+
+    fn install_watcher_signal(
+        &self,
+        source_id: SourceId,
+        lifecycle_generation: u64,
+        signal: WatcherSignal,
+    ) {
+        let mut signals = self
+            .watcher_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        signals.retain(|(existing_source_id, _), _| existing_source_id != &source_id);
+        signals.insert((source_id, lifecycle_generation), signal);
+    }
+
+    fn remove_watcher_signals(&self, source_id: &SourceId) {
+        let mut signals = self
+            .watcher_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        signals.retain(|(existing_source_id, _), _| existing_source_id != source_id);
+    }
+
+    fn clear_watcher_signals(&self) {
+        self.watcher_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    fn record_watcher_evidence(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+        evidence: WatchHintEvidence,
+    ) -> bool {
+        let signal = self
+            .watcher_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(source_id.clone(), lifecycle_generation))
+            .cloned();
+        signal.is_some_and(|signal| signal.record_evidence(evidence, Instant::now()))
+    }
 }
 
 #[cfg(test)]
 struct CatalogTestGatePause<'a> {
     gate: &'a CatalogTestGate,
     released: bool,
+}
+
+#[cfg(test)]
+struct CatalogTestAuditPause<'a> {
+    gate: &'a CatalogTestGate,
+    released: bool,
+}
+
+#[cfg(test)]
+impl CatalogTestAuditPause<'_> {
+    fn wait_until_entered(&self) {
+        self.gate.wait_until_audit_entered();
+    }
+
+    fn release(mut self) {
+        self.released = true;
+        self.gate.release_audit();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CatalogTestAuditPause<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.release_audit();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +289,20 @@ impl Drop for CatalogTestGatePause<'_> {
 #[cfg(not(test))]
 impl CatalogTestGate {
     fn before_receive(&self) {}
+
+    fn before_audit(&self) {}
+
+    fn install_watcher_signal(
+        &self,
+        _source_id: SourceId,
+        _lifecycle_generation: u64,
+        _signal: WatcherSignal,
+    ) {
+    }
+
+    fn remove_watcher_signals(&self, _source_id: &SourceId) {}
+
+    fn clear_watcher_signals(&self) {}
 }
 
 /// Maximum number of exact source paths admitted by one lazy WAV metadata request.
@@ -831,6 +989,8 @@ struct RegisteredSource {
     snapshot: Option<CatalogSnapshot>,
     attempt_token: Option<Arc<AtomicBool>>,
     curation_lineage: Option<CurationLineage>,
+    watcher: Option<SourceWatcher>,
+    watcher_schedule: WatcherSchedule,
 }
 
 struct DesiredSource {
@@ -938,7 +1098,7 @@ impl EventHub {
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if queue.events.len() >= EVENT_CAPACITY {
+        if queue.closed || queue.events.len() >= EVENT_CAPACITY {
             return false;
         }
         queue.events.push_back(QueuedEvent {
@@ -951,13 +1111,23 @@ impl EventHub {
         true
     }
 
-    fn close(&self) {
+    fn send_closed(&self) -> bool {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue.closed || queue.events.len() >= EVENT_CAPACITY {
+            return false;
+        }
+        queue.events.push_back(QueuedEvent {
+            event: CatalogEvent::Closed,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_filter_payload_bytes: 0,
+        });
         queue.closed = true;
         self.wake.notify_all();
+        true
     }
 
     fn try_recv(&self) -> Result<(CatalogEvent, usize, usize, usize), TryRecvError> {
@@ -1589,7 +1759,14 @@ pub struct CatalogService {
 impl CatalogService {
     /// Start a catalog worker using a clone of an already-acquired profile capability.
     pub fn start(profile_guard: &WritableProfileGuard) -> Result<Self, CatalogStartError> {
-        Self::start_inner(profile_guard, None)
+        #[cfg(test)]
+        {
+            Self::start_inner(profile_guard, None, WatcherMode::Detached)
+        }
+        #[cfg(not(test))]
+        {
+            Self::start_inner(profile_guard, None, WatcherMode::Native)
+        }
     }
 
     #[cfg(test)]
@@ -1597,13 +1774,18 @@ impl CatalogService {
         profile_guard: &WritableProfileGuard,
     ) -> Result<(Self, Arc<CatalogTestGate>), CatalogStartError> {
         let test_gate = Arc::new(CatalogTestGate::new());
-        let service = Self::start_inner(profile_guard, Some(Arc::clone(&test_gate)))?;
+        let service = Self::start_inner(
+            profile_guard,
+            Some(Arc::clone(&test_gate)),
+            WatcherMode::Detached,
+        )?;
         Ok((service, test_gate))
     }
 
     fn start_inner(
         profile_guard: &WritableProfileGuard,
         test_gate: Option<Arc<CatalogTestGate>>,
+        watcher_mode: WatcherMode,
     ) -> Result<Self, CatalogStartError> {
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
@@ -1621,6 +1803,7 @@ impl CatalogService {
                     worker_events,
                     worker_admission,
                     worker_test_gate,
+                    watcher_mode,
                 )
             })
             .map_err(CatalogStartError::ThreadSpawn)?;
@@ -1799,6 +1982,7 @@ fn run_worker(
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
     test_gate: Option<Arc<CatalogTestGate>>,
+    watcher_mode: WatcherMode,
 ) {
     let mut sources = HashMap::new();
     loop {
@@ -1814,7 +1998,21 @@ fn run_worker(
         } else {
             match command_rx.recv_timeout(WORKER_IDLE_POLL) {
                 Ok(command) => Some(command),
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => match command_rx.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(TryRecvError::Empty) => {
+                        run_watcher_idle_work(
+                            &profile_guard,
+                            &events,
+                            &admission,
+                            &mut sources,
+                            test_gate.as_ref(),
+                            watcher_mode,
+                        );
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                },
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         };
@@ -1846,11 +2044,17 @@ fn run_worker(
             &mut reservation,
             &admission,
             &mut sources,
+            test_gate.as_ref(),
+            watcher_mode,
         ) {
             reservation.finish();
             break;
         }
         reservation.finish();
+    }
+    sources.clear();
+    if let Some(test_gate) = test_gate.as_ref() {
+        test_gate.clear_watcher_signals();
     }
     {
         let mut state = admission
@@ -1860,10 +2064,9 @@ fn run_worker(
         state.closed = true;
     }
     assert!(
-        events.send(CatalogEvent::Closed, 0, 0, 0),
+        events.send_closed(),
         "catalog event capacity accounting invariant violated while closing"
     );
-    events.close();
 }
 
 fn handle_command(
@@ -1872,6 +2075,8 @@ fn handle_command(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    test_gate: Option<&Arc<CatalogTestGate>>,
+    watcher_mode: WatcherMode,
 ) -> bool {
     match command {
         CatalogCommand::Register {
@@ -1887,6 +2092,8 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                test_gate,
+                watcher_mode,
             );
             false
         }
@@ -1901,6 +2108,8 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                AuditTrigger::Explicit,
+                test_gate,
             );
             false
         }
@@ -2036,6 +2245,7 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                test_gate,
             );
             false
         }
@@ -2243,6 +2453,8 @@ fn register_source(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    test_gate: Option<&Arc<CatalogTestGate>>,
+    watcher_mode: WatcherMode,
 ) {
     if let Err(error) = validate_canonical_root(&canonical_root) {
         emit_failure(
@@ -2279,6 +2491,9 @@ fn register_source(
     // connection before opening the replacement generation; the admission token has already
     // invalidated any audit that used the old projection.
     sources.remove(&source_id);
+    if let Some(test_gate) = test_gate {
+        test_gate.remove_watcher_signals(&source_id);
+    }
     if let Err(error) = profile_guard.validate_current() {
         emit_failure(
             reservation,
@@ -2331,6 +2546,8 @@ fn register_source(
         snapshot: None,
         attempt_token: None,
         curation_lineage: None,
+        watcher: None,
+        watcher_schedule: WatcherSchedule::new(true),
     };
     if let Err(error) = maintain_catalog_database(&source.database, profile_guard, None, || {
         !publication_is_current(admission, &source_id, lifecycle_generation, None)
@@ -2368,9 +2585,33 @@ fn register_source(
         source.known_root_identity = Some(identity);
         source.snapshot = Some(snapshot);
     }
+    let watcher_spec = SourceWatchSpec::new(
+        source_id.clone(),
+        lifecycle_generation,
+        source.root.clone(),
+        source.known_root_identity.clone(),
+    );
+    let watcher = match watcher_mode {
+        WatcherMode::Native => SourceWatcher::start(watcher_spec),
+        WatcherMode::Detached => Ok(SourceWatcher::detached(watcher_spec)),
+    };
+    match watcher {
+        Ok(watcher) => {
+            let signal = watcher.signal();
+            source.watcher = Some(watcher);
+            source.watcher_schedule.watcher_started(Instant::now());
+            if let Some(test_gate) = test_gate {
+                test_gate.install_watcher_signal(source_id.clone(), lifecycle_generation, signal);
+            }
+        }
+        Err(_) => source.watcher_schedule.watcher_start_failed(Instant::now()),
+    }
     sources.insert(source_id.clone(), source);
     if !publication_is_current(admission, &source_id, lifecycle_generation, None) {
         sources.remove(&source_id);
+        if let Some(test_gate) = test_gate {
+            test_gate.remove_watcher_signals(&source_id);
+        }
         return;
     }
     let _ = publish_if_current(
@@ -2406,7 +2647,9 @@ fn request_audit(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
-) {
+    trigger: AuditTrigger,
+    test_gate: Option<&Arc<CatalogTestGate>>,
+) -> AuditDisposition {
     let Some(current_generation) = sources
         .get(&source_id)
         .map(|source| source.lifecycle_generation)
@@ -2419,7 +2662,10 @@ fn request_audit(
             CatalogOperation::Audit,
             CatalogError::NotRegistered(source_id),
         );
-        return;
+        return AuditDisposition::Failed {
+            retryable: false,
+            root_stale: false,
+        };
     };
     if let Err(error) = ensure_generation(&source_id, current_generation, lifecycle_generation) {
         emit_failure(
@@ -2430,20 +2676,29 @@ fn request_audit(
             CatalogOperation::Audit,
             error,
         );
-        return;
+        return AuditDisposition::Failed {
+            retryable: false,
+            root_stale: false,
+        };
     }
     if let Some(source) = sources.get_mut(&source_id) {
+        if matches!(trigger, AuditTrigger::Explicit) {
+            source.watcher_schedule.initial_audit_complete();
+        }
         // An audit is an independent revision authority. A later compound command must not
         // implicitly chain across it, even if this audit ultimately gets canceled or fails.
         source.curation_lineage = None;
     }
     let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
-        return;
+        return AuditDisposition::Canceled;
     };
     let Some(source) = sources.get_mut(&source_id) else {
-        return;
+        return AuditDisposition::Canceled;
     };
     source.attempt_token = Some(Arc::clone(&token));
+    if let Some(test_gate) = test_gate {
+        test_gate.before_audit();
+    }
     let result = maintain_catalog_database(&source.database, profile_guard, Some(&token), || {
         token.load(Ordering::Acquire)
     })
@@ -2452,7 +2707,7 @@ fn request_audit(
         Ok(snapshot) => {
             source.known_root_identity = Some(snapshot.root_identity.clone());
             source.snapshot = Some(snapshot.clone());
-            let _ = publish_if_current(
+            let published = publish_if_current(
                 admission,
                 reservation,
                 &source_id,
@@ -2460,9 +2715,19 @@ fn request_audit(
                 Some(&token),
                 CatalogEvent::AuditCommitted { snapshot },
             );
+            if published {
+                AuditDisposition::Committed
+            } else {
+                AuditDisposition::Canceled
+            }
         }
         Err(error) => {
-            let _ = publish_if_current(
+            let root_stale = matches!(
+                &error,
+                CatalogError::StaleRootGeneration { .. } | CatalogError::InvalidRoot(_)
+            );
+            let retryable = !root_stale;
+            let published = publish_if_current(
                 admission,
                 reservation,
                 &source_id,
@@ -2475,6 +2740,14 @@ fn request_audit(
                     error,
                 },
             );
+            if published {
+                AuditDisposition::Failed {
+                    retryable,
+                    root_stale,
+                }
+            } else {
+                AuditDisposition::Canceled
+            }
         }
     }
 }
@@ -2723,6 +2996,7 @@ fn remove_source(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    test_gate: Option<&Arc<CatalogTestGate>>,
 ) {
     let Some(source) = sources.get(&source_id) else {
         let _ =
@@ -2745,6 +3019,9 @@ fn remove_source(
         return;
     }
     sources.remove(&source_id);
+    if let Some(test_gate) = test_gate {
+        test_gate.remove_watcher_signals(&source_id);
+    }
     let _ = publish_removal_if_current(admission, reservation, &source_id, lifecycle_generation);
 }
 
@@ -3373,9 +3650,19 @@ mod tests {
     ) -> CatalogEvent {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let event = service
-                .recv_event_timeout(Duration::from_millis(50))
-                .expect("catalog event");
+            let event = match service.recv_event_timeout(Duration::from_millis(50)) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for catalog event"
+                    );
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("catalog event stream closed before expected event")
+                }
+            };
             if predicate(&event) {
                 return event;
             }
@@ -4857,6 +5144,8 @@ mod tests {
             }),
             attempt_token: Some(Arc::clone(&token)),
             curation_lineage: None,
+            watcher: None,
+            watcher_schedule: WatcherSchedule::new(false),
         };
 
         assert!(matches!(
@@ -7306,5 +7595,232 @@ mod tests {
             database.get_revision().expect("committed source revision"),
             snapshot.committed_revision + 1
         );
+    }
+
+    #[test]
+    fn detached_watcher_hint_runs_debounced_authoritative_audit() {
+        let fixture = Fixture::new("catalog-watcher-audit");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-audit");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let initial = register_and_audit(&service, fixture.root.path(), &source_id);
+
+        write_test_wav(&fixture.root.path().join("two.wav"), 16_000, 4);
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        });
+        let CatalogEvent::AuditCommitted { snapshot } = event else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.lifecycle_generation, initial.lifecycle_generation);
+        let paths = snapshot
+            .manifest
+            .iter()
+            .map(|entry| entry.relative_path.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![Path::new("one.wav"), Path::new("two.wav")]);
+        service.shutdown();
+    }
+
+    #[test]
+    fn unchanged_root_metadata_hint_does_not_trigger_audit() {
+        let fixture = Fixture::new("catalog-watcher-root-ambiguity");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-root-ambiguity");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &source_id);
+
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::ROOT_METADATA_AMBIGUOUS,
+        ));
+        thread::sleep(Duration::from_millis(550));
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
+    }
+
+    #[test]
+    fn removed_source_drops_watcher_signal_before_late_hint() {
+        let fixture = Fixture::new("catalog-watcher-remove");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-remove");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &source_id);
+
+        let pause = test_gate.pause_next();
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("remove admission");
+        pause.release();
+        let _ = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed {
+                    source_id: removed,
+                    lifecycle_generation: 1,
+                } if removed == &source_id
+            )
+        });
+        assert!(!test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
+    }
+
+    #[test]
+    fn watcher_hint_during_audit_is_retained_for_a_follow_up_audit() {
+        let fixture = Fixture::new("catalog-watcher-during-audit");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-during-audit");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &source_id);
+
+        let audit_pause = test_gate.arm_next_audit();
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        audit_pause.wait_until_entered();
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        audit_pause.release();
+
+        let first = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        });
+        assert!(matches!(first, CatalogEvent::AuditCommitted { .. }));
+        let second = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::AuditCommitted { .. })
+        });
+        assert!(matches!(second, CatalogEvent::AuditCommitted { .. }));
+        service.shutdown();
+    }
+
+    #[test]
+    fn watcher_hint_waits_for_event_budget_after_explicit_read() {
+        let fixture = Fixture::new("catalog-watcher-event-budget");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-event-budget");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let initial = register_and_audit(&service, fixture.root.path(), &source_id);
+
+        let boundary = test_gate.pause_next();
+        write_test_wav(&fixture.root.path().join("two.wav"), 16_000, 4);
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source_id.clone(),
+                expected_revision: Some(initial.committed_revision),
+            })
+            .expect("snapshot read admission");
+        assert!(admission_state(&service.admission, |state| state
+            .event_budget
+            > 1));
+        boundary.release();
+        thread::sleep(Duration::from_millis(650));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.event_budget),
+            2
+        );
+        let _ = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::AuditCommitted { snapshot }
+                    if snapshot.manifest.iter().any(|entry| {
+                        entry.relative_path == Path::new("two.wav")
+                    })
+            )
+        });
+        assert!(matches!(event, CatalogEvent::AuditCommitted { .. }));
+        service.shutdown();
+    }
+
+    #[test]
+    fn shutdown_drops_late_watcher_hint_without_automatic_audit() {
+        let fixture = Fixture::new("catalog-watcher-shutdown");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-watcher-shutdown");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        register_and_audit(&service, fixture.root.path(), &source_id);
+        assert!(test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+
+        service.shutdown();
+        let mut saw_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            match event {
+                CatalogEvent::Closed => saw_closed = true,
+                CatalogEvent::AuditCommitted { .. } => {
+                    panic!("shutdown must discard automatic watcher audit")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_closed);
+        assert!(!test_gate.record_watcher_evidence(
+            &source_id,
+            1,
+            WatchHintEvidence::DESCENDANT_CHANGED,
+        ));
+    }
+
+    #[test]
+    fn event_hub_publishes_closed_as_terminal_queue_state() {
+        let events = EventHub::new();
+        let source_id = SourceId::from_string("event-hub-terminal");
+        assert!(events.send(
+            CatalogEvent::Registered {
+                source_id,
+                lifecycle_generation: 1,
+            },
+            0,
+            0,
+            0,
+        ));
+        assert!(events.send_closed());
+
+        let (event, ..) = events.try_recv().expect("regular event");
+        assert!(matches!(event, CatalogEvent::Registered { .. }));
+        let (event, ..) = events.try_recv().expect("closed event");
+        assert!(matches!(event, CatalogEvent::Closed));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Disconnected)));
+        assert!(!events.send(CatalogEvent::Closed, 0, 0, 0));
     }
 }

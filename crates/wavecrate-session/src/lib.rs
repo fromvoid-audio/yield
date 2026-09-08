@@ -2949,10 +2949,9 @@ mod tests {
             }
             _ => unreachable!(),
         }
-        assert!(matches!(
-            service.try_recv_catalog(),
-            Ok(CatalogEvent::Closed)
-        ));
+        let closed =
+            wait_for_catalog_event(&service, |event| matches!(event, CatalogEvent::Closed));
+        assert!(matches!(closed, CatalogEvent::Closed));
         assert!(matches!(
             service.try_recv_catalog(),
             Err(TryRecvError::Disconnected)

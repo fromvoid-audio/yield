@@ -62,7 +62,8 @@ recompiles those crates; subsequent edits reuse the optimized dependencies.
 
 Source folders and preferences persist in the isolated GPUI profile. Add, switch,
 or forget sources from the sidebar, expand the relative folder tree, and choose
-direct-only or descendant scope. Refresh preserves valid navigation state; an
+direct-only or descendant scope. File changes refresh automatically through bounded
+native watcher hints and authoritative catalog audits. Refresh preserves valid navigation state; an
 unavailable source keeps its last successful view available for retry.
 
 Search filenames with Cmd/Ctrl+F. Sort by name, rating, Type, collection, extension,
