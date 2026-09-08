@@ -647,6 +647,25 @@ the local macOS fixture actually exposes detail context. UI request scheduling
 and rendering are still pending; this decoder alone does not improve displayed
 zoom resolution.
 
+### Waveform detail display, 2026-09-08
+
+Zoomed views now request bounded detail after a 45ms debounce when the overview
+is too coarse for the measured canvas width. File generation, exact request,
+and cancellation-token identity fence completions, including A/B/A navigation.
+The renderer independently checks the live request and maps detail columns back
+to their full-file range. Shared columns and a projection revision preserve
+geometry caching; overview data remains visible while detail is pending or
+unavailable. Layout changes request one follow-up frame, and settled detail
+does not maintain an animation loop.
+
+Validation: locked UI check and 20 targeted waveform/detail tests passed, with
+one manual benchmark ignored. The combined UI suite passed 93 tests. Formatting,
+diff checks, and the signed macOS build passed. A disposable timeline fixture
+visibly resolved individual oscillations in a short zoomed range, retained detail
+through X/Z restoration, resized correctly to 960x560, and quit cleanly. Five
+seconds of settled display consumed 0.15 seconds of process CPU time on this
+machine; this is an idle observation, not a full frame-latency benchmark.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

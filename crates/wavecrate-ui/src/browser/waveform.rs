@@ -3,7 +3,7 @@
 
 //! Waveform shaping and canvas rendering for the browser preview panel.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use gpui::{
     Bounds, Context, DragMoveEvent, MouseButton, MouseDownEvent, MouseUpEvent, Path, PathBuilder,
@@ -181,8 +181,8 @@ fn build_waveform_path(
 ///
 /// GPUI canvas closures are recreated with the surrounding view, so this cache owns the paths
 /// independently of an individual canvas element. The key includes every input that changes the
-/// path coordinates or shaped envelope. Viewport zoom currently resamples the bounded full-file
-/// projection; decoding finer per-viewport detail remains a separate follow-up.
+/// path coordinates or shaped envelope, including the exact source range and refinement revision
+/// of a viewport detail projection.
 #[derive(Clone, Default)]
 pub(super) struct WaveformRenderCache {
     state: Rc<RefCell<WaveformRenderCacheState>>,
@@ -203,6 +203,9 @@ struct WaveformCacheKey {
     peak_scale_bits: u32,
     viewport_start_bits: u64,
     viewport_end_bits: u64,
+    projection_revision: u64,
+    projection_start_bits: u64,
+    projection_end_bits: u64,
 }
 
 impl WaveformRenderCache {
@@ -214,6 +217,8 @@ impl WaveformRenderCache {
         peak_scale: f32,
         bounds: Bounds<Pixels>,
         viewport: WaveformViewport,
+        source_range: (f64, f64),
+        projection_revision: u64,
     ) -> Vec<(usize, Path<Pixels>)> {
         let key = WaveformCacheKey {
             generation,
@@ -221,10 +226,13 @@ impl WaveformRenderCache {
             peak_scale_bits: peak_scale.to_bits(),
             viewport_start_bits: viewport.start.to_bits(),
             viewport_end_bits: viewport.end.to_bits(),
+            projection_revision,
+            projection_start_bits: source_range.0.to_bits(),
+            projection_end_bits: source_range.1.to_bits(),
         };
         let mut state = self.state.borrow_mut();
         if state.key != Some(key) {
-            state.paths = build_waveform_paths(bands, peak_scale, bounds, viewport);
+            state.paths = build_waveform_paths(bands, peak_scale, bounds, viewport, source_range);
             state.key = Some(key);
             #[cfg(test)]
             {
@@ -245,9 +253,10 @@ fn build_waveform_paths(
     peak_scale: f32,
     bounds: Bounds<Pixels>,
     viewport: WaveformViewport,
+    source_range: (f64, f64),
 ) -> Vec<(usize, Path<Pixels>)> {
     let point_count = drawable_point_count(bounds.size.width, bands.len());
-    let extents = resample_extents(bands, point_count, peak_scale, viewport);
+    let extents = resample_extents(bands, point_count, peak_scale, viewport, source_range);
     let center = bounds.origin.y + bounds.size.height / 2.0;
     let half_height = (bounds.size.height / 2.0 - px(2.0)).max(px(1.0));
     let width = bounds.size.width;
@@ -277,6 +286,7 @@ fn resample_extents(
     point_count: usize,
     peak_scale: f32,
     viewport: WaveformViewport,
+    source_range: (f64, f64),
 ) -> Vec<[f32; 4]> {
     if bands.is_empty() || point_count == 0 {
         return Vec::new();
@@ -286,9 +296,14 @@ fn resample_extents(
     let viewport_start = viewport.start;
     let viewport_width = viewport.width();
     let band_count = bands.len() as f64;
+    let source_start = source_range.0;
+    let source_width = source_range.1 - source_start;
+    if !source_start.is_finite() || !source_width.is_finite() || source_width <= 0.0 {
+        return extents;
+    }
     for (index, column) in bands.iter().copied().enumerate() {
-        let band_start = index as f64 / band_count;
-        let band_end = (index + 1) as f64 / band_count;
+        let band_start = source_start + index as f64 / band_count * source_width;
+        let band_end = source_start + (index + 1) as f64 / band_count * source_width;
         let overlap_start = band_start.max(viewport_start);
         let overlap_end = band_end.min(viewport_start + viewport_width);
         if overlap_end <= overlap_start {
@@ -442,8 +457,30 @@ pub(super) fn render_waveform(
         .bg(color(theme.colors.waveform_background));
     if let Some(preview) = browser.waveform.as_ref() {
         let viewport = browser.waveform_viewport;
+        let generation = browser.waveform_generation;
+        browser
+            .waveform_detail
+            .schedule_for_preview(preview, viewport, generation, cx);
         if !preview.bands.is_empty() {
-            let bands = preview.bands.clone();
+            let projection = browser
+                .waveform_detail
+                .projection_for(preview, viewport, generation);
+            let (bands, source_range, projection_revision): (Arc<[[f32; 4]]>, (f64, f64), u64) =
+                projection
+                    .map(|projection| {
+                        (
+                            projection.bands,
+                            projection.source_range,
+                            projection.projection_revision,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            Arc::from(preview.bands.clone().into_boxed_slice()),
+                            (0.0, 1.0),
+                            0,
+                        )
+                    });
             let lane_colors = [
                 color(theme.colors.waveform_low),
                 color(theme.colors.waveform_mid),
@@ -451,13 +488,20 @@ pub(super) fn render_waveform(
                 color(theme.colors.waveform_raw),
             ];
             let peak_scale = theme.waveform.peak_scale;
-            let generation = browser.waveform_generation;
             let cache = browser.waveform_render_cache.clone();
             let waveform = canvas(
                 move |_, _, _| (),
                 move |bounds, _, window, _| {
                     for (lane, path) in cache
-                        .paths_for(generation, &bands, peak_scale, bounds, viewport)
+                        .paths_for(
+                            generation,
+                            &bands,
+                            peak_scale,
+                            bounds,
+                            viewport,
+                            source_range,
+                            projection_revision,
+                        )
                         .into_iter()
                     {
                         window.paint_path(path, lane_colors[lane]);
@@ -495,10 +539,25 @@ pub(super) fn render_waveform(
         );
     }
     let click_bounds_for_surface = Rc::clone(&click_bounds);
+    let detail_state_for_surface = browser.waveform_detail.clone();
+    let detail_active_for_surface = browser.waveform.is_some();
     bars = bars.child(
         canvas(
-            move |bounds, _, _| {
+            move |bounds, window, _| {
                 *click_bounds_for_surface.borrow_mut() = Some(bounds);
+                if detail_state_for_surface.note_layout_width(f32::from(bounds.size.width))
+                    && detail_active_for_surface
+                {
+                    // The canvas is the first place where the final layout width is known. A
+                    // single follow-up frame lets the scheduler observe a resize without adding
+                    // an idle animation loop.
+                    //
+                    // `Canvas`' prepaint callback has a window but no entity context.
+                    // `request_animation_frame` is therefore the smallest event-driven bridge to
+                    // the next render, where `schedule_for_preview` owns the debounce/task.
+                    // The follow-up request is only made when the measured width changes.
+                    window.request_animation_frame();
+                }
             },
             move |_, _, _, _| {},
         )
@@ -627,6 +686,7 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.waveform_detail.reset();
         self.waveform_viewport = WaveformViewport::full();
         self.waveform_zoom_anchor_ratio = 0.5;
         self.clear_waveform_region();
@@ -970,6 +1030,7 @@ mod tests {
             drawable_point_count(px(320.0), bands.len()),
             1.0,
             WaveformViewport::full(),
+            (0.0, 1.0),
         );
 
         assert_eq!(extents.len(), 320);
@@ -993,7 +1054,7 @@ mod tests {
             start: -0.5,
             end: 1.5,
         };
-        let extents = resample_extents(&bands, 8, 1.0, viewport);
+        let extents = resample_extents(&bands, 8, 1.0, viewport, (0.0, 1.0));
         assert!(extents[0].iter().all(|value| *value == 0.0));
         assert!(extents[1].iter().all(|value| *value == 0.0));
         assert!(extents[6].iter().all(|value| *value == 0.0));
@@ -1012,6 +1073,39 @@ mod tests {
     }
 
     #[test]
+    fn detail_projection_maps_only_its_source_range_into_silence_margins() {
+        let bands = vec![[1.0, 1.0, 1.0, 1.0]; 16];
+        let extents = resample_extents(
+            &bands,
+            16,
+            1.0,
+            WaveformViewport {
+                start: -0.5,
+                end: 1.5,
+            },
+            (0.25, 0.5),
+        );
+        assert!(
+            extents[..6]
+                .iter()
+                .flat_map(|column| column.iter())
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            extents[10..]
+                .iter()
+                .flat_map(|column| column.iter())
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            extents[6..10]
+                .iter()
+                .flat_map(|column| column.iter())
+                .any(|value| *value > 0.0)
+        );
+    }
+
+    #[test]
     fn render_cache_reuses_an_exact_key_and_invalidates_layout_or_preview_changes() {
         let cache = WaveformRenderCache::default();
         let viewport = WaveformViewport::full();
@@ -1021,35 +1115,54 @@ mod tests {
             peak_scale_bits: 1.0_f32.to_bits(),
             viewport_start_bits: viewport.start.to_bits(),
             viewport_end_bits: viewport.end.to_bits(),
+            projection_revision: 0,
+            projection_start_bits: 0.0_f64.to_bits(),
+            projection_end_bits: 1.0_f64.to_bits(),
         };
         let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
-        let initial_paths = cache.paths_for(7, &bands, 1.0, first.bounds, viewport);
+        let initial_paths = cache.paths_for(7, &bands, 1.0, first.bounds, viewport, (0.0, 1.0), 0);
         assert_eq!(initial_paths.len(), 4);
         assert_eq!(cache.rebuild_count(), 1);
         assert_eq!(
             cache
-                .paths_for(7, &bands, 1.0, first.bounds, viewport)
+                .paths_for(7, &bands, 1.0, first.bounds, viewport, (0.0, 1.0), 0)
                 .len(),
             4
         );
         assert_eq!(cache.rebuild_count(), 1);
         assert_eq!(
             cache
-                .paths_for(8, &bands, 1.0, first.bounds, viewport)
+                .paths_for(8, &bands, 1.0, first.bounds, viewport, (0.0, 1.0), 0)
                 .len(),
             4
         );
         assert_eq!(cache.rebuild_count(), 2);
         assert_eq!(
             cache
-                .paths_for(8, &bands, 1.0, test_bounds(321.0, 180.0), viewport)
+                .paths_for(
+                    8,
+                    &bands,
+                    1.0,
+                    test_bounds(321.0, 180.0),
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                )
                 .len(),
             4
         );
         assert_eq!(cache.rebuild_count(), 3);
         assert_eq!(
             cache
-                .paths_for(8, &bands, 1.1, test_bounds(321.0, 180.0), viewport)
+                .paths_for(
+                    8,
+                    &bands,
+                    1.1,
+                    test_bounds(321.0, 180.0),
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                )
                 .len(),
             4
         );
@@ -1060,11 +1173,34 @@ mod tests {
         };
         assert_eq!(
             cache
-                .paths_for(8, &bands, 1.1, test_bounds(321.0, 180.0), zoomed)
+                .paths_for(
+                    8,
+                    &bands,
+                    1.1,
+                    test_bounds(321.0, 180.0),
+                    zoomed,
+                    (0.0, 1.0),
+                    0,
+                )
                 .len(),
             4
         );
         assert_eq!(cache.rebuild_count(), 5);
+        assert_eq!(
+            cache
+                .paths_for(
+                    8,
+                    &bands,
+                    1.1,
+                    test_bounds(321.0, 180.0),
+                    zoomed,
+                    (0.25, 0.75),
+                    1,
+                )
+                .len(),
+            4
+        );
+        assert_eq!(cache.rebuild_count(), 6);
     }
 
     #[test]
@@ -1247,12 +1383,12 @@ mod tests {
         let viewport = WaveformViewport::full();
         let cold_start = Instant::now();
         for generation in 0..100 {
-            let _ = cache.paths_for(generation, &bands, 1.0, bounds, viewport);
+            let _ = cache.paths_for(generation, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0);
         }
         let cold = cold_start.elapsed();
         let warm_start = Instant::now();
         for _ in 0..100 {
-            let _ = cache.paths_for(99, &bands, 1.0, bounds, viewport);
+            let _ = cache.paths_for(99, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0);
         }
         let warm = warm_start.elapsed();
         eprintln!("waveform geometry: 100 misses {cold:?}; 100 hits {warm:?}");

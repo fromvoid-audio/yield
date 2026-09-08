@@ -43,6 +43,7 @@ mod transport;
 mod view;
 mod volume;
 mod waveform;
+mod waveform_detail;
 
 /// Install the app-owned source registry and its application-quit shutdown observer.
 pub(crate) fn install_source_registry(cx: &mut App) {
@@ -223,6 +224,7 @@ pub(crate) struct Browser {
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
+    waveform_detail: waveform_detail::WaveformDetailState,
     waveform_viewport: WaveformViewport,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
@@ -352,6 +354,7 @@ impl Browser {
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
+            waveform_detail: waveform_detail::WaveformDetailState::default(),
             waveform_viewport: WaveformViewport::full(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
@@ -459,6 +462,7 @@ impl Browser {
     }
 
     fn cancel_waveform_load(&mut self) {
+        self.waveform_detail.cancel();
         if let Some(cancellation) = self.waveform_cancel.take() {
             cancellation.store(true, Ordering::Release);
         }
@@ -846,7 +850,7 @@ impl Browser {
     pub(super) fn motion_pending(&self) -> motion::PendingWork {
         motion::pending_work(
             self.scan_cancel.is_some(),
-            self.waveform_pending,
+            self.waveform_pending || self.waveform_detail.is_pending(),
             self.audio_output_open_task.is_some(),
             self.playback_init_intent.is_some(),
         )
@@ -1664,6 +1668,7 @@ impl Drop for Browser {
             cancellation.store(true, Ordering::Release);
         }
         self.source_registry_task.take();
+        self.waveform_detail.reset();
         self.cancel_waveform_load();
         self.cancel_audio_output_options();
         self.audio_output_open_generation = self.audio_output_open_generation.wrapping_add(1);
