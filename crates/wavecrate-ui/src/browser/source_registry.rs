@@ -139,7 +139,9 @@ impl SourceRegistryGlobal {
     /// Request the profile worker to drain and close during application quit.
     pub(crate) fn shutdown(&mut self) {
         if let Some(mut service) = self.service.take() {
-            if let Err(error) = service.shutdown() {
+            let shutdown_result = service.shutdown();
+            log_shutdown_curation_failures(&service);
+            if let Err(error) = shutdown_result {
                 eprintln!("wavecrate source registry shutdown failed: {error}");
             }
         }
@@ -148,6 +150,29 @@ impl SourceRegistryGlobal {
     /// Retain the quit observer for the lifetime of the app global.
     pub(crate) fn retain_quit_subscription(&mut self, subscription: Subscription) {
         self.quit_subscription = Some(subscription);
+    }
+}
+
+fn log_shutdown_curation_failures(service: &SourceRegistryService) {
+    loop {
+        match service.try_recv_catalog() {
+            Ok(CatalogEvent::CurationOperationCompleted {
+                source_id,
+                request_id,
+                outcome,
+                ..
+            }) => {
+                if let Some(failure) = outcome.failure() {
+                    eprintln!(
+                        "wavecrate curation operation failed during shutdown: source={source_id} request={request_id} committed_batches={} error={}",
+                        outcome.committed_batches().len(),
+                        failure.error(),
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
     }
 }
 

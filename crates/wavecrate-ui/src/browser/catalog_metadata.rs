@@ -22,6 +22,7 @@ pub(super) struct CatalogMetadataContext {
     pub(super) lifecycle_generation: u64,
     pub(super) root: PathBuf,
     pub(super) root_identity: RootIdentity,
+    pub(super) directory_generation: u64,
     pub(super) revision: u64,
     pub(super) entry_indices: Arc<HashMap<PathBuf, usize>>,
 }
@@ -40,6 +41,7 @@ pub(super) struct CatalogMetadataState {
     terminal_paths: BTreeSet<PathBuf>,
     pending: Option<CatalogMetadataRequest>,
     retry_ready: bool,
+    paused: bool,
     next_request_id: u64,
     debounce_generation: u64,
     debounce_task: Option<Task<()>>,
@@ -54,6 +56,7 @@ impl Default for CatalogMetadataState {
             terminal_paths: BTreeSet::new(),
             pending: None,
             retry_ready: false,
+            paused: false,
             next_request_id: 0,
             debounce_generation: 0,
             debounce_task: None,
@@ -69,6 +72,7 @@ impl CatalogMetadataState {
         self.terminal_paths.clear();
         self.pending = None;
         self.retry_ready = false;
+        self.paused = false;
         self.debounce_generation = self.debounce_generation.wrapping_add(1);
         self.debounce_task.take();
         self.error = None;
@@ -77,6 +81,29 @@ impl CatalogMetadataState {
     pub(super) fn install_projection(&mut self, context: CatalogMetadataContext) {
         self.reset();
         self.context = Some(context);
+    }
+
+    /// Pause lazy metadata requests while a curation operation is awaiting its receipt.
+    pub(super) fn pause_for_curation(&mut self) {
+        self.latest_demand.clear();
+        self.pending = None;
+        self.retry_ready = false;
+        self.paused = true;
+        self.debounce_generation = self.debounce_generation.wrapping_add(1);
+        self.debounce_task.take();
+    }
+
+    /// Reinstall the same audited metadata mapping at a newly committed revision.
+    pub(super) fn advance_projection_revision(&mut self, revision: u64) -> bool {
+        let Some(mut context) = self.context.clone() else {
+            return false;
+        };
+        if revision < context.revision {
+            return false;
+        }
+        context.revision = revision;
+        self.install_projection(context);
+        true
     }
 
     pub(super) fn context(&self) -> Option<CatalogMetadataContext> {
@@ -88,7 +115,7 @@ impl CatalogMetadataState {
         context: CatalogMetadataContext,
         paths: Vec<PathBuf>,
     ) -> bool {
-        if !self.context_matches(&context) {
+        if self.paused || !self.context_matches(&context) {
             return false;
         }
         let mut latest = Vec::with_capacity(paths.len());
@@ -117,7 +144,8 @@ impl CatalogMetadataState {
     }
 
     pub(super) fn begin_debounce(&mut self) -> Option<u64> {
-        if self.debounce_task.is_some()
+        if self.paused
+            || self.debounce_task.is_some()
             || self.pending.is_some()
             || self.retry_ready
             || self.error.is_some()
@@ -143,7 +171,7 @@ impl CatalogMetadataState {
     }
 
     fn begin_request(&mut self) -> Option<CatalogMetadataRequest> {
-        if self.pending.is_some() || !self.retry_ready || self.error.is_some() {
+        if self.paused || self.pending.is_some() || !self.retry_ready || self.error.is_some() {
             return None;
         }
         let context = self.context.clone()?;
@@ -461,6 +489,7 @@ mod tests {
             lifecycle_generation: 3,
             root: PathBuf::from("/library"),
             root_identity: RootIdentity::from_bytes(b"root".to_vec()),
+            directory_generation: 2,
             revision: 7,
             entry_indices: Arc::new(
                 paths
@@ -585,6 +614,21 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn curation_pause_blocks_old_revision_demand_until_projection_advances() {
+        let context = context(&["sample.wav"]);
+        let mut state = CatalogMetadataState::default();
+        state.install_projection(context.clone());
+        state.pause_for_curation();
+        assert!(!state.observe_visible_demand(context.clone(), vec![PathBuf::from("sample.wav")]));
+        assert!(!state.poll_needed());
+
+        assert!(state.advance_projection_revision(8));
+        let advanced = state.context().expect("advanced projection context");
+        assert_eq!(advanced.revision, 8);
+        assert!(state.observe_visible_demand(advanced, vec![PathBuf::from("sample.wav")]));
     }
 
     #[test]

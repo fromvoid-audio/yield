@@ -6,9 +6,12 @@ pub(crate) use wavecrate_catalog::CatalogService;
 use wavecrate_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
 pub use wavecrate_catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogEvent, CatalogWavMetadataRequestError,
-    MAX_CURATION_UPDATES, MAX_WAV_METADATA_REQUEST_PATHS, SourceCurationCommitReceipt,
-    SourceCurationUpdate,
+    CatalogCommand, CatalogCurationRequestError, CatalogError, CatalogEvent,
+    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_WAV_METADATA_REQUEST_PATHS,
+    SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
+    SourceCurationOperationOutcome, SourceCurationUpdate,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
@@ -93,7 +96,6 @@ pub(crate) fn submit(
                 .and_then(|service| service.submit(command).map_err(map_submit_error));
             if matches!(result, Err(CatalogSubmitError::Closed)) {
                 slot.status = CatalogStatus::Closed;
-                slot.service = None;
             }
             result
         }

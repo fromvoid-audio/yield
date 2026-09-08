@@ -1,7 +1,10 @@
 //! Durable source-local curation commands and their bounded cache patches.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 use thiserror::Error;
 use wavecrate_library::app_dirs::WritableProfileGuard;
@@ -21,6 +24,93 @@ use super::{
 pub const MAX_CURATION_UPDATES: usize =
     wavecrate_library::sample_sources::SOURCE_CURATION_BATCH_LIMIT;
 
+/// Maximum number of library-sized curation batches admitted by one operation.
+pub const MAX_CURATION_OPERATION_BATCHES: usize = 512;
+
+/// Maximum number of metadata updates admitted by one compound curation operation.
+pub const MAX_CURATION_OPERATION_UPDATES: usize = 65_536;
+
+/// Maximum aggregate source-relative path bytes retained by one compound operation.
+pub const MAX_CURATION_OPERATION_PATH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum estimated metadata bytes retained by one compound operation outcome.
+pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize = 32 * 1024 * 1024;
+
+// This is deliberately conservative: it covers the bounded metadata row plus vector and batch
+// bookkeeping while the input batches and aggregate receipt coexist in the worker.
+const ESTIMATED_RECEIPT_ROW_BYTES: usize = 256;
+const ESTIMATED_OPERATION_BATCH_BYTES: usize = 64;
+
+/// Revision fence for a compound curation operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceCurationOperationFence {
+    /// Start a new curation lineage at this exact source revision.
+    ExactRevision(u64),
+    /// Continue only the exact latest fully successful operation in this source lifecycle.
+    AfterOperation {
+        /// Request identifier of the immediately preceding successful operation.
+        request_id: u64,
+    },
+}
+
+/// Failure detail for one batch in a compound curation operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceCurationOperationFailure {
+    batch_index: usize,
+    error: CatalogError,
+}
+
+impl SourceCurationOperationFailure {
+    /// Return the zero-based batch index that failed.
+    pub const fn batch_index(&self) -> usize {
+        self.batch_index
+    }
+
+    /// Borrow the typed failure returned for the failed batch.
+    pub const fn error(&self) -> &CatalogError {
+        &self.error
+    }
+}
+
+/// Bounded terminal result for one compound curation operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceCurationOperationOutcome {
+    initial_revision: Option<u64>,
+    final_revision: Option<u64>,
+    committed_batches: Vec<SourceCurationCommitReceipt>,
+    failure: Option<SourceCurationOperationFailure>,
+}
+
+impl SourceCurationOperationOutcome {
+    /// Return the exact starting revision when the operation could resolve its fence.
+    pub const fn initial_revision(&self) -> Option<u64> {
+        self.initial_revision
+    }
+
+    /// Return the last committed batch revision, or the initial fence if no batch committed.
+    ///
+    /// This is not a database readback. On a zero-commit failure the initial fence may be stale;
+    /// only revisions carried by [`Self::committed_batches`] are durable commit receipts.
+    pub const fn final_revision(&self) -> Option<u64> {
+        self.final_revision
+    }
+
+    /// Borrow the durable receipts for every successfully committed prefix batch.
+    pub fn committed_batches(&self) -> &[SourceCurationCommitReceipt] {
+        &self.committed_batches
+    }
+
+    /// Borrow the failed batch detail, if the operation did not complete fully.
+    pub const fn failure(&self) -> Option<&SourceCurationOperationFailure> {
+        self.failure.as_ref()
+    }
+
+    /// Return whether every admitted batch committed successfully.
+    pub const fn is_success(&self) -> bool {
+        self.failure.is_none()
+    }
+}
+
 /// A typed failure raised before a durable curation command enters the worker queue.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogCurationRequestError {
@@ -35,6 +125,43 @@ pub enum CatalogCurationRequestError {
         /// Supplied update count.
         actual: usize,
     },
+    /// The operation contained more library-sized batches than admission allows.
+    #[error("curation operation contains {actual} batches; maximum is {max}")]
+    TooManyOperationBatches {
+        /// Maximum admitted batch count.
+        max: usize,
+        /// Supplied batch count.
+        actual: usize,
+    },
+    /// The operation contained more updates than admission allows.
+    #[error("curation operation contains {actual} updates; maximum is {max}")]
+    TooManyOperationUpdates {
+        /// Maximum admitted update count.
+        max: usize,
+        /// Supplied update count.
+        actual: usize,
+    },
+    /// The operation's path and estimated receipt payload exceeded admission bounds.
+    #[error("curation operation payload is {actual} bytes; maximum is {max}")]
+    OperationPayloadTooLarge {
+        /// Maximum admitted estimated payload size.
+        max: usize,
+        /// Estimated payload size supplied by the caller.
+        actual: usize,
+    },
+    /// The operation request identifier was already used in this source lifecycle.
+    #[error(
+        "curation operation request id {received} is not greater than the last admitted id {last}"
+    )]
+    NonMonotonicRequestId {
+        /// Last request identifier admitted for this source lifecycle.
+        last: u64,
+        /// Request identifier supplied by the caller.
+        received: u64,
+    },
+    /// A predecessor request identifier of zero is not a valid chain link.
+    #[error("curation operation predecessor request id must be nonzero")]
+    InvalidPredecessorRequestId,
     /// A rating carried a value outside the supported range.
     #[error("curation request contains invalid rating value {value}")]
     InvalidRating {
@@ -74,7 +201,10 @@ pub enum CatalogCurationRequestError {
 
 /// Return whether a catalog command remains durable during shutdown draining.
 pub(crate) fn is_durable(command: &CatalogCommand) -> bool {
-    matches!(command, CatalogCommand::ApplyCuration { .. })
+    matches!(
+        command,
+        CatalogCommand::ApplyCuration { .. } | CatalogCommand::ApplyCurationOperation { .. }
+    )
 }
 
 /// Validate curation input and its current desired lifecycle under the admission mutex.
@@ -82,17 +212,30 @@ pub(crate) fn validate_submission(
     command: &CatalogCommand,
     state: &AdmissionState,
 ) -> Result<(), CatalogCurationRequestError> {
-    let CatalogCommand::ApplyCuration {
-        source_id,
-        lifecycle_generation,
-        updates,
-        ..
-    } = command
-    else {
-        return Ok(());
+    let (source_id, lifecycle_generation) = match command {
+        CatalogCommand::ApplyCuration {
+            source_id,
+            lifecycle_generation,
+            updates,
+            ..
+        } => {
+            validate_updates(updates)?;
+            (source_id, lifecycle_generation)
+        }
+        CatalogCommand::ApplyCurationOperation {
+            source_id,
+            lifecycle_generation,
+            request_id,
+            fence,
+            root_identity,
+            batches,
+            ..
+        } => {
+            validate_operation(*request_id, fence, root_identity, batches, state, source_id)?;
+            (source_id, lifecycle_generation)
+        }
+        _ => return Ok(()),
     };
-
-    validate_updates(updates)?;
     let Some(desired) = state.sources.get(source_id) else {
         return Err(CatalogCurationRequestError::NotRegistered(
             source_id.clone(),
@@ -114,6 +257,88 @@ pub(crate) fn validate_submission(
     Ok(())
 }
 
+fn validate_operation(
+    request_id: u64,
+    fence: &SourceCurationOperationFence,
+    root_identity: &RootIdentity,
+    batches: &[Vec<SourceCurationUpdate>],
+    state: &AdmissionState,
+    source_id: &SourceId,
+) -> Result<(), CatalogCurationRequestError> {
+    if request_id == 0 {
+        return Err(CatalogCurationRequestError::NonMonotonicRequestId {
+            last: 0,
+            received: request_id,
+        });
+    }
+    if let SourceCurationOperationFence::AfterOperation { request_id } = fence
+        && *request_id == 0
+    {
+        return Err(CatalogCurationRequestError::InvalidPredecessorRequestId);
+    }
+    if let Some(desired) = state.sources.get(source_id)
+        && let Some(last) = desired.last_curation_request_id
+        && request_id <= last
+    {
+        return Err(CatalogCurationRequestError::NonMonotonicRequestId {
+            last,
+            received: request_id,
+        });
+    }
+    if batches.is_empty() {
+        return Err(CatalogCurationRequestError::Empty);
+    }
+    if batches.len() > MAX_CURATION_OPERATION_BATCHES {
+        return Err(CatalogCurationRequestError::TooManyOperationBatches {
+            max: MAX_CURATION_OPERATION_BATCHES,
+            actual: batches.len(),
+        });
+    }
+    let mut total_updates = 0usize;
+    let mut path_bytes = 0usize;
+    for batch in batches {
+        if batch.is_empty() {
+            return Err(CatalogCurationRequestError::Empty);
+        }
+        if batch.len() > MAX_CURATION_UPDATES {
+            return Err(CatalogCurationRequestError::TooManyUpdates {
+                max: MAX_CURATION_UPDATES,
+                actual: batch.len(),
+            });
+        }
+        total_updates = total_updates.saturating_add(batch.len());
+        for update in batch {
+            validate_update(update)?;
+            path_bytes = path_bytes.saturating_add(path_byte_len(update_path(update)));
+        }
+    }
+    if total_updates > MAX_CURATION_OPERATION_UPDATES {
+        return Err(CatalogCurationRequestError::TooManyOperationUpdates {
+            max: MAX_CURATION_OPERATION_UPDATES,
+            actual: total_updates,
+        });
+    }
+    if path_bytes > MAX_CURATION_OPERATION_PATH_BYTES {
+        return Err(CatalogCurationRequestError::OperationPayloadTooLarge {
+            max: MAX_CURATION_OPERATION_PATH_BYTES,
+            actual: path_bytes,
+        });
+    }
+    let estimated_payload_bytes = operation_payload_bytes_with_path_bytes(
+        root_identity.as_bytes().len(),
+        batches.len(),
+        total_updates,
+        path_bytes,
+    );
+    if estimated_payload_bytes > MAX_CURATION_OPERATION_RECEIPT_BYTES {
+        return Err(CatalogCurationRequestError::OperationPayloadTooLarge {
+            max: MAX_CURATION_OPERATION_RECEIPT_BYTES,
+            actual: estimated_payload_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn validate_updates(updates: &[SourceCurationUpdate]) -> Result<(), CatalogCurationRequestError> {
     if updates.is_empty() {
         return Err(CatalogCurationRequestError::Empty);
@@ -125,25 +350,84 @@ fn validate_updates(updates: &[SourceCurationUpdate]) -> Result<(), CatalogCurat
         });
     }
     for update in updates {
-        match update {
-            SourceCurationUpdate::SetRating { rating, .. } if !(-3..=3).contains(&rating.val()) => {
-                return Err(CatalogCurationRequestError::InvalidRating {
-                    value: rating.val(),
-                });
-            }
-            SourceCurationUpdate::AddCollection { collection, .. }
-            | SourceCurationUpdate::RemoveCollection { collection, .. }
-                if usize::from(collection.index()) >= SampleCollection::COUNT =>
-            {
-                return Err(CatalogCurationRequestError::InvalidCollection {
-                    value: collection.index(),
-                });
-            }
-            SourceCurationUpdate::SetLocked { .. } => {}
-            _ => {}
-        }
+        validate_update(update)?;
     }
     Ok(())
+}
+
+fn validate_update(update: &SourceCurationUpdate) -> Result<(), CatalogCurationRequestError> {
+    match update {
+        SourceCurationUpdate::SetRating { rating, .. } if !(-3..=3).contains(&rating.val()) => {
+            Err(CatalogCurationRequestError::InvalidRating {
+                value: rating.val(),
+            })
+        }
+        SourceCurationUpdate::AddCollection { collection, .. }
+        | SourceCurationUpdate::RemoveCollection { collection, .. }
+            if usize::from(collection.index()) >= SampleCollection::COUNT =>
+        {
+            Err(CatalogCurationRequestError::InvalidCollection {
+                value: collection.index(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn update_path(update: &SourceCurationUpdate) -> &Path {
+    match update {
+        SourceCurationUpdate::SetRating { path, .. }
+        | SourceCurationUpdate::SetLocked { path, .. }
+        | SourceCurationUpdate::AddCollection { path, .. }
+        | SourceCurationUpdate::RemoveCollection { path, .. } => path.as_path(),
+    }
+}
+
+fn path_byte_len(path: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        path.as_os_str().as_bytes().len()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().len()
+    }
+}
+
+fn operation_payload_bytes_with_path_bytes(
+    root_identity_bytes: usize,
+    batch_count: usize,
+    update_count: usize,
+    path_bytes: usize,
+) -> usize {
+    // Account for the caller-owned path spelling and the path retained in each receipt. Root
+    // identity bytes are present in the operation and in every bounded receipt.
+    path_bytes
+        .saturating_mul(2)
+        .saturating_add(root_identity_bytes.saturating_mul(batch_count.saturating_add(1)))
+        .saturating_add(update_count.saturating_mul(ESTIMATED_RECEIPT_ROW_BYTES))
+        .saturating_add(batch_count.saturating_mul(ESTIMATED_OPERATION_BATCH_BYTES))
+}
+
+/// Estimate the bounded payload retained while an operation and its terminal outcome coexist.
+pub(crate) fn operation_payload_bytes(
+    root_identity: &RootIdentity,
+    batches: &[Vec<SourceCurationUpdate>],
+) -> usize {
+    let mut update_count = 0usize;
+    let mut path_bytes = 0usize;
+    for batch in batches {
+        update_count = update_count.saturating_add(batch.len());
+        for update in batch {
+            path_bytes = path_bytes.saturating_add(path_byte_len(update_path(update)));
+        }
+    }
+    operation_payload_bytes_with_path_bytes(
+        root_identity.as_bytes().len(),
+        batches.len(),
+        update_count,
+        path_bytes,
+    )
 }
 
 /// Load the full browser curation projection through revision-fenced pages.
@@ -233,6 +517,13 @@ pub(crate) fn execute(
         profile_guard,
         sources,
     );
+    if let Some(source) = sources.get_mut(&source_id)
+        && source.lifecycle_generation == lifecycle_generation
+    {
+        // An ordinary curation command is an independent writer. It cannot be used as an
+        // implicit predecessor for a compound operation, even when it committed successfully.
+        source.curation_lineage = None;
+    }
     match result {
         Ok(receipt) => reservation.publish(CatalogEvent::CurationCommitted {
             source_id,
@@ -248,6 +539,158 @@ pub(crate) fn execute(
             error,
         }),
     }
+}
+
+/// Execute an accepted compound curation command and publish one bounded terminal outcome.
+pub(crate) fn execute_operation(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    fence: SourceCurationOperationFence,
+    root_identity: RootIdentity,
+    request_id: u64,
+    batches: Vec<Vec<SourceCurationUpdate>>,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let initial_revision = match fence {
+        SourceCurationOperationFence::ExactRevision(revision) => Some(revision),
+        SourceCurationOperationFence::AfterOperation { .. } => None,
+    };
+    let (initial_revision, mut expected_revision) =
+        match resolve_operation_fence(&source_id, fence, sources) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let outcome = SourceCurationOperationOutcome {
+                    initial_revision,
+                    final_revision: initial_revision,
+                    committed_batches: Vec::new(),
+                    failure: Some(SourceCurationOperationFailure {
+                        batch_index: 0,
+                        error,
+                    }),
+                };
+                publish_operation_outcome(
+                    source_id,
+                    lifecycle_generation,
+                    request_id,
+                    outcome,
+                    reservation,
+                    sources,
+                );
+                return;
+            }
+        };
+    let mut committed_batches = Vec::new();
+    let mut failure = None;
+    for (batch_index, updates) in batches.iter().enumerate() {
+        let result = if expected_revision == u64::MAX {
+            Err(CatalogError::CurationRevisionOverflow(expected_revision))
+        } else {
+            execute_inner(
+                &source_id,
+                lifecycle_generation,
+                expected_revision,
+                &root_identity,
+                updates,
+                profile_guard,
+                sources,
+            )
+        };
+        match result {
+            Ok(receipt) => {
+                expected_revision = receipt.source_revision();
+                committed_batches.push(receipt);
+            }
+            Err(error) => {
+                failure = Some(SourceCurationOperationFailure { batch_index, error });
+                break;
+            }
+        }
+    }
+
+    // The final revision is the committed prefix's revision, or the fenced revision when the
+    // first batch failed.
+    let final_revision = committed_batches
+        .last()
+        .map(SourceCurationCommitReceipt::source_revision)
+        .or(initial_revision);
+    let outcome = SourceCurationOperationOutcome {
+        initial_revision,
+        final_revision,
+        committed_batches,
+        failure,
+    };
+    publish_operation_outcome(
+        source_id,
+        lifecycle_generation,
+        request_id,
+        outcome,
+        reservation,
+        sources,
+    );
+}
+
+fn resolve_operation_fence(
+    source_id: &SourceId,
+    fence: SourceCurationOperationFence,
+    sources: &HashMap<SourceId, RegisteredSource>,
+) -> Result<(Option<u64>, u64), CatalogError> {
+    match fence {
+        SourceCurationOperationFence::ExactRevision(revision) => Ok((Some(revision), revision)),
+        SourceCurationOperationFence::AfterOperation { request_id } => {
+            let Some(source) = sources.get(source_id) else {
+                return Err(CatalogError::NotRegistered(source_id.clone()));
+            };
+            let Some(lineage) = source.curation_lineage else {
+                return Err(CatalogError::CurationPredecessorUnavailable {
+                    source_id: source_id.clone(),
+                    request_id,
+                });
+            };
+            let Some(revision) = lineage.last_success_revision else {
+                return Err(CatalogError::CurationPredecessorUnavailable {
+                    source_id: source_id.clone(),
+                    request_id,
+                });
+            };
+            if lineage.last_terminal_request_id != request_id {
+                return Err(CatalogError::CurationPredecessorUnavailable {
+                    source_id: source_id.clone(),
+                    request_id,
+                });
+            }
+            Ok((Some(revision), revision))
+        }
+    }
+}
+
+fn publish_operation_outcome(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    request_id: u64,
+    outcome: SourceCurationOperationOutcome,
+    reservation: &mut EventReservation<'_>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let success_revision = outcome
+        .is_success()
+        .then(|| outcome.final_revision())
+        .flatten();
+    if let Some(source) = sources.get_mut(&source_id)
+        && source.lifecycle_generation == lifecycle_generation
+    {
+        source.curation_lineage = Some(super::CurationLineage {
+            last_terminal_request_id: request_id,
+            last_success_revision: success_revision,
+        });
+    }
+    reservation.publish(CatalogEvent::CurationOperationCompleted {
+        source_id,
+        lifecycle_generation,
+        request_id,
+        outcome,
+    });
 }
 
 fn execute_inner(

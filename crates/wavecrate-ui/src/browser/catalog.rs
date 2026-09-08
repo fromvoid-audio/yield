@@ -122,6 +122,7 @@ struct CatalogProjection {
     lifecycle_generation: u64,
     root: PathBuf,
     root_identity: RootIdentity,
+    directory_generation: u64,
     committed_revision: u64,
     entries: Vec<AudioFile>,
     tree: FolderTree,
@@ -284,6 +285,7 @@ impl Browser {
                 session.catalog_lifecycle_generation = None;
             }
         }
+        self.curation_state.prune_completed_except(None);
         self.catalog_pending_command = None;
         self.cancel_catalog_projection();
         if !self.catalog_pending_removes.is_empty() {
@@ -346,6 +348,7 @@ impl Browser {
                 self.catalog_pending_removes.clear();
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
+                self.curation_state.prune_completed_except(None);
                 return changed;
             }
             CatalogStatus::Ready => {}
@@ -410,12 +413,14 @@ impl Browser {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
             self.reset_catalog_metadata();
+            self.curation_state.prune_completed_except(None);
             return true;
         };
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
         self.cancel_catalog_projection();
         self.reset_catalog_metadata();
+        self.curation_state.prune_completed_except(None);
         self.catalog_activation = None;
         if activation.fallback_to_scan {
             self.scan_status = format!(
@@ -434,6 +439,12 @@ impl Browser {
         event: CatalogEvent,
         cx: &mut Context<Self>,
     ) -> bool {
+        if matches!(event, CatalogEvent::CurationOperationCompleted { .. }) {
+            // Compound outcomes belong to their source lifecycle even after the browser has
+            // switched to another source. Consume them before the active projection fence so a
+            // later receipt cannot be mistaken for a new source's metadata.
+            return self.apply_curation_event(&event, cx);
+        }
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
                 self.catalog_activation = None;
@@ -477,7 +488,9 @@ impl Browser {
             CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
                 self.apply_catalog_metadata_event(&event)
             }
-            CatalogEvent::CurationCommitted { .. } | CatalogEvent::CurationFailed { .. } => false,
+            CatalogEvent::CurationCommitted { .. }
+            | CatalogEvent::CurationFailed { .. }
+            | CatalogEvent::CurationOperationCompleted { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
@@ -567,12 +580,23 @@ impl Browser {
             activation.audit_finished && activation.audit_error.is_none()
         });
         if audit_ready {
+            self.curation_state.install_projection(
+                super::curation::CurationLifecycleKey {
+                    source_id: projection.source_id.clone(),
+                    lifecycle_generation: projection.lifecycle_generation,
+                },
+                projection.root_identity.clone(),
+                projection.directory_generation,
+                projection.committed_revision,
+                &projection.entries,
+            );
             self.catalog_metadata
                 .install_projection(catalog_metadata::CatalogMetadataContext {
                     source_id: projection.source_id.clone(),
                     lifecycle_generation: projection.lifecycle_generation,
                     root: projection.root.clone(),
                     root_identity: projection.root_identity.clone(),
+                    directory_generation: projection.directory_generation,
                     revision: projection.committed_revision,
                     entry_indices: Arc::clone(&projection.entry_indices),
                 });
@@ -719,6 +743,11 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation,
             ..
         } => Some((source_id.clone(), *lifecycle_generation)),
+        CatalogEvent::CurationOperationCompleted {
+            source_id,
+            lifecycle_generation,
+            ..
+        } => Some((source_id.clone(), *lifecycle_generation)),
         CatalogEvent::Failed {
             source_id: Some(source_id),
             lifecycle_generation: Some(lifecycle_generation),
@@ -745,6 +774,7 @@ fn project_catalog_event(
     let source_id = snapshot.source_id;
     let lifecycle_generation = snapshot.lifecycle_generation;
     let root_identity = snapshot.root_identity;
+    let directory_generation = snapshot.directory_generation;
     let committed_revision = snapshot.committed_revision;
     let manifest = snapshot.manifest;
     let directories = snapshot.directories;
@@ -810,6 +840,7 @@ fn project_catalog_event(
         lifecycle_generation,
         root,
         root_identity,
+        directory_generation,
         committed_revision,
         entries,
         tree,
@@ -907,7 +938,9 @@ pub(super) fn is_catalog_busy(browser: &Browser) -> bool {
 }
 
 pub(super) fn catalog_poll_needed(browser: &Browser) -> bool {
-    is_catalog_busy(browser) || browser.catalog_metadata.poll_needed()
+    is_catalog_busy(browser)
+        || browser.catalog_metadata.poll_needed()
+        || browser.curation_state.has_pending_outcomes()
 }
 
 #[cfg(test)]
@@ -1166,6 +1199,7 @@ mod tests {
                 wavecrate_library::sample_sources::reconciliation::RootIdentity::from_bytes(
                     b"root".to_vec(),
                 ),
+            directory_generation: 1,
             committed_revision: 1,
             entries: vec![AudioFile {
                 path: id.path().to_path_buf(),

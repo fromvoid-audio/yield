@@ -377,6 +377,7 @@ impl Render for Browser {
         } else {
             self.scan_status.clone()
         };
+        let curation_status = self.active_curation_status();
         let selected_count = self.selected_count_label();
         let metadata_status = self.catalog_metadata.status_label();
         let extension_width = theme.spacing.extension_column_width;
@@ -954,6 +955,9 @@ impl Render for Browser {
                     })
                     .child(list_status)
                     .child(self.source_registry_status.clone())
+                    .when(curation_status.is_some(), move |element| {
+                        element.child(curation_status.clone().unwrap_or_default())
+                    })
                     .when(metadata_status.is_some(), move |element| {
                         element.child(metadata_status.clone().unwrap_or_default())
                     })

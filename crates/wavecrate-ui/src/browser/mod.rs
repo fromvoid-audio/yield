@@ -277,6 +277,7 @@ pub(crate) struct Browser {
     catalog_projection_task: Option<Task<()>>,
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
     catalog_metadata: catalog_metadata::CatalogMetadataState,
+    curation_state: curation::CurationState,
     collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
@@ -417,6 +418,7 @@ impl Browser {
             catalog_projection_task: None,
             catalog_projection_cancel: None,
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
+            curation_state: curation::CurationState::default(),
             collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
@@ -1628,6 +1630,16 @@ impl Browser {
             } else if !event.is_held || volume::is_keyboard_key(key) {
                 self.change_volume_from_key(key, shift, cx);
             }
+            return;
+        }
+        if !event.is_held
+            && !secondary
+            && !shift
+            && !alt
+            && !function
+            && curation::is_shortcut_key(key)
+            && self.handle_curation_shortcut(key, cx)
+        {
             return;
         }
         if self.waveform_focus_handle.is_focused(window)

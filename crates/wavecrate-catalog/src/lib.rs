@@ -154,7 +154,23 @@ pub const MAX_WAV_METADATA_REQUEST_PATHS: usize = 16;
 /// Maximum number of metadata updates admitted by one durable curation command.
 pub const MAX_CURATION_UPDATES: usize = curation::MAX_CURATION_UPDATES;
 
-pub use curation::CatalogCurationRequestError;
+/// Maximum number of library-sized batches admitted by one curation operation.
+pub const MAX_CURATION_OPERATION_BATCHES: usize = curation::MAX_CURATION_OPERATION_BATCHES;
+
+/// Maximum number of updates admitted by one curation operation.
+pub const MAX_CURATION_OPERATION_UPDATES: usize = curation::MAX_CURATION_OPERATION_UPDATES;
+
+/// Maximum aggregate source-relative path bytes admitted by one curation operation.
+pub const MAX_CURATION_OPERATION_PATH_BYTES: usize = curation::MAX_CURATION_OPERATION_PATH_BYTES;
+
+/// Maximum estimated curation operation payload retained across queued outcomes.
+pub const MAX_CURATION_OPERATION_RECEIPT_BYTES: usize =
+    curation::MAX_CURATION_OPERATION_RECEIPT_BYTES;
+
+pub use curation::{
+    CatalogCurationRequestError, SourceCurationOperationFailure, SourceCurationOperationFence,
+    SourceCurationOperationOutcome,
+};
 
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
@@ -211,6 +227,26 @@ pub enum CatalogCommand {
         request_id: u64,
         /// Bounded typed metadata updates.
         updates: Vec<SourceCurationUpdate>,
+    },
+    /// Apply a bounded sequence of durable, revision-fenced curation batches as one operation.
+    ///
+    /// Each inner batch is committed through the library's metadata-continuity transaction. The
+    /// worker executes batches in order without interleaving another command and emits exactly one
+    /// aggregate terminal event containing the committed prefix and, when needed, the failed batch.
+    /// An operation remains durable while the worker drains during shutdown.
+    ApplyCurationOperation {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that must still own the retained database.
+        lifecycle_generation: u64,
+        /// Exact revision or exact predecessor operation required before the first batch.
+        fence: SourceCurationOperationFence,
+        /// Physical source-root identity expected by every curation transaction.
+        root_identity: RootIdentity,
+        /// Monotonic caller-assigned operation identifier for this source lifecycle.
+        request_id: u64,
+        /// Bounded library-sized curation batches.
+        batches: Vec<Vec<SourceCurationUpdate>>,
     },
     /// Read the last coherent persisted snapshot for one source.
     ReadSnapshot {
@@ -323,6 +359,17 @@ pub enum CatalogError {
     /// The database has no complete authoritative catalog snapshot.
     #[error("catalog snapshot is unavailable until a complete audit commits")]
     SnapshotUnavailable,
+    /// A compound curation operation named a predecessor that is not the latest full success.
+    #[error("curation predecessor operation {request_id} is unavailable for {source_id}")]
+    CurationPredecessorUnavailable {
+        /// Source whose curation lineage was queried.
+        source_id: SourceId,
+        /// Predecessor operation identifier supplied by the caller.
+        request_id: u64,
+    },
+    /// A source revision could not advance because it reached the integer limit.
+    #[error("source revision cannot advance beyond {0}")]
+    CurationRevisionOverflow(u64),
     /// The directory-truth projection is not coherent with the manifest revision.
     #[error("catalog directory truth is unavailable or not revision-coherent: {0}")]
     DirectoryTruthUnavailable(String),
@@ -460,6 +507,17 @@ pub enum CatalogEvent {
         /// Typed failure.
         error: CatalogError,
     },
+    /// A bounded compound curation operation reached its one terminal outcome.
+    CurationOperationCompleted {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the operation.
+        lifecycle_generation: u64,
+        /// Caller-assigned operation identifier.
+        request_id: u64,
+        /// Committed prefix and optional failed batch detail.
+        outcome: SourceCurationOperationOutcome,
+    },
     /// One source was removed from the active worker projection.
     Removed {
         /// Stable source identifier.
@@ -489,18 +547,28 @@ struct RegisteredSource {
     known_root_identity: Option<RootIdentity>,
     snapshot: Option<CatalogSnapshot>,
     attempt_token: Option<Arc<AtomicBool>>,
+    curation_lineage: Option<CurationLineage>,
 }
 
 struct DesiredSource {
     lifecycle_generation: u64,
     active: bool,
     attempt_token: Option<Arc<AtomicBool>>,
+    last_curation_request_id: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct CurationLineage {
+    last_terminal_request_id: u64,
+    last_success_revision: Option<u64>,
 }
 
 struct AdmissionState {
     shutdown: bool,
     closed: bool,
     event_budget: usize,
+    curation_payload_bytes: usize,
+    curation_update_count: usize,
     sources: HashMap<SourceId, DesiredSource>,
 }
 
@@ -510,6 +578,8 @@ impl AdmissionState {
             shutdown: false,
             closed: false,
             event_budget: 1,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
             sources: HashMap::new(),
         }
     }
@@ -525,8 +595,14 @@ impl AdmissionState {
 }
 
 struct EventQueue {
-    events: VecDeque<CatalogEvent>,
+    events: VecDeque<QueuedEvent>,
     closed: bool,
+}
+
+struct QueuedEvent {
+    event: CatalogEvent,
+    curation_payload_bytes: usize,
+    curation_update_count: usize,
 }
 
 struct EventHub {
@@ -545,7 +621,12 @@ impl EventHub {
         }
     }
 
-    fn send(&self, event: CatalogEvent) -> bool {
+    fn send(
+        &self,
+        event: CatalogEvent,
+        curation_payload_bytes: usize,
+        curation_update_count: usize,
+    ) -> bool {
         let mut queue = self
             .queue
             .lock()
@@ -553,7 +634,11 @@ impl EventHub {
         if queue.events.len() >= EVENT_CAPACITY {
             return false;
         }
-        queue.events.push_back(event);
+        queue.events.push_back(QueuedEvent {
+            event,
+            curation_payload_bytes,
+            curation_update_count,
+        });
         self.wake.notify_one();
         true
     }
@@ -567,13 +652,17 @@ impl EventHub {
         self.wake.notify_all();
     }
 
-    fn try_recv(&self) -> Result<CatalogEvent, TryRecvError> {
+    fn try_recv(&self) -> Result<(CatalogEvent, usize, usize), TryRecvError> {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(event) = queue.events.pop_front() {
-            return Ok(event);
+            return Ok((
+                event.event,
+                event.curation_payload_bytes,
+                event.curation_update_count,
+            ));
         }
         if queue.closed {
             Err(TryRecvError::Disconnected)
@@ -582,13 +671,20 @@ impl EventHub {
         }
     }
 
-    fn recv_timeout(&self, timeout: Duration) -> Result<CatalogEvent, mpsc::RecvTimeoutError> {
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<(CatalogEvent, usize, usize), mpsc::RecvTimeoutError> {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(event) = queue.events.pop_front() {
-            return Ok(event);
+            return Ok((
+                event.event,
+                event.curation_payload_bytes,
+                event.curation_update_count,
+            ));
         }
         if queue.closed {
             return Err(mpsc::RecvTimeoutError::Disconnected);
@@ -598,7 +694,11 @@ impl EventHub {
             .wait_timeout(queue, timeout)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(event) = queue.events.pop_front() {
-            return Ok(event);
+            return Ok((
+                event.event,
+                event.curation_payload_bytes,
+                event.curation_update_count,
+            ));
         }
         if queue.closed {
             Err(mpsc::RecvTimeoutError::Disconnected)
@@ -615,19 +715,30 @@ struct EventReservation<'a> {
     hub: &'a EventHub,
     admission: &'a Arc<Mutex<AdmissionState>>,
     remaining: usize,
+    curation_payload_bytes: usize,
+    curation_update_count: usize,
 }
 
 impl EventReservation<'_> {
     fn publish(&mut self, event: CatalogEvent) {
         assert!(
-            self.hub.send(event),
+            self.hub.send(
+                event,
+                self.curation_payload_bytes,
+                self.curation_update_count,
+            ),
             "catalog event capacity accounting invariant violated"
         );
         self.remaining = self.remaining.saturating_sub(1);
+        self.curation_payload_bytes = 0;
+        self.curation_update_count = 0;
     }
 
     fn finish(self) {
-        if self.remaining == 0 {
+        if self.remaining == 0
+            && self.curation_payload_bytes == 0
+            && self.curation_update_count == 0
+        {
             return;
         }
         let mut state = self
@@ -635,6 +746,12 @@ impl EventReservation<'_> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.event_budget = state.event_budget.saturating_sub(self.remaining);
+        state.curation_payload_bytes = state
+            .curation_payload_bytes
+            .saturating_sub(self.curation_payload_bytes);
+        state.curation_update_count = state
+            .curation_update_count
+            .saturating_sub(self.curation_update_count);
     }
 }
 
@@ -674,9 +791,30 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::ApplyCuration { .. }
+        | CatalogCommand::ApplyCurationOperation { .. }
         | CatalogCommand::ReadSnapshot { .. }
         | CatalogCommand::Remove { .. }
         | CatalogCommand::Shutdown => 1,
+    }
+}
+
+fn command_curation_payload_bytes(command: &CatalogCommand) -> usize {
+    match command {
+        CatalogCommand::ApplyCurationOperation {
+            root_identity,
+            batches,
+            ..
+        } => curation::operation_payload_bytes(root_identity, batches),
+        _ => 0,
+    }
+}
+
+fn command_curation_update_count(command: &CatalogCommand) -> usize {
+    match command {
+        CatalogCommand::ApplyCurationOperation { batches, .. } => {
+            batches.iter().map(Vec::len).sum()
+        }
+        _ => 0,
     }
 }
 
@@ -689,6 +827,10 @@ enum AdmissionAction {
     RequestAudit,
     RequestWavMetadata,
     ApplyCuration,
+    ApplyCurationOperation {
+        source_id: SourceId,
+        request_id: u64,
+    },
     ReadSnapshot,
     Remove {
         source_id: SourceId,
@@ -710,6 +852,14 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestAudit { .. } => AdmissionAction::RequestAudit,
         CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
+        CatalogCommand::ApplyCurationOperation {
+            source_id,
+            request_id,
+            ..
+        } => AdmissionAction::ApplyCurationOperation {
+            source_id: source_id.clone(),
+            request_id: *request_id,
+        },
         CatalogCommand::ReadSnapshot { .. } => AdmissionAction::ReadSnapshot,
         CatalogCommand::Remove {
             source_id,
@@ -744,6 +894,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                         lifecycle_generation,
                         active: true,
                         attempt_token: None,
+                        last_curation_request_id: None,
                     },
                 );
             }
@@ -768,6 +919,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                         lifecycle_generation,
                         active: false,
                         attempt_token: None,
+                        last_curation_request_id: None,
                     },
                 );
             }
@@ -780,6 +932,14 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         | AdmissionAction::RequestWavMetadata
         | AdmissionAction::ApplyCuration
         | AdmissionAction::ReadSnapshot => {}
+        AdmissionAction::ApplyCurationOperation {
+            source_id,
+            request_id,
+        } => {
+            if let Some(source) = state.sources.get_mut(&source_id) {
+                source.last_curation_request_id = Some(request_id);
+            }
+        }
     }
 }
 
@@ -964,9 +1124,27 @@ impl CatalogService {
         if admission.event_budget.saturating_add(event_budget) > EVENT_CAPACITY {
             return Err(CatalogSubmitError::Full);
         }
+        let curation_payload_bytes = command_curation_payload_bytes(&command);
+        let curation_update_count = command_curation_update_count(&command);
+        if admission
+            .curation_update_count
+            .saturating_add(curation_update_count)
+            > MAX_CURATION_OPERATION_UPDATES
+        {
+            return Err(CatalogSubmitError::Full);
+        }
+        if admission
+            .curation_payload_bytes
+            .saturating_add(curation_payload_bytes)
+            > MAX_CURATION_OPERATION_RECEIPT_BYTES
+        {
+            return Err(CatalogSubmitError::Full);
+        }
         match self.commands.try_send(command) {
             Ok(()) => {
                 admission.event_budget += event_budget;
+                admission.curation_payload_bytes += curation_payload_bytes;
+                admission.curation_update_count += curation_update_count;
                 apply_admission_action(&mut admission, action);
                 Ok(())
             }
@@ -980,8 +1158,8 @@ impl CatalogService {
 
     /// Read the next worker event without blocking.
     pub fn try_recv_event(&self) -> Result<CatalogEvent, TryRecvError> {
-        let event = self.events.try_recv()?;
-        self.release_event_credit();
+        let (event, curation_payload_bytes, curation_update_count) = self.events.try_recv()?;
+        self.release_event_credit(curation_payload_bytes, curation_update_count);
         Ok(event)
     }
 
@@ -990,17 +1168,24 @@ impl CatalogService {
         &self,
         timeout: Duration,
     ) -> Result<CatalogEvent, mpsc::RecvTimeoutError> {
-        let event = self.events.recv_timeout(timeout)?;
-        self.release_event_credit();
+        let (event, curation_payload_bytes, curation_update_count) =
+            self.events.recv_timeout(timeout)?;
+        self.release_event_credit(curation_payload_bytes, curation_update_count);
         Ok(event)
     }
 
-    fn release_event_credit(&self) {
+    fn release_event_credit(&self, curation_payload_bytes: usize, curation_update_count: usize) {
         let mut admission = self
             .admission
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         admission.event_budget = admission.event_budget.saturating_sub(1);
+        admission.curation_payload_bytes = admission
+            .curation_payload_bytes
+            .saturating_sub(curation_payload_bytes);
+        admission.curation_update_count = admission
+            .curation_update_count
+            .saturating_sub(curation_update_count);
     }
 
     /// Request cancellation and synchronously join the worker.
@@ -1063,6 +1248,8 @@ fn run_worker(
             hub: &events,
             admission: &admission,
             remaining: reserved_events,
+            curation_payload_bytes: command_curation_payload_bytes(&command),
+            curation_update_count: command_curation_update_count(&command),
         };
         if closing && !curation::is_durable(&command) {
             reservation.finish();
@@ -1088,7 +1275,7 @@ fn run_worker(
         state.closed = true;
     }
     assert!(
-        events.send(CatalogEvent::Closed),
+        events.send(CatalogEvent::Closed, 0, 0),
         "catalog event capacity accounting invariant violated while closing"
     );
     events.close();
@@ -1167,6 +1354,27 @@ fn handle_command(
                 root_identity,
                 request_id,
                 updates,
+                profile_guard,
+                reservation,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::ApplyCurationOperation {
+            source_id,
+            lifecycle_generation,
+            fence,
+            root_identity,
+            request_id,
+            batches,
+        } => {
+            curation::execute_operation(
+                source_id,
+                lifecycle_generation,
+                fence,
+                root_identity,
+                request_id,
+                batches,
                 profile_guard,
                 reservation,
                 sources,
@@ -1306,6 +1514,7 @@ fn register_source(
         known_root_identity: None,
         snapshot: None,
         attempt_token: None,
+        curation_lineage: None,
     };
     if let Err(error) = maintain_catalog_database(&source.database, profile_guard, None, || {
         !publication_is_current(admission, &source_id, lifecycle_generation, None)
@@ -1406,6 +1615,11 @@ fn request_audit(
             error,
         );
         return;
+    }
+    if let Some(source) = sources.get_mut(&source_id) {
+        // An audit is an independent revision authority. A later compound command must not
+        // implicitly chain across it, even if this audit ultimately gets canceled or fails.
+        source.curation_lineage = None;
     }
     let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
         return;
@@ -2335,6 +2549,58 @@ mod tests {
         writer.finalize().expect("finalize test WAV");
     }
 
+    fn curation_operation(
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+        root_identity: &RootIdentity,
+        request_id: u64,
+        fence: SourceCurationOperationFence,
+        batches: Vec<Vec<SourceCurationUpdate>>,
+    ) -> CatalogCommand {
+        CatalogCommand::ApplyCurationOperation {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            fence,
+            root_identity: root_identity.clone(),
+            request_id,
+            batches,
+        }
+    }
+
+    fn receive_curation_operation(
+        service: &CatalogService,
+        request_id: u64,
+    ) -> SourceCurationOperationOutcome {
+        match receive_until(service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationOperationCompleted {
+                    request_id: received,
+                    ..
+                } if *received == request_id
+            )
+        }) {
+            CatalogEvent::CurationOperationCompleted { outcome, .. } => outcome,
+            _ => unreachable!(),
+        }
+    }
+
+    fn repeated_rating_batches(
+        update_count: usize,
+        path: &RootRelativePath,
+    ) -> Vec<Vec<SourceCurationUpdate>> {
+        let updates = (0..update_count)
+            .map(|_| SourceCurationUpdate::SetRating {
+                path: path.clone(),
+                rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+            })
+            .collect::<Vec<_>>();
+        updates
+            .chunks(MAX_CURATION_UPDATES)
+            .map(|batch| batch.to_vec())
+            .collect()
+    }
+
     #[test]
     fn bounded_metadata_request_publishes_exact_patch_with_terminal_paths() {
         let fixture = Fixture::new("catalog-wav-metadata-patch");
@@ -2568,6 +2834,7 @@ mod tests {
                 lifecycle_generation: 1,
                 active: true,
                 attempt_token: Some(Arc::clone(&token)),
+                last_curation_request_id: None,
             },
         );
         let source = RegisteredSource {
@@ -2587,6 +2854,7 @@ mod tests {
                 curation_metadata: BTreeMap::new(),
             }),
             attempt_token: Some(Arc::clone(&token)),
+            curation_lineage: None,
         };
 
         assert!(matches!(
@@ -3123,6 +3391,7 @@ mod tests {
                 lifecycle_generation: 1,
                 active: true,
                 attempt_token: None,
+                last_curation_request_id: None,
             },
         );
         let predicate_admission = Arc::clone(&admission);
@@ -3235,6 +3504,7 @@ mod tests {
                     lifecycle_generation: 1,
                     active: true,
                     attempt_token: Some(Arc::clone(&token)),
+                    last_curation_request_id: None,
                 },
             );
         }
@@ -3852,6 +4122,839 @@ mod tests {
         assert_eq!(
             database.get_revision().expect("committed source revision"),
             snapshot.committed_revision + COMMAND_CAPACITY as u64
+        );
+    }
+
+    #[test]
+    fn curation_operation_commits_serial_batches_and_chains_only_after_full_success() {
+        let fixture = Fixture::new("catalog-curation-operation-chain");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-operation-chain");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let collection =
+            wavecrate_library::sample_sources::SampleCollection::new(0).expect("collection slot");
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                800,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![
+                    vec![SourceCurationUpdate::SetRating {
+                        path: path.clone(),
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                    }],
+                    vec![
+                        SourceCurationUpdate::SetLocked {
+                            path: path.clone(),
+                            locked: true,
+                        },
+                        SourceCurationUpdate::AddCollection { path, collection },
+                    ],
+                ],
+            ))
+            .expect("compound curation admission");
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationOperationCompleted {
+                    request_id: 800,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::CurationOperationCompleted { outcome, .. } = event else {
+            unreachable!();
+        };
+        assert!(outcome.is_success());
+        assert_eq!(
+            outcome.initial_revision(),
+            Some(snapshot.committed_revision)
+        );
+        assert_eq!(
+            outcome.final_revision(),
+            Some(snapshot.committed_revision + 2)
+        );
+        assert_eq!(outcome.committed_batches().len(), 2);
+        assert_eq!(
+            outcome.committed_batches()[0].source_revision(),
+            snapshot.committed_revision + 1
+        );
+        assert_eq!(
+            outcome.committed_batches()[1].source_revision(),
+            snapshot.committed_revision + 2
+        );
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                801,
+                SourceCurationOperationFence::AfterOperation { request_id: 800 },
+                vec![vec![SourceCurationUpdate::RemoveCollection {
+                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                        .expect("relative curation path"),
+                    collection,
+                }]],
+            ))
+            .expect("successor curation admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationOperationCompleted {
+                    request_id: 801,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::CurationOperationCompleted { outcome, .. } = event else {
+            unreachable!();
+        };
+        assert!(outcome.is_success());
+        assert_eq!(
+            outcome.initial_revision(),
+            Some(snapshot.committed_revision + 2)
+        );
+        assert_eq!(
+            outcome.final_revision(),
+            Some(snapshot.committed_revision + 3)
+        );
+        assert_eq!(outcome.committed_batches().len(), 1);
+        assert!(outcome.committed_batches()[0].files()[0].locked);
+        assert!(
+            outcome.committed_batches()[0].files()[0]
+                .collections
+                .is_empty()
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_fifo_chain_survives_before_any_event_is_drained() {
+        let fixture = Fixture::new("catalog-curation-operation-fifo");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-operation-fifo");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let pause = test_gate.pause_next();
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_100,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path: path.clone(),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }]],
+            ))
+            .expect("first operation admission");
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_101,
+                SourceCurationOperationFence::AfterOperation { request_id: 1_100 },
+                vec![vec![SourceCurationUpdate::SetLocked { path, locked: true }]],
+            ))
+            .expect("successor operation admission");
+        pause.release();
+
+        let first = receive_curation_operation(&service, 1_100);
+        assert!(first.is_success());
+        assert_eq!(first.initial_revision(), Some(snapshot.committed_revision));
+        assert_eq!(
+            first.final_revision(),
+            Some(snapshot.committed_revision + 1)
+        );
+        let second = receive_curation_operation(&service, 1_101);
+        assert!(second.is_success());
+        assert_eq!(
+            second.initial_revision(),
+            Some(snapshot.committed_revision + 1)
+        );
+        assert_eq!(
+            second.final_revision(),
+            Some(snapshot.committed_revision + 2)
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_partial_failure_breaks_successor_chain_without_rebasing() {
+        let fixture = Fixture::new("catalog-curation-operation-partial");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-operation-partial");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let valid_path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                900,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![
+                    vec![SourceCurationUpdate::SetRating {
+                        path: valid_path.clone(),
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                    }],
+                    vec![SourceCurationUpdate::SetRating {
+                        path: RootRelativePath::try_from_path(PathBuf::from("missing.wav"))
+                            .expect("relative missing path"),
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                    }],
+                ],
+            ))
+            .expect("partial operation admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationOperationCompleted {
+                    request_id: 900,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::CurationOperationCompleted { outcome, .. } = event else {
+            unreachable!();
+        };
+        assert!(!outcome.is_success());
+        assert_eq!(
+            outcome.initial_revision(),
+            Some(snapshot.committed_revision)
+        );
+        assert_eq!(
+            outcome.final_revision(),
+            Some(snapshot.committed_revision + 1)
+        );
+        assert_eq!(outcome.committed_batches().len(), 1);
+        assert_eq!(outcome.failure().expect("failed batch").batch_index(), 1);
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                901,
+                SourceCurationOperationFence::AfterOperation { request_id: 900 },
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path: valid_path,
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                }]],
+            ))
+            .expect("successor admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationOperationCompleted {
+                    request_id: 901,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::CurationOperationCompleted { outcome, .. } = event else {
+            unreachable!();
+        };
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.initial_revision(), None);
+        assert_eq!(outcome.final_revision(), None);
+        assert!(outcome.committed_batches().is_empty());
+        assert!(matches!(
+            outcome.failure().expect("predecessor failure").error(),
+            CatalogError::CurationPredecessorUnavailable {
+                request_id: 900,
+                ..
+            }
+        ));
+
+        let expected_prefix_revision = snapshot.committed_revision + 1;
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id,
+                expected_revision: Some(expected_prefix_revision),
+            })
+            .expect("read committed prefix");
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let CatalogEvent::SnapshotReady { snapshot } = event else {
+            unreachable!();
+        };
+        assert_eq!(snapshot.committed_revision, expected_prefix_revision);
+        assert_eq!(
+            snapshot
+                .curation_metadata
+                .get(Path::new("one.wav"))
+                .expect("prefix metadata")
+                .rating
+                .val(),
+            1
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_rejects_nonlatest_and_unrelated_revision_without_rebasing() {
+        let fixture = Fixture::new("catalog-curation-operation-fences");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-operation-fences");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_100,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path: path.clone(),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }]],
+            ))
+            .expect("first operation admission");
+        assert!(receive_curation_operation(&service, 1_100).is_success());
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_101,
+                SourceCurationOperationFence::AfterOperation { request_id: 1_100 },
+                vec![vec![SourceCurationUpdate::SetLocked {
+                    path: path.clone(),
+                    locked: true,
+                }]],
+            ))
+            .expect("second operation admission");
+        assert!(receive_curation_operation(&service, 1_101).is_success());
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_102,
+                SourceCurationOperationFence::AfterOperation { request_id: 1_100 },
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path: path.clone(),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                }]],
+            ))
+            .expect("nonlatest predecessor admission");
+        let nonlatest = receive_curation_operation(&service, 1_102);
+        assert!(!nonlatest.is_success());
+        assert!(nonlatest.committed_batches().is_empty());
+        assert_eq!(nonlatest.initial_revision(), None);
+        assert!(matches!(
+            nonlatest.failure().expect("nonlatest failure").error(),
+            CatalogError::CurationPredecessorUnavailable {
+                request_id: 1_100,
+                ..
+            }
+        ));
+
+        let second_revision = snapshot.committed_revision + 2;
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_103,
+                SourceCurationOperationFence::ExactRevision(second_revision),
+                vec![vec![SourceCurationUpdate::SetLocked {
+                    path: path.clone(),
+                    locked: false,
+                }]],
+            ))
+            .expect("new exact operation admission");
+        assert!(receive_curation_operation(&service, 1_103).is_success());
+
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision + 3,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 1_104,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path: path.clone(),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                }],
+            })
+            .expect("unrelated curation admission");
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::CurationCommitted {
+                        request_id: 1_104,
+                        ..
+                    }
+                )
+            }),
+            CatalogEvent::CurationCommitted { .. }
+        ));
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_105,
+                SourceCurationOperationFence::AfterOperation { request_id: 1_103 },
+                vec![vec![SourceCurationUpdate::SetLocked {
+                    path: path.clone(),
+                    locked: true,
+                }]],
+            ))
+            .expect("post-independent-writer admission");
+        let after_unrelated = receive_curation_operation(&service, 1_105);
+        assert!(!after_unrelated.is_success());
+        assert!(after_unrelated.committed_batches().is_empty());
+        assert!(matches!(
+            after_unrelated
+                .failure()
+                .expect("independent writer failure")
+                .error(),
+            CatalogError::CurationPredecessorUnavailable {
+                request_id: 1_103,
+                ..
+            }
+        ));
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                1_106,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path,
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }]],
+            ))
+            .expect("stale exact operation admission");
+        let stale = receive_curation_operation(&service, 1_106);
+        assert!(!stale.is_success());
+        assert_eq!(stale.initial_revision(), Some(snapshot.committed_revision));
+        assert_eq!(stale.final_revision(), Some(snapshot.committed_revision));
+        assert!(stale.committed_batches().is_empty());
+        assert_eq!(
+            stale.failure().expect("stale exact failure").batch_index(),
+            0
+        );
+        assert!(matches!(
+            stale.failure().expect("stale exact failure").error(),
+            CatalogError::StaleRevision {
+                expected,
+                actual
+            } if *expected == snapshot.committed_revision
+                && *actual == snapshot.committed_revision + 4
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_lifecycle_replacement_fails_without_rebasing() {
+        let fixture = Fixture::new("catalog-curation-operation-replacement");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let replacement_root = tempfile::tempdir().expect("replacement source root");
+        let source_id = SourceId::from_string("source-curation-operation-replacement");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: replacement_root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("replacement registration admission");
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::Registered {
+                        source_id: registered,
+                        lifecycle_generation: 2,
+                    } if registered == &source_id
+                )
+            }),
+            CatalogEvent::Registered {
+                lifecycle_generation: 2,
+                ..
+            }
+        ));
+
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        service
+            .submit(curation_operation(
+                &source_id,
+                2,
+                &snapshot.root_identity,
+                1_200,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path,
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                }]],
+            ))
+            .expect("replacement operation admission");
+        let outcome = receive_curation_operation(&service, 1_200);
+        assert!(!outcome.is_success());
+        assert_eq!(
+            outcome.initial_revision(),
+            Some(snapshot.committed_revision)
+        );
+        assert_eq!(outcome.final_revision(), Some(snapshot.committed_revision));
+        assert!(outcome.committed_batches().is_empty());
+        assert!(matches!(
+            outcome.failure().expect("replacement failure").error(),
+            CatalogError::SnapshotUnavailable
+        ));
+        service.shutdown();
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen replacement database");
+        assert_eq!(
+            database.get_revision().expect("replacement revision"),
+            snapshot.committed_revision
+        );
+    }
+
+    #[test]
+    fn curation_operation_admission_is_bounded_and_payload_credit_is_released() {
+        let fixture = Fixture::new("catalog-curation-operation-admission");
+        let source_id = SourceId::from_string("source-curation-operation-admission");
+        let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let update = SourceCurationUpdate::SetRating {
+            path,
+            rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+        };
+        assert!(matches!(
+            service.submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1,
+                SourceCurationOperationFence::ExactRevision(0),
+                Vec::new(),
+            )),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::Empty
+            ))
+        ));
+        let too_many_batches = (0..=MAX_CURATION_OPERATION_BATCHES)
+            .map(|_| vec![update.clone()])
+            .collect();
+        assert!(matches!(
+            service.submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                2,
+                SourceCurationOperationFence::ExactRevision(0),
+                too_many_batches,
+            )),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::TooManyOperationBatches { .. }
+            ))
+        ));
+
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register admission");
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                3,
+                SourceCurationOperationFence::ExactRevision(0),
+                vec![vec![update]],
+            ))
+            .expect("bounded operation admission");
+        assert!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_payload_bytes
+                > 0
+        );
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_update_count,
+            1
+        );
+        pause.release();
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::CurationOperationCompleted { request_id: 3, .. }
+                )
+            }),
+            CatalogEvent::CurationOperationCompleted { .. }
+        ));
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_payload_bytes,
+            0
+        );
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_update_count,
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_operation_aggregate_quotas_release_after_multiple_operations() {
+        let fixture = Fixture::new("catalog-curation-operation-aggregate-quotas");
+        let source_id = SourceId::from_string("source-curation-operation-aggregate-quotas");
+        let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let short_path =
+            RootRelativePath::try_from_path(PathBuf::from("one.wav")).expect("short curation path");
+        let half_update_batches =
+            repeated_rating_batches(MAX_CURATION_OPERATION_UPDATES / 2, &short_path);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register admission");
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1_200,
+                SourceCurationOperationFence::ExactRevision(0),
+                half_update_batches.clone(),
+            ))
+            .expect("first aggregate update operation admission");
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1_201,
+                SourceCurationOperationFence::ExactRevision(0),
+                half_update_batches,
+            ))
+            .expect("second aggregate update operation admission");
+        let one_update = vec![vec![SourceCurationUpdate::SetRating {
+            path: short_path.clone(),
+            rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+        }]];
+        assert_eq!(
+            service.submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1_202,
+                SourceCurationOperationFence::ExactRevision(0),
+                one_update,
+            )),
+            Err(CatalogSubmitError::Full)
+        );
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .curation_update_count,
+            MAX_CURATION_OPERATION_UPDATES
+        );
+        pause.release();
+
+        assert!(!receive_curation_operation(&service, 1_200).is_success());
+        assert!(!receive_curation_operation(&service, 1_201).is_success());
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(admission.curation_update_count, 0);
+            assert_eq!(admission.curation_payload_bytes, 0);
+        }
+
+        let long_path = RootRelativePath::try_from_path(PathBuf::from("x".repeat(512)))
+            .expect("long curation path");
+        let long_batches = repeated_rating_batches(MAX_CURATION_OPERATION_UPDATES / 4, &long_path);
+        let pause = test_gate.pause_next();
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1_300,
+                SourceCurationOperationFence::ExactRevision(0),
+                long_batches.clone(),
+            ))
+            .expect("first aggregate byte operation admission");
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert!(admission.curation_payload_bytes > MAX_CURATION_OPERATION_RECEIPT_BYTES / 2);
+            assert_eq!(
+                admission.curation_update_count,
+                MAX_CURATION_OPERATION_UPDATES / 4
+            );
+        }
+        assert_eq!(
+            service.submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1_301,
+                SourceCurationOperationFence::ExactRevision(0),
+                long_batches.clone(),
+            )),
+            Err(CatalogSubmitError::Full)
+        );
+        pause.release();
+        assert!(!receive_curation_operation(&service, 1_300).is_success());
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(admission.curation_update_count, 0);
+            assert_eq!(admission.curation_payload_bytes, 0);
+        }
+
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &root_identity,
+                1_301,
+                SourceCurationOperationFence::ExactRevision(0),
+                long_batches,
+            ))
+            .expect("aggregate byte operation re-admission");
+        assert!(!receive_curation_operation(&service, 1_301).is_success());
+        service.shutdown();
+        let mut saw_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            if matches!(event, CatalogEvent::Closed) {
+                saw_closed = true;
+            }
+        }
+        assert!(saw_closed);
+        let admission = service.admission.lock().expect("admission lock");
+        assert_eq!(admission.event_budget, 0);
+        assert_eq!(admission.curation_update_count, 0);
+        assert_eq!(admission.curation_payload_bytes, 0);
+    }
+
+    #[test]
+    fn shutdown_drains_admitted_curation_operation_before_closed() {
+        let fixture = Fixture::new("catalog-curation-operation-shutdown");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-operation-shutdown");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(curation_operation(
+                &source_id,
+                1,
+                &snapshot.root_identity,
+                950,
+                SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                vec![vec![SourceCurationUpdate::SetRating {
+                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                        .expect("relative curation path"),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                }]],
+            ))
+            .expect("operation admission");
+        let service = Arc::new(service);
+        let shutdown_service = Arc::clone(&service);
+        let shutdown_thread = thread::spawn(move || shutdown_service.shutdown());
+        while !admission_state(&service.admission, |state| state.shutdown) {
+            thread::yield_now();
+        }
+        pause.release();
+        shutdown_thread.join().expect("catalog shutdown");
+
+        let mut saw_operation = false;
+        let mut saw_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            match event {
+                CatalogEvent::CurationOperationCompleted {
+                    request_id: 950,
+                    outcome,
+                    ..
+                } => {
+                    assert!(!saw_closed);
+                    assert!(outcome.is_success());
+                    saw_operation = true;
+                }
+                CatalogEvent::Closed => {
+                    assert!(saw_operation);
+                    saw_closed = true;
+                }
+                event => panic!("unexpected shutdown event: {event:?}"),
+            }
+        }
+        assert!(saw_operation);
+        assert!(saw_closed);
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen committed source database");
+        assert_eq!(
+            database.get_revision().expect("committed source revision"),
+            snapshot.committed_revision + 1
         );
     }
 }

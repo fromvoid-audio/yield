@@ -908,3 +908,64 @@ and timestamps; persistence assigns the actual curation time. Invalid collection
 slots and no-op actions remain unchanged, while the negative threshold delegates
 to the filesystem transaction layer. All 48 core tests and the locked core check
 passed. Browser command admission and editing controls are the next integration.
+
+### Durable compound curation operations, 2026-09-08
+
+The catalog now admits a compound curation operation as one durable command.
+Each operation contains at most 512 batches of 128 updates, with a 65,536-update
+limit and bounded path/estimated payload accounting across queued commands and
+undrained outcomes. Each batch reuses the profile-guarded, exact-revision library
+transaction. Commands do not interleave between the operation's batches.
+
+An operation starts at an exact revision or the exact latest fully successful
+predecessor operation in the same source lifecycle. Predecessor state is retained
+independently of UI event draining. A failed or partially committed predecessor
+cannot authorize a successor. One terminal outcome retains every committed batch
+receipt and the failing batch/error. Its final revision is the last receipt's
+revision, or the initial fence when nothing committed; it is not a database
+readback on failure.
+
+Independent review found a remaining session receiver-lifetime edge case: a
+rejected submit after catalog shutdown discarded the retained service. That path
+now closes admission while preserving terminal event draining. The regression
+covers accepted compound work, admitted shutdown, rejected follow-up, outcome,
+Closed, and disconnection. Additional tests cover queued chains before event
+draining, aggregate quota exhaustion/release/readmission, partial failure,
+nonlatest predecessors, unrelated revisions, stale exact fences, and lifecycle
+replacement. All 41 catalog and 39 session tests passed, along with locked checks,
+formatting, and diff checks. Browser editing integration is validated separately.
+
+### Browser curation editing, 2026-09-08
+
+Plain bracket keys adjust selected ratings without advancing selection; keys 1–6
+toggle each selected file's collection membership independently. Commands are
+admitted immediately as durable catalog operations before optimistic metadata is
+shown. Rapid edits name their exact accepted predecessor, and rating/lock pairs
+stay together in a transaction when larger selections are split into batches.
+Rejected admission leaves visible metadata unchanged.
+
+Terminal outcomes are consumed before active-source filtering. Confirmed metadata
+and targeted pending patches preserve newer edits when earlier receipts arrive;
+failures retain committed prefixes, invalidate dependent overlays, and require a
+fresh audit before further editing. Superseded lifecycle state is pruned after
+pending outcomes drain. Lazy metadata has an explicit pause during writes and
+resumes at the committed revision. Per-key planning and patching avoid full-map
+copies, and unrelated metadata changes do not rebuild the sorted list. Quit drains
+and logs failed operation outcomes before releasing the service.
+
+Independent UI review found no meaningful issue. All 120 UI tests passed with one
+ignored, including 11 curation-focused tests; locked checks, formatting, diff
+checks, and the signed macOS build passed. Native checks on a separate disposable
+4,202-file profile verified four rapid positive steps reaching a keep lock,
+collection edits on locked rows, text-input shortcut isolation, two rapid toggles
+across 1,000 selected files, immediate quit and reopen, and immediate source
+switching. SQLite readback confirmed the expected ratings and membership counts.
+Editing within an active collection filter updated membership, focus, and counts
+without autoplay; lazy WAV metadata beyond the initial audit budget resumed after
+curation writes. The first quit test exited cleanly; the reopened test app was left
+available for user interaction.
+
+Unlock is represented in the core planner but awaits its reference context-menu
+control. Fourth-negative filesystem trash requests remain explicitly unavailable
+until file-transaction integration; the UI does not silently treat them as saved
+metadata edits. This does not complete full feature parity.
