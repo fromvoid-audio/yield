@@ -452,7 +452,8 @@ impl Render for Browser {
         let show_last_played = column_visibility.last_played;
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
-        let loop_enabled = self.playback_policy.enabled();
+        let loop_enabled = self.loop_toolbar_enabled();
+        let loop_label = self.loop_toolbar_label();
         if self.view_model.rows().is_empty()
             && let Some(context) = self.catalog_metadata.context()
         {
@@ -846,17 +847,7 @@ impl Render for Browser {
                             } else {
                                 theme.colors.text_muted
                             }))
-                            .child(if self.playing_path.is_some() {
-                                if loop_enabled {
-                                    "Loop next: On"
-                                } else {
-                                    "Loop next: Off"
-                                }
-                            } else if loop_enabled {
-                                "Loop On"
-                            } else {
-                                "Loop Off"
-                            }),
+                            .child(loop_label),
                     )
                     .child(
                         div()

@@ -258,7 +258,8 @@ pub(crate) struct Browser {
     autoplay_selection: bool,
     playback_history: PlaybackNavigationHistory,
     latest_playback_request_id: Option<PlaybackRequestId>,
-    pending_progress_poll: Option<(PlaybackRequestId, u64)>,
+    pending_loop_retarget: Option<transport::PendingLoopRetarget>,
+    pending_progress_poll: Option<transport::PendingProgressPoll>,
     playback_cursor_pending: Option<f32>,
     playback_cursor_sample: Option<transport::PlaybackCursorSample>,
     playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
@@ -404,6 +405,7 @@ impl Browser {
             autoplay_selection: true,
             playback_history: PlaybackNavigationHistory::default(),
             latest_playback_request_id: None,
+            pending_loop_retarget: None,
             pending_progress_poll: None,
             playback_cursor_pending: None,
             playback_cursor_sample: None,
@@ -1496,17 +1498,12 @@ impl Browser {
         cx.set_global(ActiveTheme::default());
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
         self.autoplay_selection = true;
+        let previous_loop_mode = self.playback_policy.enabled();
         self.playback_policy.reset(false);
+        let loop_mode_changed = previous_loop_mode != self.playback_policy.enabled();
         self.apply_preference_volume(volume::DEFAULT_VOLUME);
-        if let Some(intent) = self.playback_init_intent.as_mut()
-            && intent.origin != transport::PlaybackIntentOrigin::AudioOutputResume
-        {
-            intent.looped = self.playback_policy.enabled();
-        }
-        if let Some(intent) = self.audio_output_resume.as_mut()
-            && intent.origin != transport::PlaybackIntentOrigin::AudioOutputResume
-        {
-            intent.looped = self.playback_policy.enabled();
+        if loop_mode_changed {
+            self.apply_loop_mode_change(self.playback_policy.enabled(), cx);
         }
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));

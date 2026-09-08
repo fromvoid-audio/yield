@@ -86,9 +86,10 @@ The normal browser, audition, and waveform previews support WAV files. Waveforms
 cover the full file with cancellable, bounded-memory decoding, zoom and pan,
 play-region selection, and a playback cursor. Play regions can be moved, resized,
 or shifted with the keyboard. Playback navigation history, native file clipboard
-handoff, and Finder reveal are available. Loop changes currently apply to the
-next play. Loop and one-shot tags select that mode automatically; a manual choice
-remains in effect for the loaded file.
+handoff, and Finder reveal are available. Loop changes apply to active playback
+with runtime identity checks and retain the accepted audition span. Loop and
+one-shot tags select the next-play mode automatically; a manual choice remains
+in effect for the loaded file.
 
 Full parity is not complete. Remaining workflows include tag editing and naming,
 physical file operations and recovery, waveform editing/export, analysis and

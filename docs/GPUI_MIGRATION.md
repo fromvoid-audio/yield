@@ -1217,3 +1217,30 @@ transport-state integration; native interaction acceptance remains pending.
 Independent review found no correctness, atomicity, or admission-accounting
 defect. Two additional focused tests passed for duplicate/absent-tag timestamp
 semantics and compound tag-operation payload credit release at terminal receipt.
+
+### Live loop switching and progress recovery
+
+The loop control now submits guarded updates to active playback, retaining its
+accepted span and using runtime position without a new audition/history entry.
+The toolbar distinguishes confirmed, pending, and next-play modes. Repeated
+clicks alternate pending intent; after failure, a click acts on the confirmed
+mode so retry does not require toggling an invisible preference first.
+
+A bounded pending record is fenced by play identity, epoch, output generation,
+and path. A later authoritative poll can confirm an update whose acknowledgement
+was dropped. The existing 80 ms monitor expires lost polls after 400 ms; no new
+render timer was added. Output reconfiguration preserves a matching admitted
+mode and span, and ordinary progress reconciles actual mode after failed rapid
+toggles. Unchanged loop progress retains the original accepted seek offset.
+
+Review corrected stale error handling and identity-less fallback: another play's
+error cannot clear the current play, while a current poll without an accepted
+identity settles unconfirmed playback even if old executor audio remains active.
+Independent re-review found no remaining findings.
+
+Validation: the full UI suite passed with 154 tests and one ignored test. After
+final review corrections, all 30 focused transport tests passed, covering rapid
+opposing toggles, admission failure, stale responses, dropped acknowledgements,
+resume snapshots, poll timeout, error fallback, and preserved spans/offsets. UI
+compilation and formatting passed. Native audible/interaction acceptance remains
+pending; running instances and existing application bundles were preserved.

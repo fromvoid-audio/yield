@@ -12,18 +12,55 @@ use gpui::Context;
 use reson::{
     PlaybackRequestId, PlaybackRuntimeEvent, PlaybackRuntimeMode, PlaybackRuntimeProgress,
     PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest, PlaybackRuntimeSource,
-    PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy,
+    PlaybackRuntimeSpanUpdate, PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy,
 };
 use wavecrate_core::AudioFile;
 use wavecrate_core::PlaybackLoopPolicy;
 
 const PLAYBACK_MONITOR_INTERVAL: Duration = Duration::from_millis(80);
 const PLAYBACK_CURSOR_MAX_INTERPOLATION: Duration = PLAYBACK_MONITOR_INTERVAL;
+const PLAYBACK_PROGRESS_POLL_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// One authoritative normalized playback sample retained by the browser cursor.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PlaybackCursorSample {
     pub(super) ratio: f32,
+}
+
+/// One admitted live loop-mode change awaiting an authoritative runtime snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PendingLoopRetarget {
+    pub(super) retarget_id: u64,
+    pub(super) accepted_playback_id: u64,
+    pub(super) playback_epoch: u64,
+    pub(super) output_open_generation: u64,
+    pub(super) path: std::path::PathBuf,
+    pub(super) desired_looped: bool,
+    pub(super) span: WaveformPlayRegion,
+}
+
+/// The one progress poll admitted by the browser monitor at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingProgressPoll {
+    pub(super) request_id: u64,
+    pub(super) playback_epoch: u64,
+    pub(super) sent_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopRetargetProgressOutcome {
+    Ignored,
+    Failed,
+    Inactive,
+    Confirmed { desired_matches: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackProgressDisposition {
+    Current,
+    Stale,
+    TerminalWithoutIdentity,
+    Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +133,12 @@ impl Browser {
                             view.playing_path.clone(),
                             view.playback_status.clone(),
                             view.playback_cursor_sample.map(|sample| sample.ratio),
+                            view.pending_loop_retarget
+                                .as_ref()
+                                .map(|pending| (pending.retarget_id, pending.desired_looped)),
+                            view.accepted_playback_intent
+                                .as_ref()
+                                .map(|intent| intent.looped),
                         );
                         view.poll_playback_events();
                         let changed = before
@@ -103,6 +146,12 @@ impl Browser {
                                 view.playing_path.clone(),
                                 view.playback_status.clone(),
                                 view.playback_cursor_sample.map(|sample| sample.ratio),
+                                view.pending_loop_retarget
+                                    .as_ref()
+                                    .map(|pending| (pending.retarget_id, pending.desired_looped)),
+                                view.accepted_playback_intent
+                                    .as_ref()
+                                    .map(|intent| intent.looped),
                             );
                         if changed {
                             cx.notify();
@@ -122,7 +171,9 @@ impl Browser {
     }
 
     fn playback_monitor_has_work(&self) -> bool {
-        self.playing_path.is_some() || self.pending_progress_poll.is_some()
+        self.playing_path.is_some()
+            || self.pending_progress_poll.is_some()
+            || self.pending_loop_retarget.is_some()
     }
 
     /// Return the preview-relative cursor ratio for the current playback sample.
@@ -250,41 +301,160 @@ impl Browser {
             self.mark_preferences_edit_blocked(cx);
             return;
         }
-        let enabled = !self.playback_policy.enabled();
+        let enabled = next_loop_toggle_target(
+            self.playing_path.is_some(),
+            self.playback_policy.enabled(),
+            self.accepted_playback_intent
+                .as_ref()
+                .map(|intent| intent.looped),
+            self.pending_loop_retarget
+                .as_ref()
+                .map(|pending| pending.desired_looped),
+        );
         if !self.persist_loop_preference(enabled, cx) {
             return;
         }
         self.playback_policy.set_manual(enabled);
+        self.apply_loop_mode_change(enabled, cx);
+        cx.notify();
+    }
+
+    /// Apply a changed loop choice to pending playback and, when possible, the accepted play.
+    pub(super) fn apply_loop_mode_change(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if let Some(intent) = self.playback_init_intent.as_mut()
             && intent.origin != PlaybackIntentOrigin::AudioOutputResume
         {
-            intent.looped = self.playback_policy.enabled();
+            intent.looped = enabled;
         }
         if let Some(intent) = self.audio_output_resume.as_mut()
             && intent.origin != PlaybackIntentOrigin::AudioOutputResume
         {
-            intent.looped = self.playback_policy.enabled();
+            intent.looped = enabled;
         }
-        self.playback_status = if self.playing_path.is_some() {
-            format!(
-                "Loop {} — applies on next play",
-                if self.playback_policy.enabled() {
-                    "enabled"
+
+        match self.submit_live_loop_retarget(enabled, cx) {
+            Some(Ok(())) => {
+                self.playback_status = format!(
+                    "Loop {} · applying to playback",
+                    loop_mode_status_word(enabled)
+                );
+            }
+            Some(Err(error)) => {
+                self.playback_status = format!(
+                    "Loop {} · live update unavailable: {error}",
+                    loop_mode_status_word(enabled)
+                );
+            }
+            None => {
+                self.playback_status = if self.playing_path.is_some() {
+                    format!(
+                        "Loop {} — applies on next play",
+                        if enabled { "enabled" } else { "disabled" }
+                    )
                 } else {
-                    "disabled"
-                }
-            )
-        } else {
-            format!(
-                "Loop {}",
-                if self.playback_policy.enabled() {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            )
+                    format!("Loop {}", if enabled { "enabled" } else { "disabled" })
+                };
+            }
+        }
+    }
+
+    fn submit_live_loop_retarget(
+        &mut self,
+        desired_looped: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        let accepted_playback_id = self.latest_playback_request_id?;
+        let path = self.playing_path.clone()?;
+        let accepted = self.accepted_playback_intent.as_ref()?;
+        if accepted.path != path {
+            return None;
+        }
+        let span = playback_span_for_intent(accepted)
+            .ok_or_else(|| String::from("accepted playback span is unavailable"));
+        let span = match span {
+            Ok(span) => span,
+            Err(error) => return Some(Err(error)),
         };
-        cx.notify();
+        let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
+            return Some(Err(String::from("audio runtime is unavailable")));
+        };
+        let update = PlaybackRuntimeSpanUpdate {
+            start: span.start,
+            end: span.end,
+            offset: span.start,
+            seek_to_offset: false,
+            looped: desired_looped,
+            playback_gain: 1.0,
+            playback_gain_normalization: None,
+            metronome: None,
+        };
+        match handle.try_retarget_active_span(accepted_playback_id, update) {
+            Ok(retarget_id) => {
+                admit_loop_retarget(
+                    &mut self.pending_loop_retarget,
+                    PendingLoopRetarget {
+                        retarget_id: retarget_id.get(),
+                        accepted_playback_id: accepted_playback_id.get(),
+                        playback_epoch: self.playback_epoch,
+                        output_open_generation: self.audio_output_open_generation,
+                        path,
+                        desired_looped,
+                        span,
+                    },
+                );
+                self.ensure_playback_monitor(cx);
+                Some(Ok(()))
+            }
+            Err(error) => {
+                let accepted_path = self
+                    .accepted_playback_intent
+                    .as_ref()
+                    .map(|intent| intent.path.as_path());
+                retain_pending_loop_retarget_after_failed_admission(
+                    &mut self.pending_loop_retarget,
+                    self.latest_playback_request_id.map(PlaybackRequestId::get),
+                    self.playback_epoch,
+                    self.audio_output_open_generation,
+                    self.playing_path.as_deref(),
+                    accepted_path,
+                );
+                Some(Err(format!("{error:?}")))
+            }
+        }
+    }
+
+    pub(super) fn loop_toolbar_enabled(&self) -> bool {
+        if self.playing_path.is_some() {
+            self.accepted_playback_intent
+                .as_ref()
+                .map(|intent| intent.looped)
+                .unwrap_or_else(|| self.playback_policy.enabled())
+        } else {
+            self.playback_policy.enabled()
+        }
+    }
+
+    pub(super) fn loop_toolbar_label(&self) -> String {
+        let next = self.playback_policy.enabled();
+        if self.playing_path.is_none() {
+            return format!("Loop {}", loop_mode_toolbar_word(next));
+        }
+        let confirmed = self.loop_toolbar_enabled();
+        if let Some(pending) = self.pending_loop_retarget.as_ref() {
+            return format!(
+                "Loop {} → {}",
+                loop_mode_toolbar_word(confirmed),
+                loop_mode_toolbar_word(pending.desired_looped)
+            );
+        }
+        if confirmed != next {
+            return format!(
+                "Loop {} · next {}",
+                loop_mode_toolbar_word(confirmed),
+                loop_mode_toolbar_word(next)
+            );
+        }
+        format!("Loop {}", loop_mode_toolbar_word(confirmed))
     }
 
     fn selected_playback_intent(
@@ -439,6 +609,7 @@ impl Browser {
             metronome: None,
         };
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
+        self.pending_loop_retarget = None;
         self.pending_progress_poll = None;
         self.playback_cursor_sample = None;
         self.playback_cursor_interpolation = None;
@@ -462,6 +633,7 @@ impl Browser {
                 self.ensure_playback_monitor(cx);
             }
             Err(error) => {
+                self.pending_loop_retarget = None;
                 self.latest_playback_request_id = None;
                 self.playing_path = None;
                 self.accepted_playback_intent = None;
@@ -476,6 +648,7 @@ impl Browser {
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.playback_monitor_generation = self.playback_monitor_generation.wrapping_add(1);
         self.playback_monitor_running = false;
+        self.pending_loop_retarget = None;
         self.pending_progress_poll = None;
         self.playback_init_intent = None;
         self.playback_waiting_for_preferences = false;
@@ -496,6 +669,13 @@ impl Browser {
     }
 
     fn poll_playback_events(&mut self) {
+        let now = Instant::now();
+        if self
+            .pending_progress_poll
+            .is_some_and(|pending| progress_poll_has_expired(pending, now))
+        {
+            self.pending_progress_poll = None;
+        }
         let events = self
             .playback
             .as_ref()
@@ -507,42 +687,26 @@ impl Browser {
                     if playback_request_is_current(self.latest_playback_request_id, started.id) =>
                 {
                     self.set_playback_cursor_start(&started);
-                    self.playback_status = "Playing".to_string();
-                }
-                PlaybackRuntimeEvent::Progress { id, progress }
-                    if progress_poll_is_current(
-                        self.pending_progress_poll,
-                        id,
-                        self.playback_epoch,
-                    ) =>
-                {
-                    self.pending_progress_poll = None;
-                    if let Some(error) = progress.error {
-                        self.clear_playback_cursor();
-                        self.latest_playback_request_id = None;
-                        self.playing_path = None;
-                        self.accepted_playback_intent = None;
-                        self.playback_status = format!("Playback failed: {error}");
-                    } else if progress.active {
-                        self.record_playback_progress(&progress);
-                        if let Some(progress) = progress.progress {
-                            let percent = progress * 100.0;
-                            self.playback_status = format!("Playing {percent:.0}%");
-                        } else {
-                            self.playback_status = "Playing".to_string();
-                        }
+                    if let Some(pending) = self.pending_loop_retarget.as_ref() {
+                        self.set_pending_loop_status(pending.desired_looped);
                     } else {
-                        self.clear_playback_cursor();
-                        self.latest_playback_request_id = None;
-                        self.playing_path = None;
-                        self.accepted_playback_intent = None;
-                        self.playback_status = "Stopped".to_string();
+                        self.playback_status = "Playing".to_string();
                     }
+                }
+                PlaybackRuntimeEvent::Progress { id, progress } => {
+                    self.handle_playback_progress(id, progress);
+                }
+                PlaybackRuntimeEvent::Failed { id, error }
+                    if self.pending_loop_retarget_event_is_current(id) =>
+                {
+                    self.pending_loop_retarget = None;
+                    self.playback_status = format!("Loop live update failed: {error}");
                 }
                 PlaybackRuntimeEvent::Stopped { id }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
                     self.pending_progress_poll = None;
+                    self.pending_loop_retarget = None;
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
@@ -553,6 +717,7 @@ impl Browser {
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
                     self.pending_progress_poll = None;
+                    self.pending_loop_retarget = None;
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
@@ -560,9 +725,16 @@ impl Browser {
                     self.playback_status = format!("Playback failed: {error}");
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
+                    if self.pending_loop_retarget_event_is_current(id) =>
+                {
+                    self.pending_loop_retarget = None;
+                    self.playback_status = "Loop live update cancelled".to_string();
+                }
+                PlaybackRuntimeEvent::Cancelled { id, .. }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
                     self.pending_progress_poll = None;
+                    self.pending_loop_retarget = None;
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
@@ -579,10 +751,177 @@ impl Browser {
         if self.playing_path.is_some() && self.pending_progress_poll.is_none() {
             if let Some(runtime) = self.playback.as_ref() {
                 if let Ok(request_id) = runtime.handle.try_poll_progress() {
-                    self.pending_progress_poll = Some((request_id, self.playback_epoch));
+                    self.pending_progress_poll = Some(PendingProgressPoll {
+                        request_id: request_id.get(),
+                        playback_epoch: self.playback_epoch,
+                        sent_at: Instant::now(),
+                    });
                 }
             }
         }
+    }
+
+    fn handle_playback_progress(
+        &mut self,
+        id: PlaybackRequestId,
+        progress: PlaybackRuntimeProgress,
+    ) {
+        if let Some(pending) = self.pending_loop_retarget.clone()
+            && pending.retarget_id == id.get()
+        {
+            if !self.pending_loop_retarget_is_current(&pending) {
+                self.pending_loop_retarget = None;
+                return;
+            }
+            self.reconcile_loop_retarget_progress(id.get(), progress);
+            return;
+        }
+        if !progress_poll_is_current(self.pending_progress_poll, id.get(), self.playback_epoch) {
+            return;
+        }
+        self.pending_progress_poll = None;
+        match playback_progress_disposition(
+            self.latest_playback_request_id.map(PlaybackRequestId::get),
+            progress.playback_request_id.map(PlaybackRequestId::get),
+            progress.error.is_some(),
+        ) {
+            PlaybackProgressDisposition::Error => {
+                let status = progress.error.as_deref().map_or_else(
+                    || "Playback failed".to_string(),
+                    |error| format!("Playback failed: {error}"),
+                );
+                self.clear_current_playback(&status);
+                return;
+            }
+            PlaybackProgressDisposition::TerminalWithoutIdentity => {
+                self.clear_current_playback("Playback ended before it was confirmed");
+                return;
+            }
+            PlaybackProgressDisposition::Stale => return,
+            PlaybackProgressDisposition::Current => {}
+        }
+        if let Some(pending) = self.pending_loop_retarget.clone() {
+            if !self.pending_loop_retarget_is_current(&pending) {
+                self.pending_loop_retarget = None;
+            } else if id.get() > pending.retarget_id {
+                self.reconcile_loop_retarget_progress(id.get(), progress);
+                return;
+            }
+        }
+        self.apply_ordinary_progress(progress);
+    }
+
+    fn reconcile_loop_retarget_progress(
+        &mut self,
+        response_id: u64,
+        progress: PlaybackRuntimeProgress,
+    ) {
+        let accepted_path = self
+            .accepted_playback_intent
+            .as_ref()
+            .map(|intent| intent.path.clone());
+        let outcome = reduce_loop_retarget_progress(
+            &mut self.pending_loop_retarget,
+            &mut self.accepted_playback_intent,
+            response_id,
+            self.latest_playback_request_id.map(PlaybackRequestId::get),
+            self.playback_epoch,
+            self.audio_output_open_generation,
+            self.playing_path.as_deref(),
+            accepted_path.as_deref(),
+            progress.active,
+            progress.error.is_some(),
+            progress.playback_request_id.map(PlaybackRequestId::get),
+            progress.looping,
+        );
+        match outcome {
+            LoopRetargetProgressOutcome::Ignored => {}
+            LoopRetargetProgressOutcome::Failed => {
+                if let Some(error) = progress.error.as_deref() {
+                    self.playback_status = format!("Loop live update failed: {error}");
+                } else {
+                    self.playback_status = "Loop live update failed".to_string();
+                }
+            }
+            LoopRetargetProgressOutcome::Inactive => self.clear_current_playback("Stopped"),
+            LoopRetargetProgressOutcome::Confirmed { desired_matches } => {
+                self.record_playback_progress(&progress);
+                if desired_matches {
+                    self.set_playback_status_from_progress(&progress);
+                } else {
+                    self.playback_status =
+                        "Loop live update failed: playback mode did not change".to_string();
+                }
+            }
+        }
+    }
+
+    fn apply_ordinary_progress(&mut self, progress: PlaybackRuntimeProgress) {
+        if let Some(error) = progress.error {
+            self.clear_current_playback(&format!("Playback failed: {error}"));
+        } else if progress.active {
+            self.record_playback_progress(&progress);
+            if self.pending_loop_retarget.is_some() {
+                if let Some(pending) = self.pending_loop_retarget.as_ref() {
+                    self.set_pending_loop_status(pending.desired_looped);
+                }
+            } else {
+                reconcile_playback_intent_mode(
+                    self.accepted_playback_intent.as_mut(),
+                    progress.looping,
+                );
+                self.set_playback_status_from_progress(&progress);
+            }
+        } else {
+            self.clear_current_playback("Stopped");
+        }
+    }
+
+    fn set_playback_status_from_progress(&mut self, progress: &PlaybackRuntimeProgress) {
+        if let Some(progress) = progress.progress {
+            let percent = progress * 100.0;
+            self.playback_status = format!("Playing {percent:.0}%");
+        } else {
+            self.playback_status = "Playing".to_string();
+        }
+    }
+
+    fn set_pending_loop_status(&mut self, desired_looped: bool) {
+        self.playback_status = format!(
+            "Loop {} · applying to playback",
+            loop_mode_status_word(desired_looped)
+        );
+    }
+
+    fn clear_current_playback(&mut self, status: &str) {
+        self.pending_progress_poll = None;
+        self.pending_loop_retarget = None;
+        self.clear_playback_cursor();
+        self.latest_playback_request_id = None;
+        self.playing_path = None;
+        self.accepted_playback_intent = None;
+        self.playback_status = status.to_string();
+    }
+
+    fn pending_loop_retarget_is_current(&self, pending: &PendingLoopRetarget) -> bool {
+        let accepted_path = self
+            .accepted_playback_intent
+            .as_ref()
+            .map(|intent| intent.path.as_path());
+        loop_retarget_fences_match(
+            pending,
+            self.latest_playback_request_id.map(PlaybackRequestId::get),
+            self.playback_epoch,
+            self.audio_output_open_generation,
+            self.playing_path.as_deref(),
+            accepted_path,
+        )
+    }
+
+    fn pending_loop_retarget_event_is_current(&self, id: PlaybackRequestId) -> bool {
+        self.pending_loop_retarget.as_ref().is_some_and(|pending| {
+            pending.retarget_id == id.get() && self.pending_loop_retarget_is_current(pending)
+        })
     }
 
     fn capture_audio_output_resume_intent(&self) -> Option<PlaybackIntent> {
@@ -613,7 +952,12 @@ impl Browser {
         if accepted.path != *playing_path {
             return None;
         }
-        Some(accepted_resume_intent(accepted, self.volume))
+        let mut resume = accepted_resume_intent(accepted, self.volume);
+        let pending = self.pending_loop_retarget.as_ref();
+        let pending_is_current =
+            pending.is_some_and(|pending| self.pending_loop_retarget_is_current(pending));
+        apply_pending_loop_retarget_to_resume(&mut resume, pending, pending_is_current);
+        Some(resume)
     }
 
     pub(super) fn reconfigure_audio_output(&mut self, cx: &mut Context<Self>) {
@@ -754,6 +1098,181 @@ fn playback_mode_for_intent(intent: &PlaybackIntent) -> PlaybackRuntimeMode {
     }
 }
 
+fn playback_span_for_intent(intent: &PlaybackIntent) -> Option<WaveformPlayRegion> {
+    if let Some(region) = intent.region.filter(|region| region.is_valid()) {
+        return Some(region);
+    }
+    let start = normalized_playback_start(intent.start)?;
+    if intent.looped {
+        WaveformPlayRegion::new(0.0, 1.0)
+    } else {
+        WaveformPlayRegion::new(start, 1.0)
+    }
+}
+
+fn reconcile_playback_intent_mode(intent: Option<&mut PlaybackIntent>, looped: bool) {
+    let Some(intent) = intent else {
+        return;
+    };
+    if intent.looped == looped {
+        return;
+    }
+    let span = playback_span_for_intent(intent);
+    intent.looped = looped;
+    if let Some(span) = span {
+        intent.region = Some(span);
+    }
+}
+
+fn next_loop_toggle_target(
+    playing: bool,
+    policy_enabled: bool,
+    accepted_looped: Option<bool>,
+    pending_desired_looped: Option<bool>,
+) -> bool {
+    let current = if playing {
+        pending_desired_looped
+            .or(accepted_looped)
+            .unwrap_or(policy_enabled)
+    } else {
+        policy_enabled
+    };
+    !current
+}
+
+fn admit_loop_retarget(pending: &mut Option<PendingLoopRetarget>, candidate: PendingLoopRetarget) {
+    *pending = Some(candidate);
+}
+
+fn loop_retarget_fences_match(
+    pending: &PendingLoopRetarget,
+    latest_playback_id: Option<u64>,
+    playback_epoch: u64,
+    output_open_generation: u64,
+    playing_path: Option<&Path>,
+    accepted_path: Option<&Path>,
+) -> bool {
+    latest_playback_id == Some(pending.accepted_playback_id)
+        && pending.playback_epoch == playback_epoch
+        && pending.output_open_generation == output_open_generation
+        && playing_path == Some(pending.path.as_path())
+        && accepted_path == Some(pending.path.as_path())
+}
+
+fn retain_pending_loop_retarget_after_failed_admission(
+    pending: &mut Option<PendingLoopRetarget>,
+    latest_playback_id: Option<u64>,
+    playback_epoch: u64,
+    output_open_generation: u64,
+    playing_path: Option<&Path>,
+    accepted_path: Option<&Path>,
+) -> bool {
+    let retain = pending.as_ref().is_some_and(|pending| {
+        loop_retarget_fences_match(
+            pending,
+            latest_playback_id,
+            playback_epoch,
+            output_open_generation,
+            playing_path,
+            accepted_path,
+        )
+    });
+    if !retain {
+        *pending = None;
+    }
+    retain
+}
+
+fn apply_pending_loop_retarget_to_resume(
+    resume: &mut PlaybackIntent,
+    pending: Option<&PendingLoopRetarget>,
+    pending_is_current: bool,
+) {
+    if let Some(pending) = pending.filter(|_| pending_is_current) {
+        resume.looped = pending.desired_looped;
+        resume.region = Some(pending.span);
+    }
+}
+
+fn reduce_loop_retarget_progress(
+    pending: &mut Option<PendingLoopRetarget>,
+    accepted: &mut Option<PlaybackIntent>,
+    response_id: u64,
+    latest_playback_id: Option<u64>,
+    playback_epoch: u64,
+    output_open_generation: u64,
+    playing_path: Option<&Path>,
+    accepted_path: Option<&Path>,
+    active: bool,
+    has_error: bool,
+    playback_id: Option<u64>,
+    looping: bool,
+) -> LoopRetargetProgressOutcome {
+    let Some(current) = pending.as_ref() else {
+        return LoopRetargetProgressOutcome::Ignored;
+    };
+    if response_id < current.retarget_id
+        || !loop_retarget_fences_match(
+            current,
+            latest_playback_id,
+            playback_epoch,
+            output_open_generation,
+            playing_path,
+            accepted_path,
+        )
+    {
+        return LoopRetargetProgressOutcome::Ignored;
+    }
+    if playback_id.is_some() && playback_id != Some(current.accepted_playback_id) {
+        return LoopRetargetProgressOutcome::Ignored;
+    }
+    if has_error {
+        *pending = None;
+        return LoopRetargetProgressOutcome::Failed;
+    }
+    if !active || playback_id.is_none() {
+        *pending = None;
+        return LoopRetargetProgressOutcome::Inactive;
+    }
+    let desired_looped = current.desired_looped;
+    let span = current.span;
+    let path = current.path.clone();
+    *pending = None;
+    if let Some(intent) = accepted.as_mut()
+        && intent.path == path
+    {
+        intent.looped = looping;
+        intent.region = Some(span);
+    }
+    LoopRetargetProgressOutcome::Confirmed {
+        desired_matches: looping == desired_looped,
+    }
+}
+
+fn playback_progress_disposition(
+    latest_playback_id: Option<u64>,
+    playback_id: Option<u64>,
+    has_error: bool,
+) -> PlaybackProgressDisposition {
+    if playback_id.is_some() && playback_id != latest_playback_id {
+        PlaybackProgressDisposition::Stale
+    } else if has_error {
+        PlaybackProgressDisposition::Error
+    } else if playback_id.is_none() {
+        PlaybackProgressDisposition::TerminalWithoutIdentity
+    } else {
+        PlaybackProgressDisposition::Current
+    }
+}
+
+fn loop_mode_status_word(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
+fn loop_mode_toolbar_word(enabled: bool) -> &'static str {
+    if enabled { "On" } else { "Off" }
+}
+
 fn normalized_playback_start(start: f64) -> Option<f64> {
     start.is_finite().then(|| start.clamp(0.0, 1.0))
 }
@@ -839,21 +1358,27 @@ fn playback_request_number_is_current(latest: Option<u64>, event: u64) -> bool {
     latest == Some(event)
 }
 
-fn progress_poll_is_current(
-    pending: Option<(PlaybackRequestId, u64)>,
-    event: PlaybackRequestId,
-    epoch: u64,
-) -> bool {
-    pending.is_some_and(|(poll, pending_epoch)| poll.get() == event.get() && pending_epoch == epoch)
+fn progress_poll_is_current(pending: Option<PendingProgressPoll>, event: u64, epoch: u64) -> bool {
+    pending.is_some_and(|poll| poll.request_id == event && poll.playback_epoch == epoch)
+}
+
+fn progress_poll_has_expired(pending: PendingProgressPoll, now: Instant) -> bool {
+    now.saturating_duration_since(pending.sent_at) >= PLAYBACK_PROGRESS_POLL_TIMEOUT
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin, accepted_resume_intent,
-        audio_output_resume_is_current, authoritative_cursor_progress, cursor_interpolation,
+        LoopRetargetProgressOutcome, PendingLoopRetarget, PendingProgressPoll,
+        PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin,
+        PlaybackProgressDisposition, accepted_resume_intent, admit_loop_retarget,
+        apply_pending_loop_retarget_to_resume, audio_output_resume_is_current,
+        authoritative_cursor_progress, cursor_interpolation, next_loop_toggle_target,
         normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
-        playback_request_number_is_current, preview_cursor_ratio, resolve_queued_playback_intent,
+        playback_progress_disposition, playback_request_number_is_current,
+        playback_span_for_intent, preview_cursor_ratio, progress_poll_has_expired,
+        progress_poll_is_current, reconcile_playback_intent_mode, reduce_loop_retarget_progress,
+        resolve_queued_playback_intent, retain_pending_loop_retarget_after_failed_admission,
         should_cancel_pending_autoplay, should_queue_initialized_playback,
         should_record_last_played, should_record_playback_history,
     };
@@ -863,6 +1388,33 @@ mod tests {
 
     use super::super::waveform::WaveformPlayRegion;
     use wavecrate_core::{AudioFile, PlaybackLoopPolicy, PlaybackType};
+
+    fn sample_intent(path: &Path, looped: bool) -> PlaybackIntent {
+        PlaybackIntent {
+            start: 0.4,
+            region: None,
+            looped,
+            volume: 1.0,
+            path: path.to_path_buf(),
+            origin: PlaybackIntentOrigin::Explicit,
+        }
+    }
+
+    fn sample_pending_retarget(
+        path: &Path,
+        retarget_id: u64,
+        desired_looped: bool,
+    ) -> PendingLoopRetarget {
+        PendingLoopRetarget {
+            retarget_id,
+            accepted_playback_id: 42,
+            playback_epoch: 7,
+            output_open_generation: 3,
+            path: path.to_path_buf(),
+            desired_looped,
+            span: WaveformPlayRegion::new(0.4, 1.0).expect("valid test span"),
+        }
+    }
 
     #[test]
     fn stale_stop_event_cannot_clear_a_replay() {
@@ -1233,5 +1785,401 @@ mod tests {
 
         assert!(cursor_interpolation(0.9, 0.1, started_at).is_none());
         assert!(cursor_interpolation(0.2, 0.4, started_at).is_some());
+    }
+
+    #[test]
+    fn live_loop_span_keeps_a_seeked_one_shot_range() {
+        let path = PathBuf::from("sample.wav");
+        let one_shot = PlaybackIntent {
+            start: 0.4,
+            region: None,
+            looped: false,
+            volume: 1.0,
+            path: path.clone(),
+            origin: PlaybackIntentOrigin::Explicit,
+        };
+        let span = playback_span_for_intent(&one_shot).expect("seeked one-shot has a span");
+        assert_eq!(span, WaveformPlayRegion::new(0.4, 1.0).unwrap());
+
+        let confirmed_loop = PlaybackIntent {
+            region: Some(span),
+            looped: true,
+            ..one_shot
+        };
+        assert_eq!(
+            playback_mode_for_intent(&confirmed_loop),
+            PlaybackRuntimeMode::Looped {
+                start: 0.4,
+                end: 1.0,
+                offset: 0.4,
+            }
+        );
+        assert_eq!(playback_span_for_intent(&confirmed_loop), Some(span));
+    }
+
+    #[test]
+    fn ordinary_progress_converges_mode_without_expanding_a_seeked_span() {
+        let mut intent = PlaybackIntent {
+            start: 0.4,
+            region: None,
+            looped: false,
+            volume: 1.0,
+            path: PathBuf::from("sample.wav"),
+            origin: PlaybackIntentOrigin::Explicit,
+        };
+        reconcile_playback_intent_mode(Some(&mut intent), true);
+        assert_eq!(intent.region, WaveformPlayRegion::new(0.4, 1.0));
+        assert!(intent.looped);
+
+        reconcile_playback_intent_mode(Some(&mut intent), false);
+        assert_eq!(
+            playback_mode_for_intent(&intent),
+            PlaybackRuntimeMode::OneShot {
+                start: 0.4,
+                end: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn unchanged_loop_progress_preserves_the_accepted_resume_offset() {
+        let mut intent = PlaybackIntent {
+            start: 0.4,
+            region: None,
+            looped: true,
+            volume: 1.0,
+            path: PathBuf::from("sample.wav"),
+            origin: PlaybackIntentOrigin::Explicit,
+        };
+        reconcile_playback_intent_mode(Some(&mut intent), true);
+        let resume = accepted_resume_intent(&intent, 0.75);
+        assert_eq!(
+            playback_mode_for_intent(&resume),
+            PlaybackRuntimeMode::Looped {
+                start: 0.0,
+                end: 1.0,
+                offset: 0.4,
+            }
+        );
+        assert_eq!(resume.volume, 0.75);
+    }
+
+    #[test]
+    fn live_loop_toggle_uses_confirmed_mode_before_saved_policy() {
+        assert!(!next_loop_toggle_target(false, true, None, None));
+        assert!(next_loop_toggle_target(true, true, Some(false), None));
+        assert!(!next_loop_toggle_target(true, false, Some(true), None));
+        assert!(!next_loop_toggle_target(
+            true,
+            false,
+            Some(false),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn live_loop_reducer_ignores_old_ack_and_confirms_from_newer_poll() {
+        let path = PathBuf::from("sample.wav");
+        let span = WaveformPlayRegion::new(0.4, 1.0).expect("valid test span");
+        let mut accepted = Some(sample_intent(&path, false));
+        let first = sample_pending_retarget(&path, 11, true);
+        let second = sample_pending_retarget(&path, 12, false);
+        let mut pending = None;
+        admit_loop_retarget(&mut pending, first);
+        admit_loop_retarget(&mut pending, second.clone());
+
+        let old_ack = reduce_loop_retarget_progress(
+            &mut pending,
+            &mut accepted,
+            11,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+            true,
+            false,
+            Some(42),
+            true,
+        );
+        assert_eq!(old_ack, LoopRetargetProgressOutcome::Ignored);
+        assert_eq!(pending, Some(second.clone()));
+        assert!(!accepted.as_ref().expect("accepted play").looped);
+
+        let newer_poll = reduce_loop_retarget_progress(
+            &mut pending,
+            &mut accepted,
+            13,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+            true,
+            false,
+            Some(42),
+            false,
+        );
+        assert_eq!(
+            newer_poll,
+            LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: true,
+            }
+        );
+        assert!(pending.is_none());
+        let accepted = accepted.expect("accepted play");
+        assert!(!accepted.looped);
+        assert_eq!(accepted.region, Some(span));
+    }
+
+    #[test]
+    fn failed_live_loop_admission_retains_matching_pending_command() {
+        let path = PathBuf::from("sample.wav");
+        let first = sample_pending_retarget(&path, 11, true);
+        let mut pending = Some(first.clone());
+
+        assert!(retain_pending_loop_retarget_after_failed_admission(
+            &mut pending,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+        ));
+        assert_eq!(pending, Some(first));
+
+        assert!(!retain_pending_loop_retarget_after_failed_admission(
+            &mut pending,
+            Some(42),
+            8,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+        ));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn stale_live_loop_fences_and_active_identity_do_not_mutate_pending_state() {
+        let path = PathBuf::from("sample.wav");
+        let other_path = PathBuf::from("other.wav");
+        let mut pending = Some(sample_pending_retarget(&path, 11, true));
+        let mut accepted = Some(sample_intent(&path, false));
+
+        let stale_fences = [
+            (Some(43), 7, 3, path.as_path(), path.as_path()),
+            (Some(42), 8, 3, path.as_path(), path.as_path()),
+            (Some(42), 7, 4, path.as_path(), path.as_path()),
+            (Some(42), 7, 3, other_path.as_path(), path.as_path()),
+            (Some(42), 7, 3, path.as_path(), other_path.as_path()),
+        ];
+        for (latest, epoch, generation, playing_path, accepted_path) in stale_fences {
+            let outcome = reduce_loop_retarget_progress(
+                &mut pending,
+                &mut accepted,
+                11,
+                latest,
+                epoch,
+                generation,
+                Some(playing_path),
+                Some(accepted_path),
+                true,
+                false,
+                Some(42),
+                true,
+            );
+            assert_eq!(outcome, LoopRetargetProgressOutcome::Ignored);
+            assert_eq!(
+                pending.as_ref().map(|pending| pending.retarget_id),
+                Some(11)
+            );
+            assert!(!accepted.as_ref().expect("accepted play").looped);
+        }
+
+        for has_error in [false, true] {
+            let stale_play = reduce_loop_retarget_progress(
+                &mut pending,
+                &mut accepted,
+                11,
+                Some(42),
+                7,
+                3,
+                Some(path.as_path()),
+                Some(path.as_path()),
+                true,
+                has_error,
+                Some(99),
+                true,
+            );
+            assert_eq!(stale_play, LoopRetargetProgressOutcome::Ignored);
+            assert!(pending.is_some());
+            assert!(!accepted.as_ref().expect("accepted play").looped);
+        }
+
+        assert_eq!(
+            reduce_loop_retarget_progress(
+                &mut pending,
+                &mut accepted,
+                11,
+                Some(42),
+                7,
+                3,
+                Some(path.as_path()),
+                Some(path.as_path()),
+                true,
+                false,
+                Some(42),
+                true,
+            ),
+            LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: true,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_output_resume_carries_desired_span_and_current_volume() {
+        let path = PathBuf::from("sample.wav");
+        let accepted = sample_intent(&path, false);
+        let pending = sample_pending_retarget(&path, 11, true);
+        let mut resume = accepted_resume_intent(&accepted, 0.735);
+
+        apply_pending_loop_retarget_to_resume(&mut resume, Some(&pending), true);
+
+        assert!(resume.looped);
+        assert_eq!(resume.region, Some(pending.span));
+        assert_eq!(resume.volume, 0.735);
+        assert_eq!(resume.origin, PlaybackIntentOrigin::AudioOutputResume);
+    }
+
+    #[test]
+    fn failed_and_inactive_live_loop_progress_preserve_confirmed_state() {
+        let path = PathBuf::from("sample.wav");
+        let mut accepted = Some(sample_intent(&path, false));
+        let mut pending = Some(sample_pending_retarget(&path, 11, true));
+
+        assert_eq!(
+            reduce_loop_retarget_progress(
+                &mut pending,
+                &mut accepted,
+                11,
+                Some(42),
+                7,
+                3,
+                Some(path.as_path()),
+                Some(path.as_path()),
+                true,
+                true,
+                Some(42),
+                true,
+            ),
+            LoopRetargetProgressOutcome::Failed
+        );
+        assert!(pending.is_none());
+        assert!(!accepted.as_ref().expect("accepted play").looped);
+
+        pending = Some(sample_pending_retarget(&path, 12, true));
+        assert_eq!(
+            reduce_loop_retarget_progress(
+                &mut pending,
+                &mut accepted,
+                12,
+                Some(42),
+                7,
+                3,
+                Some(path.as_path()),
+                Some(path.as_path()),
+                false,
+                false,
+                None,
+                false,
+            ),
+            LoopRetargetProgressOutcome::Inactive
+        );
+        assert!(pending.is_none());
+        assert!(!accepted.as_ref().expect("accepted play").looped);
+    }
+
+    #[test]
+    fn progress_error_precedes_missing_identity_and_terminal_cleanup() {
+        let failed = PlaybackRuntimeProgress {
+            active: false,
+            playback_request_id: None,
+            error: Some("decoder failed".to_string()),
+            ..PlaybackRuntimeProgress::default()
+        };
+        assert_eq!(
+            playback_progress_disposition(
+                Some(42),
+                failed.playback_request_id.map(|id| id.get()),
+                failed.error.is_some()
+            ),
+            PlaybackProgressDisposition::Error
+        );
+
+        let terminal = PlaybackRuntimeProgress {
+            active: false,
+            playback_request_id: None,
+            ..PlaybackRuntimeProgress::default()
+        };
+        assert_eq!(
+            playback_progress_disposition(
+                Some(42),
+                terminal.playback_request_id.map(|id| id.get()),
+                terminal.error.is_some()
+            ),
+            PlaybackProgressDisposition::TerminalWithoutIdentity
+        );
+
+        let unconfirmed_active = PlaybackRuntimeProgress {
+            active: true,
+            playback_request_id: None,
+            ..PlaybackRuntimeProgress::default()
+        };
+        assert_eq!(
+            playback_progress_disposition(
+                Some(42),
+                unconfirmed_active.playback_request_id.map(|id| id.get()),
+                unconfirmed_active.error.is_some()
+            ),
+            PlaybackProgressDisposition::TerminalWithoutIdentity
+        );
+    }
+
+    #[test]
+    fn stale_progress_errors_cannot_clear_current_playback() {
+        assert_eq!(
+            playback_progress_disposition(Some(42), Some(42), false),
+            PlaybackProgressDisposition::Current
+        );
+        assert_eq!(
+            playback_progress_disposition(Some(42), Some(41), true),
+            PlaybackProgressDisposition::Stale
+        );
+        assert_eq!(
+            playback_progress_disposition(Some(42), Some(42), true),
+            PlaybackProgressDisposition::Error
+        );
+    }
+
+    #[test]
+    fn progress_poll_timeout_releases_late_responses() {
+        let now = Instant::now();
+        let pending = PendingProgressPoll {
+            request_id: 9,
+            playback_epoch: 4,
+            sent_at: now - Duration::from_millis(399),
+        };
+        assert!(!progress_poll_has_expired(pending, now));
+        assert!(progress_poll_is_current(Some(pending), 9, 4));
+        assert!(!progress_poll_is_current(Some(pending), 8, 4));
+        assert!(!progress_poll_is_current(Some(pending), 9, 5));
+
+        let expired = PendingProgressPoll {
+            sent_at: now - Duration::from_millis(400),
+            ..pending
+        };
+        assert!(progress_poll_has_expired(expired, now));
+        assert!(!progress_poll_is_current(None, 9, 4));
     }
 }
