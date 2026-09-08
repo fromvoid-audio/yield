@@ -1113,6 +1113,7 @@ fn validate_drag_target(target: &DragTarget, root: &Path) -> Result<(), Preparat
     Ok(())
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn retryable_platform_error(error: &FileDragError) -> bool {
     matches!(
         error,

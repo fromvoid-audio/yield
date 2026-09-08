@@ -1895,3 +1895,7 @@ Validation: temporary module registration passed 51 media tests and doc tests; f
 Core now has a separate `WaveformEditRegion` that preserves finite bounds outside the audio interval for silence-margin gestures. Movement and crossing resizes derive from the unchanged baseline; nonfinite, overflowing and collapsed results are rejected. Conversion to a playback region explicitly intersects the audio interval. Existing playback-region behavior is unchanged.
 
 The defaulted `waveform_edit_selection` theme color matches the native neutral overlay and is included in the example theme. Existing theme files remain compatible. Five focused core tests, the core check, 21 design tests, the updated example check and scoped formatting passed. Browser edit-selection interaction follows separately.
+
+### Windows application build follow-up
+
+Windows run `34291072626` passed the core, media and native-platform tests, including the restored-write-time revision regression. Application checking then rejected an unused non-Windows drag retry helper under `deny(warnings)`. The helper is now compiled only outside Windows or for its portable unit test. Browser tests were not reached in that run; a fresh Windows run is required for application acceptance.
