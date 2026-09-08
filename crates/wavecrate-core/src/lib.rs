@@ -9,6 +9,7 @@ mod curation;
 mod folder_tree;
 mod playback_history;
 mod rating;
+mod rating_filter;
 mod selection;
 mod waveform_region;
 mod waveform_viewport;
@@ -22,6 +23,7 @@ pub use playback_history::{
     PlaybackSpan,
 };
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
+pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};
 pub use selection::BrowserSelection;
 pub use waveform_region::WaveformRegion;
 pub use waveform_viewport::WaveformViewport;
@@ -210,6 +212,7 @@ pub struct BrowserViewModel {
     folder: Option<PathBuf>,
     folder_scope: FolderScope,
     collection_filter: Option<usize>,
+    rating_filter: RatingFilter,
     rows: Vec<BrowserRow>,
 }
 
@@ -222,6 +225,7 @@ impl BrowserViewModel {
             folder: None,
             folder_scope: FolderScope::DirectOnly,
             collection_filter: None,
+            rating_filter: RatingFilter::disabled(),
             rows: Vec::new(),
         };
         model.rebuild(entries);
@@ -251,6 +255,11 @@ impl BrowserViewModel {
     /// Return the active source collection filter, if any.
     pub fn collection_filter(&self) -> Option<usize> {
         self.collection_filter
+    }
+
+    /// Return the active source rating filter, or a disabled filter when no level is selected.
+    pub fn rating_filter(&self) -> RatingFilter {
+        self.rating_filter
     }
 
     /// Return visible rows in display order.
@@ -308,16 +317,36 @@ impl BrowserViewModel {
         self.set_collection_filter(entries, next)
     }
 
-    /// Count each collection across the current name and folder scope.
+    /// Replace the rating filter while preserving query, folder, collection, and sort state.
+    pub fn set_rating_filter(&mut self, entries: &[AudioFile], filter: RatingFilter) -> bool {
+        if self.rating_filter == filter {
+            return false;
+        }
+        self.rating_filter = filter;
+        self.rebuild(entries);
+        true
+    }
+
+    /// Toggle one rating filter level and return whether the projection changed.
+    ///
+    /// Invalid levels return `false` without changing the current projection.
+    pub fn toggle_rating_filter(&mut self, entries: &[AudioFile], level: i8) -> bool {
+        let Some(next) = self.rating_filter.toggled_level(level) else {
+            return false;
+        };
+        self.set_rating_filter(entries, next)
+    }
+
+    /// Count each collection across the current name, folder, and rating scope.
     ///
     /// The active collection filter is intentionally ignored so sidebar counts remain useful
     /// while a different collection is selected. Callers should cache this result and refresh it
-    /// when entries, query, or folder scope changes rather than during row rendering.
+    /// when entries, query, folder, or rating scope changes rather than during row rendering.
     pub fn collection_counts(&self, entries: &[AudioFile]) -> [usize; COLLECTION_COUNT] {
         let query = self.query.trim().to_ascii_lowercase();
         let mut counts = [0; COLLECTION_COUNT];
         for entry in entries {
-            if !self.entry_matches_scope(entry, &query) {
+            if !self.entry_matches_scope(entry, &query) || !self.entry_matches_rating(entry) {
                 continue;
             }
             let Some(curation) = entry.curation else {
@@ -388,6 +417,7 @@ impl BrowserViewModel {
                             .curation
                             .is_some_and(|curation| curation.has_collection(slot))
                     })
+                    && self.entry_matches_rating(entry)
             })
             .map(|(entry_index, entry)| {
                 (
@@ -426,6 +456,13 @@ impl BrowserViewModel {
         self.folder.as_deref().is_none_or(|folder| {
             folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
         }) && audio_file_matches_name_query(entry, query)
+    }
+
+    fn entry_matches_rating(&self, entry: &AudioFile) -> bool {
+        self.rating_filter.is_disabled()
+            || entry
+                .curation
+                .is_some_and(|curation| self.rating_filter.matches(curation.rating()))
     }
 }
 
@@ -612,6 +649,144 @@ mod tests {
         assert_eq!(model.query(), "wav");
         assert_eq!(model.folder(), Some(Path::new("kit")));
         assert!(!model.set_collection_filter(&entries, Some(COLLECTION_COUNT)));
+    }
+
+    #[test]
+    fn rating_filter_distinguishes_locked_keep_and_excludes_unknown_metadata() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/t3.wav"),
+                relative_path: PathBuf::from("t3.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(-3, false, 0, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/k3.wav"),
+                relative_path: PathBuf::from("k3.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(3, false, 0, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/k4.wav"),
+                relative_path: PathBuf::from("k4.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(3, true, 0, None, None),
+            },
+            model_entry("/tmp/unknown.wav", 1),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        assert_eq!(model.rows().len(), entries.len());
+
+        assert!(model.toggle_rating_filter(&entries, 3));
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
+        assert!(model.rating_filter().contains_level(3));
+
+        assert!(model.toggle_rating_filter(&entries, 4));
+        assert_eq!(model.rows().len(), 2);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!model.rating_filter().contains_level(0));
+    }
+
+    #[test]
+    fn rating_filter_intersects_name_folder_collection_and_collection_counts() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/kick-a.wav"),
+                relative_path: PathBuf::from("kit/kick-a.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(-1, false, 0b0000_0001, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/kick-b.wav"),
+                relative_path: PathBuf::from("kit/kick-b.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(-1, false, 0b0000_0010, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/elsewhere/kick-c.wav"),
+                relative_path: PathBuf::from("elsewhere/kick-c.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(-1, false, 0b0000_0001, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/pad.wav"),
+                relative_path: PathBuf::from("kit/pad.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(1, false, 0b0000_0001, None, None),
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "kick");
+        assert!(model.set_collection_filter(&entries, Some(0)));
+        assert!(model.toggle_rating_filter(&entries, -1));
+
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        assert_eq!(model.collection_counts(&entries), [1, 1, 0, 0, 0, 0]);
+
+        assert!(model.toggle_rating_filter(&entries, -1));
+        assert_eq!(model.rows().len(), 1);
+        assert!(model.rating_filter().is_disabled());
+        assert_eq!(model.rows()[0].entry_index, 0);
+    }
+
+    #[test]
+    fn rating_filter_preserves_focus_position_when_focused_row_disappears() {
+        let mut entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/alpha.wav"),
+                relative_path: PathBuf::from("alpha.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(0, false, 0, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/bravo.wav"),
+                relative_path: PathBuf::from("bravo.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(0, false, 0, None, None),
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        let alpha_id = entries[0].stable_id();
+        assert!(model.toggle_rating_filter(&entries, 0));
+        assert_eq!(model.rows().len(), 2);
+
+        entries[0].curation = AudioFileCuration::from_parts(1, false, 0, None, None);
+        model.set_entries(&entries);
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
+        assert_eq!(model.restore_focus(Some(&alpha_id), Some(0)), Some(1));
     }
 
     #[test]

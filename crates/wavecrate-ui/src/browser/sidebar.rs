@@ -524,6 +524,7 @@ pub(super) fn render(
             theme.clone(),
             cx,
         ))
+        .child(curation::render_rating_filters(browser, theme.clone(), cx))
         .child(
             div()
                 .flex_none()

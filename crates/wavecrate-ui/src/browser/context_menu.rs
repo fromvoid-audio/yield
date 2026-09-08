@@ -12,7 +12,7 @@ use gpui::{
     Point, Window, anchored, deferred, div, prelude::*, px,
 };
 use wavecrate_core::{
-    AudioFileCuration, AudioFileId, CurationAction, FolderScope, MAX_RATING, SortSpec,
+    AudioFileCuration, AudioFileId, CurationAction, FolderScope, MAX_RATING, RatingFilter, SortSpec,
 };
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
@@ -62,6 +62,7 @@ struct ContextMenuTarget {
     folder: Option<PathBuf>,
     folder_scope: FolderScope,
     collection_filter: Option<usize>,
+    rating_filter: RatingFilter,
     sort: SortSpec,
     entry_index: usize,
     visible_position: usize,
@@ -113,6 +114,7 @@ impl ContextMenuTarget {
             && browser.view_model.folder().map(Path::to_path_buf) == self.folder
             && browser.view_model.folder_scope() == self.folder_scope
             && browser.view_model.collection_filter() == self.collection_filter
+            && browser.view_model.rating_filter() == self.rating_filter
             && browser.view_model.sort() == self.sort
             && browser
                 .view_model
@@ -209,6 +211,7 @@ impl Browser {
                 folder: self.view_model.folder().map(Path::to_path_buf),
                 folder_scope: self.view_model.folder_scope(),
                 collection_filter: self.view_model.collection_filter(),
+                rating_filter: self.view_model.rating_filter(),
                 sort: self.view_model.sort(),
                 entry_index,
                 visible_position,

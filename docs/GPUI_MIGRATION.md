@@ -994,3 +994,23 @@ menu checks were inconclusive because the open QA window acquired edits outside
 the scripted sequence; UI automation was paused and both open apps were left
 untouched. Native interaction acceptance remains outstanding. Filesystem trash,
 duplication, and other context-menu actions remain subsequent parity work.
+
+### Rating filter projection
+
+The sidebar now exposes independent T3, T2, T1, U, K1, K2, K3, and K4 filters.
+K4 matches locked +3 only; K3 matches unlocked +3. Clearing every chip disables
+the filter. Enabled filters exclude unavailable curation metadata and intersect
+filename, folder, and collection scope. Runtime filter state survives source
+changes without adding persisted preferences.
+
+Collection counts honor rating scope while continuing to ignore the selected
+collection slot. Curation patches refresh projection and counts when a rating edit
+moves a row into or out of the active filter, including under Name sort. Context
+menus capture rating-filter identity and invalidate after scope changes. The UI
+reuses theme colors and hover/press styling without an animation timer per chip.
+
+Validation: all 57 core tests, 13 UI curation tests, six context-menu tests,
+formatting, and diff checks passed. Tests cover K3/K4, unavailable metadata,
+combined scopes, selection restoration, and edited rows leaving and rejoining a
+filter with correct collection counts. Native visual acceptance remains pending;
+open user/QA applications were not replaced or operated for this slice.

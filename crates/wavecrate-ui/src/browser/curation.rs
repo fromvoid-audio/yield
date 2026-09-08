@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use gpui::{ClickEvent, Context, div, prelude::*, px};
 use wavecrate_core::{
     AudioFile, AudioFileCuration, COLLECTION_COUNT, CurationAction, CurationTransition,
-    plan_curation_action,
+    RATING_FILTER_LEVELS, RatingFilter, plan_curation_action,
 };
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{
@@ -742,6 +742,126 @@ pub(super) fn render_collection_filters(
         .children(rows)
 }
 
+/// Render the eight fixed rating filters for the active source.
+pub(super) fn render_rating_filters(
+    browser: &Browser,
+    theme: Theme,
+    cx: &mut Context<Browser>,
+) -> impl gpui::IntoElement {
+    let active_source = browser.active_source.is_some();
+    let active_filter = browser.view_model.rating_filter();
+    let hover_fill = color(theme.colors.selection_hover_fill);
+    let pressed_fill = color(theme.interaction.pressed_fill);
+    let chip_width = ((theme.spacing.sidebar_width
+        - theme.spacing.panel_padding * 2.0
+        - theme.spacing.control_gap * (RATING_FILTER_LEVELS.len().saturating_sub(1) as f32))
+        / RATING_FILTER_LEVELS.len() as f32)
+        .max(18.0);
+    let chips = RATING_FILTER_LEVELS
+        .into_iter()
+        .enumerate()
+        .map(|(index, level)| {
+            let selected = active_filter.contains_level(level);
+            let marker_color = color(rating_filter_color(level, &theme));
+            let label = rating_filter_label(level);
+            div()
+                .id(("rating-filter", index))
+                .flex()
+                .flex_none()
+                .w(px(chip_width))
+                .h(px(theme.spacing.row_height))
+                .items_center()
+                .justify_center()
+                .gap(px(2.0))
+                .cursor_pointer()
+                .rounded(px(3.0))
+                .bg(if selected {
+                    color(theme.colors.selection_fill)
+                } else {
+                    transparent()
+                })
+                .hover(move |style| style.bg(hover_fill))
+                .active(move |style| style.bg(pressed_fill))
+                .when(!active_source, |element| element.opacity(0.45))
+                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                    if active_source {
+                        view.toggle_rating_filter(level, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded_full()
+                        .bg(marker_color),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme.typography.small_size))
+                        .text_color(if selected {
+                            color(theme.colors.text_primary)
+                        } else {
+                            color(theme.colors.text_muted)
+                        })
+                        .child(label),
+                )
+        })
+        .collect::<Vec<_>>();
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .pb(px(theme.spacing.control_gap))
+        .border_t(px(theme.spacing.border_width))
+        .border_color(color(theme.colors.border))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(theme.spacing.row_height))
+                .px(px(theme.spacing.panel_padding))
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.text_muted))
+                .child("RATING"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .w_full()
+                .px(px(theme.spacing.panel_padding))
+                .gap(px(theme.spacing.control_gap))
+                .children(chips),
+        )
+}
+
+fn rating_filter_label(level: i8) -> &'static str {
+    match level {
+        -3 => "T3",
+        -2 => "T2",
+        -1 => "T1",
+        0 => "U",
+        1 => "K1",
+        2 => "K2",
+        3 => "K3",
+        4 => "K4",
+        _ => "?",
+    }
+}
+
+fn rating_filter_color(level: i8, theme: &Theme) -> wavecrate_design::Color {
+    if level < 0 {
+        theme.colors.rating_trash
+    } else if level > 0 {
+        theme.colors.rating_keep
+    } else {
+        theme.colors.rating_neutral
+    }
+}
+
 /// Return the compact rating cell representation for a row.
 pub(super) fn rating_cell(entry: &AudioFile, theme: &Theme, width: f32) -> impl gpui::IntoElement {
     let Some(curation) = entry.curation else {
@@ -858,6 +978,23 @@ impl Browser {
     pub(super) fn reset_collection_filter(&mut self) {
         self.view_model.set_collection_filter(&self.entries, None);
         self.refresh_collection_filter_counts();
+    }
+
+    pub(super) fn toggle_rating_filter(&mut self, level: i8, cx: &mut Context<Self>) {
+        if self.active_source.is_none() {
+            return;
+        }
+        let previous_id = self.browser_focus_id();
+        let previous_position = self.selected_visible_position();
+        self.browser_focus_override = None;
+        self.context_menu = None;
+        if !self.view_model.toggle_rating_filter(&self.entries, level) {
+            return;
+        }
+        self.refresh_collection_filter_counts();
+        self.reconcile_selection();
+        self.restore_projection_focus(previous_id, previous_position, cx);
+        cx.notify();
     }
 
     pub(super) fn toggle_collection_filter(&mut self, slot: usize, cx: &mut Context<Self>) {
@@ -1017,9 +1154,10 @@ impl Browser {
         }) else {
             return;
         };
-        let previous_id = self.selected_id();
+        let previous_id = self.browser_focus_id();
         let previous_position = self.selected_visible_position();
         let collection_filter = self.view_model.collection_filter();
+        let rating_filter = self.view_model.rating_filter();
         let sort_column = self.view_model.sort().column;
         let entry_indices = self
             .catalog_metadata
@@ -1029,24 +1167,28 @@ impl Browser {
                     && context.lifecycle_generation == key.lifecycle_generation
             })
             .map(|context| context.entry_indices);
-        let (collection_changed, filter_membership_changed) = patch_visible_entries(
-            &mut self.entries,
-            patches,
-            collection_filter,
-            entry_indices.as_deref(),
-        );
+        let (collection_changed, filter_membership_changed, rating_filter_membership_changed) =
+            patch_visible_entries(
+                &mut self.entries,
+                patches,
+                collection_filter,
+                rating_filter,
+                entry_indices.as_deref(),
+            );
         patch_visible_entries(
             &mut self.source_sessions[active_index].entries,
             patches,
             collection_filter,
+            rating_filter,
             entry_indices.as_deref(),
         );
-        if collection_changed {
+        if collection_changed || rating_filter_membership_changed {
             self.refresh_collection_filter_counts();
         }
         if sort_column == wavecrate_core::SortColumn::Rating
             || sort_column == wavecrate_core::SortColumn::Collection
             || filter_membership_changed
+            || rating_filter_membership_changed
         {
             self.view_model.set_entries(&self.entries);
             self.reconcile_selection();
@@ -1160,10 +1302,12 @@ fn patch_visible_entries(
     entries: &mut [AudioFile],
     patches: &BTreeMap<PathBuf, AudioFileCuration>,
     collection_filter: Option<usize>,
+    rating_filter: RatingFilter,
     entry_indices: Option<&HashMap<PathBuf, usize>>,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let mut collection_changed = false;
     let mut filter_membership_changed = false;
+    let mut rating_filter_membership_changed = false;
     for (path, curation) in patches {
         let index = match entry_indices {
             Some(indices) => indices.get(path).copied(),
@@ -1185,15 +1329,28 @@ fn patch_visible_entries(
             previous.is_some_and(|previous| previous.has_collection(slot))
                 != curation.has_collection(slot)
         });
+        rating_filter_membership_changed |= curation_matches_rating_filter(rating_filter, previous)
+            != curation_matches_rating_filter(rating_filter, Some(*curation));
         entry.curation = Some(*curation);
     }
-    (collection_changed, filter_membership_changed)
+    (
+        collection_changed,
+        filter_membership_changed,
+        rating_filter_membership_changed,
+    )
+}
+
+fn curation_matches_rating_filter(
+    filter: RatingFilter,
+    curation: Option<AudioFileCuration>,
+) -> bool {
+    filter.is_disabled() || curation.is_some_and(|curation| filter.matches(curation.rating()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wavecrate_core::RatingState;
+    use wavecrate_core::{BrowserViewModel, RatingState};
 
     fn key() -> CurationLifecycleKey {
         CurationLifecycleKey {
@@ -1578,5 +1735,72 @@ mod tests {
         assert!(is_shortcut_key("6"));
         assert!(!is_shortcut_key("0"));
         assert!(!is_shortcut_key("u"));
+    }
+
+    #[test]
+    fn rating_curation_patch_rebuilds_projection_and_counts_when_rows_leave_and_rejoin_filter() {
+        let mut entries = vec![
+            entry("alpha.wav", 0, false, 0b0000_0001),
+            entry("bravo.wav", 0, false, 0b0000_0010),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.toggle_rating_filter(&entries, 0));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(model.collection_counts(&entries), [1, 1, 0, 0, 0, 0]);
+
+        let alpha = PathBuf::from("alpha.wav");
+        let changed_alpha = curation(1, false, 0b0000_0001);
+        let patches = BTreeMap::from([(alpha.clone(), changed_alpha)]);
+        let (collection_changed, collection_membership_changed, rating_membership_changed) =
+            patch_visible_entries(
+                &mut entries,
+                &patches,
+                model.collection_filter(),
+                model.rating_filter(),
+                None,
+            );
+        assert!(!collection_changed);
+        assert!(!collection_membership_changed);
+        assert!(rating_membership_changed);
+        assert_eq!(entries[0].curation, Some(changed_alpha));
+
+        model.set_entries(&entries);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(model.collection_counts(&entries), [0, 1, 0, 0, 0, 0]);
+
+        let restored_alpha = curation(0, false, 0b0000_0001);
+        let patches = BTreeMap::from([(alpha, restored_alpha)]);
+        let (_, _, rating_membership_changed) = patch_visible_entries(
+            &mut entries,
+            &patches,
+            model.collection_filter(),
+            model.rating_filter(),
+            None,
+        );
+        assert!(rating_membership_changed);
+        model.set_entries(&entries);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(model.collection_counts(&entries), [1, 1, 0, 0, 0, 0]);
     }
 }
