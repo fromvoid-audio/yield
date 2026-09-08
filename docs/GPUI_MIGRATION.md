@@ -1779,3 +1779,5 @@ The Tag Editor now offers removal for positively loaded canonical, unlocked prof
 Dictionary requests survive panel/source/page changes. Category writes also retain their admitted request across resets; stale-context completion refreshes the current panel without grafting old row data. Removal and restoration invalidate active completion results. The undo control occupies its own row to fit the compact sidebar.
 
 Validation: two dictionary-state tests, nine tag-panel tests, the completion refresh regression, UI test compilation, formatting and diff checks passed. Request retention across panel resets was code-reviewed; no new end-to-end GPUI lifecycle fixture was added. Backend session tests cover stale revision rejection. Native interaction acceptance remains pending, and this scoped undo does not implement global assignment deletion or application-wide undo.
+
+A clean detached `cd1830f82` snapshot built `target/qa/Wavecrate Dictionary Preview cd1830f.app` in 19.74 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
