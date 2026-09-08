@@ -621,12 +621,20 @@ mod tests {
             byte_len: 12,
             duration_seconds: None,
             sample_rate: None,
+            curation: wavecrate_core::AudioFileCuration::from_parts(
+                3,
+                true,
+                0b0010_0101,
+                Some(11),
+                Some(22),
+            ),
         };
         let before = entry.clone();
         apply_wav_metadata(&mut entry, 48_000, 48_000);
         assert_eq!(entry.path, before.path);
         assert_eq!(entry.relative_path, before.relative_path);
         assert_eq!(entry.byte_len, before.byte_len);
+        assert_eq!(entry.curation, before.curation);
         assert_eq!(entry.duration_seconds, Some(1.0));
         assert_eq!(entry.sample_rate, Some(48_000));
     }

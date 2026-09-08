@@ -179,6 +179,7 @@ impl Browser {
         let switching_source = self.active_source != Some(source_index);
         if switching_source {
             self.deactivate_catalog_source(cx);
+            self.reset_collection_filter();
         }
         let session = self.source_sessions.get(source_index)?;
         let target = session.entries.get(entry_index)?;
@@ -234,10 +235,12 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.search_input
             .update(cx, |input, cx| input.set_content("", cx));
         self.view_model.set_query(&self.entries, "");
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
         let count = self.entries.len();
         self.scan_status = format!(
@@ -349,6 +352,7 @@ mod tests {
             byte_len: 0,
             duration_seconds: None,
             sample_rate: None,
+            curation: None,
         }
     }
 

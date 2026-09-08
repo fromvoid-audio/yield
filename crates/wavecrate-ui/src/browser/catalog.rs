@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{BorrowAppContext, Context};
-use wavecrate_core::{AudioFile, AudioFileId, FolderTree};
-use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
+use wavecrate_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree};
+use wavecrate_library::sample_sources::{
+    BrowserFileMetadata, SourceId, reconciliation::RootIdentity,
+};
 use wavecrate_session::{CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError};
 
 use super::source_registry::SourceRegistryGlobal;
@@ -158,6 +160,7 @@ impl Browser {
         }
         if !same_active_source {
             self.selection.clear();
+            self.reset_collection_filter();
         }
 
         self.reset_focus();
@@ -209,6 +212,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
 
         self.catalog_next_generation = self.catalog_next_generation.wrapping_add(1);
@@ -358,7 +362,9 @@ impl Browser {
                     return self.handle_catalog_unavailable(reason, cx);
                 }
                 Err(
-                    CatalogSubmitError::Closed | CatalogSubmitError::InvalidWavMetadataRequest(_),
+                    CatalogSubmitError::Closed
+                    | CatalogSubmitError::InvalidWavMetadataRequest(_)
+                    | CatalogSubmitError::InvalidCurationRequest(_),
                 ) => {
                     return false;
                 }
@@ -390,7 +396,9 @@ impl Browser {
                     return self.handle_catalog_unavailable(reason, cx);
                 }
                 Err(
-                    CatalogSubmitError::Closed | CatalogSubmitError::InvalidWavMetadataRequest(_),
+                    CatalogSubmitError::Closed
+                    | CatalogSubmitError::InvalidWavMetadataRequest(_)
+                    | CatalogSubmitError::InvalidCurationRequest(_),
                 ) => return false,
             }
         }
@@ -469,6 +477,7 @@ impl Browser {
             CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
                 self.apply_catalog_metadata_event(&event)
             }
+            CatalogEvent::CurationCommitted { .. } | CatalogEvent::CurationFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 self.reset_catalog_metadata();
                 if let Some(activation) = self.catalog_activation.as_mut() {
@@ -632,6 +641,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
         if let Some(activation) = self.catalog_activation.as_mut()
             && apply_force_reload
@@ -699,6 +709,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation,
             ..
         } => Some((source_id.clone(), *lifecycle_generation)),
+        CatalogEvent::CurationCommitted {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        } => Some((source_id.clone(), *lifecycle_generation)),
         CatalogEvent::Failed {
             source_id: Some(source_id),
             lifecycle_generation: Some(lifecycle_generation),
@@ -729,6 +749,7 @@ fn project_catalog_event(
     let manifest = snapshot.manifest;
     let directories = snapshot.directories;
     let wav_metadata = snapshot.wav_metadata;
+    let curation_metadata = snapshot.curation_metadata;
     let mut entries = Vec::with_capacity(manifest.len());
     let mut facts = HashMap::with_capacity(manifest.len());
     let mut entry_indices = HashMap::with_capacity(manifest.len());
@@ -757,6 +778,9 @@ fn project_catalog_event(
             byte_len: manifest.file_size,
             duration_seconds,
             sample_rate,
+            curation: curation_metadata
+                .get(&manifest.relative_path)
+                .and_then(curation_from_metadata),
         });
         facts.insert(
             manifest.relative_path.clone(),
@@ -792,6 +816,22 @@ fn project_catalog_event(
         facts,
         entry_indices: Arc::new(entry_indices),
     })
+}
+
+fn curation_from_metadata(metadata: &BrowserFileMetadata) -> Option<AudioFileCuration> {
+    let collection_mask = metadata.collections.iter().fold(0_u8, |mask, collection| {
+        let slot = usize::from(collection.index());
+        (slot < wavecrate_core::COLLECTION_COUNT)
+            .then(|| mask | (1 << slot))
+            .unwrap_or(mask)
+    });
+    AudioFileCuration::from_parts(
+        metadata.rating.val(),
+        metadata.locked,
+        collection_mask,
+        metadata.last_played_at,
+        metadata.last_curated_at,
+    )
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), String> {
@@ -885,7 +925,9 @@ mod tests {
     use std::sync::Arc;
     use wavecrate_catalog::CatalogWavMetadata;
     use wavecrate_core::{AudioFile, FolderTree};
-    use wavecrate_library::sample_sources::{SourceId, db::SourceDirectoryEntry};
+    use wavecrate_library::sample_sources::{
+        BrowserFileMetadata, Rating, SampleCollection, SourceId, db::SourceDirectoryEntry,
+    };
 
     #[test]
     fn command_intents_preserve_source_and_generation() {
@@ -978,6 +1020,23 @@ mod tests {
                     sample_rate: 48_000,
                 },
             )]),
+            curation_metadata: BTreeMap::from([(
+                PathBuf::from("drums/kicks/kick é.wav"),
+                BrowserFileMetadata {
+                    relative_path: PathBuf::from("drums/kicks/kick é.wav"),
+                    file_size: 16,
+                    modified_ns: 20,
+                    missing: false,
+                    rating: Rating::new(2),
+                    locked: true,
+                    collections: vec![
+                        SampleCollection::new(0).expect("valid collection"),
+                        SampleCollection::new(4).expect("valid collection"),
+                    ],
+                    last_played_at: Some(10),
+                    last_curated_at: Some(11),
+                },
+            )]),
         };
         let event = wavecrate_session::CatalogEvent::AuditCommitted { snapshot };
         let cancellation = std::sync::atomic::AtomicBool::new(false);
@@ -991,6 +1050,11 @@ mod tests {
         assert_eq!(entry.byte_len, 16);
         assert_eq!(entry.duration_seconds, Some(1.0));
         assert_eq!(entry.sample_rate, Some(48_000));
+        let curation = entry.curation.expect("catalog curation metadata");
+        assert_eq!(curation.rating().value(), 2);
+        assert!(curation.rating().locked());
+        assert_eq!(curation.collection_mask(), 0b0001_0001);
+        assert_eq!(curation.last_played_at(), Some(10));
         assert!(projection.tree.contains(Path::new("empty")));
         assert!(projection.tree.contains(Path::new("drums/kicks")));
         assert!(
@@ -1015,6 +1079,7 @@ mod tests {
             manifest: Vec::new(),
             directories: Vec::new(),
             wav_metadata: BTreeMap::new(),
+            curation_metadata: BTreeMap::new(),
         };
         let event = wavecrate_session::CatalogEvent::SnapshotReady { snapshot };
         let cancellation = std::sync::atomic::AtomicBool::new(true);
@@ -1077,6 +1142,7 @@ mod tests {
             byte_len: 10,
             duration_seconds: None,
             sample_rate: None,
+            curation: None,
         }
         .stable_id();
         let mut session = super::super::SourceSession::new(root.clone());
@@ -1107,6 +1173,7 @@ mod tests {
                 byte_len: 10,
                 duration_seconds: None,
                 sample_rate: None,
+                curation: None,
             }],
             tree: FolderTree::default(),
             facts: projection_facts,

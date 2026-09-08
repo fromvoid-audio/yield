@@ -60,6 +60,8 @@
     "control_height": 26.0,
     "border_width": 1.0,
     "selected_marker_width": 2.0,
+    "rating_column_width": 56.0,
+    "collection_column_width": 72.0,
     "extension_column_width": 64.0,
     "size_column_width": 88.0,
     "duration_column_width": 88.0,

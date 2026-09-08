@@ -25,6 +25,9 @@ use wavecrate_library::sample_sources::db::{
     SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceManifestEntry,
 };
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
+pub use wavecrate_library::sample_sources::{
+    BrowserFileMetadata, SourceCurationCommitReceipt, SourceCurationUpdate,
+};
 use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId};
 use wavecrate_scan::sample_sources::scanner::{
     ScanError, ScanWritePhase, ScanWriter,
@@ -32,6 +35,7 @@ use wavecrate_scan::sample_sources::scanner::{
     read_wav_display_metadata_for_manifest,
 };
 
+mod curation;
 mod wav_metadata;
 
 const COMMAND_CAPACITY: usize = 32;
@@ -40,12 +44,117 @@ const WORKER_IDLE_POLL: Duration = Duration::from_millis(25);
 const DIRECTORY_PAGE_LIMIT: usize = 256;
 const CATALOG_CHILD_PREFIX: &str = "wavecrate-catalog-";
 
+#[cfg(test)]
+struct CatalogTestGate {
+    state: Mutex<CatalogTestGateState>,
+    wake: Condvar,
+}
+
+#[cfg(test)]
+struct CatalogTestGateState {
+    paused: bool,
+    at_boundary: bool,
+}
+
+#[cfg(not(test))]
+struct CatalogTestGate;
+
+#[cfg(test)]
+impl CatalogTestGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CatalogTestGateState {
+                paused: false,
+                at_boundary: false,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn before_receive(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.at_boundary = true;
+        self.wake.notify_all();
+        while state.paused {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.at_boundary = false;
+        self.wake.notify_all();
+    }
+
+    fn pause_next(&self) -> CatalogTestGatePause<'_> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.paused = true;
+        while !state.at_boundary {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        CatalogTestGatePause {
+            gate: self,
+            released: false,
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.paused = false;
+        self.wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct CatalogTestGatePause<'a> {
+    gate: &'a CatalogTestGate,
+    released: bool,
+}
+
+#[cfg(test)]
+impl CatalogTestGatePause<'_> {
+    fn release(mut self) {
+        self.released = true;
+        self.gate.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for CatalogTestGatePause<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.release();
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl CatalogTestGate {
+    fn before_receive(&self) {}
+}
+
 /// Maximum number of exact source paths admitted by one lazy WAV metadata request.
 ///
 /// The scanner performs two bounded one-megabyte header passes per entry. Keeping the request
 /// below the scanner's aggregate 64 MiB budget guarantees that every admitted path is attempted
 /// in one operation and that an omitted result is terminal for the request.
 pub const MAX_WAV_METADATA_REQUEST_PATHS: usize = 16;
+
+/// Maximum number of metadata updates admitted by one durable curation command.
+pub const MAX_CURATION_UPDATES: usize = curation::MAX_CURATION_UPDATES;
+
+pub use curation::CatalogCurationRequestError;
 
 /// A typed operation accepted by the catalog worker.
 #[derive(Debug)]
@@ -82,6 +191,26 @@ pub enum CatalogCommand {
         /// Source-relative paths to attempt. The worker admits at most
         /// [`MAX_WAV_METADATA_REQUEST_PATHS`] paths per request.
         relative_paths: Vec<PathBuf>,
+    },
+    /// Apply one durable, revision-fenced source curation batch.
+    ///
+    /// Once admitted, this command is drained to a terminal completion even when a later remove,
+    /// replacement, cancellation, or worker shutdown invalidates ephemeral catalog work. An
+    /// accepted command submitted before its first complete snapshot may still complete with
+    /// [`CatalogError::NotRegistered`] or [`CatalogError::SnapshotUnavailable`].
+    ApplyCuration {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that must still own the retained database.
+        lifecycle_generation: u64,
+        /// Exact source revision expected by the curation transaction.
+        expected_revision: u64,
+        /// Physical source-root identity expected by the curation transaction.
+        root_identity: RootIdentity,
+        /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Bounded typed metadata updates.
+        updates: Vec<SourceCurationUpdate>,
     },
     /// Read the last coherent persisted snapshot for one source.
     ReadSnapshot {
@@ -137,6 +266,9 @@ pub enum CatalogSubmitError {
     /// A lazy WAV metadata request failed input admission.
     #[error("invalid WAV metadata request: {0}")]
     InvalidWavMetadataRequest(#[from] CatalogWavMetadataRequestError),
+    /// A durable curation request failed bounded or lifecycle admission.
+    #[error("invalid source curation request: {0}")]
+    InvalidCurationRequest(#[from] CatalogCurationRequestError),
 }
 
 /// Startup failures for the profile-owned catalog worker.
@@ -233,6 +365,8 @@ pub struct CatalogSnapshot {
     pub directories: Vec<SourceDirectoryEntry>,
     /// Optional WAV header metadata keyed by source-relative manifest path.
     pub wav_metadata: BTreeMap<PathBuf, CatalogWavMetadata>,
+    /// Revision-fenced browser curation metadata keyed by source-relative manifest path.
+    pub curation_metadata: BTreeMap<PathBuf, BrowserFileMetadata>,
 }
 
 /// The operation associated with a failed catalog event.
@@ -296,6 +430,30 @@ pub enum CatalogEvent {
         /// Source lifecycle generation associated with the request.
         lifecycle_generation: u64,
         /// Revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
+    },
+    /// A durable curation batch committed and returned its bounded metadata patch.
+    CurationCommitted {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the commit.
+        lifecycle_generation: u64,
+        /// Caller-assigned request identifier.
+        request_id: u64,
+        /// Opaque library receipt for the exact committed revision and root.
+        receipt: SourceCurationCommitReceipt,
+    },
+    /// A durable curation batch reached a terminal failure without mutating the source.
+    CurationFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Exact source revision requested by the command.
         expected_revision: u64,
         /// Caller-assigned request identifier.
         request_id: u64,
@@ -515,6 +673,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         CatalogCommand::Register { .. } => 2,
         CatalogCommand::RequestAudit { .. }
         | CatalogCommand::RequestWavMetadata { .. }
+        | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ReadSnapshot { .. }
         | CatalogCommand::Remove { .. }
         | CatalogCommand::Shutdown => 1,
@@ -529,6 +688,7 @@ enum AdmissionAction {
     },
     RequestAudit,
     RequestWavMetadata,
+    ApplyCuration,
     ReadSnapshot,
     Remove {
         source_id: SourceId,
@@ -549,6 +709,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         },
         CatalogCommand::RequestAudit { .. } => AdmissionAction::RequestAudit,
         CatalogCommand::RequestWavMetadata { .. } => AdmissionAction::RequestWavMetadata,
+        CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ReadSnapshot { .. } => AdmissionAction::ReadSnapshot,
         CatalogCommand::Remove {
             source_id,
@@ -617,6 +778,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         }
         AdmissionAction::RequestAudit
         | AdmissionAction::RequestWavMetadata
+        | AdmissionAction::ApplyCuration
         | AdmissionAction::ReadSnapshot => {}
     }
 }
@@ -741,12 +903,29 @@ pub struct CatalogService {
 impl CatalogService {
     /// Start a catalog worker using a clone of an already-acquired profile capability.
     pub fn start(profile_guard: &WritableProfileGuard) -> Result<Self, CatalogStartError> {
+        Self::start_inner(profile_guard, None)
+    }
+
+    #[cfg(test)]
+    fn start_with_test_gate(
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(Self, Arc<CatalogTestGate>), CatalogStartError> {
+        let test_gate = Arc::new(CatalogTestGate::new());
+        let service = Self::start_inner(profile_guard, Some(Arc::clone(&test_gate)))?;
+        Ok((service, test_gate))
+    }
+
+    fn start_inner(
+        profile_guard: &WritableProfileGuard,
+        test_gate: Option<Arc<CatalogTestGate>>,
+    ) -> Result<Self, CatalogStartError> {
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let events = Arc::new(EventHub::new());
         let worker_events = Arc::clone(&events);
         let admission = Arc::new(Mutex::new(AdmissionState::new()));
         let worker_admission = Arc::clone(&admission);
+        let worker_test_gate = test_gate;
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-catalog"))
             .spawn(move || {
@@ -755,6 +934,7 @@ impl CatalogService {
                     command_rx,
                     worker_events,
                     worker_admission,
+                    worker_test_gate,
                 )
             })
             .map_err(CatalogStartError::ThreadSpawn)?;
@@ -778,6 +958,8 @@ impl CatalogService {
             return Err(CatalogSubmitError::Closed);
         }
         validate_command(&command)?;
+        curation::validate_submission(&command, &admission)
+            .map_err(CatalogSubmitError::InvalidCurationRequest)?;
         let event_budget = command_event_budget(&command);
         if admission.event_budget.saturating_add(event_budget) > EVENT_CAPACITY {
             return Err(CatalogSubmitError::Full);
@@ -831,7 +1013,6 @@ impl CatalogService {
             if !admission.shutdown && !admission.closed {
                 admission.shutdown = true;
                 admission.invalidate_all();
-                let _ = self.commands.try_send(CatalogCommand::Shutdown);
             }
         }
         if let Ok(mut worker) = self.worker.lock()
@@ -853,26 +1034,40 @@ fn run_worker(
     command_rx: Receiver<CatalogCommand>,
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
+    test_gate: Option<Arc<CatalogTestGate>>,
 ) {
     let mut sources = HashMap::new();
     loop {
-        if admission_state(&admission, |state| state.shutdown || state.closed) {
-            break;
+        if let Some(test_gate) = test_gate.as_ref() {
+            test_gate.before_receive();
         }
-        let command = match command_rx.recv_timeout(WORKER_IDLE_POLL) {
-            Ok(command) => command,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+        let closing = admission_state(&admission, |state| state.shutdown || state.closed);
+        let command = if closing {
+            match command_rx.try_recv() {
+                Ok(command) => Some(command),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+            }
+        } else {
+            match command_rx.recv_timeout(WORKER_IDLE_POLL) {
+                Ok(command) => Some(command),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         };
-        if admission_state(&admission, |state| state.shutdown || state.closed) {
+        let Some(command) = command else {
             break;
-        }
+        };
+        let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         let reserved_events = command_event_budget(&command);
         let mut reservation = EventReservation {
             hub: &events,
             admission: &admission,
             remaining: reserved_events,
         };
+        if closing && !curation::is_durable(&command) {
+            reservation.finish();
+            continue;
+        }
         if handle_command(
             command,
             &profile_guard,
@@ -953,6 +1148,27 @@ fn handle_command(
                 profile_guard,
                 reservation,
                 admission,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::ApplyCuration {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            root_identity,
+            request_id,
+            updates,
+        } => {
+            curation::execute(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                root_identity,
+                request_id,
+                updates,
+                profile_guard,
+                reservation,
                 sources,
             );
             false
@@ -1111,6 +1327,7 @@ fn register_source(
             &source_id,
             lifecycle_generation,
             &identity,
+            || !publication_is_current(admission, &source_id, lifecycle_generation, None),
         )
         && attach_wav_metadata(
             &mut snapshot,
@@ -1409,6 +1626,7 @@ fn read_snapshot(
         &source_id,
         source.lifecycle_generation,
         &identity,
+        || !publication_is_current(admission, &source_id, lifecycle_generation, None),
     );
     match result {
         Ok(mut snapshot) => {
@@ -1685,6 +1903,7 @@ fn audit_source(
         source_id,
         source.lifecycle_generation,
         &audit_identity,
+        || token.load(Ordering::Acquire),
     )?;
     if snapshot.committed_revision != audit_revision {
         return Err(CatalogError::Audit(format!(
@@ -1757,6 +1976,7 @@ fn read_snapshot_from_database(
     source_id: &SourceId,
     lifecycle_generation: u64,
     root_identity: &RootIdentity,
+    mut should_cancel: impl FnMut() -> bool,
 ) -> Result<CatalogSnapshot, CatalogError> {
     database
         .validate_profile_guard(profile_guard)
@@ -1787,6 +2007,9 @@ fn read_snapshot_from_database(
     // UTF-8 text key, whose punctuation order differs from component-aware Path ordering for
     // cases such as `a.wav` and `a/file.wav`.
     manifest.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if should_cancel() {
+        return Err(CatalogError::Canceled);
+    }
     let first_page = database
         .source_directory_truth_page(None, DIRECTORY_PAGE_LIMIT)
         .map_err(catalog_error_from_db)?;
@@ -1804,6 +2027,9 @@ fn read_snapshot_from_database(
         }
     };
     while let Some(next) = cursor.take() {
+        if should_cancel() {
+            return Err(CatalogError::Canceled);
+        }
         let page: SourceDirectoryTruthPage = database
             .source_directory_truth_page(Some(&next), DIRECTORY_PAGE_LIMIT)
             .map_err(catalog_error_from_db)?;
@@ -1831,6 +2057,12 @@ fn read_snapshot_from_database(
     database
         .validate_profile_guard(profile_guard)
         .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    let curation_metadata = curation::load_snapshot_curation_metadata(
+        database,
+        revision,
+        &manifest,
+        &mut should_cancel,
+    )?;
     Ok(CatalogSnapshot {
         source_id: source_id.clone(),
         root_identity: root_identity.clone(),
@@ -1840,6 +2072,7 @@ fn read_snapshot_from_database(
         manifest,
         directories,
         wav_metadata: BTreeMap::new(),
+        curation_metadata,
     })
 }
 
@@ -2351,6 +2584,7 @@ mod tests {
                 manifest: Vec::new(),
                 directories: Vec::new(),
                 wav_metadata: BTreeMap::new(),
+                curation_metadata: BTreeMap::new(),
             }),
             attempt_token: Some(Arc::clone(&token)),
         };
@@ -3072,5 +3306,552 @@ mod tests {
         drop(fixture.guard);
         let replacement = WritableProfileGuard::acquire_current().expect("released profile");
         drop(replacement);
+    }
+
+    #[test]
+    fn curation_commit_returns_receipt_and_updates_cached_metadata_projection() {
+        let fixture = Fixture::new("catalog-curation-commit");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-commit");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let collection =
+            wavecrate_library::sample_sources::SampleCollection::new(0).expect("collection slot");
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 501,
+                updates: vec![
+                    SourceCurationUpdate::SetRating {
+                        path: path.clone(),
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                    },
+                    SourceCurationUpdate::SetLocked {
+                        path: path.clone(),
+                        locked: true,
+                    },
+                    SourceCurationUpdate::AddCollection { path, collection },
+                ],
+            })
+            .expect("curation admission");
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: 501,
+                    ..
+                }
+            )
+        });
+        let CatalogEvent::CurationCommitted { receipt, .. } = event else {
+            unreachable!();
+        };
+        assert_eq!(receipt.source_revision(), snapshot.committed_revision + 1);
+        assert_eq!(receipt.root_identity(), &snapshot.root_identity);
+        assert_eq!(
+            receipt.directory_generation(),
+            snapshot.directory_generation
+        );
+        assert_eq!(receipt.files().len(), 1);
+        assert_eq!(receipt.files()[0].rating.val(), 3);
+        assert!(receipt.files()[0].locked);
+        assert_eq!(receipt.files()[0].collections, vec![collection]);
+        let committed_revision = receipt.source_revision();
+
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id,
+                expected_revision: Some(committed_revision),
+            })
+            .expect("read patched snapshot");
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let CatalogEvent::SnapshotReady { snapshot } = event else {
+            unreachable!();
+        };
+        let metadata = snapshot
+            .curation_metadata
+            .get(Path::new("one.wav"))
+            .expect("curation metadata row");
+        assert_eq!(metadata.rating.val(), 3);
+        assert!(metadata.locked);
+        assert_eq!(metadata.collections, vec![collection]);
+        assert_eq!(snapshot.committed_revision, committed_revision);
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_before_remove_commits_and_remove_admission_fences_later_writes() {
+        let fixture = Fixture::new("catalog-curation-remove");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-remove");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let update = SourceCurationUpdate::SetRating {
+            path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                .expect("relative curation path"),
+            rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+        };
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 502,
+                updates: vec![update.clone()],
+            })
+            .expect("curation admission");
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("remove admission");
+        assert!(matches!(
+            service.submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 503,
+                updates: vec![update],
+            }),
+            Err(CatalogSubmitError::InvalidCurationRequest(
+                CatalogCurationRequestError::Inactive { .. }
+            ))
+        ));
+        pause.release();
+
+        let first = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: 502,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(first, CatalogEvent::CurationCommitted { .. }));
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(event, CatalogEvent::Removed { .. })
+            }),
+            CatalogEvent::Removed { .. }
+        ));
+        service.shutdown();
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen committed source database");
+        let metadata = database
+            .browser_metadata_snapshot()
+            .expect("read committed curation metadata");
+        assert_eq!(metadata.revision, snapshot.committed_revision + 1);
+        assert_eq!(metadata.files[0].rating.val(), 1);
+    }
+
+    #[test]
+    fn curation_before_register_replacement_commits_against_old_binding() {
+        let fixture = Fixture::new("catalog-curation-register-replacement");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let replacement_root = tempfile::tempdir().expect("replacement source root");
+        let source_id = SourceId::from_string("source-curation-register-replacement");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 509,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path,
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }],
+            })
+            .expect("curation admission");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: replacement_root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("replacement registration admission");
+        {
+            let admission = service.admission.lock().expect("admission lock");
+            assert_eq!(
+                admission
+                    .sources
+                    .get(&source_id)
+                    .expect("replacement admission")
+                    .lifecycle_generation,
+                2
+            );
+        }
+        pause.release();
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: 509,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(event, CatalogEvent::CurationCommitted { .. }));
+        assert!(matches!(
+            receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::Registered {
+                        lifecycle_generation: 2,
+                        ..
+                    }
+                )
+            }),
+            CatalogEvent::Registered {
+                lifecycle_generation: 2,
+                ..
+            }
+        ));
+        service.shutdown();
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            replacement_root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen replacement source database");
+        let metadata = database
+            .browser_metadata_snapshot()
+            .expect("read old binding curation metadata");
+        assert_eq!(metadata.revision, snapshot.committed_revision + 1);
+        assert_eq!(metadata.files[0].rating.val(), 1);
+    }
+
+    #[test]
+    fn curation_is_terminal_snapshot_unavailable_before_first_audit() {
+        let fixture = Fixture::new("catalog-curation-pre-snapshot");
+        let source_id = SourceId::from_string("source-curation-pre-snapshot");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 1,
+            })
+            .expect("register");
+        let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: 0,
+                root_identity,
+                request_id: 504,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                        .expect("relative curation path"),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }],
+            })
+            .expect("pre-snapshot curation admission");
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationFailed {
+                    request_id: 504,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::CurationFailed {
+                error: CatalogError::SnapshotUnavailable,
+                ..
+            }
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_same_revision_conflict_has_one_commit_and_one_terminal_stale_failure() {
+        let fixture = Fixture::new("catalog-curation-conflict");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-conflict");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let update = SourceCurationUpdate::SetRating {
+            path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                .expect("relative curation path"),
+            rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+        };
+        for request_id in [505, 506] {
+            service
+                .submit(CatalogCommand::ApplyCuration {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    expected_revision: snapshot.committed_revision,
+                    root_identity: snapshot.root_identity.clone(),
+                    request_id,
+                    updates: vec![update.clone()],
+                })
+                .expect("curation admission");
+        }
+        let first = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: 505,
+                    ..
+                } | CatalogEvent::CurationFailed {
+                    request_id: 505,
+                    ..
+                }
+            )
+        });
+        let second = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationCommitted {
+                    request_id: 506,
+                    ..
+                } | CatalogEvent::CurationFailed {
+                    request_id: 506,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(first, CatalogEvent::CurationCommitted { .. }));
+        assert!(matches!(
+            second,
+            CatalogEvent::CurationFailed {
+                error: CatalogError::StaleRevision { .. },
+                ..
+            }
+        ));
+        service.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curation_root_replacement_fails_before_mutation() {
+        let fixture = Fixture::new("catalog-curation-root-replacement");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-root-replacement");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let old_root = fixture.root.path().to_path_buf();
+        let displaced = old_root.with_extension("moved");
+        std::fs::rename(&old_root, &displaced).expect("displace source root");
+        std::fs::create_dir(&old_root).expect("replace source root");
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id,
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity,
+                request_id: 507,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                        .expect("relative curation path"),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }],
+            })
+            .expect("curation admission");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationFailed {
+                    request_id: 507,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::CurationFailed {
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            }
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn shutdown_drains_admitted_curation_before_closed() {
+        let fixture = Fixture::new("catalog-curation-shutdown");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-shutdown");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity,
+                request_id: 508,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path: RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+                        .expect("relative curation path"),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                }],
+            })
+            .expect("curation admission");
+        let service = Arc::new(service);
+        let shutdown_service = Arc::clone(&service);
+        let shutdown_thread = thread::spawn(move || shutdown_service.shutdown());
+        while !admission_state(&service.admission, |state| state.shutdown) {
+            thread::yield_now();
+        }
+        pause.release();
+        shutdown_thread.join().expect("catalog shutdown");
+
+        let mut seen_commit = false;
+        let mut seen_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            match event {
+                CatalogEvent::CurationCommitted {
+                    request_id: 508, ..
+                } => {
+                    assert!(!seen_closed);
+                    seen_commit = true;
+                }
+                CatalogEvent::Closed => {
+                    assert!(seen_commit);
+                    seen_closed = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_commit);
+        assert!(seen_closed);
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen committed source database");
+        assert_eq!(
+            database.get_revision().expect("committed source revision"),
+            snapshot.committed_revision + 1
+        );
+    }
+
+    #[test]
+    fn shutdown_drains_full_durable_curation_queue_without_a_sentinel() {
+        let fixture = Fixture::new("catalog-curation-shutdown-full-queue");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-shutdown-full-queue");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let pause = test_gate.pause_next();
+        for index in 0..COMMAND_CAPACITY {
+            service
+                .submit(CatalogCommand::ApplyCuration {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    expected_revision: snapshot.committed_revision + index as u64,
+                    root_identity: snapshot.root_identity.clone(),
+                    request_id: 600 + index as u64,
+                    updates: vec![SourceCurationUpdate::SetRating {
+                        path: path.clone(),
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                    }],
+                })
+                .expect("admit queued curation");
+        }
+        assert_eq!(
+            service.submit(CatalogCommand::ApplyCuration {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision + COMMAND_CAPACITY as u64,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 700,
+                updates: vec![SourceCurationUpdate::SetRating {
+                    path,
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                }],
+            }),
+            Err(CatalogSubmitError::Full)
+        );
+
+        let service = Arc::new(service);
+        let shutdown_service = Arc::clone(&service);
+        let shutdown_thread = thread::spawn(move || shutdown_service.shutdown());
+        while !admission_state(&service.admission, |state| state.shutdown) {
+            thread::yield_now();
+        }
+        pause.release();
+        shutdown_thread.join().expect("catalog shutdown");
+
+        let mut committed_revisions = Vec::new();
+        let mut seen_closed = false;
+        while let Ok(event) = service.try_recv_event() {
+            match event {
+                CatalogEvent::CurationCommitted { receipt, .. } => {
+                    assert!(!seen_closed);
+                    committed_revisions.push(receipt.source_revision());
+                }
+                CatalogEvent::Closed => {
+                    assert!(!seen_closed);
+                    seen_closed = true;
+                }
+                event => panic!("unexpected shutdown event: {event:?}"),
+            }
+        }
+        assert!(seen_closed);
+        assert_eq!(committed_revisions.len(), COMMAND_CAPACITY);
+        assert_eq!(
+            committed_revisions,
+            (snapshot.committed_revision + 1
+                ..=snapshot.committed_revision + COMMAND_CAPACITY as u64)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            service
+                .admission
+                .lock()
+                .expect("admission lock")
+                .event_budget,
+            0
+        );
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen committed source database");
+        assert_eq!(
+            database.get_revision().expect("committed source revision"),
+            snapshot.committed_revision + COMMAND_CAPACITY as u64
+        );
     }
 }

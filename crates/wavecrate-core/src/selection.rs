@@ -211,6 +211,7 @@ mod tests {
             byte_len: 0,
             duration_seconds: None,
             sample_rate: None,
+            curation: None,
         }
         .stable_id()
     }

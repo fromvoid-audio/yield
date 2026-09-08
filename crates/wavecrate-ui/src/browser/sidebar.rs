@@ -11,6 +11,7 @@ use wavecrate_design::Theme;
 use crate::theme::{color, transparent};
 
 use super::Browser;
+use super::curation;
 use super::motion::{self, MotionFrame};
 
 fn hover_rail(group: String, theme: &Theme) -> impl gpui::IntoElement {
@@ -518,6 +519,11 @@ pub(super) fn render(
             )
         })
         .child(folder_list)
+        .child(curation::render_collection_filters(
+            browser,
+            theme.clone(),
+            cx,
+        ))
         .child(
             div()
                 .flex_none()

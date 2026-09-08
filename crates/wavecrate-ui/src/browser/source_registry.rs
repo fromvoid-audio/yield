@@ -519,6 +519,7 @@ impl Browser {
         self.root = None;
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reset_collection_filter();
         self.selected = None;
         self.folder_tree = None;
         self.folder_rows_cache.clear();

@@ -870,3 +870,32 @@ swatches matching the reference defaults. These additive fields default when
 loading older themes and preserve explicit overrides. Four focused rating tests
 and all nineteen design tests passed. Visible controls and trash transaction
 integration remain follow-on work.
+
+### Durable catalog curation and browser display, 2026-09-08
+
+Catalog curation admission now validates bounded updates and the active source
+lifecycle. Every accepted write produces a terminal receipt or failure, including
+when source removal, replacement, or shutdown follows admission. Writes require
+the exact audited root and revision; they do not silently rebase. Successful
+receipts patch retained metadata without rescanning the source. Snapshot loading
+hydrates curation through bounded, revision-checked metadata pages.
+
+Shutdown closes admission and drains accepted work. Independent review identified
+that the session wrapper discarded the event receiver too early; it now retains
+the closed worker's bounded event queue until consumers drain terminal receipts.
+A session regression verifies immediate shutdown, receipt delivery, and the exact
+persisted rating/revision after reopening. Catalog tests also cover a full command
+queue and removal/replacement ordering. All 33 catalog and 38 session tests passed.
+
+The browser displays ratings, keep locks, and all six collection swatches, with
+rating/collection sorting and source-scoped collection filters. Counts follow the
+folder and filename query while ignoring the active collection filter, and are
+cached outside rendering. Metadata updates preserve curation. New column widths
+have backward-compatible theme defaults, including older wide layouts.
+
+Validation: 42 core, 20 design, 18 media, and 109 UI tests passed (one UI test
+ignored). The signed macOS build succeeded. A disposable 4,202-file catalog
+verified audit preservation of seeded ratings, multiple memberships, accurate
+counts, collection/query intersections, passive sorting without autoplay, visible
+sort arrows, and empty-result text. The app quit cleanly. This slice displays and
+filters curation; editing shortcuts and filesystem trash remain follow-on work.

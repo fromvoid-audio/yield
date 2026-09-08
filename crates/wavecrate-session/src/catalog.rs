@@ -6,7 +6,9 @@ pub(crate) use wavecrate_catalog::CatalogService;
 use wavecrate_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
 pub use wavecrate_catalog::{
-    CatalogCommand, CatalogEvent, CatalogWavMetadataRequestError, MAX_WAV_METADATA_REQUEST_PATHS,
+    CatalogCommand, CatalogCurationRequestError, CatalogEvent, CatalogWavMetadataRequestError,
+    MAX_CURATION_UPDATES, MAX_WAV_METADATA_REQUEST_PATHS, SourceCurationCommitReceipt,
+    SourceCurationUpdate,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
@@ -43,6 +45,9 @@ pub enum CatalogSubmitError {
     /// A lazy WAV metadata request failed input admission.
     #[error("invalid source catalog WAV metadata request: {0}")]
     InvalidWavMetadataRequest(CatalogWavMetadataRequestError),
+    /// A durable source curation request failed bounded or lifecycle admission.
+    #[error("invalid source catalog curation request: {0}")]
+    InvalidCurationRequest(CatalogCurationRequestError),
 }
 
 pub(crate) struct CatalogSlot {
@@ -102,7 +107,7 @@ pub(crate) fn try_recv_event(slot: &Arc<Mutex<CatalogSlot>>) -> Result<CatalogEv
             CatalogStatus::Loading | CatalogStatus::Unavailable { .. } => {
                 return Err(TryRecvError::Empty);
             }
-            CatalogStatus::Closed => return Err(TryRecvError::Disconnected),
+            CatalogStatus::Closed => slot.service.clone().ok_or(TryRecvError::Disconnected)?,
             CatalogStatus::Ready => slot.service.clone().ok_or(TryRecvError::Disconnected)?,
         }
     };
@@ -119,7 +124,6 @@ pub(crate) fn try_recv_event(slot: &Arc<Mutex<CatalogSlot>>) -> Result<CatalogEv
 pub(crate) fn close(slot: &Arc<Mutex<CatalogSlot>>) {
     let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     slot.status = CatalogStatus::Closed;
-    slot.service.take();
 }
 
 pub(crate) fn mark_unavailable(slot: &Arc<Mutex<CatalogSlot>>, reason: String) {
@@ -158,6 +162,9 @@ fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
         CatalogWorkerSubmitError::Closed => CatalogSubmitError::Closed,
         CatalogWorkerSubmitError::InvalidWavMetadataRequest(error) => {
             CatalogSubmitError::InvalidWavMetadataRequest(error)
+        }
+        CatalogWorkerSubmitError::InvalidCurationRequest(error) => {
+            CatalogSubmitError::InvalidCurationRequest(error)
         }
     }
 }

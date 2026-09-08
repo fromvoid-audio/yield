@@ -173,6 +173,7 @@ pub fn enumerate_audio_files_with_cancel(
                 byte_len,
                 duration_seconds: probe.as_ref().and_then(|value| value.duration_seconds),
                 sample_rate: probe.and_then(|value| value.sample_rate),
+                curation: None,
             });
         }
     }

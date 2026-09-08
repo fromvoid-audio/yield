@@ -24,6 +24,88 @@ pub use selection::BrowserSelection;
 pub use waveform_region::WaveformRegion;
 pub use waveform_viewport::WaveformViewport;
 
+/// Number of fixed collection slots supported by source curation metadata.
+pub const COLLECTION_COUNT: usize = 6;
+
+/// Bit mask containing every supported collection slot.
+pub const COLLECTION_MASK: u8 = (1 << COLLECTION_COUNT) - 1;
+
+/// Optional curation metadata attached to one browser audio file.
+///
+/// Scanned files may have no curation metadata until a catalog snapshot hydrates them. The
+/// collection membership is deliberately a fixed bit mask so a projection never allocates one
+/// collection object per row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioFileCuration {
+    rating: RatingState,
+    collection_mask: u8,
+    last_played_at: Option<i64>,
+    last_curated_at: Option<i64>,
+}
+
+impl AudioFileCuration {
+    /// Construct curation metadata when every rating and collection bit is valid.
+    pub fn new(
+        rating: RatingState,
+        collection_mask: u8,
+        last_played_at: Option<i64>,
+        last_curated_at: Option<i64>,
+    ) -> Option<Self> {
+        (collection_mask & !COLLECTION_MASK == 0).then_some(Self {
+            rating,
+            collection_mask,
+            last_played_at,
+            last_curated_at,
+        })
+    }
+
+    /// Construct curation metadata from the catalog's scalar rating fields.
+    pub fn from_parts(
+        rating: i8,
+        locked: bool,
+        collection_mask: u8,
+        last_played_at: Option<i64>,
+        last_curated_at: Option<i64>,
+    ) -> Option<Self> {
+        RatingState::new(rating, locked)
+            .and_then(|rating| Self::new(rating, collection_mask, last_played_at, last_curated_at))
+    }
+
+    /// Return the validated rating and lock state.
+    pub const fn rating(self) -> RatingState {
+        self.rating
+    }
+
+    /// Return the fixed collection membership bit mask.
+    pub const fn collection_mask(self) -> u8 {
+        self.collection_mask
+    }
+
+    /// Return whether this file belongs to a valid collection slot.
+    pub const fn has_collection(self, slot: usize) -> bool {
+        slot < COLLECTION_COUNT && self.collection_mask & (1 << slot) != 0
+    }
+
+    /// Return the first collection slot for deterministic collection sorting.
+    pub const fn first_collection(self) -> Option<usize> {
+        if self.collection_mask == 0 {
+            None
+        } else {
+            Some(self.collection_mask.trailing_zeros() as usize)
+        }
+    }
+
+    /// Return the last-played timestamp, if the catalog supplied one.
+    pub const fn last_played_at(self) -> Option<i64> {
+        self.last_played_at
+    }
+
+    /// Return the last-curated timestamp, if the catalog supplied one.
+    pub const fn last_curated_at(self) -> Option<i64> {
+        self.last_curated_at
+    }
+}
+
 /// A source audio file discovered by a folder scan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioFile {
@@ -37,6 +119,8 @@ pub struct AudioFile {
     pub duration_seconds: Option<f32>,
     /// Sample rate reported by a container-level metadata probe.
     pub sample_rate: Option<u32>,
+    /// Optional catalog-owned curation metadata; direct filesystem scans leave this unset.
+    pub curation: Option<AudioFileCuration>,
 }
 
 /// Stable identity for a discovered file in the read-only browser.
@@ -70,6 +154,10 @@ pub enum SortColumn {
     Size,
     /// Order by the lowercased filename extension.
     Extension,
+    /// Order by the signed curation rating.
+    Rating,
+    /// Order by the first assigned collection slot.
+    Collection,
 }
 
 /// Direction used by a browser sort.
@@ -119,6 +207,7 @@ pub struct BrowserViewModel {
     sort: SortSpec,
     folder: Option<PathBuf>,
     folder_scope: FolderScope,
+    collection_filter: Option<usize>,
     rows: Vec<BrowserRow>,
 }
 
@@ -130,6 +219,7 @@ impl BrowserViewModel {
             sort: SortSpec::default(),
             folder: None,
             folder_scope: FolderScope::DirectOnly,
+            collection_filter: None,
             rows: Vec::new(),
         };
         model.rebuild(entries);
@@ -154,6 +244,11 @@ impl BrowserViewModel {
     /// Return the direct or recursive folder filtering mode.
     pub fn folder_scope(&self) -> FolderScope {
         self.folder_scope
+    }
+
+    /// Return the active source collection filter, if any.
+    pub fn collection_filter(&self) -> Option<usize> {
+        self.collection_filter
     }
 
     /// Return visible rows in display order.
@@ -182,6 +277,57 @@ impl BrowserViewModel {
         self.folder = folder;
         self.folder_scope = scope;
         self.rebuild(entries);
+    }
+
+    /// Set the active collection filter while preserving query, folder, and sort state.
+    ///
+    /// Returns `false` for an invalid slot or when the requested filter is already active.
+    pub fn set_collection_filter(
+        &mut self,
+        entries: &[AudioFile],
+        collection: Option<usize>,
+    ) -> bool {
+        if collection.is_some_and(|slot| slot >= COLLECTION_COUNT)
+            || self.collection_filter == collection
+        {
+            return false;
+        }
+        self.collection_filter = collection;
+        self.rebuild(entries);
+        true
+    }
+
+    /// Toggle one source collection filter and return whether the projection changed.
+    pub fn toggle_collection_filter(&mut self, entries: &[AudioFile], slot: usize) -> bool {
+        if slot >= COLLECTION_COUNT {
+            return false;
+        }
+        let next = (self.collection_filter != Some(slot)).then_some(slot);
+        self.set_collection_filter(entries, next)
+    }
+
+    /// Count each collection across the current name and folder scope.
+    ///
+    /// The active collection filter is intentionally ignored so sidebar counts remain useful
+    /// while a different collection is selected. Callers should cache this result and refresh it
+    /// when entries, query, or folder scope changes rather than during row rendering.
+    pub fn collection_counts(&self, entries: &[AudioFile]) -> [usize; COLLECTION_COUNT] {
+        let query = self.query.trim().to_ascii_lowercase();
+        let mut counts = [0; COLLECTION_COUNT];
+        for entry in entries {
+            if !self.entry_matches_scope(entry, &query) {
+                continue;
+            }
+            let Some(curation) = entry.curation else {
+                continue;
+            };
+            for (slot, count) in counts.iter_mut().enumerate() {
+                if curation.has_collection(slot) {
+                    *count += 1;
+                }
+            }
+        }
+        counts
     }
 
     /// Toggle a column, or start a new column in ascending order.
@@ -235,6 +381,11 @@ impl BrowserViewModel {
                 self.folder.as_deref().is_none_or(|folder| {
                     folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
                 }) && audio_file_matches_name_query(entry, &query)
+                    && self.collection_filter.is_none_or(|slot| {
+                        entry
+                            .curation
+                            .is_some_and(|curation| curation.has_collection(slot))
+                    })
             })
             .map(|(entry_index, entry)| {
                 (
@@ -243,6 +394,8 @@ impl BrowserViewModel {
                     file_name_sort_key(entry),
                     extension_sort_key(entry),
                     entry.byte_len,
+                    entry.curation.map(|curation| curation.rating().value()),
+                    entry.curation.and_then(AudioFileCuration::first_collection),
                 )
             })
             .collect::<Vec<_>>();
@@ -251,6 +404,8 @@ impl BrowserViewModel {
                 SortColumn::Name => left.2.cmp(&right.2),
                 SortColumn::Size => left.4.cmp(&right.4),
                 SortColumn::Extension => left.3.cmp(&right.3),
+                SortColumn::Rating => left.5.cmp(&right.5),
+                SortColumn::Collection => left.6.cmp(&right.6),
             }
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.1.path().cmp(right.1.path()));
@@ -261,8 +416,14 @@ impl BrowserViewModel {
         });
         self.rows = projected
             .into_iter()
-            .map(|(entry_index, id, _, _, _)| BrowserRow { entry_index, id })
+            .map(|(entry_index, id, _, _, _, _, _)| BrowserRow { entry_index, id })
             .collect();
+    }
+
+    fn entry_matches_scope(&self, entry: &AudioFile, query: &str) -> bool {
+        self.folder.as_deref().is_none_or(|folder| {
+            folder_contains_relative_path(folder, &entry.relative_path, self.folder_scope)
+        }) && audio_file_matches_name_query(entry, query)
     }
 }
 
@@ -319,6 +480,7 @@ mod tests {
             byte_len,
             duration_seconds: None,
             sample_rate: None,
+            curation: None,
         }
     }
 
@@ -401,6 +563,114 @@ mod tests {
     }
 
     #[test]
+    fn collection_filter_intersects_name_and_folder_scope_and_restores_focus() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/keep.wav"),
+                relative_path: PathBuf::from("kit/keep.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(2, false, 0b0000_0001, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/kit/other.wav"),
+                relative_path: PathBuf::from("kit/other.wav"),
+                byte_len: 2,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(-1, false, 0b0000_0010, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/source/elsewhere/keep.wav"),
+                relative_path: PathBuf::from("elsewhere/keep.wav"),
+                byte_len: 3,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(1, false, 0b0000_0001, None, None),
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "wav");
+        let keep_id = entries[0].stable_id();
+        assert!(model.set_collection_filter(&entries, Some(0)));
+        assert_eq!(model.collection_filter(), Some(0));
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].id, keep_id);
+        assert_eq!(model.collection_counts(&entries), [1, 1, 0, 0, 0, 0]);
+        assert_eq!(model.restore_focus(Some(&keep_id), Some(0)), Some(0));
+
+        assert!(model.set_collection_filter(&entries, None));
+        assert_eq!(model.sort(), SortSpec::default());
+        assert_eq!(model.query(), "wav");
+        assert_eq!(model.folder(), Some(Path::new("kit")));
+        assert!(!model.set_collection_filter(&entries, Some(COLLECTION_COUNT)));
+    }
+
+    #[test]
+    fn rating_and_collection_sort_use_curation_values_then_stable_name() {
+        let entries = vec![
+            AudioFile {
+                path: PathBuf::from("/tmp/zulu.wav"),
+                relative_path: PathBuf::from("zulu.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(1, false, 0b0000_0010, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/alpha.wav"),
+                relative_path: PathBuf::from("alpha.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: AudioFileCuration::from_parts(-1, false, 0b0000_0001, None, None),
+            },
+            AudioFile {
+                path: PathBuf::from("/tmp/bravo.wav"),
+                relative_path: PathBuf::from("bravo.wav"),
+                byte_len: 1,
+                duration_seconds: None,
+                sample_rate: None,
+                curation: None,
+            },
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.toggle_sort(&entries, SortColumn::Rating);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        model.toggle_sort(&entries, SortColumn::Collection);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        model.toggle_sort(&entries, SortColumn::Collection);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
     fn browser_folder_scope_combines_with_name_filter_and_sort() {
         let entries = vec![
             AudioFile {
@@ -409,6 +679,7 @@ mod tests {
                 byte_len: 30,
                 duration_seconds: None,
                 sample_rate: None,
+                curation: None,
             },
             AudioFile {
                 path: PathBuf::from("/tmp/source/kit/bravo.wav"),
@@ -416,6 +687,7 @@ mod tests {
                 byte_len: 10,
                 duration_seconds: None,
                 sample_rate: None,
+                curation: None,
             },
             AudioFile {
                 path: PathBuf::from("/tmp/source/kit/charlie.wav"),
@@ -423,6 +695,7 @@ mod tests {
                 byte_len: 20,
                 duration_seconds: None,
                 sample_rate: None,
+                curation: None,
             },
         ];
         let mut model = BrowserViewModel::new(&entries);
@@ -454,5 +727,20 @@ mod tests {
         assert_eq!(format_duration(None), "--:--");
         assert_eq!(format_duration(Some(65.4)), "01:05");
         assert_eq!(format_duration(Some(3600.0)), "60:00");
+    }
+
+    #[test]
+    fn curation_metadata_rejects_unknown_slots_and_exposes_compact_state() {
+        let curation = AudioFileCuration::from_parts(3, true, 0b0010_0101, Some(11), Some(22))
+            .expect("valid curation metadata");
+        assert_eq!(curation.rating(), RatingState::new(3, true).unwrap());
+        assert_eq!(curation.collection_mask(), 0b0010_0101);
+        assert!(curation.has_collection(0));
+        assert!(curation.has_collection(2));
+        assert!(curation.has_collection(5));
+        assert_eq!(curation.first_collection(), Some(0));
+        assert_eq!(curation.last_played_at(), Some(11));
+        assert_eq!(curation.last_curated_at(), Some(22));
+        assert!(AudioFileCuration::from_parts(0, false, 0b0100_0000, None, None).is_none());
     }
 }

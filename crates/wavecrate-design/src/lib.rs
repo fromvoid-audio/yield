@@ -160,6 +160,14 @@ fn default_waveform_scrollbar_height() -> f32 {
     6.0
 }
 
+fn default_rating_column_width() -> f32 {
+    56.0
+}
+
+fn default_collection_column_width() -> f32 {
+    72.0
+}
+
 /// Semantic colors used by the Wavecrate application.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +283,12 @@ pub struct Spacing {
     pub border_width: f32,
     /// Selected-row leading marker width.
     pub selected_marker_width: f32,
+    /// Rating column width in the sample browser.
+    #[serde(default = "default_rating_column_width")]
+    pub rating_column_width: f32,
+    /// Collection membership column width in the sample browser.
+    #[serde(default = "default_collection_column_width")]
+    pub collection_column_width: f32,
     /// Extension column width in the sample browser.
     pub extension_column_width: f32,
     /// File-size column width in the sample browser.
@@ -396,6 +410,8 @@ impl Default for Theme {
                 control_height: 26.0,
                 border_width: 1.0,
                 selected_marker_width: 2.0,
+                rating_column_width: default_rating_column_width(),
+                collection_column_width: default_collection_column_width(),
                 extension_column_width: 64.0,
                 size_column_width: 88.0,
                 duration_column_width: 88.0,
@@ -617,6 +633,18 @@ pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         16.0,
     )?;
     finite_range(
+        "spacing.rating_column_width",
+        theme.spacing.rating_column_width,
+        32.0,
+        160.0,
+    )?;
+    finite_range(
+        "spacing.collection_column_width",
+        theme.spacing.collection_column_width,
+        32.0,
+        240.0,
+    )?;
+    finite_range(
         "spacing.extension_column_width",
         theme.spacing.extension_column_width,
         32.0,
@@ -720,15 +748,20 @@ pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         ));
     }
     const MIN_WINDOW_WIDTH: f32 = 960.0;
-    const MIN_MAIN_CONTENT_WIDTH: f32 = 320.0;
+    // The two curation columns are additive to the original fixed-column budget. Keep the
+    // legacy budget of 640px valid at the 960px minimum window by reserving the 192px name
+    // column that remains after the default 56px rating and 72px collection columns.
+    const MIN_MAIN_CONTENT_WIDTH: f32 = 192.0;
     let fixed_browser_width = theme.spacing.sidebar_width
         + theme.spacing.selected_marker_width
+        + theme.spacing.rating_column_width
+        + theme.spacing.collection_column_width
         + theme.spacing.extension_column_width
         + theme.spacing.size_column_width
         + theme.spacing.duration_column_width;
     if fixed_browser_width > MIN_WINDOW_WIDTH - MIN_MAIN_CONTENT_WIDTH {
         return Err(ThemeError::Invalid(
-            "sidebar and fixed sample columns leave less than 320px for the sample names"
+            "sidebar and fixed sample columns leave less than 192px for the sample names"
                 .to_string(),
         ));
     }
@@ -782,6 +815,14 @@ mod tests {
         assert_eq!(theme.spacing.sidebar_width, 260.0);
         assert_eq!(theme.spacing.waveform_height, 226.0);
         assert_eq!(theme.spacing.row_height, 22.0);
+        assert_eq!(
+            theme.spacing.rating_column_width,
+            default_rating_column_width()
+        );
+        assert_eq!(
+            theme.spacing.collection_column_width,
+            default_collection_column_width()
+        );
     }
 
     #[test]
@@ -816,6 +857,12 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("waveform object");
         waveform.remove("scrollbar_height");
+        let spacing = object
+            .get_mut("spacing")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("spacing object");
+        spacing.remove("rating_column_width");
+        spacing.remove("collection_column_width");
         let legacy = serde_json::to_string(&legacy).expect("legacy theme serializes");
 
         let theme = parse_theme_json(&legacy).expect("legacy theme validates");
@@ -826,6 +873,36 @@ mod tests {
         assert_eq!(theme.colors.collection_slots, default_collection_slots());
         assert_eq!(theme.colors.waveform_playhead, default_waveform_playhead());
         assert_eq!(theme.waveform.scrollbar_height, 6.0);
+        assert_eq!(
+            theme.spacing.rating_column_width,
+            default_rating_column_width()
+        );
+        assert_eq!(
+            theme.spacing.collection_column_width,
+            default_collection_column_width()
+        );
+    }
+
+    #[test]
+    fn legacy_fixed_column_budget_remains_valid_with_curation_defaults() {
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&valid_json()).expect("default theme is JSON");
+        let object = legacy.as_object_mut().expect("theme object");
+        let spacing = object
+            .get_mut("spacing")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("spacing object");
+        spacing.remove("rating_column_width");
+        spacing.remove("collection_column_width");
+        // The pre-curation fixed columns total exactly 640px. The additive defaults therefore
+        // leave the compatibility 192px name-column budget at the 960px minimum window.
+        spacing.insert("sidebar_width".to_string(), serde_json::Value::from(398.0));
+        let legacy = serde_json::to_string(&legacy).expect("legacy theme serializes");
+
+        let theme = parse_theme_json(&legacy).expect("old fixed-column budget remains valid");
+
+        assert_eq!(theme.spacing.rating_column_width, 56.0);
+        assert_eq!(theme.spacing.collection_column_width, 72.0);
     }
 
     #[test]
@@ -962,7 +1039,7 @@ mod tests {
                 "\"duration_column_width\": 240.0",
             );
         let error = parse_theme_json(&too_wide).expect_err("fixed columns exceed minimum width");
-        assert!(error.to_string().contains("320px"));
+        assert!(error.to_string().contains("192px"));
 
         let too_tall =
             valid_json().replace("\"waveform_height\": 226.0", "\"waveform_height\": 480.0");

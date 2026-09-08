@@ -13,6 +13,7 @@ use wavecrate_design::Theme;
 use crate::theme::{active, color, transparent};
 
 use super::Browser;
+use super::curation;
 use super::motion;
 use super::volume;
 use super::waveform;
@@ -178,7 +179,18 @@ impl Browser {
             } else {
                 color(theme.colors.text_muted)
             })
-            .child(format!("{label}{marker}"));
+            .child(
+                div()
+                    .flex_initial()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .when(selected, |header| {
+                header.child(div().flex_none().whitespace_nowrap().child(marker))
+            });
         if let Some(width) = width {
             header = header.flex_none().w(px(width));
         } else {
@@ -370,6 +382,8 @@ impl Render for Browser {
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
+        let rating_width = theme.spacing.rating_column_width;
+        let collection_width = theme.spacing.collection_column_width;
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
         if self.view_model.rows().is_empty()
@@ -390,7 +404,7 @@ impl Render for Browser {
                 .child(if self.entries.is_empty() {
                     list_status.clone()
                 } else {
-                    "No matching filenames".to_string()
+                    "No matching audio files".to_string()
                 })
         } else {
             div()
@@ -495,6 +509,16 @@ impl Render for Browser {
                                                         entry.relative_path.display().to_string(),
                                                     ),
                                             )
+                                            .child(curation::rating_cell(
+                                                &entry,
+                                                &list_theme,
+                                                rating_width,
+                                            ))
+                                            .child(curation::collection_cell(
+                                                &entry,
+                                                &list_theme,
+                                                collection_width,
+                                            ))
                                             .child(
                                                 div()
                                                     .flex_none()
@@ -855,6 +879,22 @@ impl Render for Browser {
                                                 cx,
                                                 None,
                                                 theme.spacing.row_padding_x,
+                                            ))
+                                            .child(self.render_column_header(
+                                                "Rating",
+                                                SortColumn::Rating,
+                                                theme.clone(),
+                                                cx,
+                                                Some(rating_width),
+                                                theme.spacing.control_gap,
+                                            ))
+                                            .child(self.render_column_header(
+                                                "Col",
+                                                SortColumn::Collection,
+                                                theme.clone(),
+                                                cx,
+                                                Some(collection_width),
+                                                theme.spacing.control_gap,
                                             ))
                                             .child(self.render_column_header(
                                                 "Ext",

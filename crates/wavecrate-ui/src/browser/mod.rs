@@ -35,6 +35,7 @@ use crate::theme::ActiveTheme;
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod curation;
 mod handoff;
 mod history;
 mod motion;
@@ -276,6 +277,7 @@ pub(crate) struct Browser {
     catalog_projection_task: Option<Task<()>>,
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
     catalog_metadata: catalog_metadata::CatalogMetadataState,
+    collection_filter_counts: [usize; wavecrate_core::COLLECTION_COUNT],
     preferences: preferences::PreferenceState,
     waveform_cancel: Option<Arc<AtomicBool>>,
     waveform_task: Option<Task<()>>,
@@ -339,6 +341,7 @@ impl Browser {
                 let previous_position = view.selected_visible_position();
                 let query = input.read(cx).content().to_owned();
                 view.view_model.set_query(&view.entries, query);
+                view.refresh_collection_filter_counts();
                 view.reconcile_selection();
                 view.restore_projection_focus(previous_id, previous_position, cx);
             });
@@ -414,6 +417,7 @@ impl Browser {
             catalog_projection_task: None,
             catalog_projection_cancel: None,
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
+            collection_filter_counts: [0; wavecrate_core::COLLECTION_COUNT],
             preferences: preferences::PreferenceState::new(),
             waveform_cancel: None,
             waveform_task: None,
@@ -598,6 +602,7 @@ impl Browser {
         self.deactivate_catalog_source(cx);
         if source_index != self.active_source {
             self.selection.clear();
+            self.reset_collection_filter();
         }
         self.reset_focus();
         self.reset_scroll_edges();
@@ -632,6 +637,7 @@ impl Browser {
         self.root = Some(root.clone());
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.refresh_collection_filter_counts();
         self.selected = None;
         self.cancel_waveform_load();
         self.waveform_pending = false;
@@ -730,6 +736,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.scan_status = format!(
             "{count} audio file{} · {} skipped",
@@ -788,6 +795,7 @@ impl Browser {
             self.folder_tree = None;
             self.folder_rows_cache.clear();
             self.view_model.set_entries(&self.entries);
+            self.reset_collection_filter();
             self.scan_status = error;
             self.selected = None;
             self.waveform_pending = false;
@@ -816,6 +824,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.scan_status = if is_refresh {
             format!(
@@ -1135,6 +1144,7 @@ impl Browser {
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
+        self.refresh_collection_filter_counts();
         self.reconcile_selection();
         if let Some(index) = self.active_source
             && let Some(session) = self.source_sessions.get_mut(index)
