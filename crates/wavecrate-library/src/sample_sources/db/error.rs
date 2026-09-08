@@ -153,6 +153,33 @@ pub enum SourceDbError {
     /// A curation tag label contained an embedded NUL byte.
     #[error("Curation tag label contains an embedded NUL byte")]
     TagLabelContainsNul,
+    /// A bounded tag-page request contained too many selected paths.
+    #[error("Tag page selected {actual} paths; maximum is {max}")]
+    TagPageTooManyPaths {
+        /// Maximum number of selected paths accepted by one page request.
+        max: usize,
+        /// Number of paths supplied by the caller.
+        actual: usize,
+    },
+    /// A bounded tag-page request exceeded its aggregate selected-path byte budget.
+    #[error("Tag page selected paths use {actual} bytes; maximum is {max}")]
+    TagPagePathBytesTooLarge {
+        /// Maximum aggregate UTF-8/path byte length accepted by one page request.
+        max: usize,
+        /// Aggregate path byte length supplied by the caller.
+        actual: usize,
+    },
+    /// A bounded tag-page vocabulary prefix exceeded its UTF-8 byte budget.
+    #[error("Tag page prefix is {actual} UTF-8 bytes; maximum is {max}")]
+    TagPagePrefixTooLong {
+        /// Maximum prefix byte length accepted by one page request.
+        max: usize,
+        /// Prefix byte length supplied by the caller.
+        actual: usize,
+    },
+    /// A bounded tag-page vocabulary prefix contained an embedded NUL byte.
+    #[error("Tag page prefix contains an embedded NUL byte")]
+    TagPagePrefixContainsNul,
     /// Read-only mode requires an existing database file.
     #[error("Read-only source DB mode requires an existing database file: {0}")]
     ReadOnlyDatabaseMissing(PathBuf),

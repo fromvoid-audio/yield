@@ -1,10 +1,23 @@
-use std::path::Path;
+use std::collections::{BTreeSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
+use rusqlite::{OptionalExtension, Transaction, types::ToSql};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
-use super::super::{SourceDatabase, SourceDbError, SourceTag, SourceTagUsage};
+use super::super::{
+    SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
+    SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
+    SourceDatabase, SourceDbError, SourceTag, SourceTagPage, SourceTagPageCursor,
+    SourceTagPageEntry, SourceTagUsage,
+};
 use super::identity::normalize_tag_identity;
 
 const DEFAULT_TAG_LIMIT: usize = 32;
+const TAG_PAGE_PREVIEW_CHAR_LIMIT: usize = 256;
 
 impl SourceDatabase {
     /// Return the most-used persisted normal tags, ordered by usage then label.
@@ -116,6 +129,94 @@ impl SourceDatabase {
             .map(|tag| tag.display_label)
             .collect())
     }
+
+    /// Fetch tags assigned to an exact bounded set of source-relative paths at one revision.
+    ///
+    /// Paths are normalized and deduplicated before the single read transaction. The returned
+    /// assignment count is the number of distinct selected paths carrying each tag. The page
+    /// size is clamped to `1..=SOURCE_TAG_PAGE_MAX_PAGE_SIZE`, matching the browser metadata page
+    /// API. A cursor is valid only for the same revision and canonical selected-path set.
+    pub fn tags_for_paths_page_at_revision(
+        &self,
+        expected_revision: u64,
+        paths: &[PathBuf],
+        after_cursor: Option<&SourceTagPageCursor>,
+        requested_limit: usize,
+    ) -> Result<SourceTagPage, SourceDbError> {
+        let paths = normalize_tag_page_paths(paths)?;
+        let query_signature = tag_page_paths_signature(&paths);
+        let limit = tag_page_limit(requested_limit);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let revision = source_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(SourceDbError::Unexpected);
+        }
+        let cursor_id =
+            validate_tag_page_cursor(&transaction, revision, query_signature, after_cursor)?;
+        let mut entries = if paths.is_empty() {
+            Vec::new()
+        } else {
+            query_tags_for_paths(&transaction, &paths, cursor_id, limit)?
+        };
+        let has_more = entries.len() > limit;
+        if has_more {
+            entries.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| SourceTagPageCursor {
+            revision,
+            query_signature,
+            last_tag_id: entries
+                .last()
+                .expect("a page with continuation has a last entry")
+                .id,
+        });
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceTagPage {
+            revision,
+            entries,
+            next_cursor,
+        })
+    }
+
+    /// Fetch source vocabulary tags matching a literal normalized prefix at one revision.
+    ///
+    /// Empty or whitespace-only prefixes return the whole vocabulary in canonical order. The
+    /// page size is clamped to `1..=SOURCE_TAG_PAGE_MAX_PAGE_SIZE`, matching the browser metadata
+    /// page API. Vocabulary entries omit assignment counts. A cursor is valid only for the same
+    /// revision and normalized prefix.
+    pub fn tag_vocabulary_page_at_revision(
+        &self,
+        expected_revision: u64,
+        prefix: &str,
+        after_cursor: Option<&SourceTagPageCursor>,
+        requested_limit: usize,
+    ) -> Result<SourceTagPage, SourceDbError> {
+        let prefix = normalize_tag_page_prefix(prefix)?;
+        let query_signature = tag_page_prefix_signature(&prefix);
+        let limit = tag_page_limit(requested_limit);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let revision = source_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(SourceDbError::Unexpected);
+        }
+        let cursor_id =
+            validate_tag_page_cursor(&transaction, revision, query_signature, after_cursor)?;
+        let entries = query_tag_vocabulary(&transaction, &prefix, cursor_id, limit)?;
+        let (entries, next_cursor) =
+            split_tag_page_entries(entries, limit, revision, query_signature);
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceTagPage {
+            revision,
+            entries,
+            next_cursor,
+        })
+    }
 }
 
 fn query_limit(limit: usize) -> i64 {
@@ -158,4 +259,392 @@ fn fuzzy_subsequence_match(candidate: &str, query: &str) -> bool {
     query
         .chars()
         .all(|query_char| chars.any(|candidate_char| candidate_char == query_char))
+}
+
+fn tag_page_limit(requested_limit: usize) -> usize {
+    requested_limit.clamp(1, SOURCE_TAG_PAGE_MAX_PAGE_SIZE)
+}
+
+fn normalize_tag_page_paths(paths: &[PathBuf]) -> Result<Vec<String>, SourceDbError> {
+    if paths.len() > SOURCE_TAG_PAGE_MAX_PATHS {
+        return Err(SourceDbError::TagPageTooManyPaths {
+            max: SOURCE_TAG_PAGE_MAX_PATHS,
+            actual: paths.len(),
+        });
+    }
+
+    let mut path_bytes = 0usize;
+    for path in paths {
+        path_bytes = path_bytes.saturating_add(encoded_path_len(path));
+    }
+    if path_bytes > SOURCE_TAG_PAGE_MAX_PATH_BYTES {
+        return Err(SourceDbError::TagPagePathBytesTooLarge {
+            max: SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+            actual: path_bytes,
+        });
+    }
+
+    paths
+        .iter()
+        .map(|path| normalize_relative_path(path))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|paths| paths.into_iter().collect())
+}
+
+#[cfg(unix)]
+fn encoded_path_len(path: &Path) -> usize {
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(not(unix))]
+fn encoded_path_len(path: &Path) -> usize {
+    path.to_string_lossy().len()
+}
+
+fn normalize_tag_page_prefix(prefix: &str) -> Result<String, SourceDbError> {
+    if prefix.len() > SOURCE_TAG_PAGE_MAX_PREFIX_BYTES {
+        return Err(SourceDbError::TagPagePrefixTooLong {
+            max: SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
+            actual: prefix.len(),
+        });
+    }
+    if prefix.contains('\0') {
+        return Err(SourceDbError::TagPagePrefixContainsNul);
+    }
+    match normalize_tag_identity(prefix) {
+        Ok(identity) => Ok(identity.normalized_text),
+        Err(SourceDbError::EmptyTagLabel) => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn tag_page_paths_signature(paths: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "wavecrate-source-tag-page-v1".hash(&mut hasher);
+    "paths".hash(&mut hasher);
+    paths.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn tag_page_prefix_signature(prefix: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "wavecrate-source-tag-page-v1".hash(&mut hasher);
+    "vocabulary".hash(&mut hasher);
+    prefix.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn source_revision(transaction: &Transaction<'_>) -> Result<u64, SourceDbError> {
+    transaction
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'revision'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sql_error)?
+        .map(|raw| raw.parse::<u64>().map_err(|_| SourceDbError::Unexpected))
+        .transpose()
+        .map(|revision| revision.unwrap_or_default())
+}
+
+fn validate_tag_page_cursor(
+    transaction: &Transaction<'_>,
+    revision: u64,
+    query_signature: u64,
+    cursor: Option<&SourceTagPageCursor>,
+) -> Result<Option<i64>, SourceDbError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    if cursor.revision != revision || cursor.query_signature != query_signature {
+        return Err(SourceDbError::Unexpected);
+    }
+    let exists = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM source_tags WHERE id = ?1)",
+            [cursor.last_tag_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_sql_error)?
+        != 0;
+    exists
+        .then_some(cursor.last_tag_id)
+        .ok_or(SourceDbError::Unexpected)
+        .map(Some)
+}
+
+fn bounded_tag_text_sql(column: &str) -> String {
+    format!(
+        "CASE WHEN length(CAST({column} AS BLOB)) <= {max_bytes}
+                  AND instr({column}, char(0)) = 0
+              THEN {column}
+              ELSE substr({column}, 1, {preview_chars})
+         END",
+        max_bytes = SOURCE_CURATION_MAX_TAG_LABEL_BYTES,
+        preview_chars = TAG_PAGE_PREVIEW_CHAR_LIMIT,
+    )
+}
+
+fn tag_preview_sql() -> String {
+    format!(
+        "(
+        length(CAST(st.display_label AS BLOB)) > {max_bytes}
+        OR instr(st.display_label, char(0)) > 0
+        OR length(CAST(st.normalized_text AS BLOB)) > {max_bytes}
+        OR instr(st.normalized_text, char(0)) > 0
+    )",
+        max_bytes = SOURCE_CURATION_MAX_TAG_LABEL_BYTES,
+    )
+}
+
+fn query_tags_for_paths(
+    transaction: &Transaction<'_>,
+    paths: &[String],
+    cursor_id: Option<i64>,
+    limit: usize,
+) -> Result<Vec<SourceTagPageEntry>, SourceDbError> {
+    let values = (0..paths.len())
+        .map(|index| format!("(?{})", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let limit_parameter = paths.len() + 2;
+    let sql = format!(
+        "WITH selected_paths(path) AS (VALUES {values}),
+              selected_tags AS (
+                  SELECT wft.tag_id, COUNT(DISTINCT wft.path) AS assignment_count
+                  FROM wav_file_tags AS wft
+                  JOIN selected_paths AS selected ON selected.path = wft.path
+                  GROUP BY wft.tag_id
+              )
+         SELECT st.id,
+                {display_label},
+                {normalized_text},
+                {preview},
+                selected_tags.assignment_count
+         FROM source_tags AS st
+         JOIN selected_tags ON selected_tags.tag_id = st.id
+         WHERE (?1 IS NULL OR (st.normalized_text, st.id) >
+                (SELECT normalized_text, id FROM source_tags WHERE id = ?1))
+         ORDER BY st.normalized_text COLLATE BINARY ASC, st.id ASC
+         LIMIT ?{limit_parameter}",
+        display_label = bounded_tag_text_sql("st.display_label"),
+        normalized_text = bounded_tag_text_sql("st.normalized_text"),
+        preview = tag_preview_sql(),
+    );
+    let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
+    let mut parameters: Vec<&dyn ToSql> = Vec::with_capacity(paths.len() + 2);
+    parameters.push(&cursor_id);
+    for path in paths {
+        parameters.push(path);
+    }
+    parameters.push(&fetch_limit);
+    statement
+        .query_map(
+            rusqlite::params_from_iter(parameters),
+            tag_page_entry_with_count,
+        )
+        .map_err(map_sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sql_error)
+}
+
+fn query_tag_vocabulary(
+    transaction: &Transaction<'_>,
+    prefix: &str,
+    cursor_id: Option<i64>,
+    limit: usize,
+) -> Result<Vec<SourceTagPageEntry>, SourceDbError> {
+    let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let sql = tag_vocabulary_sql(prefix.is_empty(), cursor_id.is_some());
+
+    if prefix.is_empty() {
+        if let Some(cursor_id) = cursor_id {
+            let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
+            return statement
+                .query_map(
+                    rusqlite::params![cursor_id, fetch_limit],
+                    tag_page_entry_without_count,
+                )
+                .map_err(map_sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(map_sql_error);
+        }
+
+        let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
+        return statement
+            .query_map([fetch_limit], tag_page_entry_without_count)
+            .map_err(map_sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_error);
+    }
+
+    let upper_bound = tag_prefix_upper_bound(prefix).expect("a non-empty UTF-8 prefix has a bound");
+    if let Some(cursor_id) = cursor_id {
+        let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
+        return statement
+            .query_map(
+                rusqlite::params![upper_bound, prefix, cursor_id, fetch_limit],
+                tag_page_entry_without_count,
+            )
+            .map_err(map_sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_error);
+    }
+
+    let mut statement = transaction.prepare_cached(&sql).map_err(map_sql_error)?;
+    statement
+        .query_map(
+            rusqlite::params![prefix, upper_bound, fetch_limit],
+            tag_page_entry_without_count,
+        )
+        .map_err(map_sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sql_error)
+}
+
+fn tag_vocabulary_sql(prefix_is_empty: bool, cursor_present: bool) -> String {
+    let display_label = bounded_tag_text_sql("st.display_label");
+    let normalized_text = bounded_tag_text_sql("st.normalized_text");
+    let preview = tag_preview_sql();
+    let where_clause = match (prefix_is_empty, cursor_present) {
+        (true, false) => String::new(),
+        (true, true) => String::from(
+            "WHERE (st.normalized_text, st.id) >
+                  (SELECT normalized_text, id FROM source_tags WHERE id = ?1)",
+        ),
+        (false, false) => String::from(
+            "WHERE st.normalized_text >= ?1 COLLATE BINARY
+                AND st.normalized_text < CAST(?2 AS TEXT) COLLATE BINARY
+                AND substr(st.normalized_text, 1, length(?1)) = ?1 COLLATE BINARY",
+        ),
+        (false, true) => String::from(
+            "WHERE st.normalized_text < CAST(?1 AS TEXT) COLLATE BINARY
+                AND substr(st.normalized_text, 1, length(?2)) = ?2 COLLATE BINARY
+                AND (st.normalized_text, st.id) >
+                    (SELECT normalized_text, id FROM source_tags WHERE id = ?3)",
+        ),
+    };
+    let limit_parameter = match (prefix_is_empty, cursor_present) {
+        (true, false) => 1,
+        (true, true) => 2,
+        (false, false) => 3,
+        (false, true) => 4,
+    };
+    format!(
+        "SELECT st.id,
+                {display_label},
+                {normalized_text},
+                {preview}
+         FROM source_tags AS st
+         {where_clause}
+         ORDER BY st.normalized_text COLLATE BINARY ASC, st.id ASC
+         LIMIT ?{limit_parameter}"
+    )
+}
+
+fn tag_prefix_upper_bound(prefix: &str) -> Option<Vec<u8>> {
+    let mut upper_bound = prefix.as_bytes().to_vec();
+    while upper_bound.last().is_some_and(|byte| *byte == u8::MAX) {
+        upper_bound.pop();
+    }
+    let last = upper_bound.last_mut()?;
+    *last = last.checked_add(1)?;
+    Some(upper_bound)
+}
+
+fn tag_page_entry_with_count(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceTagPageEntry> {
+    tag_page_entry_from_row(row, Some(4))
+}
+
+fn tag_page_entry_without_count(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceTagPageEntry> {
+    tag_page_entry_from_row(row, None)
+}
+
+fn tag_page_entry_from_row(
+    row: &rusqlite::Row<'_>,
+    assignment_count_column: Option<usize>,
+) -> rusqlite::Result<SourceTagPageEntry> {
+    let assignment_count = assignment_count_column
+        .map(|column| row.get::<_, i64>(column))
+        .transpose()?
+        .map(|count| count.max(0) as u64);
+    Ok(SourceTagPageEntry {
+        id: row.get(0)?,
+        display_label: row.get(1)?,
+        normalized_text: row.get(2)?,
+        is_preview: row.get::<_, i64>(3)? != 0,
+        assignment_count,
+    })
+}
+
+fn split_tag_page_entries(
+    mut entries: Vec<SourceTagPageEntry>,
+    limit: usize,
+    revision: u64,
+    query_signature: u64,
+) -> (Vec<SourceTagPageEntry>, Option<SourceTagPageCursor>) {
+    let has_more = entries.len() > limit;
+    if has_more {
+        entries.truncate(limit);
+    }
+    let next_cursor = has_more.then(|| SourceTagPageCursor {
+        revision,
+        query_signature,
+        last_tag_id: entries
+            .last()
+            .expect("a page with continuation has a last entry")
+            .id,
+    });
+    (entries, next_cursor)
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use super::{SourceDatabase, tag_prefix_upper_bound, tag_vocabulary_sql};
+
+    #[test]
+    fn vocabulary_prefix_range_plans_include_an_index_seek() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+        for label in ["alpha", "atom", "beta"] {
+            database
+                .assign_tag_to_path(Path::new("one.wav"), label)
+                .unwrap();
+        }
+        let upper_bound = tag_prefix_upper_bound("a").unwrap();
+
+        let no_cursor_opcodes = explain_opcodes(
+            &database,
+            &format!("EXPLAIN {}", tag_vocabulary_sql(false, false)),
+            rusqlite::params!["a", upper_bound.clone(), 2_i64],
+        );
+        assert!(no_cursor_opcodes.iter().any(|opcode| opcode == "SeekGE"));
+
+        let cursor_opcodes = explain_opcodes(
+            &database,
+            &format!("EXPLAIN {}", tag_vocabulary_sql(false, true)),
+            rusqlite::params![upper_bound, "a", 1_i64, 2_i64],
+        );
+        assert!(cursor_opcodes.iter().any(|opcode| opcode == "SeekGE"));
+    }
+
+    fn explain_opcodes<P: rusqlite::Params>(
+        database: &SourceDatabase,
+        sql: &str,
+        parameters: P,
+    ) -> Vec<String> {
+        let mut statement = database.connection.prepare(sql).unwrap();
+        statement
+            .query_map(parameters, |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
 }

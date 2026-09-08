@@ -601,3 +601,42 @@ pub struct SourceTagUsage {
     /// Number of wav rows currently assigned to this tag.
     pub assignment_count: u64,
 }
+
+/// One bounded tag row returned by a revision-fenced tag page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTagPageEntry {
+    /// Stable source-local tag row id.
+    pub id: i64,
+    /// User-facing label, or a bounded preview when [`Self::is_preview`] is true.
+    pub display_label: String,
+    /// Canonical identity text, or a bounded preview when [`Self::is_preview`] is true.
+    pub normalized_text: String,
+    /// Number of distinct selected paths assigned to this tag, when the page is path-scoped.
+    /// Vocabulary pages leave this value as `None`.
+    pub assignment_count: Option<u64>,
+    /// True when either returned label is a bounded preview of legacy data.
+    ///
+    /// Preview text is for display only and cannot be submitted as a tag identity through the
+    /// current label-based mutation API. Callers must retain [`Self::id`] for a future id-based
+    /// mutation.
+    pub is_preview: bool,
+}
+
+/// Opaque keyset cursor for bounded source-tag pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceTagPageCursor {
+    pub(crate) revision: u64,
+    pub(crate) query_signature: u64,
+    pub(crate) last_tag_id: i64,
+}
+
+/// One bounded source-tag page at an exact source revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTagPage {
+    /// Source metadata revision observed by the page.
+    pub revision: u64,
+    /// Tag rows in canonical normalized-text then id order.
+    pub entries: Vec<SourceTagPageEntry>,
+    /// Opaque cursor to pass to the next page, or `None` when this is the final page.
+    pub next_cursor: Option<SourceTagPageCursor>,
+}

@@ -69,7 +69,7 @@ pub use types::{
     SourceDirectoryTruthPublication, SourceDirectoryTruthState,
     SourceDirectoryTruthUnavailableReason, SourceIndexClassification, SourceIndexDiagnostic,
     SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag,
-    SourceTagUsage, WavEntry,
+    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage, WavEntry,
 };
 pub use util::normalize_relative_path;
 pub use write::{
@@ -120,6 +120,14 @@ pub const SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT: usize = 8;
 pub const SOURCE_DIRECTORY_TRUTH_MAX_IDENTITY_BYTES: usize = 1024;
 /// Maximum UTF-8 byte length of a curation tag label before identity normalization.
 pub const SOURCE_CURATION_MAX_TAG_LABEL_BYTES: usize = 1024;
+/// Maximum number of selected paths accepted by one bounded source-tag page request.
+pub const SOURCE_TAG_PAGE_MAX_PATHS: usize = 128;
+/// Maximum aggregate encoded byte length of selected paths in one tag-page request.
+pub const SOURCE_TAG_PAGE_MAX_PATH_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 byte length of a source-tag vocabulary prefix.
+pub const SOURCE_TAG_PAGE_MAX_PREFIX_BYTES: usize = 1024;
+/// Maximum number of entries returned by one bounded source-tag page request.
+pub const SOURCE_TAG_PAGE_MAX_PAGE_SIZE: usize = 64;
 /// Env var that enables read-only source DB opening by default.
 pub const SOURCE_DB_READ_ONLY_ENV: &str = "WAVECRATE_SOURCE_DB_READ_ONLY";
 

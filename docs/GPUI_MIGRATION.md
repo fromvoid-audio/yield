@@ -1271,3 +1271,20 @@ Core tag categories now preserve the five native category IDs, labels, order,
 Playback Type lock, two default tags, and inference rules. Category inference
 rejects inputs above 1024 bytes before allocation. Five focused category tests
 and all 91 core tests passed, along with core compilation and formatting.
+
+### Bounded source tag pages
+
+SourceDatabase now exposes revision-fenced pages for selected-file tag unions and
+literal vocabulary prefixes. Pages contain at most 64 entries; selected requests
+allow 128 paths and 512 KiB of path bytes, with 1024-byte prefix bounds. Selected
+assignment counts deduplicate paths. Opaque fixed-size cursors retain revision,
+query context and the last tag ID, resolving the ordered key inside SQLite.
+
+SQL bounds outgoing labels before Rust allocation and marks legacy long or NUL
+labels as display-only previews, preserving their IDs for later exact mutations.
+Vocabulary queries use indexed binary prefix ranges and cursor seeks; continuation
+does not restart at the prefix beginning. The existing unbounded APIs retain their
+behavior. Twelve focused library tag tests passed, including the real production
+query's index-seek plan, paging, literal prefixes, revision fences and legacy
+previews. Library compilation, formatting and diff checks passed. Catalog and UI
+integration follow separately.

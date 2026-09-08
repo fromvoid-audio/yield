@@ -1,8 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
-use super::super::SourceDatabase;
+use super::super::{
+    SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
+    SourceDatabase, SourceDbError,
+};
 
 #[test]
 fn normalization_prevents_case_and_spacing_duplicates() {
@@ -129,4 +132,241 @@ fn search_tags_finds_less_common_fuzzy_matches() {
         .collect::<Vec<_>>();
 
     assert_eq!(labels, vec!["Rare FX".to_string()]);
+}
+
+#[test]
+fn tag_vocabulary_pages_are_keyset_paged_in_canonical_order() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    for label in ["Bravo", "alpha", "charlie"] {
+        db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+
+    let first = db
+        .tag_vocabulary_page_at_revision(revision, "", None, 2)
+        .unwrap();
+    assert_eq!(first.revision, revision);
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.normalized_text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "bravo"]
+    );
+    assert!(
+        first
+            .entries
+            .iter()
+            .all(|entry| entry.assignment_count.is_none())
+    );
+    let second = db
+        .tag_vocabulary_page_at_revision(revision, "", first.next_cursor.as_ref(), 2)
+        .unwrap();
+    assert_eq!(
+        second
+            .entries
+            .iter()
+            .map(|entry| entry.normalized_text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["charlie"]
+    );
+    assert!(second.next_cursor.is_none());
+}
+
+#[test]
+fn tag_vocabulary_prefixes_treat_percent_and_underscore_literally() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    for label in ["foo%literal", "foo_literal", "fooXliteral", "éclair"] {
+        db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+
+    let percent = db
+        .tag_vocabulary_page_at_revision(revision, "foo%", None, 64)
+        .unwrap();
+    assert_eq!(
+        percent
+            .entries
+            .iter()
+            .map(|entry| entry.normalized_text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["foo%literal"]
+    );
+    let underscore = db
+        .tag_vocabulary_page_at_revision(revision, "foo_", None, 64)
+        .unwrap();
+    assert_eq!(
+        underscore
+            .entries
+            .iter()
+            .map(|entry| entry.normalized_text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["foo_literal"]
+    );
+    let unicode = db
+        .tag_vocabulary_page_at_revision(revision, "écl", None, 64)
+        .unwrap();
+    assert_eq!(
+        unicode
+            .entries
+            .iter()
+            .map(|entry| entry.normalized_text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["éclair"]
+    );
+}
+
+#[test]
+fn selected_tag_page_unions_paths_and_counts_distinct_selected_paths() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    for path in ["one.wav", "two.wav", "three.wav"] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+    db.assign_tag_to_path(Path::new("one.wav"), "Alpha")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("two.wav"), "alpha")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("one.wav"), "Beta").unwrap();
+    db.assign_tag_to_path(Path::new("three.wav"), "beta")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+
+    let selected = db
+        .tags_for_paths_page_at_revision(
+            revision,
+            &[
+                PathBuf::from("one.wav"),
+                PathBuf::from("two.wav"),
+                PathBuf::from("one.wav"),
+            ],
+            None,
+            64,
+        )
+        .unwrap();
+    assert_eq!(
+        selected
+            .entries
+            .iter()
+            .map(|entry| (entry.normalized_text.as_str(), entry.assignment_count))
+            .collect::<Vec<_>>(),
+        vec![("alpha", Some(2)), ("beta", Some(1))]
+    );
+
+    let vocabulary = db
+        .tag_vocabulary_page_at_revision(revision, "", None, 64)
+        .unwrap();
+    assert!(
+        vocabulary
+            .entries
+            .iter()
+            .all(|entry| entry.assignment_count.is_none())
+    );
+}
+
+#[test]
+fn tag_pages_reject_overlarge_inputs_before_querying() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let too_many_paths = (0..=SOURCE_TAG_PAGE_MAX_PATHS)
+        .map(|index| PathBuf::from(format!("{index}.wav")))
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        db.tags_for_paths_page_at_revision(0, &too_many_paths, None, 1),
+        Err(SourceDbError::TagPageTooManyPaths { .. })
+    ));
+
+    let too_many_bytes = vec![PathBuf::from(
+        "x".repeat(SOURCE_TAG_PAGE_MAX_PATH_BYTES + 1),
+    )];
+    assert!(matches!(
+        db.tags_for_paths_page_at_revision(0, &too_many_bytes, None, 1),
+        Err(SourceDbError::TagPagePathBytesTooLarge { .. })
+    ));
+    let too_long_prefix = "p".repeat(SOURCE_TAG_PAGE_MAX_PREFIX_BYTES + 1);
+    assert!(matches!(
+        db.tag_vocabulary_page_at_revision(0, &too_long_prefix, None, 1),
+        Err(SourceDbError::TagPagePrefixTooLong { .. })
+    ));
+    assert!(matches!(
+        db.tag_vocabulary_page_at_revision(0, "tag\0prefix", None, 1),
+        Err(SourceDbError::TagPagePrefixContainsNul)
+    ));
+}
+
+#[test]
+fn tag_page_cursors_are_revision_and_query_fenced() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    for label in ["alpha", "atom", "beta"] {
+        db.assign_tag_to_path(Path::new("one.wav"), label).unwrap();
+    }
+    let revision = db.get_revision().unwrap();
+    let first = db
+        .tag_vocabulary_page_at_revision(revision, "a", None, 1)
+        .unwrap();
+    let cursor = first.next_cursor.as_ref().expect("second matching tag");
+    assert!(matches!(
+        db.tag_vocabulary_page_at_revision(revision, "b", Some(cursor), 1),
+        Err(SourceDbError::Unexpected)
+    ));
+
+    db.assign_tag_to_path(Path::new("one.wav"), "later")
+        .unwrap();
+    assert!(matches!(
+        db.tag_vocabulary_page_at_revision(revision, "a", Some(cursor), 1),
+        Err(SourceDbError::Unexpected)
+    ));
+}
+
+#[test]
+fn tag_page_bounds_legacy_long_multibyte_and_nul_labels_while_advancing() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+    db.upsert_file(Path::new("two.wav"), 10, 5).unwrap();
+    db.upsert_file(Path::new("three.wav"), 10, 5).unwrap();
+    db.upsert_file(Path::new("four.wav"), 10, 5).unwrap();
+    db.assign_tag_to_path(Path::new("one.wav"), &"a".repeat(2_000))
+        .unwrap();
+    db.assign_tag_to_path(Path::new("two.wav"), &"é".repeat(600))
+        .unwrap();
+    db.assign_tag_to_path(Path::new("three.wav"), "nul\0tag")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("four.wav"), "tail")
+        .unwrap();
+    let revision = db.get_revision().unwrap();
+
+    let mut cursor = None;
+    let mut entries = Vec::new();
+    loop {
+        let page = db
+            .tag_vocabulary_page_at_revision(revision, "", cursor.as_ref(), 1)
+            .unwrap();
+        entries.extend(page.entries);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    assert_eq!(entries.len(), 4);
+    assert!(entries.iter().any(|entry| entry.normalized_text == "tail"));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.display_label.len() <= SOURCE_TAG_PAGE_MAX_PREFIX_BYTES)
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.normalized_text.len() <= SOURCE_TAG_PAGE_MAX_PREFIX_BYTES)
+    );
+    assert_eq!(entries.iter().filter(|entry| entry.is_preview).count(), 3);
 }
