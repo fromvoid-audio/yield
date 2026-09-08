@@ -1116,3 +1116,7 @@ Validation: 71 core tests, two UI view tests, and 21 design tests passed, includ
 legacy theme compatibility, custom-width round trips, invalid dimensions, sort
 direction, and responsive boundaries. Formatting and diff checks passed. Native
 visual acceptance remains pending; open application bundles were not changed.
+
+A clean-tree executable build of de963d4c9 also passed. A separate revision-named
+macOS preview bundle was assembled and passed strict ad-hoc signature verification;
+it was not launched for native acceptance, and existing bundles were preserved.
