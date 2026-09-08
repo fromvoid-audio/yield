@@ -14,6 +14,7 @@ mod playback_loop_policy;
 mod playback_type_filter;
 mod rating;
 mod rating_filter;
+mod sample_name;
 mod selection;
 mod tag_category;
 mod tag_filter;
@@ -36,6 +37,7 @@ pub use playback_loop_policy::PlaybackLoopPolicy;
 pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackTypeFilter};
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};
+pub use sample_name::{SampleNameViewMode, sample_display_name};
 pub use selection::BrowserSelection;
 pub use tag_category::{
     DEFAULT_METADATA_TAGS, MAX_TAG_CATEGORY_INPUT_BYTES, TAG_CATEGORIES, TagCategory,

@@ -1755,3 +1755,7 @@ Live gain updates use playback-ID-scoped commands and bounded retries on the exi
 Validation: the full UI suite passed 231 tests with one existing ignored test before the last loop-disable correction. After that correction and compact icon rendering, all 13 normalized-audition tests, both focused transport regressions, the UI check, formatting, and diff checks passed. Independent review found no additional actionable lifecycle or persistence issue. Native audible acceptance remains pending. The peak reader fences its file revision, but the later runtime WAV path open is not atomically bound to that captured file object; this source-open race remains a known limitation.
 
 A clean detached `35a451c63` snapshot built `target/qa/Wavecrate Normalized Preview 35a451c.app` in 17.26 seconds. Strict ad-hoc signature verification passed. This preview includes the accepted tag panel and normalized-audition integration; it was not launched by the agent, and existing previews were preserved.
+
+### Display-name projection foundation
+
+Core now exposes the native Disk/Label display mode and a pure name projection: Disk shows the filename stem, Label uses an already ordered metadata label, and unavailable/empty labels fall back to the disk stem. This changes no file identity or filename and is not yet wired to the browser. Both focused parity tests passed, including nested paths, Unicode, final-extension handling, preserved label order, and fallback. Bounded targeted label hydration follows separately.
