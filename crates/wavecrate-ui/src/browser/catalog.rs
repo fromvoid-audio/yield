@@ -1072,6 +1072,7 @@ mod tests {
                     ],
                     last_played_at: Some(10),
                     last_curated_at: Some(11),
+                    playback_type: None,
                 },
             )]),
         };

@@ -25,7 +25,8 @@ pub use db::{
     SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate, SourceDatabase,
     SourceDatabaseConnectionRole, SourceDbError, SourceFileWrite, SourceIndexClassification,
     SourceIndexCommitResult, SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot,
-    SourceManifestEntry, SourceTag, SourceTagUsage, SourceTagWrite, SourceWriteCommand, WavEntry,
+    SourceManifestEntry, SourcePlaybackType, SourceTag, SourceTagUsage, SourceTagWrite,
+    SourceWriteCommand, WavEntry,
 };
 pub use library::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterQueueError,

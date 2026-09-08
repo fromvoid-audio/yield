@@ -7,6 +7,7 @@ use crate::sample_sources::db::SourceDirectoryTruthState;
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SampleCollection, SourceCurationUpdate, SourceDatabase,
+    SourcePlaybackType,
 };
 
 struct CurationFixture {
@@ -275,6 +276,60 @@ fn valid_curation_commit_preserves_continuity_and_returns_bounded_rows() {
     assert_eq!(unrelated_after.tag, unrelated_before.tag);
     assert_eq!(unrelated_after.file_size, unrelated_before.file_size);
     assert_eq!(unrelated_after.modified_ns, unrelated_before.modified_ns);
+}
+
+#[test]
+fn curation_receipt_matches_browser_playback_type_projection() {
+    let fixture = CurationFixture::new();
+    let path = Path::new("one.wav");
+    let mut tag_batch = fixture.database.write_batch().expect("tag batch");
+    tag_batch
+        .assign_tag_to_path(path, " One\t-\tShot ")
+        .expect("canonical playback tag");
+    tag_batch
+        .commit_auxiliary_state()
+        .expect("auxiliary tag commit");
+
+    let revision = fixture.revision;
+    let snapshot = fixture
+        .database
+        .browser_metadata_snapshot()
+        .expect("browser snapshot");
+    let page = fixture
+        .database
+        .browser_metadata_page(revision, None, 64)
+        .expect("browser page");
+    let exact = fixture
+        .database
+        .browser_metadata_for_paths_at_revision(revision, &[path.to_path_buf()])
+        .expect("exact browser metadata");
+    let receipt = fixture
+        .commit(&[SourceCurationUpdate::SetRating {
+            path: CurationFixture::path("one.wav"),
+            rating: Rating::KEEP_1,
+        }])
+        .expect("curation receipt");
+
+    let expected = Some(SourcePlaybackType::OneShot);
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == path)
+            .expect("snapshot row")
+            .playback_type,
+        expected
+    );
+    assert_eq!(
+        page.files
+            .iter()
+            .find(|file| file.relative_path == path)
+            .expect("page row")
+            .playback_type,
+        expected
+    );
+    assert_eq!(exact.files[0].playback_type, expected);
+    assert_eq!(receipt.files()[0].playback_type, expected);
 }
 
 #[test]

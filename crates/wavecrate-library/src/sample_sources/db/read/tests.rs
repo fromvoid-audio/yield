@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, params};
 use tempfile::tempdir;
 
-use super::super::{DB_FILE_NAME, Rating, SampleCollection, SampleSoundType, SourceDatabase};
+use super::super::{
+    DB_FILE_NAME, Rating, SampleCollection, SampleSoundType, SourceDatabase, SourcePlaybackType,
+};
 
 use super::super::util::{EXACT_SUBTREE_PATH_PREDICATE, exact_subtree_path_bounds};
 
@@ -40,6 +42,91 @@ fn browser_metadata_snapshot_reads_multi_collection_rows_coherently() {
             SampleCollection::new(1).unwrap(),
             SampleCollection::new(3).unwrap()
         ]
+    );
+}
+
+#[test]
+fn browser_metadata_projects_canonical_playback_tags_across_read_shapes() {
+    let dir = tempdir().unwrap();
+    let db = SourceDatabase::open_for_source_write(dir.path()).unwrap();
+    for path in [
+        "loop.wav",
+        "oneshot.wav",
+        "one-shot.wav",
+        "one_shot.wav",
+        "one-shot-whitespace.wav",
+        "unknown.wav",
+        "untagged.wav",
+        "conflicting.wav",
+        "conflicting-prefix.wav",
+        "nul.wav",
+    ] {
+        db.upsert_file(Path::new(path), 10, 5).unwrap();
+    }
+    db.assign_tag_to_path(Path::new("loop.wav"), "LOOP")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("oneshot.wav"), "oneshot")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("one-shot.wav"), "ONE-SHOT")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("one_shot.wav"), "one_shot")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("one-shot-whitespace.wav"), "  One\t - \tShot  ")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("unknown.wav"), "warm")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("conflicting.wav"), "One Shot")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("conflicting.wav"), "loop")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("conflicting-prefix.wav"), "--One-Shot")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("conflicting-prefix.wav"), "loop")
+        .unwrap();
+    db.assign_tag_to_path(Path::new("nul.wav"), "one shot\0garbage")
+        .unwrap();
+
+    let expected = [
+        ("conflicting-prefix.wav", Some(SourcePlaybackType::OneShot)),
+        ("conflicting.wav", Some(SourcePlaybackType::Loop)),
+        ("loop.wav", Some(SourcePlaybackType::Loop)),
+        ("nul.wav", None),
+        ("one-shot-whitespace.wav", Some(SourcePlaybackType::OneShot)),
+        ("one-shot.wav", Some(SourcePlaybackType::OneShot)),
+        ("one_shot.wav", Some(SourcePlaybackType::OneShot)),
+        ("oneshot.wav", Some(SourcePlaybackType::OneShot)),
+        ("unknown.wav", None),
+        ("untagged.wav", None),
+    ];
+    let revision = db.get_revision().unwrap();
+    let snapshot = db.browser_metadata_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|file| (
+                file.relative_path.to_string_lossy().into_owned(),
+                file.playback_type
+            ))
+            .collect::<Vec<_>>(),
+        expected
+            .into_iter()
+            .map(|(path, playback_type)| (String::from(path), playback_type))
+            .collect::<Vec<_>>()
+    );
+
+    let page = db.browser_metadata_page(revision, None, 64).unwrap();
+    let exact = db
+        .browser_metadata_for_paths_at_revision(revision, &[PathBuf::from("conflicting.wav")])
+        .unwrap();
+    assert_eq!(page.files, snapshot.files);
+    assert_eq!(exact.files[0].playback_type, Some(SourcePlaybackType::Loop));
+    assert_eq!(
+        page.files
+            .iter()
+            .find(|file| file.relative_path == Path::new("conflicting.wav"))
+            .and_then(|file| file.playback_type),
+        exact.files[0].playback_type
     );
 }
 
@@ -165,7 +252,7 @@ fn browser_metadata_snapshot_has_constant_statement_count_for_large_sources() {
     assert_eq!(snapshot.files.len(), 2_000);
     assert_eq!(statement_count, empty_statement_count);
     assert!(
-        statement_count <= 6,
+        statement_count <= 8,
         "browser metadata used {statement_count} statements"
     );
     assert!(
@@ -843,6 +930,7 @@ fn legacy_read_only_minimal_wav_files_schema_reads_with_defaults() {
     assert_eq!(browser_snapshot.files[0].modified_ns, 99);
     assert!(!browser_snapshot.files[0].missing);
     assert!(browser_snapshot.files[0].collections.is_empty());
+    assert_eq!(browser_snapshot.files[0].playback_type, None);
     assert_eq!(db.count_files().unwrap(), 1);
     assert_eq!(db.count_present_files().unwrap(), 1);
     assert_eq!(db.list_files_page(10, 0).unwrap().len(), 1);

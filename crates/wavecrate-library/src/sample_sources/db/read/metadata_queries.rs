@@ -6,7 +6,7 @@ use super::super::util::map_sql_error;
 use super::super::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
     META_WAV_PATHS_REVISION, Rating, SampleCollection, SampleSoundType, SourceDatabase,
-    SourceDbError,
+    SourceDbError, SourcePlaybackType,
 };
 use super::decode::{
     decode_path_row, decode_relative_path, table_has_columns, wav_file_has_column,
@@ -16,6 +16,52 @@ struct BrowserMetadataCapabilities {
     wav_columns: std::collections::HashSet<String>,
     collection_memberships: bool,
     metadata_revision: bool,
+    playback_type_catalog: bool,
+}
+
+const PLAYBACK_TYPE_CLASSIFICATION: &str = "CASE
+    WHEN instr(st.normalized_text, char(0)) > 0 THEN NULL
+    WHEN trim(st.normalized_text, ' -_') = 'loop' THEN 1
+    WHEN trim(st.normalized_text, ' -_') = 'oneshot' THEN 2
+    WHEN length(trim(st.normalized_text, ' -_')) > 7
+         AND substr(trim(st.normalized_text, ' -_'), 1, 3) = 'one'
+         AND substr(trim(st.normalized_text, ' -_'), -4) = 'shot'
+         AND trim(
+                 substr(
+                     trim(st.normalized_text, ' -_'),
+                     4,
+                     length(trim(st.normalized_text, ' -_')) - 7
+                 ),
+                 ' -_'
+             ) = ''
+        THEN 2
+END";
+
+fn playback_type_select_expr(available: bool, path_expr: &str) -> String {
+    if !available {
+        return String::from("NULL AS playback_type");
+    }
+    format!(
+        "(
+            SELECT {classification}
+            FROM source_tags AS st
+            JOIN wav_file_tags AS wft ON wft.tag_id = st.id
+            WHERE wft.path = {path_expr}
+              AND ({classification}) IS NOT NULL
+            ORDER BY st.display_label COLLATE NOCASE ASC, st.normalized_text ASC
+            LIMIT 1
+        ) AS playback_type",
+        classification = PLAYBACK_TYPE_CLASSIFICATION,
+        path_expr = path_expr,
+    )
+}
+
+fn decode_playback_type(value: Option<i64>) -> Option<SourcePlaybackType> {
+    match value {
+        Some(1) => Some(SourcePlaybackType::Loop),
+        Some(2) => Some(SourcePlaybackType::OneShot),
+        _ => None,
+    }
 }
 
 fn optional_browser_column<'a>(
@@ -46,11 +92,20 @@ fn browser_metadata_snapshot_with_observer(
         super::super::schema::table_columns(&transaction, "wav_file_collections")?;
     statement_started();
     let metadata_columns = super::super::schema::table_columns(&transaction, "metadata")?;
+    statement_started();
+    let source_tag_columns = super::super::schema::table_columns(&transaction, "source_tags")?;
+    statement_started();
+    let wav_file_tag_columns = super::super::schema::table_columns(&transaction, "wav_file_tags")?;
     let capabilities = BrowserMetadataCapabilities {
         wav_columns,
         collection_memberships: collection_columns.contains("path")
             && collection_columns.contains("collection"),
         metadata_revision: metadata_columns.contains("key") && metadata_columns.contains("value"),
+        playback_type_catalog: source_tag_columns.contains("id")
+            && source_tag_columns.contains("display_label")
+            && source_tag_columns.contains("normalized_text")
+            && wav_file_tag_columns.contains("path")
+            && wav_file_tag_columns.contains("tag_id"),
     };
 
     let revision = if capabilities.metadata_revision {
@@ -80,8 +135,10 @@ fn browser_metadata_snapshot_with_observer(
         "collection",
         "NULL AS collection",
     );
+    let playback_type =
+        playback_type_select_expr(capabilities.playback_type_catalog, "wav_files.path");
     let sql = format!(
-        "SELECT path, {}, {}, {}, {}, {legacy_collection}, {}, {}, {}
+        "SELECT path, {}, {}, {}, {}, {legacy_collection}, {}, {}, {}, {playback_type}
          FROM wav_files
          WHERE {supported_filter}
          ORDER BY path ASC",
@@ -131,6 +188,7 @@ fn browser_metadata_snapshot_with_observer(
                     collections: legacy_collection,
                     last_played_at: row.get(3)?,
                     last_curated_at: row.get(4)?,
+                    playback_type: decode_playback_type(row.get(9)?),
                 }))
             })
             .map_err(map_sql_error)?
@@ -285,8 +343,15 @@ pub(crate) fn browser_metadata_rows_for_paths(
     let wav_columns = super::super::schema::table_columns(transaction, "wav_files")?;
     let collection_columns =
         super::super::schema::table_columns(transaction, "wav_file_collections")?;
+    let source_tag_columns = super::super::schema::table_columns(transaction, "source_tags")?;
+    let wav_file_tag_columns = super::super::schema::table_columns(transaction, "wav_file_tags")?;
     let memberships_available =
         collection_columns.contains("path") && collection_columns.contains("collection");
+    let playback_type_catalog = source_tag_columns.contains("id")
+        && source_tag_columns.contains("display_label")
+        && source_tag_columns.contains("normalized_text")
+        && wav_file_tag_columns.contains("path")
+        && wav_file_tag_columns.contains("tag_id");
     let supported_filter = if wav_columns.contains("extension") {
         crate::sample_sources::supported_audio_where_clause()
     } else {
@@ -294,12 +359,13 @@ pub(crate) fn browser_metadata_rows_for_paths(
     };
     let legacy_collection =
         optional_browser_column(&wav_columns, "collection", "NULL AS collection");
+    let playback_type = playback_type_select_expr(playback_type_catalog, "wav_files.path");
     let placeholders = (1..=paths.len())
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT path, {}, {}, {}, {}, {legacy_collection}, {}, {}, {}
+        "SELECT path, {}, {}, {}, {}, {legacy_collection}, {}, {}, {}, {playback_type}
              FROM wav_files
              WHERE {supported_filter} AND path IN ({placeholders})
              ORDER BY path ASC",
@@ -345,6 +411,7 @@ pub(crate) fn browser_metadata_rows_for_paths(
                     collections: legacy_collection,
                     last_played_at: row.get(3)?,
                     last_curated_at: row.get(4)?,
+                    playback_type: decode_playback_type(row.get(9)?),
                 },
             )))
         })
@@ -421,8 +488,16 @@ impl SourceDatabase {
         let wav_columns = super::super::schema::table_columns(&transaction, "wav_files")?;
         let collection_columns =
             super::super::schema::table_columns(&transaction, "wav_file_collections")?;
+        let source_tag_columns = super::super::schema::table_columns(&transaction, "source_tags")?;
+        let wav_file_tag_columns =
+            super::super::schema::table_columns(&transaction, "wav_file_tags")?;
         let memberships_available =
             collection_columns.contains("path") && collection_columns.contains("collection");
+        let playback_type_catalog = source_tag_columns.contains("id")
+            && source_tag_columns.contains("display_label")
+            && source_tag_columns.contains("normalized_text")
+            && wav_file_tag_columns.contains("path")
+            && wav_file_tag_columns.contains("tag_id");
         let supported_filter = if wav_columns.contains("extension") {
             crate::sample_sources::supported_audio_where_clause()
         } else {
@@ -432,8 +507,9 @@ impl SourceDatabase {
         };
         let legacy_collection =
             optional_browser_column(&wav_columns, "collection", "NULL AS collection");
+        let playback_type = playback_type_select_expr(playback_type_catalog, "wav_files.path");
         let sql = format!(
-            "SELECT path, {}, {}, {}, {}, {legacy_collection}, {}, {}, {}
+            "SELECT path, {}, {}, {}, {}, {legacy_collection}, {}, {}, {}, {playback_type}
              FROM wav_files
              WHERE {supported_filter} AND (?1 IS NULL OR path > ?1)
              ORDER BY path ASC LIMIT ?2",
@@ -482,6 +558,7 @@ impl SourceDatabase {
                                 collections: legacy_collection,
                                 last_played_at: row.get(3)?,
                                 last_curated_at: row.get(4)?,
+                                playback_type: decode_playback_type(row.get(9)?),
                             }),
                         ))
                     },

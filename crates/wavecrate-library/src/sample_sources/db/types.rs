@@ -221,6 +221,15 @@ impl SampleSoundType {
     }
 }
 
+/// Playback behavior inferred from canonical source tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourcePlaybackType {
+    /// A sample intended to repeat as a loop.
+    Loop,
+    /// A sample intended to play once.
+    OneShot,
+}
+
 /// Details about a wav file stored in a source database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WavEntry {
@@ -286,6 +295,8 @@ pub struct BrowserFileMetadata {
     pub last_played_at: Option<i64>,
     /// Epoch seconds of the most recent explicit curation decision, if any.
     pub last_curated_at: Option<i64>,
+    /// Playback behavior inferred from the file's canonical tags, if recognized.
+    pub playback_type: Option<SourcePlaybackType>,
 }
 
 /// Coherent browser metadata projection read from one committed SQLite snapshot.

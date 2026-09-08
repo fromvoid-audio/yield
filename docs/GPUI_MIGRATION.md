@@ -1069,3 +1069,17 @@ UI checks, formatting, and diff checks passed. Coverage includes exact playback
 path targeting, accepted origin selection, timestamp no-ops, and history/rating
 pending overlays and committed receipts in both orders. Passive-focus re-sorting
 preserves the loaded preview. Native audio/interaction acceptance remains pending.
+
+### Bounded playback-type catalog projection
+
+Browser metadata now carries a fixed-size optional Loop/OneShot classification
+from canonical tags. Snapshot, paged, exact-path, and committed-operation reads
+use the same ordering as the original tag model when recognized tags conflict.
+Legacy catalogs without tag tables return no classification. Canonical separator
+variants are recognized, while embedded-NUL labels are rejected.
+
+The projection adds no tag vectors to bounded operation receipts and no schema
+migration. Library browser/curation tests, catalog curation tests, UI projection
+tests, locked catalog/UI checks, formatting, and diff checks passed. Additional
+real-tag API coverage verifies plain oneshot and conflicting-label ordering.
+TYPE controls and transport policy remain subsequent integration work.

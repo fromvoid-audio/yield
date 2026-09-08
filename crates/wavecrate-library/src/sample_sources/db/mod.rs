@@ -68,8 +68,8 @@ pub use types::{
     SourceDirectoryTruthCleanup, SourceDirectoryTruthCursor, SourceDirectoryTruthPage,
     SourceDirectoryTruthPublication, SourceDirectoryTruthState,
     SourceDirectoryTruthUnavailableReason, SourceIndexClassification, SourceIndexDiagnostic,
-    SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourceTag, SourceTagUsage,
-    WavEntry,
+    SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag,
+    SourceTagUsage, WavEntry,
 };
 pub use util::normalize_relative_path;
 pub use write::{
