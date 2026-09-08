@@ -10,6 +10,7 @@ mod curation;
 mod folder_tree;
 mod last_played;
 mod playback_history;
+mod playback_type_filter;
 mod rating;
 mod rating_filter;
 mod selection;
@@ -27,6 +28,7 @@ pub use playback_history::{
     PLAYBACK_NAVIGATION_HISTORY_LIMIT, PlaybackHistoryEntry, PlaybackNavigationHistory,
     PlaybackSpan,
 };
+pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackTypeFilter};
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};
 pub use selection::BrowserSelection;
@@ -128,6 +130,8 @@ pub struct AudioFile {
     pub duration_seconds: Option<f32>,
     /// Sample rate reported by a container-level metadata probe.
     pub sample_rate: Option<u32>,
+    /// Optional catalog-owned playback classification; direct filesystem scans leave this unset.
+    pub playback_type: Option<PlaybackType>,
     /// Optional catalog-owned curation metadata; direct filesystem scans leave this unset.
     pub curation: Option<AudioFileCuration>,
 }
@@ -220,6 +224,7 @@ pub struct BrowserViewModel {
     folder_scope: FolderScope,
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
+    playback_type_filter: PlaybackTypeFilter,
     rows: Vec<BrowserRow>,
 }
 
@@ -233,6 +238,7 @@ impl BrowserViewModel {
             folder_scope: FolderScope::DirectOnly,
             collection_filter: None,
             rating_filter: RatingFilter::disabled(),
+            playback_type_filter: PlaybackTypeFilter::disabled(),
             rows: Vec::new(),
         };
         model.rebuild(entries);
@@ -267,6 +273,12 @@ impl BrowserViewModel {
     /// Return the active source rating filter, or a disabled filter when no level is selected.
     pub fn rating_filter(&self) -> RatingFilter {
         self.rating_filter
+    }
+
+    /// Return the active source playback-type filter, or a disabled filter when no type is
+    /// selected.
+    pub fn playback_type_filter(&self) -> PlaybackTypeFilter {
+        self.playback_type_filter
     }
 
     /// Return visible rows in display order.
@@ -344,16 +356,45 @@ impl BrowserViewModel {
         self.set_rating_filter(entries, next)
     }
 
-    /// Count each collection across the current name, folder, and rating scope.
+    /// Replace the playback-type filter while preserving query, folder, collection, rating, and
+    /// sort state.
+    pub fn set_playback_type_filter(
+        &mut self,
+        entries: &[AudioFile],
+        filter: PlaybackTypeFilter,
+    ) -> bool {
+        if self.playback_type_filter == filter {
+            return false;
+        }
+        self.playback_type_filter = filter;
+        self.rebuild(entries);
+        true
+    }
+
+    /// Toggle one playback-type filter chip and return whether the projection changed.
+    pub fn toggle_playback_type_filter(
+        &mut self,
+        entries: &[AudioFile],
+        playback_type: PlaybackType,
+    ) -> bool {
+        let next = self.playback_type_filter.toggled_type(playback_type);
+        self.set_playback_type_filter(entries, next)
+    }
+
+    /// Count each collection across the current name, folder, rating, and playback-type scope.
     ///
     /// The active collection filter is intentionally ignored so sidebar counts remain useful
     /// while a different collection is selected. Callers should cache this result and refresh it
-    /// when entries, query, folder, or rating scope changes rather than during row rendering.
+    /// when entries, query, folder, rating, or playback-type scope changes rather than during row
+    /// rendering.
     pub fn collection_counts(&self, entries: &[AudioFile]) -> [usize; COLLECTION_COUNT] {
         let query = self.query.trim().to_ascii_lowercase();
         let mut counts = [0; COLLECTION_COUNT];
         for entry in entries {
-            if !self.entry_matches_scope(entry, &query) || !self.entry_matches_rating(entry) {
+            if !self.entry_matches_scope(entry, &query)
+                || !self.entry_matches_rating(entry)
+                || !self.entry_matches_playback_type(entry)
+            {
                 continue;
             }
             let Some(curation) = entry.curation else {
@@ -429,6 +470,7 @@ impl BrowserViewModel {
                             .is_some_and(|curation| curation.has_collection(slot))
                     })
                     && self.entry_matches_rating(entry)
+                    && self.entry_matches_playback_type(entry)
             })
             .map(|(entry_index, entry)| {
                 (
@@ -479,6 +521,10 @@ impl BrowserViewModel {
             || entry
                 .curation
                 .is_some_and(|curation| self.rating_filter.matches(curation.rating()))
+    }
+
+    fn entry_matches_playback_type(&self, entry: &AudioFile) -> bool {
+        self.playback_type_filter.matches(entry.playback_type)
     }
 }
 
@@ -542,7 +588,24 @@ mod tests {
             byte_len,
             duration_seconds: None,
             sample_rate: None,
+            playback_type: None,
             curation: None,
+        }
+    }
+
+    fn typed_entry(
+        path: &str,
+        playback_type: Option<PlaybackType>,
+        curation: Option<AudioFileCuration>,
+    ) -> AudioFile {
+        AudioFile {
+            path: PathBuf::from(path),
+            relative_path: PathBuf::from(path),
+            byte_len: 1,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type,
+            curation,
         }
     }
 
@@ -633,6 +696,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(2, false, 0b0000_0001, None, None),
             },
             AudioFile {
@@ -641,6 +705,7 @@ mod tests {
                 byte_len: 2,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(-1, false, 0b0000_0010, None, None),
             },
             AudioFile {
@@ -649,6 +714,7 @@ mod tests {
                 byte_len: 3,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(1, false, 0b0000_0001, None, None),
             },
         ];
@@ -683,6 +749,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(-3, false, 0, None, None),
             },
             AudioFile {
@@ -691,6 +758,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(3, false, 0, None, None),
             },
             AudioFile {
@@ -699,6 +767,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(3, true, 0, None, None),
             },
             model_entry("/tmp/unknown.wav", 1),
@@ -733,6 +802,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(-1, false, 0b0000_0001, None, None),
             },
             AudioFile {
@@ -741,6 +811,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(-1, false, 0b0000_0010, None, None),
             },
             AudioFile {
@@ -749,6 +820,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(-1, false, 0b0000_0001, None, None),
             },
             AudioFile {
@@ -757,6 +829,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(1, false, 0b0000_0001, None, None),
             },
         ];
@@ -781,6 +854,114 @@ mod tests {
     }
 
     #[test]
+    fn playback_type_filter_toggles_independently_and_excludes_unknown_when_active() {
+        let entries = vec![
+            typed_entry("/tmp/one-shot.wav", Some(PlaybackType::OneShot), None),
+            typed_entry("/tmp/loop.wav", Some(PlaybackType::Loop), None),
+            typed_entry("/tmp/unknown.wav", None, None),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        assert_eq!(model.rows().len(), 3);
+
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::OneShot));
+        assert_eq!(model.playback_type_filter().mask(), 0b01);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::Loop));
+        assert_eq!(model.playback_type_filter().mask(), 0b11);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::OneShot));
+        assert_eq!(model.rows()[0].entry_index, 1);
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::Loop));
+        assert!(model.playback_type_filter().is_disabled());
+        assert_eq!(model.rows().len(), 3);
+    }
+
+    #[test]
+    fn playback_type_filter_intersects_other_scopes_and_collection_counts() {
+        let curation = |rating, collections| {
+            AudioFileCuration::from_parts(rating, false, collections, None, None)
+        };
+        let entries = vec![
+            typed_entry(
+                "kit/kick-one.wav",
+                Some(PlaybackType::OneShot),
+                curation(-1, 0b0000_0011),
+            ),
+            typed_entry(
+                "kit/kick-loop.wav",
+                Some(PlaybackType::Loop),
+                curation(-1, 0b0000_0110),
+            ),
+            typed_entry("kit/kick-unknown.wav", None, curation(-1, 0b0000_1001)),
+            typed_entry(
+                "other/kick-loop.wav",
+                Some(PlaybackType::Loop),
+                curation(-1, 0b0000_0001),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, "kick");
+        assert!(model.set_collection_filter(&entries, Some(1)));
+        assert!(model.toggle_rating_filter(&entries, -1));
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::Loop));
+
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(model.collection_counts(&entries), [0, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn playback_type_filter_restores_focus_after_the_focused_row_disappears() {
+        let entries = vec![
+            typed_entry("/tmp/one.wav", Some(PlaybackType::OneShot), None),
+            typed_entry("/tmp/loop.wav", Some(PlaybackType::Loop), None),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        let focused_id = entries[1].stable_id();
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::OneShot));
+        assert_eq!(model.restore_focus(Some(&focused_id), Some(1)), Some(0));
+    }
+
+    #[test]
+    fn playback_type_filter_survives_source_entry_replacement() {
+        let entries = vec![
+            typed_entry("/tmp/one.wav", Some(PlaybackType::OneShot), None),
+            typed_entry("/tmp/loop.wav", Some(PlaybackType::Loop), None),
+        ];
+        let replacement = vec![typed_entry(
+            "/tmp/reloaded-loop.wav",
+            Some(PlaybackType::Loop),
+            None,
+        )];
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::Loop));
+        model.set_entries(&replacement);
+
+        assert_eq!(model.playback_type_filter().mask(), 0b10);
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 0);
+    }
+
+    #[test]
     fn rating_filter_preserves_focus_position_when_focused_row_disappears() {
         let mut entries = vec![
             AudioFile {
@@ -789,6 +970,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(0, false, 0, None, None),
             },
             AudioFile {
@@ -797,6 +979,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(0, false, 0, None, None),
             },
         ];
@@ -821,6 +1004,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(1, false, 0b0000_0010, None, None),
             },
             AudioFile {
@@ -829,6 +1013,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: AudioFileCuration::from_parts(-1, false, 0b0000_0001, None, None),
             },
             AudioFile {
@@ -837,6 +1022,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: None,
             },
         ];
@@ -882,6 +1068,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: curation(Some(NOW - 2 * SECONDS_PER_DAY as i64)),
             },
             AudioFile {
@@ -890,6 +1077,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: curation(Some(NOW - 2 * SECONDS_PER_DAY as i64)),
             },
             AudioFile {
@@ -898,6 +1086,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: curation(Some(NOW - 1)),
             },
             AudioFile {
@@ -906,6 +1095,7 @@ mod tests {
                 byte_len: 1,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: curation(None),
             },
         ];
@@ -945,6 +1135,7 @@ mod tests {
                 byte_len: 30,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: None,
             },
             AudioFile {
@@ -953,6 +1144,7 @@ mod tests {
                 byte_len: 10,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: None,
             },
             AudioFile {
@@ -961,6 +1153,7 @@ mod tests {
                 byte_len: 20,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: None,
             },
         ];

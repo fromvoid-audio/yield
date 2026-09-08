@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{BorrowAppContext, Context};
-use wavecrate_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree};
+use wavecrate_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree, PlaybackType};
 use wavecrate_library::sample_sources::{
-    BrowserFileMetadata, SourceId, reconciliation::RootIdentity,
+    BrowserFileMetadata, SourceId, SourcePlaybackType, reconciliation::RootIdentity,
 };
 use wavecrate_session::{CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError};
 
@@ -812,6 +812,9 @@ fn project_catalog_event(
             byte_len: manifest.file_size,
             duration_seconds,
             sample_rate,
+            playback_type: curation_metadata
+                .get(&manifest.relative_path)
+                .and_then(playback_type_from_metadata),
             curation: curation_metadata
                 .get(&manifest.relative_path)
                 .and_then(curation_from_metadata),
@@ -851,6 +854,14 @@ fn project_catalog_event(
         facts,
         entry_indices: Arc::new(entry_indices),
     })
+}
+
+fn playback_type_from_metadata(metadata: &BrowserFileMetadata) -> Option<PlaybackType> {
+    match metadata.playback_type {
+        Some(SourcePlaybackType::OneShot) => Some(PlaybackType::OneShot),
+        Some(SourcePlaybackType::Loop) => Some(PlaybackType::Loop),
+        None => None,
+    }
 }
 
 fn curation_from_metadata(metadata: &BrowserFileMetadata) -> Option<AudioFileCuration> {
@@ -961,9 +972,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use wavecrate_catalog::CatalogWavMetadata;
-    use wavecrate_core::{AudioFile, FolderTree};
+    use wavecrate_core::{AudioFile, FolderTree, PlaybackType};
     use wavecrate_library::sample_sources::{
-        BrowserFileMetadata, Rating, SampleCollection, SourceId, db::SourceDirectoryEntry,
+        BrowserFileMetadata, Rating, SampleCollection, SourceId, SourcePlaybackType,
+        db::SourceDirectoryEntry,
     };
 
     #[test]
@@ -1072,7 +1084,7 @@ mod tests {
                     ],
                     last_played_at: Some(10),
                     last_curated_at: Some(11),
-                    playback_type: None,
+                    playback_type: Some(SourcePlaybackType::Loop),
                 },
             )]),
         };
@@ -1088,6 +1100,7 @@ mod tests {
         assert_eq!(entry.byte_len, 16);
         assert_eq!(entry.duration_seconds, Some(1.0));
         assert_eq!(entry.sample_rate, Some(48_000));
+        assert_eq!(entry.playback_type, Some(PlaybackType::Loop));
         let curation = entry.curation.expect("catalog curation metadata");
         assert_eq!(curation.rating().value(), 2);
         assert!(curation.rating().locked());
@@ -1180,6 +1193,7 @@ mod tests {
             byte_len: 10,
             duration_seconds: None,
             sample_rate: None,
+            playback_type: None,
             curation: None,
         }
         .stable_id();
@@ -1212,6 +1226,7 @@ mod tests {
                 byte_len: 10,
                 duration_seconds: None,
                 sample_rate: None,
+                playback_type: None,
                 curation: None,
             }],
             tree: FolderTree::default(),

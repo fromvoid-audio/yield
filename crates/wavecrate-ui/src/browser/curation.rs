@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use gpui::{ClickEvent, Context, ScrollStrategy, div, prelude::*, px};
 use wavecrate_core::{
     AudioFile, AudioFileCuration, AudioFileId, COLLECTION_COUNT, CurationAction,
-    CurationTransition, RATING_FILTER_LEVELS, RatingFilter, plan_curation_action,
+    CurationTransition, PLAYBACK_TYPE_FILTERS, PlaybackType, RATING_FILTER_LEVELS, RatingFilter,
+    plan_curation_action,
 };
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{
@@ -748,6 +749,99 @@ pub(super) fn render_collection_filters(
         .children(rows)
 }
 
+/// Render the two fixed playback-type filters for the active source.
+pub(super) fn render_playback_type_filters(
+    browser: &Browser,
+    theme: Theme,
+    cx: &mut Context<Browser>,
+) -> impl gpui::IntoElement {
+    let active_source = browser.active_source.is_some();
+    let active_filter = browser.view_model.playback_type_filter();
+    let hover_fill = color(theme.colors.selection_hover_fill);
+    let pressed_fill = color(theme.interaction.pressed_fill);
+    let chip_width = ((theme.spacing.sidebar_width
+        - theme.spacing.panel_padding * 2.0
+        - theme.spacing.control_gap * (PLAYBACK_TYPE_FILTERS.len().saturating_sub(1) as f32))
+        / PLAYBACK_TYPE_FILTERS.len() as f32)
+        .max(18.0);
+    let chips = PLAYBACK_TYPE_FILTERS
+        .into_iter()
+        .enumerate()
+        .map(|(index, playback_type)| {
+            let selected = active_filter.contains_type(playback_type);
+            let label = playback_type_filter_label(playback_type);
+            div()
+                .id(("playback-type-filter", index))
+                .flex()
+                .flex_none()
+                .w(px(chip_width))
+                .h(px(theme.spacing.row_height))
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .rounded(px(3.0))
+                .bg(if selected {
+                    color(theme.colors.selection_fill)
+                } else {
+                    transparent()
+                })
+                .hover(move |style| style.bg(hover_fill))
+                .active(move |style| style.bg(pressed_fill))
+                .when(!active_source, |element| element.opacity(0.45))
+                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                    if active_source {
+                        view.toggle_playback_type_filter(playback_type, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .text_size(px(theme.typography.small_size))
+                        .text_color(if selected {
+                            color(theme.colors.text_primary)
+                        } else {
+                            color(theme.colors.text_muted)
+                        })
+                        .child(label),
+                )
+        })
+        .collect::<Vec<_>>();
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .pb(px(theme.spacing.control_gap))
+        .border_t(px(theme.spacing.border_width))
+        .border_color(color(theme.colors.border))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(theme.spacing.row_height))
+                .px(px(theme.spacing.panel_padding))
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.text_muted))
+                .child("TYPE"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .w_full()
+                .px(px(theme.spacing.panel_padding))
+                .gap(px(theme.spacing.control_gap))
+                .children(chips),
+        )
+}
+
+fn playback_type_filter_label(playback_type: PlaybackType) -> &'static str {
+    match playback_type {
+        PlaybackType::OneShot => "1-SHOT",
+        PlaybackType::Loop => "LOOP",
+    }
+}
+
 /// Render the eight fixed rating filters for the active source.
 pub(super) fn render_rating_filters(
     browser: &Browser,
@@ -1000,6 +1094,29 @@ impl Browser {
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.restore_projection_focus(previous_id, previous_position, cx);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_playback_type_filter(
+        &mut self,
+        playback_type: PlaybackType,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_source.is_none() {
+            return;
+        }
+        let previous_id = self.browser_focus_id();
+        let previous_position = self.selected_visible_position();
+        self.context_menu = None;
+        if !self
+            .view_model
+            .toggle_playback_type_filter(&self.entries, playback_type)
+        {
+            return;
+        }
+        self.refresh_collection_filter_counts();
+        self.reconcile_selection();
+        self.restore_metadata_projection_focus(previous_id, previous_position, cx);
         cx.notify();
     }
 
@@ -1529,6 +1646,7 @@ mod tests {
             byte_len: 1,
             duration_seconds: Some(1.0),
             sample_rate: Some(48_000),
+            playback_type: None,
             curation: Some(curation(value, locked, collections)),
         }
     }
@@ -2134,6 +2252,18 @@ mod tests {
             vec![0, 1]
         );
         assert_eq!(model.collection_counts(&entries), [1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn curation_patch_preserves_projected_playback_type() {
+        let path = PathBuf::from("loop.wav");
+        let mut entries = vec![entry("loop.wav", 0, false, 0)];
+        entries[0].playback_type = Some(PlaybackType::Loop);
+        let patches = BTreeMap::from([(path, curation(1, false, 0b0000_0001))]);
+        patch_visible_entries(&mut entries, &patches, None, RatingFilter::disabled(), None);
+
+        assert_eq!(entries[0].playback_type, Some(PlaybackType::Loop));
+        assert_eq!(entries[0].curation, Some(curation(1, false, 0b0000_0001)));
     }
 
     #[test]

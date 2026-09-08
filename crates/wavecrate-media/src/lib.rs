@@ -173,6 +173,7 @@ pub fn enumerate_audio_files_with_cancel(
                 byte_len,
                 duration_seconds: probe.as_ref().and_then(|value| value.duration_seconds),
                 sample_rate: probe.and_then(|value| value.sample_rate),
+                playback_type: None,
                 curation: None,
             });
         }
@@ -471,6 +472,7 @@ mod tests {
         );
         assert_eq!(scan.files[1].relative_path, PathBuf::from("root.wav"));
         assert_eq!(scan.files[1].duration_seconds, Some(1.0));
+        assert_eq!(scan.files[1].playback_type, None);
         assert!(scan.directories.contains(&PathBuf::from(".")));
         assert!(scan.directories.contains(&PathBuf::from("nested")));
     }

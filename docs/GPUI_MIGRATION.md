@@ -1083,3 +1083,20 @@ migration. Library browser/curation tests, catalog curation tests, UI projection
 tests, locked catalog/UI checks, formatting, and diff checks passed. Additional
 real-tag API coverage verifies plain oneshot and conflicting-label ordering.
 TYPE controls and transport policy remain subsequent integration work.
+
+### TYPE filters and catalog classification in the browser
+
+The sidebar now provides independent 1-SHOT and LOOP filters above RATING. With
+both cleared, all files remain eligible; enabled filters require recognized
+catalog metadata. TYPE intersects folder, name, collection, and rating filters,
+and collection counts honor TYPE while ignoring the selected collection slot.
+The runtime filter survives source entry replacement without adding preferences.
+
+Catalog classification maps into a pure core value. Lazy WAV display patches and
+curation updates retain that value. Context menus fence their captured TYPE state.
+Filter reconciliation uses the existing metadata-focus path, preserving a passive
+focused row and the loaded preview when that focused row remains visible.
+
+Validation: 70 core tests, 137 UI tests (one ignored), and 18 media tests passed;
+formatting and diff checks passed. Native interaction acceptance remains pending.
+The sortable column and automatic transport policy follow separately.

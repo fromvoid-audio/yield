@@ -12,7 +12,8 @@ use gpui::{
     Point, Window, anchored, deferred, div, prelude::*, px,
 };
 use wavecrate_core::{
-    AudioFileCuration, AudioFileId, CurationAction, FolderScope, MAX_RATING, RatingFilter, SortSpec,
+    AudioFileCuration, AudioFileId, CurationAction, FolderScope, MAX_RATING, PlaybackTypeFilter,
+    RatingFilter, SortSpec,
 };
 use wavecrate_design::Theme;
 use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
@@ -63,6 +64,7 @@ struct ContextMenuTarget {
     folder_scope: FolderScope,
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
+    playback_type_filter: PlaybackTypeFilter,
     sort: SortSpec,
     entry_index: usize,
     visible_position: usize,
@@ -113,9 +115,16 @@ impl ContextMenuTarget {
             && browser.view_model.query() == self.query
             && browser.view_model.folder().map(Path::to_path_buf) == self.folder
             && browser.view_model.folder_scope() == self.folder_scope
-            && browser.view_model.collection_filter() == self.collection_filter
-            && browser.view_model.rating_filter() == self.rating_filter
-            && browser.view_model.sort() == self.sort
+            && view_filter_fence_matches(
+                self.collection_filter,
+                self.rating_filter,
+                self.playback_type_filter,
+                self.sort,
+                browser.view_model.collection_filter(),
+                browser.view_model.rating_filter(),
+                browser.view_model.playback_type_filter(),
+                browser.view_model.sort(),
+            )
             && browser
                 .view_model
                 .rows()
@@ -212,6 +221,7 @@ impl Browser {
                 folder_scope: self.view_model.folder_scope(),
                 collection_filter: self.view_model.collection_filter(),
                 rating_filter: self.view_model.rating_filter(),
+                playback_type_filter: self.view_model.playback_type_filter(),
                 sort: self.view_model.sort(),
                 entry_index,
                 visible_position,
@@ -347,6 +357,22 @@ fn projection_fence_matches(
         && captured_lifecycle_generation == current_lifecycle_generation
         && captured_root == current_root
         && Arc::ptr_eq(captured_entry_indices, current_entry_indices)
+}
+
+fn view_filter_fence_matches(
+    captured_collection: Option<usize>,
+    captured_rating: RatingFilter,
+    captured_playback_type: PlaybackTypeFilter,
+    captured_sort: SortSpec,
+    current_collection: Option<usize>,
+    current_rating: RatingFilter,
+    current_playback_type: PlaybackTypeFilter,
+    current_sort: SortSpec,
+) -> bool {
+    captured_collection == current_collection
+        && captured_rating == current_rating
+        && captured_playback_type == current_playback_type
+        && captured_sort == current_sort
 }
 
 fn context_selection_effect(
@@ -566,11 +592,14 @@ mod tests {
         ContextMenuAction, ContextSelectionEffect, MenuKeyEffect, context_menu_actions,
         context_selection_effect, dismiss_menu_state, format_copy_path, menu_key_effect,
         next_action_index, previous_action_index, projection_fence_matches, unlock_paths,
+        view_filter_fence_matches,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use wavecrate_core::{AudioFileCuration, MAX_RATING};
+    use wavecrate_core::{
+        AudioFileCuration, MAX_RATING, PlaybackType, PlaybackTypeFilter, RatingFilter, SortSpec,
+    };
     use wavecrate_library::sample_sources::SourceId;
 
     #[test]
@@ -668,6 +697,32 @@ mod tests {
             4,
             &root,
             &replacement_indices,
+        ));
+    }
+
+    #[test]
+    fn stale_view_fence_rejects_playback_type_filter_changes() {
+        let one_shot = PlaybackTypeFilter::disabled().toggled_type(PlaybackType::OneShot);
+        let looped = one_shot.toggled_type(PlaybackType::Loop);
+        assert!(view_filter_fence_matches(
+            Some(1),
+            RatingFilter::disabled(),
+            one_shot,
+            SortSpec::default(),
+            Some(1),
+            RatingFilter::disabled(),
+            one_shot,
+            SortSpec::default(),
+        ));
+        assert!(!view_filter_fence_matches(
+            Some(1),
+            RatingFilter::disabled(),
+            one_shot,
+            SortSpec::default(),
+            Some(1),
+            RatingFilter::disabled(),
+            looped,
+            SortSpec::default(),
         ));
     }
 

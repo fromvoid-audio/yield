@@ -281,6 +281,7 @@ mod tests {
             byte_len: 1,
             duration_seconds: None,
             sample_rate: None,
+            playback_type: None,
             curation: None,
         }
     }
