@@ -1859,3 +1859,9 @@ A clean detached `e5fb7b212` snapshot built `target/qa/Wavecrate BPM Preview e5f
 A separate transient toolbar toggle now paints the internal beat divisions of the current play region using the shared beat count. The bounded projection follows live selection changes and clips through the waveform viewport, without invalidating waveform caches. It remains independent from BPM snapping. Separate edit-selection guides await the edit-selection workflow.
 
 Validation: 35 focused waveform tests passed with one existing ignored test, and the UI check, formatting and diff checks passed. Primary inspection corrected guide-height clamping for subpixel-height canvases. Native visual acceptance remains pending.
+
+### Windows media read consistency
+
+The first Windows workflow run (`34286241825`) exposed three stale-source test failures. Windows media reads now retain a descriptor that shares reading/deletion but excludes data writers for the complete decode/export operation. Existing writers reject admission; concurrent writes cannot pass unnoticed while Windows defers file-time publication. Identity/revision checks still detect replacement. The shared library change-marker format remains unchanged. Tests close completed mutations before inspecting their revision and exercise Windows writer exclusion and lease release.
+
+Validation: all 39 media tests passed on macOS and the media check passed. The Windows share-mode API compiled in isolation; full local cross-checking remains blocked by the SQLite C toolchain. Primary acceptance added the direct Windows dependency and corrected a wrapped-error assertion. Independent review found no production/lifetime issue and requested in-operation replacement coverage; the added Windows sink fixture verifies replacement succeeds under delete sharing and export rejects the stale source. A fresh native Windows CI run follows.

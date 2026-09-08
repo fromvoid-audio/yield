@@ -7114,6 +7114,7 @@ dependencies = [
  "wavecrate-analysis",
  "wavecrate-core",
  "wavecrate-library",
+ "windows 0.62.2",
 ]
 
 [[package]]

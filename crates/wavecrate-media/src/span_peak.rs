@@ -568,6 +568,7 @@ mod tests {
         source.write_all(&[0x7f]).expect("mutate WAV payload");
         source.flush().expect("flush WAV payload");
         assert!(load_wav_span_peak(&refreshed_request).is_err());
+        drop(source);
 
         let truncated_context = context_for(&path);
         let truncated_request = WavSpanPeakRequest::from_frames(truncated_context, 0, 3).unwrap();

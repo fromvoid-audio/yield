@@ -218,6 +218,9 @@ impl FileObservation {
 }
 
 /// A WAV reader whose original descriptor remains retained for identity fencing.
+///
+/// On Windows, the retained descriptor also denies concurrent data writers for the duration of
+/// the operation while allowing replacement detection through delete sharing.
 pub(super) struct OpenWav {
     pub(super) file: File,
     pub(super) reader: hound::WavReader<BufReader<File>>,
@@ -226,11 +229,30 @@ pub(super) struct OpenWav {
     pub(super) observation: FileObservation,
 }
 
+fn open_wav_source(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+        // Keep a read lease for the complete operation. Sharing delete preserves replacement
+        // detection through the retained descriptor while denying concurrent data writers.
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_DELETE).0)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 pub(super) fn open_wav(path: &Path, cancellation: Option<&AtomicBool>) -> Result<OpenWav, String> {
     if is_cancelled(cancellation) {
         return Err(String::from("waveform preview canceled"));
     }
-    let file = File::open(path)
+    let file = open_wav_source(path)
         .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))?;
     let observation = observe_file(path, &file)?;
     if is_cancelled(cancellation) {
@@ -299,7 +321,7 @@ pub(super) fn recheck_wav(
         return Err(String::from("waveform preview canceled"));
     }
     let retained_observation = observe_file(path, retained_file)?;
-    let file = File::open(path)
+    let file = open_wav_source(path)
         .map_err(|error| format!("failed to revalidate WAV {}: {error}", path.display()))?;
     let observation = observe_file(path, &file)?;
     let reader_file = file

@@ -864,11 +864,75 @@ mod tests {
             .expect("postread stale request");
         let mut output = MutateSourceSink::new(&path);
         let error = export_wav_span(&request, &mut output).expect_err("postread stale source");
+        #[cfg(windows)]
+        {
+            assert!(output.mutation_denied);
+            assert!(
+                error.contains("source mutation") || error.contains("denied"),
+                "{error}"
+            );
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("source read lease must release after export");
+        }
+        #[cfg(not(windows))]
         assert!(
             error.contains("stale") || error.contains("changed"),
             "{error}"
         );
         assert!(!output.inner.get_ref().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_export_releases_source_read_lease() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("read-lease.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        write_int_wav(&path, spec, &[1, 2, 3]);
+        let request = WavSpanExportRequest::from_frames(context_for(&path), 0, 3)
+            .expect("read lease request");
+        let mut output = Cursor::new(Vec::new());
+        export_wav_span(&request, &mut output).expect("successful export");
+
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("source read lease must release after successful export");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_after_export_starts_is_rejected_by_retained_identity() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("replacement-source.wav");
+        let replacement = directory.path().join("replacement.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        write_int_wav(&path, spec, &[1, 2, 3]);
+        write_int_wav(&replacement, spec, &[4, 5, 6]);
+        let request = WavSpanExportRequest::from_frames(context_for(&path), 0, 3)
+            .expect("replacement request");
+        let mut output = ReplaceSourceSink::new(&path, &replacement);
+        let error = export_wav_span(&request, &mut output).expect_err("replacement must stale");
+
+        assert!(output.replaced, "replacement rename must succeed");
+        assert!(path.is_file(), "replacement must occupy the source path");
+        assert!(!replacement.exists(), "replacement path must be consumed");
+        assert!(
+            error.contains("stale") || error.contains("replaced"),
+            "{error}"
+        );
     }
 
     struct CancelAfterWrites<'a> {
@@ -1010,6 +1074,7 @@ mod tests {
         inner: Cursor<Vec<u8>>,
         source: std::path::PathBuf,
         writes: usize,
+        mutation_denied: bool,
     }
 
     impl MutateSourceSink {
@@ -1018,6 +1083,7 @@ mod tests {
                 inner: Cursor::new(Vec::new()),
                 source: source.to_path_buf(),
                 writes: 0,
+                mutation_denied: false,
             }
         }
     }
@@ -1027,7 +1093,16 @@ mod tests {
             self.writes += 1;
             let written = self.inner.write(bytes)?;
             if self.writes == 2 {
-                let mut source = OpenOptions::new().write(true).open(&self.source)?;
+                let mut source = match OpenOptions::new().write(true).open(&self.source) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.mutation_denied = true;
+                        return Err(Error::new(
+                            error.kind(),
+                            format!("source mutation denied during export: {error}"),
+                        ));
+                    }
+                };
                 source.seek(SeekFrom::End(-1))?;
                 source.write_all(&[0x7f])?;
                 source.flush()?;
@@ -1041,6 +1116,52 @@ mod tests {
     }
 
     impl Seek for MutateSourceSink {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[cfg(windows)]
+    struct ReplaceSourceSink {
+        inner: Cursor<Vec<u8>>,
+        source: std::path::PathBuf,
+        replacement: std::path::PathBuf,
+        writes: usize,
+        replaced: bool,
+    }
+
+    #[cfg(windows)]
+    impl ReplaceSourceSink {
+        fn new(source: &Path, replacement: &Path) -> Self {
+            Self {
+                inner: Cursor::new(Vec::new()),
+                source: source.to_path_buf(),
+                replacement: replacement.to_path_buf(),
+                writes: 0,
+                replaced: false,
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Write for ReplaceSourceSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            let written = self.inner.write(bytes)?;
+            if self.writes == 2 {
+                fs::rename(&self.replacement, &self.source)?;
+                self.replaced = true;
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[cfg(windows)]
+    impl Seek for ReplaceSourceSink {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(position)
         }

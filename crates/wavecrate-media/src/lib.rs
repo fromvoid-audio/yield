@@ -894,17 +894,19 @@ mod tests {
                 .expect("refreshed request");
         let source_len = std::fs::metadata(&path).expect("detail metadata").len();
         let original_modified = refreshed_context.file_revision.modified_time;
-        let mut source = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .expect("open detail source for in-place mutation");
-        source.seek(SeekFrom::End(-1)).expect("seek detail payload");
-        source.write_all(&[0x7f]).expect("mutate detail payload");
-        source.flush().expect("flush detail payload");
-        if let Some(original_modified) = original_modified {
-            source
-                .set_times(FileTimes::new().set_modified(original_modified))
-                .expect("restore detail modified time");
+        {
+            let mut source = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open detail source for in-place mutation");
+            source.seek(SeekFrom::End(-1)).expect("seek detail payload");
+            source.write_all(&[0x7f]).expect("mutate detail payload");
+            source.flush().expect("flush detail payload");
+            if let Some(original_modified) = original_modified {
+                source
+                    .set_times(FileTimes::new().set_modified(original_modified))
+                    .expect("restore detail modified time");
+            }
         }
         assert_eq!(
             std::fs::metadata(&path)
@@ -944,5 +946,28 @@ mod tests {
         let truncated = load_waveform_detail(&refreshed_request)
             .expect_err("truncated source must reject detail");
         assert!(!truncated.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detail_rejects_preexisting_writer_and_releases_read_lease() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("detail-read-lease.wav");
+        write_fixture(&path);
+        let context = load_waveform_preview(&path)
+            .expect("overview")
+            .detail_context
+            .expect("strong overview context");
+        let request = WaveformDetailRequest::new(context, 0, 1_024, 1_024).expect("detail request");
+
+        let source = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open source writer");
+        let error = load_waveform_detail(&request).expect_err("writer must block detail read");
+        assert!(error.starts_with("WAV detail failed"), "{error}");
+        drop(source);
+
+        load_waveform_detail(&request).expect("detail read lease must release after failure");
     }
 }
