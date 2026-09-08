@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod bpm_snap;
 mod curation;
 mod folder_tree;
 mod last_played;
@@ -22,6 +23,7 @@ mod tag_input;
 mod waveform_region;
 mod waveform_viewport;
 
+pub use bpm_snap::snap_resize_ratio_to_whole_bpm;
 pub use curation::{CurationAction, CurationTransition, plan_curation_action};
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
