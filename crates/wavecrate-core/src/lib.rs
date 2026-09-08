@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod curation;
 mod folder_tree;
 mod playback_history;
 mod rating;
@@ -12,6 +13,7 @@ mod selection;
 mod waveform_region;
 mod waveform_viewport;
 
+pub use curation::{CurationAction, CurationTransition, plan_curation_action};
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
 };

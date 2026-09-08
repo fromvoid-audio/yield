@@ -899,3 +899,12 @@ verified audit preservation of seeded ratings, multiple memberships, accurate
 counts, collection/query intersections, passive sorting without autoplay, visible
 sort arrows, and empty-result text. The app quit cleanly. This slice displays and
 filters curation; editing shortcuts and filesystem trash remain follow-on work.
+
+### Pure curation action planning, 2026-09-08
+
+The core crate now plans rating adjustments, independent per-row collection
+toggles, and unlocking a maximum keep rating. Plans preserve unrelated metadata
+and timestamps; persistence assigns the actual curation time. Invalid collection
+slots and no-op actions remain unchanged, while the negative threshold delegates
+to the filesystem transaction layer. All 48 core tests and the locked core check
+passed. Browser command admission and editing controls are the next integration.
