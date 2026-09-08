@@ -1821,3 +1821,5 @@ Sample rows now start a native copy drag after bounded background preparation. A
 Capture-phase presses, pointer release, Escape, and source/selection/projection changes cancel unadmitted work. Gesture/request identities keep delayed callbacks from clearing newer drags. Native admission borrows the actual window, reuses the prepared paths across retries, and explicitly starts completion polling. AppKit owns retained native resources independently of the themed GPUI ghost. Windows browser activation remains gated on a separate deferred-call integration.
 
 Validation: the broader UI suite passed 262 tests with one existing ignored test before the final review corrections. After correcting retry allocations and replacement-link acceptance, all 13 focused drag tests, the UI check, formatting and diff checks passed. Independent re-review confirmed both findings resolved with no new issue. Native macOS drag acceptance remains pending.
+
+A clean detached `ed4f6fcc0` snapshot built `target/qa/Wavecrate Drag Preview ed4f6fc.app` in 43.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
