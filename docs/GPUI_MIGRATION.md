@@ -1771,3 +1771,11 @@ Validation: 13 library vocabulary tests, six session vocabulary-service tests, t
 The source database can now project metadata names for at most 64 requested paths at one exact revision. It preserves native tag ordering and first-playback-tag selection, returns disk-fallback markers for empty labels, and limits each label to 4096 UTF-8 bytes and 64 tag rows plus an overflow sentinel. Legacy malformed or oversized text is bounded before decoding and explicitly marked as truncated. Reads preserve assignments and the source revision.
 
 Validation: all 28 tag-module tests and the library check passed, including independent malformed-text fixtures, path budgets, typed stale revisions, SQL cancellation/recovery, and query-plan inspection. SQLite seeks assignments by path and may use a temporary B-tree for exact per-path ordering; cancellation remains active during that work. Catalog delivery and the Disk/Label UI follow separately.
+
+### Dictionary definition removal and scoped undo
+
+The Tag Editor now offers removal for positively loaded canonical, unlocked profile definitions, with a tooltip identifying the dictionary-only action. Source assignments remain intact and confirmed source-only values are marked Local. The last successful removal retains one bounded before-image and an explicit Undo removal control. Restore requires the exact removal revision and never rebases over subsequent dictionary edits.
+
+Dictionary requests survive panel/source/page changes. Category writes also retain their admitted request across resets; stale-context completion refreshes the current panel without grafting old row data. Removal and restoration invalidate active completion results. The undo control occupies its own row to fit the compact sidebar.
+
+Validation: two dictionary-state tests, nine tag-panel tests, the completion refresh regression, UI test compilation, formatting and diff checks passed. Request retention across panel resets was code-reviewed; no new end-to-end GPUI lifecycle fixture was added. Backend session tests cover stale revision rejection. Native interaction acceptance remains pending, and this scoped undo does not implement global assignment deletion or application-wide undo.

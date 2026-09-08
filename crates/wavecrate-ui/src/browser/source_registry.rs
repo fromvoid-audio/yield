@@ -7,9 +7,9 @@ use wavecrate_library::sample_sources::SampleSource;
 use wavecrate_session::{
     CanonicalSourceRoot, CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
     PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
-    ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
-    ProfileTagVocabularySetReceipt, RegistryEvent, RequestId, SourceRegistryService, SubmitError,
-    VocabularyRequest, VocabularyStatus, VocabularySubmitError,
+    ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
+    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt, RegistryEvent, RequestId,
+    SourceRegistryService, SubmitError, VocabularyRequest, VocabularyStatus, VocabularySubmitError,
 };
 
 /// The app-owned source registry service.
@@ -133,6 +133,18 @@ impl SourceRegistryGlobal {
             .as_ref()
             .ok_or(VocabularySubmitError::Closed)?
             .set_profile_tag_category(expected_revision, label, category)
+    }
+
+    /// Submit deletion of one exact profile vocabulary label at a matching revision.
+    pub(crate) fn delete_profile_tag_vocabulary(
+        &self,
+        expected_revision: u64,
+        label: String,
+    ) -> Result<VocabularyRequest<ProfileTagVocabularyDeleteReceipt>, VocabularySubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(VocabularySubmitError::Closed)?
+            .delete_profile_tag_vocabulary(expected_revision, label)
     }
 
     /// Submit one typed catalog command through the profile-owned session service.

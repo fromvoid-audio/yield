@@ -205,6 +205,28 @@ pub(super) fn on_rejected(browser: &mut Browser, cx: &mut Context<Browser>) {
     cx.notify();
 }
 
+/// Refresh an active completion after a profile dictionary mutation while preserving its draft.
+pub(super) fn invalidate_profile_vocabulary(browser: &mut Browser, cx: &mut Context<Browser>) {
+    if !reset_query_for_profile_mutation(&mut browser.tag_completion) {
+        return;
+    }
+    clear_completion_ghost(browser, cx);
+    browser.start_source_registry_poll(cx);
+}
+
+fn reset_query_for_profile_mutation(state: &mut TagCompletionState) -> bool {
+    let Some(query) = state.desired.clone() else {
+        return false;
+    };
+    state.bump_generation();
+    state.set_query(Some(QueryIntent {
+        draft_generation: state.draft_generation,
+        prefix: query.prefix,
+        context: query.context,
+    }));
+    true
+}
+
 /// Return whether a completion request or admitted retry still needs polling.
 pub(super) fn has_pending(browser: &Browser) -> bool {
     browser.tag_completion.source_pending.is_some()
@@ -1188,14 +1210,14 @@ mod tests {
         MAX_CURSOR_HISTORY, MergedCandidate, ProfilePageWindow, SelectionDirection,
         SourcePageWindow, StreamCheckpoint, TagCompletionState, apply_stream_checkpoint,
         candidate_is_current, install_source_page, merge_ready_page, next_selection,
-        normalized_completion_prefix, push_page_history,
+        normalized_completion_prefix, push_page_history, reset_query_for_profile_mutation,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tempfile::{TempDir, tempdir};
     use wavecrate_library::sample_sources::{
-        ProfileTagCategory, ProfileTagVocabularyEntry, SourceDatabase, SourceTagPage,
-        SourceTagPageEntry,
+        ProfileTagCategory, ProfileTagVocabularyEntry, SourceDatabase, SourceId, SourceTagPage,
+        SourceTagPageEntry, reconciliation::RootIdentity,
     };
 
     #[test]
@@ -1208,6 +1230,38 @@ mod tests {
         assert_eq!(normalized_completion_prefix("kick;warm"), None);
         assert_eq!(normalized_completion_prefix("kick\nwarm"), None);
         assert_eq!(normalized_completion_prefix("---"), None);
+    }
+
+    #[test]
+    fn profile_mutation_refresh_preserves_draft_and_fences_old_pages() {
+        let context = super::tags::TagSubmissionContext {
+            source_id: SourceId::from_string("source"),
+            lifecycle_generation: 2,
+            root: PathBuf::from("/source"),
+            root_identity: RootIdentity::from_bytes(b"root".to_vec()),
+            directory_generation: 3,
+            revision: 4,
+            paths: vec![PathBuf::from("one.wav")],
+        };
+        let mut state = TagCompletionState::default();
+        state.draft_generation = 7;
+        state.desired = Some(super::QueryIntent {
+            draft_generation: 7,
+            prefix: String::from("warm"),
+            context: context.clone(),
+        });
+        state.pager.merged_page = vec![MergedCandidate::Profile {
+            label: String::from("warm").to_owned(),
+        }];
+
+        assert!(reset_query_for_profile_mutation(&mut state));
+        let query = state.desired.as_ref().expect("query remains active");
+        assert_eq!(query.draft_generation, 8);
+        assert_eq!(query.prefix, "warm");
+        assert_eq!(query.context, context);
+        assert!(state.pager.merged_page.is_empty());
+        assert!(state.source_target.is_some());
+        assert!(state.profile_target.is_some());
     }
 
     #[test]

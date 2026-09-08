@@ -47,6 +47,7 @@ mod source_recovery;
 mod source_registry;
 mod tag_chips;
 mod tag_completion;
+mod tag_dictionary;
 mod tag_filter;
 mod tag_library;
 mod tag_pager;
@@ -302,6 +303,7 @@ pub(crate) struct Browser {
     curation_state: curation::CurationState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
+    tag_dictionary: tag_dictionary::TagDictionaryState,
     tag_library: tag_library::TagLibraryState,
     tag_filter: tag_filter::TagFilterState,
     tag_chips: tag_chips::TagChipsState,
@@ -492,6 +494,7 @@ impl Browser {
             curation_state: curation::CurationState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
+            tag_dictionary: tag_dictionary::TagDictionaryState::default(),
             tag_library: tag_library::TagLibraryState::default(),
             tag_filter: tag_filter::TagFilterState::default(),
             tag_chips: tag_chips::TagChipsState::default(),

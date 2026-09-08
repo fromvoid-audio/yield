@@ -57,6 +57,7 @@ pub(super) struct TagLibraryState {
     assignment_counts: BTreeMap<i64, u64>,
     profile_lookup_pending: Option<PendingProfileLookup>,
     profile_lookup_target: Option<ProfileLookupTarget>,
+    profile_lookup_state: ProfileLookupState,
     profile_categories: BTreeMap<String, ProfileTagCategory>,
     profile_revision: Option<u64>,
     metadata_retry_ticks: u8,
@@ -89,6 +90,7 @@ impl Default for TagLibraryState {
             assignment_counts: BTreeMap::new(),
             profile_lookup_pending: None,
             profile_lookup_target: None,
+            profile_lookup_state: ProfileLookupState::NotRequested,
             profile_categories: BTreeMap::new(),
             profile_revision: None,
             metadata_retry_ticks: 0,
@@ -173,6 +175,28 @@ struct PendingCategoryWrite {
     label: String,
     category: ProfileTagCategory,
     request: VocabularyRequest<ProfileTagVocabularySetReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileLookupState {
+    NotRequested,
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileDefinitionStatus {
+    Pending,
+    Failed,
+    KnownAbsent,
+    Known(ProfileTagCategory),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DefinitionRemovalTarget {
+    label: String,
+    category: ProfileTagCategory,
 }
 
 /// Lightweight row payload retained by GPUI while a category drag is active.
@@ -263,7 +287,7 @@ pub(super) fn cancel_for_source_change(browser: &mut Browser) {
     browser.tag_library.counts_target = None;
     browser.tag_library.profile_lookup_pending = None;
     browser.tag_library.profile_lookup_target = None;
-    browser.tag_library.category_pending = None;
+    browser.tag_library.profile_lookup_state = ProfileLookupState::NotRequested;
     browser.tag_library.source_ready = false;
     browser.tag_library.profile_ready = false;
     browser.tag_library.page_materialized = false;
@@ -284,7 +308,8 @@ pub(super) fn cancel_for_source_change(browser: &mut Browser) {
 /// Return whether panel work needs the shared source registry poll lane.
 pub(super) fn has_pending(browser: &Browser) -> bool {
     let state = &browser.tag_library;
-    state.category_pending.is_some()
+    browser.tag_dictionary.has_pending()
+        || state.category_pending.is_some()
         || (state.open
             && (state.source_pending.is_some()
                 || state.source_target.is_some()
@@ -303,6 +328,7 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
     changed |= poll_profile_page(browser);
     changed |= poll_profile_lookup(browser);
     changed |= poll_category_write(browser, cx);
+    changed |= super::tag_dictionary::poll(browser, cx);
     if !browser.tag_library.open {
         return changed;
     }
@@ -384,6 +410,7 @@ fn capture_target(browser: &mut Browser) -> bool {
     browser.tag_library.pager.current_checkpoint = Some(StreamCheckpoint::initial());
     browser.tag_library.assignment_counts.clear();
     browser.tag_library.profile_categories.clear();
+    browser.tag_library.profile_lookup_state = ProfileLookupState::NotRequested;
     browser.tag_library.profile_revision = None;
     browser.tag_library.dragged = None;
     true
@@ -405,6 +432,7 @@ impl TagLibraryState {
         self.assignment_counts.clear();
         self.profile_categories.clear();
         self.profile_lookup_target = None;
+        self.profile_lookup_state = ProfileLookupState::NotRequested;
         self.profile_revision = None;
         self.metadata_retry_ticks = 0;
         self.dragged = None;
@@ -423,7 +451,7 @@ impl TagLibraryState {
         self.counts_target = None;
         self.profile_lookup_pending = None;
         self.profile_lookup_target = None;
-        self.category_pending = None;
+        // Profile-owned category and dictionary requests outlive visible panel state.
         self.source_ready = false;
         self.profile_ready = false;
         self.page_materialized = false;
@@ -433,6 +461,7 @@ impl TagLibraryState {
         self.pager.clear_pages();
         self.assignment_counts.clear();
         self.profile_categories.clear();
+        self.profile_lookup_state = ProfileLookupState::NotRequested;
         self.profile_revision = None;
         self.metadata_retry_ticks = 0;
         self.dragged = None;
@@ -947,9 +976,11 @@ fn start_page_metadata_reads(browser: &mut Browser, cx: &mut Context<Browser>) -
     if labels.is_empty() {
         browser.tag_library.categories_requested = true;
         browser.tag_library.profile_lookup_target = None;
+        browser.tag_library.profile_lookup_state = ProfileLookupState::Ready;
     } else if !browser.tag_library.categories_requested
         && browser.tag_library.profile_lookup_pending.is_none()
     {
+        browser.tag_library.profile_lookup_state = ProfileLookupState::Pending;
         let lookup_target = ProfileLookupTarget {
             generation: target.generation,
             page_epoch,
@@ -963,6 +994,7 @@ fn start_page_metadata_reads(browser: &mut Browser, cx: &mut Context<Browser>) -
         else {
             browser.tag_library.categories_requested = true;
             browser.tag_library.profile_lookup_target = None;
+            browser.tag_library.profile_lookup_state = ProfileLookupState::Failed;
             return changed;
         };
         match global.lookup_profile_tag_categories(lookup_target.labels.clone()) {
@@ -980,6 +1012,7 @@ fn start_page_metadata_reads(browser: &mut Browser, cx: &mut Context<Browser>) -
             }
             Err(error @ (VocabularySubmitError::Full | VocabularySubmitError::Initializing)) => {
                 browser.tag_library.profile_lookup_target = Some(lookup_target);
+                browser.tag_library.profile_lookup_state = ProfileLookupState::Pending;
                 browser.tag_library.metadata_retry_ticks = 5;
                 browser.tag_library.message =
                     Some(format!("Could not load tag categories: {error}"));
@@ -988,6 +1021,7 @@ fn start_page_metadata_reads(browser: &mut Browser, cx: &mut Context<Browser>) -
             Err(error) => {
                 browser.tag_library.profile_lookup_target = None;
                 browser.tag_library.categories_requested = true;
+                browser.tag_library.profile_lookup_state = ProfileLookupState::Failed;
                 browser.tag_library.message =
                     Some(format!("Could not load tag categories: {error}"));
                 changed = true;
@@ -1044,6 +1078,7 @@ fn poll_profile_lookup(browser: &mut Browser) -> bool {
                     .context_is_current(browser, &pending.context)
             {
                 browser.tag_library.categories_requested = true;
+                browser.tag_library.profile_lookup_state = ProfileLookupState::Failed;
                 browser.tag_library.message = Some(String::from("Tag categories disconnected"));
             }
             return true;
@@ -1056,6 +1091,7 @@ fn poll_profile_lookup(browser: &mut Browser) -> bool {
     if pending.page_epoch != browser.tag_library.pager.page_epoch {
         browser.tag_library.categories_requested = false;
         browser.tag_library.profile_lookup_target = None;
+        browser.tag_library.profile_lookup_state = ProfileLookupState::NotRequested;
         return true;
     }
     if pending.profile_revision != browser.tag_library.profile_revision {
@@ -1080,6 +1116,7 @@ fn poll_profile_lookup(browser: &mut Browser) -> bool {
             }
             browser.tag_library.profile_revision = Some(lookup.revision);
             browser.tag_library.profile_lookup_target = None;
+            browser.tag_library.profile_lookup_state = ProfileLookupState::Ready;
             for entry in lookup.entries {
                 browser
                     .tag_library
@@ -1091,6 +1128,7 @@ fn poll_profile_lookup(browser: &mut Browser) -> bool {
         Err(error) => {
             browser.tag_library.categories_requested = true;
             browser.tag_library.profile_lookup_target = None;
+            browser.tag_library.profile_lookup_state = ProfileLookupState::Failed;
             browser.tag_library.message = Some(format!("Could not load tag categories: {error}"));
             true
         }
@@ -1129,6 +1167,10 @@ fn poll_category_write(browser: &mut Browser, cx: &mut Context<Browser>) -> bool
     match result {
         Ok(receipt) => {
             if !current {
+                if browser.tag_library.open {
+                    browser.tag_library.mark_dirty();
+                    browser.start_source_registry_poll(cx);
+                }
                 return true;
             }
             browser.tag_library.profile_revision = Some(receipt.revision);
@@ -1154,6 +1196,34 @@ fn poll_category_write(browser: &mut Browser, cx: &mut Context<Browser>) -> bool
             true
         }
     }
+}
+
+/// Invalidate visible pages after a profile dictionary mutation without touching its receipt.
+pub(super) fn dictionary_mutation_finished(
+    browser: &mut Browser,
+    message: &str,
+    cx: &mut Context<Browser>,
+) {
+    if browser.tag_library.open {
+        browser.tag_library.mark_dirty();
+        browser.start_source_registry_poll(cx);
+    }
+    super::tag_completion::invalidate_profile_vocabulary(browser, cx);
+    browser.tag_library.message = Some(message.to_owned());
+}
+
+/// Invalidate visible pages after a profile dictionary mutation failure.
+pub(super) fn dictionary_mutation_failed(
+    browser: &mut Browser,
+    message: String,
+    cx: &mut Context<Browser>,
+) {
+    if browser.tag_library.open {
+        browser.tag_library.mark_dirty();
+        browser.start_source_registry_poll(cx);
+    }
+    super::tag_completion::invalidate_profile_vocabulary(browser, cx);
+    browser.tag_library.message = Some(message);
 }
 
 /// Route a source tag page or count page to the matching panel request.
@@ -1420,6 +1490,11 @@ pub(super) fn render(
         .border_r(px(theme.spacing.border_width))
         .border_color(color(theme.colors.border))
         .child(header)
+        .child(super::tag_dictionary::render_undo(
+            browser,
+            theme.clone(),
+            cx,
+        ))
         .child(editor)
         .child(selected)
         .child(body)
@@ -1605,6 +1680,12 @@ fn render_candidate(
     let generation = browser.tag_library.generation;
     let assignment = assignment_label(browser, candidate);
     let movable = movable_candidate(candidate);
+    let profile_revision = browser.tag_library.profile_revision;
+    let removal_target = definition_removal_target(
+        candidate,
+        &browser.tag_library.profile_categories,
+        browser.tag_library.profile_lookup_state,
+    );
     let drag_label = category_label(candidate)
         .map(str::to_owned)
         .unwrap_or_else(|| candidate.display_label());
@@ -1636,6 +1717,51 @@ fn render_candidate(
         });
     let hover = color(theme.colors.selection_hover_fill);
     let pressed = color(theme.interaction.pressed_fill);
+    let remove_pending =
+        browser.tag_dictionary.has_pending() || browser.tag_library.category_pending.is_some();
+    let remove_button = removal_target.map(|target| {
+        let remove_enabled = !remove_pending;
+        let remove_token = token.clone();
+        let remove_target = target.clone();
+        let remove_hover = color(theme.colors.selection_hover_fill);
+        let remove_pressed = color(theme.interaction.pressed_fill);
+        div()
+            .id(("tag-library-remove-definition", index))
+            .flex_none()
+            .w(px(theme.spacing.control_height))
+            .h(px(theme.spacing.control_height))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(if remove_enabled {
+                theme.colors.text_muted
+            } else {
+                theme.colors.text_disabled
+            }))
+            .when(remove_enabled, |element| {
+                element
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(remove_hover))
+                    .active(move |style| style.bg(remove_pressed))
+            })
+            .tooltip(super::tag_dictionary::remove_definition_tooltip)
+            .on_click(cx.listener(move |view, _, _, cx| {
+                cx.stop_propagation();
+                if remove_enabled {
+                    view.remove_tag_library_definition(
+                        index,
+                        remove_token.clone(),
+                        generation,
+                        epoch,
+                        profile_revision,
+                        remove_target.clone(),
+                        cx,
+                    );
+                }
+            }))
+            .child("×")
+    });
     div()
         .id(("tag-library-row", index))
         .flex()
@@ -1691,6 +1817,7 @@ fn render_candidate(
                 .text_color(color(theme.colors.text_muted))
                 .child(assignment),
         )
+        .children(remove_button)
 }
 
 fn assignment_label(browser: &Browser, candidate: &MergedCandidate) -> &'static str {
@@ -1772,6 +1899,62 @@ fn category_label(candidate: &MergedCandidate) -> Option<&str> {
             exact_label: None, ..
         } => None,
     }
+}
+
+fn profile_definition_status(
+    candidate: &MergedCandidate,
+    profile_categories: &BTreeMap<String, ProfileTagCategory>,
+    lookup_state: ProfileLookupState,
+) -> ProfileDefinitionStatus {
+    let Some(label) = category_label(candidate) else {
+        return match lookup_state {
+            ProfileLookupState::Failed => ProfileDefinitionStatus::Failed,
+            ProfileLookupState::NotRequested | ProfileLookupState::Pending => {
+                ProfileDefinitionStatus::Pending
+            }
+            ProfileLookupState::Ready => ProfileDefinitionStatus::KnownAbsent,
+        };
+    };
+    if let Some(category) = profile_categories.get(label).copied() {
+        return ProfileDefinitionStatus::Known(category);
+    }
+    match lookup_state {
+        ProfileLookupState::Failed => ProfileDefinitionStatus::Failed,
+        ProfileLookupState::NotRequested | ProfileLookupState::Pending => {
+            ProfileDefinitionStatus::Pending
+        }
+        ProfileLookupState::Ready => ProfileDefinitionStatus::KnownAbsent,
+    }
+}
+
+fn definition_removal_target(
+    candidate: &MergedCandidate,
+    profile_categories: &BTreeMap<String, ProfileTagCategory>,
+    lookup_state: ProfileLookupState,
+) -> Option<DefinitionRemovalTarget> {
+    if let MergedCandidate::Source { tag_id, .. } = candidate
+        && *tag_id <= 0
+    {
+        return None;
+    }
+    let label = category_label(candidate)?;
+    if !is_profile_label(label)
+        || !infer_tag_category(label).is_ok_and(|category| category.is_user_extensible())
+    {
+        return None;
+    }
+    let ProfileDefinitionStatus::Known(category) =
+        profile_definition_status(candidate, profile_categories, lookup_state)
+    else {
+        return None;
+    };
+    if category == ProfileTagCategory::PlaybackType {
+        return None;
+    }
+    Some(DefinitionRemovalTarget {
+        label: label.to_owned(),
+        category,
+    })
 }
 
 fn is_profile_label(label: &str) -> bool {
@@ -1958,8 +2141,8 @@ impl Browser {
             return;
         }
         let context = target.context;
-        if self.tag_library.category_pending.is_some() {
-            self.tag_library.message = Some(String::from("Tag category write is still pending"));
+        if self.tag_library.category_pending.is_some() || self.tag_dictionary.has_pending() {
+            self.tag_library.message = Some(String::from("Tag dictionary write is still pending"));
             cx.notify();
             return;
         }
@@ -1994,6 +2177,151 @@ impl Browser {
             }
             Err(error) => {
                 self.tag_library.message = Some(format!("Could not save tag category: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Remove one positively-known profile dictionary definition from a fenced row action.
+    pub(super) fn remove_tag_library_definition(
+        &mut self,
+        index: usize,
+        token: CandidateToken,
+        generation: u64,
+        epoch: u64,
+        profile_revision: Option<u64>,
+        expected: DefinitionRemovalTarget,
+        cx: &mut Context<Browser>,
+    ) {
+        if self.tag_dictionary.has_pending() || self.tag_library.category_pending.is_some() {
+            self.tag_library.message = Some(String::from("Tag dictionary write is still pending"));
+            cx.notify();
+            return;
+        }
+        if self.tag_library.generation != generation
+            || self.tag_library.pager.page_epoch != epoch
+            || self
+                .tag_library
+                .pager
+                .merged_page
+                .get(index)
+                .map(MergedCandidate::token)
+                != Some(token.clone())
+            || self.tag_library.profile_revision != profile_revision
+        {
+            self.tag_library.message =
+                Some(String::from("Tag list changed; refresh and try again"));
+            self.tag_library.mark_dirty();
+            self.start_source_registry_poll(cx);
+            cx.notify();
+            return;
+        }
+        let Some(candidate) = self.tag_library.pager.merged_page.get(index) else {
+            return;
+        };
+        let Some(current) = definition_removal_target(
+            candidate,
+            &self.tag_library.profile_categories,
+            self.tag_library.profile_lookup_state,
+        ) else {
+            self.tag_library.message = Some(String::from(
+                "Tag definition is unavailable or cannot be removed",
+            ));
+            cx.notify();
+            return;
+        };
+        if current != expected || candidate.token() != token {
+            self.tag_library.message = Some(String::from("Tag row changed; refresh and try again"));
+            self.tag_library.mark_dirty();
+            self.start_source_registry_poll(cx);
+            cx.notify();
+            return;
+        }
+        let Some(panel_target) = self.tag_library.current_target().cloned() else {
+            self.tag_library.message = Some(String::from("Tag library is still loading"));
+            cx.notify();
+            return;
+        };
+        if !tags::tag_context_is_current(self, &panel_target.context) {
+            self.tag_library.message = Some(String::from("Tag context changed; refreshing tags"));
+            self.tag_library.mark_dirty();
+            self.start_source_registry_poll(cx);
+            cx.notify();
+            return;
+        }
+        let current_paths = match self.capture_tag_target_paths(1) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.tag_library.message = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        if current_paths != panel_target.context.paths || current_paths.is_empty() {
+            self.tag_library.message = Some(String::from("Selection changed; refreshing tags"));
+            self.tag_library.mark_dirty();
+            self.start_source_registry_poll(cx);
+            cx.notify();
+            return;
+        }
+        let Some(revision) = profile_revision else {
+            self.tag_library.message = Some(String::from("Profile tags are still loading"));
+            cx.notify();
+            return;
+        };
+        let Some(global) = cx
+            .has_global::<SourceRegistryGlobal>()
+            .then(|| cx.global::<SourceRegistryGlobal>())
+        else {
+            self.tag_library.message = Some(String::from("Profile vocabulary unavailable"));
+            cx.notify();
+            return;
+        };
+        match self
+            .tag_dictionary
+            .submit_remove(global, revision, current.label)
+        {
+            Ok(()) => {
+                self.tag_library.message = Some(String::from("Removing tag definition…"));
+                self.start_source_registry_poll(cx);
+            }
+            Err(error) => {
+                self.tag_library.message =
+                    Some(format!("Could not remove tag definition: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Restore the last successfully removed profile definition at its exact receipt revision.
+    pub(super) fn undo_tag_library_definition(&mut self, cx: &mut Context<Browser>) {
+        if self.tag_dictionary.has_pending() || self.tag_library.category_pending.is_some() {
+            self.tag_library.message = Some(String::from("Tag dictionary write is still pending"));
+            cx.notify();
+            return;
+        }
+        let Some((revision, label, category)) = self.tag_dictionary.undo_details() else {
+            return;
+        };
+        let Some(global) = cx
+            .has_global::<SourceRegistryGlobal>()
+            .then(|| cx.global::<SourceRegistryGlobal>())
+        else {
+            self.tag_library.message = Some(String::from("Profile vocabulary unavailable"));
+            cx.notify();
+            return;
+        };
+        match self
+            .tag_dictionary
+            .submit_restore(global, revision, label, category)
+        {
+            Ok(()) => {
+                self.tag_library.message = Some(String::from("Restoring tag definition…"));
+                self.start_source_registry_poll(cx);
+            }
+            Err(error) => {
+                self.tag_library.message =
+                    Some(format!("Could not restore tag definition: {error}"));
             }
         }
         cx.notify();
@@ -2144,6 +2472,7 @@ impl Browser {
         self.tag_library.page_materialized = false;
         self.tag_library.counts_requested = false;
         self.tag_library.categories_requested = false;
+        self.tag_library.profile_lookup_state = ProfileLookupState::NotRequested;
         self.tag_library.assignment_counts.clear();
         self.tag_library.profile_categories.clear();
         self.tag_library.counts_target = None;
@@ -2160,6 +2489,7 @@ fn restore_checkpoint(state: &mut TagLibraryState, checkpoint: StreamCheckpoint)
     state.page_materialized = false;
     state.counts_requested = false;
     state.categories_requested = false;
+    state.profile_lookup_state = ProfileLookupState::NotRequested;
     state.assignment_counts.clear();
     state.profile_categories.clear();
     state.counts_target = None;
@@ -2204,9 +2534,11 @@ mod tests {
     use super::super::tags::TagSubmissionContext;
     use super::{
         CandidateAction, CandidateActionError, DragTarget, candidate_action,
-        context_identity_matches, drag_target_is_current, drag_target_paths_match,
-        is_profile_label, metadata_target_matches, movable_candidate,
+        context_identity_matches, definition_removal_target, drag_target_is_current,
+        drag_target_paths_match, is_profile_label, metadata_target_matches, movable_candidate,
+        profile_definition_status,
     };
+    use wavecrate_library::sample_sources::ProfileTagCategory;
     use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
 
     fn context(revision: u64, paths: &[&str]) -> TagSubmissionContext {
@@ -2425,5 +2757,117 @@ mod tests {
             Some(7),
             &target_context,
         ));
+    }
+
+    #[test]
+    fn profile_lookup_distinguishes_pending_failed_and_known_absent() {
+        let candidate = MergedCandidate::Profile {
+            label: String::from("warm"),
+        };
+        let categories = BTreeMap::new();
+        assert_eq!(
+            profile_definition_status(
+                &candidate,
+                &categories,
+                super::ProfileLookupState::NotRequested,
+            ),
+            super::ProfileDefinitionStatus::Pending
+        );
+        assert_eq!(
+            profile_definition_status(&candidate, &categories, super::ProfileLookupState::Pending,),
+            super::ProfileDefinitionStatus::Pending
+        );
+        assert_eq!(
+            profile_definition_status(&candidate, &categories, super::ProfileLookupState::Failed,),
+            super::ProfileDefinitionStatus::Failed
+        );
+        assert_eq!(
+            profile_definition_status(&candidate, &categories, super::ProfileLookupState::Ready,),
+            super::ProfileDefinitionStatus::KnownAbsent
+        );
+        let categories = BTreeMap::from([(String::from("warm"), ProfileTagCategory::Character)]);
+        assert_eq!(
+            profile_definition_status(&candidate, &categories, super::ProfileLookupState::Pending,),
+            super::ProfileDefinitionStatus::Known(ProfileTagCategory::Character)
+        );
+    }
+
+    #[test]
+    fn definition_removal_requires_a_loaded_canonical_extensible_definition() {
+        let categories = BTreeMap::from([(String::from("warm"), ProfileTagCategory::Character)]);
+        let profile = MergedCandidate::Profile {
+            label: String::from("warm"),
+        };
+        assert_eq!(
+            definition_removal_target(&profile, &categories, super::ProfileLookupState::Pending,),
+            Some(super::DefinitionRemovalTarget {
+                label: String::from("warm"),
+                category: ProfileTagCategory::Character,
+            })
+        );
+        let source = MergedCandidate::Source {
+            tag_id: 9,
+            label: String::from("warm"),
+            exact_label: Some(String::from("warm")),
+            revision: 4,
+        };
+        assert!(
+            definition_removal_target(&source, &categories, super::ProfileLookupState::Ready,)
+                .is_some()
+        );
+        let preview = MergedCandidate::Source {
+            tag_id: 9,
+            label: String::from("warm…"),
+            exact_label: None,
+            revision: 4,
+        };
+        assert!(
+            definition_removal_target(&preview, &categories, super::ProfileLookupState::Ready,)
+                .is_none()
+        );
+        let invalid_id = MergedCandidate::Source {
+            tag_id: 0,
+            label: String::from("warm"),
+            exact_label: Some(String::from("warm")),
+            revision: 4,
+        };
+        assert!(
+            definition_removal_target(&invalid_id, &categories, super::ProfileLookupState::Ready,)
+                .is_none()
+        );
+        let locked = MergedCandidate::Profile {
+            label: String::from("one-shot"),
+        };
+        let locked_categories =
+            BTreeMap::from([(String::from("one-shot"), ProfileTagCategory::PlaybackType)]);
+        assert!(
+            definition_removal_target(
+                &locked,
+                &locked_categories,
+                super::ProfileLookupState::Ready,
+            )
+            .is_none()
+        );
+        let noncanonical = MergedCandidate::Profile {
+            label: String::from("legacy tag"),
+        };
+        let noncanonical_categories =
+            BTreeMap::from([(String::from("legacy tag"), ProfileTagCategory::Character)]);
+        assert!(
+            definition_removal_target(
+                &noncanonical,
+                &noncanonical_categories,
+                super::ProfileLookupState::Ready,
+            )
+            .is_none()
+        );
+        assert!(
+            definition_removal_target(
+                &profile,
+                &BTreeMap::new(),
+                super::ProfileLookupState::Pending,
+            )
+            .is_none()
+        );
     }
 }
