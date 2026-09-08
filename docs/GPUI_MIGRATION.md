@@ -666,6 +666,30 @@ through X/Z restoration, resized correctly to 960x560, and quit cleanly. Five
 seconds of settled display consumed 0.15 seconds of process CPU time on this
 machine; this is an idle observation, not a full frame-latency benchmark.
 
+### Catalog-owned WAV display metadata, 2026-09-08
+
+Catalog snapshots can now include optional WAV frame counts and sample rates.
+The scanner reads headers through a retained no-follow source capability, checks
+manifest identity/size/timestamp and descriptor change markers, rechecks path
+binding, and rejects changed roots. The catalog revalidates profile/physical
+database ownership and revision after header reads. UI consumers need no file
+opens to derive duration. Replaced links, non-regular files, malformed headers,
+and changed entries retain membership without borrowing replacement metadata.
+
+Reads have a 1 MiB per-parser limit and aggregate limits of 64 MiB and 4,096
+entries per call, including buffered reads and both header passes. Cancellation
+is checked between reads. Budget exhaustion returns the metadata collected so
+far; enrichment of remaining entries is still follow-on work. Unix no-follow
+opens use nonblocking mode and regular-file checks to reject FIFO replacements.
+
+Validation: 14 metadata tests and 19 catalog tests passed, along with locked UI
+check, formatting, and diff checks. The full scanner suite passed all 218 tests
+serially in 2.48 seconds. Its parallel run passed 217 and failed the existing
+global descriptor-count stress assertion; that test passed in isolation, with
+no resource leak reproduced. Independent review identified the path-probe and
+aggregate-budget issues addressed in this implementation. Windows execution
+remains unverified.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

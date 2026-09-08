@@ -4,6 +4,8 @@ use std::{
 };
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, ambient_authority};
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt;
 use cap_std::fs::{Dir, OpenOptions};
 use wavecrate_library::filesystem_identity::{
     stable_filesystem_identity, stable_filesystem_identity_from_open_file,
@@ -98,6 +100,23 @@ impl SourceRootCapability {
         let Some((parent, name)) = self.open_parent(relative_path)? else {
             return Ok(None);
         };
+        // Inspect the final component without following it before attempting the open. This
+        // keeps a FIFO, socket, or directory replacement out of the blocking open path. The
+        // descriptor is still checked after opening because the entry can change between these
+        // two operations.
+        let metadata = match parent.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ScanError::Io {
+                    path: self.root.join(relative_path),
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(None);
+        }
         let current = match open_file_nofollow(&parent, &name) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -207,6 +226,8 @@ impl SourceRootCapability {
 fn open_file_nofollow(parent: &Dir, name: &Path) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     parent.open_with(name, &options).map(|file| file.into_std())
 }
 
@@ -274,6 +295,40 @@ mod tests {
         assert!(
             capability
                 .open_regular_file(Path::new("linked-dir/outside.wav"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_fifo_is_nonblocking_and_rejected_as_nonregular() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let source = tempfile::tempdir().unwrap();
+        let fifo = source.path().join("waiting.wav");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        let capability = SourceRootCapability::open(source.path()).unwrap();
+        let (parent, name) = capability
+            .open_parent(Path::new("waiting.wav"))
+            .unwrap()
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            sender.send(open_file_nofollow(&parent, &name)).unwrap();
+        });
+        let file = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(!file.metadata().unwrap().is_file());
+        assert!(
+            capability
+                .open_regular_file(Path::new("waiting.wav"))
                 .unwrap()
                 .is_none()
         );

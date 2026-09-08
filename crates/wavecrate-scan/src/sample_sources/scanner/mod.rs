@@ -10,6 +10,7 @@ mod scan_index;
 mod scan_paths;
 mod scan_walk;
 mod scan_writer;
+mod wav_metadata;
 
 pub use scan::{
     CatalogManifestAudit, ChangedSample, CommittedScanBatch, CommittedSourceDelta,
@@ -35,3 +36,4 @@ pub use scan_paths::{
     sync_paths_with_progress_and_writer, validate_exact_regular_paths,
 };
 pub use scan_writer::{ScanWritePhase, ScanWriter, UncoordinatedScanWriter};
+pub use wav_metadata::{WavDisplayMetadata, read_wav_display_metadata_for_manifest};

@@ -14,4 +14,5 @@ wavecrate-library = { path = "../wavecrate-library" }
 wavecrate-scan = { path = "../wavecrate-scan" }
 
 [dev-dependencies]
+hound.workspace = true
 tempfile = "3.23.0"

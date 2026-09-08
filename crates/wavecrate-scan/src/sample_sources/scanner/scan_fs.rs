@@ -17,7 +17,7 @@ use wavecrate_library::filesystem_identity::filesystem_change_marker;
 use wavecrate_library::filesystem_identity::{
     stable_filesystem_identity, stable_filesystem_identity_from_open_file,
 };
-use wavecrate_library::sample_sources::db::SourceDirectoryEntry;
+use wavecrate_library::sample_sources::db::{SourceDirectoryEntry, SourceManifestEntry};
 use wavecrate_library::sample_sources::{
     SourceEntryClassification, SourceEntryFileType, SourceFileClassification,
     SourceIndexDiagnostic, SourceIndexEntry, SourceTraversalPolicy,
@@ -301,6 +301,18 @@ pub(super) struct FileFacts {
 }
 
 impl FileFacts {
+    pub(super) fn matches_manifest_entry(&self, expected: &SourceManifestEntry) -> bool {
+        let (Some(actual_identity), Some(expected_identity)) =
+            (self.file_identity.as_ref(), expected.file_identity.as_ref())
+        else {
+            return false;
+        };
+        self.relative == expected.relative_path
+            && self.size == expected.file_size
+            && self.modified_ns == expected.modified_ns
+            && actual_identity == expected_identity
+    }
+
     pub(super) fn same_file_facts(&self, other: &Self) -> bool {
         self.size == other.size
             && self.modified_ns == other.modified_ns

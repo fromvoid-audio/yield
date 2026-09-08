@@ -11,15 +11,16 @@ missing_docs = "deny"
 blake3 = "1.6.1"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
-wavecrate-library = { path = "../wavecrate-library" }
+hound.workspace = true
 thiserror = "2.0.17"
+wavecrate-library = { path = "../wavecrate-library" }
 tracing = "0.1.41"
 
 [dev-dependencies]
 filetime = "0.2.26"
 tempfile = "3.23.0"
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.176"
 
 [target.'cfg(target_os = "windows")'.dependencies]

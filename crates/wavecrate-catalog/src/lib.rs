@@ -7,7 +7,7 @@
 //! deliberately accepts only scanner-produced authoritative audits; filesystem watcher evidence
 //! is not a catalog publication mechanism.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -29,6 +29,7 @@ use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId}
 use wavecrate_scan::sample_sources::scanner::{
     ScanError, ScanWritePhase, ScanWriter,
     audit_manifest_for_catalog_with_budget_and_progress_and_writer,
+    read_wav_display_metadata_for_manifest,
 };
 
 const COMMAND_CAPACITY: usize = 32;
@@ -151,6 +152,15 @@ pub enum CatalogError {
     Canceled,
 }
 
+/// WAV header metadata captured while auditing a catalog manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogWavMetadata {
+    /// Number of audio frames in the audited WAV data chunk.
+    pub frames: u32,
+    /// WAV sample rate in samples per second.
+    pub sample_rate: u32,
+}
+
 /// A revision-fenced, authoritative source snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogSnapshot {
@@ -168,6 +178,8 @@ pub struct CatalogSnapshot {
     pub manifest: Vec<SourceManifestEntry>,
     /// Directory rows visible at `committed_revision`.
     pub directories: Vec<SourceDirectoryEntry>,
+    /// Optional WAV header metadata keyed by source-relative manifest path.
+    pub wav_metadata: BTreeMap<PathBuf, CatalogWavMetadata>,
 }
 
 /// The operation associated with a failed catalog event.
@@ -950,13 +962,23 @@ fn register_source(
         return;
     }
     if let Ok(identity) = source_root_identity(&source.root)
-        && let Ok(snapshot) = read_snapshot_from_database(
+        && let Ok(mut snapshot) = read_snapshot_from_database(
             &source.database,
             profile_guard,
             &source_id,
             lifecycle_generation,
             &identity,
         )
+        && attach_wav_metadata(
+            &mut snapshot,
+            &source.root,
+            &source.database,
+            profile_guard,
+            &source_id,
+            &identity,
+            || !publication_is_current(admission, &source_id, lifecycle_generation, None),
+        )
+        .is_ok()
     {
         source.known_root_identity = Some(identity);
         source.snapshot = Some(snapshot);
@@ -1135,7 +1157,7 @@ fn read_snapshot(
         &identity,
     );
     match result {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
             if let Some(expected) = expected_revision
                 && expected != snapshot.committed_revision
             {
@@ -1149,6 +1171,25 @@ fn read_snapshot(
                         expected,
                         actual: snapshot.committed_revision,
                     },
+                );
+                return;
+            }
+            if let Err(error) = attach_wav_metadata(
+                &mut snapshot,
+                &source.root,
+                &source.database,
+                profile_guard,
+                &source_id,
+                &identity,
+                || !publication_is_current(admission, &source_id, lifecycle_generation, None),
+            ) {
+                emit_failure(
+                    reservation,
+                    admission,
+                    Some(source_id),
+                    Some(source.lifecycle_generation),
+                    CatalogOperation::ReadSnapshot,
+                    error,
                 );
                 return;
             }
@@ -1384,7 +1425,7 @@ fn audit_source(
         .database
         .validate_profile_guard(profile_guard)
         .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
-    let snapshot = read_snapshot_from_database(
+    let mut snapshot = read_snapshot_from_database(
         &source.database,
         profile_guard,
         source_id,
@@ -1397,7 +1438,63 @@ fn audit_source(
             snapshot.committed_revision
         )));
     }
+    attach_wav_metadata(
+        &mut snapshot,
+        &source.root,
+        &source.database,
+        profile_guard,
+        source_id,
+        &audit_identity,
+        || token.load(Ordering::Acquire),
+    )?;
     Ok(snapshot)
+}
+
+fn attach_wav_metadata(
+    snapshot: &mut CatalogSnapshot,
+    root: &Path,
+    database: &SourceDatabase,
+    profile_guard: &WritableProfileGuard,
+    source_id: &SourceId,
+    expected_root_identity: &RootIdentity,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<(), CatalogError> {
+    let metadata = read_wav_display_metadata_for_manifest(
+        root,
+        expected_root_identity,
+        &snapshot.manifest,
+        &mut should_cancel,
+    )
+    .map_err(|error| scan_wav_metadata_error(source_id, error))?;
+    if should_cancel() {
+        return Err(CatalogError::Canceled);
+    }
+    database
+        .validate_profile_guard(profile_guard)
+        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    if should_cancel() {
+        return Err(CatalogError::Canceled);
+    }
+    let current_revision = database.get_revision().map_err(catalog_error_from_db)?;
+    if current_revision != snapshot.committed_revision {
+        return Err(CatalogError::StaleRevision {
+            expected: snapshot.committed_revision,
+            actual: current_revision,
+        });
+    }
+    snapshot.wav_metadata = metadata
+        .into_iter()
+        .map(|(path, metadata)| {
+            (
+                path,
+                CatalogWavMetadata {
+                    frames: metadata.frames,
+                    sample_rate: metadata.sample_rate,
+                },
+            )
+        })
+        .collect();
+    Ok(())
 }
 
 fn read_snapshot_from_database(
@@ -1483,6 +1580,7 @@ fn read_snapshot_from_database(
         directory_generation,
         manifest,
         directories,
+        wav_metadata: BTreeMap::new(),
     })
 }
 
@@ -1579,6 +1677,25 @@ fn scan_error(
 ) -> CatalogError {
     match error {
         wavecrate_scan::sample_sources::scanner::ScanError::Canceled => CatalogError::Canceled,
+        error => CatalogError::Audit(format!("{source_id}: {error}")),
+    }
+}
+
+fn scan_wav_metadata_error(
+    source_id: &SourceId,
+    error: wavecrate_scan::sample_sources::scanner::ScanError,
+) -> CatalogError {
+    match error {
+        wavecrate_scan::sample_sources::scanner::ScanError::Canceled => CatalogError::Canceled,
+        wavecrate_scan::sample_sources::scanner::ScanError::StaleRootGeneration { root } => {
+            CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: format!(
+                    "source root changed while reading WAV metadata: {}",
+                    root.display()
+                ),
+            }
+        }
         error => CatalogError::Audit(format!("{source_id}: {error}")),
     }
 }
@@ -1683,6 +1800,81 @@ mod tests {
             CatalogEvent::AuditCommitted { snapshot, .. } => snapshot,
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn audited_snapshot_includes_descriptor_checked_wav_metadata() {
+        let fixture = Fixture::new("catalog-wav-metadata");
+        let path = fixture.root.path().join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create WAV");
+        for frame in 0..7_i16 {
+            writer.write_sample(frame).expect("left sample");
+            writer.write_sample(-frame).expect("right sample");
+        }
+        writer.finalize().expect("finalize WAV");
+
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let source_id = SourceId::from_string("source-wav-metadata");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        assert_eq!(
+            snapshot.wav_metadata.get(Path::new("stereo.wav")),
+            Some(&CatalogWavMetadata {
+                frames: 7,
+                sample_rate: 44_100,
+            })
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn registered_snapshot_rehydrates_descriptor_checked_wav_metadata() {
+        let fixture = Fixture::new("catalog-wav-metadata-reopen");
+        let path = fixture.root.path().join("reopen.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create WAV");
+        for sample in 0..5_i16 {
+            writer.write_sample(sample).expect("sample");
+        }
+        writer.finalize().expect("finalize WAV");
+
+        let source_id = SourceId::from_string("source-wav-metadata-reopen");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let _ = register_and_audit(&service, fixture.root.path(), &source_id);
+        service.shutdown();
+
+        let service = CatalogService::start(&fixture.guard).expect("reopened catalog service");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("register reopen");
+        let event = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+        let CatalogEvent::SnapshotReady { snapshot } = event else {
+            unreachable!();
+        };
+        assert_eq!(
+            snapshot.wav_metadata.get(Path::new("reopen.wav")),
+            Some(&CatalogWavMetadata {
+                frames: 5,
+                sample_rate: 16_000,
+            })
+        );
+        service.shutdown();
     }
 
     #[test]
