@@ -169,6 +169,8 @@ pub enum SortColumn {
     Extension,
     /// Order by the signed curation rating.
     Rating,
+    /// Order by the recognized playback classification.
+    PlaybackType,
     /// Order by the first assigned collection slot.
     Collection,
     /// Order by elapsed time since the catalog last recorded playback.
@@ -485,6 +487,7 @@ impl BrowserViewModel {
                         entry.curation.and_then(AudioFileCuration::last_played_at),
                         now_epoch_seconds,
                     ),
+                    playback_type_sort_key(entry.playback_type),
                 )
             })
             .collect::<Vec<_>>();
@@ -496,6 +499,7 @@ impl BrowserViewModel {
                 SortColumn::Rating => left.5.cmp(&right.5),
                 SortColumn::Collection => left.6.cmp(&right.6),
                 SortColumn::LastPlayed => left.7.cmp(&right.7),
+                SortColumn::PlaybackType => left.8.cmp(&right.8),
             }
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.1.path().cmp(right.1.path()));
@@ -506,7 +510,7 @@ impl BrowserViewModel {
         });
         self.rows = projected
             .into_iter()
-            .map(|(entry_index, id, _, _, _, _, _, _)| BrowserRow { entry_index, id })
+            .map(|(entry_index, id, _, _, _, _, _, _, _)| BrowserRow { entry_index, id })
             .collect();
     }
 
@@ -566,6 +570,14 @@ fn extension_sort_key(entry: &AudioFile) -> String {
         .extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+fn playback_type_sort_key(playback_type: Option<PlaybackType>) -> u8 {
+    match playback_type {
+        Some(PlaybackType::Loop) => 0,
+        Some(PlaybackType::OneShot) => 1,
+        None => 2,
+    }
 }
 
 /// Format a duration for compact display in the browser chrome.
@@ -684,6 +696,36 @@ mod tests {
                 .map(|row| row.entry_index)
                 .collect::<Vec<_>>(),
             vec![1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn playback_type_sort_uses_loop_then_one_shot_then_unknown_order() {
+        let entries = vec![
+            typed_entry("/tmp/unknown.wav", None, None),
+            typed_entry("/tmp/one-shot.wav", Some(PlaybackType::OneShot), None),
+            typed_entry("/tmp/loop.wav", Some(PlaybackType::Loop), None),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+
+        model.toggle_sort(&entries, SortColumn::PlaybackType);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+
+        model.toggle_sort(&entries, SortColumn::PlaybackType);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
         );
     }
 

@@ -8,7 +8,9 @@ use gpui::{
     Window, div, font, prelude::*, px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use wavecrate_core::{SortColumn, SortDirection, format_duration, format_last_played};
+use wavecrate_core::{
+    PlaybackType, SortColumn, SortDirection, format_duration, format_last_played,
+};
 use wavecrate_design::Theme;
 
 use crate::theme::{active, color, transparent};
@@ -41,7 +43,13 @@ fn current_unix_epoch_seconds() -> i64 {
 
 const MIN_SAMPLE_NAME_WIDTH: f32 = 192.0;
 
-fn last_played_column_min_window_width(theme: &Theme) -> f32 {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BrowserColumnVisibility {
+    playback_type: bool,
+    last_played: bool,
+}
+
+fn base_browser_min_window_width(theme: &Theme) -> f32 {
     theme.spacing.sidebar_width
         + theme.spacing.selected_marker_width
         + theme.spacing.rating_column_width
@@ -49,12 +57,34 @@ fn last_played_column_min_window_width(theme: &Theme) -> f32 {
         + theme.spacing.extension_column_width
         + theme.spacing.size_column_width
         + theme.spacing.duration_column_width
-        + theme.spacing.last_played_column_width
         + MIN_SAMPLE_NAME_WIDTH
 }
 
-fn last_played_column_visible(window_width: f32, theme: &Theme) -> bool {
-    window_width.is_finite() && window_width >= last_played_column_min_window_width(theme)
+fn browser_column_visibility(window_width: f32, theme: &Theme) -> BrowserColumnVisibility {
+    if !window_width.is_finite() {
+        return BrowserColumnVisibility::default();
+    }
+    let base_width = base_browser_min_window_width(theme);
+    let playback_type_width = theme.spacing.playback_type_column_width;
+    let last_played_width = theme.spacing.last_played_column_width;
+    let playback_type = window_width >= base_width + playback_type_width;
+    let last_played = if playback_type {
+        window_width >= base_width + playback_type_width + last_played_width
+    } else {
+        window_width >= base_width + last_played_width
+    };
+    BrowserColumnVisibility {
+        playback_type,
+        last_played,
+    }
+}
+
+fn playback_type_label(playback_type: Option<PlaybackType>) -> &'static str {
+    match playback_type {
+        Some(PlaybackType::Loop) => "Loop",
+        Some(PlaybackType::OneShot) => "1-Shot",
+        None => "—",
+    }
 }
 
 impl Browser {
@@ -411,12 +441,15 @@ impl Render for Browser {
         let extension_width = theme.spacing.extension_column_width;
         let size_width = theme.spacing.size_column_width;
         let duration_width = theme.spacing.duration_column_width;
+        let playback_type_width = theme.spacing.playback_type_column_width;
         let last_played_width = theme.spacing.last_played_column_width;
         let rating_width = theme.spacing.rating_column_width;
         let collection_width = theme.spacing.collection_column_width;
         let now_epoch_seconds = current_unix_epoch_seconds();
-        let show_last_played =
-            last_played_column_visible(f32::from(window.bounds().size.width), &theme);
+        let column_visibility =
+            browser_column_visibility(f32::from(window.bounds().size.width), &theme);
+        let show_playback_type = column_visibility.playback_type;
+        let show_last_played = column_visibility.last_played;
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
         if self.view_model.rows().is_empty()
@@ -490,6 +523,8 @@ impl Render for Browser {
                                             .unwrap_or_default();
                                         let size = format_file_size(entry.byte_len);
                                         let duration = format_duration(entry.duration_seconds);
+                                        let playback_type = show_playback_type
+                                            .then(|| playback_type_label(entry.playback_type));
                                         let last_played = show_last_played.then(|| {
                                             entry
                                                 .curation
@@ -576,6 +611,25 @@ impl Render for Browser {
                                                 &list_theme,
                                                 rating_width,
                                             ))
+                                            ;
+                                        let sample_row = if let Some(playback_type) = playback_type
+                                        {
+                                            sample_row.child(
+                                                div()
+                                                    .flex_none()
+                                                    .w(px(playback_type_width))
+                                                    .px(px(list_theme.spacing.control_gap))
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_size(px(list_theme.typography.small_size))
+                                                    .text_color(color(list_theme.colors.text_muted))
+                                                    .child(playback_type),
+                                            )
+                                        } else {
+                                            sample_row
+                                        };
+                                        let sample_row = sample_row
                                             .child(curation::collection_cell(
                                                 &entry,
                                                 &list_theme,
@@ -607,8 +661,7 @@ impl Render for Browser {
                                                     .text_size(px(list_theme.typography.small_size))
                                                     .text_color(color(list_theme.colors.text_muted))
                                                     .child(duration),
-                                            )
-                                            ;
+                                            );
                                         let sample_row = if let Some(last_played) = last_played {
                                             sample_row.child(
                                                 div()
@@ -964,46 +1017,60 @@ impl Render for Browser {
                                                 cx,
                                                 Some(rating_width),
                                                 theme.spacing.control_gap,
-                                            ))
-                                            .child(self.render_column_header(
+                                            ));
+                                        if show_playback_type {
+                                            column_header =
+                                                column_header.child(self.render_column_header(
+                                                    "Type",
+                                                    SortColumn::PlaybackType,
+                                                    theme.clone(),
+                                                    cx,
+                                                    Some(playback_type_width),
+                                                    theme.spacing.control_gap,
+                                                ));
+                                        }
+                                        column_header =
+                                            column_header.child(self.render_column_header(
                                                 "Col",
                                                 SortColumn::Collection,
                                                 theme.clone(),
                                                 cx,
                                                 Some(collection_width),
                                                 theme.spacing.control_gap,
-                                            ))
-                                            .child(self.render_column_header(
+                                            ));
+                                        column_header =
+                                            column_header.child(self.render_column_header(
                                                 "Ext",
                                                 SortColumn::Extension,
                                                 theme.clone(),
                                                 cx,
                                                 Some(extension_width),
                                                 theme.spacing.control_gap,
-                                            ))
-                                            .child(self.render_column_header(
+                                            ));
+                                        column_header =
+                                            column_header.child(self.render_column_header(
                                                 "Size",
                                                 SortColumn::Size,
                                                 theme.clone(),
                                                 cx,
                                                 Some(size_width),
                                                 theme.spacing.control_gap,
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .flex_none()
-                                                    .w(px(duration_width))
-                                                    .h(px(theme.spacing.row_height))
-                                                    .pl(px(theme.spacing.control_gap))
-                                                    .pr(px(theme.spacing.control_gap))
-                                                    .border_b(px(theme.spacing.border_width))
-                                                    .border_color(color(theme.colors.border))
-                                                    .text_size(px(theme.typography.small_size))
-                                                    .text_color(color(theme.colors.text_muted))
-                                                    .child("Duration"),
-                                            );
+                                            ));
+                                        column_header = column_header.child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .flex_none()
+                                                .w(px(duration_width))
+                                                .h(px(theme.spacing.row_height))
+                                                .pl(px(theme.spacing.control_gap))
+                                                .pr(px(theme.spacing.control_gap))
+                                                .border_b(px(theme.spacing.border_width))
+                                                .border_color(color(theme.colors.border))
+                                                .text_size(px(theme.typography.small_size))
+                                                .text_color(color(theme.colors.text_muted))
+                                                .child("Duration"),
+                                        );
                                         if show_last_played {
                                             column_header =
                                                 column_header.child(self.render_column_header(
@@ -1088,19 +1155,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn last_played_column_reserves_name_space_responsively() {
+    fn optional_columns_reserve_name_space_with_type_priority() {
         let theme = Theme::default();
-        let required_width = last_played_column_min_window_width(&theme);
-        assert!(last_played_column_visible(required_width, &theme));
-        assert!(!last_played_column_visible(required_width - 0.1, &theme));
+        let base_width = base_browser_min_window_width(&theme);
+        let type_width = theme.spacing.playback_type_column_width;
+        let last_played_width = theme.spacing.last_played_column_width;
+        assert_eq!(
+            browser_column_visibility(base_width - 0.1, &theme),
+            BrowserColumnVisibility::default()
+        );
+        assert_eq!(
+            browser_column_visibility(base_width + type_width, &theme),
+            BrowserColumnVisibility {
+                playback_type: true,
+                last_played: false,
+            }
+        );
+        assert_eq!(
+            browser_column_visibility(base_width + last_played_width, &theme),
+            BrowserColumnVisibility {
+                playback_type: true,
+                last_played: false,
+            }
+        );
+        assert_eq!(
+            browser_column_visibility(base_width + type_width + last_played_width, &theme),
+            BrowserColumnVisibility {
+                playback_type: true,
+                last_played: true,
+            }
+        );
 
         let mut legacy_theme = theme.clone();
         legacy_theme.spacing.sidebar_width = 398.0;
-        assert!(!last_played_column_visible(960.0, &legacy_theme));
-        assert!(last_played_column_visible(
-            last_played_column_min_window_width(&legacy_theme),
-            &legacy_theme
-        ));
-        assert!(!last_played_column_visible(f32::NAN, &theme));
+        assert_eq!(
+            browser_column_visibility(960.0, &legacy_theme),
+            BrowserColumnVisibility::default()
+        );
+        assert_eq!(
+            browser_column_visibility(
+                base_browser_min_window_width(&legacy_theme)
+                    + legacy_theme.spacing.playback_type_column_width,
+                &legacy_theme,
+            ),
+            BrowserColumnVisibility {
+                playback_type: true,
+                last_played: false,
+            }
+        );
+
+        let mut wide_type_theme = theme.clone();
+        wide_type_theme.spacing.playback_type_column_width = 240.0;
+        assert_eq!(
+            browser_column_visibility(
+                base_browser_min_window_width(&wide_type_theme)
+                    + wide_type_theme.spacing.last_played_column_width,
+                &wide_type_theme,
+            ),
+            BrowserColumnVisibility {
+                playback_type: false,
+                last_played: true,
+            }
+        );
+        assert_eq!(
+            browser_column_visibility(f32::NAN, &theme),
+            BrowserColumnVisibility::default()
+        );
+    }
+
+    #[test]
+    fn playback_type_labels_keep_unknown_and_recognized_values_compact() {
+        assert_eq!(playback_type_label(Some(PlaybackType::Loop)), "Loop");
+        assert_eq!(playback_type_label(Some(PlaybackType::OneShot)), "1-Shot");
+        assert_eq!(playback_type_label(None), "—");
     }
 }

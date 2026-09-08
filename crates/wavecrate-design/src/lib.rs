@@ -168,6 +168,10 @@ fn default_collection_column_width() -> f32 {
     72.0
 }
 
+fn default_playback_type_column_width() -> f32 {
+    76.0
+}
+
 fn default_last_played_column_width() -> f32 {
     112.0
 }
@@ -290,6 +294,9 @@ pub struct Spacing {
     /// Rating column width in the sample browser.
     #[serde(default = "default_rating_column_width")]
     pub rating_column_width: f32,
+    /// Optional playback-type column width in the sample browser.
+    #[serde(default = "default_playback_type_column_width")]
+    pub playback_type_column_width: f32,
     /// Collection membership column width in the sample browser.
     #[serde(default = "default_collection_column_width")]
     pub collection_column_width: f32,
@@ -418,6 +425,7 @@ impl Default for Theme {
                 border_width: 1.0,
                 selected_marker_width: 2.0,
                 rating_column_width: default_rating_column_width(),
+                playback_type_column_width: default_playback_type_column_width(),
                 collection_column_width: default_collection_column_width(),
                 extension_column_width: 64.0,
                 size_column_width: 88.0,
@@ -671,6 +679,12 @@ pub fn validate_theme(mut theme: Theme) -> Result<Theme, ThemeError> {
         240.0,
     )?;
     finite_range(
+        "spacing.playback_type_column_width",
+        theme.spacing.playback_type_column_width,
+        32.0,
+        240.0,
+    )?;
+    finite_range(
         "spacing.last_played_column_width",
         theme.spacing.last_played_column_width,
         32.0,
@@ -882,6 +896,7 @@ mod tests {
         spacing.remove("rating_column_width");
         spacing.remove("collection_column_width");
         spacing.remove("last_played_column_width");
+        spacing.remove("playback_type_column_width");
         let legacy = serde_json::to_string(&legacy).expect("legacy theme serializes");
 
         let theme = parse_theme_json(&legacy).expect("legacy theme validates");
@@ -918,6 +933,7 @@ mod tests {
         spacing.remove("rating_column_width");
         spacing.remove("collection_column_width");
         spacing.remove("last_played_column_width");
+        spacing.remove("playback_type_column_width");
         // The pre-curation fixed columns total exactly 640px. The additive defaults therefore
         // leave the compatibility 192px name-column budget at the 960px minimum window.
         spacing.insert("sidebar_width".to_string(), serde_json::Value::from(398.0));
@@ -928,6 +944,23 @@ mod tests {
         assert_eq!(theme.spacing.rating_column_width, 56.0);
         assert_eq!(theme.spacing.collection_column_width, 72.0);
         assert_eq!(theme.spacing.last_played_column_width, 112.0);
+        assert_eq!(theme.spacing.playback_type_column_width, 76.0);
+    }
+
+    #[test]
+    fn playback_type_width_round_trips_and_rejects_invalid_dimensions() {
+        for width in [32.0, 76.0, 240.0] {
+            let mut theme = Theme::default();
+            theme.spacing.playback_type_column_width = width;
+            let json = serde_json::to_string(&theme).expect("theme serializes");
+            let parsed = parse_theme_json(&json).expect("bounded width validates");
+            assert_eq!(parsed.spacing.playback_type_column_width, width);
+        }
+        for width in [31.0, 241.0, f32::NAN, f32::INFINITY] {
+            let mut theme = Theme::default();
+            theme.spacing.playback_type_column_width = width;
+            assert!(validate_theme(theme).is_err());
+        }
     }
 
     #[test]

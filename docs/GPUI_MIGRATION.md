@@ -1100,3 +1100,19 @@ focused row and the loaded preview when that focused row remains visible.
 Validation: 70 core tests, 137 UI tests (one ignored), and 18 media tests passed;
 formatting and diff checks passed. Native interaction acceptance remains pending.
 The sortable column and automatic transport policy follow separately.
+
+### Sortable Type column and responsive metadata widths
+
+Type now appears between Rating and Col, displaying Loop, 1-Shot, or a dash.
+Its explicit ascending rank matches Wavecrate: Loop, OneShot, then unknown;
+descending reverses that order with the existing deterministic name/path ties.
+
+The optional theme width defaults to the reference 76 pixels and accepts bounded
+custom widths without invalidating older theme files. Header and rows share one
+visibility decision that reserves sample-name space, prioritizes Type when it
+fits, and adds Last Played when space permits. Narrow custom cells clip labels.
+
+Validation: 71 core tests, two UI view tests, and 21 design tests passed, including
+legacy theme compatibility, custom-width round trips, invalid dimensions, sort
+direction, and responsive boundaries. Formatting and diff checks passed. Native
+visual acceptance remains pending; open application bundles were not changed.
