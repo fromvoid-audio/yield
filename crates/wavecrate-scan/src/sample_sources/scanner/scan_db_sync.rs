@@ -34,7 +34,7 @@ pub(super) fn db_sync_phase(
         if chunk.is_empty() {
             break;
         }
-        let _writer = writer.lock(ScanWritePhase::Manifest);
+        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
         if cancel_requested(cancel) {
             return Err(ScanError::Canceled);
         }
@@ -81,7 +81,7 @@ pub(super) fn complete_scan_generation(
         return Ok(context.latest_committed_snapshot());
     }
     source_root.ensure_current_generation()?;
-    let _writer = writer.lock(ScanWritePhase::Manifest);
+    let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }

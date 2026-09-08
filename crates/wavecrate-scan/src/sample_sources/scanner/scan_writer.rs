@@ -1,3 +1,5 @@
+use super::scan::ScanError;
+
 /// Database mutation phases exposed by the scanner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanWritePhase {
@@ -19,6 +21,24 @@ pub trait ScanWriter {
 
     /// Acquire write ownership for the supplied scanner phase.
     fn lock(&self, phase: ScanWritePhase) -> Self::Guard;
+
+    /// Try to acquire write ownership for one bounded scanner mutation.
+    ///
+    /// Existing coordinators retain the infallible `lock` contract by default. Owners that must
+    /// revalidate profile or source authority before each write phase can override this method
+    /// and fail closed without changing existing scanner callers.
+    fn try_lock(&self, phase: ScanWritePhase) -> Result<Self::Guard, ScanError> {
+        Ok(self.lock(phase))
+    }
+
+    /// Acquire ownership for discarding private staging rows after an aborted audit.
+    ///
+    /// Cleanup must still validate the owning profile/source boundary, but it deliberately does
+    /// not inherit an operation's cancellation flag. The caller only uses this for rows created
+    /// by the failed audit and never for active or inactive directory generations.
+    fn try_lock_cleanup(&self) -> Result<Self::Guard, ScanError> {
+        self.try_lock(ScanWritePhase::Manifest)
+    }
 }
 
 /// Default coordinator for callers that already own serialization or only need SQLite's

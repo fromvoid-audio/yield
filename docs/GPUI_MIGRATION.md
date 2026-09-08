@@ -569,6 +569,30 @@ restoration, cross-source navigation into a nested folder, search-focus isolatio
 and clearing a hiding filter when navigating from browser focus. The test app
 quit cleanly. Audible quality and Windows input acceptance remain unverified.
 
+### Profile-owned catalog foundation, 2026-09-08
+
+Added the GPUI-free `wavecrate-catalog` worker with bounded commands and completion
+events. It clones an existing writable profile capability, retains exclusive
+leases on profile-child catalog databases, and never opens a source-local
+database. Snapshots require matching source/lifecycle/root identity and an exact
+manifest, directory-truth, and audit-metadata revision. Catalog enumeration stops
+before optional content verification can advance that revision.
+
+The shared scanner now rejects incomplete directory evidence before issuing a
+complete-audit receipt. Directory staging and cleanup use bounded transactions;
+the final activation records the authoritative revision atomically. Metadata-only
+revision changes are accepted only after exact manifest equality and a final
+transaction fence. Catalog-owned maintenance reclaims interrupted staging and
+inactive generations, revalidating ownership and cancellation between batches.
+
+Validation: all 452 library and 203 scanner tests passed, followed by all 17
+catalog tests after the final registration-cancellation change. Doc tests,
+formatting, and diff checks passed. Regressions cover opaque root identity bytes,
+incomplete traversal, interrupted audits, revision neutrality, source/profile
+replacement, bounded admission, shutdown, orphan recovery, and repeated-audit
+retention. The foundation is not yet composed into the browser; watcher
+convergence and persistent browser projection remain integration work.
+
 ### Required final evidence
 
 Record implementation status and exact checks for each migrated workflow.

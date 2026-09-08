@@ -8,6 +8,7 @@ members = [
     "crates/reson",
     "crates/wavecrate-analysis",
     "crates/wavecrate-library",
+    "crates/wavecrate-catalog",
     "crates/wavecrate-session",
     "crates/wavecrate-scan",
 ]

@@ -461,7 +461,7 @@ fn verify_content_batch_window_with_source_root_hooks(
     let manifest_revision = db.get_revision()?;
     source_root.ensure_current_generation()?;
     let checkpoint = {
-        let _writer = writer.lock(ScanWritePhase::Manifest);
+        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
         db.begin_or_resume_content_audit(now, manifest_revision)?
     };
     let forward = db.content_audit_forward_candidates(
@@ -635,7 +635,7 @@ fn verify_content_batch_window_with_source_root_hooks(
     let cancelled = cancel_requested(cancel);
     if !verified.is_empty() || !skipped.is_empty() || cursor_only_progress {
         source_root.ensure_current_generation()?;
-        let _writer = writer.lock(ScanWritePhase::DeferredHash);
+        let _writer = writer.try_lock(ScanWritePhase::DeferredHash)?;
         let mut batch = db.write_batch()?;
         let stats_before_staging = stats.clone();
         if !batch.matches_revision(manifest_revision)? {
@@ -787,13 +787,13 @@ fn verify_content_batch_window_with_source_root_hooks(
         stats.committed_delta.revision = db.get_revision()?;
     };
     let report = {
-        let _writer = writer.lock(ScanWritePhase::Manifest);
+        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
         db.content_audit_report(now)?
     };
     let completed_rotation = report.remaining_entries == 0 && report.total_entries > 0;
     if completed_rotation {
         source_root.ensure_current_generation()?;
-        let _writer = writer.lock(ScanWritePhase::Manifest);
+        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
         let mut batch = db.write_batch()?;
         if !batch.matches_revision(stats.committed_delta.revision)? {
             return Err(ScanError::StaleRevision {
@@ -807,7 +807,7 @@ fn verify_content_batch_window_with_source_root_hooks(
         stats.committed_delta.revision = result.revision;
     }
     stats.content_audit = Some({
-        let _writer = writer.lock(ScanWritePhase::Manifest);
+        let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
         db.content_audit_report(now)?
     });
     if cancelled {
@@ -1055,7 +1055,7 @@ fn reconcile_hashed_rename_candidates_with_source_root_and_hook(
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }
-    let _writer = writer.lock(ScanWritePhase::DeferredHash);
+    let _writer = writer.try_lock(ScanWritePhase::DeferredHash)?;
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }
@@ -1407,7 +1407,7 @@ fn deep_hash_scan_window_with_root_hooks(
     }
 
     source_root.ensure_current_generation()?;
-    let _writer = writer.lock(ScanWritePhase::DeferredHash);
+    let _writer = writer.try_lock(ScanWritePhase::DeferredHash)?;
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }

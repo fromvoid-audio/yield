@@ -111,7 +111,7 @@ pub(super) fn reconcile_index_entries(
         return Ok(());
     }
     source_root.ensure_current_generation()?;
-    let _writer = writer.lock(ScanWritePhase::Manifest);
+    let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
     let mut batch = database.write_batch()?;
     for path in &unavailable_manifest_paths {
         batch.set_missing(path, true)?;

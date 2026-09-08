@@ -71,6 +71,14 @@ fn schema_unavailable() -> SourceDbError {
     SourceDirectoryTruthError::SchemaUnavailable.into()
 }
 
+fn directory_generation_sql_value(generation: u64) -> Result<i64, SourceDbError> {
+    if generation == 0 {
+        return Err(SourceDirectoryTruthError::InvalidGeneration { generation }.into());
+    }
+    i64::try_from(generation)
+        .map_err(|_| SourceDirectoryTruthError::InvalidGeneration { generation }.into())
+}
+
 fn requires_audit(reason: SourceDirectoryTruthUnavailableReason) -> SourceDbError {
     SourceDirectoryTruthError::RequiresAudit { reason }.into()
 }
@@ -284,6 +292,161 @@ impl SourceDatabase {
         let mut batch = self.write_batch()?;
         batch.stage_source_directory_truth_entries(generation, entries)?;
         batch.commit_auxiliary_state()
+    }
+
+    /// Read a bounded page of incomplete directory-truth generations.
+    ///
+    /// A catalog owner calls this only when no audit is active for the source. Staging rows are
+    /// private and never participate in the active directory-truth projection.
+    pub fn staged_source_directory_truth_generations(
+        &self,
+        requested_limit: usize,
+    ) -> Result<Vec<u64>, SourceDbError> {
+        if !directory_truth_schema_available(&self.connection)? {
+            return Err(schema_unavailable());
+        }
+        let limit = requested_limit.clamp(1, SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT generation
+                 FROM source_directory_generations
+                 WHERE status = 'staging'
+                 ORDER BY generation ASC
+                 LIMIT ?1",
+            )
+            .map_err(map_sql_error)?;
+        let generations = statement
+            .query_map(
+                [i64::try_from(limit).map_err(|_| SourceDbError::Unexpected)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sql_error)?
+            .map(|generation| {
+                generation.map_err(map_sql_error).and_then(|generation| {
+                    u64::try_from(generation).map_err(|_| SourceDbError::Unexpected)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(generations)
+    }
+
+    /// Discard one bounded batch from an incomplete staged directory generation.
+    ///
+    /// Active and inactive generations are never removed. Callers that own a long-running audit
+    /// should acquire their authority for each call and repeat while `more_work` is true.
+    pub fn discard_source_directory_truth_generation_batch(
+        &self,
+        generation: u64,
+        requested_limit: usize,
+    ) -> Result<SourceDirectoryTruthCleanup, SourceDbError> {
+        let generation = directory_generation_sql_value(generation)?;
+        let limit = requested_limit.min(SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT);
+        if limit == 0 {
+            return Ok(SourceDirectoryTruthCleanup {
+                deleted_entries: 0,
+                deleted_generations: 0,
+                more_work: true,
+            });
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(map_sql_error)?;
+        let is_staging = transaction
+            .query_row(
+                "SELECT status FROM source_directory_generations WHERE generation = ?1",
+                [generation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?
+            .is_some_and(|status| status == "staging");
+        if !is_staging {
+            transaction.rollback().map_err(map_sql_error)?;
+            return Ok(SourceDirectoryTruthCleanup {
+                deleted_entries: 0,
+                deleted_generations: 0,
+                more_work: false,
+            });
+        }
+        let deleted_entries = transaction
+            .execute(
+                "DELETE FROM source_directory_entries
+                 WHERE generation = ?1
+                   AND path IN (
+                       SELECT path
+                       FROM source_directory_entries
+                       WHERE generation = ?1
+                       ORDER BY path ASC
+                       LIMIT ?2
+                   )
+                   AND EXISTS (
+                       SELECT 1
+                       FROM source_directory_generations
+                       WHERE generation = ?1 AND status = 'staging'
+                   )",
+                rusqlite::params![generation, i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .map_err(map_sql_error)?;
+        let has_entries = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM source_directory_entries WHERE generation = ?1
+                 )",
+                [generation],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sql_error)?
+            != 0;
+        let removed_generations = if has_entries {
+            0
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM source_directory_generations
+                     WHERE generation = ?1 AND status = 'staging'",
+                    [generation],
+                )
+                .map_err(map_sql_error)?
+        };
+        let db_path = self.db_path.clone();
+        let telemetry_label = self.telemetry_label;
+        transaction.commit().map_err(map_sql_error)?;
+        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
+        Ok(SourceDirectoryTruthCleanup {
+            deleted_entries: usize::try_from(deleted_entries)
+                .map_err(|_| SourceDbError::Unexpected)?,
+            deleted_generations: usize::try_from(removed_generations)
+                .map_err(|_| SourceDbError::Unexpected)?,
+            more_work: has_entries,
+        })
+    }
+
+    /// Discard an incomplete staged directory generation without changing source revision.
+    ///
+    /// This compatibility wrapper repeats the bounded operation until the generation is gone.
+    /// Long-running scanner owners should use the batch method so they can revalidate authority
+    /// between transactions.
+    pub fn discard_source_directory_truth_generation(
+        &self,
+        generation: u64,
+    ) -> Result<bool, SourceDbError> {
+        let mut removed = false;
+        loop {
+            let cleanup = self.discard_source_directory_truth_generation_batch(
+                generation,
+                SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT,
+            )?;
+            removed |= cleanup.deleted_generations != 0;
+            if !cleanup.more_work {
+                return Ok(removed);
+            }
+        }
     }
 
     /// Atomically publish one complete directory generation at the expected source revision.
@@ -561,6 +724,7 @@ mod tests {
         SourceDirectoryTruthError, SourceDirectoryTruthState,
         SourceDirectoryTruthUnavailableReason, SourceManifestEntry,
     };
+    use crate::sample_sources::reconciliation::RootIdentity;
 
     fn directory(path: &str, identity: &str) -> SourceDirectoryEntry {
         SourceDirectoryEntry {
@@ -618,6 +782,54 @@ mod tests {
     }
 
     #[test]
+    fn staged_catalog_handoff_keeps_revision_neutral_until_final_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SourceDatabase::open_for_source_write(root.path()).unwrap();
+        db.begin_source_directory_truth_generation(1, 1).unwrap();
+        db.stage_source_directory_truth_entries(1, &[directory("drums", "dir-1")])
+            .unwrap();
+
+        assert_eq!(db.get_revision().unwrap(), 0);
+        assert!(db.last_authoritative_audit_metadata().unwrap().is_none());
+        assert_eq!(
+            db.source_directory_truth_state().unwrap(),
+            SourceDirectoryTruthState::Uninitialized
+        );
+
+        let (commit, _) = db
+            .write_batch()
+            .unwrap()
+            .commit_manifest_audit_with_staged_directory_truth(
+                1,
+                0,
+                1234,
+                RootIdentity::from_bytes(vec![0xff, 0x00]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(commit.committed_source_revision(), 1);
+        assert_eq!(db.get_revision().unwrap(), 1);
+        assert_eq!(
+            db.last_authoritative_audit_metadata()
+                .unwrap()
+                .unwrap()
+                .source_revision,
+            1
+        );
+        assert_eq!(
+            db.get_metadata(META_LAST_SCAN_COMPLETED_AT).unwrap(),
+            Some("1234".to_owned())
+        );
+        assert_eq!(
+            db.source_directory_truth_state().unwrap(),
+            SourceDirectoryTruthState::Active {
+                generation: 1,
+                published_source_revision: 1,
+            }
+        );
+    }
+
+    #[test]
     fn allocator_starts_at_one_for_an_empty_directory_truth_table() {
         let root = tempfile::tempdir().unwrap();
         let db = SourceDatabase::open_for_source_write(root.path()).unwrap();
@@ -645,6 +857,107 @@ mod tests {
                 )
                 .unwrap(),
             ("staging".to_owned(), 0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn discard_staged_generation_keeps_active_truth_and_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SourceDatabase::open_for_source_write(root.path()).unwrap();
+        db.begin_source_directory_truth_generation(1, 1).unwrap();
+        db.stage_source_directory_truth_entries(1, &[directory("one", "dir-1")])
+            .unwrap();
+        db.finalize_source_directory_truth_generation(1, 0).unwrap();
+        let revision_before = db.get_revision().unwrap();
+
+        db.begin_source_directory_truth_generation(2, 1).unwrap();
+        db.stage_source_directory_truth_entries(2, &[directory("two", "dir-2")])
+            .unwrap();
+        assert!(db.discard_source_directory_truth_generation(2).unwrap());
+        assert!(!db.discard_source_directory_truth_generation(2).unwrap());
+        assert_eq!(db.get_revision().unwrap(), revision_before);
+        assert_eq!(
+            db.source_directory_truth_state().unwrap(),
+            SourceDirectoryTruthState::Active {
+                generation: 1,
+                published_source_revision: revision_before,
+            }
+        );
+        assert_eq!(
+            db.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM source_directory_generations
+                     WHERE generation = 2",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn discard_staged_generation_is_bounded_and_preserves_active_truth() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SourceDatabase::open_for_source_write(root.path()).unwrap();
+        db.begin_source_directory_truth_generation(1, 1).unwrap();
+        db.stage_source_directory_truth_entries(1, &[directory("one", "dir-1")])
+            .unwrap();
+        db.finalize_source_directory_truth_generation(1, 0).unwrap();
+        let revision_before = db.get_revision().unwrap();
+
+        let entry_count = super::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT * 2 + 1;
+        db.begin_source_directory_truth_generation(2, entry_count as u64)
+            .unwrap();
+        let entries = (0..entry_count)
+            .map(|index| directory(&format!("staged/{index}"), &format!("staged-{index}")))
+            .collect::<Vec<_>>();
+        for chunk in entries.chunks(super::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT) {
+            db.stage_source_directory_truth_entries(2, chunk).unwrap();
+        }
+
+        let first = db
+            .discard_source_directory_truth_generation_batch(
+                2,
+                super::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT,
+            )
+            .unwrap();
+        assert_eq!(
+            first.deleted_entries,
+            super::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT
+        );
+        assert_eq!(first.deleted_generations, 0);
+        assert!(first.more_work);
+        assert_eq!(db.get_revision().unwrap(), revision_before);
+        assert_eq!(
+            db.source_directory_truth_state().unwrap(),
+            SourceDirectoryTruthState::Active {
+                generation: 1,
+                published_source_revision: revision_before,
+            }
+        );
+
+        while db
+            .discard_source_directory_truth_generation_batch(
+                2,
+                super::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT,
+            )
+            .unwrap()
+            .more_work
+        {}
+        assert_eq!(db.get_revision().unwrap(), revision_before);
+        assert_eq!(
+            db.connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM source_directory_generations
+                        WHERE generation = 2
+                    )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
     }
 

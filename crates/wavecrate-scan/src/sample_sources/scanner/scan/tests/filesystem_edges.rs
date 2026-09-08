@@ -1,6 +1,9 @@
 use super::*;
 use crate::sample_sources::scanner::scan_fs::force_directory_identity;
-use crate::sample_sources::scanner::{DirectoryRepeatKind, SourceTreeDiagnostic};
+use crate::sample_sources::scanner::{
+    DirectoryRepeatKind, SourceTreeDiagnostic, UncoordinatedScanWriter,
+    audit_manifest_for_catalog_with_budget_and_progress_and_writer,
+};
 use std::path::PathBuf;
 
 #[test]
@@ -116,6 +119,41 @@ fn full_scan_stops_an_injected_directory_identity_cycle() {
             ..
         } if path == std::path::Path::new("cycle")
     )));
+}
+
+#[test]
+fn catalog_manifest_audit_does_not_complete_on_incomplete_directory_evidence() {
+    let dir = tempdir().unwrap();
+    let cycle = dir.path().join("cycle");
+    std::fs::create_dir(&cycle).unwrap();
+    std::fs::write(dir.path().join("root.wav"), b"root").unwrap();
+    std::fs::write(cycle.join("never-reached.wav"), b"cycle").unwrap();
+
+    let _root_identity = force_directory_identity(dir.path(), Some("root-identity"));
+    let _cycle_identity = force_directory_identity(&cycle, Some("root-identity"));
+    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let result = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+        &db,
+        None,
+        1234,
+        &mut |_, _| {},
+        &UncoordinatedScanWriter,
+        None,
+    );
+    let ScanError::Incomplete { committed, .. } = result.unwrap_err() else {
+        panic!("an incomplete directory traversal must not mint a catalog audit");
+    };
+    let snapshot = committed
+        .source_tree_snapshot
+        .expect("source tree snapshot");
+    assert!(!snapshot.is_complete());
+    assert!(snapshot.complete_directory_entries().is_none());
+    assert!(db.last_authoritative_audit_metadata().unwrap().is_none());
+    assert_eq!(
+        db.get_metadata(wavecrate_library::sample_sources::db::META_LAST_SCAN_COMPLETED_AT)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]

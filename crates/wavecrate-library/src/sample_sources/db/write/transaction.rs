@@ -9,6 +9,7 @@ use super::super::util::{
     map_sql_error, normalize_relative_path, parse_canonical_directory_path_from_db,
 };
 use super::super::{
+    META_LAST_AUTHORITATIVE_AUDIT_REVISION, META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
     META_LAST_SCAN_COMPLETED_AT, META_SOURCE_TRAVERSAL_POLICY, SourceDatabase, SourceDbError,
     SourceDirectoryEntry, SourceDirectoryTruthError, SourceDirectoryTruthPublication,
     SourceIndexEntry, SourceManifestEntry, SourceTraversalPolicy, SourceWriteBatch,
@@ -587,6 +588,56 @@ impl SourceWriteBatch<'_> {
             "source_db",
             self.telemetry_label,
         );
+        Ok((
+            SourceAuditCommit::new(revision, committed_root_identity, audit_request.cloned()),
+            snapshot,
+        ))
+    }
+
+    /// Finish a catalog audit after its directory rows were durably staged in bounded batches.
+    ///
+    /// The final transaction activates the already-complete generation, advances the source
+    /// revision, records the audit identity and completion metadata, and captures the exact
+    /// manifest snapshot returned with the audit authority. Staging rows remain invisible if this
+    /// transaction fails or is canceled before it commits.
+    pub fn commit_manifest_audit_with_staged_directory_truth(
+        mut self,
+        generation: u64,
+        expected_source_revision: u64,
+        completed_at: i64,
+        committed_root_identity: RootIdentity,
+        audit_request: Option<&SourceAuditRequest>,
+    ) -> Result<(SourceAuditCommit, Vec<SourceManifestEntry>), SourceDbError> {
+        if self.paths_revision_dirty
+            || self.identities_revision_dirty
+            || self.index_revision_dirty
+            || !self.manifest_touched_paths.is_empty()
+            || !self.source_index_changes.is_empty()
+        {
+            return Err(SourceDbError::Unexpected);
+        }
+        self.complete_manifest_audit(completed_at)?;
+        let publication = self.activate_source_directory_truth_generation(
+            generation,
+            expected_source_revision,
+            DirectoryTruthActivationMode::RequireStaging,
+        )?;
+        let (revision, snapshot) = manifest_snapshot(&self.tx)?;
+        if publication.source_revision != revision {
+            return Err(SourceDbError::Unexpected);
+        }
+        self.set_metadata(META_LAST_SCAN_COMPLETED_AT, &completed_at.to_string())?;
+        let identity = serde_json::to_string(committed_root_identity.as_bytes())
+            .map_err(|_| SourceDbError::Unexpected)?;
+        self.set_metadata(META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY, &identity)?;
+        self.set_metadata(
+            META_LAST_AUTHORITATIVE_AUDIT_REVISION,
+            &revision.to_string(),
+        )?;
+        let db_path = self.db_path.clone();
+        let telemetry_label = self.telemetry_label;
+        self.tx.commit().map_err(map_sql_error)?;
+        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
         Ok((
             SourceAuditCommit::new(revision, committed_root_identity, audit_request.cloned()),
             snapshot,

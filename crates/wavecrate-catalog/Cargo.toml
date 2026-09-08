@@ -1,0 +1,17 @@
+[package]
+name = "wavecrate-catalog"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+warnings = "deny"
+missing_docs = "deny"
+
+[dependencies]
+blake3 = "1.6.1"
+thiserror = "2.0.17"
+wavecrate-library = { path = "../wavecrate-library" }
+wavecrate-scan = { path = "../wavecrate-scan" }
+
+[dev-dependencies]
+tempfile = "3.23.0"

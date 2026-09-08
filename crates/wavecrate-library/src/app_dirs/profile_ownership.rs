@@ -1,9 +1,11 @@
 //! Cross-process writable ownership for one Wavecrate persistence profile.
 
 use std::{
+    collections::HashSet,
     fs::File,
     io::{self, Write},
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, ambient_authority};
@@ -56,6 +58,12 @@ pub enum ProfileOwnershipError {
         /// Profile path whose identity could not be established.
         path: PathBuf,
     },
+    /// A profile-owned child database is already retained by another participant in this process.
+    #[error("profile child database is already open: {path}")]
+    ProfileChildAlreadyLeased {
+        /// Child path whose retained capability is already leased.
+        path: PathBuf,
+    },
     /// This platform has no verified nonblocking profile ownership primitive.
     #[error("profile ownership is unsupported on this platform: {path}")]
     Unsupported {
@@ -77,6 +85,27 @@ pub struct WritableProfileGuard {
     lock_identity: String,
     root_dir: Dir,
     _lock_file: File,
+    catalog_leases: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Retained in-process exclusivity for one profile child database capability.
+///
+/// The lease is carried by the database's descriptor-bound root and therefore lives until the
+/// database itself is dropped. Profile guard clones share the registry but do not acquire another
+/// process-wide profile lock.
+pub(crate) struct ProfileChildLease {
+    registry: Arc<Mutex<HashSet<String>>>,
+    identity: String,
+}
+
+impl Drop for ProfileChildLease {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.remove(&self.identity);
+    }
 }
 
 impl WritableProfileGuard {
@@ -104,6 +133,7 @@ impl WritableProfileGuard {
             lock_identity,
             root_dir,
             _lock_file: lock_file,
+            catalog_leases: Arc::new(Mutex::new(HashSet::new())),
         };
         guard.validate_current()?;
         Ok(guard)
@@ -147,6 +177,7 @@ impl WritableProfileGuard {
             lock_identity: self.lock_identity.clone(),
             root_dir,
             _lock_file: lock_file,
+            catalog_leases: Arc::clone(&self.catalog_leases),
         })
     }
 
@@ -234,6 +265,38 @@ impl WritableProfileGuard {
             })?;
         self.validate_current()?;
         Ok(child_dir)
+    }
+
+    /// Open one direct child and retain an in-process exclusive lease for its physical identity.
+    pub(crate) fn open_child_dir_with_lease(
+        &self,
+        child: &Path,
+    ) -> Result<(Dir, ProfileChildLease), ProfileOwnershipError> {
+        let child_dir = self.open_child_dir(child)?;
+        let identity = identity_from_dir(&child_dir).ok_or_else(|| {
+            ProfileOwnershipError::IdentityUnavailable {
+                path: self.profile_root.join(child),
+            }
+        })?;
+        let mut registry = self
+            .catalog_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !registry.insert(identity.clone()) {
+            return Err(ProfileOwnershipError::ProfileChildAlreadyLeased {
+                path: self.profile_root.join(child),
+            });
+        }
+        let lease = ProfileChildLease {
+            registry: Arc::clone(&self.catalog_leases),
+            identity,
+        };
+        drop(registry);
+        if let Err(error) = self.validate_current() {
+            drop(lease);
+            return Err(error);
+        }
+        Ok((child_dir, lease))
     }
 }
 

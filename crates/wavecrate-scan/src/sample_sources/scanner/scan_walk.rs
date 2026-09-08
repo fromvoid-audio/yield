@@ -651,7 +651,7 @@ fn apply_batch_with_source_root_and_precommit_hook(
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }
-    let _writer = writer.lock(ScanWritePhase::Manifest);
+    let _writer = writer.try_lock(ScanWritePhase::Manifest)?;
     if cancel_requested(cancel) {
         return Err(ScanError::Canceled);
     }

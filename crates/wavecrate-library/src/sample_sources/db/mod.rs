@@ -8,6 +8,9 @@ use std::{
 use rusqlite::{Connection, Transaction};
 use std::fmt;
 
+use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
+
+use super::reconciliation::RootIdentity;
 use super::source_entry::SourceTraversalPolicy;
 
 mod content_audit;
@@ -101,6 +104,11 @@ pub const META_WAV_IDENTITIES_REVISION: &str = "wav_identities_revision_v1";
 pub const META_READINESS_DUPLICATE_IDENTITY: &str = "readiness_duplicate_identity_v1";
 /// Metadata key storing the revision of the index-only unsupported file set.
 pub const META_SOURCE_INDEX_REVISION: &str = "source_index_revision_v1";
+/// Metadata key storing the physical root identity of the last complete manifest audit.
+pub const META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY: &str =
+    "last_authoritative_audit_root_identity_v1";
+/// Metadata key storing the exact source revision committed by the last complete manifest audit.
+pub const META_LAST_AUTHORITATIVE_AUDIT_REVISION: &str = "last_authoritative_audit_revision_v1";
 /// Metadata key for the persisted source traversal/visibility policy.
 pub const META_SOURCE_TRAVERSAL_POLICY: &str = "source_traversal_policy_v1";
 /// Maximum number of directory entries accepted by one staging batch or read page.
@@ -112,12 +120,26 @@ pub const SOURCE_DIRECTORY_TRUTH_MAX_IDENTITY_BYTES: usize = 1024;
 /// Env var that enables read-only source DB opening by default.
 pub const SOURCE_DB_READ_ONLY_ENV: &str = "WAVECRATE_SOURCE_DB_READ_ONLY";
 
+/// Durable identity and source revision committed by one complete manifest audit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceAuditMetadata {
+    /// Physical source-root identity captured by the audit.
+    pub root_identity: RootIdentity,
+    /// Exact source revision committed by the audit transaction.
+    pub source_revision: u64,
+}
+
 /// Keeps a verified database-root namespace alive for the lifetime of its connection.
 ///
 /// Recovery and profile-owned writers supply platform-specific implementations when SQLite must
 /// open through a descriptor-bound namespace. This is intentionally private to the library's
 /// database implementation; ordinary callers continue to use pathname-based opening.
-pub(crate) trait DatabaseRootBindingGuard: Send {}
+pub(crate) trait DatabaseRootBindingGuard: Send {
+    fn validate_profile_guard(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), ProfileOwnershipError>;
+}
 
 /// SQLite wrapper that stores wav metadata for a single source folder.
 pub struct SourceDatabase {
@@ -161,6 +183,47 @@ pub struct SourceWriteBatch<'conn> {
 }
 
 impl SourceDatabase {
+    /// Read the identity and exact revision of the last complete manifest audit.
+    ///
+    /// Both values are written by the same audit transaction. A partially present or malformed
+    /// pair is rejected so callers cannot publish an identity without its matching revision.
+    pub fn last_authoritative_audit_metadata(
+        &self,
+    ) -> Result<Option<SourceAuditMetadata>, SourceDbError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(SourceDbError::from)?;
+        let (identity, revision): (Option<String>, Option<String>) = transaction
+            .query_row(
+                "SELECT
+                    (SELECT value FROM metadata WHERE key = ?1),
+                    (SELECT value FROM metadata WHERE key = ?2)",
+                rusqlite::params![
+                    META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY,
+                    META_LAST_AUTHORITATIVE_AUDIT_REVISION
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(SourceDbError::from)?;
+        transaction.rollback().map_err(SourceDbError::from)?;
+        match (identity, revision) {
+            (None, None) => Ok(None),
+            (Some(identity), Some(revision)) => {
+                let source_revision = revision
+                    .parse::<u64>()
+                    .map_err(|_| SourceDbError::Unexpected)?;
+                let identity = serde_json::from_str::<Vec<u8>>(&identity)
+                    .map_err(|_| SourceDbError::Unexpected)?;
+                Ok(Some(SourceAuditMetadata {
+                    root_identity: RootIdentity::from_bytes(identity),
+                    source_revision,
+                }))
+            }
+            _ => Err(SourceDbError::Unexpected),
+        }
+    }
+
     /// Override this connection's SQLite busy timeout for deterministic contention tests.
     #[cfg(feature = "test-support")]
     pub fn set_busy_timeout_for_tests(&self, timeout: Duration) -> Result<(), SourceDbError> {
@@ -337,6 +400,26 @@ impl SourceDatabase {
         self
     }
 
+    /// Revalidate the retained profile-owned database namespace before an operation.
+    ///
+    /// Profile-owned catalog connections retain both the profile capability and the named child
+    /// identity. A successful check means neither the profile root nor that child pathname was
+    /// replaced since the connection was opened.
+    pub fn validate_profile_guard(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), SourceDbError> {
+        if let Some(binding) = self.database_root_binding.as_ref() {
+            binding
+                .validate_profile_guard(profile_guard)
+                .map_err(SourceDbError::from)
+        } else {
+            profile_guard
+                .validate_current()
+                .map_err(SourceDbError::from)
+        }
+    }
+
     /// Open a startup-friendly database for a background job.
     pub fn open_for_background_job(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         Self::open_with_role(root, SourceDatabaseConnectionRole::JobWorker)
@@ -365,6 +448,33 @@ impl SourceDatabase {
         database_root: impl AsRef<Path>,
     ) -> Result<Self, SourceDbError> {
         Self::open_for_background_job_with_database_root(root, database_root)
+    }
+
+    /// Open a scan database in one direct child of an already-owned profile root.
+    ///
+    /// The child is created and retained through the profile capability, so callers cannot
+    /// accidentally create a source-local `.wavecrate.db` while building an app-owned catalog.
+    /// The returned database retains the descriptor-bound child capability for its lifetime.
+    pub fn open_for_catalog_with_profile_guard(
+        root: impl AsRef<Path>,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+        profile_child: impl AsRef<Path>,
+    ) -> Result<Self, SourceDbError> {
+        let binding = file_ops_journal::BoundDatabaseRoot::for_profile_child(
+            profile_guard,
+            profile_child.as_ref(),
+        )
+        .map_err(SourceDbError::from)?;
+        let database = open::open_source_database_with_database_root(
+            root.as_ref(),
+            binding.path(),
+            false,
+            open::SourceDatabaseOpenMode::Full,
+        )?;
+        binding
+            .validate_profile_guard(profile_guard)
+            .map_err(SourceDbError::from)?;
+        Ok(database.retain_database_root_binding(Box::new(binding)))
     }
 
     /// Open an existing database for UI-owned read access.

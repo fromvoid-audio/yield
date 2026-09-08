@@ -177,6 +177,9 @@ pub enum SourceDbError {
         /// Underlying application directory error.
         source: crate::app_dirs::AppDirError,
     },
+    /// The retained profile capability could not safely host an external catalog database.
+    #[error("Profile-owned catalog database root is unavailable: {0}")]
+    ProfileOwnership(#[from] crate::app_dirs::ProfileOwnershipError),
     /// Failed to move a source DB from its legacy filename to the current filename.
     #[error("Could not migrate source database from {from} to {to}: {source}")]
     RenameLegacyDatabase {

@@ -161,8 +161,7 @@ impl SourceTreeSnapshot {
     }
 
     /// Borrow persistence-ready directory entries only from a complete traversal snapshot.
-    #[allow(dead_code)]
-    pub(crate) fn complete_directory_entries(&self) -> Option<&[SourceDirectoryEntry]> {
+    pub fn complete_directory_entries(&self) -> Option<&[SourceDirectoryEntry]> {
         if !self.is_complete() {
             return None;
         }

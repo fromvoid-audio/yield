@@ -907,6 +907,37 @@ fn unchanged_large_scan_only_commits_completion_metadata() {
 }
 
 #[test]
+fn catalog_manifest_audit_commits_before_deferred_content_hashing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("large.wav");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(8 * 1024 * 1024 + 1).unwrap();
+    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+
+    let audit = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+        &db,
+        None,
+        1_234,
+        &mut |_, _| {},
+        &UncoordinatedScanWriter,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(audit.stats.hashes_pending, 1);
+    assert_eq!(
+        audit.audit_commit.committed_source_revision(),
+        db.get_revision().unwrap()
+    );
+    assert_eq!(
+        db.get_metadata(crate::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
+            .unwrap()
+            .as_deref(),
+        Some("1234")
+    );
+}
+
+#[test]
 fn bounded_manifest_audit_repairs_same_size_closed_app_edit() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("same.wav");
@@ -953,6 +984,9 @@ fn manifest_audit_keeps_an_unreadable_subtree_due_for_retry() {
     std::fs::write(protected.join("kick.wav"), b"kick").unwrap();
     let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
     scan_once(&db).unwrap();
+    let scan_completion_before = db
+        .get_metadata(crate::sample_sources::db::META_LAST_SCAN_COMPLETED_AT)
+        .unwrap();
 
     std::fs::remove_file(protected.join("kick.wav")).unwrap();
     let failure = force_directory_read_failure(&protected);
@@ -966,6 +1000,12 @@ fn manifest_audit_keeps_an_unreadable_subtree_due_for_retry() {
         db.get_metadata(crate::sample_sources::db::META_LAST_MANIFEST_AUDIT_AT)
             .unwrap()
             .is_none()
+    );
+    assert_eq!(
+        db.get_metadata(crate::sample_sources::db::META_LAST_SCAN_COMPLETED_AT)
+            .unwrap(),
+        scan_completion_before,
+        "incomplete traversal must not publish a new scan completion marker"
     );
 
     drop(failure);

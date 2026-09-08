@@ -176,6 +176,7 @@ impl SourceWriteBatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample_sources::reconciliation::RootIdentity;
     use std::path::Path;
 
     #[test]
@@ -235,5 +236,33 @@ mod tests {
                 .as_deref(),
             Some("30")
         );
+    }
+
+    #[test]
+    fn audit_metadata_round_trips_non_utf8_root_identity() {
+        let directory = tempfile::tempdir().expect("source");
+        let database = SourceDatabase::open_for_source_write(directory.path()).expect("database");
+        let root_identity = RootIdentity::from_bytes(vec![0xff, 0x00, 0x7f]);
+        database
+            .begin_source_directory_truth_generation(1, 0)
+            .expect("empty directory generation");
+        let (commit, _) = database
+            .write_batch()
+            .expect("completion batch")
+            .commit_manifest_audit_with_staged_directory_truth(
+                1,
+                0,
+                30,
+                root_identity.clone(),
+                None,
+            )
+            .expect("commit audit");
+
+        let metadata = database
+            .last_authoritative_audit_metadata()
+            .expect("audit metadata")
+            .expect("metadata present");
+        assert_eq!(metadata.root_identity, root_identity);
+        assert_eq!(metadata.source_revision, commit.committed_source_revision());
     }
 }

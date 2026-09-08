@@ -783,6 +783,7 @@ fn profile_error_path(error: &ProfileOwnershipError) -> PathBuf {
         | ProfileOwnershipError::Io { path, .. }
         | ProfileOwnershipError::NotRegularFile { path }
         | ProfileOwnershipError::IdentityUnavailable { path }
+        | ProfileOwnershipError::ProfileChildAlreadyLeased { path }
         | ProfileOwnershipError::Unsupported { path } => path.clone(),
         ProfileOwnershipError::AppDirectory(_) => PathBuf::new(),
     }

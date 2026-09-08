@@ -7,8 +7,9 @@ pub use super::scan_hash::{ContentAuditActivity, ContentAuditBudget, ContentAudi
 pub(crate) use context::ScanContext;
 pub use errors::ScanError;
 pub use runner::{
-    ManifestAuditOutcome, ScanMode, audit_source, audit_source_and_record,
-    audit_source_and_record_with_budget_and_progress,
+    CatalogManifestAudit, ManifestAuditOutcome, ScanMode,
+    audit_manifest_for_catalog_with_budget_and_progress_and_writer, audit_source,
+    audit_source_and_record, audit_source_and_record_with_budget_and_progress,
     audit_source_and_record_with_budget_and_progress_and_writer,
     audit_source_and_record_with_budget_and_progress_and_writer_outcome,
     audit_source_and_record_with_budget_and_progress_and_writer_with_request,

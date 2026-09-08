@@ -20,6 +20,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
 | `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
+| `wavecrate-catalog` | Bounded authoritative source audits and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
 | `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
 | `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
@@ -37,6 +38,8 @@ flowchart TD
     Media --> Analysis[wavecrate-analysis]
     UI --> Design[wavecrate-design]
     Session --> Library
+    Catalog[wavecrate-catalog] --> Library
+    Catalog --> Scan
     Scan[wavecrate-scan] --> Library
 ```
 
@@ -68,6 +71,24 @@ canonical roots in the isolated `gpui-development` profile. It submits through
 the existing library writer and never opens a source-local database or writes a
 source folder. Persistent scanning, watcher, readiness, journal, and recovery
 contracts remain outside this slice.
+
+The catalog foundation is available separately from the current browser and
+session composition. It starts with a clone of an existing writable profile
+capability and retains an exclusive lease on each catalog's direct profile
+child directory. Every write phase revalidates that profile and child binding.
+An authoritative snapshot carries source identity, lifecycle generation, root
+identity, and the exact revision shared by its manifest and directory truth.
+Incomplete traversal cannot mint a complete-audit receipt. Catalog audits stop
+before optional content verification, which may advance the source revision.
+
+Directory generations are staged in bounded, revision-neutral transactions;
+the final transaction activates the complete generation and records the audit
+identity at the committed manifest revision. Catalog maintenance reclaims
+abandoned staging and inactive generations under its exclusive child lease.
+The general scanner does not reclaim other scanners' staging generations.
+Commands and completion events both have bounded admission, and cancellation
+cannot make rejected commands invalidate accepted work. Browser composition
+and filesystem watchers remain subsequent integration work.
 
 WAV waveforms use two buffered streaming passes: the first finds the global
 mono peak and the second feeds normalized frames into bounded peak and frequency

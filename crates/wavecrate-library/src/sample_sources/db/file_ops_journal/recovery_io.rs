@@ -12,7 +12,7 @@ use cap_primitives::fs::{FollowSymlinks, OpenOptions, open, open_ambient_dir, op
 #[cfg(test)]
 use cap_primitives::fs::{hard_link, remove_file};
 
-use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
+use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileGuard};
 use crate::filesystem_identity::{
     stable_filesystem_identity, stable_filesystem_identity_from_open_file,
 };
@@ -450,6 +450,9 @@ impl RecoveryRoot {
                 path,
                 _capability: capability,
                 identity: self.identity.clone(),
+                profile_identity: self.identity.clone(),
+                named_path: None,
+                _lease: None,
             });
         }
 
@@ -463,6 +466,9 @@ impl RecoveryRoot {
                 path,
                 _capability: capability,
                 identity: self.identity.clone(),
+                profile_identity: self.identity.clone(),
+                named_path: None,
+                _lease: None,
             })
         }
     }
@@ -504,6 +510,9 @@ pub(crate) struct BoundDatabaseRoot {
     path: PathBuf,
     _capability: fs::File,
     identity: String,
+    profile_identity: String,
+    named_path: Option<PathBuf>,
+    _lease: Option<ProfileChildLease>,
 }
 
 impl BoundDatabaseRoot {
@@ -539,6 +548,75 @@ impl BoundDatabaseRoot {
             path,
             _capability: capability,
             identity: expected_identity.to_owned(),
+            profile_identity: expected_identity.to_owned(),
+            named_path: Some(profile_guard.profile_root().to_path_buf()),
+            _lease: None,
+        })
+    }
+
+    pub(crate) fn for_profile_child(
+        profile_guard: &WritableProfileGuard,
+        child: &Path,
+    ) -> Result<Self, ProfileOwnershipError> {
+        let (child_dir, lease) = profile_guard.open_child_dir_with_lease(child)?;
+        let child_identity_capability = child_dir
+            .try_clone()
+            .map_err(|source| {
+                profile_binding_error(
+                    profile_guard,
+                    format!("failed to retain profile database child capability: {source}"),
+                )
+            })?
+            .into_std_file();
+        let child_identity =
+            root_identity_from_open_file(&child_identity_capability).map_err(|source| {
+                profile_binding_error(
+                    profile_guard,
+                    format!("failed to inspect profile database child capability: {source}"),
+                )
+            })?;
+
+        #[cfg(windows)]
+        let capability = windows_database_root_binding(
+            &profile_guard.profile_root().join(child),
+            &child_identity,
+        )
+        .map_err(|error| profile_binding_error(profile_guard, error))?;
+
+        #[cfg(not(windows))]
+        let capability = child_dir.into_std_file();
+
+        let identity = root_identity_from_open_file(&capability).map_err(|source| {
+            profile_binding_error(
+                profile_guard,
+                format!("failed to inspect profile database child capability: {source}"),
+            )
+        })?;
+        if identity != child_identity {
+            return Err(profile_binding_error(
+                profile_guard,
+                "profile database child identity changed while opening its retained capability"
+                    .to_string(),
+            ));
+        }
+
+        #[cfg(windows)]
+        let path = windows_final_path(&capability)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+
+        #[cfg(not(windows))]
+        let path = database_root_alias(&capability, profile_guard.profile_root(), &identity)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+
+        validate_database_root_alias(&capability, &path, &identity)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+        Ok(Self {
+            path,
+            _capability: capability,
+            identity,
+            profile_identity: profile_guard.profile_root_identity().to_owned(),
+            named_path: Some(profile_guard.profile_root().join(child)),
+            _lease: Some(lease),
         })
     }
 
@@ -547,13 +625,34 @@ impl BoundDatabaseRoot {
         profile_guard: &WritableProfileGuard,
     ) -> Result<(), ProfileOwnershipError> {
         profile_guard.validate_current()?;
-        validate_database_root_alias(
-            &self._capability,
-            &self.path,
-            profile_guard.profile_root_identity(),
-        )
-        .map_err(|error| profile_binding_error(profile_guard, error))?;
-        if self.identity != profile_guard.profile_root_identity() {
+        if let Some(named_path) = &self.named_path {
+            let named_capability = open_root_nofollow(named_path).map_err(|error| {
+                profile_binding_error(
+                    profile_guard,
+                    format!(
+                        "failed to revalidate retained database root {} without following symlinks: {error}",
+                        named_path.display()
+                    ),
+                )
+            })?;
+            let named_identity = root_identity_from_open_file(&named_capability).map_err(|error| {
+                profile_binding_error(
+                    profile_guard,
+                    format!(
+                        "failed to inspect retained database root {} during revalidation: {error}",
+                        named_path.display()
+                    ),
+                )
+            })?;
+            if named_identity != self.identity {
+                return Err(ProfileOwnershipError::ProfileRootReplaced {
+                    path: named_path.clone(),
+                });
+            }
+        }
+        validate_database_root_alias(&self._capability, &self.path, &self.identity)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+        if self.profile_identity != profile_guard.profile_root_identity() {
             return Err(ProfileOwnershipError::ProfileRootReplaced {
                 path: profile_guard.profile_root().to_path_buf(),
             });
@@ -562,7 +661,14 @@ impl BoundDatabaseRoot {
     }
 }
 
-impl DatabaseRootBindingGuard for BoundDatabaseRoot {}
+impl DatabaseRootBindingGuard for BoundDatabaseRoot {
+    fn validate_profile_guard(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), ProfileOwnershipError> {
+        Self::validate_profile_guard(self, profile_guard)
+    }
+}
 
 fn profile_binding_error(
     profile_guard: &WritableProfileGuard,

@@ -21,10 +21,10 @@ pub use db::normalize_relative_path;
 pub use db::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
     DB_FILE_NAME, ExistingFileMetadataUpdate, ManifestCommitResult, Rating, SampleCollection,
-    SourceCollectionWrite, SourceContentHashWrite, SourceDatabase, SourceDatabaseConnectionRole,
-    SourceDbError, SourceFileWrite, SourceIndexClassification, SourceIndexCommitResult,
-    SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourceTag,
-    SourceTagUsage, SourceTagWrite, SourceWriteCommand, WavEntry,
+    SourceAuditMetadata, SourceCollectionWrite, SourceContentHashWrite, SourceDatabase,
+    SourceDatabaseConnectionRole, SourceDbError, SourceFileWrite, SourceIndexClassification,
+    SourceIndexCommitResult, SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot,
+    SourceManifestEntry, SourceTag, SourceTagUsage, SourceTagWrite, SourceWriteCommand, WavEntry,
 };
 pub use library::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterQueueError,

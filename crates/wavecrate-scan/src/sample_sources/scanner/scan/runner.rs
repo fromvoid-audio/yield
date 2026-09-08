@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread;
 
 use crate::sample_sources::SourceDatabase;
-use crate::sample_sources::db::SourceManifestEntry;
+use crate::sample_sources::db::{SourceDbError, SourceManifestEntry};
 use wavecrate_library::sample_sources::reconciliation::{
     RootIdentity, SourceAuditCommit, SourceAuditRequest,
 };
@@ -241,6 +241,92 @@ pub fn audit_source_and_record_with_budget_and_progress_and_writer_with_request(
     )
 }
 
+/// Result of the catalog-owned manifest audit boundary.
+///
+/// This result is returned immediately after a complete source traversal, manifest reconciliation,
+/// and directory-truth publication. Deferred content verification and pending-rename finalization
+/// are intentionally outside this boundary.
+#[derive(Debug)]
+pub struct CatalogManifestAudit {
+    /// Statistics and the exact manifest revision committed by the audit.
+    pub stats: ScanStats,
+    /// Opaque authority for the committed complete audit.
+    pub audit_commit: SourceAuditCommit,
+}
+
+/// Run the catalog-owned authoritative manifest audit with bounded directory staging.
+///
+/// The source traversal and manifest checkpoints may commit partial progress, but the audit
+/// receipt and completion metadata are written only when the traversal supplies complete directory
+/// evidence. Directory rows are staged in revision-neutral bounded transactions and become
+/// visible only in the final revision-advancing activation transaction.
+pub fn audit_manifest_for_catalog_with_budget_and_progress_and_writer(
+    db: &SourceDatabase,
+    cancel: Option<&AtomicBool>,
+    completed_at: i64,
+    on_progress: &mut impl FnMut(usize, &Path),
+    writer: &impl ScanWriter,
+    audit_request: Option<&SourceAuditRequest>,
+) -> Result<CatalogManifestAudit, ScanError> {
+    let root = ensure_root_dir(db)?;
+    let source_root = SourceRootCapability::open(&root)?;
+    source_root.ensure_current_generation()?;
+    let mut stats = match scan_with_writer_using_root_and_committed_batch(
+        db,
+        &root,
+        &source_root,
+        ScanMode::Quick,
+        cancel,
+        Some(on_progress),
+        Some(completed_at),
+        false,
+        false,
+        false,
+        &mut |_| {},
+        writer,
+    ) {
+        Ok(stats) => stats,
+        Err(ScanError::Incomplete { committed, error }) => {
+            return Err(ScanError::Incomplete { committed, error });
+        }
+        Err(error) => return Err(error),
+    };
+
+    let complete_directory_evidence = stats
+        .source_tree_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.complete_directory_entries())
+        .is_some();
+    if !complete_directory_evidence {
+        let error = stats
+            .source_tree_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.diagnostics.first())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                String::from("complete directory evidence was not produced by the traversal")
+            });
+        return Err(ScanError::Incomplete {
+            committed: Box::new(stats),
+            error,
+        });
+    }
+
+    let audit_commit = record_staged_manifest_audit_completion(
+        db,
+        &mut stats,
+        completed_at,
+        writer,
+        &source_root,
+        cancel,
+        audit_request,
+    )?;
+    Ok(CatalogManifestAudit {
+        stats,
+        audit_commit,
+    })
+}
+
 /// Outcome of a source manifest audit with bounded content verification.
 ///
 /// Manifest traversal coverage is represented independently from resumable content
@@ -346,7 +432,7 @@ fn audit_source_and_record_after_scan_outcome(
     let source_root = SourceRootCapability::open(&root)?;
     source_root.ensure_current_generation()?;
     let held_root_identity = source_root.generation().to_owned();
-    let mut stats = match scan_with_writer_using_root(
+    let mut stats = match scan_with_writer_using_root_and_committed_batch(
         db,
         &root,
         &source_root,
@@ -355,6 +441,9 @@ fn audit_source_and_record_after_scan_outcome(
         on_progress,
         Some(completed_at),
         false,
+        true,
+        false,
+        &mut |_| {},
         writer,
     ) {
         Ok(stats) => stats,
@@ -367,6 +456,26 @@ fn audit_source_and_record_after_scan_outcome(
         }
         Err(error) => return Err(error),
     };
+    if stats
+        .source_tree_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.complete_directory_entries())
+        .is_none()
+    {
+        let error = stats
+            .source_tree_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.diagnostics.first())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                String::from("complete directory evidence was not produced by the traversal")
+            });
+        return Ok(ManifestAuditOutcome::Incomplete {
+            committed: stats,
+            error,
+            root_identity: source_root.generation().to_owned(),
+        });
+    }
     before_record();
     let audit_commit = match record_manifest_audit_completion(
         db,
@@ -374,6 +483,7 @@ fn audit_source_and_record_after_scan_outcome(
         completed_at,
         writer,
         &source_root,
+        cancel,
         audit_request,
     ) {
         Ok(audit_commit) => audit_commit,
@@ -445,41 +555,143 @@ fn record_manifest_audit_completion(
     completed_at: i64,
     writer: &impl ScanWriter,
     source_root: &SourceRootCapability,
+    cancel: Option<&AtomicBool>,
     audit_request: Option<&SourceAuditRequest>,
 ) -> Result<SourceAuditCommit, ScanError> {
-    source_root.ensure_current_generation()?;
+    record_staged_manifest_audit_completion(
+        db,
+        stats,
+        completed_at,
+        writer,
+        source_root,
+        cancel,
+        audit_request,
+    )
+}
+
+fn record_staged_manifest_audit_completion(
+    db: &SourceDatabase,
+    stats: &mut ScanStats,
+    completed_at: i64,
+    writer: &impl ScanWriter,
+    source_root: &SourceRootCapability,
+    cancel: Option<&AtomicBool>,
+    audit_request: Option<&SourceAuditRequest>,
+) -> Result<SourceAuditCommit, ScanError> {
     let before = stats.manifest_before.clone();
-    let _writer = writer.lock(super::super::scan_writer::ScanWritePhase::Manifest);
-    let mut batch = db.write_batch()?;
-    if !batch.matches_revision(stats.committed_delta.revision)? {
-        drop(batch);
-        let (current_revision, current_manifest) = db.manifest_snapshot_with_revision()?;
-        if current_manifest != stats.manifest_after {
-            return Err(ScanError::StaleRevision {
-                expected: stats.committed_delta.revision,
-                actual: current_revision,
-            });
+    let (generation, result) = {
+        let directory_entries = stats
+            .source_tree_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.complete_directory_entries())
+            .ok_or_else(|| ScanError::Incomplete {
+                committed: Box::new(stats.clone()),
+                error: String::from(
+                    "complete directory evidence was not produced by the traversal",
+                ),
+            })?;
+        if cancel_requested(cancel) {
+            return Err(ScanError::Canceled);
         }
-        batch = db.write_batch()?;
-        if !batch.matches_revision(current_revision)? {
-            return Err(ScanError::StaleRevision {
-                expected: current_revision,
-                actual: db.get_revision()?,
-            });
+        source_root.ensure_current_generation()?;
+        let _writer = writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
+        let generation = db.begin_next_source_directory_truth_generation(
+            u64::try_from(directory_entries.len())
+                .map_err(|_| ScanError::Db(SourceDbError::Unexpected))?,
+        )?;
+        let result = (|| {
+            drop(_writer);
+            for chunk in directory_entries
+                .chunks(wavecrate_library::sample_sources::db::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT)
+            {
+                if cancel_requested(cancel) {
+                    return Err(ScanError::Canceled);
+                }
+                source_root.ensure_current_generation()?;
+                let _writer =
+                    writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
+                db.stage_source_directory_truth_entries(generation, chunk)?;
+            }
+
+            if cancel_requested(cancel) {
+                return Err(ScanError::Canceled);
+            }
+            source_root.ensure_current_generation()?;
+            let _writer = writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
+            let expected_revision = {
+                let expected = stats.committed_delta.revision;
+                let current_revision = db.get_revision()?;
+                if current_revision == expected {
+                    current_revision
+                } else {
+                    let (observed_revision, current_manifest) =
+                        db.manifest_snapshot_with_revision()?;
+                    if current_manifest != stats.manifest_after {
+                        return Err(ScanError::StaleRevision {
+                            expected,
+                            actual: observed_revision,
+                        });
+                    }
+                    observed_revision
+                }
+            };
+            let batch = db.write_batch()?;
+            if !batch.matches_revision(expected_revision)? {
+                return Err(ScanError::StaleRevision {
+                    expected: expected_revision,
+                    actual: batch.get_revision()?,
+                });
+            }
+            let root_identity =
+                RootIdentity::from_bytes(source_root.generation().as_bytes().to_vec());
+            let (audit_commit, committed_manifest) = batch
+                .commit_manifest_audit_with_staged_directory_truth(
+                    generation,
+                    expected_revision,
+                    completed_at,
+                    root_identity,
+                    audit_request,
+                )?;
+            Ok((audit_commit, committed_manifest))
+        })();
+        (generation, result)
+    };
+    match result {
+        Ok((audit_commit, committed_manifest)) => {
+            super::super::manifest::publish_committed_delta(
+                stats,
+                before,
+                (audit_commit.committed_source_revision(), committed_manifest),
+            );
+            Ok(audit_commit)
+        }
+        Err(error) => {
+            match discard_staged_directory_generation(db, generation, writer, source_root) {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
+            }
         }
     }
-    batch.complete_manifest_audit(completed_at)?;
-    source_root.ensure_current_generation()?;
-    let (audit_commit, committed_manifest) = batch.commit_with_manifest_snapshot_and_audit(
-        RootIdentity::from_bytes(source_root.generation().as_bytes().to_vec()),
-        audit_request,
-    )?;
-    super::super::manifest::publish_committed_delta(
-        stats,
-        before,
-        (audit_commit.committed_source_revision(), committed_manifest),
-    );
-    Ok(audit_commit)
+}
+
+fn discard_staged_directory_generation(
+    db: &SourceDatabase,
+    generation: u64,
+    writer: &impl ScanWriter,
+    source_root: &SourceRootCapability,
+) -> Result<(), ScanError> {
+    loop {
+        source_root.ensure_current_generation()?;
+        let _writer = writer.try_lock_cleanup()?;
+        let cleanup = db.discard_source_directory_truth_generation_batch(
+            generation,
+            wavecrate_library::sample_sources::db::SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT,
+        )?;
+        drop(_writer);
+        if !cleanup.more_work {
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -580,6 +792,10 @@ fn now_epoch_seconds() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
+fn cancel_requested(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Scan with a progress callback, optionally honoring a cancel flag.
 pub fn scan_with_progress(
     db: &SourceDatabase,
@@ -645,6 +861,8 @@ pub fn scan_with_progress_and_writer_and_committed_batch(
         Some(on_progress),
         None,
         true,
+        true,
+        true,
         on_committed_batch,
         writer,
     )
@@ -695,6 +913,8 @@ fn scan_with_writer_using_root(
         on_progress,
         manifest_audit_started_at,
         finalize_pending_renames,
+        true,
+        true,
         &mut |_| {},
         writer,
     )
@@ -709,6 +929,8 @@ fn scan_with_writer_using_root_and_committed_batch(
     mut on_progress: Option<&mut dyn FnMut(usize, &Path)>,
     manifest_audit_started_at: Option<i64>,
     finalize_pending_renames: bool,
+    reconcile_renames: bool,
+    complete_generation: bool,
     on_committed_batch: &mut dyn FnMut(CommittedScanBatch),
     writer: &impl ScanWriter,
 ) -> Result<ScanStats, ScanError> {
@@ -741,15 +963,19 @@ fn scan_with_writer_using_root_and_committed_batch(
     )
     .and_then(|()| db_sync_phase(db, source_root, &mut context, cancel, writer))
     .and_then(|committed_snapshot| {
-        reconcile_scan_renames(
-            db,
-            source_root,
-            &mut context,
-            &manifest_before,
-            committed_snapshot,
-            cancel,
-            writer,
-        )
+        if reconcile_renames {
+            reconcile_scan_renames(
+                db,
+                source_root,
+                &mut context,
+                &manifest_before,
+                committed_snapshot,
+                cancel,
+                writer,
+            )
+        } else {
+            Ok(committed_snapshot)
+        }
     })
     .and_then(|committed_snapshot| {
         if finalize_pending_renames && !context.has_uncertain_prefixes() {
@@ -763,7 +989,13 @@ fn scan_with_writer_using_root_and_committed_batch(
         }
         Ok(committed_snapshot)
     })
-    .and_then(|_| complete_scan_generation(db, &source_root, &mut context, cancel, writer));
+    .and_then(|_| {
+        if complete_generation {
+            complete_scan_generation(db, &source_root, &mut context, cancel, writer)
+        } else {
+            Ok(context.latest_committed_snapshot())
+        }
+    });
     finish_scan_result(manifest_before, context, result)
 }
 
@@ -874,6 +1106,12 @@ pub(crate) fn reconcile_scan_renames(
     }
     source_root.ensure_current_generation()?;
     if renamed.is_empty() && context.mode != ScanMode::Hard {
+        if rename_revision.is_some() && context.mode != ScanMode::Targeted {
+            // A carried rename candidate may have required a bounded hash/revalidation write
+            // even when no move was proven. Return that transaction's current snapshot so the
+            // later audit receipt is fenced to the revision actually on disk.
+            return Ok(db.manifest_snapshot_with_revision()?);
+        }
         if context.mode == ScanMode::Targeted {
             let expected = rename_revision.unwrap_or(committed_snapshot.0);
             let actual = db.get_revision()?;
@@ -939,7 +1177,7 @@ fn finalize_pending_rename_completion(
     if let Some(source_root) = source_root {
         source_root.ensure_current_generation()?;
     }
-    let _writer = writer.lock(super::super::scan_writer::ScanWritePhase::Manifest);
+    let _writer = writer.try_lock(super::super::scan_writer::ScanWritePhase::Manifest)?;
     let mut batch = db.write_batch()?;
     if mode == ScanMode::Hard {
         batch.prune_invalid_retained_rename_destinations()?;
