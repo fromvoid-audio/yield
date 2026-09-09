@@ -25,7 +25,7 @@ use wavecrate_media::{
 use super::waveform::WaveformPlayRegion;
 use super::{
     Browser,
-    transport::{PlaybackDesiredState, PlaybackIntent},
+    transport::{PlaybackIntent, PlaybackRetargetTarget},
 };
 
 const MAX_NORMALIZED_GAIN_RETRIES: u8 = 3;
@@ -101,7 +101,7 @@ pub(super) enum NormalizedAuditionAction {
     /// Apply the gain to the currently accepted playback request.
     ApplyGain,
     /// Retarget the current playback mode with the prepared gain.
-    RetargetPlayback { desired: PlaybackDesiredState },
+    RetargetPlayback { target: PlaybackRetargetTarget },
 }
 
 /// One bounded normalized audition request retained while an older job is winding down.
@@ -173,7 +173,7 @@ fn deferred_play_origin(
 fn pending_playback_retarget_for_disable(
     active_fence: Option<NormalizedAuditionFence>,
     queued_request: Option<&PendingNormalizedAudition>,
-    desired: Option<PlaybackDesiredState>,
+    target: Option<PlaybackRetargetTarget>,
 ) -> Option<PendingNormalizedAudition> {
     if let Some(request) = queued_request.filter(|request| {
         matches!(
@@ -183,12 +183,12 @@ fn pending_playback_retarget_for_disable(
     }) {
         return Some(request.clone());
     }
-    let (Some(fence), Some(desired)) = (active_fence, desired) else {
+    let (Some(fence), Some(target)) = (active_fence, target) else {
         return None;
     };
     Some(PendingNormalizedAudition {
         fence,
-        action: NormalizedAuditionAction::RetargetPlayback { desired },
+        action: NormalizedAuditionAction::RetargetPlayback { target },
     })
 }
 
@@ -522,11 +522,11 @@ impl Browser {
                 }
             }
             if let Some(request) = pending_playback_retarget {
-                let NormalizedAuditionAction::RetargetPlayback { desired } = request.action else {
+                let NormalizedAuditionAction::RetargetPlayback { target } = request.action else {
                     unreachable!("disable retarget helper returned another action");
                 };
                 if let Some(Err(error)) =
-                    self.submit_live_playback_retarget_with_gain(desired, 1.0, cx)
+                    self.submit_live_playback_retarget_with_gain(target, 1.0, cx)
                 {
                     self.playback_status = format!("Could not apply playback change: {error}");
                 }
@@ -557,7 +557,7 @@ impl Browser {
     }
 
     /// Return the newest complete live target only while its playback fence is current.
-    pub(super) fn current_normalized_playback_target(&self) -> Option<PlaybackDesiredState> {
+    pub(super) fn current_normalized_playback_target(&self) -> Option<PlaybackRetargetTarget> {
         let request = pending_playback_retarget_for_disable(
             self.normalized_audition.pending_fence(),
             self.normalized_audition_queued.as_ref(),
@@ -567,7 +567,7 @@ impl Browser {
             return None;
         }
         match request.action {
-            NormalizedAuditionAction::RetargetPlayback { desired } => Some(desired),
+            NormalizedAuditionAction::RetargetPlayback { target } => Some(target),
             _ => None,
         }
     }
@@ -634,7 +634,7 @@ impl Browser {
     /// Schedule a normalized gain update for a live playback-mode retarget.
     pub(super) fn schedule_normalized_playback_retarget(
         &mut self,
-        desired: PlaybackDesiredState,
+        target: PlaybackRetargetTarget,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(playback_id) = self.latest_playback_request_id else {
@@ -646,18 +646,18 @@ impl Browser {
         let Some(accepted) = self.accepted_playback_intent.as_ref() else {
             return false;
         };
-        let Some(span) = span_for_playback_intent(accepted) else {
-            return false;
-        };
         if accepted.path != path || !self.normalized_audition.enabled() {
             return false;
         }
-        self.normalized_audition_pending_playback_target = Some(desired);
-        let fence = self.normalized_fence(&path, span, Some(playback_id));
+        if !target.span.is_valid() {
+            return false;
+        }
+        self.normalized_audition_pending_playback_target = Some(target);
+        let fence = self.normalized_fence(&path, target.span, Some(playback_id));
         self.schedule_normalized_request(
             PendingNormalizedAudition {
                 fence,
-                action: NormalizedAuditionAction::RetargetPlayback { desired },
+                action: NormalizedAuditionAction::RetargetPlayback { target },
             },
             cx,
         );
@@ -765,12 +765,9 @@ impl Browser {
                         }
                     }
                 }
-                NormalizedAuditionAction::RetargetPlayback { desired } => {
-                    match self.submit_live_playback_retarget_with_gain(
-                        desired,
-                        preparation.gain,
-                        cx,
-                    ) {
+                NormalizedAuditionAction::RetargetPlayback { target } => {
+                    match self.submit_live_playback_retarget_with_gain(target, preparation.gain, cx)
+                    {
                         Some(Err(error)) => {
                             self.playback_status =
                                 format!("Playback live update unavailable: {error}");
@@ -1065,6 +1062,7 @@ pub(super) fn span_for_playback_intent(
 
 #[cfg(test)]
 mod tests {
+    use super::super::transport::PlaybackDesiredState;
     use super::*;
     use std::path::Path;
     use std::time::SystemTime;
@@ -1328,27 +1326,39 @@ mod tests {
         let active = PendingNormalizedAudition {
             fence: make_fence("one.wav", 0.0, 1.0),
             action: NormalizedAuditionAction::RetargetPlayback {
-                desired: PlaybackDesiredState {
-                    looped: true,
-                    metronome_beat_count: Some(4),
+                target: PlaybackRetargetTarget {
+                    span: WaveformPlayRegion::new(0.0, 1.0).expect("valid span"),
+                    desired: PlaybackDesiredState {
+                        looped: true,
+                        metronome_beat_count: Some(4),
+                    },
+                    seek_if_outside: false,
                 },
             },
         };
         let latest = PendingNormalizedAudition {
             fence: make_fence("one.wav", 0.2, 0.8),
             action: NormalizedAuditionAction::RetargetPlayback {
-                desired: PlaybackDesiredState {
-                    looped: false,
-                    metronome_beat_count: None,
+                target: PlaybackRetargetTarget {
+                    span: WaveformPlayRegion::new(0.2, 0.8).expect("valid span"),
+                    desired: PlaybackDesiredState {
+                        looped: false,
+                        metronome_beat_count: None,
+                    },
+                    seek_if_outside: true,
                 },
             },
         };
         let retained = pending_playback_retarget_for_disable(
             Some(active.fence.clone()),
             Some(&latest),
-            Some(PlaybackDesiredState {
-                looped: false,
-                metronome_beat_count: None,
+            Some(PlaybackRetargetTarget {
+                span: WaveformPlayRegion::new(0.2, 0.8).expect("valid span"),
+                desired: PlaybackDesiredState {
+                    looped: false,
+                    metronome_beat_count: None,
+                },
+                seek_if_outside: false,
             }),
         )
         .expect("latest queued retarget");
@@ -1357,9 +1367,13 @@ mod tests {
         let retained_active = pending_playback_retarget_for_disable(
             Some(active.fence.clone()),
             None,
-            Some(PlaybackDesiredState {
-                looped: true,
-                metronome_beat_count: Some(4),
+            Some(PlaybackRetargetTarget {
+                span: WaveformPlayRegion::new(0.0, 1.0).expect("valid span"),
+                desired: PlaybackDesiredState {
+                    looped: true,
+                    metronome_beat_count: Some(4),
+                },
+                seek_if_outside: false,
             }),
         )
         .expect("active retarget");

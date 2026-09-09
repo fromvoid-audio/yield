@@ -348,7 +348,7 @@ pub(crate) struct Browser {
     normalized_audition_task: Option<Task<()>>,
     normalized_audition_queued: Option<normalized_audition::PendingNormalizedAudition>,
     normalized_audition_deferred_play: Option<normalized_audition::PendingNormalizedAudition>,
-    normalized_audition_pending_playback_target: Option<transport::PlaybackDesiredState>,
+    normalized_audition_pending_playback_target: Option<transport::PlaybackRetargetTarget>,
     normalized_gain_runtime_pending: Option<normalized_audition::PendingNormalizedGain>,
     waveform_pending: bool,
     motion_started_at: Option<Instant>,
