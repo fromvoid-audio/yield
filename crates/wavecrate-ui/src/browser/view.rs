@@ -920,12 +920,18 @@ impl Render for Browser {
                 MouseButton::Right,
                 cx.listener(|view, event: &MouseUpEvent, _, cx| {
                     view.finish_waveform_region_drag(event.position, MouseButton::Right, cx);
+                    // Match clicks commit on press without a region drag. Native secondary
+                    // release must still invalidate the view to publish that selection.
+                    cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Right,
                 cx.listener(|view, event: &MouseUpEvent, _, cx| {
                     view.finish_waveform_region_drag(event.position, MouseButton::Right, cx);
+                    // Match clicks commit on press without a region drag. Native secondary
+                    // release must still invalidate the view to publish that selection.
+                    cx.notify();
                 }),
             )
             .on_mouse_up(
