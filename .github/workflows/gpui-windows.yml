@@ -38,7 +38,7 @@ jobs:
         run: ./scripts/internal/release/setup_windows_asio_sdk.ps1
       - name: Test core, media and native platform
         run: cargo test --locked -p wavecrate-core -p wavecrate-media -p wavecrate-platform --lib
-      - name: Check GPUI application
-        run: cargo check --locked -p wavecrate-gpui --tests
+      - name: Compile GPUI application and browser tests
+        run: cargo test --locked -p wavecrate-gpui -p wavecrate-ui --no-run
       - name: Test browser state and interactions
         run: cargo test --locked -p wavecrate-ui --lib
