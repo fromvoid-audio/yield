@@ -47,6 +47,7 @@ mod history;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod played_ranges;
 mod playmark_timing;
 mod preferences;
 mod random_audition;
@@ -305,6 +306,7 @@ pub(crate) struct Browser {
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
     waveform_pan_drag: Option<waveform::WaveformPanDrag>,
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
+    played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
     playback_status: String,
     volume: f32,
@@ -547,6 +549,7 @@ impl Browser {
             waveform_region_drag: None,
             waveform_pan_drag: None,
             waveform_scrollbar_drag: None,
+            played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,

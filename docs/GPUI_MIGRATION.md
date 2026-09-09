@@ -2106,3 +2106,14 @@ Validation: all 376 UI tests passed, with one existing benchmark ignored; applic
 The clean `ebabb2dfd` macOS timing-editor preview built in 29.58 seconds and passed strict ad-hoc signature verification. Using the isolated zero-snap QA profile/fixture, native pointer/keyboard smoke testing created a 488 ms selection, opened its compact label input, committed `250ms` with the left boundary preserved, retained invalid `oops` on Enter with an error status, and cancelled back to `250 ms` with Escape. Playback stayed stopped. Closing the window exited with code 0 and no matching process remained. Bundle: `target/qa/Wavecrate Timing Edit Preview ebabb2d.app`.
 
 The background-targeted click-away attempt left the invalid draft without delivering validation; the preview appeared inactive, consistent with GPUI suppressing blur paths for inactive windows. Native foreground blur acceptance is therefore not claimed. The activated GPUI focus regression passes. Audible active-span acceptance remains outstanding.
+
+
+### Played-range observation rail, 2026-09-09
+
+A passive four-pixel rail now shows observed played ranges in the loaded waveform, using the existing played-waveform theme color. The core history merges overlapping/touching ranges with the native 1e-6 tolerance, splits loop wraps at configured span boundaries, and leaves backward non-loop seek gaps unfilled. Stop preserves ranges; waveform invalidation clears them. No marked-range recall UI was added: the reference's marked-play-range list is internal metadata, distinct from this visible played-range rail.
+
+Playback admission captures path/root, waveform generation, playback ID and epoch. Started/progress checks reject stale ownership, including a same-path reload. Persistent configured retarget identity and source-plan bounds reset observation across seeks, including same-span retargets. Invalid observation gaps reset the progress anchor while allowing subsequent valid samples to resume without bridging the gap. Only active validated progress is recorded; there is no synthetic terminal fill. Same-content reload/trim/crop preservation remains deferred until explicit revision/transform identity is available.
+
+Core snapshots use Arc storage; already-covered progress returns before copying or mutating ranges. Rendering skips offscreen intervals using sorted history, paints directly without an intermediate per-frame rail vector, and adds no idle task or decoding.
+
+Validation passed: eight core history regressions, seven UI ownership/state regressions, application checking, workspace formatting and diff checks. Review corrected repeated covered-range copying, missing same-span retarget fencing, missing first-sample coverage, and observation-gap recovery. Audible/native playback-rail acceptance remains outstanding.

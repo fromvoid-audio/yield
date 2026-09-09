@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::Browser;
 use super::metronome::{self, PlaybackMetronomeGrid};
+use super::played_ranges;
 use super::waveform::WaveformPlayRegion;
 use gpui::Context;
 use reson::{
@@ -280,11 +281,12 @@ impl Browser {
             ratio: started.playback_start,
         });
         self.playback_cursor_interpolation = None;
+        played_ranges::record_started(self, started);
     }
 
     fn record_playback_progress(&mut self, progress: &PlaybackRuntimeProgress) {
         let Some(ratio) = authoritative_cursor_progress(progress) else {
-            self.clear_playback_cursor();
+            self.clear_playback_cursor_for_observation_gap();
             return;
         };
         let sampled_at = Instant::now();
@@ -294,9 +296,18 @@ impl Browser {
         self.playback_cursor_pending = None;
         self.playback_cursor_sample = Some(PlaybackCursorSample { ratio });
         self.playback_cursor_interpolation = interpolation;
+        played_ranges::record_progress(self, progress);
     }
 
     pub(super) fn clear_playback_cursor(&mut self) {
+        played_ranges::clear_anchor(self);
+        self.playback_cursor_pending = None;
+        self.playback_cursor_sample = None;
+        self.playback_cursor_interpolation = None;
+    }
+
+    fn clear_playback_cursor_for_observation_gap(&mut self) {
+        played_ranges::reset_observation_gap(self);
         self.playback_cursor_pending = None;
         self.playback_cursor_sample = None;
         self.playback_cursor_interpolation = None;
@@ -1026,6 +1037,7 @@ impl Browser {
                 }
                 self.mark_volume_applied_by_play();
                 self.latest_playback_request_id = Some(request_id);
+                played_ranges::record_admission(self, request_id.get(), &intent.path);
                 let mut accepted = intent.clone();
                 accepted.resume_desired = Some(PlaybackDesiredState {
                     looped: intent.looped,

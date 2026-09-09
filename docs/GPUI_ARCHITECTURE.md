@@ -280,6 +280,25 @@ at dispatch, including missing or nonfinite progress, rather than using the UI
 cursor. This contract applies to one-shot and looped playback. Invalid or unchanged
 editor drafts do not submit transport changes.
 
+## Played-range observation contract
+
+The played-range rail records observed progress for the currently loaded sample,
+not requested playback or cursor interpolation. Admission requires matching
+selected and accepted playback ownership and valid configured source-plan bounds.
+New playback or a changed configured span resets the progress anchor so a seek
+cannot bridge unheard audio. Forward progress records its traversed interval;
+a loop wrap splits at the confirmed span boundaries. Non-loop backward movement
+and invalid progress add nothing. Stop preserves accumulated ranges and clears
+the anchor; it never synthesizes a fill through the span end.
+
+The core history merges touching/overlapping intervals within the native 1e-6
+tolerance. Rendering uses a cheap shared snapshot and viewport clipping, with a
+four-pixel passive bottom rail in the existing played-waveform theme color.
+No independent animation or media decoding task is needed. Actual waveform
+invalidation clears ownership and history; preserving observations across a
+reload or destructive transform requires explicit source revision/transform
+identity and must not be inferred from an unchanged path.
+
 ## Development
 
 ```sh

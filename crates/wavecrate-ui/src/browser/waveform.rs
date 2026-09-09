@@ -20,6 +20,7 @@ use wavecrate_design::Theme;
 use crate::theme::color;
 
 use super::Browser;
+use super::played_ranges;
 use super::playmark_timing;
 use super::similar_sections;
 use super::waveform_fades;
@@ -1898,6 +1899,10 @@ pub(super) fn render_waveform(
             color(theme.colors.waveform_playhead),
         ));
     }
+    bars = bars.child(played_ranges::render_overlay(
+        browser,
+        color(theme.colors.waveform_played),
+    ));
     let click_bounds_for_down = Rc::clone(&click_bounds);
     let click_bounds_for_secondary = Rc::clone(&click_bounds);
     let click_bounds_for_wheel = Rc::clone(&click_bounds);
@@ -2230,6 +2235,7 @@ impl Browser {
     }
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
+        played_ranges::clear_history(self);
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
         self.waveform_detail.reset();
         self.waveform_viewport = WaveformViewport::full();
