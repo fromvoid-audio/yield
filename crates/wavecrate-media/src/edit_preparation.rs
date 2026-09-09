@@ -23,6 +23,13 @@ pub enum WavEditOperation {
     Trim,
     /// Keep only selected existing frames; silence outside the source is not supported here.
     Crop,
+    /// Keep a signed half-open frame span, padding portions outside the source with silence.
+    CropWithSilence {
+        /// Inclusive start frame; negative values select silence before the source.
+        start_frame: i64,
+        /// Exclusive end frame; values beyond the source select trailing silence.
+        end_frame: i64,
+    },
 }
 
 /// A revision-fenced edit of a half-open selection within a whole WAV file.
@@ -31,6 +38,7 @@ pub struct WavEditPreparationRequest {
     /// Source identity, revision and format captured before background admission.
     pub context: WaveformDetailContext,
     /// Existing source frames to edit; outer fades may also change adjacent frames.
+    /// For `CropWithSilence`, this must be the whole source; signed bounds live in the operation.
     pub range: WaveformDetailRange,
     /// Operation to apply to the selected frames.
     pub operation: WavEditOperation,
@@ -56,11 +64,51 @@ impl WavEditPreparationRequest {
         if operation == WavEditOperation::Trim && range.len() == context.total_frames {
             return Err(String::from("trimming the entire WAV would leave no audio"));
         }
+        if let WavEditOperation::CropWithSilence {
+            start_frame,
+            end_frame,
+        } = operation
+        {
+            if range.start_frame != 0 || range.end_frame != context.total_frames {
+                return Err(String::from(
+                    "padded crop requires a whole-source context range",
+                ));
+            }
+            crate::padded_crop::PaddedCropPlan::new(
+                context.total_frames,
+                usize::from(context.spec.channels),
+                start_frame,
+                end_frame,
+            )?;
+        }
         Ok(Self {
             context,
             range,
             operation,
         })
+    }
+
+    /// Create a crop with exact signed frame bounds, including silence outside the source.
+    ///
+    /// Bounds must describe at least one frame. Output size and the decoded-memory budget are
+    /// revalidated at execution before allocating or writing. This does not publish a file.
+    pub fn with_padded_crop(
+        context: WaveformDetailContext,
+        start_frame: i64,
+        end_frame: i64,
+    ) -> Result<Self, String> {
+        let range = WaveformDetailRange {
+            start_frame: 0,
+            end_frame: context.total_frames,
+        };
+        Self::with_operation(
+            context,
+            range,
+            WavEditOperation::CropWithSilence {
+                start_frame,
+                end_frame,
+            },
+        )
     }
 }
 
@@ -70,7 +118,9 @@ impl WavEditPreparationRequest {
 /// [`MAX_WAV_EDIT_DECODED_BYTES`]. The caller must run this blocking work off the UI thread.
 /// Output retains channels and sample rate and uses native unclipped 32-bit float encoding.
 /// Trim removes selected frames; crop retains only selected frames. Other operations retain
-/// the original frame count. Selection bounds must lie within existing audio.
+/// the original frame count. `CropWithSilence` accepts signed bounds and pads absent frames.
+/// Other selection bounds must lie within existing audio. The budget bounds the larger of
+/// the source and output decoded buffers; one buffer is reserved before decoding.
 /// The source is checked before decoding, before output and after finalization. A successful
 /// result is only a prepared payload, not a durable file operation or publication authority.
 /// Any error requires discarding the output, including a stale-source error after finalization.
@@ -103,8 +153,26 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
     )?;
     let context = &request.context;
     let sample_count = checked_sample_count(context, decoded_byte_budget)?;
+    let padded_crop = if let WavEditOperation::CropWithSilence {
+        start_frame,
+        end_frame,
+    } = request.operation
+    {
+        Some(crate::padded_crop::PaddedCropPlan::new(
+            context.total_frames,
+            usize::from(context.spec.channels),
+            start_frame,
+            end_frame,
+        )?)
+    } else {
+        None
+    };
+    let capacity = sample_count.max(padded_crop.as_ref().map_or(0, |plan| plan.output_samples));
+    check_sample_budget(capacity, decoded_byte_budget)?;
     crate::edited_wav::checked_spec(
-        sample_count,
+        padded_crop
+            .as_ref()
+            .map_or(sample_count, |plan| plan.output_samples),
         usize::from(context.spec.channels),
         context.spec.sample_rate,
     )?;
@@ -121,7 +189,7 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
     check_cancel(cancellation)?;
     let mut samples = Vec::new();
     samples
-        .try_reserve_exact(sample_count)
+        .try_reserve_exact(capacity)
         .map_err(|error| format!("failed to reserve WAV edit buffer: {error}"))?;
     match opened.spec.sample_format {
         hound::SampleFormat::Float => {
@@ -173,6 +241,12 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
                 || check_cancel(cancellation),
             )?;
         }
+        WavEditOperation::CropWithSilence { .. } => {
+            padded_crop
+                .as_ref()
+                .expect("validated padded crop plan")
+                .apply(&mut samples, || check_cancel(cancellation))?;
+        }
     }
     recheck(context, &opened, cancellation)?;
     crate::encode_edited_wav_with_cancel(
@@ -190,13 +264,18 @@ fn checked_sample_count(context: &WaveformDetailContext, budget: usize) -> Resul
         .total_frames
         .checked_mul(usize::from(context.spec.channels))
         .ok_or_else(|| String::from("WAV edit sample count overflows"))?;
+    check_sample_budget(sample_count, budget)?;
+    Ok(sample_count)
+}
+
+fn check_sample_budget(sample_count: usize, budget: usize) -> Result<(), String> {
     let bytes = sample_count
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| String::from("WAV edit decoded size overflows"))?;
     if bytes > budget.min(MAX_WAV_EDIT_DECODED_BYTES) {
         return Err(String::from("WAV edit exceeds decoded memory budget"));
     }
-    Ok(sample_count)
+    Ok(())
 }
 
 // Inputs are validated sample offsets. Forward copy order preserves unread source samples
@@ -362,6 +441,73 @@ mod tests {
             reader.spec(),
             reader.samples::<f32>().collect::<Result<_, _>>().unwrap(),
         )
+    }
+
+    #[test]
+    fn padded_crop_prepares_exact_stereo_silence_and_source_intersection() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("padded.wav");
+        write_int(&path, &[1, 11, 2, 12, 3, 13, 4, 14], 2, 16);
+        let source_bytes = fs::read(&path).unwrap();
+        for (start, end, expected) in [
+            (-2, 2, vec![0, 0, 0, 0, 1, 11, 2, 12]),
+            (2, 6, vec![3, 13, 4, 14, 0, 0, 0, 0]),
+            (-1, 5, vec![0, 0, 1, 11, 2, 12, 3, 13, 4, 14, 0, 0]),
+            (-4, -2, vec![0, 0, 0, 0]),
+            (6, 8, vec![0, 0, 0, 0]),
+            (1, 3, vec![2, 12, 3, 13]),
+        ] {
+            let request =
+                WavEditPreparationRequest::with_padded_crop(request(&path).context, start, end)
+                    .unwrap();
+            let mut output = Cursor::new(Vec::new());
+            prepare_wav_edit(&request, 64, &mut output).unwrap();
+            let (spec, actual) = read_output(output);
+            assert_eq!(spec.channels, 2);
+            assert_eq!(spec.sample_rate, 1_000);
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .map(|value| *value as f32 / 32768.0)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        }
+    }
+
+    #[test]
+    fn padded_crop_rejects_invalid_bounds_and_output_budget_before_writing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("budget.wav");
+        write_int(&path, &[1, 2, 3, 4, 5, 6, 7, 8], 2, 16);
+        let context = request(&path).context;
+        for (start, end) in [(0, 0), (2, 1), (i64::MIN, i64::MAX)] {
+            assert!(
+                WavEditPreparationRequest::with_padded_crop(context.clone(), start, end).is_err()
+            );
+        }
+        let mut request = WavEditPreparationRequest::with_padded_crop(context, -2, 6).unwrap();
+        let mut output = Cursor::new(Vec::new());
+        assert!(
+            prepare_wav_edit(&request, 32, &mut output)
+                .unwrap_err()
+                .contains("budget")
+        );
+        assert!(output.get_ref().is_empty());
+        request.operation = WavEditOperation::CropWithSilence {
+            start_frame: 0,
+            end_frame: i64::MAX,
+        };
+        assert!(prepare_wav_edit(&request, usize::MAX, &mut output).is_err());
+        assert!(output.get_ref().is_empty());
+        request.operation = WavEditOperation::CropWithSilence {
+            start_frame: -1,
+            end_frame: 3,
+        };
+        request.range.start_frame = 1;
+        assert!(prepare_wav_edit(&request, 64, &mut output).is_err());
+        assert!(output.get_ref().is_empty());
     }
 
     #[test]

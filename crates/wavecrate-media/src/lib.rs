@@ -15,6 +15,7 @@ use wavecrate_library::sample_sources::is_recognized_audio;
 mod detail;
 mod edit_preparation;
 mod edited_wav;
+mod padded_crop;
 mod similar_sections;
 mod span_export;
 mod span_peak;

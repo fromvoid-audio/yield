@@ -89,9 +89,10 @@ navigation clear batch membership. These choices remain session-only.
 Gain/fade, reverse, mute, trim and crop preparation belong to `wavecrate-media`.
 The service retains a source handle, validates the captured WAV revision before decoding and after encoding,
 and prepares float WAV bytes in a fresh caller-owned sink. Trim removes selected
-frames; crop keeps selected frames. These operations currently require bounds
-within existing audio and reject an empty result. The caller
-sets a decoded-buffer budget subject to a 256 MiB ceiling and runs the operation
+frames; crop keeps selected frames. `CropWithSilence` accepts signed frame bounds
+and fills portions outside the source with silence. Other operations require bounds
+within existing audio; every prepared result must contain at least one frame. The caller
+sets a decoded-buffer budget for the larger of source and output, subject to a 256 MiB ceiling and runs the operation
 off the UI thread. Failure requires discarding the output, including a source
 revision failure after finalization. Prepared bytes confer no publication,
 replacement, journal or undo authority; those remain with the durable file owner.
