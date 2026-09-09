@@ -118,6 +118,58 @@ impl WaveformEditSettings {
         self.fade_out
     }
 
+    /// Evaluate the native visual gain envelope at an absolute waveform ratio.
+    ///
+    /// Outer fades take precedence at selection boundaries and are independent of selection
+    /// gain. Inner fades multiply selection gain. This matches the visual shader: unlike the
+    /// destructive sample transform, it does not add a two-millisecond minimum inner fade.
+    /// Non-finite positions leave the signal unchanged; unrepresentable outer spans are ignored.
+    pub fn visual_gain_at_ratio(self, region: WaveformEditRegion, position: f64) -> f32 {
+        if !position.is_finite() {
+            return 1.0;
+        }
+        let width = region.width();
+        if let Some(fade) = self.fade_in.filter(|fade| fade.mute > 0.0) {
+            let start = region.start() - width * f64::from(fade.mute);
+            let span = region.start() - start;
+            if start.is_finite()
+                && span.is_finite()
+                && position >= start
+                && position <= region.start()
+            {
+                let ratio = (position - start) / span.max(1.0e-6);
+                return fade.outer_gain * (1.0 - visual_fade_curve(ratio, fade.curve));
+            }
+        }
+        if let Some(fade) = self.fade_out.filter(|fade| fade.mute > 0.0) {
+            let end = region.end() + width * f64::from(fade.mute);
+            let span = end - region.end();
+            if end.is_finite() && span.is_finite() && position >= region.end() && position <= end {
+                let ratio = (position - region.end()) / span.max(1.0e-6);
+                return fade.outer_gain * visual_fade_curve(ratio, fade.curve);
+            }
+        }
+        if position < region.start() || position > region.end() {
+            return 1.0;
+        }
+        let mut envelope = 1.0;
+        if let Some(fade) = self.fade_in {
+            let length = width * f64::from(fade.length);
+            let distance = position - region.start();
+            if length > 0.0 && distance < length {
+                envelope *= visual_fade_curve(distance / length, fade.curve);
+            }
+        }
+        if let Some(fade) = self.fade_out {
+            let length = width * f64::from(fade.length);
+            let distance = region.end() - position;
+            if length > 0.0 && distance < length {
+                envelope *= visual_fade_curve(distance / length, fade.curve);
+            }
+        }
+        envelope * self.gain
+    }
+
     /// Update gain from a pointer-y drag relative to an unchanged baseline.
     ///
     /// Moving upward increases gain by three units per 120 pixels; moving downward decreases it
@@ -191,6 +243,42 @@ impl WaveformEditSettings {
         settings
     }
 
+    pub(crate) fn with_fade_in_for_region(
+        self,
+        region: WaveformEditRegion,
+        fade: Option<WaveformEditFade>,
+    ) -> Self {
+        match fade {
+            None => Self {
+                fade_in: None,
+                ..self
+            },
+            Some(fade) => self.with_resized_fade_in(
+                fade,
+                fade.length,
+                bounded_mute(f64::from(fade.mute), region.start() / region.width()),
+            ),
+        }
+    }
+
+    pub(crate) fn with_fade_out_for_region(
+        self,
+        region: WaveformEditRegion,
+        fade: Option<WaveformEditFade>,
+    ) -> Self {
+        match fade {
+            None => Self {
+                fade_out: None,
+                ..self
+            },
+            Some(fade) => self.with_resized_fade_out(
+                fade,
+                fade.length,
+                bounded_mute(f64::from(fade.mute), (1.0 - region.end()) / region.width()),
+            ),
+        }
+    }
+
     fn with_resized_fade_in(self, source: WaveformEditFade, length: f32, mute: f32) -> Self {
         let length = clamped_fade_length(length, self.fade_out.map_or(0.0, |fade| fade.length));
         let mute = finite_nonnegative(mute);
@@ -214,6 +302,14 @@ impl WaveformEditSettings {
         });
         Self { fade_out, ..self }
     }
+}
+
+fn visual_fade_curve(ratio: f64, curve: f32) -> f32 {
+    let t = ratio.clamp(0.0, 1.0) as f32;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let smootherstep = t3 * (t * (t * 6.0 - 15.0) + 10.0);
+    t * (1.0 - curve) + smootherstep * curve
 }
 
 fn preserved_inner_fade_length(source_width: f64, length: f32, resized_width: f64) -> f32 {
@@ -336,6 +432,53 @@ fn finite_f32(value: f64) -> Option<f32> {
 mod tests {
     use super::{WaveformEditFade, WaveformEditSettings};
     use crate::WaveformEditRegion;
+
+    #[test]
+    fn visual_envelope_matches_linear_and_s_curve_fades_before_signal_shaping() {
+        let region = WaveformEditRegion::new(0.25, 0.75).unwrap();
+        let fade = WaveformEditFade::new(0.5, 0.0, 0.0, 1.0).unwrap();
+        let settings = WaveformEditSettings::new(2.0, Some(fade), Some(fade)).unwrap();
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.0), 1.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.25), 0.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.375), 1.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.5), 2.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.625), 1.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.75), 0.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 1.0), 1.0);
+        let curved = WaveformEditSettings::new(
+            2.0,
+            Some(WaveformEditFade::new(0.5, 1.0, 0.0, 1.0).unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_close(curved.visual_gain_at_ratio(region, 0.3125), 0.20703125);
+    }
+
+    #[test]
+    fn visual_outer_fades_are_independent_of_gain_and_win_at_edges() {
+        let region = WaveformEditRegion::new(0.25, 0.75).unwrap();
+        let fade = WaveformEditFade::new(0.0, 0.0, 0.5, 0.8).unwrap();
+        let settings = WaveformEditSettings::new(3.0, Some(fade), Some(fade)).unwrap();
+        assert_close(settings.visual_gain_at_ratio(region, 0.0), 0.8);
+        assert_close(settings.visual_gain_at_ratio(region, 0.125), 0.4);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.25), 0.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.5), 3.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.75), 0.0);
+        assert_close(settings.visual_gain_at_ratio(region, 0.875), 0.4);
+        assert_close(settings.visual_gain_at_ratio(region, 1.0), 0.8);
+        assert_eq!(settings.visual_gain_at_ratio(region, -0.01), 1.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, f64::NAN), 1.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn visual_envelope_ignores_overflowing_outer_spans() {
+        let region = WaveformEditRegion::new(-f64::MAX / 2.0, f64::MAX / 2.0).unwrap();
+        let fade = WaveformEditFade::new(0.25, 0.5, f32::MAX, 1.0).unwrap();
+        let settings = WaveformEditSettings::new(0.0, Some(fade), Some(fade)).unwrap();
+        assert_eq!(settings.visual_gain_at_ratio(region, 0.0), 0.0);
+        assert_eq!(settings.visual_gain_at_ratio(region, f64::MAX), 1.0);
+    }
 
     #[test]
     fn fade_parameters_clamp_native_ranges() {
