@@ -250,6 +250,32 @@ view destruction or render paths. Release profile guards only after accepted
 commands have drained and database connections have closed. An asynchronous quit
 future alone does not satisfy this ordering.
 
+## Live playmark timing contract
+
+Interactive duration editing is not enabled yet. Before enabling it, live retargeting
+must carry an immutable complete target (selection span, loop mode and metronome
+configuration), a monotonic target generation, and the playback identity, path,
+waveform generation, playback epoch and output generation that admitted it.
+Normalized preparation analyzes the captured target span. Completion checks that
+anchor and latest target generation; equality with the formerly accepted span is
+not a freshness check, because an earlier retarget can be acknowledged while a
+newer target is still preparing. Never reconstruct a prepared target from mutable
+selection or accepted playback state.
+
+Runtime request identities remain separate from desired target generations.
+Acknowledgements may update confirmed state, but an older response cannot clear
+or replace a newer desired target. Confirmation requires configured source-frame
+bounds, loop mode and metronome state, together with identity/generation fences.
+Later progress must expose the same configuration because a disposable retarget
+response may be lost. Output resume captures the newest valid desired target,
+then an admitted runtime target, then confirmed state, retaining current volume.
+
+Duration edits preserve the authoritative current position when it lies inside
+the new span; otherwise they seek to its start. Resolve that policy in the runtime
+at dispatch, including missing or nonfinite progress, rather than using the UI
+cursor. This contract applies to one-shot and looped playback. Invalid or unchanged
+editor drafts do not submit transport changes.
+
 ## Development
 
 ```sh
