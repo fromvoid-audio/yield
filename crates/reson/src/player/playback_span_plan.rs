@@ -193,6 +193,10 @@ impl PlaybackSpanPlan {
         self.seek
     }
 
+    pub(crate) fn with_seek(self, seek: PlaybackSeekBehavior) -> Self {
+        Self { seek, ..self }
+    }
+
     pub(crate) fn start_sample(&self) -> usize {
         self.start_frame
             .saturating_mul(self.layout.channels() as u64) as usize

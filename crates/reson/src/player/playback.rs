@@ -137,11 +137,32 @@ impl AudioPlayer {
         seek_to_offset: bool,
         metronome: Option<PlaybackMetronomeConfig>,
     ) -> Result<(), String> {
+        self.retarget_looped_range_with_metronome_and_seek_policy(
+            start,
+            end,
+            offset,
+            seek_to_offset,
+            false,
+            metronome,
+        )
+    }
+
+    /// Retarget an active loop span with an exact-frame outside-span seek policy.
+    pub(super) fn retarget_looped_range_with_metronome_and_seek_policy(
+        &mut self,
+        start: f64,
+        end: f64,
+        offset: f64,
+        seek_to_offset: bool,
+        seek_if_outside: bool,
+        metronome: Option<PlaybackMetronomeConfig>,
+    ) -> Result<(), String> {
         self.retarget_playback_span_with_metronome(
             start,
             end,
             offset,
             seek_to_offset,
+            seek_if_outside,
             true,
             metronome,
         )
@@ -163,6 +184,28 @@ impl AudioPlayer {
             offset,
             seek_to_offset,
             false,
+            false,
+            metronome,
+        )
+    }
+
+    /// Retarget an active one-shot span with an exact-frame outside-span seek policy.
+    pub(super) fn retarget_one_shot_range_with_metronome_and_seek_policy(
+        &mut self,
+        start: f64,
+        end: f64,
+        offset: f64,
+        seek_to_offset: bool,
+        seek_if_outside: bool,
+        metronome: Option<PlaybackMetronomeConfig>,
+    ) -> Result<(), String> {
+        self.retarget_playback_span_with_metronome(
+            start,
+            end,
+            offset,
+            seek_to_offset,
+            seek_if_outside,
+            false,
             metronome,
         )
     }
@@ -173,6 +216,7 @@ impl AudioPlayer {
         end: f64,
         offset: f64,
         seek_to_offset: bool,
+        seek_if_outside: bool,
         looped: bool,
         metronome: Option<PlaybackMetronomeConfig>,
     ) -> Result<(), String> {
@@ -182,30 +226,40 @@ impl AudioPlayer {
             ((clamped_offset * f64::from(duration)) - f64::from(bounded_start)).max(0.0) as f32;
         let sample_rate = self.sample_rate.unwrap_or(44_100).max(1);
         let offset_frames = seconds_to_frames_round(offset_seconds, sample_rate);
-        let plan = self.playback_span_plan(
+        let requested_plan = self.playback_span_plan(
             bounded_start,
             bounded_end,
             duration,
             looped,
             PlaybackSeekBehavior::FrameOffset(offset_frames),
         )?;
+        // Take one source-frame snapshot before any mode restart or live control
+        // update. The f32 progress ratio intentionally is not used by the
+        // guarded policy because it aliases adjacent frames on long sources.
+        let current_frame = (!seek_to_offset).then(|| self.progress_frame()).flatten();
+        let decision = resolve_retarget_seek(
+            &requested_plan,
+            seek_to_offset,
+            seek_if_outside,
+            current_frame,
+        );
 
         if self.looping != looped {
             return if looped {
-                self.start_with_looped_span_offset(
+                self.start_with_looped_span_offset_frames(
                     bounded_start,
                     bounded_end,
                     duration,
-                    offset_seconds,
+                    decision.restart_offset_frames(&requested_plan),
                     PlaybackRuntimeReplacePolicy::FadeOutPrevious,
                     metronome,
                 )
             } else {
-                self.start_with_span_offset(
+                self.start_with_span_offset_frames(
                     bounded_start,
                     bounded_end,
                     duration,
-                    offset_seconds,
+                    decision.restart_offset_frames(&requested_plan),
                     metronome,
                 )
             };
@@ -213,38 +267,26 @@ impl AudioPlayer {
 
         let Some(playback_span) = self.active_playback_span.clone() else {
             return if looped {
-                self.start_with_looped_span_offset(
+                self.start_with_looped_span_offset_frames(
                     bounded_start,
                     bounded_end,
                     duration,
-                    offset_seconds,
+                    decision.restart_offset_frames(&requested_plan),
                     PlaybackRuntimeReplacePolicy::FadeOutPrevious,
                     metronome,
                 )
             } else {
-                self.start_with_span_offset(
+                self.start_with_span_offset_frames(
                     bounded_start,
                     bounded_end,
                     duration,
-                    offset_seconds,
+                    decision.restart_offset_frames(&requested_plan),
                     metronome,
                 )
             };
         };
-        let seek_frame = seek_to_offset.then_some(
-            plan.start_frame()
-                .saturating_add(plan.seek_offset_frames())
-                .min(plan.end_frame().saturating_sub(1)),
-        );
-        // Preserve the runtime-time source position, not the request-time UI
-        // offset: command queue latency otherwise becomes permanent clock drift.
-        let current_frame = if seek_to_offset {
-            None
-        } else {
-            self.progress_frame()
-        };
-        let progress_offset_frames =
-            live_retarget_progress_offset_frames(&plan, seek_to_offset, current_frame);
+        let (plan, seek_frame, progress_offset_frames) =
+            resolve_retarget_plan(&requested_plan, decision);
         playback_span.update_from_plan(&plan, seek_frame, metronome);
         self.finish_span_playback(&plan, Some(progress_offset_frames));
         self.active_playback_span = Some(playback_span);
@@ -326,6 +368,27 @@ impl AudioPlayer {
         replace_policy: PlaybackRuntimeReplacePolicy,
         metronome: Option<PlaybackMetronomeConfig>,
     ) -> Result<(), String> {
+        self.start_with_span_plan(
+            start_seconds,
+            end_seconds,
+            duration,
+            looped,
+            replace_policy,
+            metronome,
+            None,
+        )
+    }
+
+    fn start_with_span_plan(
+        &mut self,
+        start_seconds: f32,
+        end_seconds: f32,
+        duration: f32,
+        looped: bool,
+        replace_policy: PlaybackRuntimeReplacePolicy,
+        metronome: Option<PlaybackMetronomeConfig>,
+        planned: Option<PlaybackSpanPlan>,
+    ) -> Result<(), String> {
         let total_started_at = playback_stage_started();
         let source_kind = self.current_source_kind();
         if duration <= 0.0 {
@@ -342,13 +405,13 @@ impl AudioPlayer {
         );
 
         let plan_started_at = playback_stage_started();
-        let plan = self.playback_span_plan(
+        let plan = planned.unwrap_or(self.playback_span_plan(
             start_seconds,
             end_seconds,
             duration,
             looped,
             PlaybackSeekBehavior::SpanStart,
-        )?;
+        )?);
         log_playback_stage("span_plan", plan_started_at, source_kind, looped);
         let sample_rate = plan.layout().sample_rate();
         let channels = plan.layout().channels();
@@ -410,7 +473,7 @@ impl AudioPlayer {
                     samples,
                     playback_span.clone(),
                     SpanSamplesMode::OneShot,
-                    plan.start_sample(),
+                    plan.seek_sample(),
                 )
                 .with_edge_fade(self.anti_clip_fade());
                 active_playback_span = Some(playback_span);
@@ -434,8 +497,12 @@ impl AudioPlayer {
                     self.anti_clip_fade(),
                 ))
             };
-            let editable =
-                EditFadeSource::new(source, self.edit_fade_handle.clone(), plan.start_seconds());
+            let editable = EditFadeSource::new_with_frame_offset(
+                source,
+                self.edit_fade_handle.clone(),
+                plan.start_seconds(),
+                plan.seek_offset_frames(),
+            );
             Box::new(editable)
         };
         let final_source =
@@ -449,7 +516,8 @@ impl AudioPlayer {
 
         let (handle, format) = self.build_sink_with_fade(final_source, replace_policy)?;
         let finish_started_at = playback_stage_started();
-        self.finish_span_playback(&plan, None);
+        let initial_offset = (!looped).then_some(plan.seek_offset_frames());
+        self.finish_span_playback(&plan, initial_offset);
         self.active_playback_span = active_playback_span;
         self.fade_out = Some(handle);
         self.sink_format = Some(format);
@@ -463,22 +531,29 @@ impl AudioPlayer {
         Ok(())
     }
 
-    fn start_with_span_offset(
+    fn start_with_span_offset_frames(
         &mut self,
         start_seconds: f32,
         end_seconds: f32,
         duration: f32,
-        offset_seconds: f32,
+        offset_frames: u64,
         metronome: Option<PlaybackMetronomeConfig>,
     ) -> Result<(), String> {
-        let playback_start = (start_seconds + offset_seconds).min(end_seconds);
-        self.start_with_span(
-            playback_start,
+        let plan = self.playback_span_plan(
+            start_seconds,
+            end_seconds,
+            duration,
+            false,
+            PlaybackSeekBehavior::FrameOffset(offset_frames),
+        )?;
+        self.start_with_span_plan(
+            start_seconds,
             end_seconds,
             duration,
             false,
             PlaybackRuntimeReplacePolicy::FadeOutPrevious,
             metronome,
+            Some(plan),
         )
     }
 
@@ -488,6 +563,27 @@ impl AudioPlayer {
         end_seconds: f32,
         duration: f32,
         offset_seconds: f32,
+        replace_policy: PlaybackRuntimeReplacePolicy,
+        metronome: Option<PlaybackMetronomeConfig>,
+    ) -> Result<(), String> {
+        let sample_rate = self.sample_rate.unwrap_or(44_100).max(1);
+        let offset_frames = seconds_to_frames_round(offset_seconds, sample_rate);
+        self.start_with_looped_span_offset_frames(
+            start_seconds,
+            end_seconds,
+            duration,
+            offset_frames,
+            replace_policy,
+            metronome,
+        )
+    }
+
+    fn start_with_looped_span_offset_frames(
+        &mut self,
+        start_seconds: f32,
+        end_seconds: f32,
+        duration: f32,
+        offset_frames: u64,
         replace_policy: PlaybackRuntimeReplacePolicy,
         metronome: Option<PlaybackMetronomeConfig>,
     ) -> Result<(), String> {
@@ -501,8 +597,6 @@ impl AudioPlayer {
         self.prepare_previous_sink_for_new_source(self.anti_clip_fade(), replace_policy);
         log_playback_stage("clear_or_fade_current", clear_started_at, source_kind, true);
 
-        let sample_rate = self.sample_rate.unwrap_or(44_100).max(1);
-        let offset_frames = seconds_to_frames_round(offset_seconds, sample_rate);
         let plan_started_at = playback_stage_started();
         let plan = self.playback_span_plan(
             start_seconds,
@@ -628,6 +722,95 @@ impl AudioPlayer {
             .map(AudioPlaybackSource::kind)
             .unwrap_or("none")
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetargetSeekDecision {
+    /// Honor an explicit seek request at the requested frame offset.
+    Requested { offset_frames: u64 },
+    /// Keep the exact current source frame in the new span.
+    Preserve { offset_frames: u64 },
+    /// Restart at the frame-quantized start of the new span.
+    RestartAtStart,
+    /// Preserve the legacy non-seeking behavior when no outside-span policy is requested.
+    Legacy { offset_frames: u64 },
+}
+
+impl RetargetSeekDecision {
+    fn restart_offset_frames(self, plan: &PlaybackSpanPlan) -> u64 {
+        match self {
+            Self::Requested { offset_frames } | Self::Preserve { offset_frames } => {
+                offset_frames.min(plan.frame_count().saturating_sub(1))
+            }
+            Self::RestartAtStart => 0,
+            Self::Legacy { .. } => plan.seek_offset_frames(),
+        }
+    }
+}
+
+fn resolve_retarget_seek(
+    plan: &PlaybackSpanPlan,
+    seek_to_offset: bool,
+    seek_if_outside: bool,
+    current_frame: Option<u64>,
+) -> RetargetSeekDecision {
+    if seek_to_offset {
+        return RetargetSeekDecision::Requested {
+            offset_frames: plan.seek_offset_frames(),
+        };
+    }
+
+    if seek_if_outside {
+        return match current_frame {
+            Some(frame) if retarget_frame_is_inside(plan, frame) => {
+                RetargetSeekDecision::Preserve {
+                    offset_frames: frame.saturating_sub(plan.start_frame()),
+                }
+            }
+            _ => RetargetSeekDecision::RestartAtStart,
+        };
+    }
+
+    RetargetSeekDecision::Legacy {
+        offset_frames: live_retarget_progress_offset_frames(plan, false, current_frame),
+    }
+}
+
+fn resolve_retarget_plan(
+    requested_plan: &PlaybackSpanPlan,
+    decision: RetargetSeekDecision,
+) -> (PlaybackSpanPlan, Option<u64>, u64) {
+    match decision {
+        RetargetSeekDecision::Requested { .. } => (
+            *requested_plan,
+            Some(
+                requested_plan
+                    .start_frame()
+                    .saturating_add(requested_plan.seek_offset_frames())
+                    .min(requested_plan.end_frame().saturating_sub(1)),
+            ),
+            requested_plan.seek_offset_frames(),
+        ),
+        RetargetSeekDecision::Preserve { offset_frames } => (
+            *requested_plan,
+            None,
+            offset_frames.min(requested_plan.frame_count().saturating_sub(1)),
+        ),
+        RetargetSeekDecision::RestartAtStart => {
+            let plan = requested_plan.with_seek(PlaybackSeekBehavior::SpanStart);
+            (plan, Some(plan.start_frame()), 0)
+        }
+        RetargetSeekDecision::Legacy { offset_frames } => (
+            *requested_plan,
+            None,
+            offset_frames.min(requested_plan.frame_count().saturating_sub(1)),
+        ),
+    }
+}
+
+fn retarget_frame_is_inside(plan: &PlaybackSpanPlan, frame: u64) -> bool {
+    let guard_frames = plan.track_frames().div_ceil(100);
+    frame >= plan.start_frame() && frame.saturating_add(guard_frames) < plan.end_frame()
 }
 
 fn live_retarget_progress_offset_frames(

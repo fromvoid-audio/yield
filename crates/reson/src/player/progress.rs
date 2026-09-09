@@ -91,6 +91,18 @@ impl AudioPlayer {
         self.play_span
     }
 
+    /// Return the exact frame bounds of the configured playback span.
+    #[doc(hidden)]
+    pub(super) fn playback_span_frames(&self) -> Option<(u64, u64)> {
+        self.play_span_frames
+    }
+
+    /// Return the exact number of source frames used by the playback plan.
+    #[doc(hidden)]
+    pub(super) fn track_total_frames(&self) -> Option<u64> {
+        self.track_total_frames
+    }
+
     /// Return the loaded track duration in seconds.
     #[doc(hidden)]
     pub fn track_duration(&self) -> Option<f32> {
@@ -168,6 +180,28 @@ mod tests {
         let progress = player.progress().expect("progress");
         let expected = 12_000.0 / 48_000.0;
         assert!((progress - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn configured_span_readback_preserves_exact_source_frames() {
+        let Ok(outcome) = open_output_stream(&AudioOutputConfig::default()) else {
+            return;
+        };
+        let stream = outcome.stream;
+        let mut player = AudioPlayer::test_with_state(
+            stream,
+            Some(2.0),
+            Some(Instant::now()),
+            Some((0.25, 1.25)),
+            true,
+            None,
+            Some(Duration::from_millis(10)),
+        );
+        player.play_span_frames = Some((12_345, 67_891));
+        player.track_total_frames = Some(96_001);
+
+        assert_eq!(player.playback_span_frames(), Some((12_345, 67_891)));
+        assert_eq!(player.track_total_frames(), Some(96_001));
     }
 
     #[test]

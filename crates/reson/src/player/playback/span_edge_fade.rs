@@ -54,7 +54,9 @@ where
         let emitted_frame = self.samples_emitted / u64::from(self.channels);
         let frame = match self.mode {
             SpanSamplesMode::Looped => (self.frame_offset + emitted_frame) % self.frame_count,
-            SpanSamplesMode::OneShot => emitted_frame,
+            SpanSamplesMode::OneShot => {
+                (self.frame_offset + emitted_frame).min(self.frame_count.saturating_sub(1))
+            }
         };
         self.samples_emitted = self.samples_emitted.saturating_add(1);
         Some(sample * span_edge_fade_gain(frame, self.frame_count, self.fade_frames))

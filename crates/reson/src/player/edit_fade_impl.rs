@@ -160,8 +160,13 @@ impl<S> EditFadeSource<S>
 where
     S: Source,
 {
-    pub(crate) fn new(inner: S, handle: EditFadeHandle, global_start_secs: f32) -> Self {
-        Self::with_loop(inner, handle, global_start_secs, None, 0)
+    pub(crate) fn new_with_frame_offset(
+        inner: S,
+        handle: EditFadeHandle,
+        global_start_secs: f32,
+        frame_offset: u64,
+    ) -> Self {
+        Self::with_loop(inner, handle, global_start_secs, None, frame_offset)
     }
 
     /// Create a source that repeats edit fades for each loop iteration.

@@ -52,9 +52,14 @@ struct SpanReadRequest {
 
 impl SpanReadRequest {
     fn from_plan(plan: &PlaybackSpanPlan) -> Self {
+        let offset_frames = (!plan.looped())
+            .then(|| plan.seek_offset_frames())
+            .unwrap_or(0);
+        let start_frame = plan.start_frame().saturating_add(offset_frames);
+        let remaining_frames = plan.frame_count().saturating_sub(offset_frames).max(1);
         Self {
-            start_frame: plan.start_frame(),
-            span_samples: plan.sample_count(),
+            start_frame,
+            span_samples: remaining_frames.saturating_mul(plan.layout().channels() as u64),
             total_duration: duration_for_frames(plan.track_frames(), plan.layout().sample_rate()),
         }
     }
@@ -74,5 +79,44 @@ impl RepeatReadRequest {
             span_samples: plan.sample_count(),
             offset_frames: plan.seek_offset_frames(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::player::{
+        PlaybackChannelLayout, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
+        PlaybackSpanRequest,
+    };
+
+    #[test]
+    fn one_shot_span_request_applies_exact_initial_offset() {
+        let plan = PlaybackSpanPlan::new(
+            PlaybackSourceIdentity::new(PlaybackSourceKind::File, None),
+            PlaybackChannelLayout::new(1, 1_000).expect("layout"),
+            PlaybackSpanRequest::new(0.1, 0.5, 1.0, false, PlaybackSeekBehavior::FrameOffset(125)),
+        )
+        .expect("plan");
+
+        let request = SpanReadRequest::from_plan(&plan);
+
+        assert_eq!(request.start_frame, plan.start_frame() + 125);
+        assert_eq!(request.span_samples, plan.frame_count() - 125);
+    }
+
+    #[test]
+    fn one_shot_span_start_request_remains_unchanged() {
+        let plan = PlaybackSpanPlan::new(
+            PlaybackSourceIdentity::new(PlaybackSourceKind::File, None),
+            PlaybackChannelLayout::new(1, 1_000).expect("layout"),
+            PlaybackSpanRequest::new(0.1, 0.5, 1.0, false, PlaybackSeekBehavior::SpanStart),
+        )
+        .expect("plan");
+
+        let request = SpanReadRequest::from_plan(&plan);
+
+        assert_eq!(request.start_frame, plan.start_frame());
+        assert_eq!(request.span_samples, plan.frame_count());
     }
 }

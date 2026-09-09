@@ -440,6 +440,7 @@ impl Browser {
             end: span.end,
             offset: span.start,
             seek_to_offset: false,
+            seek_if_outside: false,
             looped: desired.looped,
             playback_gain,
             playback_gain_normalization: None,

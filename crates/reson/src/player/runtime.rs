@@ -244,6 +244,13 @@ pub struct PlaybackRuntimeSpanUpdate {
     pub end: f64,
     pub offset: f64,
     pub seek_to_offset: bool,
+    /// Seek to the new span start when dispatch-time progress is outside it.
+    ///
+    /// The concrete player resolves this policy against its frame-quantized
+    /// target plan immediately before dispatch. A finite position inside the
+    /// requested span is preserved; an outside, missing, or non-finite
+    /// position starts at `start`.
+    pub seek_if_outside: bool,
     pub looped: bool,
     pub playback_gain: f32,
     pub playback_gain_normalization: Option<PlaybackRuntimeGainNormalization>,
@@ -293,6 +300,24 @@ pub struct PlaybackRuntimeProgress {
     pub looping: bool,
     pub progress: Option<f32>,
     pub error: Option<String>,
+    /// Exact frame bounds of the currently configured playback plan.
+    ///
+    /// These values come from the frame-quantized playback plan and remain
+    /// lossless when a normalized UI position cannot represent the source
+    /// frame precisely.
+    pub playback_span_frames: Option<(u64, u64)>,
+    /// Frame denominator used by the currently configured playback plan.
+    ///
+    /// This is the plan's quantized denominator, which can differ from a
+    /// source container's nominal frame count.
+    pub track_total_frames: Option<u64>,
+    /// Last successful live span-retarget command for this playback lifetime.
+    ///
+    /// This is present only with a valid active configured-span tuple. It is
+    /// reset when a new play is attempted or playback is stopped, so a later
+    /// progress poll can acknowledge a retarget without reimplementing the
+    /// player's plan quantization.
+    pub configured_span_request_id: Option<PlaybackRequestId>,
     /// Configured beat count for the active sample metronome.
     ///
     /// This is `None` when the metronome is disabled, playback is inactive, or
@@ -463,9 +488,10 @@ impl PlaybackRuntimeHandle {
     /// matching play that is inactive, or whose authoritative preflight snapshot reports an
     /// error, emits a best-effort [`PlaybackRuntimeEvent::Progress`] response without retargeting.
     /// For an active non-seeking update, a finite runtime dispatch-time position replaces the
-    /// caller's offset; seeking updates retain their requested offset. Responses are
-    /// disposable runtime events, so callers must reconcile with a later progress poll rather
-    /// than rely on a retained acknowledgement.
+    /// caller's offset; seeking updates retain their requested offset. `seek_if_outside` is
+    /// resolved by the concrete player from its exact frame plan and source position. Responses
+    /// are disposable runtime events, but a later active progress poll retains the successful
+    /// retarget identity with its configured frame tuple.
     pub fn try_retarget_active_span(
         &self,
         expected_playback: PlaybackRequestId,
@@ -1148,21 +1174,25 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
                 &self.player,
             ));
         if update.looped {
-            self.player.retarget_looped_range_with_metronome(
-                update.start,
-                update.end,
-                update.offset,
-                update.seek_to_offset,
-                update.metronome,
-            )?;
+            self.player
+                .retarget_looped_range_with_metronome_and_seek_policy(
+                    update.start,
+                    update.end,
+                    update.offset,
+                    update.seek_to_offset,
+                    update.seek_if_outside,
+                    update.metronome,
+                )?;
         } else {
-            self.player.retarget_one_shot_range_with_metronome(
-                update.start,
-                update.end,
-                update.offset,
-                update.seek_to_offset,
-                update.metronome,
-            )?;
+            self.player
+                .retarget_one_shot_range_with_metronome_and_seek_policy(
+                    update.start,
+                    update.end,
+                    update.offset,
+                    update.seek_to_offset,
+                    update.seek_if_outside,
+                    update.metronome,
+                )?;
         }
         Ok(update
             .offset
@@ -1188,13 +1218,26 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
     }
 
     fn progress(&mut self) -> PlaybackRuntimeProgress {
+        let active = self.player.is_playing();
+        let (playback_span_frames, track_total_frames, metronome_beat_count) = if active {
+            (
+                self.player.playback_span_frames(),
+                self.player.track_total_frames(),
+                self.player.metronome_beat_count(),
+            )
+        } else {
+            (None, None, None)
+        };
         PlaybackRuntimeProgress {
-            active: self.player.is_playing(),
+            active,
             elapsed: self.player.playback_elapsed(),
             looping: self.player.is_looping(),
             progress: self.player.progress(),
             error: self.player.take_error(),
-            metronome_beat_count: self.player.metronome_beat_count(),
+            playback_span_frames,
+            track_total_frames,
+            configured_span_request_id: None,
+            metronome_beat_count,
             playback_request_id: None,
         }
     }
@@ -1203,10 +1246,55 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
 fn authoritative_progress(
     executor: &mut impl PlaybackRuntimeExecutor,
     playback_request_id: Option<PlaybackRequestId>,
+    configured_span_request_id: Option<PlaybackRequestId>,
 ) -> PlaybackRuntimeProgress {
     let mut progress = executor.progress();
     progress.playback_request_id = playback_request_id;
+    normalize_configured_span_metadata(&mut progress, configured_span_request_id);
     progress
+}
+
+fn normalize_configured_span_metadata(
+    progress: &mut PlaybackRuntimeProgress,
+    configured_span_request_id: Option<PlaybackRequestId>,
+) {
+    let configured_span = match (
+        progress.active,
+        progress.playback_request_id,
+        progress.playback_span_frames,
+        progress.track_total_frames,
+    ) {
+        (true, Some(_), Some((start, end)), Some(total)) if start < end && end <= total => {
+            Some(((start, end), total))
+        }
+        _ => None,
+    };
+
+    if let Some((span, total)) = configured_span {
+        progress.playback_span_frames = Some(span);
+        progress.track_total_frames = Some(total);
+        progress.configured_span_request_id = configured_span_request_id;
+    } else {
+        progress.playback_span_frames = None;
+        progress.track_total_frames = None;
+        progress.configured_span_request_id = None;
+        progress.metronome_beat_count = None;
+    }
+}
+
+fn apply_dispatch_time_progress(
+    update: &mut PlaybackRuntimeSpanUpdate,
+    progress: &PlaybackRuntimeProgress,
+) {
+    // `seek_if_outside` is resolved after the AudioPlayer has quantized the
+    // target span to source frames. Keeping it untouched here avoids losing
+    // adjacent-frame distinctions in the public f32 progress ratio.
+    if update.seek_to_offset || update.seek_if_outside {
+        return;
+    }
+    if let Some(progress_ratio) = progress.progress.filter(|ratio| ratio.is_finite()) {
+        update.offset = f64::from(progress_ratio);
+    }
 }
 
 fn spawn_executor(
@@ -1238,9 +1326,11 @@ fn run_playback_runtime(
     let mut pending = VecDeque::new();
     let mut latest_span_retarget_id = None;
     let mut current_playback_id = None;
+    let mut configured_span_request_id = None;
     while let Some(command) = next_runtime_command(&commands, &mut pending) {
         match coalesce_command(command, &commands, &events, &mut pending) {
             CoalescedCommand::Play { id, request } => {
+                configured_span_request_id = None;
                 let event = match executor.play(request) {
                     Ok(started) => {
                         current_playback_id = Some(id);
@@ -1258,6 +1348,7 @@ fn run_playback_runtime(
                 send_runtime_event(&events, event);
             }
             CoalescedCommand::Stop { id } => {
+                configured_span_request_id = None;
                 let result = executor.stop();
                 current_playback_id = None;
                 let event = match result {
@@ -1284,7 +1375,11 @@ fn run_playback_runtime(
                 }
 
                 if expected_playback_id.is_some() {
-                    let progress = authoritative_progress(&mut executor, current_playback_id);
+                    let progress = authoritative_progress(
+                        &mut executor,
+                        current_playback_id,
+                        configured_span_request_id,
+                    );
                     if !progress.active || progress.error.is_some() {
                         send_runtime_event(
                             &events,
@@ -1293,20 +1388,21 @@ fn run_playback_runtime(
                         continue;
                     }
                     latest_span_retarget_id = Some(id);
-                    if !update.seek_to_offset {
-                        if let Some(progress_ratio) =
-                            progress.progress.filter(|ratio| ratio.is_finite())
-                        {
-                            update.offset = f64::from(progress_ratio);
-                        }
-                    }
+                    apply_dispatch_time_progress(&mut update, &progress);
                 }
 
                 let event = match executor.retarget_span(update) {
-                    Ok(_) => PlaybackRuntimeEvent::Progress {
-                        id,
-                        progress: authoritative_progress(&mut executor, current_playback_id),
-                    },
+                    Ok(_) => {
+                        configured_span_request_id = Some(id);
+                        PlaybackRuntimeEvent::Progress {
+                            id,
+                            progress: authoritative_progress(
+                                &mut executor,
+                                current_playback_id,
+                                configured_span_request_id,
+                            ),
+                        }
+                    }
                     Err(error) => PlaybackRuntimeEvent::Failed { id, error },
                 };
                 send_runtime_event(&events, event);
@@ -1316,7 +1412,11 @@ fn run_playback_runtime(
                     &events,
                     PlaybackRuntimeEvent::Progress {
                         id,
-                        progress: authoritative_progress(&mut executor, current_playback_id),
+                        progress: authoritative_progress(
+                            &mut executor,
+                            current_playback_id,
+                            configured_span_request_id,
+                        ),
                     },
                 );
             }
@@ -1850,6 +1950,10 @@ fn normalized_gain_from_peak(peak: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::{
+        PlaybackChannelLayout, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
+        PlaybackSpanPlan, PlaybackSpanRequest,
+    };
     use std::io::Write;
     use std::sync::{
         Arc, Mutex,
@@ -1869,6 +1973,7 @@ mod tests {
         playback_gains: Arc<Mutex<Vec<(f32, Option<PlaybackRuntimeGainNormalization>)>>>,
         stopped: Arc<Mutex<usize>>,
         stop_error: Option<&'static str>,
+        retarget_outcomes: Vec<Result<(), &'static str>>,
         progress: Arc<Mutex<PlaybackRuntimeProgress>>,
         dropped: Arc<AtomicBool>,
         play_gate: Option<PlayGate>,
@@ -1894,12 +1999,16 @@ mod tests {
                 playback_gains: Arc::new(Mutex::new(Vec::new())),
                 stopped: Arc::new(Mutex::new(0)),
                 stop_error: None,
+                retarget_outcomes: Vec::new(),
                 progress: Arc::new(Mutex::new(PlaybackRuntimeProgress {
                     active: true,
                     elapsed: Some(Duration::from_millis(10)),
                     looping: false,
                     progress: Some(0.25),
                     error: None,
+                    playback_span_frames: None,
+                    track_total_frames: None,
+                    configured_span_request_id: None,
                     metronome_beat_count: None,
                     playback_request_id: None,
                 })),
@@ -1933,6 +2042,11 @@ mod tests {
 
         fn with_stop_error(mut self, error: &'static str) -> Self {
             self.stop_error = Some(error);
+            self
+        }
+
+        fn with_retarget_outcomes(mut self, outcomes: Vec<Result<(), &'static str>>) -> Self {
+            self.retarget_outcomes = outcomes;
             self
         }
 
@@ -2054,7 +2168,10 @@ mod tests {
                 .lock()
                 .expect("retargeted lock")
                 .push(update);
-            Ok(update.offset as f32)
+            match self.retarget_outcomes.pop().unwrap_or(Ok(())) {
+                Ok(()) => Ok(update.offset as f32),
+                Err(error) => Err(String::from(error)),
+            }
         }
 
         fn set_volume(&mut self, _volume: f32) {}
@@ -2107,11 +2224,13 @@ mod tests {
     #[test]
     fn playback_runtime_progress_reports_metronome_count_with_request_identity() {
         let executor = FakeExecutor::new(vec![]);
-        executor
-            .progress_state()
-            .lock()
-            .expect("progress lock")
-            .metronome_beat_count = Some(4);
+        {
+            let progress_state = executor.progress_state();
+            let mut progress = progress_state.lock().expect("progress lock");
+            progress.playback_span_frames = Some((20, 80));
+            progress.track_total_frames = Some(100);
+            progress.metronome_beat_count = Some(4);
+        }
         let runtime =
             spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
 
@@ -2964,6 +3083,249 @@ mod tests {
     }
 
     #[test]
+    fn configured_span_ack_persists_after_a_successful_retarget() {
+        let executor = FakeExecutor::new(vec![]);
+        let progress_state = executor.progress_state();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        {
+            let mut progress = progress_state.lock().expect("progress lock");
+            progress.playback_span_frames = Some((12_345, 67_891));
+            progress.track_total_frames = Some(96_001);
+            progress.looping = true;
+            progress.metronome_beat_count = Some(7);
+        }
+
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, span_update(0.1, 0.7, true))
+            .expect("retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("retarget event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == retarget_id
+                    && progress.configured_span_request_id == Some(retarget_id)
+                    && progress.playback_span_frames == Some((12_345, 67_891))
+                    && progress.track_total_frames == Some(96_001)
+                    && progress.looping
+                    && progress.metronome_beat_count == Some(7)
+        ));
+
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        assert!(matches!(
+            runtime.events.recv().expect("poll event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == poll_id
+                    && progress.configured_span_request_id == Some(retarget_id)
+                    && progress.playback_span_frames == Some((12_345, 67_891))
+                    && progress.track_total_frames == Some(96_001)
+        ));
+    }
+
+    #[test]
+    fn failed_newer_retarget_retains_the_last_successful_configured_span_ack() {
+        let executor =
+            FakeExecutor::new(vec![]).with_retarget_outcomes(vec![Err("B failed"), Ok(())]);
+        let progress_state = executor.progress_state();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        {
+            let mut progress = progress_state.lock().expect("progress lock");
+            progress.playback_span_frames = Some((20, 80));
+            progress.track_total_frames = Some(100);
+        }
+
+        let first = runtime
+            .handle
+            .try_retarget_active_span(playback_id, span_update(0.2, 0.8, true))
+            .expect("first retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("first event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == first && progress.configured_span_request_id == Some(first)
+        ));
+
+        let second = runtime
+            .handle
+            .try_retarget_active_span(playback_id, span_update(0.3, 0.7, false))
+            .expect("second retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("failed second event"),
+            PlaybackRuntimeEvent::Failed { id, error } if id == second && error == "B failed"
+        ));
+
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        assert!(matches!(
+            runtime.events.recv().expect("poll event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == poll_id
+                    && progress.configured_span_request_id == Some(first)
+                    && progress.playback_span_frames == Some((20, 80))
+                    && progress.track_total_frames == Some(100)
+        ));
+    }
+
+    #[test]
+    fn play_and_stop_reset_the_configured_span_ack() {
+        let executor = FakeExecutor::new(vec![]);
+        let progress_state = executor.progress_state();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let first_play = runtime
+            .handle
+            .try_play(test_request(0.0))
+            .expect("first play");
+        assert!(matches!(
+            runtime.events.recv().expect("first started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == first_play
+        ));
+        {
+            let mut progress = progress_state.lock().expect("progress lock");
+            progress.playback_span_frames = Some((20, 80));
+            progress.track_total_frames = Some(100);
+            progress.metronome_beat_count = Some(4);
+        }
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(first_play, span_update(0.2, 0.8, true))
+            .expect("retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("retarget event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == retarget_id && progress.configured_span_request_id == Some(retarget_id)
+        ));
+
+        let second_play = runtime
+            .handle
+            .try_play(test_request(0.0))
+            .expect("second play");
+        assert!(matches!(
+            runtime.events.recv().expect("second started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == second_play
+        ));
+        let after_play_poll = runtime.handle.try_poll_progress().expect("play reset poll");
+        assert!(matches!(
+            runtime.events.recv().expect("play reset event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == after_play_poll
+                    && progress.configured_span_request_id.is_none()
+                    && progress.playback_span_frames == Some((20, 80))
+                    && progress.track_total_frames == Some(100)
+        ));
+
+        let stop_id = runtime.handle.try_stop().expect("stop");
+        assert!(matches!(
+            runtime.events.recv().expect("stopped event"),
+            PlaybackRuntimeEvent::Stopped { id } if id == stop_id
+        ));
+        let after_stop_poll = runtime.handle.try_poll_progress().expect("stop reset poll");
+        assert!(matches!(
+            runtime.events.recv().expect("stop reset event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == after_stop_poll
+                    && progress.configured_span_request_id.is_none()
+                    && progress.playback_span_frames.is_none()
+                    && progress.track_total_frames.is_none()
+                    && progress.metronome_beat_count.is_none()
+        ));
+    }
+
+    #[test]
+    fn inactive_or_invalid_progress_hides_all_configured_span_metadata() {
+        let executor = FakeExecutor::new(vec![]);
+        let progress_state = executor.progress_state();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+        {
+            let mut progress = progress_state.lock().expect("progress lock");
+            progress.active = false;
+            progress.playback_span_frames = Some((80, 20));
+            progress.track_total_frames = Some(100);
+            progress.metronome_beat_count = Some(4);
+        }
+
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        assert!(matches!(
+            runtime.events.recv().expect("inactive event"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == poll_id
+                    && !progress.active
+                    && progress.playback_span_frames.is_none()
+                    && progress.track_total_frames.is_none()
+                    && progress.configured_span_request_id.is_none()
+                    && progress.metronome_beat_count.is_none()
+        ));
+    }
+
+    #[test]
+    fn dispatch_passes_seek_if_outside_through_to_the_player_executor() {
+        let executor = FakeExecutor::new(vec![]);
+        let retargeted = executor.retargeted();
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let mut update = span_update(0.1, 0.6, true);
+        update.offset = 0.9;
+        update.seek_to_offset = false;
+        update.seek_if_outside = true;
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, update)
+            .expect("retarget");
+        assert!(matches!(
+            runtime.events.recv().expect("retarget event"),
+            PlaybackRuntimeEvent::Progress { id, .. } if id == retarget_id
+        ));
+        assert_eq!(retargeted.lock().expect("retargeted").as_slice(), &[update]);
+    }
+
+    #[test]
+    fn dispatch_rebases_nonpolicy_retargets_but_leaves_policy_offsets_unchanged() {
+        let progress = PlaybackRuntimeProgress {
+            active: true,
+            progress: Some(0.25),
+            ..PlaybackRuntimeProgress::default()
+        };
+        let mut ordinary = span_update(0.1, 0.6, true);
+        ordinary.offset = 0.9;
+        ordinary.seek_to_offset = false;
+        apply_dispatch_time_progress(&mut ordinary, &progress);
+        assert_eq!(ordinary.offset, 0.25);
+
+        let mut policy = ordinary;
+        policy.offset = 0.9;
+        policy.seek_if_outside = true;
+        apply_dispatch_time_progress(&mut policy, &progress);
+        assert_eq!(policy.offset, 0.9);
+        assert!(!policy.seek_to_offset);
+    }
+
+    #[test]
     fn playback_runtime_guarded_retarget_uses_fresh_progress_for_non_seeking_updates() {
         let executor = FakeExecutor::new(vec![]);
         let retargeted = executor.retargeted();
@@ -3577,6 +3939,135 @@ mod tests {
         assert!((gain - 2.0).abs() < f32::EPSILON);
     }
 
+    #[test]
+    fn real_executor_publishes_retargeted_plan_tuple_through_later_progress() {
+        const SAMPLE_RATE: u32 = 1_000;
+        const DURATION: f32 = 1.003;
+
+        let player = match AudioPlayer::new() {
+            Ok(player) => player,
+            Err(error) => {
+                eprintln!("skipping real executor provenance test: no audio output ({error})");
+                return;
+            }
+        };
+        let runtime = PlaybackRuntime::spawn(player, PlaybackRuntimeConfig::default())
+            .expect("spawn runtime with real executor");
+        let request = PlaybackRuntimeRequest {
+            source: PlaybackRuntimeSource::DecodedSamples {
+                audio_bytes: Arc::from([]),
+                samples: Arc::from(vec![0.0_f32; 1_003]),
+                duration: DURATION,
+                sample_rate: SAMPLE_RATE,
+                channels: 1,
+            },
+            mode: PlaybackRuntimeMode::Looped {
+                start: 0.0,
+                end: 1.0,
+                offset: 0.0,
+            },
+            stream_policy: PlaybackRuntimeStreamPolicy::full(),
+            volume: 0.0,
+            playback_gain: 1.0,
+            playback_gain_normalization: None,
+            replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
+            edit_fade: None,
+            metronome: Some(PlaybackMetronomeConfig::new(7).with_source_cycle(400, 3)),
+        };
+        let playback_id = runtime.handle.try_play(request).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let mut update = span_update(0.123, 0.876, true);
+        update.seek_if_outside = true;
+        update.metronome = Some(PlaybackMetronomeConfig::new(7).with_source_cycle(400, 3));
+        let expected_plan = PlaybackSpanPlan::new(
+            PlaybackSourceIdentity::new(PlaybackSourceKind::Bytes, None),
+            PlaybackChannelLayout::new(1, SAMPLE_RATE).expect("layout"),
+            PlaybackSpanRequest::new(
+                update.start as f32,
+                update.end as f32,
+                DURATION,
+                true,
+                PlaybackSeekBehavior::SpanStart,
+            ),
+        )
+        .expect("expected plan");
+        assert_eq!(expected_plan.track_frames(), 1_003);
+
+        let retarget_id = runtime
+            .handle
+            .try_retarget_active_span(playback_id, update)
+            .expect("guarded retarget");
+        assert_retargeted_real_executor_progress(
+            runtime.events.recv().expect("retarget progress"),
+            retarget_id,
+            &expected_plan,
+        );
+
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        match runtime.events.recv().expect("later progress") {
+            PlaybackRuntimeEvent::Progress { id, progress } => {
+                assert_eq!(id, poll_id);
+                assert_eq!(progress.configured_span_request_id, Some(retarget_id));
+                assert_eq!(
+                    progress.playback_span_frames,
+                    Some((expected_plan.start_frame(), expected_plan.end_frame()))
+                );
+                assert_eq!(
+                    progress.track_total_frames,
+                    Some(expected_plan.track_frames())
+                );
+                assert_eq!(progress.metronome_beat_count, Some(7));
+            }
+            event => panic!("expected later progress, got {event:?}"),
+        }
+
+        let stop_id = runtime.handle.try_stop().expect("stop");
+        assert!(matches!(
+            runtime.events.recv().expect("stopped event"),
+            PlaybackRuntimeEvent::Stopped { id } if id == stop_id
+        ));
+        let inactive_poll_id = runtime.handle.try_poll_progress().expect("inactive poll");
+        match runtime.events.recv().expect("inactive progress") {
+            PlaybackRuntimeEvent::Progress { id, progress } => {
+                assert_eq!(id, inactive_poll_id);
+                assert!(!progress.active);
+                assert!(progress.playback_span_frames.is_none());
+                assert!(progress.track_total_frames.is_none());
+                assert!(progress.configured_span_request_id.is_none());
+                assert!(progress.metronome_beat_count.is_none());
+            }
+            event => panic!("expected inactive progress, got {event:?}"),
+        }
+        runtime.handle.try_shutdown().expect("shutdown");
+    }
+
+    fn assert_retargeted_real_executor_progress(
+        event: PlaybackRuntimeEvent,
+        retarget_id: PlaybackRequestId,
+        expected_plan: &PlaybackSpanPlan,
+    ) {
+        match event {
+            PlaybackRuntimeEvent::Progress { id, progress } => {
+                assert_eq!(id, retarget_id);
+                assert_eq!(progress.configured_span_request_id, Some(retarget_id));
+                assert_eq!(
+                    progress.playback_span_frames,
+                    Some((expected_plan.start_frame(), expected_plan.end_frame()))
+                );
+                assert_eq!(
+                    progress.track_total_frames,
+                    Some(expected_plan.track_frames())
+                );
+                assert_eq!(progress.metronome_beat_count, Some(7));
+            }
+            event => panic!("expected retarget progress, got {event:?}"),
+        }
+    }
+
     fn test_request(start: f64) -> PlaybackRuntimeRequest {
         PlaybackRuntimeRequest {
             source: PlaybackRuntimeSource::AudioBytes {
@@ -3640,6 +4131,7 @@ mod tests {
             end,
             offset: start,
             seek_to_offset: true,
+            seek_if_outside: false,
             looped,
             playback_gain: 1.0,
             playback_gain_normalization: None,

@@ -295,6 +295,25 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_source_starts_at_plan_offset() {
+        let samples = Arc::<[f32]>::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        let plan = one_shot_span_plan(1, 5, 2);
+        let handle = PlaybackSpanHandle::from_plan(&plan);
+        let mut source = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples,
+            handle,
+            SpanSamplesMode::OneShot,
+            plan.seek_sample(),
+        );
+
+        assert_eq!(source.next(), Some(3.0));
+        assert_eq!(source.next(), Some(4.0));
+        assert_eq!(source.next(), None);
+    }
+
+    #[test]
     fn edge_fade_applies_to_live_loop_cycles() {
         let samples = Arc::<[f32]>::from(vec![1.0; 4]);
         let handle = PlaybackSpanHandle::from_plan(&span_plan(0, 4, 0));
@@ -591,6 +610,21 @@ mod tests {
                 end_frame as f32 / 1_000.0,
                 1.0,
                 true,
+                PlaybackSeekBehavior::FrameOffset(offset_frame),
+            ),
+        )
+        .expect("span plan")
+    }
+
+    fn one_shot_span_plan(start_frame: u64, end_frame: u64, offset_frame: u64) -> PlaybackSpanPlan {
+        PlaybackSpanPlan::new(
+            PlaybackSourceIdentity::new(PlaybackSourceKind::Bytes, None),
+            PlaybackChannelLayout::new(1, 1_000).expect("layout"),
+            PlaybackSpanRequest::new(
+                start_frame as f32 / 1_000.0,
+                end_frame as f32 / 1_000.0,
+                1.0,
+                false,
                 PlaybackSeekBehavior::FrameOffset(offset_frame),
             ),
         )
