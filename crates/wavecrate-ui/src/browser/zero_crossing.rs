@@ -516,7 +516,7 @@ pub(super) fn toggle_from_toolbar(
         browser.mark_preferences_edit_blocked(cx);
         return;
     }
-    window.focus(&browser.focus_handle);
+    window.focus(&browser.waveform_focus_handle);
     let enabled = !browser.zero_crossing.enabled();
     browser.zero_crossing.set_enabled(enabled);
     browser.zero_crossing_queued = None;
