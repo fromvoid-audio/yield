@@ -78,6 +78,7 @@ pub(crate) struct SearchInputOptions {
     paste_newlines: PasteNewlines,
     underlined: bool,
     ascii_digits_only: bool,
+    compact_height: Option<u16>,
 }
 
 impl SearchInputOptions {
@@ -89,6 +90,7 @@ impl SearchInputOptions {
             paste_newlines: PasteNewlines::AsSpaces,
             underlined: false,
             ascii_digits_only: false,
+            compact_height: None,
         }
     }
 
@@ -100,6 +102,7 @@ impl SearchInputOptions {
             paste_newlines: PasteNewlines::AsCommas,
             underlined: true,
             ascii_digits_only: false,
+            compact_height: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl SearchInputOptions {
             paste_newlines: PasteNewlines::Preserve,
             underlined: true,
             ascii_digits_only: false,
+            compact_height: None,
         }
     }
 
@@ -122,6 +126,7 @@ impl SearchInputOptions {
             paste_newlines: PasteNewlines::Preserve,
             underlined: false,
             ascii_digits_only: true,
+            compact_height: None,
         }
     }
 }
@@ -866,6 +871,24 @@ impl Render for SearchInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = active(cx);
         let underlined = self.options.underlined;
+        let compact_height = self.options.compact_height.map(f32::from);
+        let border_edges = if underlined { 1.0 } else { 2.0 };
+        let border_width = compact_height.map_or(theme.spacing.border_width, |height| {
+            theme
+                .spacing
+                .border_width
+                .max(theme.interaction.focus_outline_width)
+                .min((height - 1.0).max(0.0) / border_edges)
+        });
+        let inner_height = compact_height.map_or(theme.spacing.control_height, |height| {
+            (height - border_width * border_edges).max(1.0)
+        });
+        let line_height = compact_height.map_or(theme.typography.line_height, |_| {
+            theme.typography.line_height.min(inner_height)
+        });
+        let font_size = compact_height.map_or(theme.typography.body_size, |_| {
+            theme.typography.body_size.min(inner_height)
+        });
         div()
             .flex()
             .key_context("SearchInput")
@@ -891,19 +914,16 @@ impl Render for SearchInput {
             .when(!underlined, |style| {
                 style.bg(color(theme.colors.surface_overlay))
             })
-            .line_height(px(theme.typography.line_height))
-            .text_size(px(theme.typography.body_size))
+            .line_height(px(line_height))
+            .text_size(px(font_size))
             .text_color(color(theme.colors.text_primary))
-            .when(underlined, |style| {
-                style.border_b(px(theme.spacing.border_width))
-            })
-            .when(!underlined, |style| {
-                style.border(px(theme.spacing.border_width))
-            })
+            .when(underlined, |style| style.border_b(px(border_width)))
+            .when(!underlined, |style| style.border(px(border_width)))
             .border_color(color(theme.colors.border))
             .focus({
                 let focus_color = color(theme.interaction.focus_outline);
-                let focus_width = theme.interaction.focus_outline_width;
+                let focus_width =
+                    compact_height.map_or(theme.interaction.focus_outline_width, |_| border_width);
                 move |style| {
                     let style = if underlined {
                         style.border_b(px(focus_width))
@@ -917,9 +937,11 @@ impl Render for SearchInput {
                 div()
                     .flex()
                     .items_center()
-                    .h(px(theme.spacing.control_height))
+                    .h(px(inner_height))
                     .w_full()
-                    .px(px(theme.spacing.control_gap))
+                    .px(px(compact_height.map_or(theme.spacing.control_gap, |_| {
+                        theme.spacing.control_gap.min(3.0)
+                    })))
                     .child(TextElement { input: cx.entity() }),
             )
     }
