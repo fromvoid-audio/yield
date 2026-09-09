@@ -1983,3 +1983,9 @@ Reson now offers `PlaybackMetronomeConfig::with_source_cycle` to anchor a click 
 ### Metronome transport readback, 2026-09-09
 
 Runtime progress now carries the configured metronome beat count together with playback request identity. The accessor reads the coherently published span configuration, avoiding a lagging audio-thread-applied value during retarget acknowledgement, and returns no count for inactive/disabled/unavailable transport. All 196 Reson library tests and checking passed; independent review found no meaningful issue. This is the acknowledgement foundation for the GPUI metronome control, which remains in progress.
+
+### Last-window shutdown correction, 2026-09-09
+
+Closing the macOS red window button previously removed the window while leaving the application process, Dock running indicator and menu bar active. This was reproduced with the isolated `61ad8563f` preview; explicit Quit then exited normally. The launcher now retains a GPUI window-closed observer and calls the existing application quit path only when no windows remain, preserving the source-registry and browser worker shutdown observers.
+
+Application checking passed. A clean, signature-verified preview built from `edfba3ee8` was launched with the isolated QA profile and closed through its actual native close button. The process exited with status zero and a subsequent process query found neither the old nor fixed preview running. The fixed preview is `target/qa/Wavecrate Close Preview edfba3e.app`. No live profile or audio session was used.
