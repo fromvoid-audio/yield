@@ -20,6 +20,7 @@ use wavecrate_design::Theme;
 use crate::theme::color;
 
 use super::Browser;
+use super::playmark_timing;
 use super::similar_sections;
 use super::waveform_fades;
 use super::waveform_scrollbar;
@@ -1817,6 +1818,21 @@ pub(super) fn render_waveform(
                 WaveformSelectionKind::Play,
             ),
         ));
+        if let Some(preview) = browser.waveform.as_ref()
+            && let Some(region) = region.core()
+        {
+            bars = bars.child(playmark_timing::render_overlay(
+                region,
+                browser.waveform_viewport,
+                preview.total_frames,
+                preview.sample_rate,
+                browser
+                    .beat_guides_enabled
+                    .then_some(browser.beat_guide_count),
+                color(theme.colors.waveform_playmark_label_background),
+                color(theme.colors.text_primary),
+            ));
+        }
     }
     if let Some(region) = edit_region {
         let edit_color = color(theme.colors.waveform_edit_selection);

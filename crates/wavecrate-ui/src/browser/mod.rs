@@ -47,6 +47,7 @@ mod history;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod playmark_timing;
 mod preferences;
 mod random_audition;
 mod shortcut_help;
