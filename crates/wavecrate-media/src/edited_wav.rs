@@ -71,7 +71,7 @@ fn check_cancellation(cancellation: Option<&AtomicBool>) -> Result<(), String> {
     }
 }
 
-fn checked_spec(
+pub(super) fn checked_spec(
     sample_count: usize,
     channels: usize,
     sample_rate: u32,

@@ -86,6 +86,14 @@ and refresh discard identities no longer visible. Plain pointer focus clears
 explicit membership, while plain arrow focus preserves it. Source and folder
 navigation clear batch membership. These choices remain session-only.
 
+Gain/fade edit preparation also belongs to `wavecrate-media`. It retains a source
+handle, validates the captured WAV revision before decoding and after encoding,
+and prepares whole-file float WAV bytes in a fresh caller-owned sink. The caller
+sets a decoded-buffer budget subject to a 256 MiB ceiling and runs the operation
+off the UI thread. Failure requires discarding the output, including a source
+revision failure after finalization. Prepared bytes confer no publication,
+replacement, journal or undo authority; those remain with the durable file owner.
+
 The current media scanner is a read-only browsing service. It returns a canonical
 root and every traversed relative directory, including empty directories, so the
 UI can project a complete folder tree without doing filesystem work while

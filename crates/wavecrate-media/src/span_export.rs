@@ -343,22 +343,7 @@ pub fn export_wav_span_with_cancel<W: Write + Seek>(
         return Err(String::from("stale WAV span export request"));
     }
 
-    let source_data = inspect_source_data(
-        &mut opened.file,
-        opened.observation.byte_len(),
-        cancellation,
-    )?;
-    let (_data_len, output_data_len) = checked_span_layout(request, &opened, source_data)?;
-    opened
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("failed to rewind WAV span export source: {error}"))?;
-    let reader_file = opened
-        .file
-        .try_clone()
-        .map_err(|error| format!("failed to retain WAV span export source: {error}"))?;
-    opened.reader = hound::WavReader::new(std::io::BufReader::new(reader_file))
-        .map_err(|error| format!("failed to reopen WAV span export source: {error}"))?;
+    let output_data_len = validate_source_and_rewind(request, &mut opened, cancellation)?;
     if is_cancelled(cancellation) {
         return Err(String::from("WAV span export canceled"));
     }
@@ -428,6 +413,30 @@ pub fn export_wav_span_with_cancel<W: Write + Seek>(
     writer
         .finalize()
         .map_err(|error| format!("failed to finalize WAV span export: {error}"))
+}
+
+pub(super) fn validate_source_and_rewind(
+    request: &WavSpanExportRequest,
+    opened: &mut detail::OpenWav,
+    cancellation: Option<&AtomicBool>,
+) -> Result<u32, String> {
+    let source_data = inspect_source_data(
+        &mut opened.file,
+        opened.observation.byte_len(),
+        cancellation,
+    )?;
+    let (_data_len, output_data_len) = checked_span_layout(request, opened, source_data)?;
+    opened
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind WAV span export source: {error}"))?;
+    let reader_file = opened
+        .file
+        .try_clone()
+        .map_err(|error| format!("failed to retain WAV span export source: {error}"))?;
+    opened.reader = hound::WavReader::new(std::io::BufReader::new(reader_file))
+        .map_err(|error| format!("failed to reopen WAV span export source: {error}"))?;
+    Ok(output_data_len)
 }
 
 fn copy_wav_samples<W: Write + Seek>(

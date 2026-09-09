@@ -13,6 +13,7 @@ use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
 mod detail;
+mod edit_preparation;
 mod edited_wav;
 mod similar_sections;
 mod span_export;
@@ -25,6 +26,10 @@ pub use detail::{
     MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
     WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
     WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
+};
+pub use edit_preparation::{
+    MAX_WAV_EDIT_DECODED_BYTES, WavEditPreparationRequest, prepare_wav_edit,
+    prepare_wav_edit_with_cancel,
 };
 pub use edited_wav::{encode_edited_wav, encode_edited_wav_with_cancel};
 pub use similar_sections::{
