@@ -25,7 +25,7 @@ use wavecrate_media::{
 use super::waveform::WaveformPlayRegion;
 use super::{
     Browser,
-    transport::{PlaybackIntent, PlaybackRetargetTarget},
+    transport::{PlaybackIntent, PlaybackRetargetRequest},
 };
 
 const MAX_NORMALIZED_GAIN_RETRIES: u8 = 3;
@@ -101,7 +101,7 @@ pub(super) enum NormalizedAuditionAction {
     /// Apply the gain to the currently accepted playback request.
     ApplyGain,
     /// Retarget the current playback mode with the prepared gain.
-    RetargetPlayback { target: PlaybackRetargetTarget },
+    RetargetPlayback { request: PlaybackRetargetRequest },
 }
 
 /// One bounded normalized audition request retained while an older job is winding down.
@@ -173,7 +173,7 @@ fn deferred_play_origin(
 fn pending_playback_retarget_for_disable(
     active_fence: Option<NormalizedAuditionFence>,
     queued_request: Option<&PendingNormalizedAudition>,
-    target: Option<PlaybackRetargetTarget>,
+    request: Option<&PlaybackRetargetRequest>,
 ) -> Option<PendingNormalizedAudition> {
     if let Some(request) = queued_request.filter(|request| {
         matches!(
@@ -183,13 +183,62 @@ fn pending_playback_retarget_for_disable(
     }) {
         return Some(request.clone());
     }
-    let (Some(fence), Some(target)) = (active_fence, target) else {
+    let (Some(fence), Some(request)) = (active_fence, request) else {
         return None;
     };
     Some(PendingNormalizedAudition {
         fence,
-        action: NormalizedAuditionAction::RetargetPlayback { target },
+        action: NormalizedAuditionAction::RetargetPlayback {
+            request: request.clone(),
+        },
     })
+}
+
+/// Keep a complete latest retarget ahead of a generic gain preparation.
+///
+/// A gain request is fenced against the accepted span, whereas a live retarget owns an
+/// immutable target that may differ while an earlier runtime acknowledgement is arriving.
+/// Replacing the retarget with the gain would leave its desired state advertised but never
+/// prepared. The caller admits `retarget` only after validating its anchor.
+fn preserve_retarget_over_gain(
+    request: PendingNormalizedAudition,
+    retarget: Option<&PlaybackRetargetRequest>,
+) -> PendingNormalizedAudition {
+    if !matches!(request.action, NormalizedAuditionAction::ApplyGain) {
+        return request;
+    }
+    let Some(retarget) = retarget else {
+        return request;
+    };
+    PendingNormalizedAudition {
+        fence: NormalizedAuditionFence {
+            span: retarget.target.span,
+            ..request.fence
+        },
+        action: NormalizedAuditionAction::RetargetPlayback {
+            request: retarget.clone(),
+        },
+    }
+}
+
+fn normalized_retarget_request_is_current(
+    request: &PlaybackRetargetRequest,
+    latest: Option<&PlaybackRetargetRequest>,
+    anchor_is_current: bool,
+    fence_is_current: bool,
+) -> bool {
+    anchor_is_current
+        && fence_is_current
+        && latest.is_some_and(|latest| {
+            latest.generation == request.generation && latest.anchor == request.anchor
+        })
+}
+
+fn clear_current_retarget_after_completion(
+    request_is_current: bool,
+    has_queued_request: bool,
+) -> bool {
+    request_is_current && !has_queued_request
 }
 
 fn delayed_play_intent_with_volume(mut intent: PlaybackIntent, volume: f32) -> PlaybackIntent {
@@ -501,12 +550,12 @@ impl Browser {
             pending_playback_retarget_for_disable(
                 self.normalized_audition.pending_fence(),
                 self.normalized_audition_queued.as_ref(),
-                self.normalized_audition_pending_playback_target,
+                self.normalized_audition_pending_playback_target.as_ref(),
             )
         });
         let pending_playback_retarget = pending_playback_retarget
             .flatten()
-            .filter(|request| self.normalized_live_request_is_current(request));
+            .filter(|request| self.normalized_request_is_current(request));
         if !self.normalized_audition.set_enabled(enabled) {
             return;
         }
@@ -522,11 +571,11 @@ impl Browser {
                 }
             }
             if let Some(request) = pending_playback_retarget {
-                let NormalizedAuditionAction::RetargetPlayback { target } = request.action else {
+                let NormalizedAuditionAction::RetargetPlayback { request } = request.action else {
                     unreachable!("disable retarget helper returned another action");
                 };
                 if let Some(Err(error)) =
-                    self.submit_live_playback_retarget_with_gain(target, 1.0, cx)
+                    self.submit_live_playback_retarget_request_with_gain(request, 1.0, cx)
                 {
                     self.playback_status = format!("Could not apply playback change: {error}");
                 }
@@ -557,17 +606,17 @@ impl Browser {
     }
 
     /// Return the newest complete live target only while its playback fence is current.
-    pub(super) fn current_normalized_playback_target(&self) -> Option<PlaybackRetargetTarget> {
+    pub(super) fn current_normalized_playback_target(&self) -> Option<PlaybackRetargetRequest> {
         let request = pending_playback_retarget_for_disable(
             self.normalized_audition.pending_fence(),
             self.normalized_audition_queued.as_ref(),
-            self.normalized_audition_pending_playback_target,
+            self.normalized_audition_pending_playback_target.as_ref(),
         )?;
-        if !self.normalized_live_request_is_current(&request) {
+        if !self.normalized_request_is_current(&request) {
             return None;
         }
         match request.action {
-            NormalizedAuditionAction::RetargetPlayback { target } => Some(target),
+            NormalizedAuditionAction::RetargetPlayback { request } => Some(request),
             _ => None,
         }
     }
@@ -634,7 +683,7 @@ impl Browser {
     /// Schedule a normalized gain update for a live playback-mode retarget.
     pub(super) fn schedule_normalized_playback_retarget(
         &mut self,
-        target: PlaybackRetargetTarget,
+        request: PlaybackRetargetRequest,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(playback_id) = self.latest_playback_request_id else {
@@ -649,15 +698,20 @@ impl Browser {
         if accepted.path != path || !self.normalized_audition.enabled() {
             return false;
         }
-        if !target.span.is_valid() {
+        if !request.target.span.is_valid() {
             return false;
         }
-        self.normalized_audition_pending_playback_target = Some(target);
-        let fence = self.normalized_fence(&path, target.span, Some(playback_id));
+        if request.anchor.playback_id != playback_id.get()
+            || !self.playback_retarget_anchor_is_current(&request.anchor)
+        {
+            return false;
+        }
+        self.normalized_audition_pending_playback_target = Some(request.clone());
+        let fence = self.normalized_fence(&path, request.target.span, Some(playback_id));
         self.schedule_normalized_request(
             PendingNormalizedAudition {
                 fence,
-                action: NormalizedAuditionAction::RetargetPlayback { target },
+                action: NormalizedAuditionAction::RetargetPlayback { request },
             },
             cx,
         );
@@ -685,11 +739,13 @@ impl Browser {
         request: PendingNormalizedAudition,
         cx: &mut Context<Self>,
     ) {
+        let current_retarget = self
+            .normalized_audition_pending_playback_target
+            .as_ref()
+            .filter(|retarget| self.playback_retarget_anchor_is_current(&retarget.anchor));
+        let request = preserve_retarget_over_gain(request, current_retarget);
         self.normalized_gain_runtime_pending = None;
-        if !matches!(
-            &request.action,
-            NormalizedAuditionAction::RetargetPlayback { .. }
-        ) {
+        if matches!(&request.action, NormalizedAuditionAction::Play(_)) {
             self.normalized_audition_pending_playback_target = None;
         }
         if self.normalized_audition_task.is_some() {
@@ -736,11 +792,14 @@ impl Browser {
     ) {
         let completion = self.normalized_audition.finish(&job, result);
         let request_is_current = self.normalized_request_is_current(&request);
-        if matches!(
+        let retarget_request_is_current = matches!(
             &request.action,
             NormalizedAuditionAction::RetargetPlayback { .. }
-        ) && self.normalized_audition_queued.is_none()
-        {
+        ) && request_is_current;
+        if clear_current_retarget_after_completion(
+            retarget_request_is_current,
+            self.normalized_audition_queued.is_some(),
+        ) {
             self.normalized_audition_pending_playback_target = None;
         }
         match completion {
@@ -765,9 +824,12 @@ impl Browser {
                         }
                     }
                 }
-                NormalizedAuditionAction::RetargetPlayback { target } => {
-                    match self.submit_live_playback_retarget_with_gain(target, preparation.gain, cx)
-                    {
+                NormalizedAuditionAction::RetargetPlayback { request } => {
+                    match self.submit_live_playback_retarget_request_with_gain(
+                        request,
+                        preparation.gain,
+                        cx,
+                    ) {
                         Some(Err(error)) => {
                             self.playback_status =
                                 format!("Playback live update unavailable: {error}");
@@ -809,11 +871,26 @@ impl Browser {
                     && intent.path == request.fence.path
                     && self.selected_path() == Some(request.fence.path.as_path())
             }
-            NormalizedAuditionAction::ApplyGain
-            | NormalizedAuditionAction::RetargetPlayback { .. } => {
-                self.normalized_live_request_is_current(request)
+            NormalizedAuditionAction::ApplyGain => self.normalized_live_request_is_current(request),
+            NormalizedAuditionAction::RetargetPlayback { .. } => {
+                self.normalized_retarget_request_is_current(request)
             }
         }
+    }
+
+    fn normalized_retarget_request_is_current(&self, request: &PendingNormalizedAudition) -> bool {
+        let NormalizedAuditionAction::RetargetPlayback {
+            request: target_request,
+        } = &request.action
+        else {
+            return false;
+        };
+        normalized_retarget_request_is_current(
+            target_request,
+            self.normalized_audition_pending_playback_target.as_ref(),
+            self.playback_retarget_anchor_is_current(&target_request.anchor),
+            self.normalized_fence_is_current(request),
+        )
     }
 
     fn normalized_live_request_is_current(&self, request: &PendingNormalizedAudition) -> bool {
@@ -1062,7 +1139,10 @@ pub(super) fn span_for_playback_intent(
 
 #[cfg(test)]
 mod tests {
-    use super::super::transport::PlaybackDesiredState;
+    use super::super::transport::{
+        PlaybackDesiredState, PlaybackRetargetAnchor, PlaybackRetargetRequest,
+        PlaybackRetargetTarget,
+    };
     use super::*;
     use std::path::Path;
     use std::time::SystemTime;
@@ -1076,6 +1156,24 @@ mod tests {
             PathBuf::from(path),
             WaveformPlayRegion::new(start, end).expect("valid span"),
         )
+    }
+
+    fn make_retarget_request(
+        path: &str,
+        generation: u64,
+        target: PlaybackRetargetTarget,
+    ) -> PlaybackRetargetRequest {
+        PlaybackRetargetRequest {
+            generation,
+            target,
+            anchor: PlaybackRetargetAnchor {
+                playback_id: 42,
+                playback_epoch: 1,
+                waveform_generation: 2,
+                output_open_generation: 3,
+                path: PathBuf::from(path),
+            },
+        }
     }
 
     fn preparation(
@@ -1323,43 +1421,40 @@ mod tests {
 
     #[test]
     fn disabling_keeps_the_latest_pending_playback_tuple() {
+        let active_target = PlaybackRetargetTarget {
+            span: WaveformPlayRegion::new(0.0, 1.0).expect("valid span"),
+            desired: PlaybackDesiredState {
+                looped: true,
+                metronome_beat_count: Some(4),
+            },
+            seek_if_outside: false,
+        };
+        let latest_target = PlaybackRetargetTarget {
+            span: WaveformPlayRegion::new(0.2, 0.8).expect("valid span"),
+            desired: PlaybackDesiredState {
+                looped: false,
+                metronome_beat_count: None,
+            },
+            seek_if_outside: true,
+        };
+        let active_request = make_retarget_request("one.wav", 1, active_target);
+        let latest_request = make_retarget_request("one.wav", 2, latest_target);
         let active = PendingNormalizedAudition {
             fence: make_fence("one.wav", 0.0, 1.0),
             action: NormalizedAuditionAction::RetargetPlayback {
-                target: PlaybackRetargetTarget {
-                    span: WaveformPlayRegion::new(0.0, 1.0).expect("valid span"),
-                    desired: PlaybackDesiredState {
-                        looped: true,
-                        metronome_beat_count: Some(4),
-                    },
-                    seek_if_outside: false,
-                },
+                request: active_request.clone(),
             },
         };
         let latest = PendingNormalizedAudition {
             fence: make_fence("one.wav", 0.2, 0.8),
             action: NormalizedAuditionAction::RetargetPlayback {
-                target: PlaybackRetargetTarget {
-                    span: WaveformPlayRegion::new(0.2, 0.8).expect("valid span"),
-                    desired: PlaybackDesiredState {
-                        looped: false,
-                        metronome_beat_count: None,
-                    },
-                    seek_if_outside: true,
-                },
+                request: latest_request.clone(),
             },
         };
         let retained = pending_playback_retarget_for_disable(
             Some(active.fence.clone()),
             Some(&latest),
-            Some(PlaybackRetargetTarget {
-                span: WaveformPlayRegion::new(0.2, 0.8).expect("valid span"),
-                desired: PlaybackDesiredState {
-                    looped: false,
-                    metronome_beat_count: None,
-                },
-                seek_if_outside: false,
-            }),
+            Some(&latest_request),
         )
         .expect("latest queued retarget");
         assert_eq!(retained, latest);
@@ -1367,17 +1462,131 @@ mod tests {
         let retained_active = pending_playback_retarget_for_disable(
             Some(active.fence.clone()),
             None,
-            Some(PlaybackRetargetTarget {
-                span: WaveformPlayRegion::new(0.0, 1.0).expect("valid span"),
-                desired: PlaybackDesiredState {
-                    looped: true,
-                    metronome_beat_count: Some(4),
-                },
-                seek_if_outside: false,
-            }),
+            Some(&active_request),
         )
         .expect("active retarget");
         assert_eq!(retained_active, active);
+    }
+
+    #[test]
+    fn gain_preparation_preserves_the_latest_complete_retarget() {
+        let target = PlaybackRetargetTarget {
+            span: WaveformPlayRegion::new(0.25, 0.75).expect("valid target span"),
+            desired: PlaybackDesiredState {
+                looped: true,
+                metronome_beat_count: Some(6),
+            },
+            seek_if_outside: true,
+        };
+        let retarget = make_retarget_request("one.wav", 9, target);
+        let gain = PendingNormalizedAudition {
+            fence: make_fence("one.wav", 0.0, 1.0),
+            action: NormalizedAuditionAction::ApplyGain,
+        };
+
+        let preserved = preserve_retarget_over_gain(gain, Some(&retarget));
+        assert_eq!(preserved.fence.span, target.span);
+        assert_eq!(
+            preserved.action,
+            NormalizedAuditionAction::RetargetPlayback {
+                request: retarget.clone(),
+            }
+        );
+
+        let independent_gain = PendingNormalizedAudition {
+            fence: make_fence("one.wav", 0.0, 1.0),
+            action: NormalizedAuditionAction::ApplyGain,
+        };
+        assert_eq!(
+            preserve_retarget_over_gain(independent_gain.clone(), None),
+            independent_gain
+        );
+    }
+
+    #[gpui::test]
+    fn newest_retarget_survives_older_ack_and_only_its_completion_clears(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(Browser::new);
+        browser.update(cx, |_view, _| {
+            let a = make_retarget_request(
+                "one.wav",
+                1,
+                PlaybackRetargetTarget {
+                    span: WaveformPlayRegion::new(0.0, 0.4).expect("valid A span"),
+                    desired: PlaybackDesiredState {
+                        looped: false,
+                        metronome_beat_count: None,
+                    },
+                    seek_if_outside: false,
+                },
+            );
+            let b = make_retarget_request(
+                "one.wav",
+                2,
+                PlaybackRetargetTarget {
+                    span: WaveformPlayRegion::new(0.4, 0.7).expect("valid B span"),
+                    desired: PlaybackDesiredState {
+                        looped: true,
+                        metronome_beat_count: Some(4),
+                    },
+                    seek_if_outside: true,
+                },
+            );
+            let c = make_retarget_request(
+                "one.wav",
+                3,
+                PlaybackRetargetTarget {
+                    span: WaveformPlayRegion::new(0.7, 1.0).expect("valid C span"),
+                    desired: PlaybackDesiredState {
+                        looped: false,
+                        metronome_beat_count: Some(8),
+                    },
+                    seek_if_outside: true,
+                },
+            );
+
+            // A's acknowledgement changes the mutable accepted span while B is preparing.
+            let mut accepted_span =
+                WaveformPlayRegion::new(0.1, 0.3).expect("valid accepted span before A");
+            assert_ne!(accepted_span, b.target.span);
+            assert!(normalized_retarget_request_is_current(
+                &b,
+                Some(&b),
+                true,
+                true,
+            ));
+            accepted_span = a.target.span;
+            assert_ne!(accepted_span, b.target.span);
+            assert!(normalized_retarget_request_is_current(
+                &b,
+                Some(&b),
+                true,
+                true,
+            ));
+
+            // C supersedes B, so B's completion or failure cannot clear C.
+            assert!(!normalized_retarget_request_is_current(
+                &b,
+                Some(&c),
+                true,
+                true,
+            ));
+            assert!(!clear_current_retarget_after_completion(false, false));
+            assert!(normalized_retarget_request_is_current(
+                &c,
+                Some(&c),
+                true,
+                true,
+            ));
+
+            // A current failed C preparation clears only C, allowing the earlier runtime or
+            // confirmed configuration to become the fallback.
+            assert!(clear_current_retarget_after_completion(true, false));
+        });
     }
 
     #[test]

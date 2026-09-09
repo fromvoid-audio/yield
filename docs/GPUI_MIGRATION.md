@@ -2074,3 +2074,12 @@ The browser now carries `PlaybackRetargetTarget` (span, loop/metronome configura
 The repository is at a tested prerequisite checkpoint. Compact text-input sizing is opt-in; existing constructors retain their dimensions, and all 12 text-input regressions passed after complete-target propagation. Logical retarget-generation fencing, browser consumption of persistent runtime acknowledgements, and interactive duration editing remain deferred. No generation-fencing changes were made. The existing live-playmark contract in `GPUI_ARCHITECTURE.md` is the next-step authority.
 
 Windows run `34331156363` finished cancelled, so it supplies no completed coverage for Similar Sections or timing work. The latest successful Windows evidence remains `34326573383` at `0427c65f7407e4ab9223e2241c0cacc921d36fac`. Current runtime and target-propagation validation is local as recorded above.
+
+
+### Retarget generation ownership, 2026-09-09
+
+Live retargets now retain a logical generation and playback ID, path, playback epoch, waveform generation and output generation anchor. Normalized retarget freshness uses that immutable ownership and the current logical target; it does not depend on the mutable accepted span. Independent gain preparation preserves/reschedules the current retarget instead of cancelling it while leaving it advertised. Current configuration lookup and resume ignore stale anchors and keep the captured span/seek policy. ApplyGain retains its stricter accepted-span fence.
+
+Lifecycle stabilization fixed optimistic metronome fallback after a failed enable: confirmed disabled state remains disabled, with accepted resume configuration preferred over preferences when confirmation is unavailable. Stale completion/failure cannot clear a newer normalized target; failure of the current target clears only its logical ownership. Runtime acknowledgement consumption and interactive timing editing remain pending.
+
+The full UI suite passed 367 tests with one existing benchmark ignored. A subsequent focused GPUI regression also passed, covering an older accepted-span update during newer preparation, supersession, stale completion/failure, and clearing only the current failed target. Complementary tests cover old runtime replies, repeated output resume and confirmed-disabled fallback. UI/application checks, formatting and diff checks passed. This is deterministic UI/state validation, not audible runtime acceptance. The compact input's rendered 18-pixel height was separately verified before/after focus in an isolated checkout.
