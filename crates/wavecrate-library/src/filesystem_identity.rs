@@ -69,17 +69,20 @@ fn filesystem_change_marker_impl(_path: &Path, metadata: &fs::Metadata) -> Optio
 fn stable_filesystem_identity_impl(path: &Path, metadata: &fs::Metadata) -> Option<String> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = fs::OpenOptions::new();
     options
         .access_mode(FILE_READ_ATTRIBUTES.0)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0);
+    // Windows requires this flag to obtain an attribute-only handle to a directory.
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
     if metadata.file_type().is_symlink() {
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
     }
+    options.custom_flags(flags.0);
 
     let file = options.open(path).ok()?;
     stable_windows_identity(&file)
@@ -197,5 +200,13 @@ mod tests {
             stable_filesystem_identity(&renamed, &renamed_metadata).expect("read renamed identity");
 
         assert_eq!(original_identity, renamed_identity);
+    }
+
+    #[test]
+    fn directory_has_identity() {
+        let temp = tempfile::tempdir().expect("create identity fixture");
+        let metadata = fs::metadata(temp.path()).expect("read directory metadata");
+
+        assert!(stable_filesystem_identity(temp.path(), &metadata).is_some());
     }
 }
