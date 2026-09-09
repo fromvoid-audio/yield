@@ -20,7 +20,8 @@ use gpui::{
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
-    FolderTreeRow, PlaybackLoopPolicy, PlaybackNavigationHistory, SortColumn, WaveformViewport,
+    FolderTreeRow, PlaybackLoopPolicy, PlaybackNavigationHistory, SortColumn, WaveformEditRegion,
+    WaveformViewport,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_library::sample_sources::{SampleSource, SourceId};
@@ -269,6 +270,7 @@ pub(crate) struct Browser {
     waveform_viewport: WaveformViewport,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    waveform_edit_region: Option<WaveformEditRegion>,
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
     waveform_pan_drag: Option<waveform::WaveformPanDrag>,
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
@@ -482,6 +484,7 @@ impl Browser {
             waveform_viewport: WaveformViewport::full(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
+            waveform_edit_region: None,
             waveform_region_drag: None,
             waveform_pan_drag: None,
             waveform_scrollbar_drag: None,

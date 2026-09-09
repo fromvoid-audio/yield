@@ -11,7 +11,9 @@ use gpui::{
     Path, PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div,
     fill, point, prelude::*, px,
 };
-use wavecrate_core::{WaveformRegion, WaveformViewport, snap_resize_ratio_to_whole_bpm};
+use wavecrate_core::{
+    WaveformEditRegion, WaveformRegion, WaveformViewport, snap_resize_ratio_to_whole_bpm,
+};
 use wavecrate_design::Theme;
 
 use crate::theme::color;
@@ -27,6 +29,11 @@ const PLAY_REGION_RESIZE_HANDLE_WIDTH: f32 = 9.0;
 const PLAY_REGION_RESIZE_HIT_WIDTH: f32 = 15.0;
 const PLAY_REGION_MOVE_GRIP_HEIGHT: f32 = 7.0;
 const PLAY_REGION_MOVE_GRIP_INSET: f32 = 9.0;
+const EDIT_REGION_RESIZE_HANDLE_HEIGHT: f32 = 22.0;
+const EDIT_REGION_RESIZE_HANDLE_WIDTH: f32 = 7.0;
+const EDIT_REGION_RESIZE_HIT_WIDTH: f32 = 13.0;
+const EDIT_REGION_MOVE_GRIP_HEIGHT: f32 = 7.0;
+const EDIT_REGION_MOVE_GRIP_INSET: f32 = 9.0;
 const WAVEFORM_PAN_REFERENCE_WIDTH: f64 = 1_200.0;
 const WAVEFORM_WHEEL_EPSILON: f64 = f64::EPSILON;
 const BPM_SNAP_ICON_SIZE: f32 = 16.0;
@@ -266,12 +273,24 @@ pub(super) enum WaveformRegionHandle {
     Move,
 }
 
+/// The committed waveform selection that owns a pointer gesture or snap result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaveformSelectionKind {
+    /// The playback selection, which remains clamped to the audio interval.
+    Play,
+    /// The edit selection, which may retain finite silence-margin bounds.
+    Edit,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WaveformRegionDragMode {
-    Create,
-    Move { baseline: WaveformRegion },
-    ResizeStart { baseline: WaveformRegion },
-    ResizeEnd { baseline: WaveformRegion },
+    Create { kind: WaveformSelectionKind },
+    MovePlay { baseline: WaveformRegion },
+    ResizePlayStart { baseline: WaveformRegion },
+    ResizePlayEnd { baseline: WaveformRegion },
+    MoveEdit { baseline: WaveformEditRegion },
+    ResizeEditStart { baseline: WaveformEditRegion },
+    ResizeEditEnd { baseline: WaveformEditRegion },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -283,6 +302,7 @@ pub(super) struct WaveformRegionDrag {
     viewport: WaveformViewport,
     moved: bool,
     generation: u64,
+    button: MouseButton,
     mode: WaveformRegionDragMode,
 }
 
@@ -300,7 +320,30 @@ impl WaveformRegionDrag {
             bounds,
             viewport,
             generation,
-            WaveformRegionDragMode::Create,
+            MouseButton::Left,
+            WaveformRegionDragMode::Create {
+                kind: WaveformSelectionKind::Play,
+            },
+        )
+    }
+
+    fn begin_edit(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        generation: u64,
+    ) -> Self {
+        Self::with_mode(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            generation,
+            MouseButton::Right,
+            WaveformRegionDragMode::Create {
+                kind: WaveformSelectionKind::Edit,
+            },
         )
     }
 
@@ -315,9 +358,11 @@ impl WaveformRegionDrag {
     ) -> Option<Self> {
         let baseline = region.core()?;
         let mode = match handle {
-            WaveformRegionHandle::ResizeStart => WaveformRegionDragMode::ResizeStart { baseline },
-            WaveformRegionHandle::ResizeEnd => WaveformRegionDragMode::ResizeEnd { baseline },
-            WaveformRegionHandle::Move => WaveformRegionDragMode::Move { baseline },
+            WaveformRegionHandle::ResizeStart => {
+                WaveformRegionDragMode::ResizePlayStart { baseline }
+            }
+            WaveformRegionHandle::ResizeEnd => WaveformRegionDragMode::ResizePlayEnd { baseline },
+            WaveformRegionHandle::Move => WaveformRegionDragMode::MovePlay { baseline },
         };
         Some(Self::with_mode(
             position,
@@ -325,8 +370,60 @@ impl WaveformRegionDrag {
             bounds,
             viewport,
             generation,
+            MouseButton::Left,
             mode,
         ))
+    }
+
+    fn begin_edit_handle(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        region: WaveformEditRegion,
+        handle: WaveformRegionHandle,
+        generation: u64,
+    ) -> Self {
+        Self::begin_edit_handle_with_button(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            region,
+            handle,
+            generation,
+            MouseButton::Right,
+        )
+    }
+
+    fn begin_edit_handle_with_button(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        region: WaveformEditRegion,
+        handle: WaveformRegionHandle,
+        generation: u64,
+        button: MouseButton,
+    ) -> Self {
+        let mode = match handle {
+            WaveformRegionHandle::ResizeStart => {
+                WaveformRegionDragMode::ResizeEditStart { baseline: region }
+            }
+            WaveformRegionHandle::ResizeEnd => {
+                WaveformRegionDragMode::ResizeEditEnd { baseline: region }
+            }
+            WaveformRegionHandle::Move => WaveformRegionDragMode::MoveEdit { baseline: region },
+        };
+        Self::with_mode(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            generation,
+            button,
+            mode,
+        )
     }
 
     fn with_mode(
@@ -335,6 +432,7 @@ impl WaveformRegionDrag {
         bounds: Bounds<Pixels>,
         viewport: WaveformViewport,
         generation: u64,
+        button: MouseButton,
         mode: WaveformRegionDragMode,
     ) -> Self {
         let ratio = viewport.absolute_ratio_from_visible(visible_ratio);
@@ -346,6 +444,7 @@ impl WaveformRegionDrag {
             viewport,
             moved: false,
             generation,
+            button,
             mode,
         }
     }
@@ -368,29 +467,97 @@ impl WaveformRegionDrag {
     ) -> Option<WaveformPlayRegion> {
         if !self.moved {
             match self.mode {
-                WaveformRegionDragMode::Create => {}
-                WaveformRegionDragMode::Move { baseline }
-                | WaveformRegionDragMode::ResizeStart { baseline }
-                | WaveformRegionDragMode::ResizeEnd { baseline } => {
+                WaveformRegionDragMode::Create {
+                    kind: WaveformSelectionKind::Play,
+                } => {}
+                WaveformRegionDragMode::MovePlay { baseline }
+                | WaveformRegionDragMode::ResizePlayStart { baseline }
+                | WaveformRegionDragMode::ResizePlayEnd { baseline } => {
                     return Some(WaveformPlayRegion::from_core(baseline));
                 }
+                _ => return None,
             }
         }
         match self.mode {
-            WaveformRegionDragMode::Create => WaveformPlayRegion::new(self.anchor, self.current),
-            WaveformRegionDragMode::Move { baseline } => baseline
+            WaveformRegionDragMode::Create {
+                kind: WaveformSelectionKind::Play,
+            } => WaveformPlayRegion::new(self.anchor, self.current),
+            WaveformRegionDragMode::MovePlay { baseline } => baseline
                 .moved_by(self.current - self.anchor)
                 .map(WaveformPlayRegion::from_core),
-            WaveformRegionDragMode::ResizeStart { baseline } => baseline
+            WaveformRegionDragMode::ResizePlayStart { baseline } => baseline
                 .resized_start_to(snapped_resize_edge(baseline.end(), self.current, bpm_snap))
                 .map(WaveformPlayRegion::from_core),
-            WaveformRegionDragMode::ResizeEnd { baseline } => baseline
+            WaveformRegionDragMode::ResizePlayEnd { baseline } => baseline
                 .resized_end_to(snapped_resize_edge(
                     baseline.start(),
                     self.current,
                     bpm_snap,
                 ))
                 .map(WaveformPlayRegion::from_core),
+            _ => None,
+        }
+    }
+
+    fn preview_edit_region(self) -> Option<WaveformEditRegion> {
+        self.preview_edit_region_with_bpm(BpmSnapSettings::disabled())
+    }
+
+    pub(super) fn preview_edit_region_with_bpm(
+        self,
+        bpm_snap: BpmSnapSettings,
+    ) -> Option<WaveformEditRegion> {
+        if !self.moved {
+            match self.mode {
+                WaveformRegionDragMode::Create {
+                    kind: WaveformSelectionKind::Edit,
+                } => {}
+                WaveformRegionDragMode::MoveEdit { baseline }
+                | WaveformRegionDragMode::ResizeEditStart { baseline }
+                | WaveformRegionDragMode::ResizeEditEnd { baseline } => return Some(baseline),
+                _ => return None,
+            }
+        }
+        match self.mode {
+            WaveformRegionDragMode::Create {
+                kind: WaveformSelectionKind::Edit,
+            } => WaveformEditRegion::new(self.anchor, self.current),
+            WaveformRegionDragMode::MoveEdit { baseline } => {
+                baseline.moved_by(self.current - self.anchor)
+            }
+            WaveformRegionDragMode::ResizeEditStart { baseline } => baseline
+                .resized_start_to(snapped_resize_edge(baseline.end(), self.current, bpm_snap)),
+            WaveformRegionDragMode::ResizeEditEnd { baseline } => baseline.resized_end_to(
+                snapped_resize_edge(baseline.start(), self.current, bpm_snap),
+            ),
+            _ => None,
+        }
+    }
+
+    pub(super) fn selection_kind(self) -> WaveformSelectionKind {
+        match self.mode {
+            WaveformRegionDragMode::Create { kind } => kind,
+            WaveformRegionDragMode::MovePlay { .. }
+            | WaveformRegionDragMode::ResizePlayStart { .. }
+            | WaveformRegionDragMode::ResizePlayEnd { .. } => WaveformSelectionKind::Play,
+            WaveformRegionDragMode::MoveEdit { .. }
+            | WaveformRegionDragMode::ResizeEditStart { .. }
+            | WaveformRegionDragMode::ResizeEditEnd { .. } => WaveformSelectionKind::Edit,
+        }
+    }
+
+    pub(super) fn button(self) -> MouseButton {
+        self.button
+    }
+
+    pub(super) fn preview_bounds_with_bpm(self, bpm_snap: BpmSnapSettings) -> Option<(f64, f64)> {
+        match self.selection_kind() {
+            WaveformSelectionKind::Play => self
+                .preview_region_with_bpm(bpm_snap)
+                .map(|region| (region.start, region.end)),
+            WaveformSelectionKind::Edit => self
+                .preview_edit_region_with_bpm(bpm_snap)
+                .map(|region| (region.start(), region.end())),
         }
     }
 
@@ -400,7 +567,7 @@ impl WaveformRegionDrag {
     }
 
     fn is_handle_drag(self) -> bool {
-        !matches!(self.mode, WaveformRegionDragMode::Create)
+        !matches!(self.mode, WaveformRegionDragMode::Create { .. })
     }
 
     pub(super) fn zero_crossing_applies(self, bpm_snap: BpmSnapSettings) -> bool {
@@ -410,7 +577,10 @@ impl WaveformRegionDrag {
     fn is_resize(self) -> bool {
         matches!(
             self.mode,
-            WaveformRegionDragMode::ResizeStart { .. } | WaveformRegionDragMode::ResizeEnd { .. }
+            WaveformRegionDragMode::ResizePlayStart { .. }
+                | WaveformRegionDragMode::ResizePlayEnd { .. }
+                | WaveformRegionDragMode::ResizeEditStart { .. }
+                | WaveformRegionDragMode::ResizeEditEnd { .. }
         )
     }
 }
@@ -434,16 +604,18 @@ fn snapped_resize_edge(fixed_ratio: f64, moving_ratio: f64, bpm_snap: BpmSnapSet
 /// intentionally omitted; only the divisions inside the selected region are returned.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BeatGuideProjection {
-    region: WaveformPlayRegion,
+    start: f64,
+    end: f64,
     viewport: WaveformViewport,
     beat_count: u8,
     next_index: u8,
 }
 
 impl BeatGuideProjection {
-    fn new(region: WaveformPlayRegion, viewport: WaveformViewport, beat_count: u8) -> Self {
+    fn new(start: f64, end: f64, viewport: WaveformViewport, beat_count: u8) -> Self {
         Self {
-            region,
+            start,
+            end,
             viewport,
             beat_count: beat_count.min(MAX_BEAT_COUNT),
             next_index: 1,
@@ -459,8 +631,7 @@ impl Iterator for BeatGuideProjection {
             let index = self.next_index;
             self.next_index = self.next_index.saturating_add(1);
             let fraction = f64::from(index) / f64::from(self.beat_count);
-            let absolute_ratio =
-                self.region.start + (self.region.end - self.region.start) * fraction;
+            let absolute_ratio = self.start + (self.end - self.start) * fraction;
             let Some(visible_ratio) = self.viewport.visible_ratio_from_absolute(absolute_ratio)
             else {
                 continue;
@@ -472,11 +643,12 @@ impl Iterator for BeatGuideProjection {
 }
 
 fn beat_guide_projection(
-    region: WaveformPlayRegion,
+    start: f64,
+    end: f64,
     viewport: WaveformViewport,
     beat_count: u8,
 ) -> BeatGuideProjection {
-    BeatGuideProjection::new(region, viewport, beat_count)
+    BeatGuideProjection::new(start, end, viewport, beat_count)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -827,6 +999,7 @@ pub(super) fn render_waveform(
     let click_bounds = Rc::new(RefCell::new(None));
     let mut bars = div()
         .id("waveform")
+        .debug_selector(|| String::from("waveform"))
         .flex()
         .items_center()
         .gap(px(theme.spacing.waveform_bar_gap))
@@ -957,17 +1130,44 @@ pub(super) fn render_waveform(
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
     ));
-    if let Some(region) = browser
+    let play_region = browser
         .waveform_region_drag
         .and_then(|drag| zero_crossing::preview_drag_region(browser, drag))
-        .or(browser.waveform_play_region)
-    {
+        .or(browser.waveform_play_region);
+    let edit_region = browser
+        .waveform_region_drag
+        .and_then(|drag| zero_crossing::preview_drag_edit_region(browser, drag))
+        .or(browser.waveform_edit_region);
+    let active_selection_kind = browser
+        .waveform_region_drag
+        .map(|drag| drag.selection_kind());
+    if let Some(region) = play_region {
         bars = bars.child(waveform_region_overlay(
             region,
             browser.waveform_viewport,
             color(theme.colors.selection_fill),
             color(theme.colors.waveform_playhead),
-            beat_guides,
+            beat_guides_for_region(
+                beat_guides,
+                active_selection_kind,
+                WaveformSelectionKind::Play,
+            ),
+        ));
+    }
+    if let Some(region) = edit_region {
+        let edit_color = color(theme.colors.waveform_edit_selection);
+        bars = bars.child(waveform_edit_region_overlay(
+            region,
+            browser.waveform_viewport,
+            edit_color.opacity(46.0 / 255.0),
+            edit_color.opacity(230.0 / 255.0),
+            edit_color.opacity(180.0 / 255.0),
+            edit_color.opacity(190.0 / 255.0),
+            beat_guides_for_region(
+                beat_guides,
+                active_selection_kind,
+                WaveformSelectionKind::Edit,
+            ),
         ));
     }
     if let Some(ratio) = playback_cursor_ratio.and_then(|ratio| {
@@ -982,6 +1182,7 @@ pub(super) fn render_waveform(
         ));
     }
     let click_bounds_for_down = Rc::clone(&click_bounds);
+    let click_bounds_for_secondary = Rc::clone(&click_bounds);
     let click_bounds_for_wheel = Rc::clone(&click_bounds);
     let click_bounds_for_middle = Rc::clone(&click_bounds);
     let bars = bars
@@ -1004,7 +1205,7 @@ pub(super) fn render_waveform(
                 if !bounds.contains(&event.position) {
                     return;
                 }
-                zero_crossing::cancel_for_interruption(view);
+                view.cancel_waveform_gestures(window, cx);
                 view.begin_waveform_pan(event.position, bounds, window, cx);
             }),
         )
@@ -1024,41 +1225,48 @@ pub(super) fn render_waveform(
                 let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
                     return;
                 };
-                zero_crossing::cancel_for_interruption(view);
+                view.cancel_waveform_gestures(window, cx);
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                view.waveform_region_drag = view
-                    .waveform_play_region
-                    .and_then(|region| {
-                        waveform_region_handle_at(
-                            region,
-                            view.waveform_viewport,
-                            bounds,
-                            event.position,
-                        )
-                    })
-                    .and_then(|handle| {
-                        view.waveform_play_region.and_then(|region| {
-                            WaveformRegionDrag::begin_handle(
-                                event.position,
-                                ratio,
-                                bounds,
-                                view.waveform_viewport,
-                                region,
-                                handle,
-                                view.waveform_generation,
-                            )
-                        })
-                    })
-                    .or_else(|| {
-                        Some(WaveformRegionDrag::begin(
-                            event.position,
-                            ratio,
-                            bounds,
-                            view.waveform_viewport,
-                            view.waveform_generation,
-                        ))
-                    });
+                view.waveform_region_drag = Some(begin_primary_waveform_drag(
+                    view.waveform_play_region,
+                    view.waveform_edit_region,
+                    event.position,
+                    ratio,
+                    bounds,
+                    view.waveform_viewport,
+                    view.waveform_generation,
+                ));
+                cx.notify();
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                window.focus(&view.waveform_focus_handle);
+                if view.waveform.is_none() {
+                    return;
+                }
+                let Some(bounds) = click_bounds_for_secondary.borrow().as_ref().copied() else {
+                    return;
+                };
+                if !bounds.contains(&event.position) {
+                    return;
+                }
+                let Some(ratio) = waveform_click_ratio(event.position, bounds) else {
+                    return;
+                };
+                view.cancel_waveform_gestures(window, cx);
+                view.waveform_zoom_anchor_ratio =
+                    view.waveform_viewport.absolute_ratio_from_visible(ratio);
+                view.waveform_region_drag = Some(begin_secondary_waveform_drag(
+                    view.waveform_edit_region,
+                    event.position,
+                    ratio,
+                    bounds,
+                    view.waveform_viewport,
+                    view.waveform_generation,
+                ));
                 cx.notify();
             }),
         )
@@ -1067,7 +1275,7 @@ pub(super) fn render_waveform(
         })
         .on_drag_move::<WaveformDragToken>(cx.listener(
             |view, event: &DragMoveEvent<WaveformDragToken>, _, cx| {
-                view.update_waveform_region_drag(event.event.position);
+                view.update_waveform_region_drag(event.event.position, Some(MouseButton::Left));
                 zero_crossing::schedule_for_drag(view, cx);
                 cx.notify();
             },
@@ -1075,13 +1283,13 @@ pub(super) fn render_waveform(
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|view, event: &MouseUpEvent, _, cx| {
-                view.finish_waveform_region_drag(event.position, cx);
+                view.finish_waveform_region_drag(event.position, MouseButton::Left, cx);
             }),
         )
         .on_mouse_up_out(
             MouseButton::Left,
             cx.listener(|view, event: &MouseUpEvent, _, cx| {
-                view.finish_waveform_region_drag(event.position, cx);
+                view.finish_waveform_region_drag(event.position, MouseButton::Left, cx);
             }),
         );
     let scrollbar = waveform_scrollbar::render(browser, theme.clone(), cx);
@@ -1099,6 +1307,7 @@ impl Browser {
     pub(super) fn clear_waveform_region(&mut self) {
         zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
+        self.waveform_edit_region = None;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
         self.waveform_scrollbar_drag = None;
@@ -1330,28 +1539,67 @@ impl Browser {
         true
     }
 
-    fn update_waveform_region_drag(&mut self, position: Point<Pixels>) {
-        let Some(drag) = self.waveform_region_drag.as_mut() else {
-            return;
+    pub(super) fn update_waveform_region_drag(
+        &mut self,
+        position: Point<Pixels>,
+        pressed_button: Option<MouseButton>,
+    ) -> bool {
+        let Some(drag) = self.waveform_region_drag else {
+            return false;
         };
-        if !waveform_drag_is_current(*drag, self.waveform_generation, self.waveform.is_some()) {
+        if !waveform_drag_button_is_pressed(drag, pressed_button) {
             self.waveform_region_drag = None;
-            return;
+            zero_crossing::cancel_for_interruption(self);
+            return true;
         }
-        drag.update(position);
+        if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
+            self.waveform_region_drag = None;
+            zero_crossing::cancel_for_interruption(self);
+            return true;
+        }
+        if let Some(drag) = self.waveform_region_drag.as_mut() {
+            drag.update(position);
+        }
+        true
     }
 
-    fn finish_waveform_region_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn finish_waveform_region_drag(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        cx: &mut Context<Self>,
+    ) {
         let Some(drag) = self.waveform_region_drag.take() else {
             return;
         };
+        if drag.button() != button {
+            self.waveform_region_drag = Some(drag);
+            return;
+        }
         if !waveform_drag_is_current(drag, self.waveform_generation, self.waveform.is_some()) {
             return;
         }
         let mut drag = drag;
         drag.update(position);
         let bpm_snap = self.bpm_snap_settings();
-        if drag.is_handle_drag() {
+        if drag.selection_kind() == WaveformSelectionKind::Edit {
+            if drag.moved {
+                let preview = if bpm_snap.enabled {
+                    drag.preview_edit_region_with_bpm(bpm_snap)
+                } else {
+                    drag.preview_edit_region()
+                };
+                if let Some(region) = preview {
+                    self.waveform_edit_region = Some(region);
+                    if drag.zero_crossing_applies(bpm_snap) {
+                        zero_crossing::commit_or_schedule_edit(self, region, cx);
+                    }
+                }
+            } else if secondary_drag_should_clear_edit(drag) {
+                self.waveform_edit_region = None;
+                zero_crossing::cancel_for_interruption(self);
+            }
+        } else if drag.is_handle_drag() {
             if drag.moved {
                 if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
                     self.waveform_play_region = Some(region);
@@ -1425,11 +1673,169 @@ fn waveform_click_ratio(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Opti
     Some(((x - left) / width).clamp(0.0, 1.0) as f64)
 }
 
+fn begin_primary_waveform_drag(
+    play_region: Option<WaveformPlayRegion>,
+    edit_region: Option<WaveformEditRegion>,
+    position: Point<Pixels>,
+    visible_ratio: f64,
+    bounds: Bounds<Pixels>,
+    viewport: WaveformViewport,
+    generation: u64,
+) -> WaveformRegionDrag {
+    if let Some(region) = edit_region
+        && let Some(handle) = region_resize_handle_at(
+            region.start(),
+            region.end(),
+            viewport,
+            bounds,
+            position,
+            EDIT_REGION_RESIZE_HIT_WIDTH,
+        )
+    {
+        return WaveformRegionDrag::begin_edit_handle_with_button(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            region,
+            handle,
+            generation,
+            MouseButton::Left,
+        );
+    }
+    if let Some(region) = play_region {
+        if let Some(handle) = region_resize_handle_at(
+            region.start,
+            region.end,
+            viewport,
+            bounds,
+            position,
+            PLAY_REGION_RESIZE_HIT_WIDTH,
+        ) {
+            return WaveformRegionDrag::begin_handle(
+                position,
+                visible_ratio,
+                bounds,
+                viewport,
+                region,
+                handle,
+                generation,
+            )
+            .expect("play region handles have a valid playback baseline");
+        }
+        if let Some(handle) = region_move_handle_at(
+            region.start,
+            region.end,
+            viewport,
+            bounds,
+            position,
+            PLAY_REGION_MOVE_GRIP_HEIGHT,
+            PLAY_REGION_MOVE_GRIP_INSET,
+        ) {
+            return WaveformRegionDrag::begin_handle(
+                position,
+                visible_ratio,
+                bounds,
+                viewport,
+                region,
+                handle,
+                generation,
+            )
+            .expect("play region handles have a valid playback baseline");
+        }
+    }
+    if let Some(region) = edit_region
+        && let Some(handle) = region_move_handle_at(
+            region.start(),
+            region.end(),
+            viewport,
+            bounds,
+            position,
+            EDIT_REGION_MOVE_GRIP_HEIGHT,
+            EDIT_REGION_MOVE_GRIP_INSET,
+        )
+    {
+        return WaveformRegionDrag::begin_edit_handle(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            region,
+            handle,
+            generation,
+        );
+    }
+    WaveformRegionDrag::begin(position, visible_ratio, bounds, viewport, generation)
+}
+
+fn begin_secondary_waveform_drag(
+    edit_region: Option<WaveformEditRegion>,
+    position: Point<Pixels>,
+    visible_ratio: f64,
+    bounds: Bounds<Pixels>,
+    viewport: WaveformViewport,
+    generation: u64,
+) -> WaveformRegionDrag {
+    if let Some(region) = edit_region
+        && let Some(handle) = edit_region_handle_at(region, viewport, bounds, position)
+    {
+        return WaveformRegionDrag::begin_edit_handle(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            region,
+            handle,
+            generation,
+        );
+    }
+    WaveformRegionDrag::begin_edit(position, visible_ratio, bounds, viewport, generation)
+}
+
+#[cfg(test)]
 fn waveform_region_handle_at(
     region: WaveformPlayRegion,
     viewport: WaveformViewport,
     bounds: Bounds<Pixels>,
     position: Point<Pixels>,
+) -> Option<WaveformRegionHandle> {
+    region_handle_at(
+        region.start,
+        region.end,
+        viewport,
+        bounds,
+        position,
+        PLAY_REGION_RESIZE_HIT_WIDTH,
+        PLAY_REGION_MOVE_GRIP_HEIGHT,
+        PLAY_REGION_MOVE_GRIP_INSET,
+    )
+}
+
+fn edit_region_handle_at(
+    region: WaveformEditRegion,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> Option<WaveformRegionHandle> {
+    region_handle_at(
+        region.start(),
+        region.end(),
+        viewport,
+        bounds,
+        position,
+        EDIT_REGION_RESIZE_HIT_WIDTH,
+        EDIT_REGION_MOVE_GRIP_HEIGHT,
+        EDIT_REGION_MOVE_GRIP_INSET,
+    )
+}
+
+fn region_resize_handle_at(
+    start: f64,
+    end: f64,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    resize_hit_width: f32,
 ) -> Option<WaveformRegionHandle> {
     if !bounds.contains(&position) {
         return None;
@@ -1448,45 +1854,92 @@ fn waveform_region_handle_at(
     {
         return None;
     }
-    let in_resize_strip = y >= top && y <= top + PLAY_REGION_RESIZE_HANDLE_HEIGHT;
-    if in_resize_strip {
-        let start_x = viewport
-            .visible_ratio_from_absolute(region.start)
-            .map(|ratio| left + width * ratio as f32);
-        let end_x = viewport
-            .visible_ratio_from_absolute(region.end)
-            .map(|ratio| left + width * ratio as f32);
-        let half_hit_width = PLAY_REGION_RESIZE_HIT_WIDTH * 0.5;
-        let start_distance = start_x
-            .filter(|center| (x - center).abs() <= half_hit_width)
-            .map(|center| (x - center).abs());
-        let end_distance = end_x
-            .filter(|center| (x - center).abs() <= half_hit_width)
-            .map(|center| (x - center).abs());
-        match (start_distance, end_distance) {
-            (Some(start), Some(end)) if end < start => {
-                return Some(WaveformRegionHandle::ResizeEnd);
-            }
-            (Some(_), Some(_)) | (Some(_), None) => {
-                return Some(WaveformRegionHandle::ResizeStart);
-            }
-            (None, Some(_)) => return Some(WaveformRegionHandle::ResizeEnd),
-            (None, None) => {}
-        }
-    }
-
-    if y > top + PLAY_REGION_MOVE_GRIP_HEIGHT {
+    if y < top || y > top + PLAY_REGION_RESIZE_HANDLE_HEIGHT {
         return None;
     }
-    let Some((visible_start, visible_end)) =
-        viewport.visible_range_from_absolute(region.start, region.end)
+    let start_x = viewport
+        .visible_ratio_from_absolute(start)
+        .map(|ratio| left + width * ratio as f32);
+    let end_x = viewport
+        .visible_ratio_from_absolute(end)
+        .map(|ratio| left + width * ratio as f32);
+    let half_hit_width = resize_hit_width * 0.5;
+    let start_distance = start_x
+        .filter(|center| (x - center).abs() <= half_hit_width)
+        .map(|center| (x - center).abs());
+    let end_distance = end_x
+        .filter(|center| (x - center).abs() <= half_hit_width)
+        .map(|center| (x - center).abs());
+    match (start_distance, end_distance) {
+        (Some(start), Some(end)) if end < start => Some(WaveformRegionHandle::ResizeEnd),
+        (Some(_), Some(_)) | (Some(_), None) => Some(WaveformRegionHandle::ResizeStart),
+        (None, Some(_)) => Some(WaveformRegionHandle::ResizeEnd),
+        (None, None) => None,
+    }
+}
+
+fn region_move_handle_at(
+    start: f64,
+    end: f64,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    move_grip_height: f32,
+    move_grip_inset: f32,
+) -> Option<WaveformRegionHandle> {
+    if !bounds.contains(&position) {
+        return None;
+    }
+    let width = f32::from(bounds.size.width);
+    let left = f32::from(bounds.origin.x);
+    let x = f32::from(position.x);
+    let y = f32::from(position.y);
+    let top = f32::from(bounds.origin.y);
+    if !width.is_finite()
+        || width <= 0.0
+        || !left.is_finite()
+        || !x.is_finite()
+        || !y.is_finite()
+        || !top.is_finite()
+    {
+        return None;
+    }
+    if y > top + move_grip_height {
+        return None;
+    }
+    let Some((visible_start, visible_end)) = viewport.visible_range_from_absolute(start, end)
     else {
         return None;
     };
-    let grip_left = left + width * visible_start as f32 + PLAY_REGION_MOVE_GRIP_INSET;
-    let grip_right = left + width * visible_end as f32 - PLAY_REGION_MOVE_GRIP_INSET;
+    let grip_left = left + width * visible_start as f32 + move_grip_inset;
+    let grip_right = left + width * visible_end as f32 - move_grip_inset;
     (grip_right > grip_left && x >= grip_left && x <= grip_right)
         .then_some(WaveformRegionHandle::Move)
+}
+
+fn region_handle_at(
+    start: f64,
+    end: f64,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    resize_hit_width: f32,
+    move_grip_height: f32,
+    move_grip_inset: f32,
+) -> Option<WaveformRegionHandle> {
+    region_resize_handle_at(start, end, viewport, bounds, position, resize_hit_width).or_else(
+        || {
+            region_move_handle_at(
+                start,
+                end,
+                viewport,
+                bounds,
+                position,
+                move_grip_height,
+                move_grip_inset,
+            )
+        },
+    )
 }
 
 fn waveform_drag_is_current(
@@ -1495,6 +1948,19 @@ fn waveform_drag_is_current(
     waveform_loaded: bool,
 ) -> bool {
     waveform_loaded && drag.generation == generation
+}
+
+fn waveform_drag_button_is_pressed(
+    drag: WaveformRegionDrag,
+    pressed_button: Option<MouseButton>,
+) -> bool {
+    pressed_button == Some(drag.button())
+}
+
+fn secondary_drag_should_clear_edit(drag: WaveformRegionDrag) -> bool {
+    drag.selection_kind() == WaveformSelectionKind::Edit
+        && drag.button() == MouseButton::Right
+        && !drag.moved
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1527,6 +1993,72 @@ fn waveform_region_overlay(
     edge_color: gpui::Hsla,
     beat_guides: Option<(u8, gpui::Hsla)>,
 ) -> impl IntoElement {
+    waveform_selection_overlay(
+        region.start,
+        region.end,
+        viewport,
+        selection_color,
+        edge_color,
+        edge_color.opacity(0.75),
+        edge_color.opacity(0.9),
+        PLAY_REGION_RESIZE_HANDLE_WIDTH,
+        PLAY_REGION_RESIZE_HANDLE_HEIGHT,
+        PLAY_REGION_MOVE_GRIP_HEIGHT,
+        PLAY_REGION_MOVE_GRIP_INSET,
+        beat_guides,
+    )
+}
+
+fn beat_guides_for_region(
+    beat_guides: Option<(u8, gpui::Hsla)>,
+    active_selection_kind: Option<WaveformSelectionKind>,
+    region_kind: WaveformSelectionKind,
+) -> Option<(u8, gpui::Hsla)> {
+    match active_selection_kind {
+        Some(active_kind) if active_kind != region_kind => None,
+        _ => beat_guides,
+    }
+}
+
+fn waveform_edit_region_overlay(
+    region: WaveformEditRegion,
+    viewport: WaveformViewport,
+    selection_color: gpui::Hsla,
+    edge_color: gpui::Hsla,
+    grip_color: gpui::Hsla,
+    handle_color: gpui::Hsla,
+    beat_guides: Option<(u8, gpui::Hsla)>,
+) -> impl IntoElement {
+    waveform_selection_overlay(
+        region.start(),
+        region.end(),
+        viewport,
+        selection_color,
+        edge_color,
+        grip_color,
+        handle_color,
+        EDIT_REGION_RESIZE_HANDLE_WIDTH,
+        EDIT_REGION_RESIZE_HANDLE_HEIGHT,
+        EDIT_REGION_MOVE_GRIP_HEIGHT,
+        EDIT_REGION_MOVE_GRIP_INSET,
+        beat_guides,
+    )
+}
+
+fn waveform_selection_overlay(
+    start_ratio: f64,
+    end_ratio: f64,
+    viewport: WaveformViewport,
+    selection_color: gpui::Hsla,
+    edge_color: gpui::Hsla,
+    grip_color: gpui::Hsla,
+    handle_color: gpui::Hsla,
+    resize_handle_width: f32,
+    resize_handle_height: f32,
+    move_grip_height: f32,
+    move_grip_inset: f32,
+    beat_guides: Option<(u8, gpui::Hsla)>,
+) -> impl IntoElement {
     canvas(
         move |_, _, _| (),
         move |bounds, _, window, _| {
@@ -1536,7 +2068,7 @@ fn waveform_region_overlay(
                 return;
             }
             let Some((visible_start, visible_end)) =
-                viewport.visible_range_from_absolute(region.start, region.end)
+                viewport.visible_range_from_absolute(start_ratio, end_ratio)
             else {
                 return;
             };
@@ -1556,7 +2088,9 @@ fn waveform_region_overlay(
                     .round()
                     .clamp(guide_width.min(height), height);
                 let guide_top = (height - guide_height) * 0.5;
-                for visible_ratio in beat_guide_projection(region, viewport, beat_count) {
+                for visible_ratio in
+                    beat_guide_projection(start_ratio, end_ratio, viewport, beat_count)
+                {
                     let center = width * visible_ratio as f32;
                     let left =
                         (center - guide_width * 0.5).clamp(0.0, (width - guide_width).max(0.0));
@@ -1571,7 +2105,7 @@ fn waveform_region_overlay(
                 }
             }
             let edge_width = WAVEFORM_SELECTION_EDGE_WIDTH.min(width);
-            for absolute in [region.start, region.end] {
+            for absolute in [start_ratio, end_ratio] {
                 let Some(visible) = viewport.visible_ratio_from_absolute(absolute) else {
                     continue;
                 };
@@ -1584,14 +2118,14 @@ fn waveform_region_overlay(
                 window.paint_quad(fill(edge_bounds, edge_color));
             }
             let move_left = viewport
-                .visible_ratio_from_absolute(region.start)
+                .visible_ratio_from_absolute(start_ratio)
                 .unwrap_or(visible_start) as f32;
             let move_right = viewport
-                .visible_ratio_from_absolute(region.end)
+                .visible_ratio_from_absolute(end_ratio)
                 .unwrap_or(visible_end) as f32;
-            let grip_left = width * move_left + PLAY_REGION_MOVE_GRIP_INSET;
-            let grip_right = width * move_right - PLAY_REGION_MOVE_GRIP_INSET;
-            let grip_height = PLAY_REGION_MOVE_GRIP_HEIGHT.min(height);
+            let grip_left = width * move_left + move_grip_inset;
+            let grip_right = width * move_right - move_grip_inset;
+            let grip_height = move_grip_height.min(height);
             if grip_right > grip_left && grip_height > 0.0 {
                 let grip_bounds = Bounds::from_corners(
                     point(bounds.left() + px(grip_left), bounds.top()),
@@ -1600,16 +2134,16 @@ fn waveform_region_overlay(
                         bounds.top() + px(grip_height),
                     ),
                 );
-                window.paint_quad(fill(grip_bounds, edge_color.opacity(0.75)));
+                window.paint_quad(fill(grip_bounds, grip_color));
             }
-            let handle_height = PLAY_REGION_RESIZE_HANDLE_HEIGHT.min(height);
+            let handle_height = resize_handle_height.min(height);
             if handle_height > 0.0 {
-                for absolute in [region.start, region.end] {
+                for absolute in [start_ratio, end_ratio] {
                     let Some(visible) = viewport.visible_ratio_from_absolute(absolute) else {
                         continue;
                     };
                     let center = width * visible as f32;
-                    let handle_width = PLAY_REGION_RESIZE_HANDLE_WIDTH.min(width);
+                    let handle_width = resize_handle_width.min(width);
                     let left = (center - handle_width * 0.5).clamp(0.0, width - handle_width);
                     let handle_bounds = Bounds::from_corners(
                         point(bounds.left() + px(left), bounds.top()),
@@ -1618,7 +2152,7 @@ fn waveform_region_overlay(
                             bounds.top() + px(handle_height),
                         ),
                     );
-                    window.paint_quad(fill(handle_bounds, edge_color.opacity(0.9)));
+                    window.paint_quad(fill(handle_bounds, handle_color));
                 }
             }
         },
@@ -2087,6 +2621,162 @@ mod tests {
     }
 
     #[test]
+    fn edit_region_hit_zones_use_the_tall_resize_strip_and_short_move_grip() {
+        let bounds = test_bounds(200.0, 100.0);
+        let viewport = WaveformViewport {
+            start: -0.5,
+            end: 1.5,
+        };
+        let region = WaveformEditRegion::new(-0.2, 1.2).expect("edit region");
+
+        assert_eq!(
+            edit_region_handle_at(region, viewport, bounds, point(px(30.0), px(20.0))),
+            Some(WaveformRegionHandle::ResizeStart)
+        );
+        assert_eq!(
+            edit_region_handle_at(region, viewport, bounds, point(px(170.0), px(20.0))),
+            Some(WaveformRegionHandle::ResizeEnd)
+        );
+        assert_eq!(
+            edit_region_handle_at(region, viewport, bounds, point(px(100.0), px(3.0))),
+            Some(WaveformRegionHandle::Move)
+        );
+        assert_eq!(
+            edit_region_handle_at(region, viewport, bounds, point(px(100.0), px(8.0))),
+            None
+        );
+        assert_eq!(
+            edit_region_handle_at(region, viewport, bounds, point(px(100.0), px(24.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn primary_hit_priority_keeps_play_and_edit_gestures_independent() {
+        let bounds = test_bounds(200.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let play = WaveformPlayRegion::new(0.3, 0.7).expect("play region");
+        let edit = WaveformEditRegion::new(0.2, 0.8).expect("edit region");
+
+        let edit_resize = begin_primary_waveform_drag(
+            Some(play),
+            Some(edit),
+            point(px(40.0), px(10.0)),
+            0.2,
+            bounds,
+            viewport,
+            1,
+        );
+        assert_eq!(edit_resize.selection_kind(), WaveformSelectionKind::Edit);
+        assert_eq!(edit_resize.button(), MouseButton::Left);
+
+        let play_resize = begin_primary_waveform_drag(
+            Some(play),
+            Some(edit),
+            point(px(60.0), px(10.0)),
+            0.3,
+            bounds,
+            viewport,
+            1,
+        );
+        assert_eq!(play_resize.selection_kind(), WaveformSelectionKind::Play);
+        assert_eq!(play_resize.button(), MouseButton::Left);
+
+        let play_move = begin_primary_waveform_drag(
+            Some(play),
+            Some(edit),
+            point(px(100.0), px(3.0)),
+            0.5,
+            bounds,
+            viewport,
+            1,
+        );
+        assert_eq!(play_move.selection_kind(), WaveformSelectionKind::Play);
+
+        let edit_move = begin_primary_waveform_drag(
+            Some(play),
+            Some(edit),
+            point(px(50.0), px(3.0)),
+            0.25,
+            bounds,
+            viewport,
+            1,
+        );
+        assert_eq!(edit_move.selection_kind(), WaveformSelectionKind::Edit);
+
+        let play_create = begin_primary_waveform_drag(
+            Some(play),
+            Some(edit),
+            point(px(190.0), px(50.0)),
+            0.95,
+            bounds,
+            viewport,
+            1,
+        );
+        assert_eq!(play_create.selection_kind(), WaveformSelectionKind::Play);
+    }
+
+    #[test]
+    fn secondary_drag_preserves_extended_edit_baseline_and_uses_right_button() {
+        let bounds = test_bounds(200.0, 100.0);
+        let viewport = WaveformViewport {
+            start: -0.5,
+            end: 1.5,
+        };
+        let baseline = WaveformEditRegion::new(-0.2, 0.4).expect("edit region");
+        let mut drag = WaveformRegionDrag::begin_edit_handle(
+            point(px(30.0), px(3.0)),
+            0.15,
+            bounds,
+            viewport,
+            baseline,
+            WaveformRegionHandle::Move,
+            1,
+        );
+        assert_eq!(drag.selection_kind(), WaveformSelectionKind::Edit);
+        assert_eq!(drag.button(), MouseButton::Right);
+
+        drag.update(point(px(10.0), px(3.0)));
+        let moved = drag.preview_edit_region().expect("moved edit region");
+        assert!((moved.start() + 0.4).abs() < 1.0e-6);
+        assert!((moved.end() - 0.2).abs() < 1.0e-6);
+        assert_eq!(baseline, WaveformEditRegion::new(-0.2, 0.4).unwrap());
+        assert!(drag.moved);
+
+        let create = begin_secondary_waveform_drag(
+            Some(baseline),
+            point(px(180.0), px(50.0)),
+            0.9,
+            bounds,
+            viewport,
+            1,
+        );
+        assert_eq!(create.selection_kind(), WaveformSelectionKind::Edit);
+        assert_eq!(create.button(), MouseButton::Right);
+        assert!(secondary_drag_should_clear_edit(create));
+    }
+
+    #[test]
+    fn secondary_drag_button_loss_cancels_without_synthesizing_release() {
+        let drag = WaveformRegionDrag::begin_edit(
+            point(px(40.0), px(10.0)),
+            0.2,
+            test_bounds(200.0, 100.0),
+            WaveformViewport::full(),
+            5,
+        );
+        assert!(waveform_drag_button_is_pressed(
+            drag,
+            Some(MouseButton::Right)
+        ));
+        assert!(!waveform_drag_button_is_pressed(
+            drag,
+            Some(MouseButton::Left)
+        ));
+        assert!(!waveform_drag_button_is_pressed(drag, None));
+    }
+
+    #[test]
     fn handle_drags_preview_move_and_resize_from_the_original_baseline() {
         let bounds = test_bounds(100.0, 100.0);
         let viewport = WaveformViewport::full();
@@ -2178,11 +2868,15 @@ mod tests {
         let region = WaveformPlayRegion::new(0.0, 1.0).unwrap();
         let viewport = WaveformViewport::full();
 
-        let guides = beat_guide_projection(region, viewport, 4).collect::<Vec<_>>();
+        let guides =
+            beat_guide_projection(region.start, region.end, viewport, 4).collect::<Vec<_>>();
         assert_eq!(guides, vec![0.25, 0.5, 0.75]);
-        assert_eq!(beat_guide_projection(region, viewport, 1).count(), 0);
         assert_eq!(
-            beat_guide_projection(region, viewport, u8::MAX).count(),
+            beat_guide_projection(region.start, region.end, viewport, 1).count(),
+            0
+        );
+        assert_eq!(
+            beat_guide_projection(region.start, region.end, viewport, u8::MAX).count(),
             usize::from(MAX_BEAT_COUNT - 1)
         );
     }
@@ -2195,12 +2889,13 @@ mod tests {
             end: 0.75,
         };
 
-        let guides = beat_guide_projection(region, viewport, 4).collect::<Vec<_>>();
+        let guides =
+            beat_guide_projection(region.start, region.end, viewport, 4).collect::<Vec<_>>();
         assert_eq!(guides, vec![0.0, 0.5, 1.0]);
 
         let outside_region = WaveformPlayRegion::new(0.0, 0.2).unwrap();
         assert_eq!(
-            beat_guide_projection(outside_region, viewport, 4).count(),
+            beat_guide_projection(outside_region.start, outside_region.end, viewport, 4,).count(),
             0
         );
     }
@@ -2210,7 +2905,8 @@ mod tests {
         let bounds = test_bounds(100.0, 100.0);
         let viewport = WaveformViewport::full();
         let baseline = WaveformPlayRegion::new(0.2, 0.6).unwrap();
-        let committed = beat_guide_projection(baseline, viewport, 4).collect::<Vec<_>>();
+        let committed =
+            beat_guide_projection(baseline.start, baseline.end, viewport, 4).collect::<Vec<_>>();
         let mut drag = WaveformRegionDrag::begin_handle(
             point(px(60.0), px(10.0)),
             0.6,
@@ -2223,7 +2919,8 @@ mod tests {
         .expect("valid resize handle");
         drag.update(point(px(80.0), px(10.0)));
         let live_region = drag.preview_region().expect("valid live region");
-        let live = beat_guide_projection(live_region, viewport, 4).collect::<Vec<_>>();
+        let live = beat_guide_projection(live_region.start, live_region.end, viewport, 4)
+            .collect::<Vec<_>>();
 
         for (actual, expected) in committed.iter().zip([0.3, 0.4, 0.5]) {
             assert!((actual - expected).abs() < 1.0e-9);
@@ -2232,6 +2929,45 @@ mod tests {
             assert!((actual - expected).abs() < 1.0e-6);
         }
         assert_ne!(committed, live);
+    }
+
+    #[test]
+    fn beat_guides_render_for_both_idle_ranges_but_only_the_active_range_during_drag() {
+        let guides = Some((4, gpui::Hsla::default()));
+        assert!(beat_guides_for_region(guides, None, WaveformSelectionKind::Play).is_some());
+        assert!(beat_guides_for_region(guides, None, WaveformSelectionKind::Edit).is_some());
+        assert!(
+            beat_guides_for_region(
+                guides,
+                Some(WaveformSelectionKind::Play),
+                WaveformSelectionKind::Play
+            )
+            .is_some()
+        );
+        assert!(
+            beat_guides_for_region(
+                guides,
+                Some(WaveformSelectionKind::Play),
+                WaveformSelectionKind::Edit
+            )
+            .is_none()
+        );
+        assert!(
+            beat_guides_for_region(
+                guides,
+                Some(WaveformSelectionKind::Edit),
+                WaveformSelectionKind::Play
+            )
+            .is_none()
+        );
+        assert!(
+            beat_guides_for_region(
+                guides,
+                Some(WaveformSelectionKind::Edit),
+                WaveformSelectionKind::Edit
+            )
+            .is_some()
+        );
     }
 
     #[test]

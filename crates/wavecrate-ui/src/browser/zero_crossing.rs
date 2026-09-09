@@ -21,7 +21,7 @@ use wavecrate_media::{
 };
 
 use super::Browser;
-use super::waveform::{WaveformPlayRegion, WaveformRegionDrag};
+use super::waveform::{WaveformPlayRegion, WaveformRegionDrag, WaveformSelectionKind};
 
 const ZERO_CROSSING_ICON_SIZE: f32 = 16.0;
 const ZERO_CROSSING_ICON_STROKE_WIDTH: f32 = 1.25;
@@ -33,16 +33,59 @@ pub(super) struct ZeroCrossingIntent {
     pub(super) generation: u64,
     /// Revision-fenced source request and its exact raw bounds.
     pub(super) request: WavZeroCrossingSnapRequest,
-    /// Raw normalized selection shown before the snapped result is accepted.
-    pub(super) raw: WaveformPlayRegion,
+    /// Selection kind and raw normalized bounds shown before the snapped result is accepted.
+    pub(super) raw: ZeroCrossingBounds,
+}
+
+/// Selection bounds shared by playback and edit snapping without clamping edit margins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ZeroCrossingBounds {
+    pub(super) kind: WaveformSelectionKind,
+    pub(super) start: f64,
+    pub(super) end: f64,
+}
+
+impl ZeroCrossingBounds {
+    fn new(kind: WaveformSelectionKind, start: f64, end: f64) -> Option<Self> {
+        let (start, end) = match kind {
+            WaveformSelectionKind::Play => {
+                let region = WaveformPlayRegion::new(start, end)?;
+                (region.start, region.end)
+            }
+            WaveformSelectionKind::Edit => {
+                let region = wavecrate_core::WaveformEditRegion::new(start, end)?;
+                (region.start(), region.end())
+            }
+        };
+        Some(Self { kind, start, end })
+    }
+
+    fn from_snapped(kind: WaveformSelectionKind, start: f64, end: f64) -> Option<Self> {
+        Self::new(kind, start, end)
+    }
+
+    fn as_play(self) -> Option<WaveformPlayRegion> {
+        (self.kind == WaveformSelectionKind::Play)
+            .then(|| WaveformPlayRegion::new(self.start, self.end))
+            .flatten()
+    }
+
+    fn as_edit(self) -> Option<wavecrate_core::WaveformEditRegion> {
+        (self.kind == WaveformSelectionKind::Edit)
+            .then(|| wavecrate_core::WaveformEditRegion::new(self.start, self.end))
+            .flatten()
+    }
 }
 
 impl ZeroCrossingIntent {
     fn new(
         generation: u64,
         context: WaveformDetailContext,
-        raw: WaveformPlayRegion,
+        kind: WaveformSelectionKind,
+        start: f64,
+        end: f64,
     ) -> Option<Self> {
+        let raw = ZeroCrossingBounds::new(kind, start, end)?;
         let request = WavZeroCrossingSnapRequest::new(context, raw.start, raw.end).ok()?;
         Some(Self {
             generation,
@@ -55,7 +98,7 @@ impl ZeroCrossingIntent {
         &self,
         generation: u64,
         context: &WaveformDetailContext,
-        raw: WaveformPlayRegion,
+        raw: ZeroCrossingBounds,
     ) -> bool {
         self.generation == generation
             && self.raw == raw
@@ -81,7 +124,7 @@ pub(super) struct ZeroCrossingJob {
 #[derive(Clone, Debug, PartialEq)]
 struct ReadyZeroCrossing {
     intent: ZeroCrossingIntent,
-    snapped: WaveformPlayRegion,
+    snapped: ZeroCrossingBounds,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,12 +224,12 @@ impl ZeroCrossingState {
         true
     }
 
-    fn set_ready(&mut self, intent: ZeroCrossingIntent, snapped: WaveformPlayRegion) {
+    fn set_ready(&mut self, intent: ZeroCrossingIntent, snapped: ZeroCrossingBounds) {
         self.ready = Some(ReadyZeroCrossing { intent, snapped });
         self.status = None;
     }
 
-    fn take_ready_for(&mut self, intent: &ZeroCrossingIntent) -> Option<WaveformPlayRegion> {
+    fn take_ready_for(&mut self, intent: &ZeroCrossingIntent) -> Option<ZeroCrossingBounds> {
         if self
             .ready
             .as_ref()
@@ -202,8 +245,11 @@ impl ZeroCrossingState {
         &self,
         generation: u64,
         context: &WaveformDetailContext,
-        raw: WaveformPlayRegion,
-    ) -> Option<WaveformPlayRegion> {
+        kind: WaveformSelectionKind,
+        start: f64,
+        end: f64,
+    ) -> Option<ZeroCrossingBounds> {
+        let raw = ZeroCrossingBounds::new(kind, start, end)?;
         self.ready.as_ref().and_then(|ready| {
             ready
                 .intent
@@ -216,7 +262,7 @@ impl ZeroCrossingState {
         &mut self,
         job: ZeroCrossingJob,
         result: Result<wavecrate_media::WavZeroCrossingSnapRange, String>,
-    ) -> Option<Result<WaveformPlayRegion, String>> {
+    ) -> Option<Result<ZeroCrossingBounds, String>> {
         let active = self.active.as_ref()?;
         if active.id != job.id
             || active.intent != job.intent
@@ -230,8 +276,12 @@ impl ZeroCrossingState {
         }
         match result {
             Ok(snapped) => {
-                let region = WaveformPlayRegion::new(snapped.start_ratio, snapped.end_ratio)
-                    .ok_or_else(|| String::from("zero-crossing snap returned invalid bounds"));
+                let region = ZeroCrossingBounds::from_snapped(
+                    job.intent.raw.kind,
+                    snapped.start_ratio,
+                    snapped.end_ratio,
+                )
+                .ok_or_else(|| String::from("zero-crossing snap returned invalid bounds"));
                 if region.is_err() {
                     self.status = Some(ZeroCrossingStatus::Unavailable);
                 } else {
@@ -328,22 +378,23 @@ pub(super) fn tooltip(_: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|_| ZeroCrossingTooltip).into()
 }
 
-fn intent_for_raw(browser: &Browser, raw: WaveformPlayRegion) -> Option<ZeroCrossingIntent> {
+fn intent_for_raw(
+    browser: &Browser,
+    kind: WaveformSelectionKind,
+    start: f64,
+    end: f64,
+) -> Option<ZeroCrossingIntent> {
     let context = browser.waveform.as_ref()?.detail_context.as_ref()?.clone();
-    ZeroCrossingIntent::new(browser.waveform_generation, context, raw)
+    ZeroCrossingIntent::new(browser.waveform_generation, context, kind, start, end)
 }
 
-fn drag_intent(
-    browser: &Browser,
-    drag: WaveformRegionDrag,
-) -> Option<(ZeroCrossingIntent, WaveformPlayRegion)> {
+fn drag_intent(browser: &Browser, drag: WaveformRegionDrag) -> Option<ZeroCrossingIntent> {
     let bpm_snap = browser.bpm_snap_settings();
     if !drag.zero_crossing_applies(bpm_snap) {
         return None;
     }
-    let raw = drag.preview_region_with_bpm(bpm_snap)?;
-    let intent = intent_for_raw(browser, raw)?;
-    Some((intent, raw))
+    let (start, end) = drag.preview_bounds_with_bpm(bpm_snap)?;
+    intent_for_raw(browser, drag.selection_kind(), start, end)
 }
 
 /// Return the raw or exact snapped preview for a live waveform drag.
@@ -351,6 +402,9 @@ pub(super) fn preview_drag_region(
     browser: &Browser,
     drag: WaveformRegionDrag,
 ) -> Option<WaveformPlayRegion> {
+    if drag.selection_kind() != WaveformSelectionKind::Play {
+        return None;
+    }
     let bpm_snap = browser.bpm_snap_settings();
     let raw = drag.preview_region_with_bpm(bpm_snap)?;
     if !drag.zero_crossing_applies(bpm_snap) {
@@ -362,7 +416,45 @@ pub(super) fn preview_drag_region(
     Some(
         browser
             .zero_crossing
-            .ready_for(browser.waveform_generation, context, raw)
+            .ready_for(
+                browser.waveform_generation,
+                context,
+                WaveformSelectionKind::Play,
+                raw.start,
+                raw.end,
+            )
+            .and_then(ZeroCrossingBounds::as_play)
+            .unwrap_or(raw),
+    )
+}
+
+/// Return the raw or exact snapped edit preview for a live waveform drag.
+pub(super) fn preview_drag_edit_region(
+    browser: &Browser,
+    drag: WaveformRegionDrag,
+) -> Option<wavecrate_core::WaveformEditRegion> {
+    if drag.selection_kind() != WaveformSelectionKind::Edit {
+        return None;
+    }
+    let bpm_snap = browser.bpm_snap_settings();
+    let raw = drag.preview_edit_region_with_bpm(bpm_snap)?;
+    if !drag.zero_crossing_applies(bpm_snap) {
+        return Some(raw);
+    }
+    let Some(context) = browser.waveform.as_ref()?.detail_context.as_ref() else {
+        return Some(raw);
+    };
+    Some(
+        browser
+            .zero_crossing
+            .ready_for(
+                browser.waveform_generation,
+                context,
+                WaveformSelectionKind::Edit,
+                raw.start(),
+                raw.end(),
+            )
+            .and_then(ZeroCrossingBounds::as_edit)
             .unwrap_or(raw),
     )
 }
@@ -378,7 +470,7 @@ pub(super) fn schedule_for_drag(browser: &mut Browser, cx: &mut Context<Browser>
     let Some(drag) = browser.waveform_region_drag else {
         return;
     };
-    let Some((intent, _)) = drag_intent(browser, drag) else {
+    let Some(intent) = drag_intent(browser, drag) else {
         return;
     };
     schedule_intent(browser, intent, cx);
@@ -395,7 +487,8 @@ pub(super) fn schedule_for_committed_region(browser: &mut Browser, cx: &mut Cont
     else {
         return;
     };
-    let Some(intent) = intent_for_raw(browser, raw) else {
+    let Some(intent) = intent_for_raw(browser, WaveformSelectionKind::Play, raw.start, raw.end)
+    else {
         return;
     };
     if !browser.zero_crossing.try_set_pending_commit(intent.clone()) {
@@ -410,19 +503,44 @@ pub(super) fn commit_or_schedule(
     raw: WaveformPlayRegion,
     cx: &mut Context<Browser>,
 ) {
-    browser.waveform_play_region = Some(raw);
+    commit_or_schedule_bounds(browser, WaveformSelectionKind::Play, raw.start, raw.end, cx);
+}
+
+/// Commit a released edit region immediately, then refine it when an exact snap is ready.
+pub(super) fn commit_or_schedule_edit(
+    browser: &mut Browser,
+    raw: wavecrate_core::WaveformEditRegion,
+    cx: &mut Context<Browser>,
+) {
+    commit_or_schedule_bounds(
+        browser,
+        WaveformSelectionKind::Edit,
+        raw.start(),
+        raw.end(),
+        cx,
+    );
+}
+
+fn commit_or_schedule_bounds(
+    browser: &mut Browser,
+    kind: WaveformSelectionKind,
+    start: f64,
+    end: f64,
+    cx: &mut Context<Browser>,
+) {
+    apply_bounds(browser, kind, start, end);
     if !browser.zero_crossing.enabled() {
         browser.zero_crossing_queued = None;
         browser.zero_crossing.cancel_for_interruption();
         return;
     }
-    let Some(intent) = intent_for_raw(browser, raw) else {
+    let Some(intent) = intent_for_raw(browser, kind, start, end) else {
         browser.zero_crossing.cancel_for_interruption();
         browser.zero_crossing_queued = None;
         return;
     };
     if let Some(snapped) = browser.zero_crossing.take_ready_for(&intent) {
-        browser.waveform_play_region = Some(snapped);
+        apply_bounds(browser, snapped.kind, snapped.start, snapped.end);
         browser.zero_crossing.take_pending_commit(&intent);
         return;
     }
@@ -430,6 +548,17 @@ pub(super) fn commit_or_schedule(
         return;
     }
     schedule_intent(browser, intent, cx);
+}
+
+fn apply_bounds(browser: &mut Browser, kind: WaveformSelectionKind, start: f64, end: f64) {
+    match kind {
+        WaveformSelectionKind::Play => {
+            browser.waveform_play_region = WaveformPlayRegion::new(start, end);
+        }
+        WaveformSelectionKind::Edit => {
+            browser.waveform_edit_region = wavecrate_core::WaveformEditRegion::new(start, end);
+        }
+    }
 }
 
 fn schedule_intent(browser: &mut Browser, intent: ZeroCrossingIntent, cx: &mut Context<Browser>) {
@@ -482,12 +611,12 @@ fn finish(
     match browser.zero_crossing.finish(job, result) {
         Some(Ok(snapped)) => {
             if browser.zero_crossing.pending_commit_matches(&intent) {
-                browser.waveform_play_region = Some(snapped);
+                apply_bounds(browser, snapped.kind, snapped.start, snapped.end);
                 browser.zero_crossing.take_pending_commit(&intent);
             } else if browser
                 .waveform_region_drag
                 .and_then(|drag| drag_intent(browser, drag))
-                .is_some_and(|(current, _)| current == intent)
+                .is_some_and(|current| current == intent)
             {
                 browser.zero_crossing.set_ready(intent, snapped);
             }
@@ -539,7 +668,9 @@ mod tests {
     use super::*;
     use std::fs;
     use wavecrate_core::WaveformRegion;
-    use wavecrate_media::{WaveformFileRevision, load_waveform_preview};
+    use wavecrate_media::{
+        WavZeroCrossingSnapRange, WaveformFileRevision, WaveformPreview, load_waveform_preview,
+    };
 
     fn context() -> WaveformDetailContext {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -575,12 +706,8 @@ mod tests {
     }
 
     fn intent(start: f64, end: f64) -> ZeroCrossingIntent {
-        ZeroCrossingIntent::new(
-            7,
-            context(),
-            WaveformPlayRegion::new(start, end).expect("valid region"),
-        )
-        .expect("valid intent")
+        ZeroCrossingIntent::new(7, context(), WaveformSelectionKind::Play, start, end)
+            .expect("valid intent")
     }
 
     #[test]
@@ -590,17 +717,27 @@ mod tests {
             ..ZeroCrossingState::default()
         };
         let exact = intent(0.2, 0.6);
-        let snapped = WaveformPlayRegion::new(0.21, 0.59).expect("valid snap");
+        let snapped =
+            ZeroCrossingBounds::new(WaveformSelectionKind::Play, 0.21, 0.59).expect("valid snap");
         state.set_ready(exact.clone(), snapped);
-        assert_eq!(state.ready_for(7, &context(), exact.raw), Some(snapped));
-        assert_eq!(state.ready_for(8, &context(), exact.raw), None);
         assert_eq!(
-            state.ready_for(7, &context(), WaveformPlayRegion::new(0.2, 0.7).unwrap()),
+            state.ready_for(7, &context(), WaveformSelectionKind::Play, 0.2, 0.6),
+            Some(snapped)
+        );
+        assert_eq!(
+            state.ready_for(8, &context(), WaveformSelectionKind::Play, 0.2, 0.6),
+            None
+        );
+        assert_eq!(
+            state.ready_for(7, &context(), WaveformSelectionKind::Play, 0.2, 0.7),
             None
         );
         let mut changed = context();
         changed.file_revision.change_marker = String::from("new");
-        assert_eq!(state.ready_for(7, &changed, exact.raw), None);
+        assert_eq!(
+            state.ready_for(7, &changed, WaveformSelectionKind::Play, 0.2, 0.6),
+            None
+        );
     }
 
     #[test]
@@ -636,7 +773,10 @@ mod tests {
             .expect("current result");
         assert_eq!(
             result,
-            Ok(WaveformPlayRegion::new(0.21, 0.69).expect("valid snap"))
+            Ok(
+                ZeroCrossingBounds::new(WaveformSelectionKind::Play, 0.21, 0.69)
+                    .expect("valid snap")
+            )
         );
     }
 
@@ -680,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn selection_kind_fences_identical_play_and_edit_bounds() {
+        let mut state = ZeroCrossingState {
+            enabled: true,
+            ..ZeroCrossingState::default()
+        };
+        let edit = ZeroCrossingIntent::new(7, context(), WaveformSelectionKind::Edit, 0.2, 0.6)
+            .expect("valid edit intent");
+        let snapped = ZeroCrossingBounds::new(WaveformSelectionKind::Edit, 0.21, 0.59)
+            .expect("valid edit snap");
+        state.set_ready(edit, snapped);
+
+        assert_eq!(
+            state.ready_for(7, &context(), WaveformSelectionKind::Play, 0.2, 0.6),
+            None
+        );
+        assert_eq!(
+            state.ready_for(7, &context(), WaveformSelectionKind::Edit, 0.2, 0.6),
+            Some(snapped)
+        );
+    }
+
+    #[test]
     fn disabled_committed_nudge_cannot_create_snap_ownership() {
         let raw = WaveformPlayRegion::new(0.25, 0.75).expect("raw region");
         let moved_core = WaveformRegion::new(raw.start, raw.end)
@@ -695,10 +857,96 @@ mod tests {
         assert!(state.pending_commit.is_none());
         assert!(state.active.is_none());
         assert_eq!(state.status_label(), None);
-        assert!(state.ready_for(7, &context(), moved).is_none());
+        assert!(
+            state
+                .ready_for(
+                    7,
+                    &context(),
+                    WaveformSelectionKind::Play,
+                    moved.start,
+                    moved.end
+                )
+                .is_none()
+        );
 
         state.set_enabled(true);
         assert!(state.try_set_pending_commit(request));
         assert_eq!(state.status_label(), Some("Snapping zero crossings…"));
+    }
+
+    #[gpui::test]
+    fn root_edit_pointer_loss_cancels_snap_and_ignores_late_completion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let play_region = WaveformPlayRegion::new(0.2, 0.8).expect("play region");
+        let edit_region = wavecrate_core::WaveformEditRegion::new(0.15, 0.85).expect("edit region");
+        let canceled_job = browser.update(cx, |view, _| {
+            view.waveform = Some(WaveformPreview {
+                peaks: vec![0.5; 8],
+                bands: Vec::new(),
+                duration_seconds: 1.0,
+                sample_rate: 48_000,
+                total_frames: 48_000,
+                detail_context: None,
+            });
+            view.waveform_play_region = Some(play_region);
+            view.waveform_edit_region = Some(edit_region);
+            view.zero_crossing.enabled = true;
+            view.zero_crossing
+                .begin(
+                    ZeroCrossingIntent::new(0, context(), WaveformSelectionKind::Edit, 0.25, 0.55)
+                        .expect("edit snap intent"),
+                )
+                .expect("active edit snap")
+        });
+        cx.refresh().expect("refresh inert browser");
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("waveform").expect("waveform bounds");
+        let start = gpui::point(
+            bounds.origin.x + bounds.size.width * 0.25,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let end = gpui::point(
+            bounds.origin.x + bounds.size.width * 0.55,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let modifiers = gpui::Modifiers::none();
+
+        cx.simulate_mouse_down(start, gpui::MouseButton::Right, modifiers);
+        assert!(canceled_job.cancellation.load(Ordering::Acquire));
+        cx.simulate_mouse_move(end, gpui::MouseButton::Right, modifiers);
+        cx.simulate_mouse_move(end, None, modifiers);
+
+        browser.update(cx, |view, _| {
+            assert!(view.waveform_region_drag.is_none());
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert!(
+                view.zero_crossing
+                    .finish(
+                        canceled_job,
+                        Ok(WavZeroCrossingSnapRange {
+                            start_ratio: 0.3,
+                            end_ratio: 0.5,
+                        }),
+                    )
+                    .is_none()
+            );
+            assert!(view.zero_crossing.active.is_none());
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+        });
+
+        cx.simulate_mouse_down(end, gpui::MouseButton::Right, modifiers);
+        cx.simulate_mouse_up(end, gpui::MouseButton::Right, modifiers);
+        browser.update(cx, |view, _| {
+            assert!(view.waveform_region_drag.is_none());
+            assert!(view.waveform_edit_region.is_none());
+            assert_eq!(view.waveform_play_region, Some(play_region));
+        });
     }
 }
