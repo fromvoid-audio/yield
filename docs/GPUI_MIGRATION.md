@@ -2007,3 +2007,7 @@ Output resume retains the complete admitted or confirmed configuration on its in
 ### Native metronome toolbar and shutdown smoke, 2026-09-09
 
 A clean `95aa470aa` snapshot built `target/qa/Wavecrate Metronome Preview 95aa470.app` in 25.58 seconds and passed strict ad-hoc signature verification. With the isolated QA profile, native toolbar clicks showed metronome enabled and disabled while audio remained idle. Closing the native window then exited with status zero; no Wavecrate preview process remained. This is idle UI/shutdown smoke evidence, not audible click/phase acceptance. Windows run `34322675452` targets the same revision and includes the new explicit Reson test step.
+
+### Extraction final-claim ownership design review, 2026-09-09
+
+Independent review confirmed that separate staging/final journal identities are necessary for clone publication but not sufficient. `fclonefileat` reports success without returning the new final handle or identity. A concurrent replacement before reopening can therefore yield a different object; matching content and a distinct inode alone do not prove operation ownership. The existing finalizer remains disabled. Future qualification must establish creation provenance as well as identity, containment, synchronization and crash checkpoints; ambiguous post-claim recovery must preserve evidence for audit rather than adopt or remove a content-matching file. Schema design should represent staging and final identities independently and retain explicit unproven-claim state before any macOS publication path is enabled.
