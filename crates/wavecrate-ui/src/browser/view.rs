@@ -1628,6 +1628,119 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn root_gain_pointer_routes_both_buttons_without_touching_playback(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-gain-test.wav");
+        let play_region = waveform::WaveformPlayRegion::new(0.2, 0.8).expect("play region");
+        let edit_region = wavecrate_core::WaveformEditRegion::new(0.25, 0.75).expect("edit region");
+        let accepted = transport::PlaybackIntent {
+            start: 0.2,
+            region: Some(play_region),
+            looped: false,
+            volume: 0.7,
+            path: path.clone(),
+            origin: transport::PlaybackIntentOrigin::Explicit,
+        };
+        browser.update(cx, |view, _| {
+            view.waveform = Some(inert_preview());
+            view.waveform_play_region = Some(play_region);
+            view.waveform_edit_region = Some(edit_region);
+            view.waveform_edit_settings = waveform::default_edit_settings();
+            view.playing_path = Some(path.clone());
+            view.accepted_playback_intent = Some(accepted.clone());
+            view.playback_epoch = 23;
+        });
+        cx.refresh().expect("refresh inert browser");
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("waveform").expect("waveform bounds");
+        let center_x = bounds.origin.x + bounds.size.width * 0.5;
+        let handle_y = bounds.origin.y + px(8.0);
+        let boosted_y = bounds.origin.y - px(32.0);
+        let attenuated_y = bounds.origin.y + px(48.0);
+        let modifiers = Modifiers::none();
+
+        cx.simulate_mouse_down(point(center_x, handle_y), MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            let drag = view.waveform_region_drag.expect("left gain drag");
+            assert!(drag.is_edit_gain());
+            assert_eq!(drag.selection_kind(), waveform::WaveformSelectionKind::Edit);
+            assert_eq!(drag.button(), MouseButton::Left);
+            assert_eq!(view.waveform_edit_settings.gain(), 1.0);
+        });
+        // Cross GPUI's drag threshold while still over the waveform before moving above its
+        // bounds. Once the drag is active, the capture-phase drag listener follows the pointer
+        // outside the element as the native handle does.
+        cx.simulate_mouse_move(
+            point(center_x, bounds.origin.y + px(4.0)),
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(point(center_x, boosted_y), MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            let drag = view.waveform_region_drag.expect("left gain preview");
+            assert!((drag.preview_edit_settings().gain() - 2.0).abs() < 1.0e-6);
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 23);
+        });
+        cx.simulate_mouse_up(point(center_x, boosted_y), MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.waveform_region_drag.is_none());
+            assert!((view.waveform_edit_settings.gain() - 2.0).abs() < 1.0e-6);
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 23);
+        });
+
+        cx.simulate_mouse_down(point(center_x, handle_y), MouseButton::Right, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            let drag = view.waveform_region_drag.expect("right gain drag");
+            assert!(drag.is_edit_gain());
+            assert_eq!(drag.button(), MouseButton::Right);
+        });
+        cx.simulate_mouse_move(point(center_x, attenuated_y), MouseButton::Right, modifiers);
+        cx.simulate_mouse_up(point(center_x, attenuated_y), MouseButton::Right, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.waveform_region_drag.is_none());
+            assert!((view.waveform_edit_settings.gain() - (2.0 - 40.0 / 120.0)).abs() < 1.0e-6);
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 23);
+        });
+
+        let committed_gain = cx
+            .cx
+            .read(|app| browser.read(app).waveform_edit_settings.gain());
+        cx.simulate_mouse_down(point(center_x, handle_y), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(
+            point(center_x, bounds.origin.y + px(4.0)),
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(point(center_x, boosted_y), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(center_x, boosted_y), None, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.waveform_region_drag.is_none());
+            assert_eq!(view.waveform_edit_settings.gain(), committed_gain);
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 23);
+        });
+    }
+
     #[test]
     fn optional_columns_reserve_name_space_with_type_priority() {
         let theme = Theme::default();

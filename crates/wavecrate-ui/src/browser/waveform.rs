@@ -7,12 +7,13 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::beat_count_input::MAX_BEAT_COUNT;
 use gpui::{
-    AnyView, App, Bounds, Context, DragMoveEvent, Hsla, MouseButton, MouseDownEvent, MouseUpEvent,
-    Path, PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window, canvas, div,
-    fill, point, prelude::*, px,
+    AnyView, App, Bounds, ContentMask, Context, DragMoveEvent, Hsla, MouseButton, MouseDownEvent,
+    MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Window,
+    canvas, div, fill, point, prelude::*, px,
 };
 use wavecrate_core::{
-    WaveformEditRegion, WaveformRegion, WaveformViewport, snap_resize_ratio_to_whole_bpm,
+    WaveformEditRegion, WaveformEditSettings, WaveformRegion, WaveformViewport,
+    snap_resize_ratio_to_whole_bpm,
 };
 use wavecrate_design::Theme;
 
@@ -34,11 +35,19 @@ const EDIT_REGION_RESIZE_HANDLE_WIDTH: f32 = 7.0;
 const EDIT_REGION_RESIZE_HIT_WIDTH: f32 = 13.0;
 const EDIT_REGION_MOVE_GRIP_HEIGHT: f32 = 7.0;
 const EDIT_REGION_MOVE_GRIP_INSET: f32 = 9.0;
+const EDIT_GAIN_HANDLE_WIDTH: f32 = 12.0;
+const EDIT_GAIN_HANDLE_HEIGHT: f32 = 10.0;
+const EDIT_GAIN_HANDLE_HIT_SIZE: f32 = 18.0;
 const WAVEFORM_PAN_REFERENCE_WIDTH: f64 = 1_200.0;
 const WAVEFORM_WHEEL_EPSILON: f64 = f64::EPSILON;
 const BPM_SNAP_ICON_SIZE: f32 = 16.0;
 const BEAT_GUIDE_WIDTH: f32 = 1.0;
 const BEAT_GUIDE_HEIGHT_FRACTION: f32 = 0.72;
+
+/// Return the default settings for a newly created edit selection.
+pub(super) fn default_edit_settings() -> WaveformEditSettings {
+    WaveformEditSettings::new(1.0, None, None).expect("the unity edit settings baseline is finite")
+}
 
 /// The transient BPM snap settings used by one waveform resize gesture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -171,7 +180,7 @@ impl Render for BpmSnapTooltip {
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
             .child(
-                "Snap resized play and edit marks to whole BPM values using the beat guide count.",
+                "Snap resized play and edit selections to whole BPM values using the beat guide count.",
             )
     }
 }
@@ -284,13 +293,31 @@ pub(super) enum WaveformSelectionKind {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WaveformRegionDragMode {
-    Create { kind: WaveformSelectionKind },
-    MovePlay { baseline: WaveformRegion },
-    ResizePlayStart { baseline: WaveformRegion },
-    ResizePlayEnd { baseline: WaveformRegion },
-    MoveEdit { baseline: WaveformEditRegion },
-    ResizeEditStart { baseline: WaveformEditRegion },
-    ResizeEditEnd { baseline: WaveformEditRegion },
+    Create {
+        kind: WaveformSelectionKind,
+    },
+    MovePlay {
+        baseline: WaveformRegion,
+    },
+    ResizePlayStart {
+        baseline: WaveformRegion,
+    },
+    ResizePlayEnd {
+        baseline: WaveformRegion,
+    },
+    MoveEdit {
+        baseline: WaveformEditRegion,
+    },
+    ResizeEditStart {
+        baseline: WaveformEditRegion,
+    },
+    ResizeEditEnd {
+        baseline: WaveformEditRegion,
+    },
+    EditGain {
+        baseline: WaveformEditRegion,
+        anchor_y: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -298,12 +325,14 @@ pub(super) struct WaveformRegionDrag {
     anchor: f64,
     current: f64,
     anchor_x: f32,
+    current_y: f32,
     bounds: Bounds<Pixels>,
     viewport: WaveformViewport,
     moved: bool,
     generation: u64,
     button: MouseButton,
     mode: WaveformRegionDragMode,
+    edit_settings: Option<WaveformEditSettings>,
 }
 
 impl WaveformRegionDrag {
@@ -321,6 +350,7 @@ impl WaveformRegionDrag {
             viewport,
             generation,
             MouseButton::Left,
+            None,
             WaveformRegionDragMode::Create {
                 kind: WaveformSelectionKind::Play,
             },
@@ -341,6 +371,7 @@ impl WaveformRegionDrag {
             viewport,
             generation,
             MouseButton::Right,
+            Some(default_edit_settings()),
             WaveformRegionDragMode::Create {
                 kind: WaveformSelectionKind::Edit,
             },
@@ -371,10 +402,12 @@ impl WaveformRegionDrag {
             viewport,
             generation,
             MouseButton::Left,
+            None,
             mode,
         ))
     }
 
+    #[cfg(test)]
     fn begin_edit_handle(
         position: Point<Pixels>,
         visible_ratio: f64,
@@ -393,6 +426,7 @@ impl WaveformRegionDrag {
             handle,
             generation,
             MouseButton::Right,
+            default_edit_settings(),
         )
     }
 
@@ -405,6 +439,7 @@ impl WaveformRegionDrag {
         handle: WaveformRegionHandle,
         generation: u64,
         button: MouseButton,
+        edit_settings: WaveformEditSettings,
     ) -> Self {
         let mode = match handle {
             WaveformRegionHandle::ResizeStart => {
@@ -422,7 +457,33 @@ impl WaveformRegionDrag {
             viewport,
             generation,
             button,
+            Some(edit_settings),
             mode,
+        )
+    }
+
+    fn begin_edit_gain(
+        position: Point<Pixels>,
+        visible_ratio: f64,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        region: WaveformEditRegion,
+        settings: WaveformEditSettings,
+        generation: u64,
+        button: MouseButton,
+    ) -> Self {
+        Self::with_mode(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            generation,
+            button,
+            Some(settings),
+            WaveformRegionDragMode::EditGain {
+                baseline: region,
+                anchor_y: f32::from(position.y),
+            },
         )
     }
 
@@ -433,6 +494,7 @@ impl WaveformRegionDrag {
         viewport: WaveformViewport,
         generation: u64,
         button: MouseButton,
+        edit_settings: Option<WaveformEditSettings>,
         mode: WaveformRegionDragMode,
     ) -> Self {
         let ratio = viewport.absolute_ratio_from_visible(visible_ratio);
@@ -440,12 +502,14 @@ impl WaveformRegionDrag {
             anchor: ratio,
             current: ratio,
             anchor_x: f32::from(position.x),
+            current_y: f32::from(position.y),
             bounds,
             viewport,
             moved: false,
             generation,
             button,
             mode,
+            edit_settings,
         }
     }
 
@@ -453,8 +517,14 @@ impl WaveformRegionDrag {
         if let Some(ratio) = waveform_click_ratio(position, self.bounds) {
             self.current = self.viewport.absolute_ratio_from_visible(ratio);
         }
-        self.moved |=
-            (f32::from(position.x) - self.anchor_x).abs() > WAVEFORM_SELECTION_CLICK_SLOP_PX;
+        self.current_y = f32::from(position.y);
+        let moved = match self.mode {
+            WaveformRegionDragMode::EditGain { anchor_y, .. } => {
+                (self.current_y - anchor_y).abs() > WAVEFORM_SELECTION_CLICK_SLOP_PX
+            }
+            _ => (f32::from(position.x) - self.anchor_x).abs() > WAVEFORM_SELECTION_CLICK_SLOP_PX,
+        };
+        self.moved |= moved;
     }
 
     fn preview_region(self) -> Option<WaveformPlayRegion> {
@@ -514,7 +584,8 @@ impl WaveformRegionDrag {
                 } => {}
                 WaveformRegionDragMode::MoveEdit { baseline }
                 | WaveformRegionDragMode::ResizeEditStart { baseline }
-                | WaveformRegionDragMode::ResizeEditEnd { baseline } => return Some(baseline),
+                | WaveformRegionDragMode::ResizeEditEnd { baseline }
+                | WaveformRegionDragMode::EditGain { baseline, .. } => return Some(baseline),
                 _ => return None,
             }
         }
@@ -530,7 +601,18 @@ impl WaveformRegionDrag {
             WaveformRegionDragMode::ResizeEditEnd { baseline } => baseline.resized_end_to(
                 snapped_resize_edge(baseline.start(), self.current, bpm_snap),
             ),
+            WaveformRegionDragMode::EditGain { baseline, .. } => Some(baseline),
             _ => None,
+        }
+    }
+
+    pub(super) fn preview_edit_settings(self) -> WaveformEditSettings {
+        let settings = self.edit_settings.unwrap_or_else(default_edit_settings);
+        match self.mode {
+            WaveformRegionDragMode::EditGain { anchor_y, .. } => {
+                settings.with_gain_for_pointer_y(anchor_y, self.current_y)
+            }
+            _ => settings,
         }
     }
 
@@ -542,7 +624,8 @@ impl WaveformRegionDrag {
             | WaveformRegionDragMode::ResizePlayEnd { .. } => WaveformSelectionKind::Play,
             WaveformRegionDragMode::MoveEdit { .. }
             | WaveformRegionDragMode::ResizeEditStart { .. }
-            | WaveformRegionDragMode::ResizeEditEnd { .. } => WaveformSelectionKind::Edit,
+            | WaveformRegionDragMode::ResizeEditEnd { .. }
+            | WaveformRegionDragMode::EditGain { .. } => WaveformSelectionKind::Edit,
         }
     }
 
@@ -570,8 +653,12 @@ impl WaveformRegionDrag {
         !matches!(self.mode, WaveformRegionDragMode::Create { .. })
     }
 
+    pub(super) fn is_edit_gain(self) -> bool {
+        matches!(self.mode, WaveformRegionDragMode::EditGain { .. })
+    }
+
     pub(super) fn zero_crossing_applies(self, bpm_snap: BpmSnapSettings) -> bool {
-        self.moved && (!self.is_resize() || !bpm_snap.enabled)
+        self.moved && !self.is_edit_gain() && (!self.is_resize() || !bpm_snap.enabled)
     }
 
     fn is_resize(self) -> bool {
@@ -743,9 +830,13 @@ pub(super) struct WaveformRenderCache {
 #[derive(Default)]
 struct WaveformRenderCacheState {
     key: Option<WaveformCacheKey>,
-    paths: Vec<(usize, Path<Pixels>)>,
+    paths: Rc<Vec<(usize, Path<Pixels>)>>,
+    gain_preview_key: Option<WaveformGainPreviewKey>,
+    gain_preview_geometry: Option<WaveformGainPreviewGeometry>,
     #[cfg(test)]
     rebuild_count: usize,
+    #[cfg(test)]
+    gain_preview_rebuild_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,8 +851,90 @@ struct WaveformCacheKey {
     projection_end_bits: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaveformGainPreviewKind {
+    Bands,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaveformGainPreviewKey {
+    base: WaveformCacheKey,
+    kind: WaveformGainPreviewKind,
+    visible_start_bits: u64,
+    visible_end_bits: u64,
+    gain_bits: u32,
+    preview_len: usize,
+}
+
+#[derive(Clone)]
+enum WaveformGainPreviewGeometry {
+    Bands {
+        selection_bounds: Bounds<Pixels>,
+        paths: Rc<Vec<(usize, Path<Pixels>)>>,
+    },
+}
+
 impl WaveformRenderCache {
-    /// Return paths for this exact preview generation and layout, rebuilding only on a key miss.
+    fn base_key(
+        generation: u64,
+        peak_scale: f32,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        source_range: (f64, f64),
+        projection_revision: u64,
+    ) -> WaveformCacheKey {
+        WaveformCacheKey {
+            generation,
+            bounds,
+            peak_scale_bits: peak_scale.to_bits(),
+            viewport_start_bits: viewport.start.to_bits(),
+            viewport_end_bits: viewport.end.to_bits(),
+            projection_revision,
+            projection_start_bits: source_range.0.to_bits(),
+            projection_end_bits: source_range.1.to_bits(),
+        }
+    }
+
+    fn ensure_base_paths(
+        &self,
+        generation: u64,
+        bands: &[[f32; 4]],
+        peak_scale: f32,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        source_range: (f64, f64),
+        projection_revision: u64,
+    ) -> WaveformCacheKey {
+        let key = Self::base_key(
+            generation,
+            peak_scale,
+            bounds,
+            viewport,
+            source_range,
+            projection_revision,
+        );
+        let mut state = self.state.borrow_mut();
+        if state.key != Some(key) {
+            state.paths = Rc::new(build_waveform_paths(
+                bands,
+                peak_scale,
+                bounds,
+                viewport,
+                source_range,
+            ));
+            state.key = Some(key);
+            state.gain_preview_key = None;
+            state.gain_preview_geometry = None;
+            #[cfg(test)]
+            {
+                state.rebuild_count += 1;
+            }
+        }
+        key
+    }
+
+    /// Share immutable paths for this exact preview generation and layout.
+    /// Cache retrieval never copies vertices; GPUI's owned paint API copies each path at drawing.
     fn paths_for(
         &self,
         generation: u64,
@@ -771,32 +944,103 @@ impl WaveformRenderCache {
         viewport: WaveformViewport,
         source_range: (f64, f64),
         projection_revision: u64,
-    ) -> Vec<(usize, Path<Pixels>)> {
-        let key = WaveformCacheKey {
+    ) -> Rc<Vec<(usize, Path<Pixels>)>> {
+        self.ensure_base_paths(
             generation,
+            bands,
+            peak_scale,
             bounds,
-            peak_scale_bits: peak_scale.to_bits(),
-            viewport_start_bits: viewport.start.to_bits(),
-            viewport_end_bits: viewport.end.to_bits(),
+            viewport,
+            source_range,
             projection_revision,
-            projection_start_bits: source_range.0.to_bits(),
-            projection_end_bits: source_range.1.to_bits(),
+        );
+        self.state.borrow().paths.clone()
+    }
+
+    fn gain_preview_paths_for(
+        &self,
+        generation: u64,
+        bands: &[[f32; 4]],
+        peak_scale: f32,
+        bounds: Bounds<Pixels>,
+        viewport: WaveformViewport,
+        source_range: (f64, f64),
+        projection_revision: u64,
+        selection: WaveformEditRegion,
+        gain: f32,
+    ) -> Option<WaveformGainPreviewGeometry> {
+        let base = self.ensure_base_paths(
+            generation,
+            bands,
+            peak_scale,
+            bounds,
+            viewport,
+            source_range,
+            projection_revision,
+        );
+        let (visible_start, visible_end) =
+            viewport.visible_range_from_absolute(selection.start(), selection.end())?;
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        let key = WaveformGainPreviewKey {
+            base,
+            kind: WaveformGainPreviewKind::Bands,
+            visible_start_bits: visible_start.to_bits(),
+            visible_end_bits: visible_end.to_bits(),
+            gain_bits: gain.to_bits(),
+            preview_len: bands.len(),
         };
         let mut state = self.state.borrow_mut();
-        if state.key != Some(key) {
-            state.paths = build_waveform_paths(bands, peak_scale, bounds, viewport, source_range);
-            state.key = Some(key);
+        if state.gain_preview_key != Some(key) {
+            let selection_bounds = visible_selection_bounds(bounds, visible_start, visible_end)?;
+            let point_count = drawable_point_count(bounds.size.width, bands.len());
+            let extents = resample_gain_preview_extents(
+                bands,
+                point_count,
+                peak_scale,
+                viewport,
+                source_range,
+                selection,
+                visible_start,
+                visible_end,
+                gain,
+            );
+            let paths = Rc::new(build_waveform_paths_from_extents(
+                &extents,
+                selection_bounds,
+            ));
+            state.gain_preview_key = Some(key);
+            state.gain_preview_geometry = Some(WaveformGainPreviewGeometry::Bands {
+                selection_bounds,
+                paths,
+            });
             #[cfg(test)]
             {
-                state.rebuild_count += 1;
+                state.gain_preview_rebuild_count += 1;
             }
         }
-        state.paths.clone()
+        match state.gain_preview_geometry.as_ref()? {
+            WaveformGainPreviewGeometry::Bands {
+                selection_bounds,
+                paths,
+            } => Some(WaveformGainPreviewGeometry::Bands {
+                selection_bounds: *selection_bounds,
+                paths: paths.clone(),
+            }),
+        }
     }
 
     #[cfg(test)]
     fn rebuild_count(&self) -> usize {
         self.state.borrow().rebuild_count
+    }
+
+    #[cfg(test)]
+    fn gain_preview_rebuild_count(&self) -> usize {
+        self.state.borrow().gain_preview_rebuild_count
     }
 }
 
@@ -809,6 +1053,13 @@ fn build_waveform_paths(
 ) -> Vec<(usize, Path<Pixels>)> {
     let point_count = drawable_point_count(bounds.size.width, bands.len());
     let extents = resample_extents(bands, point_count, peak_scale, viewport, source_range);
+    build_waveform_paths_from_extents(&extents, bounds)
+}
+
+fn build_waveform_paths_from_extents(
+    extents: &[[f32; 4]],
+    bounds: Bounds<Pixels>,
+) -> Vec<(usize, Path<Pixels>)> {
     let center = bounds.origin.y + bounds.size.height / 2.0;
     let half_height = (bounds.size.height / 2.0 - px(2.0)).max(px(1.0));
     let width = bounds.size.width;
@@ -884,6 +1135,135 @@ fn resample_extents(
     extents
 }
 
+fn visible_selection_bounds(
+    bounds: Bounds<Pixels>,
+    visible_start: f64,
+    visible_end: f64,
+) -> Option<Bounds<Pixels>> {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if !width.is_finite()
+        || width <= 0.0
+        || !height.is_finite()
+        || height <= 0.0
+        || !visible_start.is_finite()
+        || !visible_end.is_finite()
+        || visible_end <= visible_start
+    {
+        return None;
+    }
+    let left = f32::from(bounds.origin.x) + width * visible_start as f32;
+    let right = f32::from(bounds.origin.x) + width * visible_end as f32;
+    Some(Bounds::from_corners(
+        point(px(left), bounds.origin.y),
+        point(px(right), bounds.bottom()),
+    ))
+}
+
+/// Rebuild only the selected visible span after applying gain to raw signal lanes.
+///
+/// The static waveform path shapes each source column before max pooling. Gain must be applied
+/// to the raw lanes first, matching the native signal preview's clamp-before-visualization order.
+fn resample_gain_preview_extents(
+    bands: &[[f32; 4]],
+    point_count: usize,
+    peak_scale: f32,
+    viewport: WaveformViewport,
+    source_range: (f64, f64),
+    selection: WaveformEditRegion,
+    visible_start: f64,
+    visible_end: f64,
+    gain: f32,
+) -> Vec<[f32; 4]> {
+    if bands.is_empty() || point_count < 2 {
+        return Vec::new();
+    }
+    let mut first_bucket =
+        ((visible_start * point_count as f64).floor() as usize).min(point_count.saturating_sub(1));
+    let mut last_bucket = ((visible_end * point_count as f64)
+        .ceil()
+        .max((first_bucket + 1) as f64)
+        .min(point_count as f64)) as usize;
+    if last_bucket.saturating_sub(first_bucket) < 2 {
+        if first_bucket + 2 <= point_count {
+            last_bucket = first_bucket + 2;
+        } else {
+            last_bucket = point_count;
+            first_bucket = last_bucket.saturating_sub(2);
+        }
+    }
+    let preview_count = last_bucket.saturating_sub(first_bucket);
+    if preview_count < 2 {
+        return Vec::new();
+    }
+    let source_start = source_range.0;
+    let source_width = source_range.1 - source_start;
+    let viewport_start = viewport.start;
+    let viewport_width = viewport.width();
+    if !source_start.is_finite()
+        || !source_width.is_finite()
+        || source_width <= 0.0
+        || !viewport_start.is_finite()
+        || !viewport_width.is_finite()
+        || viewport_width <= 0.0
+    {
+        return vec![[0.0; 4]; preview_count];
+    }
+    let selection_start = selection.start().min(selection.end());
+    let selection_end = selection.start().max(selection.end());
+    let source_end = source_start + source_width;
+    let overlap_start = source_start.max(viewport.start).max(selection_start);
+    let overlap_end = source_end.min(viewport.end).min(selection_end);
+    let mut extents = vec![[0.0_f32; 4]; preview_count];
+    if overlap_end <= overlap_start {
+        return extents;
+    }
+    let band_count = bands.len() as f64;
+    let first_source = (((overlap_start - source_start) / source_width) * band_count)
+        .floor()
+        .clamp(0.0, (bands.len().saturating_sub(1)) as f64) as usize;
+    let last_source = (((overlap_end - source_start) / source_width) * band_count)
+        .ceil()
+        .clamp((first_source + 1) as f64, bands.len() as f64) as usize;
+    for (index, column) in bands[first_source..last_source].iter().copied().enumerate() {
+        let index = first_source + index;
+        let band_start = source_start + index as f64 / band_count * source_width;
+        let band_end = source_start + (index + 1) as f64 / band_count * source_width;
+        let mapped_start = band_start.max(viewport.start).max(selection_start);
+        let mapped_end = band_end.min(viewport.end).min(selection_end);
+        if mapped_end <= mapped_start {
+            continue;
+        }
+        let first = (((mapped_start - viewport_start) / viewport_width) * point_count as f64)
+            .floor()
+            .clamp(first_bucket as f64, last_bucket.saturating_sub(1) as f64)
+            as usize;
+        let last = (((mapped_end - viewport_start) / viewport_width) * point_count as f64)
+            .ceil()
+            .max((first + 1) as f64)
+            .min(last_bucket as f64) as usize;
+        let scaled = [
+            (column[0] * gain).clamp(0.0, 1.0),
+            (column[1] * gain).clamp(0.0, 1.0),
+            (column[2] * gain).clamp(0.0, 1.0),
+            (column[3] * gain).clamp(0.0, 1.0),
+        ];
+        let values = [
+            waveform_extent(scaled, 0, peak_scale),
+            waveform_extent(scaled, 1, peak_scale),
+            waveform_extent(scaled, 2, peak_scale),
+            waveform_extent(scaled, 3, peak_scale),
+        ];
+        for bucket in first..last {
+            let bucket = bucket.saturating_sub(first_bucket);
+            for (lane, value) in values.into_iter().enumerate() {
+                extents[bucket][lane] = extents[bucket][lane].max(value);
+            }
+        }
+    }
+    extents
+}
+
 fn visible_peak_values(peaks: &[f32], viewport: WaveformViewport) -> Vec<f32> {
     if peaks.is_empty() {
         return Vec::new();
@@ -892,7 +1272,14 @@ fn visible_peak_values(peaks: &[f32], viewport: WaveformViewport) -> Vec<f32> {
         ((peaks.len() as f64 * viewport.width()).ceil() as usize).clamp(1, peaks.len());
     let mut visible = vec![0.0_f32; point_count];
     let peak_count = peaks.len() as f64;
-    for (index, peak) in peaks.iter().copied().enumerate() {
+    let first_source = (viewport.start * peak_count)
+        .floor()
+        .clamp(0.0, (peaks.len().saturating_sub(1)) as f64) as usize;
+    let last_source = (viewport.end * peak_count)
+        .ceil()
+        .clamp((first_source + 1) as f64, peaks.len() as f64) as usize;
+    for (index, peak) in peaks[first_source..last_source].iter().copied().enumerate() {
+        let index = first_source + index;
         let peak_start = index as f64 / peak_count;
         let peak_end = (index + 1) as f64 / peak_count;
         let overlap_start = peak_start.max(viewport.start);
@@ -914,6 +1301,17 @@ fn visible_peak_values(peaks: &[f32], viewport: WaveformViewport) -> Vec<f32> {
         }
     }
     visible
+}
+
+fn gain_for_visible_peak(
+    index: usize,
+    visible_peaks: &[f32],
+    gain_range: Option<((f64, f64), f32)>,
+) -> Option<f32> {
+    let center = (index as f64 + 0.5) / visible_peaks.len().max(1) as f64;
+    gain_range
+        .filter(|((start, end), _)| center >= *start && center <= *end)
+        .map(|(_, gain)| gain)
 }
 
 fn waveform_extent(column: [f32; 4], lane: usize, peak_scale: f32) -> f32 {
@@ -997,6 +1395,19 @@ pub(super) fn render_waveform(
     cx: &mut Context<Browser>,
 ) -> impl IntoElement {
     let click_bounds = Rc::new(RefCell::new(None));
+    let drag = browser.waveform_region_drag;
+    let play_region = drag
+        .and_then(|drag| zero_crossing::preview_drag_region(browser, drag))
+        .or(browser.waveform_play_region);
+    let edit_region = drag
+        .and_then(|drag| zero_crossing::preview_drag_edit_region(browser, drag))
+        .or(browser.waveform_edit_region);
+    let edit_settings = drag
+        .map(|drag| drag.preview_edit_settings())
+        .unwrap_or(browser.waveform_edit_settings);
+    let gain_preview = edit_region
+        .filter(|_| (edit_settings.gain() - 1.0).abs() > f32::EPSILON)
+        .map(|region| (region, edit_settings));
     let mut bars = div()
         .id("waveform")
         .debug_selector(|| String::from("waveform"))
@@ -1045,8 +1456,20 @@ pub(super) fn render_waveform(
             let waveform = canvas(
                 move |_, _, _| (),
                 move |bounds, _, window, _| {
-                    for (lane, path) in cache
-                        .paths_for(
+                    let paths = cache.paths_for(
+                        generation,
+                        &bands,
+                        peak_scale,
+                        bounds,
+                        viewport,
+                        source_range,
+                        projection_revision,
+                    );
+                    if let Some((selection, settings)) = gain_preview
+                        && let Some(WaveformGainPreviewGeometry::Bands {
+                            selection_bounds,
+                            paths: preview_paths,
+                        }) = cache.gain_preview_paths_for(
                             generation,
                             &bands,
                             peak_scale,
@@ -1054,10 +1477,49 @@ pub(super) fn render_waveform(
                             viewport,
                             source_range,
                             projection_revision,
+                            selection,
+                            settings.gain(),
                         )
-                        .into_iter()
                     {
-                        window.paint_path(path, lane_colors[lane]);
+                        let bounds_origin = bounds.origin;
+                        let bounds_bottom = bounds.bottom();
+                        let left_bounds = Bounds::from_corners(
+                            bounds_origin,
+                            point(selection_bounds.left(), bounds_bottom),
+                        );
+                        let right_bounds = Bounds::from_corners(
+                            point(selection_bounds.right(), bounds_origin.y),
+                            point(bounds.right(), bounds_bottom),
+                        );
+                        for clip_bounds in [left_bounds, right_bounds] {
+                            if clip_bounds.size.width <= px(0.0) {
+                                continue;
+                            }
+                            window.with_content_mask(
+                                Some(ContentMask {
+                                    bounds: clip_bounds,
+                                }),
+                                |window| {
+                                    for (lane, path) in paths.iter() {
+                                        window.paint_path(path.clone(), lane_colors[*lane]);
+                                    }
+                                },
+                            );
+                        }
+                        window.with_content_mask(
+                            Some(ContentMask {
+                                bounds: selection_bounds,
+                            }),
+                            |window| {
+                                for (lane, path) in preview_paths.iter() {
+                                    window.paint_path(path.clone(), lane_colors[*lane]);
+                                }
+                            },
+                        );
+                    } else {
+                        for (lane, path) in paths.iter() {
+                            window.paint_path(path.clone(), lane_colors[*lane]);
+                        }
                     }
                 },
             )
@@ -1079,14 +1541,24 @@ pub(super) fn render_waveform(
             } else {
                 theme.colors.waveform_unplayed
             };
-            for peak in visible_peak_values(&preview.peaks, viewport) {
-                bars = bars.child(
-                    div()
-                        .flex_1()
-                        .h(px((peak * theme.waveform.peak_scale * available_height)
-                            .max(theme.spacing.waveform_min_bar_height)))
-                        .bg(color(bar_color)),
-                );
+            let gain_range = gain_preview.and_then(|(selection, settings)| {
+                viewport
+                    .visible_range_from_absolute(selection.start(), selection.end())
+                    .map(|range| (range, settings.gain()))
+            });
+            let visible_peaks = visible_peak_values(&preview.peaks, viewport);
+            for (index, peak) in visible_peaks.iter().copied().enumerate() {
+                let gain = gain_for_visible_peak(index, &visible_peaks, gain_range);
+                let peak = gain
+                    .map(|gain| (peak * gain).clamp(0.0, 1.0))
+                    .unwrap_or(peak);
+                let height = if gain.is_some() && peak <= 0.0 {
+                    0.0
+                } else {
+                    (peak * theme.waveform.peak_scale * available_height)
+                        .max(theme.spacing.waveform_min_bar_height)
+                };
+                bars = bars.child(div().flex_1().h(px(height)).bg(color(bar_color)));
             }
         }
     } else {
@@ -1130,14 +1602,6 @@ pub(super) fn render_waveform(
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
     ));
-    let play_region = browser
-        .waveform_region_drag
-        .and_then(|drag| zero_crossing::preview_drag_region(browser, drag))
-        .or(browser.waveform_play_region);
-    let edit_region = browser
-        .waveform_region_drag
-        .and_then(|drag| zero_crossing::preview_drag_edit_region(browser, drag))
-        .or(browser.waveform_edit_region);
     let active_selection_kind = browser
         .waveform_region_drag
         .map(|drag| drag.selection_kind());
@@ -1169,6 +1633,28 @@ pub(super) fn render_waveform(
                 WaveformSelectionKind::Edit,
             ),
         ));
+        bars = bars.child(waveform_edit_gain_handle_overlay(
+            region,
+            browser.waveform_viewport,
+            edit_color.opacity(220.0 / 255.0),
+        ));
+    }
+    if let Some(drag) = drag.filter(|drag| drag.is_edit_gain()) {
+        let gain = drag.preview_edit_settings().gain();
+        bars = bars.child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.text_primary))
+                .child(format!("Gain {gain:.2}×")),
+        );
     }
     if let Some(ratio) = playback_cursor_ratio.and_then(|ratio| {
         browser
@@ -1228,9 +1714,10 @@ pub(super) fn render_waveform(
                 view.cancel_waveform_gestures(window, cx);
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                view.waveform_region_drag = Some(begin_primary_waveform_drag(
+                view.waveform_region_drag = Some(begin_primary_waveform_drag_with_settings(
                     view.waveform_play_region,
                     view.waveform_edit_region,
+                    view.waveform_edit_settings,
                     event.position,
                     ratio,
                     bounds,
@@ -1259,8 +1746,9 @@ pub(super) fn render_waveform(
                 view.cancel_waveform_gestures(window, cx);
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                view.waveform_region_drag = Some(begin_secondary_waveform_drag(
+                view.waveform_region_drag = Some(begin_secondary_waveform_drag_with_settings(
                     view.waveform_edit_region,
+                    view.waveform_edit_settings,
                     event.position,
                     ratio,
                     bounds,
@@ -1308,6 +1796,7 @@ impl Browser {
         zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
         self.waveform_edit_region = None;
+        self.waveform_edit_settings = default_edit_settings();
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
         self.waveform_scrollbar_drag = None;
@@ -1582,7 +2071,12 @@ impl Browser {
         let mut drag = drag;
         drag.update(position);
         let bpm_snap = self.bpm_snap_settings();
-        if drag.selection_kind() == WaveformSelectionKind::Edit {
+        if drag.is_edit_gain() {
+            if drag.moved {
+                self.waveform_edit_settings = drag.preview_edit_settings();
+            }
+            zero_crossing::cancel_for_interruption(self);
+        } else if drag.selection_kind() == WaveformSelectionKind::Edit {
             if drag.moved {
                 let preview = if bpm_snap.enabled {
                     drag.preview_edit_region_with_bpm(bpm_snap)
@@ -1591,12 +2085,14 @@ impl Browser {
                 };
                 if let Some(region) = preview {
                     self.waveform_edit_region = Some(region);
+                    self.waveform_edit_settings = drag.preview_edit_settings();
                     if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule_edit(self, region, cx);
                     }
                 }
             } else if secondary_drag_should_clear_edit(drag) {
                 self.waveform_edit_region = None;
+                self.waveform_edit_settings = default_edit_settings();
                 zero_crossing::cancel_for_interruption(self);
             }
         } else if drag.is_handle_drag() {
@@ -1673,6 +2169,7 @@ fn waveform_click_ratio(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Opti
     Some(((x - left) / width).clamp(0.0, 1.0) as f64)
 }
 
+#[cfg(test)]
 fn begin_primary_waveform_drag(
     play_region: Option<WaveformPlayRegion>,
     edit_region: Option<WaveformEditRegion>,
@@ -1682,6 +2179,42 @@ fn begin_primary_waveform_drag(
     viewport: WaveformViewport,
     generation: u64,
 ) -> WaveformRegionDrag {
+    begin_primary_waveform_drag_with_settings(
+        play_region,
+        edit_region,
+        default_edit_settings(),
+        position,
+        visible_ratio,
+        bounds,
+        viewport,
+        generation,
+    )
+}
+
+fn begin_primary_waveform_drag_with_settings(
+    play_region: Option<WaveformPlayRegion>,
+    edit_region: Option<WaveformEditRegion>,
+    edit_settings: WaveformEditSettings,
+    position: Point<Pixels>,
+    visible_ratio: f64,
+    bounds: Bounds<Pixels>,
+    viewport: WaveformViewport,
+    generation: u64,
+) -> WaveformRegionDrag {
+    if let Some(region) = edit_region
+        && edit_gain_handle_at(region, viewport, bounds, position)
+    {
+        return WaveformRegionDrag::begin_edit_gain(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            region,
+            edit_settings,
+            generation,
+            MouseButton::Left,
+        );
+    }
     if let Some(region) = edit_region
         && let Some(handle) = region_resize_handle_at(
             region.start(),
@@ -1701,6 +2234,7 @@ fn begin_primary_waveform_drag(
             handle,
             generation,
             MouseButton::Left,
+            edit_settings,
         );
     }
     if let Some(region) = play_region {
@@ -1755,7 +2289,7 @@ fn begin_primary_waveform_drag(
             EDIT_REGION_MOVE_GRIP_INSET,
         )
     {
-        return WaveformRegionDrag::begin_edit_handle(
+        return WaveformRegionDrag::begin_edit_handle_with_button(
             position,
             visible_ratio,
             bounds,
@@ -1763,11 +2297,14 @@ fn begin_primary_waveform_drag(
             region,
             handle,
             generation,
+            MouseButton::Left,
+            edit_settings,
         );
     }
     WaveformRegionDrag::begin(position, visible_ratio, bounds, viewport, generation)
 }
 
+#[cfg(test)]
 fn begin_secondary_waveform_drag(
     edit_region: Option<WaveformEditRegion>,
     position: Point<Pixels>,
@@ -1776,10 +2313,44 @@ fn begin_secondary_waveform_drag(
     viewport: WaveformViewport,
     generation: u64,
 ) -> WaveformRegionDrag {
+    begin_secondary_waveform_drag_with_settings(
+        edit_region,
+        default_edit_settings(),
+        position,
+        visible_ratio,
+        bounds,
+        viewport,
+        generation,
+    )
+}
+
+fn begin_secondary_waveform_drag_with_settings(
+    edit_region: Option<WaveformEditRegion>,
+    edit_settings: WaveformEditSettings,
+    position: Point<Pixels>,
+    visible_ratio: f64,
+    bounds: Bounds<Pixels>,
+    viewport: WaveformViewport,
+    generation: u64,
+) -> WaveformRegionDrag {
+    if let Some(region) = edit_region
+        && edit_gain_handle_at(region, viewport, bounds, position)
+    {
+        return WaveformRegionDrag::begin_edit_gain(
+            position,
+            visible_ratio,
+            bounds,
+            viewport,
+            region,
+            edit_settings,
+            generation,
+            MouseButton::Right,
+        );
+    }
     if let Some(region) = edit_region
         && let Some(handle) = edit_region_handle_at(region, viewport, bounds, position)
     {
-        return WaveformRegionDrag::begin_edit_handle(
+        return WaveformRegionDrag::begin_edit_handle_with_button(
             position,
             visible_ratio,
             bounds,
@@ -1787,6 +2358,8 @@ fn begin_secondary_waveform_drag(
             region,
             handle,
             generation,
+            MouseButton::Right,
+            edit_settings,
         );
     }
     WaveformRegionDrag::begin_edit(position, visible_ratio, bounds, viewport, generation)
@@ -1827,6 +2400,60 @@ fn edit_region_handle_at(
         EDIT_REGION_MOVE_GRIP_HEIGHT,
         EDIT_REGION_MOVE_GRIP_INSET,
     )
+}
+
+fn edit_gain_handle_at(
+    region: WaveformEditRegion,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> bool {
+    edit_gain_handle_rect(
+        region,
+        viewport,
+        bounds,
+        EDIT_GAIN_HANDLE_HIT_SIZE,
+        EDIT_GAIN_HANDLE_HIT_SIZE,
+    )
+    .is_some_and(|rect| rect.contains(&position))
+}
+
+fn edit_gain_handle_rect(
+    region: WaveformEditRegion,
+    viewport: WaveformViewport,
+    bounds: Bounds<Pixels>,
+    width: f32,
+    height: f32,
+) -> Option<Bounds<Pixels>> {
+    if !width.is_finite() || width <= 0.0 || !height.is_finite() || height <= 0.0 {
+        return None;
+    }
+    let Some((visible_start, visible_end)) =
+        viewport.visible_range_from_absolute(region.start(), region.end())
+    else {
+        return None;
+    };
+    let bounds_width = f32::from(bounds.size.width);
+    let bounds_height = f32::from(bounds.size.height);
+    let bounds_left = f32::from(bounds.origin.x);
+    let bounds_top = f32::from(bounds.origin.y);
+    if !bounds_width.is_finite()
+        || bounds_width <= 0.0
+        || !bounds_height.is_finite()
+        || bounds_height <= 0.0
+        || !bounds_left.is_finite()
+        || !bounds_top.is_finite()
+    {
+        return None;
+    }
+    let width = width.min(bounds_width);
+    let height = height.min(bounds_height);
+    let center = bounds_left + bounds_width * ((visible_start + visible_end) * 0.5) as f32;
+    let left = (center - width * 0.5).clamp(bounds_left, bounds_left + bounds_width - width);
+    Some(Bounds::from_corners(
+        point(px(left), px(bounds_top)),
+        point(px(left + width), px(bounds_top + height)),
+    ))
 }
 
 fn region_resize_handle_at(
@@ -2045,6 +2672,33 @@ fn waveform_edit_region_overlay(
     )
 }
 
+fn waveform_edit_gain_handle_overlay(
+    region: WaveformEditRegion,
+    viewport: WaveformViewport,
+    handle_color: gpui::Hsla,
+) -> impl IntoElement {
+    canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            let Some(handle) = edit_gain_handle_rect(
+                region,
+                viewport,
+                bounds,
+                EDIT_GAIN_HANDLE_WIDTH,
+                EDIT_GAIN_HANDLE_HEIGHT,
+            ) else {
+                return;
+            };
+            window.paint_quad(fill(handle, handle_color));
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left_0()
+    .right_0()
+}
+
 fn waveform_selection_overlay(
     start_ratio: f64,
     end_ratio: f64,
@@ -2261,6 +2915,26 @@ mod tests {
     }
 
     #[test]
+    fn zoomed_peak_preview_maps_gain_to_visible_columns() {
+        let viewport = WaveformViewport {
+            start: 0.5,
+            end: 1.0,
+        };
+        let visible_peaks = visible_peak_values(&[1.0; 8], viewport);
+        let gain_range = viewport
+            .visible_range_from_absolute(0.75, 0.9)
+            .map(|range| (range, 0.0));
+        let centers = visible_peaks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| gain_for_visible_peak(index, &visible_peaks, gain_range))
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible_peaks.len(), 4);
+        assert_eq!(centers, vec![None, None, Some(0.0), None]);
+    }
+
+    #[test]
     fn detail_projection_maps_only_its_source_range_into_silence_margins() {
         let bands = vec![[1.0, 1.0, 1.0, 1.0]; 16];
         let extents = resample_extents(
@@ -2389,6 +3063,173 @@ mod tests {
             4
         );
         assert_eq!(cache.rebuild_count(), 6);
+    }
+
+    #[test]
+    fn cache_hits_share_vertices_and_retained_geometry_survives_invalidation() {
+        let cache = WaveformRenderCache::default();
+        let bands = [[0.5, 0.4, 0.3, 0.6]; 32];
+        let bounds = test_bounds(320.0, 180.0);
+        let viewport = WaveformViewport::full();
+        let selection = WaveformEditRegion::new(0.25, 0.75).unwrap();
+        let first = cache.paths_for(1, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0);
+        let second = cache.paths_for(1, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0);
+        assert!(Rc::ptr_eq(&first, &second));
+        let preview = |gain| {
+            let WaveformGainPreviewGeometry::Bands { paths, .. } = cache
+                .gain_preview_paths_for(
+                    1,
+                    &bands,
+                    1.0,
+                    bounds,
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                    selection,
+                    gain,
+                )
+                .unwrap();
+            paths
+        };
+        let before = preview(0.5);
+        assert!(Rc::ptr_eq(&before, &preview(0.5)));
+        assert!(!Rc::ptr_eq(&before, &preview(2.0)));
+        assert_eq!(before.len(), 4);
+        assert!(Rc::ptr_eq(
+            &first,
+            &cache.paths_for(1, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0)
+        ));
+    }
+
+    #[test]
+    fn gain_preview_reuses_static_and_dynamic_cache_entries() {
+        let cache = WaveformRenderCache::default();
+        let bounds = test_bounds(320.0, 180.0);
+        let viewport = WaveformViewport::full();
+        let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
+        let selection = WaveformEditRegion::new(0.25, 0.75).expect("edit selection");
+
+        assert_eq!(
+            cache
+                .paths_for(7, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0)
+                .len(),
+            4
+        );
+        assert_eq!(cache.rebuild_count(), 1);
+        assert!(
+            cache
+                .gain_preview_paths_for(
+                    7,
+                    &bands,
+                    1.0,
+                    bounds,
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                    selection,
+                    0.0,
+                )
+                .is_some()
+        );
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.gain_preview_rebuild_count(), 1);
+        assert!(
+            cache
+                .gain_preview_paths_for(
+                    7,
+                    &bands,
+                    1.0,
+                    bounds,
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                    selection,
+                    0.0,
+                )
+                .is_some()
+        );
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.gain_preview_rebuild_count(), 1);
+        assert!(
+            cache
+                .gain_preview_paths_for(
+                    7,
+                    &bands,
+                    1.0,
+                    bounds,
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                    selection,
+                    2.0,
+                )
+                .is_some()
+        );
+        assert_eq!(cache.rebuild_count(), 1);
+        assert_eq!(cache.gain_preview_rebuild_count(), 2);
+    }
+
+    #[test]
+    fn gain_preview_applies_gain_before_nonlinear_waveform_shaping() {
+        let bands = vec![[0.2, 0.25, 0.3, 0.35]; 8];
+        let selection = WaveformEditRegion::new(0.25, 0.75).expect("edit selection");
+        let boosted = resample_gain_preview_extents(
+            &bands,
+            8,
+            1.0,
+            WaveformViewport::full(),
+            (0.0, 1.0),
+            selection,
+            0.25,
+            0.75,
+            2.0,
+        );
+        let silent = resample_gain_preview_extents(
+            &bands,
+            8,
+            1.0,
+            WaveformViewport::full(),
+            (0.0, 1.0),
+            selection,
+            0.25,
+            0.75,
+            0.0,
+        );
+        assert!(
+            silent
+                .iter()
+                .all(|column| column.iter().all(|value| *value == 0.0))
+        );
+        let expected = waveform_extent([0.4, 0.5, 0.6, 0.7], 0, 1.0);
+        assert!(boosted[2][0] > expected * 0.99);
+        assert!(boosted[2][0] <= 1.0);
+    }
+
+    #[test]
+    fn gain_preview_keeps_a_narrow_selection_visible_at_zero_gain() {
+        let bounds = test_bounds(320.0, 180.0);
+        let viewport = WaveformViewport::full();
+        let bands = vec![[0.6, 0.5, 0.4, 0.7]; 2_048];
+        let selection = WaveformEditRegion::new(0.50001, 0.50002).expect("narrow selection");
+        let preview = WaveformRenderCache::default()
+            .gain_preview_paths_for(
+                9,
+                &bands,
+                1.0,
+                bounds,
+                viewport,
+                (0.0, 1.0),
+                0,
+                selection,
+                0.0,
+            )
+            .expect("narrow visible preview");
+        let WaveformGainPreviewGeometry::Bands {
+            selection_bounds,
+            paths,
+        } = preview;
+        assert!(selection_bounds.size.width > px(0.0));
+        assert_eq!(paths.len(), 4);
     }
 
     #[test]
@@ -2652,6 +3493,58 @@ mod tests {
     }
 
     #[test]
+    fn edit_gain_handle_matches_native_size_and_visible_clipped_center() {
+        let bounds = test_bounds(200.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let region = WaveformEditRegion::new(0.25, 0.75).expect("edit region");
+        let visual = edit_gain_handle_rect(
+            region,
+            viewport,
+            bounds,
+            EDIT_GAIN_HANDLE_WIDTH,
+            EDIT_GAIN_HANDLE_HEIGHT,
+        )
+        .expect("visible gain handle");
+        assert!((f32::from(visual.origin.x) - 94.0).abs() < 1.0e-6);
+        assert!((f32::from(visual.origin.y) - 0.0).abs() < 1.0e-6);
+        assert!((f32::from(visual.size.width) - 12.0).abs() < 1.0e-6);
+        assert!((f32::from(visual.size.height) - 10.0).abs() < 1.0e-6);
+
+        let clipped = WaveformEditRegion::new(-0.2, 0.4).expect("clipped edit region");
+        let clipped_visual = edit_gain_handle_rect(
+            clipped,
+            viewport,
+            bounds,
+            EDIT_GAIN_HANDLE_WIDTH,
+            EDIT_GAIN_HANDLE_HEIGHT,
+        )
+        .expect("clipped gain handle");
+        assert!((f32::from(clipped_visual.origin.x) - 34.0).abs() < 1.0e-6);
+        assert!(edit_gain_handle_at(
+            region,
+            viewport,
+            bounds,
+            point(px(100.0), px(17.0))
+        ));
+        assert!(!edit_gain_handle_at(
+            region,
+            viewport,
+            bounds,
+            point(px(100.0), px(19.0))
+        ));
+        assert!(
+            edit_gain_handle_rect(
+                WaveformEditRegion::new(1.1, 1.2).expect("offscreen edit region"),
+                viewport,
+                bounds,
+                EDIT_GAIN_HANDLE_WIDTH,
+                EDIT_GAIN_HANDLE_HEIGHT,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn primary_hit_priority_keeps_play_and_edit_gestures_independent() {
         let bounds = test_bounds(200.0, 100.0);
         let viewport = WaveformViewport::full();
@@ -2685,8 +3578,8 @@ mod tests {
         let play_move = begin_primary_waveform_drag(
             Some(play),
             Some(edit),
-            point(px(100.0), px(3.0)),
-            0.5,
+            point(px(125.0), px(3.0)),
+            0.625,
             bounds,
             viewport,
             1,
@@ -2714,6 +3607,72 @@ mod tests {
             1,
         );
         assert_eq!(play_create.selection_kind(), WaveformSelectionKind::Play);
+    }
+
+    #[test]
+    fn gain_handle_has_priority_for_both_pointer_buttons() {
+        let bounds = test_bounds(200.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let play = WaveformPlayRegion::new(0.3, 0.7).expect("play region");
+        let edit = WaveformEditRegion::new(0.2, 0.8).expect("edit region");
+        let settings = WaveformEditSettings::new(1.0, None, None).expect("settings");
+
+        let primary = begin_primary_waveform_drag_with_settings(
+            Some(play),
+            Some(edit),
+            settings,
+            point(px(100.0), px(8.0)),
+            0.5,
+            bounds,
+            viewport,
+            1,
+        );
+        assert!(primary.is_edit_gain());
+        assert_eq!(primary.selection_kind(), WaveformSelectionKind::Edit);
+        assert_eq!(primary.button(), MouseButton::Left);
+
+        let secondary = begin_secondary_waveform_drag_with_settings(
+            Some(edit),
+            settings,
+            point(px(100.0), px(8.0)),
+            0.5,
+            bounds,
+            viewport,
+            1,
+        );
+        assert!(secondary.is_edit_gain());
+        assert_eq!(secondary.button(), MouseButton::Right);
+    }
+
+    #[test]
+    fn gain_drag_uses_one_baseline_for_asymmetric_vertical_updates() {
+        let bounds = test_bounds(200.0, 100.0);
+        let viewport = WaveformViewport::full();
+        let region = WaveformEditRegion::new(0.2, 0.8).expect("edit region");
+        let fade =
+            wavecrate_core::WaveformEditFade::new(0.2, 0.3, 0.4, 0.5).expect("fade settings");
+        let settings = WaveformEditSettings::new(1.0, Some(fade), None).expect("settings");
+        let mut drag = WaveformRegionDrag::begin_edit_gain(
+            point(px(100.0), px(100.0)),
+            0.5,
+            bounds,
+            viewport,
+            region,
+            settings,
+            1,
+            MouseButton::Left,
+        );
+
+        drag.update(point(px(100.0), px(60.0)));
+        assert!(drag.moved);
+        assert!((drag.preview_edit_settings().gain() - 2.0).abs() < 1.0e-6);
+        assert_eq!(drag.preview_edit_settings().fade_in(), Some(fade));
+        assert_eq!(drag.preview_edit_region(), Some(region));
+        assert!(!drag.zero_crossing_applies(BpmSnapSettings::disabled()));
+
+        drag.update(point(px(100.0), px(140.0)));
+        assert!((drag.preview_edit_settings().gain() - (2.0 / 3.0)).abs() < 1.0e-6);
+        assert_eq!(settings.gain(), 1.0);
     }
 
     #[test]
@@ -3074,7 +4033,7 @@ mod tests {
     #[test]
     #[ignore = "manual waveform geometry cache benchmark"]
     fn waveform_geometry_cache_benchmark() {
-        use std::time::Instant;
+        use std::{hint::black_box, time::Instant};
 
         let cache = WaveformRenderCache::default();
         let bands = vec![[0.5, 0.4, 0.3, 0.6]; 2_048];
@@ -3091,5 +4050,50 @@ mod tests {
         }
         let warm = warm_start.elapsed();
         eprintln!("waveform geometry: 100 misses {cold:?}; 100 hits {warm:?}");
+
+        let selection = WaveformEditRegion::new(0.25, 0.75).expect("benchmark selection");
+        for (preview_len, generation) in [(2_048, 200), (65_536, 300)] {
+            let bands = vec![[0.5, 0.4, 0.3, 0.6]; preview_len];
+            let bounds = test_bounds(1_120.0, 180.0);
+            let viewport = WaveformViewport::full();
+            let cache = WaveformRenderCache::default();
+            black_box(cache.paths_for(generation, &bands, 1.0, bounds, viewport, (0.0, 1.0), 0));
+
+            let cold_start = Instant::now();
+            for step in 0..8 {
+                let gain = step as f32 * 0.5;
+                black_box(cache.gain_preview_paths_for(
+                    generation,
+                    &bands,
+                    1.0,
+                    bounds,
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                    selection,
+                    gain,
+                ));
+            }
+            let cold = cold_start.elapsed();
+
+            let warm_start = Instant::now();
+            for _ in 0..100 {
+                black_box(cache.gain_preview_paths_for(
+                    generation,
+                    &bands,
+                    1.0,
+                    bounds,
+                    viewport,
+                    (0.0, 1.0),
+                    0,
+                    selection,
+                    3.5,
+                ));
+            }
+            let warm = warm_start.elapsed();
+            eprintln!(
+                "gain preview {preview_len} inputs at 1120px: 8 distinct gains {cold:?}; 100 cache hits {warm:?}"
+            );
+        }
     }
 }

@@ -286,6 +286,22 @@ const CURATION_ROWS: &[ShortcutRow] = &[
 
 const WAVEFORM_ROWS: &[ShortcutRow] = &[
     ShortcutRow {
+        keys: "Left-drag",
+        description: "Create a play selection; drag its handles to adjust",
+    },
+    ShortcutRow {
+        keys: "Right-drag",
+        description: "Create an edit selection; drag its handles to adjust",
+    },
+    ShortcutRow {
+        keys: "Right-click waveform",
+        description: "Clear the edit selection away from its handles",
+    },
+    ShortcutRow {
+        keys: "Gain handle",
+        description: "Drag vertically to preview edit gain",
+    },
+    ShortcutRow {
         keys: "Z",
         description: "Zoom the waveform to the play selection",
     },
