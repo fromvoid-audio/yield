@@ -2067,3 +2067,10 @@ Review identified and corrected inactive cached metadata, floating-point boundar
 
 
 The browser now carries `PlaybackRetargetTarget` (span, loop/metronome configuration and seek policy) as one value through pending runtime updates, normalized preparation/disable fallback, and output resume. Existing controls still construct it from the accepted span with the new seek policy disabled. This is data propagation only; logical target-generation ordering and editable-span admission remain pending. All 39 transport and 13 normalization tests passed, together with the UI library check.
+
+
+### Budget checkpoint, 2026-09-09
+
+The repository is at a tested prerequisite checkpoint. Compact text-input sizing is opt-in; existing constructors retain their dimensions, and all 12 text-input regressions passed after complete-target propagation. Logical retarget-generation fencing, browser consumption of persistent runtime acknowledgements, and interactive duration editing remain deferred. No generation-fencing changes were made. The existing live-playmark contract in `GPUI_ARCHITECTURE.md` is the next-step authority.
+
+Windows run `34331156363` finished cancelled, so it supplies no completed coverage for Similar Sections or timing work. The latest successful Windows evidence remains `34326573383` at `0427c65f7407e4ab9223e2241c0cacc921d36fac`. Current runtime and target-propagation validation is local as recorded above.
