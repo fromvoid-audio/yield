@@ -2050,3 +2050,8 @@ The shared text input now supports an optional Unicode scalar limit across progr
 
 
 The read-only playmark label now displays duration or beat-relative BPM using the resolved live drag selection. Native placement prefers the selection interior, then either outside edge, with viewport clipping and a bounded fallback. Painting uses actual canvas bounds and the semantic theme background; no idle animation is introduced. Seven focused geometry tests passed, covering narrow and wide selections, edges, tiny bounds and invalid geometry. Interactive editing remains pending the active-span transport foundation.
+
+
+Windows run `34326573383` succeeded at `0427c65f7407e4ab9223e2241c0cacc921d36fac`, adding random-audition coverage to the previously validated shutdown/metronome changes. Run `34331156363` targets `2665c45aea3de1f50230b8c3126a1948097da6a9` for Similar Sections and the read-only playmark label; it does not include the in-progress runtime span work.
+
+The clean `a7f88617d` timing preview built in 22.92 seconds and passed strict ad-hoc signature verification. A native screenshot shows the centered `426 ms` label. The app state changed during interaction and Last Played became Today, so further native actions were paused; this is visual label evidence only, not controlled transport acceptance. Bundle: `target/qa/Wavecrate Timing Preview a7f8861.app`.
