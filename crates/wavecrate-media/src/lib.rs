@@ -13,6 +13,7 @@ use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
 mod detail;
+mod edited_wav;
 mod similar_sections;
 mod span_export;
 mod span_peak;
@@ -25,6 +26,7 @@ pub use detail::{
     WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
     WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
 };
+pub use edited_wav::{encode_edited_wav, encode_edited_wav_with_cancel};
 pub use similar_sections::{
     WavSimilarSectionsRequest, scan_wav_similar_sections, scan_wav_similar_sections_with_cancel,
 };
