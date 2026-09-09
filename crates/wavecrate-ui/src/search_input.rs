@@ -1335,4 +1335,50 @@ mod tests {
             })
         });
     }
+
+    #[gpui::test]
+    fn compact_input_keeps_eighteen_pixel_height_when_focused(cx: &mut gpui::TestAppContext) {
+        use gpui::{ParentElement, Styled};
+        use std::{cell::Cell, rc::Rc};
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let mut options = SearchInputOptions::filename();
+        options.compact_height = Some(18);
+        let (input, cx) = cx.add_window_view(|_, cx| {
+            super::SearchInput::new_with_options_and_content(cx, options, "426 ms")
+        });
+        for focused in [false, true] {
+            if focused {
+                cx.update(|window, app| window.focus(&input.read(app).focus_handle()));
+            }
+            let height = Rc::new(Cell::new(None));
+            let measured = height.clone();
+            cx.draw(
+                gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                gpui::size(
+                    gpui::AvailableSpace::Definite(gpui::px(150.0)),
+                    gpui::AvailableSpace::MinContent,
+                ),
+                |_, _| {
+                    gpui::div()
+                        .relative()
+                        .w(gpui::px(150.0))
+                        .child(input.clone())
+                        .child(
+                            gpui::canvas(
+                                move |bounds, _, _| {
+                                    measured.set(Some(f32::from(bounds.size.height)));
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .right_0(),
+                        )
+                },
+            );
+            assert_eq!(height.get(), Some(18.0), "focused={focused}");
+        }
+    }
 }
