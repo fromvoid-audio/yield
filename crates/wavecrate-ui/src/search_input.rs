@@ -15,12 +15,17 @@ use gpui::{
     fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
-use wavecrate_core::{MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES};
+use wavecrate_core::{
+    MAX_PLAYMARK_TIMING_CHARACTERS, MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES,
+};
 
 use crate::theme::{active, color};
 
 const MAX_NUMERIC_INPUT_BYTES: usize = 64 * 1024;
 const MAX_NUMERIC_DIGITS: usize = 3;
+
+/// Maximum UTF-8 bytes accepted by the compact playmark timing editor.
+pub(crate) const MAX_PLAYMARK_TIMING_INPUT_BYTES: usize = 256;
 
 actions!(
     search_input,
@@ -127,6 +132,19 @@ impl SearchInputOptions {
             underlined: false,
             ascii_digits_only: true,
             compact_height: None,
+        }
+    }
+
+    /// Options for the compact duration/BPM editor rendered over a playmark.
+    pub(crate) const fn playmark_timing() -> Self {
+        Self {
+            placeholder: "",
+            max_bytes: Some(MAX_PLAYMARK_TIMING_INPUT_BYTES),
+            max_characters: Some(MAX_PLAYMARK_TIMING_CHARACTERS),
+            paste_newlines: PasteNewlines::Preserve,
+            underlined: false,
+            ascii_digits_only: false,
+            compact_height: Some(18),
         }
     }
 }
@@ -1144,10 +1162,10 @@ fn marked_selection_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NUMERIC_INPUT_BYTES, MAX_TAG_FILTER_INPUT_BYTES, MAX_TAG_INPUT_BYTES,
-        NumericFilterError, PasteNewlines, SearchInputOptions, filter_ascii_digits,
-        filtered_selection_range_utf16, input_within_limit, marked_selection_range,
-        paste_replacement_text, plan_replacement,
+        MAX_NUMERIC_INPUT_BYTES, MAX_PLAYMARK_TIMING_INPUT_BYTES, MAX_TAG_FILTER_INPUT_BYTES,
+        MAX_TAG_INPUT_BYTES, NumericFilterError, PasteNewlines, SearchInputOptions,
+        filter_ascii_digits, filtered_selection_range_utf16, input_within_limit,
+        marked_selection_range, paste_replacement_text, plan_replacement,
     };
 
     #[test]
@@ -1186,6 +1204,16 @@ mod tests {
         assert_eq!(beat_count.max_bytes, Some(3));
         assert_eq!(beat_count.paste_newlines, PasteNewlines::Preserve);
         assert!(beat_count.ascii_digits_only);
+
+        let playmark_timing = SearchInputOptions::playmark_timing();
+        assert_eq!(
+            playmark_timing.max_bytes,
+            Some(MAX_PLAYMARK_TIMING_INPUT_BYTES)
+        );
+        assert_eq!(playmark_timing.max_characters, Some(64));
+        assert_eq!(playmark_timing.compact_height, Some(18));
+        assert!(!playmark_timing.underlined);
+        assert!(!playmark_timing.ascii_digits_only);
     }
 
     #[test]

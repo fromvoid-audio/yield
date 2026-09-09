@@ -449,6 +449,13 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.playmark_timing_blur_subscription.is_none() {
+            let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
+            self.playmark_timing_blur_subscription =
+                Some(cx.on_blur(&focus_handle, window, |view, window, cx| {
+                    view.commit_playmark_timing_edit(window, cx, false);
+                }));
+        }
         context_menu::invalidate_if_stale(self);
         similar_sections::invalidate_if_stale(self);
         let theme = active(cx).clone();
@@ -1546,10 +1553,13 @@ impl Render for Browser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use gpui::{Modifiers, MouseDownEvent, TestAppContext, point, px};
-    use wavecrate_core::{WaveformEditFade, WaveformEditSettings};
+    use gpui::{
+        EntityInputHandler, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, TestAppContext,
+        VisualTestContext, point, px,
+    };
+    use wavecrate_core::{AudioFile, WaveformEditFade, WaveformEditSettings};
     use wavecrate_media::WaveformPreview;
 
     use super::super::transport;
@@ -1563,6 +1573,281 @@ mod tests {
             total_frames: 48_000,
             detail_context: None,
         }
+    }
+
+    fn install_playmark_state(
+        browser: &gpui::Entity<Browser>,
+        cx: &mut VisualTestContext,
+        path: &Path,
+        region: waveform::WaveformPlayRegion,
+    ) {
+        browser.update(cx, |view, _| {
+            view.root = path.parent().map(Path::to_path_buf);
+            view.entries = vec![AudioFile {
+                path: path.to_path_buf(),
+                relative_path: path
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("sample.wav")),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            view.waveform = Some(inert_preview());
+            view.waveform_generation = 7;
+            view.waveform_play_region = Some(region);
+        });
+    }
+
+    fn commit_playmark_draft(
+        browser: &gpui::Entity<Browser>,
+        cx: &mut VisualTestContext,
+        draft: &str,
+    ) {
+        let draft = draft.to_owned();
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content(draft, cx));
+                view.commit_playmark_timing_edit(window, cx, true);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn playmark_timing_duration_and_bpm_commit_update_stopped_selection(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-playmark-commit-test.wav");
+        let initial = waveform::WaveformPlayRegion::new(0.2, 0.6).expect("play region");
+        install_playmark_state(&browser, cx, &path, initial);
+        commit_playmark_draft(&browser, cx, "200ms");
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert_eq!(
+                view.waveform_play_region,
+                Some(waveform::WaveformPlayRegion::new(0.2, 0.4).expect("duration region"))
+            );
+            assert!(view.playback_init_intent.is_none());
+            assert!(view.playing_path.is_none());
+            assert!(view.accepted_playback_intent.is_none());
+        });
+
+        let bpm_initial = waveform::WaveformPlayRegion::new(0.2, 0.6).expect("BPM region");
+        browser.update(cx, |view, _| {
+            view.waveform_play_region = Some(bpm_initial);
+            view.beat_guides_enabled = false;
+            view.beat_guide_count = 4;
+        });
+        commit_playmark_draft(&browser, cx, "120bpm");
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert_eq!(
+                view.waveform_play_region,
+                Some(waveform::WaveformPlayRegion::new(0.2, 1.0).expect("BPM region"))
+            );
+            assert!(view.playback_init_intent.is_none());
+            assert!(view.playing_path.is_none());
+            assert!(view.accepted_playback_intent.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn playmark_timing_unchanged_and_equivalent_frames_are_noops(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-playmark-noop-test.wav");
+        let initial = waveform::WaveformPlayRegion::new(0.2, 0.4).expect("play region");
+        install_playmark_state(&browser, cx, &path, initial);
+
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                let original = view.playmark_timing_input.read(cx).content().to_owned();
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content(original, cx));
+                view.commit_playmark_timing_edit(window, cx, true);
+            });
+        });
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.playmark_timing_editor.is_none());
+            assert_eq!(view.waveform_play_region, Some(initial));
+            assert!(view.playback_init_intent.is_none());
+        });
+
+        commit_playmark_draft(&browser, cx, "200ms");
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.playmark_timing_editor.is_none());
+            assert_eq!(view.waveform_play_region, Some(initial));
+            assert!(view.playback_init_intent.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn stale_playmark_timing_commit_is_discarded_for_generation_and_selection_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-playmark-stale-test.wav");
+        let initial = waveform::WaveformPlayRegion::new(0.2, 0.6).expect("play region");
+        install_playmark_state(&browser, cx, &path, initial);
+
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content("200ms", cx));
+                view.waveform_generation = view.waveform_generation.wrapping_add(1);
+                view.commit_playmark_timing_edit(window, cx, true);
+            });
+        });
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.playmark_timing_editor.is_none());
+            assert_eq!(view.waveform_play_region, Some(initial));
+        });
+
+        browser.update(cx, |view, _| {
+            view.waveform_generation = 7;
+            view.selected = Some(0);
+            view.waveform_play_region = Some(initial);
+        });
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content("200ms", cx));
+                view.selected = None;
+                view.commit_playmark_timing_edit(window, cx, true);
+            });
+        });
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.playmark_timing_editor.is_none());
+            assert_eq!(view.waveform_play_region, Some(initial));
+        });
+    }
+
+    #[gpui::test]
+    fn playmark_timing_escape_cancels_and_ime_enter_does_not_commit(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-playmark-key-test.wav");
+        let initial = waveform::WaveformPlayRegion::new(0.2, 0.6).expect("play region");
+        install_playmark_state(&browser, cx, &path, initial);
+
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input.update(cx, |input, cx| {
+                    input.replace_and_mark_text_in_range(
+                        Some(0..input.content().len()),
+                        "200ms",
+                        Some(0..5),
+                        window,
+                        cx,
+                    );
+                });
+                let enter = KeyDownEvent {
+                    keystroke: Keystroke::parse("enter").expect("enter keystroke"),
+                    is_held: false,
+                };
+                view.handle_key_down(&enter, window, cx);
+                assert!(view.playmark_timing_editor.is_some());
+                assert_eq!(view.waveform_play_region, Some(initial));
+
+                let escape = KeyDownEvent {
+                    keystroke: Keystroke::parse("escape").expect("escape keystroke"),
+                    is_held: false,
+                };
+                view.handle_key_down(&escape, window, cx);
+                assert!(view.playmark_timing_editor.is_none());
+                assert_eq!(view.waveform_play_region, Some(initial));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn invalid_playmark_timing_blur_keeps_draft_and_refocuses_editor(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, _| window.activate_window());
+        let path = PathBuf::from("/tmp/inert-playmark-timing-test.wav");
+        let region = waveform::WaveformPlayRegion::new(0.2, 0.6).expect("play region");
+        browser.update(cx, |view, _| {
+            view.root = Some(PathBuf::from("/tmp"));
+            view.entries = vec![AudioFile {
+                path: path.clone(),
+                relative_path: PathBuf::from("inert-playmark-timing-test.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            view.waveform = Some(inert_preview());
+            view.waveform_generation = 7;
+            view.waveform_play_region = Some(region);
+        });
+        cx.refresh().expect("refresh inert browser");
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content("not a timing", cx));
+            });
+        });
+        cx.refresh().expect("refresh active playmark timing editor");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let view = browser.read(app);
+            assert!(
+                view.playmark_timing_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
+
+        cx.update(|window, app| {
+            let view = browser.read(app);
+            let search_focus = view.search_input.read(app).focus_handle();
+            window.focus(&search_focus);
+        });
+        cx.refresh().expect("refresh after playmark timing blur");
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            let view = browser.read(app);
+            let editor = view
+                .playmark_timing_editor
+                .as_ref()
+                .expect("invalid blur keeps editor open");
+            assert_eq!(
+                editor.error.as_deref(),
+                Some("Use a value such as 1000ms, 1.5s, 1min, or 142bpm")
+            );
+            assert_eq!(
+                view.playmark_timing_input.read(app).content(),
+                "not a timing"
+            );
+            assert!(
+                view.playmark_timing_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
     }
 
     #[gpui::test]

@@ -21,7 +21,7 @@ use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
     FolderTreeRow, PlaybackLoopPolicy, PlaybackNavigationHistory, SortColumn, WaveformEditRegion,
-    WaveformEditSettings, WaveformViewport,
+    WaveformEditSettings, WaveformViewport, parse_playmark_frame_range, playmark_selection_label,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_library::sample_sources::{SampleSource, SourceId};
@@ -228,12 +228,27 @@ impl ThemeLoadState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PlaymarkTimingEditorState {
+    source_id: Option<SourceId>,
+    source_root: PathBuf,
+    path: PathBuf,
+    waveform_generation: u64,
+    region: waveform::WaveformPlayRegion,
+    original_text: String,
+    error: Option<String>,
+}
+
 pub(crate) struct Browser {
     focus_handle: FocusHandle,
     waveform_focus_handle: FocusHandle,
     volume_focus_handle: FocusHandle,
     search_input: gpui::Entity<SearchInput>,
     _search_subscription: gpui::Subscription,
+    playmark_timing_input: gpui::Entity<SearchInput>,
+    _playmark_timing_subscription: gpui::Subscription,
+    playmark_timing_editor: Option<PlaymarkTimingEditorState>,
+    playmark_timing_blur_subscription: Option<gpui::Subscription>,
     beat_count_input: gpui::Entity<BeatCountInput>,
     _beat_count_subscription: gpui::Subscription,
     tag_input: gpui::Entity<SearchInput>,
@@ -421,6 +436,17 @@ impl Browser {
                 view.reconcile_selection();
                 view.restore_explicit_projection_focus(previous_id, previous_position, cx);
             });
+        let playmark_timing_input =
+            cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::playmark_timing()));
+        let playmark_timing_subscription = cx.subscribe(
+            &playmark_timing_input,
+            |view, _input, _: &SearchChanged, cx| {
+                if let Some(editor) = view.playmark_timing_editor.as_mut() {
+                    editor.error = None;
+                    cx.notify();
+                }
+            },
+        );
         let beat_count_input = cx.new(BeatCountInput::new);
         let beat_count_subscription = cx.subscribe(
             &beat_count_input,
@@ -461,6 +487,10 @@ impl Browser {
             volume_focus_handle: cx.focus_handle(),
             search_input,
             _search_subscription: search_subscription,
+            playmark_timing_input,
+            _playmark_timing_subscription: playmark_timing_subscription,
+            playmark_timing_editor: None,
+            playmark_timing_blur_subscription: None,
             beat_count_input,
             _beat_count_subscription: beat_count_subscription,
             tag_input,
@@ -646,6 +676,168 @@ impl Browser {
         self.selected
             .and_then(|index| self.entries.get(index))
             .map(AudioFile::stable_id)
+    }
+
+    fn active_source_id(&self) -> Option<SourceId> {
+        self.active_source
+            .and_then(|index| self.source_sessions.get(index))
+            .and_then(|session| session.source_id.clone())
+    }
+
+    fn selected_audio_path(&self) -> Option<&Path> {
+        self.selected
+            .and_then(|index| self.entries.get(index))
+            .map(|entry| entry.path.as_path())
+    }
+
+    fn playmark_timing_editor_is_current(&self, editor: &PlaymarkTimingEditorState) -> bool {
+        self.waveform.is_some()
+            && self.waveform_generation == editor.waveform_generation
+            && self.waveform_play_region == Some(editor.region)
+            && self.selected_audio_path() == Some(editor.path.as_path())
+            && self.root.as_deref() == Some(editor.source_root.as_path())
+            && self.active_source_id() == editor.source_id
+    }
+
+    fn begin_playmark_timing_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(preview) = self.waveform.as_ref() else {
+            return false;
+        };
+        let Some(region) = self.waveform_play_region else {
+            return false;
+        };
+        let Some(source_root) = self.root.clone() else {
+            return false;
+        };
+        let Some(path) = self.selected_audio_path().map(Path::to_path_buf) else {
+            return false;
+        };
+        let Some(core_region) = region.core() else {
+            return false;
+        };
+        let Some(original_text) = playmark_selection_label(
+            core_region,
+            preview.total_frames,
+            preview.sample_rate,
+            self.beat_guides_enabled.then_some(self.beat_guide_count),
+        ) else {
+            return false;
+        };
+        self.playmark_timing_editor = Some(PlaymarkTimingEditorState {
+            source_id: self.active_source_id(),
+            source_root,
+            path,
+            waveform_generation: self.waveform_generation,
+            region,
+            original_text: original_text.clone(),
+            error: None,
+        });
+        self.playmark_timing_input.update(cx, |input, cx| {
+            input.set_content(original_text, cx);
+            input.select_all_content(cx);
+        });
+        let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
+        window.focus(&focus_handle);
+        cx.notify();
+        true
+    }
+
+    fn cancel_playmark_timing_edit(&mut self) -> bool {
+        self.playmark_timing_editor.take().is_some()
+    }
+
+    fn theme_changed_inputs(&self, cx: &mut Context<Self>) {
+        self.search_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+        self.playmark_timing_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+    }
+
+    fn commit_playmark_timing_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        restore_focus: bool,
+    ) {
+        let Some(editor) = self.playmark_timing_editor.clone() else {
+            return;
+        };
+        let draft = self.playmark_timing_input.read(cx).content().to_owned();
+        if !self.playmark_timing_editor_is_current(&editor) {
+            self.cancel_playmark_timing_edit();
+            return;
+        }
+        if draft == editor.original_text {
+            self.cancel_playmark_timing_edit();
+            if restore_focus {
+                window.focus(&self.waveform_focus_handle);
+            }
+            cx.notify();
+            return;
+        }
+        let Some(preview) = self.waveform.as_ref() else {
+            self.cancel_playmark_timing_edit();
+            return;
+        };
+        let Some(current) = editor.region.core() else {
+            self.cancel_playmark_timing_edit();
+            return;
+        };
+        let parsed = parse_playmark_frame_range(
+            &draft,
+            preview.sample_rate,
+            preview.total_frames,
+            self.beat_guide_count,
+            current,
+        );
+        let (start_frame, end_frame) = match parsed {
+            Ok(range) => range,
+            Err(error) => {
+                if let Some(editor) = self.playmark_timing_editor.as_mut() {
+                    editor.error = Some(error.clone());
+                }
+                self.playback_status = format!("Playmark timing: {error}");
+                let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
+                window.focus(&focus_handle);
+                cx.notify();
+                return;
+            }
+        };
+        if playmark_timing::frame_range_for_region(editor.region, preview.total_frames)
+            == Some((start_frame, end_frame))
+        {
+            self.cancel_playmark_timing_edit();
+            if restore_focus {
+                window.focus(&self.waveform_focus_handle);
+            }
+            cx.notify();
+            return;
+        }
+        let total_frames = preview.total_frames as f64;
+        let Some(region) = waveform::WaveformPlayRegion::new(
+            start_frame as f64 / total_frames,
+            end_frame as f64 / total_frames,
+        ) else {
+            self.cancel_playmark_timing_edit();
+            return;
+        };
+        let path = editor.path.clone();
+        self.cancel_playmark_timing_edit();
+        self.set_waveform_play_region(Some(region));
+        similar_sections::invalidate_if_stale(self);
+        match self.submit_playmark_timing_span(&path, region, cx) {
+            Some(Ok(())) => {
+                self.playback_status = "Playmark timing applying to playback".to_string();
+            }
+            Some(Err(error)) => {
+                self.playback_status = format!("Playmark timing update unavailable: {error}");
+            }
+            None => {}
+        }
+        if restore_focus {
+            window.focus(&self.waveform_focus_handle);
+        }
+        cx.notify();
     }
 
     fn bpm_snap_settings(&self) -> waveform::BpmSnapSettings {
@@ -1645,8 +1837,7 @@ impl Browser {
             return;
         }
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.search_input
-            .update(cx, |input, cx| input.theme_changed(cx));
+        self.theme_changed_inputs(cx);
         cx.notify();
     }
 
@@ -1793,8 +1984,7 @@ impl Browser {
         self.theme_task.take();
         cx.set_global(ActiveTheme(Arc::new(theme)));
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
-        self.search_input
-            .update(cx, |input, cx| input.theme_changed(cx));
+        self.theme_changed_inputs(cx);
         cx.notify();
     }
 
@@ -1814,8 +2004,7 @@ impl Browser {
         if loop_mode_changed {
             self.apply_loop_mode_change(self.playback_policy.enabled(), cx);
         }
-        self.search_input
-            .update(cx, |input, cx| input.theme_changed(cx));
+        self.theme_changed_inputs(cx);
         cx.notify();
     }
 
@@ -1881,8 +2070,7 @@ impl Browser {
         let theme_name = theme.name.clone();
         cx.set_global(ActiveTheme(Arc::new(theme)));
         self.theme_status = theme_name;
-        self.search_input
-            .update(cx, |input, cx| input.theme_changed(cx));
+        self.theme_changed_inputs(cx);
         cx.notify();
     }
 
@@ -2061,6 +2249,25 @@ impl Browser {
             }
             if key == "escape" {
                 window.focus(&self.focus_handle);
+            }
+            return;
+        }
+        if self
+            .playmark_timing_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            if key == "escape" {
+                self.cancel_playmark_timing_edit();
+                window.focus(&self.waveform_focus_handle);
+                cx.notify();
+                cx.stop_propagation();
+            } else if key == "enter" {
+                if !event.is_held && !self.playmark_timing_input.read(cx).is_composing() {
+                    self.commit_playmark_timing_edit(window, cx, true);
+                }
+                cx.stop_propagation();
             }
             return;
         }

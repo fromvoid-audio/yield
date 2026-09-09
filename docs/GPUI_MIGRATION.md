@@ -2092,3 +2092,12 @@ The browser confirms retargets only when the persistent configured request ident
 The runtime executor now retains successful metronome configuration for lazy WAV playback, whose static metronome cannot be read through a live span control. Replacement attempts, stop and inactive playback clear this metadata; successful retargets update it. The public AudioPlayer live-control accessor keeps its existing semantics.
 
 Validation passed: 214 Reson tests, 43 focused browser transport tests, application checking, formatting and diff checks. The real-output lazy-WAV regression explicitly skipped because no audio output device was available. Audible acceptance and interactive timing editing remain outstanding.
+
+
+### Interactive playmark timing, 2026-09-09
+
+The waveform duration/BPM label now opens an 18-pixel text editor using current-frame label geometry. Existing resize, move, fade and gain handles retain priority. The input accepts at most 64 Unicode scalars and 256 UTF-8 bytes; invalid blur retains the draft and restores focus, composing Enter does not commit, and Escape cancels. Exact original text and equivalent frame ranges close without changing the selection. BPM input uses the configured beat count even when guides are hidden.
+
+Draft ownership includes source, path, waveform generation and original selection. Selection changes and waveform gestures cancel stale drafts. Valid edits update the visible playmark and retarget only accepted playback of that file through the shared normalization/generation path with the runtime outside-span seek policy. Stopped edits do not start playback. Theme changes refresh the compact input.
+
+Validation: all 376 UI tests passed, with one existing benchmark ignored; application checking and diff checks passed. Focused coverage includes duration/BPM commits, no-op edits, stale generation/selection rejection, Escape/IME, invalid blur, geometry and input bounds. A failing blur test was traced to its inactive GPUI test window and fixed by activating that window before drawing; no production focus workaround was needed. Native pointer/keyboard smoke testing and audible acceptance remain pending.

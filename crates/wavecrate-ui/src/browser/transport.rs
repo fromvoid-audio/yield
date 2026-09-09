@@ -439,6 +439,41 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
         let target = self.accepted_playback_retarget_target(desired)?;
+        self.submit_live_playback_target(target, cx)
+    }
+
+    /// Apply a committed timing span only to accepted playback of the edited file.
+    /// Stopped playback and other selected files do not start a new audition.
+    pub(super) fn submit_playmark_timing_span(
+        &mut self,
+        path: &Path,
+        span: WaveformPlayRegion,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
+        let selected_path = self
+            .selected
+            .and_then(|index| self.entries.get(index))
+            .map(|entry| entry.path.as_path());
+        if selected_path != Some(path)
+            || self.playing_path.as_deref() != Some(path)
+            || self.accepted_playback_intent.as_ref()?.path != path
+            || self.waveform.is_none()
+        {
+            return None;
+        }
+        let target = PlaybackRetargetTarget {
+            span,
+            desired: self.current_playback_desired_state(),
+            seek_if_outside: true,
+        };
+        self.submit_live_playback_target(target, cx)
+    }
+
+    fn submit_live_playback_target(
+        &mut self,
+        target: PlaybackRetargetTarget,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), String>> {
         if self.normalized_audition.enabled() {
             let request = self.new_playback_retarget_request(target)?;
             if self.schedule_normalized_playback_retarget(request.clone(), cx) {

@@ -310,7 +310,7 @@ impl Browser {
         self.waveform_scrollbar_drag = None;
         self.waveform_fade_hover = None;
         super::zero_crossing::cancel_for_interruption(self);
-        self.waveform_play_region = Some(region);
+        self.set_waveform_play_region(Some(region));
         super::similar_sections::invalidate_if_stale(self);
         self.waveform_viewport =
             viewport_containing_selection(self.waveform_viewport, total_frames, region);

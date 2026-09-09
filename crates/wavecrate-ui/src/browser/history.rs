@@ -120,8 +120,10 @@ impl Browser {
     fn replay_loaded_history_entry(&mut self, entry: PlaybackHistoryEntry, cx: &mut Context<Self>) {
         let span = entry.span();
         self.clear_waveform_region();
-        self.waveform_play_region =
-            WaveformPlayRegion::new(f64::from(span.start()), f64::from(span.end()));
+        self.set_waveform_play_region(WaveformPlayRegion::new(
+            f64::from(span.start()),
+            f64::from(span.end()),
+        ));
         let Some(selected_path) = self
             .selected
             .and_then(|index| self.entries.get(index))

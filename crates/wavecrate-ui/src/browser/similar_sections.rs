@@ -528,7 +528,7 @@ mod tests {
             end_frame: 850,
         };
         browser.update(cx, |view, _| {
-            view.waveform_play_region = Some(play_region);
+            view.set_waveform_play_region(Some(play_region));
             view.playing_path = Some(path.clone());
             view.accepted_playback_intent = Some(accepted.clone());
             view.playback_epoch = 41;

@@ -252,8 +252,7 @@ future alone does not satisfy this ordering.
 
 ## Live playmark timing contract
 
-Interactive duration editing is not enabled yet. Before enabling it, live retargeting
-must carry an immutable complete target (selection span, loop mode and metronome
+Interactive duration editing uses live retargeting that must carry an immutable complete target (selection span, loop mode and metronome
 configuration), a monotonic target generation, and the playback identity, path,
 waveform generation, playback epoch and output generation that admitted it.
 Normalized preparation analyzes the captured target span. Completion checks that

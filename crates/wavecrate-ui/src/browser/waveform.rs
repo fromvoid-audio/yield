@@ -263,7 +263,7 @@ impl WaveformPlayRegion {
         }
     }
 
-    fn core(self) -> Option<WaveformRegion> {
+    pub(super) fn core(self) -> Option<WaveformRegion> {
         WaveformRegion::new(self.start, self.end)
     }
 
@@ -1818,9 +1818,7 @@ pub(super) fn render_waveform(
                 WaveformSelectionKind::Play,
             ),
         ));
-        if let Some(preview) = browser.waveform.as_ref()
-            && let Some(region) = region.core()
-        {
+        if let Some(preview) = browser.waveform.as_ref() {
             bars = bars.child(playmark_timing::render_overlay(
                 region,
                 browser.waveform_viewport,
@@ -1831,6 +1829,11 @@ pub(super) fn render_waveform(
                     .then_some(browser.beat_guide_count),
                 color(theme.colors.waveform_playmark_label_background),
                 color(theme.colors.text_primary),
+                browser
+                    .playmark_timing_editor
+                    .as_ref()
+                    .filter(|editor| browser.playmark_timing_editor_is_current(editor))
+                    .map(|_| browser.playmark_timing_input.clone()),
             ));
         }
     }
@@ -1946,7 +1949,10 @@ pub(super) fn render_waveform(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                window.focus(&view.waveform_focus_handle);
+                if view.playmark_timing_editor.is_some() {
+                    view.cancel_playmark_timing_edit();
+                    window.focus(&view.waveform_focus_handle);
+                }
                 if view.waveform.is_none() {
                     return;
                 }
@@ -1993,6 +1999,24 @@ pub(super) fn render_waveform(
                     view.waveform_viewport,
                     view.waveform_generation,
                 );
+                if matches!(drag.mode, WaveformRegionDragMode::Create { .. })
+                    && let Some(preview) = view.waveform.as_ref()
+                    && let Some(region) = view.waveform_play_region
+                    && let Some((_, layout)) = playmark_timing::label_layout(
+                        bounds,
+                        view.waveform_viewport,
+                        region,
+                        preview.total_frames,
+                        preview.sample_rate,
+                        view.beat_guides_enabled.then_some(view.beat_guide_count),
+                    )
+                    && layout.rect.contains(&event.position)
+                    && view.begin_playmark_timing_edit(window, cx)
+                {
+                    cx.stop_propagation();
+                    return;
+                }
+                window.focus(&view.waveform_focus_handle);
                 if matches!(drag.mode, WaveformRegionDragMode::Create { .. })
                     && similar_sections::select_at(
                         view,
@@ -2145,6 +2169,7 @@ impl Browser {
     }
 
     pub(super) fn clear_waveform_region(&mut self) {
+        self.cancel_playmark_timing_edit();
         self.similar_sections.cancel();
         zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
@@ -2156,18 +2181,26 @@ impl Browser {
         self.waveform_scrollbar_drag = None;
     }
 
+    pub(super) fn set_waveform_play_region(&mut self, region: Option<WaveformPlayRegion>) {
+        if self.waveform_play_region != region {
+            self.cancel_playmark_timing_edit();
+        }
+        self.waveform_play_region = region;
+    }
+
     pub(super) fn cancel_waveform_region_drag(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let canceled_timing = self.cancel_playmark_timing_edit();
         let had_region_drag = self.waveform_region_drag.take().is_some();
         if had_region_drag {
             self.clear_waveform_fade_hover();
             cx.stop_active_drag(window);
         }
         let canceled_zero_crossing = zero_crossing::cancel_for_interruption(self);
-        had_region_drag || canceled_zero_crossing
+        had_region_drag || canceled_timing || canceled_zero_crossing
     }
 
     pub(super) fn cancel_waveform_gestures(
@@ -2175,6 +2208,7 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let canceled_timing = self.cancel_playmark_timing_edit();
         let had_region_drag = self.waveform_region_drag.take().is_some();
         let had_pan_drag = self.waveform_pan_drag.take().is_some();
         let had_scrollbar_drag = self.waveform_scrollbar_drag.take().is_some();
@@ -2182,8 +2216,11 @@ impl Browser {
             self.clear_waveform_fade_hover();
         }
         let canceled_zero_crossing = zero_crossing::cancel_for_interruption(self);
-        let canceled =
-            had_region_drag || had_pan_drag || had_scrollbar_drag || canceled_zero_crossing;
+        let canceled = had_region_drag
+            || had_pan_drag
+            || had_scrollbar_drag
+            || canceled_timing
+            || canceled_zero_crossing;
         if canceled {
             if had_region_drag || had_pan_drag || had_scrollbar_drag {
                 cx.stop_active_drag(window);
@@ -2298,6 +2335,7 @@ impl Browser {
         if self.waveform_viewport.is_effectively_equal(next) {
             return false;
         }
+        self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
@@ -2332,6 +2370,7 @@ impl Browser {
         if self.waveform_viewport.is_effectively_equal(next) {
             return false;
         }
+        self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
@@ -2347,6 +2386,7 @@ impl Browser {
         if self.waveform_viewport.is_effectively_equal(next) {
             return false;
         }
+        self.cancel_playmark_timing_edit();
         self.waveform_viewport = next;
         self.waveform_region_drag = None;
         self.waveform_pan_drag = None;
@@ -2368,7 +2408,8 @@ impl Browser {
         if next == region {
             return false;
         }
-        self.waveform_play_region = Some(next);
+        self.cancel_playmark_timing_edit();
+        self.set_waveform_play_region(Some(next));
         similar_sections::invalidate_if_stale(self);
         let Some(preview) = self.waveform.as_ref() else {
             return true;
@@ -2474,7 +2515,7 @@ impl Browser {
         } else if drag.is_handle_drag() {
             if drag.moved {
                 if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
-                    self.waveform_play_region = Some(region);
+                    self.set_waveform_play_region(Some(region));
                     similar_sections::invalidate_if_stale(self);
                     if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule(self, region, cx);
@@ -2484,14 +2525,14 @@ impl Browser {
         } else if drag.moved {
             self.stop_playback();
             if let Some(region) = drag.preview_region() {
-                self.waveform_play_region = Some(region);
+                self.set_waveform_play_region(Some(region));
                 similar_sections::invalidate_if_stale(self);
                 if drag.zero_crossing_applies(bpm_snap) {
                     zero_crossing::commit_or_schedule(self, region, cx);
                 }
             }
         } else if let Some(ratio) = drag.ratio_at(position) {
-            self.waveform_play_region = None;
+            self.set_waveform_play_region(None);
             similar_sections::invalidate_if_stale(self);
             self.start_playback_from_position(ratio, cx);
         }

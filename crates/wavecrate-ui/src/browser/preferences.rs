@@ -492,6 +492,8 @@ impl Browser {
             cx.set_global(crate::theme::ActiveTheme(Arc::new(effective.theme.clone())));
             self.search_input
                 .update(cx, |input, cx| input.theme_changed(cx));
+            self.playmark_timing_input
+                .update(cx, |input, cx| input.theme_changed(cx));
         }
         if self.theme_load.pending_path.is_none() {
             self.theme_load.active_path = effective.theme_source_path.clone();
