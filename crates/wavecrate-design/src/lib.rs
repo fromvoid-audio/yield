@@ -137,6 +137,10 @@ fn default_waveform_edit_selection() -> Color {
     Color::rgb(174, 176, 173)
 }
 
+fn default_waveform_playmark_label_background() -> Color {
+    Color::rgba(24, 27, 28, 230)
+}
+
 fn default_waveform_similar_fill() -> Color {
     Color::rgba(114, 235, 184, 54)
 }
@@ -258,6 +262,9 @@ pub struct Colors {
     /// Neutral edit-selection color, independent of the playback selection accent.
     #[serde(default = "default_waveform_edit_selection")]
     pub waveform_edit_selection: Color,
+    /// Background behind the waveform playmark duration or BPM label.
+    #[serde(default = "default_waveform_playmark_label_background")]
+    pub waveform_playmark_label_background: Color,
     /// Similar-section fill color.
     #[serde(default = "default_waveform_similar_fill")]
     pub waveform_similar_fill: Color,
@@ -434,6 +441,7 @@ impl Default for Theme {
                 waveform_high: Color::rgba(232, 236, 237, 209),
                 waveform_playhead: default_waveform_playhead(),
                 waveform_edit_selection: default_waveform_edit_selection(),
+                waveform_playmark_label_background: default_waveform_playmark_label_background(),
                 waveform_similar_fill: default_waveform_similar_fill(),
                 waveform_similar_rail: default_waveform_similar_rail(),
                 waveform_similar_hover_fill: default_waveform_similar_hover_fill(),
@@ -922,6 +930,7 @@ mod tests {
             "collection_slots",
             "waveform_playhead",
             "waveform_edit_selection",
+            "waveform_playmark_label_background",
             "waveform_similar_fill",
             "waveform_similar_rail",
             "waveform_similar_hover_fill",
@@ -970,6 +979,10 @@ mod tests {
         assert_eq!(
             theme.colors.waveform_similar_hover_rail,
             default_waveform_similar_hover_rail()
+        );
+        assert_eq!(
+            theme.colors.waveform_playmark_label_background,
+            default_waveform_playmark_label_background()
         );
         assert_eq!(theme.waveform.scrollbar_height, 6.0);
         assert_eq!(

@@ -74,6 +74,7 @@ pub(crate) fn install_keybindings(cx: &mut App) {
 pub(crate) struct SearchInputOptions {
     placeholder: &'static str,
     max_bytes: Option<usize>,
+    max_characters: Option<usize>,
     paste_newlines: PasteNewlines,
     underlined: bool,
     ascii_digits_only: bool,
@@ -84,6 +85,7 @@ impl SearchInputOptions {
         Self {
             placeholder: "Search filenames",
             max_bytes: None,
+            max_characters: None,
             paste_newlines: PasteNewlines::AsSpaces,
             underlined: false,
             ascii_digits_only: false,
@@ -94,6 +96,7 @@ impl SearchInputOptions {
         Self {
             placeholder: "ADD TAG",
             max_bytes: Some(MAX_TAG_INPUT_BYTES),
+            max_characters: None,
             paste_newlines: PasteNewlines::AsCommas,
             underlined: true,
             ascii_digits_only: false,
@@ -104,6 +107,7 @@ impl SearchInputOptions {
         Self {
             placeholder: "ANY",
             max_bytes: Some(MAX_TAG_FILTER_INPUT_BYTES),
+            max_characters: None,
             paste_newlines: PasteNewlines::Preserve,
             underlined: true,
             ascii_digits_only: false,
@@ -114,6 +118,7 @@ impl SearchInputOptions {
         Self {
             placeholder: "",
             max_bytes: Some(3),
+            max_characters: None,
             paste_newlines: PasteNewlines::Preserve,
             underlined: false,
             ascii_digits_only: true,
@@ -169,6 +174,11 @@ impl SearchInput {
         } else {
             content
         };
+        let content = if characters_within_limit(&content, options.max_characters) {
+            content
+        } else {
+            "".into()
+        };
         Self {
             focus_handle: cx.focus_handle(),
             options,
@@ -220,7 +230,9 @@ impl SearchInput {
         } else {
             content
         };
-        if !input_within_limit(content.len(), self.options.max_bytes) {
+        if !input_within_limit(content.len(), self.options.max_bytes)
+            || !characters_within_limit(&content, self.options.max_characters)
+        {
             self.reject_edit(cx);
             return;
         }
@@ -536,6 +548,15 @@ impl EntityInputHandler for SearchInput {
             self.reject_edit(cx);
             return;
         };
+        if !replacement_within_character_limit(
+            &self.content,
+            &range,
+            replacement.as_ref(),
+            self.options.max_characters,
+        ) {
+            self.reject_edit(cx);
+            return;
+        }
         self.content =
             replace_content(&self.content, &range, replacement.as_ref(), resulting_len).into();
         self.ghost = "".into();
@@ -580,6 +601,15 @@ impl EntityInputHandler for SearchInput {
             self.reject_edit(cx);
             return;
         };
+        if !replacement_within_character_limit(
+            &self.content,
+            &range,
+            replacement.as_ref(),
+            self.options.max_characters,
+        ) {
+            self.reject_edit(cx);
+            return;
+        }
         self.content =
             replace_content(&self.content, &range, replacement.as_ref(), resulting_len).into();
         self.ghost = "".into();
@@ -905,6 +935,34 @@ fn input_within_limit(value_len: usize, max_bytes: Option<usize>) -> bool {
     max_bytes.is_none_or(|max_bytes| value_len <= max_bytes)
 }
 
+fn characters_within_limit(value: &str, max_characters: Option<usize>) -> bool {
+    max_characters.is_none_or(|limit| value.chars().take(limit.saturating_add(1)).count() <= limit)
+}
+
+fn replacement_within_character_limit(
+    content: &str,
+    range: &Range<usize>,
+    replacement: &str,
+    max_characters: Option<usize>,
+) -> bool {
+    let Some(limit) = max_characters else {
+        return true;
+    };
+    if range.start > range.end {
+        return false;
+    }
+    let (Some(before), Some(after)) = (content.get(..range.start), content.get(range.end..)) else {
+        return false;
+    };
+    before
+        .chars()
+        .chain(replacement.chars())
+        .chain(after.chars())
+        .take(limit.saturating_add(1))
+        .count()
+        <= limit
+}
+
 fn plan_replacement(
     content: &str,
     range: &Range<usize>,
@@ -1191,5 +1249,68 @@ mod tests {
         assert_eq!(filtered_selection_range_utf16("a1😀2", &(1..4)), 0..1);
         assert_eq!(filtered_selection_range_utf16("a1😀2", &(2..3)), 1..1);
         assert_eq!(filtered_selection_range_utf16("abc", &(1..2)), 0..0);
+    }
+
+    #[test]
+    fn character_limit_counts_scalars_and_reclaims_the_replaced_selection() {
+        use super::{characters_within_limit, replacement_within_character_limit};
+        assert!(characters_within_limit("a😀b", Some(3)));
+        assert!(!characters_within_limit("a😀bc", Some(3)));
+        assert!(!characters_within_limit("e\u{301}", Some(1)));
+        assert!(replacement_within_character_limit(
+            "a😀b",
+            &(1..5),
+            "é",
+            Some(3)
+        ));
+        assert!(!replacement_within_character_limit(
+            "a😀b",
+            &(1..5),
+            "éé",
+            Some(3)
+        ));
+        assert!(!replacement_within_character_limit(
+            "a😀b",
+            &(2..5),
+            "é",
+            Some(3)
+        ));
+        assert!(replacement_within_character_limit(
+            "a😀b",
+            &(1..5),
+            "long",
+            None
+        ));
+    }
+
+    #[gpui::test]
+    fn bounded_input_preserves_text_and_composition_when_an_edit_is_rejected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::EntityInputHandler;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let mut options = SearchInputOptions::filename();
+        options.max_bytes = Some(12);
+        options.max_characters = Some(3);
+        let (input, cx) = cx.add_window_view(|_, cx| {
+            super::SearchInput::new_with_options_and_content(cx, options, "a😀b")
+        });
+        cx.update(|window, app| {
+            input.update(app, |input, cx| {
+                input.replace_text_in_range(Some(1..3), "é", window, cx);
+                assert_eq!(input.content(), "aéb");
+                input.replace_and_mark_text_in_range(Some(1..2), "😀", Some(0..2), window, cx);
+                assert_eq!(input.content(), "a😀b");
+                let marked = input.marked_range.clone();
+                let selected = input.selected_range.clone();
+                input.replace_and_mark_text_in_range(Some(4..4), "z", Some(1..1), window, cx);
+                assert_eq!(input.content(), "a😀b");
+                assert_eq!(input.marked_range, marked);
+                assert_eq!(input.selected_range, selected);
+                input.set_content("abcd", cx);
+                assert_eq!(input.content(), "a😀b");
+                assert_eq!(input.marked_range, marked);
+            })
+        });
     }
 }

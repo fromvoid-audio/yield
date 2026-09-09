@@ -13,6 +13,7 @@ mod last_played;
 mod playback_history;
 mod playback_loop_policy;
 mod playback_type_filter;
+mod playmark_timing;
 mod random_audition;
 mod rating;
 mod rating_filter;
@@ -41,6 +42,9 @@ pub use playback_history::{
 };
 pub use playback_loop_policy::PlaybackLoopPolicy;
 pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackTypeFilter};
+pub use playmark_timing::{
+    MAX_PLAYMARK_TIMING_CHARACTERS, parse_playmark_frame_range, playmark_selection_label,
+};
 pub use random_audition::{RandomAuditionUnits, random_audition_span_for_units};
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};

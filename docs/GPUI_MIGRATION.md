@@ -2040,3 +2040,10 @@ Native smoke of clean `6a51d547c` confirmed missing-playmark feedback, a complet
 
 
 The redraw correction passed all three Similar Sections regressions and eight root pointer tests. A clean, strict-signature-verified `161e1b2f0` preview built in 23.81 seconds. Native secondary click immediately displayed the matched edit handles without an unrelated redraw; disabling removed the green marks while retaining the edit selection. Audio remained idle and Last Played stayed Never. The native close button exited with status zero and no Wavecrate preview process remained. Evidence: `target/qa/zero-snap-native/similar-right-161e1b2.png`; bundle: `target/qa/Wavecrate Similar Preview 161e1b2.app`. This verifies idle native interaction and shutdown, not audible transport or external-drive timing.
+
+
+### Playmark timing foundation, 2026-09-09
+
+Core now formats native duration/BPM playmark labels and parses bounded duration text: milliseconds, seconds, minutes, compound durations and beat-count-relative BPM. Frame edits keep the floored start, round the requested length and clamp the end to the file. The 64-character cap is checked before parsing allocation. Display rounding is intentional; the future editor must treat an unchanged draft as a no-op rather than reparsing it.
+
+The shared text input now supports an optional Unicode scalar limit across programmatic, typed and composed replacements. Existing input modes remain unbounded by character count and retain their byte policies. Rejected edits preserve text, selection and composition; selected characters are reclaimed before checking a replacement. The label background is an additive semantic theme token with the native default. All 152 core tests, 12 text-input tests (including real GPUI composition rejection) and 21 design tests passed; application checking and diff checks passed. Read-only label display and live-span-safe editing remain follow-on work.
