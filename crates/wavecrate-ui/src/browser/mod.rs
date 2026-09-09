@@ -51,6 +51,7 @@ mod preferences;
 mod random_audition;
 mod shortcut_help;
 mod sidebar;
+mod similar_sections;
 mod source_recovery;
 mod source_registry;
 mod tag_chips;
@@ -267,6 +268,7 @@ pub(crate) struct Browser {
     waveform_fade_render_cache: waveform_fades::WaveformFadeRenderCache,
     waveform_detail: waveform_detail::WaveformDetailState,
     zero_crossing: zero_crossing::ZeroCrossingState,
+    similar_sections: similar_sections::SimilarSectionsState,
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
@@ -492,6 +494,7 @@ impl Browser {
             waveform_fade_render_cache: waveform_fades::WaveformFadeRenderCache::default(),
             waveform_detail: waveform_detail::WaveformDetailState::default(),
             zero_crossing: zero_crossing::ZeroCrossingState::default(),
+            similar_sections: similar_sections::SimilarSectionsState::default(),
             bpm_snap_enabled: false,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
@@ -699,6 +702,7 @@ impl Browser {
     }
 
     fn cancel_waveform_load(&mut self) {
+        self.similar_sections.cancel();
         self.random_audition_pending = None;
         self.waveform_detail.cancel();
         zero_crossing::cancel_for_interruption(self);

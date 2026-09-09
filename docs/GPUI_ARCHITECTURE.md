@@ -16,7 +16,7 @@ it does not duplicate Rox's full crate inventory or incorporate its code.
 | --- | --- | --- |
 | `wavecrate-gpui` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
 | `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, waveform viewport/region geometry, display formatting | GPUI types, filesystem calls, audio devices, databases |
-| `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation, cancellation checks | Window state, input routing, source mutation, persistent source registration |
+| `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation/similar-section matching, cancellation checks | Window state, input routing, source mutation, persistent source registration |
 | `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
 | `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
 | `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
@@ -52,6 +52,14 @@ GPUI is a UI dependency. Core projections operate on supplied data and use pure
 path identities; canonicalization happens once during background scanning.
 Filtering and sorting must not probe the filesystem. UI selection follows
 sample identity, not the position of a row in the filtered list.
+
+Similar-section matching belongs to `wavecrate-media`: a retained WAV read lease,
+strong source revision and exact frame anchor fence the native profile algorithm.
+It samples bounded neighborhoods rather than retaining decoded PCM. The browser
+owns one active scan and at most one replacement; source/play-selection changes
+cancel ownership, and completion must still match the exact context and anchor.
+Match painting and edit-only pointer selection remain in `wavecrate-ui`, with
+semantic fill/rail/hover colors in `wavecrate-design`.
 
 The platform drag foundation accepts a borrowed window handle and prepared
 absolute paths. It requires the AppKit main thread, an originating-window mouse

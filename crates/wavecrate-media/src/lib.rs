@@ -13,6 +13,7 @@ use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
 mod detail;
+mod similar_sections;
 mod span_export;
 mod span_peak;
 mod visual_bands;
@@ -23,6 +24,9 @@ pub use detail::{
     MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
     WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
     WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
+};
+pub use similar_sections::{
+    WavSimilarSectionsRequest, scan_wav_similar_sections, scan_wav_similar_sections_with_cancel,
 };
 pub use span_export::{WavSpanExportRequest, export_wav_span, export_wav_span_with_cancel};
 pub use span_peak::{WavSpanPeakRequest, load_wav_span_peak, load_wav_span_peak_with_cancel};

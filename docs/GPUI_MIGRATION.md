@@ -2020,3 +2020,17 @@ Random selections remain in focus: a covered range retains the view, a fitting o
 
 
 A clean `6d6a6ae00` snapshot built `target/qa/Wavecrate Random Preview 6d6a6ae.app` in 34.55 seconds and passed strict ad-hoc signature verification. This preview has not been launched for native random-audition acceptance.
+
+
+### Windows shutdown and metronome validation, 2026-09-09
+
+Run `34322675452` succeeded at `95aa470aa5703beb208e0cc5ae9d7f3d7f632aea`: Reson/core/media/platform tests, combined GPUI application/browser compilation and browser tests passed. This includes the last-window shutdown correction and GPUI metronome transport/resume changes. Random audition was added afterward; run `34326573383` targets `0427c65f7407e4ab9223e2241c0cacc921d36fac` for that coverage. Native audible acceptance remains separate.
+
+
+### Similar Sections, 2026-09-09
+
+The native Similar Sections toolbar control now scans the loaded sample against the playmark selection. Media retains a strong-revision-fenced WAV read lease, samples 192 bounded neighborhoods per candidate and groups native-score matches. Work is capped at 8,000 candidate windows with cancellation checked through decoding; no complete PCM buffer is retained. Short and quiet anchors return the native actionable messages.
+
+The browser owns one active scan and one replaceable queued intent. Generation, path, strong context and raw play bounds fence results; source changes, committed play-selection changes and disabling cancel ownership. Clipped green fills/rails and hover colors use backward-compatible semantic theme tokens. Primary/secondary clicks on marks select and flash a fresh edit range with default effects; existing waveform handles retain priority and playback intent/range/epoch stay unchanged. Motion follows the theme and ends after the flash.
+
+Validation: 354 UI tests, 68 media tests and 21 design tests passed; the UI and media suites each retain one explicitly ignored timing probe. Independent review caught the short/quiet status mismatch, which was corrected, and found no further meaningful issues. A release probe scanned a 60-second/48 kHz mono fixture with a one-second anchor, 7,978 candidate windows and radius-eight (17-frame) neighborhoods in 1.102 seconds. This is local background-scan timing, not external-drive or UI latency evidence. Native scan/click smoke and Windows coverage of this feature remain outstanding.

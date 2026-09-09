@@ -655,6 +655,7 @@ fn apply_bounds(
     match kind {
         WaveformSelectionKind::Play => {
             browser.waveform_play_region = WaveformPlayRegion::new(start, end);
+            super::similar_sections::invalidate_if_stale(browser);
         }
         WaveformSelectionKind::Edit => {
             let next = wavecrate_core::WaveformEditRegion::new(start, end);

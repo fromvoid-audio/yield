@@ -137,6 +137,22 @@ fn default_waveform_edit_selection() -> Color {
     Color::rgb(174, 176, 173)
 }
 
+fn default_waveform_similar_fill() -> Color {
+    Color::rgba(114, 235, 184, 54)
+}
+
+fn default_waveform_similar_rail() -> Color {
+    Color::rgba(155, 255, 218, 210)
+}
+
+fn default_waveform_similar_hover_fill() -> Color {
+    Color::rgba(156, 255, 218, 92)
+}
+
+fn default_waveform_similar_hover_rail() -> Color {
+    Color::rgba(219, 255, 240, 255)
+}
+
 fn default_rating_keep() -> Color {
     Color::rgba(122, 226, 96, 235)
 }
@@ -242,6 +258,18 @@ pub struct Colors {
     /// Neutral edit-selection color, independent of the playback selection accent.
     #[serde(default = "default_waveform_edit_selection")]
     pub waveform_edit_selection: Color,
+    /// Similar-section fill color.
+    #[serde(default = "default_waveform_similar_fill")]
+    pub waveform_similar_fill: Color,
+    /// Similar-section rail color.
+    #[serde(default = "default_waveform_similar_rail")]
+    pub waveform_similar_rail: Color,
+    /// Similar-section hover fill color.
+    #[serde(default = "default_waveform_similar_hover_fill")]
+    pub waveform_similar_hover_fill: Color,
+    /// Similar-section hover rail color.
+    #[serde(default = "default_waveform_similar_hover_rail")]
+    pub waveform_similar_hover_rail: Color,
     /// Subtle raw waveform carrier layer.
     pub waveform_raw: Color,
     /// Played waveform bars.
@@ -406,6 +434,10 @@ impl Default for Theme {
                 waveform_high: Color::rgba(232, 236, 237, 209),
                 waveform_playhead: default_waveform_playhead(),
                 waveform_edit_selection: default_waveform_edit_selection(),
+                waveform_similar_fill: default_waveform_similar_fill(),
+                waveform_similar_rail: default_waveform_similar_rail(),
+                waveform_similar_hover_fill: default_waveform_similar_hover_fill(),
+                waveform_similar_hover_rail: default_waveform_similar_hover_rail(),
                 waveform_raw: Color::rgba(236, 232, 223, 13),
                 waveform_played: Color::rgb(98, 102, 106),
                 waveform_grid: Color::rgb(54, 57, 57),
@@ -890,6 +922,10 @@ mod tests {
             "collection_slots",
             "waveform_playhead",
             "waveform_edit_selection",
+            "waveform_similar_fill",
+            "waveform_similar_rail",
+            "waveform_similar_hover_fill",
+            "waveform_similar_hover_rail",
         ] {
             colors.remove(field);
         }
@@ -918,6 +954,22 @@ mod tests {
         assert_eq!(
             theme.colors.waveform_edit_selection,
             default_waveform_edit_selection()
+        );
+        assert_eq!(
+            theme.colors.waveform_similar_fill,
+            default_waveform_similar_fill()
+        );
+        assert_eq!(
+            theme.colors.waveform_similar_rail,
+            default_waveform_similar_rail()
+        );
+        assert_eq!(
+            theme.colors.waveform_similar_hover_fill,
+            default_waveform_similar_hover_fill()
+        );
+        assert_eq!(
+            theme.colors.waveform_similar_hover_rail,
+            default_waveform_similar_hover_rail()
         );
         assert_eq!(theme.waveform.scrollbar_height, 6.0);
         assert_eq!(

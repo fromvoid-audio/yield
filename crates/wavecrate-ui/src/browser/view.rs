@@ -25,6 +25,7 @@ use super::motion;
 use super::normalized_audition;
 use super::random_audition;
 use super::shortcut_help;
+use super::similar_sections;
 use super::tag_filter;
 use super::volume;
 use super::waveform;
@@ -449,6 +450,7 @@ impl Browser {
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         context_menu::invalidate_if_stale(self);
+        similar_sections::invalidate_if_stale(self);
         let theme = active(cx).clone();
         let motion_frame = self.motion_frame(theme.motion, window);
         let playback_cursor_ratio = self.playback_cursor_ratio(theme.motion.enabled);
@@ -1019,6 +1021,37 @@ impl Render for Browser {
                                 theme.colors.text_muted
                             }))
                             .child(loop_label),
+                    )
+                    .child(
+                        div()
+                            .id("similar-sections-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(similar_sections::tooltip)
+                            })
+                            .on_click(
+                                cx.listener(|view, _, _, cx| similar_sections::toggle(view, cx)),
+                            )
+                            .child(similar_sections::render_icon(color(
+                                if self.similar_sections.pending() {
+                                    theme.colors.warning
+                                } else if self.similar_sections.enabled() {
+                                    theme.colors.accent
+                                } else {
+                                    theme.colors.text_muted
+                                },
+                            ))),
                     )
                     .child(
                         div()

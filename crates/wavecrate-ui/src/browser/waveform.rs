@@ -20,6 +20,7 @@ use wavecrate_design::Theme;
 use crate::theme::color;
 
 use super::Browser;
+use super::similar_sections;
 use super::waveform_fades;
 use super::waveform_scrollbar;
 use super::zero_crossing;
@@ -1796,6 +1797,7 @@ pub(super) fn render_waveform(
         .left_0()
         .right_0(),
     );
+    bars = bars.child(similar_sections::overlay(browser, theme.clone()));
     let beat_guides = browser.beat_guides_enabled.then_some((
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
@@ -1885,13 +1887,21 @@ pub(super) fn render_waveform(
     let bars = bars
         .track_focus(&browser.waveform_focus_handle)
         .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
-            if !*hovered && view.waveform_fade_hover.take().is_some() {
-                cx.notify();
+            if !*hovered {
+                let changed = view.waveform_fade_hover.take().is_some();
+                if similar_sections::hover(view, None) || changed {
+                    cx.notify();
+                }
             }
         }))
         .on_mouse_move(cx.listener(move |view, event: &MouseMoveEvent, _, cx| {
             let bounds = click_bounds_for_hover.borrow().as_ref().copied();
-            if view.update_waveform_fade_hover(event.position, bounds) {
+            let ratio = bounds
+                .filter(|bounds| bounds.contains(&event.position))
+                .and_then(|bounds| waveform_click_ratio(event.position, bounds))
+                .map(|ratio| view.waveform_viewport.absolute_ratio_from_visible(ratio));
+            let similar_changed = similar_sections::hover(view, ratio);
+            if view.update_waveform_fade_hover(event.position, bounds) || similar_changed {
                 cx.notify();
             }
         }))
@@ -1957,7 +1967,7 @@ pub(super) fn render_waveform(
                 view.clear_waveform_fade_hover();
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                view.waveform_region_drag = Some(begin_primary_waveform_drag_with_settings(
+                let drag = begin_primary_waveform_drag_with_settings(
                     view.waveform_play_region,
                     view.waveform_edit_region,
                     view.waveform_edit_settings,
@@ -1966,7 +1976,18 @@ pub(super) fn render_waveform(
                     bounds,
                     view.waveform_viewport,
                     view.waveform_generation,
-                ));
+                );
+                if matches!(drag.mode, WaveformRegionDragMode::Create { .. })
+                    && similar_sections::select_at(
+                        view,
+                        view.waveform_viewport.absolute_ratio_from_visible(ratio),
+                        window,
+                        cx,
+                    )
+                {
+                    return;
+                }
+                view.waveform_region_drag = Some(drag);
                 cx.notify();
             }),
         )
@@ -1990,7 +2011,7 @@ pub(super) fn render_waveform(
                 view.clear_waveform_fade_hover();
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                view.waveform_region_drag = Some(begin_secondary_waveform_drag_with_settings(
+                let drag = begin_secondary_waveform_drag_with_settings(
                     view.waveform_edit_region,
                     view.waveform_edit_settings,
                     event.position,
@@ -1998,7 +2019,18 @@ pub(super) fn render_waveform(
                     bounds,
                     view.waveform_viewport,
                     view.waveform_generation,
-                ));
+                );
+                if matches!(drag.mode, WaveformRegionDragMode::Create { .. })
+                    && similar_sections::select_at(
+                        view,
+                        view.waveform_viewport.absolute_ratio_from_visible(ratio),
+                        window,
+                        cx,
+                    )
+                {
+                    return;
+                }
+                view.waveform_region_drag = Some(drag);
                 cx.notify();
             }),
         )
@@ -2097,6 +2129,7 @@ impl Browser {
     }
 
     pub(super) fn clear_waveform_region(&mut self) {
+        self.similar_sections.cancel();
         zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
         self.waveform_edit_region = None;
@@ -2320,6 +2353,7 @@ impl Browser {
             return false;
         }
         self.waveform_play_region = Some(next);
+        similar_sections::invalidate_if_stale(self);
         let Some(preview) = self.waveform.as_ref() else {
             return true;
         };
@@ -2425,6 +2459,7 @@ impl Browser {
             if drag.moved {
                 if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
                     self.waveform_play_region = Some(region);
+                    similar_sections::invalidate_if_stale(self);
                     if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule(self, region, cx);
                     }
@@ -2434,12 +2469,14 @@ impl Browser {
             self.stop_playback();
             if let Some(region) = drag.preview_region() {
                 self.waveform_play_region = Some(region);
+                similar_sections::invalidate_if_stale(self);
                 if drag.zero_crossing_applies(bpm_snap) {
                     zero_crossing::commit_or_schedule(self, region, cx);
                 }
             }
         } else if let Some(ratio) = drag.ratio_at(position) {
             self.waveform_play_region = None;
+            similar_sections::invalidate_if_stale(self);
             self.start_playback_from_position(ratio, cx);
         }
         cx.notify();
