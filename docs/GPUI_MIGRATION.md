@@ -1993,3 +1993,7 @@ Application checking passed. A clean, signature-verified preview built from `edf
 ### Random audition range foundation, 2026-09-09
 
 Core now exposes deterministic random-section units and the native `f32` range calculation, including the 250 ms minimum, whole-file fallback for short or invalid durations, and native endpoint handling. It introduces no random generator, file access or playback side effects. All 143 core tests and checking passed, including four range parity tests. Browser candidate selection, loading and the three toolbar modifier modes remain follow-on work.
+
+### Windows fade and metronome-backend validation, 2026-09-09
+
+Windows run `34318763629` succeeded at `572aa5a3008cdf4634ee6093e1771aa2011352a9`: core/media/platform library tests, combined GPUI application/browser test compilation and browser tests passed. This run predates the last-window shutdown fix, the explicit Reson test step and the GPUI metronome UI. Those later changes require a newer run; native Windows input acceptance remains separate.
