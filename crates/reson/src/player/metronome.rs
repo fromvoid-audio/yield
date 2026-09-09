@@ -20,8 +20,14 @@ pub struct PlaybackMetronomeConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlaybackMetronomeCycle {
+    kind: PlaybackMetronomeCycleKind,
     frames: u64,
-    offset_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackMetronomeCycleKind {
+    Relative { offset_frames: u64 },
+    Source { origin_frame: u64 },
 }
 
 impl PlaybackMetronomeConfig {
@@ -44,8 +50,24 @@ impl PlaybackMetronomeConfig {
     pub fn with_cycle(mut self, frames: u64, offset_frames: u64) -> Self {
         let frames = frames.max(1);
         self.cycle = Some(PlaybackMetronomeCycle {
+            kind: PlaybackMetronomeCycleKind::Relative {
+                offset_frames: offset_frames % frames,
+            },
             frames,
-            offset_frames: offset_frames % frames,
+        });
+        self
+    }
+
+    /// Use an explicit click-cycle length anchored to an absolute source frame.
+    ///
+    /// `origin_frame` is the decoded source frame at which the cycle starts.
+    /// The phase is resolved when a playback plan is created, so retargeting a
+    /// live source keeps the click grid tied to source position rather than a
+    /// request-time UI offset.
+    pub fn with_source_cycle(mut self, frames: u64, origin_frame: u64) -> Self {
+        self.cycle = Some(PlaybackMetronomeCycle {
+            kind: PlaybackMetronomeCycleKind::Source { origin_frame },
+            frames: frames.max(1),
         });
         self
     }
@@ -54,15 +76,39 @@ impl PlaybackMetronomeConfig {
         self.beat_count
     }
 
-    pub(crate) fn cycle(self, default_frames: u64, default_offset_frames: u64) -> (u64, u64) {
+    pub(crate) fn cycle_at_anchor(
+        self,
+        default_frames: u64,
+        default_offset_frames: u64,
+        anchor_frame: u64,
+    ) -> (u64, u64) {
         let default_frames = default_frames.max(1);
         match self.cycle {
-            Some(cycle) => (
-                cycle.frames.max(1),
-                cycle.offset_frames % cycle.frames.max(1),
-            ),
+            Some(cycle) => match cycle.kind {
+                PlaybackMetronomeCycleKind::Relative { offset_frames } => {
+                    (cycle.frames.max(1), offset_frames % cycle.frames.max(1))
+                }
+                PlaybackMetronomeCycleKind::Source { origin_frame } => (
+                    cycle.frames.max(1),
+                    source_phase(anchor_frame, origin_frame, cycle.frames),
+                ),
+            },
             None => (default_frames, default_offset_frames % default_frames),
         }
+    }
+}
+
+fn source_phase(anchor_frame: u64, origin_frame: u64, cycle_frames: u64) -> u64 {
+    let cycle_frames = cycle_frames.max(1);
+    if anchor_frame >= origin_frame {
+        return anchor_frame.saturating_sub(origin_frame) % cycle_frames;
+    }
+
+    let distance = origin_frame.saturating_sub(anchor_frame) % cycle_frames;
+    if distance == 0 {
+        0
+    } else {
+        cycle_frames - distance
     }
 }
 
@@ -88,8 +134,10 @@ where
         config: PlaybackMetronomeConfig,
         cycle_frames: u64,
         cycle_offset_frames: u64,
+        anchor_frame: u64,
     ) -> Self {
-        let (cycle_frames, cycle_offset_frames) = config.cycle(cycle_frames, cycle_offset_frames);
+        let (cycle_frames, cycle_offset_frames) =
+            config.cycle_at_anchor(cycle_frames, cycle_offset_frames, anchor_frame);
         let channels = inner.channels().max(1);
         let sample_rate = inner.sample_rate().max(1);
         Self {
@@ -254,7 +302,7 @@ mod tests {
         let samples = Arc::<[f32]>::from(vec![0.0; 48_000]);
         let source = SamplesBuffer::from_arc(1, 48_000, samples);
         let mut metronome =
-            MetronomeSource::new(source, PlaybackMetronomeConfig::new(4), 48_000, 0);
+            MetronomeSource::new(source, PlaybackMetronomeConfig::new(4), 48_000, 0, 0);
 
         assert!(metronome.next().expect("downbeat") > 0.20);
         for _ in 1..6_000 {
@@ -274,7 +322,7 @@ mod tests {
         let samples = Arc::<[f32]>::from(vec![0.0; 48_000]);
         let source = SamplesBuffer::from_arc(1, 48_000, samples);
         let mut metronome =
-            MetronomeSource::new(source, PlaybackMetronomeConfig::new(4), 48_000, 6_000);
+            MetronomeSource::new(source, PlaybackMetronomeConfig::new(4), 48_000, 6_000, 0);
 
         let first = metronome.next().expect("offset starts on offbeat");
         assert!((0.11..0.15).contains(&first));
@@ -285,7 +333,7 @@ mod tests {
         let samples = Arc::<[f32]>::from(vec![0.0; 24_000]);
         let source = SamplesBuffer::from_arc(1, 48_000, samples);
         let config = PlaybackMetronomeConfig::new(4).with_cycle(48_000, 6_000);
-        let mut metronome = MetronomeSource::new(source, config, 24_000, 0);
+        let mut metronome = MetronomeSource::new(source, config, 24_000, 0, 0);
 
         let first = metronome.next().expect("explicit cycle offbeat");
 
@@ -293,11 +341,47 @@ mod tests {
     }
 
     #[test]
+    fn source_cycle_resolves_against_the_absolute_anchor() {
+        let config = PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 100);
+
+        assert_eq!(config.cycle_at_anchor(1, 0, 1_125), (1_000, 25));
+    }
+
+    #[test]
+    fn source_cycle_phase_handles_before_origin_and_u64_extremes() {
+        let before_origin = PlaybackMetronomeConfig::new(1).with_source_cycle(10, 10);
+        assert_eq!(before_origin.cycle_at_anchor(1, 0, 3), (10, 3));
+
+        let max_origin = PlaybackMetronomeConfig::new(1).with_source_cycle(10, u64::MAX);
+        assert_eq!(max_origin.cycle_at_anchor(1, 0, 0), (10, 5));
+
+        let max_cycle = PlaybackMetronomeConfig::new(1).with_source_cycle(u64::MAX, 0);
+        assert_eq!(max_cycle.cycle_at_anchor(1, 0, u64::MAX), (u64::MAX, 0));
+
+        let wrapped_before_origin =
+            PlaybackMetronomeConfig::new(1).with_source_cycle(u64::MAX - 1, u64::MAX);
+        assert_eq!(
+            wrapped_before_origin.cycle_at_anchor(1, 0, 0),
+            (u64::MAX - 1, u64::MAX - 2)
+        );
+
+        let unit_cycle = PlaybackMetronomeConfig::new(1).with_source_cycle(0, u64::MAX);
+        assert_eq!(unit_cycle.cycle_at_anchor(1, 0, u64::MAX), (1, 0));
+    }
+
+    #[test]
+    fn relative_cycle_semantics_ignore_source_anchor_resolution() {
+        let config = PlaybackMetronomeConfig::new(1).with_cycle(10, 3);
+
+        assert_eq!(config.cycle_at_anchor(1, 0, 999), (10, 3));
+    }
+
+    #[test]
     fn metronome_source_preserves_source_layout_and_duration() {
         let samples = Arc::<[f32]>::from(vec![0.1; 96_000]);
         let source = SamplesBuffer::from_arc(2, 48_000, samples);
         let mut metronome =
-            MetronomeSource::new(source, PlaybackMetronomeConfig::new(4), 48_000, 0);
+            MetronomeSource::new(source, PlaybackMetronomeConfig::new(4), 48_000, 0, 0);
 
         assert_eq!(metronome.channels(), 2);
         assert_eq!(metronome.sample_rate(), 48_000);

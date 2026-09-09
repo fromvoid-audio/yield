@@ -4,6 +4,7 @@ use crate::timebase::{frames_to_seconds, seconds_to_frames_round};
 use crate::{AsyncSource, Source};
 
 use super::metronome::MetronomeSource;
+use super::playback_span_handle::plan_anchor_frame;
 use super::{
     AudioPlaybackSource, AudioPlayer, EditFadeSource, PlaybackChannelLayout,
     PlaybackMetronomeConfig, PlaybackRuntimeReplacePolicy, PlaybackSeekBehavior,
@@ -662,6 +663,7 @@ fn source_with_metronome(
             config,
             plan.frame_count(),
             plan.seek_offset_frames(),
+            plan_anchor_frame(plan),
         )),
         (None, None) => source,
     }

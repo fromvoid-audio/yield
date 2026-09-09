@@ -166,6 +166,7 @@ impl Source for SpanSamplesSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SamplesBuffer;
     use crate::player::{
         PlaybackChannelLayout, PlaybackMetronomeConfig, PlaybackSeekBehavior,
         PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan, PlaybackSpanRequest,
@@ -395,6 +396,60 @@ mod tests {
     }
 
     #[test]
+    fn source_anchored_live_retarget_uses_actual_non_seek_progress() {
+        use crate::player::metronome::MetronomeSource;
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 1_000]);
+        let config = PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 10);
+        let initial_plan = span_plan(100, 900, 50);
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&initial_plan, Some(config));
+        let source = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples,
+            handle.clone(),
+            SpanSamplesMode::Looped,
+            150,
+        );
+        let mut metronome = MetronomeSource::new_live(source, handle.clone());
+
+        metronome.next().expect("initial source frame");
+        let retargeted_plan = span_plan(100, 900, 250);
+        handle.update_from_plan(&retargeted_plan, None, Some(config));
+        metronome.next().expect("retargeted source frame");
+
+        let applied = handle.applied_metronome();
+        assert_eq!(applied.cycle_frames(), 1_000);
+        assert_eq!(applied.phase_frames(), 141);
+    }
+
+    #[test]
+    fn source_anchored_live_explicit_seek_uses_the_seeked_source_frame() {
+        use crate::player::metronome::MetronomeSource;
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 1_000]);
+        let config = PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 10);
+        let initial_plan = span_plan(0, 1_000, 0);
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&initial_plan, Some(config));
+        let source = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples,
+            handle.clone(),
+            SpanSamplesMode::Looped,
+            0,
+        );
+        let mut metronome = MetronomeSource::new_live(source, handle.clone());
+
+        metronome.next().expect("initial source frame");
+        let seeked_plan = span_plan(0, 1_000, 400);
+        handle.update_from_plan(&seeked_plan, Some(400), Some(config));
+        metronome.next().expect("seeked source frame");
+
+        assert_eq!(handle.applied_metronome().phase_frames(), 390);
+    }
+
+    #[test]
     fn live_metronome_phase_resets_on_explicit_seek_and_can_be_disabled() {
         use crate::player::metronome::MetronomeSource;
 
@@ -470,6 +525,61 @@ mod tests {
         let applied = handle.applied_metronome();
         assert!(applied.revision() > before_wrap);
         assert_eq!(applied.phase_frames(), 1);
+    }
+
+    #[test]
+    fn source_anchored_loop_wrap_reanchors_to_the_absolute_source_frame() {
+        use crate::player::metronome::MetronomeSource;
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 4]);
+        let config = PlaybackMetronomeConfig::new(2).with_source_cycle(10, 0);
+        let plan = span_plan(1, 3, 0);
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, Some(config));
+        let source = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples,
+            handle.clone(),
+            SpanSamplesMode::Looped,
+            2,
+        );
+        let mut metronome = MetronomeSource::new_live(source, handle.clone());
+
+        metronome.next().expect("source frame before wrap");
+        let before_wrap = handle.applied_metronome().revision();
+        metronome.next().expect("source frame at wrap");
+
+        let applied = handle.applied_metronome();
+        assert!(applied.revision() > before_wrap);
+        assert_eq!(applied.phase_frames(), 1);
+    }
+
+    #[test]
+    fn static_and_live_metronomes_resolve_source_cycles_identically() {
+        use crate::player::metronome::MetronomeSource;
+
+        let samples = Arc::<[f32]>::from(vec![0.0; 16]);
+        let config = PlaybackMetronomeConfig::new(4).with_source_cycle(10, 3);
+        let plan = span_plan(1, 8, 2);
+        let static_inner = SamplesBuffer::from_arc_span_at(1, 1_000, samples.clone(), 3, 8, 3);
+        let static_inner: Box<dyn Source<Item = f32> + Send> = Box::new(static_inner);
+        let mut static_metronome =
+            super::super::source_with_metronome(static_inner, Some(config), &plan, None);
+
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, Some(config));
+        let live_inner = SpanSamplesSource::new(
+            1,
+            1_000,
+            samples,
+            handle.clone(),
+            SpanSamplesMode::Looped,
+            3,
+        );
+        let mut live_metronome = MetronomeSource::new_live(live_inner, handle);
+
+        for _ in 0..5 {
+            assert_eq!(static_metronome.next(), live_metronome.next());
+        }
     }
 
     fn span_plan(start_frame: u64, end_frame: u64, offset_frame: u64) -> PlaybackSpanPlan {

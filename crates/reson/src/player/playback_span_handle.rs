@@ -279,15 +279,14 @@ impl PlaybackSpanSnapshot {
         let end_frame = plan.end_frame().max(start_frame.saturating_add(1));
         let pending_seek_frame =
             seek_frame.map(|frame| clamp_frame_to_span(frame, start_frame, end_frame));
-        let anchor_frame = clamp_frame_to_span(
-            start_frame.saturating_add(plan.seek_offset_frames()),
-            start_frame,
-            end_frame,
-        );
+        let anchor_frame = plan_anchor_frame(plan);
         let (enabled, beat_count, cycle_frames, anchor_phase_frames) = match metronome {
             Some(config) => {
-                let (cycle_frames, phase_frames) =
-                    config.cycle(plan.frame_count(), plan.seek_offset_frames());
+                let (cycle_frames, phase_frames) = config.cycle_at_anchor(
+                    plan.frame_count(),
+                    plan.seek_offset_frames(),
+                    anchor_frame,
+                );
                 (
                     true,
                     config.beat_count(),
@@ -340,6 +339,16 @@ impl PlaybackSpanSnapshot {
     }
 }
 
+pub(crate) fn plan_anchor_frame(plan: &PlaybackSpanPlan) -> u64 {
+    let start_frame = plan.start_frame();
+    let end_frame = plan.end_frame().max(start_frame.saturating_add(1));
+    clamp_frame_to_span(
+        start_frame.saturating_add(plan.seek_offset_frames()),
+        start_frame,
+        end_frame,
+    )
+}
+
 impl PlaybackMetronomeSnapshot {
     fn phase_at(self, frame: u64) -> u64 {
         let cycle_frames = self.cycle_frames.max(1);
@@ -389,7 +398,7 @@ fn decode_optional_frame(frame: u64) -> Option<u64> {
 }
 
 fn clamp_frame_to_span(frame: u64, start_frame: u64, end_frame: u64) -> u64 {
-    frame.clamp(start_frame, end_frame.saturating_sub(1))
+    frame.clamp(start_frame, end_frame.saturating_sub(1).max(start_frame))
 }
 
 fn add_modulo(value: u64, increment: u64, modulus: u64) -> u64 {
@@ -462,6 +471,20 @@ mod tests {
         assert_eq!(snapshot.metronome.beat_count, 1);
         assert_eq!(snapshot.metronome.cycle_frames, 10_001);
         assert_eq!(snapshot.metronome.anchor_phase_frames, 10_000);
+    }
+
+    #[test]
+    fn source_cycle_uses_the_clamped_plan_anchor() {
+        let plan = span_plan(100, 200, 150);
+        let snapshot = PlaybackSpanSnapshot::from_plan(
+            1,
+            &plan,
+            None,
+            Some(PlaybackMetronomeConfig::new(4).with_source_cycle(1_000, 50)),
+        );
+
+        assert_eq!(snapshot.metronome.anchor_frame, 150);
+        assert_eq!(snapshot.metronome.anchor_phase_frames, 100);
     }
 
     #[test]
