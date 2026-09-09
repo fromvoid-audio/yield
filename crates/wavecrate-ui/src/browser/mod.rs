@@ -44,6 +44,7 @@ mod display_labels;
 mod file_drag;
 mod handoff;
 mod history;
+mod metronome;
 mod motion;
 mod normalized_audition;
 mod preferences;
@@ -268,6 +269,11 @@ pub(crate) struct Browser {
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
+    metronome_enabled: bool,
+    playback_metronome_beat_count: Option<u16>,
+    playback_metronome_confirmed: bool,
+    playback_metronome_grid: Option<metronome::PlaybackMetronomeGrid>,
+    playback_metronome_grid_path: Option<PathBuf>,
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
     waveform_zoom_anchor_ratio: f64,
@@ -336,7 +342,7 @@ pub(crate) struct Browser {
     normalized_audition_task: Option<Task<()>>,
     normalized_audition_queued: Option<normalized_audition::PendingNormalizedAudition>,
     normalized_audition_deferred_play: Option<normalized_audition::PendingNormalizedAudition>,
-    normalized_audition_pending_loop_target: Option<bool>,
+    normalized_audition_pending_playback_target: Option<transport::PlaybackDesiredState>,
     normalized_gain_runtime_pending: Option<normalized_audition::PendingNormalizedGain>,
     waveform_pending: bool,
     motion_started_at: Option<Instant>,
@@ -413,6 +419,7 @@ impl Browser {
             &beat_count_input,
             |view, _input, event: &BeatCountChanged, cx| {
                 view.beat_guide_count = event.count;
+                view.apply_metronome_count_change(event.count, cx);
                 cx.notify();
             },
         );
@@ -485,6 +492,11 @@ impl Browser {
             bpm_snap_enabled: false,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
+            metronome_enabled: false,
+            playback_metronome_beat_count: None,
+            playback_metronome_confirmed: false,
+            playback_metronome_grid: None,
+            playback_metronome_grid_path: None,
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
             waveform_zoom_anchor_ratio: 0.5,
@@ -553,7 +565,7 @@ impl Browser {
             normalized_audition_task: None,
             normalized_audition_queued: None,
             normalized_audition_deferred_play: None,
-            normalized_audition_pending_loop_target: None,
+            normalized_audition_pending_playback_target: None,
             normalized_gain_runtime_pending: None,
             waveform_pending: false,
             motion_started_at: None,
@@ -1699,6 +1711,15 @@ impl Browser {
     ) {
         self.beat_guides_enabled = !self.beat_guides_enabled;
         cx.notify();
+    }
+
+    fn toggle_metronome_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_metronome(cx);
     }
 
     fn reload_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {

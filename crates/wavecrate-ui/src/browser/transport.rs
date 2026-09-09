@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::Browser;
+use super::metronome::{self, PlaybackMetronomeGrid};
 use super::waveform::WaveformPlayRegion;
 use gpui::Context;
 use reson::{
@@ -27,7 +28,16 @@ pub(super) struct PlaybackCursorSample {
     pub(super) ratio: f32,
 }
 
-/// One admitted live loop-mode change awaiting an authoritative runtime snapshot.
+/// The complete playback mode that one live retarget must apply atomically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PlaybackDesiredState {
+    /// Whether the accepted span should repeat.
+    pub(super) looped: bool,
+    /// Requested metronome divisions, or `None` when the metronome is disabled.
+    pub(super) metronome_beat_count: Option<u16>,
+}
+
+/// One admitted live playback-mode change awaiting an authoritative runtime snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PendingLoopRetarget {
     pub(super) retarget_id: u64,
@@ -35,8 +45,9 @@ pub(super) struct PendingLoopRetarget {
     pub(super) playback_epoch: u64,
     pub(super) output_open_generation: u64,
     pub(super) path: std::path::PathBuf,
-    pub(super) desired_looped: bool,
+    pub(super) desired: PlaybackDesiredState,
     pub(super) span: WaveformPlayRegion,
+    pub(super) metronome_grid: Option<PlaybackMetronomeGrid>,
 }
 
 /// The one progress poll admitted by the browser monitor at a time.
@@ -79,6 +90,8 @@ pub(super) struct PlaybackIntent {
     pub(super) volume: f32,
     pub(super) path: std::path::PathBuf,
     pub(super) origin: PlaybackIntentOrigin,
+    /// Last admitted or confirmed configuration, captured by output resume and deferred preparation.
+    pub(super) resume_desired: Option<PlaybackDesiredState>,
 }
 
 impl PlaybackIntent {
@@ -136,10 +149,12 @@ impl Browser {
                             view.playback_cursor_sample.map(|sample| sample.ratio),
                             view.pending_loop_retarget
                                 .as_ref()
-                                .map(|pending| (pending.retarget_id, pending.desired_looped)),
+                                .map(|pending| (pending.retarget_id, pending.desired)),
                             view.accepted_playback_intent
                                 .as_ref()
                                 .map(|intent| intent.looped),
+                            view.playback_metronome_beat_count,
+                            view.playback_metronome_confirmed,
                         );
                         view.poll_playback_events();
                         let changed = before
@@ -149,10 +164,12 @@ impl Browser {
                                 view.playback_cursor_sample.map(|sample| sample.ratio),
                                 view.pending_loop_retarget
                                     .as_ref()
-                                    .map(|pending| (pending.retarget_id, pending.desired_looped)),
+                                    .map(|pending| (pending.retarget_id, pending.desired)),
                                 view.accepted_playback_intent
                                     .as_ref()
                                     .map(|intent| intent.looped),
+                                view.playback_metronome_beat_count,
+                                view.playback_metronome_confirmed,
                             );
                         if changed {
                             cx.notify();
@@ -305,84 +322,95 @@ impl Browser {
             self.mark_preferences_edit_blocked(cx);
             return;
         }
-        let enabled = next_loop_toggle_target(
-            self.playing_path.is_some(),
-            self.playback_policy.enabled(),
-            self.accepted_playback_intent
-                .as_ref()
-                .map(|intent| intent.looped),
-            self.normalized_audition_pending_loop_target().or_else(|| {
-                self.pending_loop_retarget
-                    .as_ref()
-                    .map(|pending| pending.desired_looped)
-            }),
-        );
+        let mut desired = self.current_playback_desired_state();
+        desired.looped = !desired.looped;
+        let enabled = desired.looped;
         if !self.persist_loop_preference(enabled, cx) {
             return;
         }
         self.playback_policy.set_manual(enabled);
-        self.apply_loop_mode_change(enabled, cx);
+        self.apply_playback_state_change(desired, cx);
         cx.notify();
     }
 
     /// Apply a changed loop choice to pending playback and, when possible, the accepted play.
     pub(super) fn apply_loop_mode_change(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let mut desired = self.current_playback_desired_state();
+        desired.looped = enabled;
+        self.apply_playback_state_change_with_status(
+            desired,
+            format!("Loop {}", loop_mode_status_word(enabled)),
+            cx,
+        );
+    }
+
+    /// Apply a complete playback mode choice to pending playback and, when possible, the
+    /// accepted play.
+    pub(super) fn apply_playback_state_change(
+        &mut self,
+        desired: PlaybackDesiredState,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_playback_state_change_with_status(
+            desired,
+            playback_state_status_word(desired),
+            cx,
+        );
+    }
+
+    fn apply_playback_state_change_with_status(
+        &mut self,
+        desired: PlaybackDesiredState,
+        status_label: String,
+        cx: &mut Context<Self>,
+    ) {
         if self.playback_init_intent.is_some() {
             self.cancel_normalized_audition();
         }
         if let Some(intent) = self.playback_init_intent.as_mut()
             && intent.origin != PlaybackIntentOrigin::AudioOutputResume
         {
-            intent.looped = enabled;
+            intent.looped = desired.looped;
         }
         if let Some(intent) = self.audio_output_resume.as_mut()
             && intent.origin != PlaybackIntentOrigin::AudioOutputResume
         {
-            intent.looped = enabled;
+            intent.looped = desired.looped;
         }
 
-        match self.submit_live_loop_retarget(enabled, cx) {
+        match self.submit_live_playback_retarget(desired, cx) {
             Some(Ok(())) => {
-                self.playback_status = format!(
-                    "Loop {} · applying to playback",
-                    loop_mode_status_word(enabled)
-                );
+                self.playback_status = format!("{status_label} · applying to playback");
             }
             Some(Err(error)) => {
-                self.playback_status = format!(
-                    "Loop {} · live update unavailable: {error}",
-                    loop_mode_status_word(enabled)
-                );
+                self.playback_status = format!("{status_label} · live update unavailable: {error}");
             }
             None => {
                 self.playback_status = if self.playing_path.is_some() {
-                    format!(
-                        "Loop {} — applies on next play",
-                        if enabled { "enabled" } else { "disabled" }
-                    )
+                    format!("{status_label} — applies on next play")
                 } else {
-                    format!("Loop {}", if enabled { "enabled" } else { "disabled" })
+                    status_label
                 };
             }
         }
     }
 
-    fn submit_live_loop_retarget(
+    fn submit_live_playback_retarget(
         &mut self,
-        desired_looped: bool,
+        desired: PlaybackDesiredState,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
         if self.normalized_audition.enabled()
-            && self.schedule_normalized_loop_retarget(desired_looped, cx)
+            && self.schedule_normalized_playback_retarget(desired, cx)
         {
             return Some(Ok(()));
         }
-        self.submit_live_loop_retarget_with_gain(desired_looped, 1.0, cx)
+        self.submit_live_playback_retarget_with_gain(desired, 1.0, cx)
     }
 
-    pub(super) fn submit_live_loop_retarget_with_gain(
+    pub(super) fn submit_live_playback_retarget_with_gain(
         &mut self,
-        desired_looped: bool,
+        desired: PlaybackDesiredState,
         playback_gain: f32,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
@@ -398,6 +426,12 @@ impl Browser {
             Ok(span) => span,
             Err(error) => return Some(Err(error)),
         };
+        let metronome_grid = captured_metronome_grid_or_source(
+            &path,
+            self.playback_metronome_grid_path.as_deref(),
+            self.playback_metronome_grid,
+            || metronome::source_grid_for_span(self, &path, span),
+        );
         let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
             return Some(Err(String::from("audio runtime is unavailable")));
         };
@@ -406,13 +440,15 @@ impl Browser {
             end: span.end,
             offset: span.start,
             seek_to_offset: false,
-            looped: desired_looped,
+            looped: desired.looped,
             playback_gain,
             playback_gain_normalization: None,
-            metronome: None,
+            metronome: metronome::config_for_count(desired.metronome_beat_count, metronome_grid),
         };
         match handle.try_retarget_active_span(accepted_playback_id, update) {
             Ok(retarget_id) => {
+                self.playback_metronome_grid = metronome_grid;
+                self.playback_metronome_grid_path = Some(path.clone());
                 admit_loop_retarget(
                     &mut self.pending_loop_retarget,
                     PendingLoopRetarget {
@@ -421,8 +457,9 @@ impl Browser {
                         playback_epoch: self.playback_epoch,
                         output_open_generation: self.audio_output_open_generation,
                         path,
-                        desired_looped,
+                        desired,
                         span,
+                        metronome_grid,
                     },
                 );
                 self.ensure_playback_monitor(cx);
@@ -446,6 +483,113 @@ impl Browser {
         }
     }
 
+    fn current_playback_desired_state(&self) -> PlaybackDesiredState {
+        if self.playing_path.is_some() {
+            if let Some(desired) = self.normalized_audition_pending_playback_target {
+                return desired;
+            }
+            if let Some(pending) = self.pending_loop_retarget.as_ref() {
+                return pending.desired;
+            }
+            return PlaybackDesiredState {
+                looped: self
+                    .accepted_playback_intent
+                    .as_ref()
+                    .map(|intent| intent.looped)
+                    .unwrap_or_else(|| self.playback_policy.enabled()),
+                metronome_beat_count: self.playback_metronome_beat_count.or_else(|| {
+                    self.metronome_enabled
+                        .then_some(self.beat_guide_count as u16)
+                }),
+            };
+        }
+        PlaybackDesiredState {
+            looped: self.playback_policy.enabled(),
+            metronome_beat_count: self
+                .metronome_enabled
+                .then_some(self.beat_guide_count as u16),
+        }
+    }
+
+    /// Toggle the metronome preference and submit a complete live playback retarget when active.
+    pub(super) fn toggle_metronome(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let mut desired = self.current_playback_desired_state();
+        desired.metronome_beat_count = if desired.metronome_beat_count.is_some() {
+            None
+        } else {
+            Some(self.beat_guide_count as u16)
+        };
+        self.metronome_enabled = desired.metronome_beat_count.is_some();
+        self.apply_playback_state_change_with_status(
+            desired,
+            format!(
+                "Metronome {}",
+                if self.metronome_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Apply a changed beat-guide count to an active metronome without changing loop mode.
+    pub(super) fn apply_metronome_count_change(&mut self, count: u8, cx: &mut Context<Self>) {
+        if !self.metronome_enabled
+            && self
+                .current_playback_desired_state()
+                .metronome_beat_count
+                .is_none()
+        {
+            return;
+        }
+        let mut desired = self.current_playback_desired_state();
+        desired.metronome_beat_count = Some(count as u16);
+        self.apply_playback_state_change_with_status(
+            desired,
+            format!("Metronome beat count {count}"),
+            cx,
+        );
+    }
+
+    /// Return whether the metronome is enabled in the current confirmed or idle state.
+    pub(super) fn metronome_toolbar_enabled(&self) -> bool {
+        if self.playing_path.is_some() {
+            self.playback_metronome_confirmed && self.playback_metronome_beat_count.is_some()
+        } else {
+            self.metronome_enabled
+        }
+    }
+
+    /// Return whether the metronome target is still waiting for runtime or normalized confirmation.
+    pub(super) fn metronome_toolbar_pending(&self) -> bool {
+        (self.playing_path.is_some()
+            && self.metronome_enabled
+            && !self.playback_metronome_confirmed)
+            || self
+                .normalized_audition_pending_playback_target
+                .is_some_and(|desired| {
+                    metronome_target_is_pending(
+                        desired.metronome_beat_count,
+                        self.playback_metronome_beat_count,
+                        self.playback_metronome_confirmed,
+                    )
+                })
+            || self.pending_loop_retarget.as_ref().is_some_and(|pending| {
+                metronome_target_is_pending(
+                    pending.desired.metronome_beat_count,
+                    self.playback_metronome_beat_count,
+                    self.playback_metronome_confirmed,
+                )
+            })
+    }
+
     pub(super) fn loop_toolbar_enabled(&self) -> bool {
         if self.playing_path.is_some() {
             self.accepted_playback_intent
@@ -463,11 +607,12 @@ impl Browser {
             return format!("Loop {}", loop_mode_toolbar_word(next));
         }
         let confirmed = self.loop_toolbar_enabled();
-        if let Some(pending) = self.pending_loop_retarget.as_ref() {
+        let desired = self.current_playback_desired_state().looped;
+        if desired != confirmed {
             return format!(
                 "Loop {} → {}",
                 loop_mode_toolbar_word(confirmed),
-                loop_mode_toolbar_word(pending.desired_looped)
+                loop_mode_toolbar_word(desired)
             );
         }
         if confirmed != next {
@@ -516,6 +661,7 @@ impl Browser {
             volume: super::volume::quantize_volume(self.volume),
             path,
             origin,
+            resume_desired: None,
         })
     }
 
@@ -656,6 +802,20 @@ impl Browser {
             return;
         };
         let mode = playback_mode_for_intent(&intent);
+        let metronome_grid = playback_span_for_intent(&intent).and_then(|span| {
+            preferred_metronome_grid(
+                intent.origin,
+                &intent.path,
+                self.playback_metronome_grid_path.as_deref(),
+                self.playback_metronome_grid,
+                || metronome::source_grid_for_span(self, &intent.path, span),
+            )
+        });
+        let metronome_beat_count = metronome_count_for_intent(
+            &intent,
+            self.metronome_enabled
+                .then_some(self.beat_guide_count as u16),
+        );
         let request = PlaybackRuntimeRequest {
             source: PlaybackRuntimeSource::WavFile {
                 path: intent.path.clone(),
@@ -667,7 +827,7 @@ impl Browser {
             playback_gain_normalization: None,
             replace_policy: PlaybackRuntimeReplacePolicy::ClearPrevious,
             edit_fade: None,
-            metronome: None,
+            metronome: metronome::config_for_count(metronome_beat_count, metronome_grid),
         };
         self.normalized_gain_runtime_pending = None;
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
@@ -685,8 +845,17 @@ impl Browser {
                 }
                 self.mark_volume_applied_by_play();
                 self.latest_playback_request_id = Some(request_id);
-                self.accepted_playback_intent = Some(intent.clone());
+                let mut accepted = intent.clone();
+                accepted.resume_desired = Some(PlaybackDesiredState {
+                    looped: intent.looped,
+                    metronome_beat_count,
+                });
+                self.accepted_playback_intent = Some(accepted);
                 self.playing_path = Some(intent.path);
+                self.playback_metronome_grid = metronome_grid;
+                self.playback_metronome_grid_path = self.playing_path.clone();
+                self.playback_metronome_beat_count = None;
+                self.playback_metronome_confirmed = false;
                 self.playback_cursor_pending = Some(start as f32);
                 self.playback_status = "Starting…".to_string();
                 if record_last_played {
@@ -699,6 +868,8 @@ impl Browser {
                 self.latest_playback_request_id = None;
                 self.playing_path = None;
                 self.accepted_playback_intent = None;
+                self.playback_metronome_beat_count = None;
+                self.playback_metronome_confirmed = false;
                 self.clear_playback_cursor();
                 self.playback_status = format!("Could not queue playback: {error:?}");
             }
@@ -719,6 +890,8 @@ impl Browser {
         self.playback_waiting_for_preferences = false;
         self.audio_output_resume = None;
         self.accepted_playback_intent = None;
+        self.playback_metronome_beat_count = None;
+        self.playback_metronome_confirmed = false;
         self.clear_playback_cursor();
         if let Some(runtime) = self.playback.as_ref() {
             if let Ok(request_id) = runtime.handle.try_stop() {
@@ -753,7 +926,7 @@ impl Browser {
                 {
                     self.set_playback_cursor_start(&started);
                     if let Some(pending) = self.pending_loop_retarget.as_ref() {
-                        self.set_pending_loop_status(pending.desired_looped);
+                        self.set_pending_playback_status(pending.desired);
                     } else {
                         self.playback_status = "Playing".to_string();
                     }
@@ -765,13 +938,15 @@ impl Browser {
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
                     self.pending_loop_retarget = None;
-                    self.playback_status = format!("Loop live update failed: {error}");
+                    self.playback_status = format!("Playback live update failed: {error}");
                 }
                 PlaybackRuntimeEvent::Stopped { id }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
                     self.pending_progress_poll = None;
                     self.pending_loop_retarget = None;
+                    self.playback_metronome_beat_count = None;
+                    self.playback_metronome_confirmed = false;
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
@@ -783,6 +958,8 @@ impl Browser {
                 {
                     self.pending_progress_poll = None;
                     self.pending_loop_retarget = None;
+                    self.playback_metronome_beat_count = None;
+                    self.playback_metronome_confirmed = false;
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
@@ -793,13 +970,15 @@ impl Browser {
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
                     self.pending_loop_retarget = None;
-                    self.playback_status = "Loop live update cancelled".to_string();
+                    self.playback_status = "Playback live update cancelled".to_string();
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
                 {
                     self.pending_progress_poll = None;
                     self.pending_loop_retarget = None;
+                    self.playback_metronome_beat_count = None;
+                    self.playback_metronome_confirmed = false;
                     self.clear_playback_cursor();
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
@@ -886,7 +1065,7 @@ impl Browser {
             .accepted_playback_intent
             .as_ref()
             .map(|intent| intent.path.clone());
-        let outcome = reduce_loop_retarget_progress(
+        let outcome = reduce_playback_retarget_progress(
             &mut self.pending_loop_retarget,
             &mut self.accepted_playback_intent,
             response_id,
@@ -899,26 +1078,39 @@ impl Browser {
             progress.error.is_some(),
             progress.playback_request_id.map(PlaybackRequestId::get),
             progress.looping,
+            progress.metronome_beat_count,
         );
         match outcome {
             LoopRetargetProgressOutcome::Ignored => {}
             LoopRetargetProgressOutcome::Failed => {
                 if let Some(error) = progress.error.as_deref() {
-                    self.playback_status = format!("Loop live update failed: {error}");
+                    self.playback_status = format!("Playback live update failed: {error}");
                 } else {
-                    self.playback_status = "Loop live update failed".to_string();
+                    self.playback_status = "Playback live update failed".to_string();
                 }
             }
             LoopRetargetProgressOutcome::Inactive => self.clear_current_playback("Stopped"),
             LoopRetargetProgressOutcome::Confirmed { desired_matches } => {
+                self.record_confirmed_metronome(&progress);
+                self.playback_metronome_confirmed = true;
                 self.record_playback_progress(&progress);
                 if desired_matches {
                     self.set_playback_status_from_progress(&progress);
                 } else {
                     self.playback_status =
-                        "Loop live update failed: playback mode did not change".to_string();
+                        "Playback live update failed: playback mode did not change".to_string();
                 }
             }
+        }
+    }
+
+    fn record_confirmed_metronome(&mut self, progress: &PlaybackRuntimeProgress) {
+        self.playback_metronome_beat_count = progress.metronome_beat_count;
+        if let Some(accepted) = self.accepted_playback_intent.as_mut() {
+            accepted.resume_desired = Some(PlaybackDesiredState {
+                looped: progress.looping,
+                metronome_beat_count: progress.metronome_beat_count,
+            });
         }
     }
 
@@ -927,9 +1119,11 @@ impl Browser {
             self.clear_current_playback(&format!("Playback failed: {error}"));
         } else if progress.active {
             self.record_playback_progress(&progress);
+            self.record_confirmed_metronome(&progress);
+            self.playback_metronome_confirmed = true;
             if self.pending_loop_retarget.is_some() {
                 if let Some(pending) = self.pending_loop_retarget.as_ref() {
-                    self.set_pending_loop_status(pending.desired_looped);
+                    self.set_pending_playback_status(pending.desired);
                 }
             } else {
                 reconcile_playback_intent_mode(
@@ -952,10 +1146,10 @@ impl Browser {
         }
     }
 
-    fn set_pending_loop_status(&mut self, desired_looped: bool) {
+    fn set_pending_playback_status(&mut self, desired: PlaybackDesiredState) {
         self.playback_status = format!(
-            "Loop {} · applying to playback",
-            loop_mode_status_word(desired_looped)
+            "{} · applying to playback",
+            playback_state_status_word(desired)
         );
     }
 
@@ -967,6 +1161,8 @@ impl Browser {
         self.latest_playback_request_id = None;
         self.playing_path = None;
         self.accepted_playback_intent = None;
+        self.playback_metronome_beat_count = None;
+        self.playback_metronome_confirmed = false;
         self.playback_status = status.to_string();
     }
 
@@ -1011,6 +1207,9 @@ impl Browser {
         {
             return Some(pending_resume_intent(resume, self.volume));
         }
+        if let Some(resume) = self.current_normalized_resume_intent() {
+            return Some(resume);
+        }
         let playing_path = self.playing_path.as_ref()?;
         if selected_path != Some(playing_path) {
             return None;
@@ -1019,12 +1218,17 @@ impl Browser {
         if accepted.path != *playing_path {
             return None;
         }
-        let mut resume = accepted_resume_intent(accepted, self.volume);
-        let pending = self.pending_loop_retarget.as_ref();
-        let pending_is_current =
-            pending.is_some_and(|pending| self.pending_loop_retarget_is_current(pending));
-        apply_pending_loop_retarget_to_resume(&mut resume, pending, pending_is_current);
-        Some(resume)
+        let pending = self
+            .pending_loop_retarget
+            .as_ref()
+            .filter(|pending| self.pending_loop_retarget_is_current(pending));
+        Some(capture_resume_configuration(
+            accepted,
+            self.volume,
+            self.playback_metronome_beat_count,
+            pending,
+            self.current_normalized_playback_target(),
+        ))
     }
 
     pub(super) fn reconfigure_audio_output(&mut self, cx: &mut Context<Self>) {
@@ -1098,6 +1302,39 @@ fn resolve_queued_playback_intent(
         }
         intent
     })
+}
+
+fn capture_resume_configuration(
+    accepted: &PlaybackIntent,
+    volume: f32,
+    confirmed_metronome: Option<u16>,
+    pending: Option<&PendingLoopRetarget>,
+    normalized: Option<PlaybackDesiredState>,
+) -> PlaybackIntent {
+    let mut resume = accepted_resume_intent(accepted, volume);
+    resume.resume_desired = Some(PlaybackDesiredState {
+        looped: accepted.looped,
+        metronome_beat_count: accepted
+            .resume_desired
+            .map_or(confirmed_metronome, |desired| desired.metronome_beat_count),
+    });
+    apply_pending_loop_retarget_to_resume(&mut resume, pending, true);
+    if let Some(desired) = normalized {
+        resume.looped = desired.looped;
+        resume.resume_desired = Some(desired);
+        resume.region = playback_span_for_intent(accepted);
+    }
+    resume
+}
+
+fn metronome_count_for_intent(intent: &PlaybackIntent, preference: Option<u16>) -> Option<u16> {
+    if intent.origin == PlaybackIntentOrigin::AudioOutputResume {
+        intent
+            .resume_desired
+            .map_or(preference, |desired| desired.metronome_beat_count)
+    } else {
+        preference
+    }
 }
 
 fn accepted_resume_intent(accepted: &PlaybackIntent, volume: f32) -> PlaybackIntent {
@@ -1186,6 +1423,33 @@ pub(super) fn playback_span_matches_preparation(
     playback_span_for_intent(intent) == Some(prepared_span)
 }
 
+fn preferred_metronome_grid(
+    origin: PlaybackIntentOrigin,
+    requested_path: &Path,
+    captured_path: Option<&Path>,
+    captured_grid: Option<PlaybackMetronomeGrid>,
+    source_grid: impl FnOnce() -> Option<PlaybackMetronomeGrid>,
+) -> Option<PlaybackMetronomeGrid> {
+    if origin == PlaybackIntentOrigin::AudioOutputResume && captured_path == Some(requested_path) {
+        captured_grid
+    } else {
+        source_grid()
+    }
+}
+
+fn captured_metronome_grid_or_source(
+    requested_path: &Path,
+    captured_path: Option<&Path>,
+    captured_grid: Option<PlaybackMetronomeGrid>,
+    source_grid: impl FnOnce() -> Option<PlaybackMetronomeGrid>,
+) -> Option<PlaybackMetronomeGrid> {
+    if captured_path == Some(requested_path) {
+        captured_grid
+    } else {
+        source_grid()
+    }
+}
+
 fn reconcile_playback_intent_mode(intent: Option<&mut PlaybackIntent>, looped: bool) {
     let Some(intent) = intent else {
         return;
@@ -1198,22 +1462,6 @@ fn reconcile_playback_intent_mode(intent: Option<&mut PlaybackIntent>, looped: b
     if let Some(span) = span {
         intent.region = Some(span);
     }
-}
-
-fn next_loop_toggle_target(
-    playing: bool,
-    policy_enabled: bool,
-    accepted_looped: Option<bool>,
-    pending_desired_looped: Option<bool>,
-) -> bool {
-    let current = if playing {
-        pending_desired_looped
-            .or(accepted_looped)
-            .unwrap_or(policy_enabled)
-    } else {
-        policy_enabled
-    };
-    !current
 }
 
 fn admit_loop_retarget(pending: &mut Option<PendingLoopRetarget>, candidate: PendingLoopRetarget) {
@@ -1265,11 +1513,13 @@ fn apply_pending_loop_retarget_to_resume(
     pending_is_current: bool,
 ) {
     if let Some(pending) = pending.filter(|_| pending_is_current) {
-        resume.looped = pending.desired_looped;
+        resume.looped = pending.desired.looped;
+        resume.resume_desired = Some(pending.desired);
         resume.region = Some(pending.span);
     }
 }
 
+#[cfg(test)]
 fn reduce_loop_retarget_progress(
     pending: &mut Option<PendingLoopRetarget>,
     accepted: &mut Option<PlaybackIntent>,
@@ -1283,6 +1533,38 @@ fn reduce_loop_retarget_progress(
     has_error: bool,
     playback_id: Option<u64>,
     looping: bool,
+) -> LoopRetargetProgressOutcome {
+    reduce_playback_retarget_progress(
+        pending,
+        accepted,
+        response_id,
+        latest_playback_id,
+        playback_epoch,
+        output_open_generation,
+        playing_path,
+        accepted_path,
+        active,
+        has_error,
+        playback_id,
+        looping,
+        None,
+    )
+}
+
+fn reduce_playback_retarget_progress(
+    pending: &mut Option<PendingLoopRetarget>,
+    accepted: &mut Option<PlaybackIntent>,
+    response_id: u64,
+    latest_playback_id: Option<u64>,
+    playback_epoch: u64,
+    output_open_generation: u64,
+    playing_path: Option<&Path>,
+    accepted_path: Option<&Path>,
+    active: bool,
+    has_error: bool,
+    playback_id: Option<u64>,
+    looping: bool,
+    metronome_beat_count: Option<u16>,
 ) -> LoopRetargetProgressOutcome {
     let Some(current) = pending.as_ref() else {
         return LoopRetargetProgressOutcome::Ignored;
@@ -1310,7 +1592,7 @@ fn reduce_loop_retarget_progress(
         *pending = None;
         return LoopRetargetProgressOutcome::Inactive;
     }
-    let desired_looped = current.desired_looped;
+    let desired = current.desired;
     let span = current.span;
     let path = current.path.clone();
     *pending = None;
@@ -1321,7 +1603,8 @@ fn reduce_loop_retarget_progress(
         intent.region = Some(span);
     }
     LoopRetargetProgressOutcome::Confirmed {
-        desired_matches: looping == desired_looped,
+        desired_matches: looping == desired.looped
+            && metronome_beat_count == desired.metronome_beat_count,
     }
 }
 
@@ -1347,6 +1630,28 @@ fn loop_mode_status_word(enabled: bool) -> &'static str {
 
 fn loop_mode_toolbar_word(enabled: bool) -> &'static str {
     if enabled { "On" } else { "Off" }
+}
+
+fn playback_state_status_word(desired: PlaybackDesiredState) -> String {
+    if desired.metronome_beat_count.is_some() {
+        format!(
+            "Loop {} · metronome enabled",
+            loop_mode_status_word(desired.looped)
+        )
+    } else {
+        format!(
+            "Loop {} · metronome disabled",
+            loop_mode_status_word(desired.looped)
+        )
+    }
+}
+
+fn metronome_target_is_pending(
+    desired: Option<u16>,
+    confirmed: Option<u16>,
+    has_confirmed_progress: bool,
+) -> bool {
+    desired != confirmed || (desired.is_some() && !has_confirmed_progress)
 }
 
 fn normalized_playback_start(start: f64) -> Option<f64> {
@@ -1449,15 +1754,16 @@ mod tests {
         PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin,
         PlaybackProgressDisposition, accepted_resume_intent, admit_loop_retarget,
         apply_pending_loop_retarget_to_resume, audio_output_resume_is_current,
-        authoritative_cursor_progress, cursor_interpolation, next_loop_toggle_target,
-        normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
-        playback_progress_disposition, playback_request_number_is_current,
-        playback_span_for_intent, playback_span_matches_preparation, preview_cursor_ratio,
+        authoritative_cursor_progress, captured_metronome_grid_or_source, cursor_interpolation,
+        metronome_target_is_pending, normalized_playback_start, pending_resume_intent,
+        playback_mode_for_intent, playback_progress_disposition,
+        playback_request_number_is_current, playback_span_for_intent,
+        playback_span_matches_preparation, preferred_metronome_grid, preview_cursor_ratio,
         progress_poll_has_expired, progress_poll_is_current, reconcile_playback_intent_mode,
-        reduce_loop_retarget_progress, resolve_queued_playback_intent,
-        retain_pending_loop_retarget_after_failed_admission, should_cancel_pending_autoplay,
-        should_queue_initialized_playback, should_record_last_played,
-        should_record_playback_history,
+        reduce_loop_retarget_progress, reduce_playback_retarget_progress,
+        resolve_queued_playback_intent, retain_pending_loop_retarget_after_failed_admission,
+        should_cancel_pending_autoplay, should_queue_initialized_playback,
+        should_record_last_played, should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -1474,6 +1780,7 @@ mod tests {
             volume: 1.0,
             path: path.to_path_buf(),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         }
     }
 
@@ -1482,15 +1789,162 @@ mod tests {
         retarget_id: u64,
         desired_looped: bool,
     ) -> PendingLoopRetarget {
+        sample_pending_playback_retarget(
+            path,
+            retarget_id,
+            super::PlaybackDesiredState {
+                looped: desired_looped,
+                metronome_beat_count: None,
+            },
+        )
+    }
+
+    fn sample_pending_playback_retarget(
+        path: &Path,
+        retarget_id: u64,
+        desired: super::PlaybackDesiredState,
+    ) -> PendingLoopRetarget {
         PendingLoopRetarget {
             retarget_id,
             accepted_playback_id: 42,
             playback_epoch: 7,
             output_open_generation: 3,
             path: path.to_path_buf(),
-            desired_looped,
+            desired,
             span: WaveformPlayRegion::new(0.4, 1.0).expect("valid test span"),
+            metronome_grid: None,
         }
+    }
+
+    #[gpui::test]
+    fn repeated_output_capture_recovers_fenced_normalized_resume(cx: &mut gpui::TestAppContext) {
+        use super::super::normalized_audition::{
+            NormalizedAuditionAction, NormalizedAuditionFence, PendingNormalizedAudition,
+        };
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        browser.update(cx, |view, _| {
+            let path = PathBuf::from("sample.wav");
+            view.entries = vec![AudioFile {
+                path: path.clone(),
+                relative_path: path.clone(),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            view.normalized_audition.set_enabled(true);
+            let accepted = sample_intent(&path, false);
+            let desired = super::PlaybackDesiredState {
+                looped: true,
+                metronome_beat_count: Some(6),
+            };
+            let resume =
+                super::capture_resume_configuration(&accepted, 1.0, None, None, Some(desired));
+            let span = playback_span_for_intent(&resume).unwrap();
+            let pending = PendingNormalizedAudition {
+                fence: NormalizedAuditionFence::new(
+                    view.playback_epoch,
+                    view.waveform_generation,
+                    view.audio_output_open_generation,
+                    None,
+                    path.clone(),
+                    span,
+                ),
+                action: NormalizedAuditionAction::Play(resume),
+            };
+            view.normalized_audition_deferred_play = Some(pending.clone());
+            let recaptured = view
+                .capture_audio_output_resume_intent()
+                .expect("resume during preparation");
+            assert_eq!(recaptured.resume_desired, Some(desired));
+            view.stop_playback();
+            assert!(view.capture_audio_output_resume_intent().is_none());
+            let mut next = pending.clone();
+            next.fence.playback_epoch = view.playback_epoch;
+            next.action = NormalizedAuditionAction::Play(recaptured);
+            view.normalized_audition_queued = Some(next);
+            assert_eq!(
+                view.capture_audio_output_resume_intent()
+                    .unwrap()
+                    .resume_desired,
+                Some(desired)
+            );
+            view.waveform_generation += 1;
+            assert!(view.capture_audio_output_resume_intent().is_none());
+        });
+    }
+
+    #[test]
+    fn output_resume_keeps_newest_complete_target_through_repeated_capture() {
+        let path = Path::new("sample.wav");
+        let accepted = sample_intent(path, false);
+        let pending = sample_pending_playback_retarget(
+            path,
+            44,
+            super::PlaybackDesiredState {
+                looped: true,
+                metronome_beat_count: Some(4),
+            },
+        );
+        let latest = super::PlaybackDesiredState {
+            looped: false,
+            metronome_beat_count: Some(7),
+        };
+        let resume = super::capture_resume_configuration(
+            &accepted,
+            0.75,
+            None,
+            Some(&pending),
+            Some(latest),
+        );
+        assert_eq!(resume.resume_desired, Some(latest));
+        assert!(!resume.looped);
+        assert_eq!(resume.region, playback_span_for_intent(&accepted));
+        let repeated = pending_resume_intent(&resume, 0.5);
+        assert_eq!(repeated.resume_desired, Some(latest));
+        assert_eq!(super::metronome_count_for_intent(&repeated, None), Some(7));
+        assert_eq!(repeated.volume, 0.5);
+        let admitted =
+            super::capture_resume_configuration(&accepted, 0.75, None, Some(&pending), None);
+        assert_eq!(admitted.resume_desired, Some(pending.desired));
+        let confirmed = super::capture_resume_configuration(&accepted, 0.75, Some(3), None, None);
+        assert_eq!(
+            confirmed.resume_desired.unwrap().metronome_beat_count,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn output_resume_retains_admitted_count_before_first_progress() {
+        let mut accepted = sample_intent(Path::new("sample.wav"), false);
+        accepted.resume_desired = Some(super::PlaybackDesiredState {
+            looped: false,
+            metronome_beat_count: Some(5),
+        });
+        let resume = super::capture_resume_configuration(&accepted, 1.0, None, None, None);
+        assert_eq!(super::metronome_count_for_intent(&resume, None), Some(5));
+        accepted
+            .resume_desired
+            .as_mut()
+            .unwrap()
+            .metronome_beat_count = None;
+        let disabled = super::capture_resume_configuration(&accepted, 1.0, None, None, None);
+        assert_eq!(super::metronome_count_for_intent(&disabled, Some(5)), None);
+    }
+
+    #[test]
+    fn disabled_resume_metronome_does_not_fall_back_to_idle_preference() {
+        let accepted = sample_intent(Path::new("sample.wav"), false);
+        let resume = super::capture_resume_configuration(&accepted, 1.0, None, None, None);
+        assert_eq!(super::metronome_count_for_intent(&resume, Some(8)), None);
+        assert_eq!(
+            super::metronome_count_for_intent(&accepted, Some(8)),
+            Some(8)
+        );
     }
 
     #[test]
@@ -1623,6 +2077,7 @@ mod tests {
             volume: 1.0,
             path: path.clone(),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         let mut policy = PlaybackLoopPolicy::default();
         let resolved = resolve_queued_playback_intent(&mut policy, intent, Some(&entry))
@@ -1649,6 +2104,7 @@ mod tests {
 
         let resume = PlaybackIntent {
             origin: PlaybackIntentOrigin::AudioOutputResume,
+            resume_desired: None,
             looped: true,
             path,
             ..resolved_manual
@@ -1668,6 +2124,7 @@ mod tests {
             volume: 0.25,
             path: PathBuf::from("sample.wav"),
             origin: PlaybackIntentOrigin::HistoryReplay,
+            resume_desired: None,
         };
         let resume = accepted_resume_intent(&accepted, 0.75);
         assert_eq!(resume.origin, PlaybackIntentOrigin::AudioOutputResume);
@@ -1687,6 +2144,7 @@ mod tests {
             volume: 0.25,
             path: PathBuf::from("sample.wav"),
             origin: PlaybackIntentOrigin::SelectionAutoplay,
+            resume_desired: None,
         };
         let resume = pending_resume_intent(&pending, 0.75);
         assert_eq!(resume.origin, PlaybackIntentOrigin::SelectionAutoplay);
@@ -1705,6 +2163,7 @@ mod tests {
                 volume: 1.0,
                 path: path.clone(),
                 origin: PlaybackIntentOrigin::Explicit,
+                resume_desired: None,
             }),
             PlaybackRuntimeMode::OneShot {
                 start: 1.0,
@@ -1719,6 +2178,7 @@ mod tests {
                 volume: 1.0,
                 path,
                 origin: PlaybackIntentOrigin::SelectionAutoplay,
+                resume_desired: None,
             }),
             PlaybackRuntimeMode::Looped {
                 start: 0.0,
@@ -1739,6 +2199,7 @@ mod tests {
             volume: 1.0,
             path: path.clone(),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         assert_eq!(
             playback_mode_for_intent(&one_shot),
@@ -1763,6 +2224,79 @@ mod tests {
     }
 
     #[test]
+    fn output_resume_prefers_the_admitted_grid_before_current_waveform_metadata() {
+        let path = Path::new("sample.wav");
+        let captured = super::PlaybackMetronomeGrid {
+            frames: 48_000,
+            origin_frame: 12_000,
+        };
+        let current = super::PlaybackMetronomeGrid {
+            frames: 96_000,
+            origin_frame: 24_000,
+        };
+        let mut source_called = false;
+        let selected = preferred_metronome_grid(
+            PlaybackIntentOrigin::AudioOutputResume,
+            path,
+            Some(path),
+            Some(captured),
+            || {
+                source_called = true;
+                Some(current)
+            },
+        );
+        assert_eq!(selected, Some(captured));
+        assert!(!source_called);
+
+        let mut source_called = false;
+        let fallback = preferred_metronome_grid(
+            PlaybackIntentOrigin::AudioOutputResume,
+            path,
+            Some(Path::new("other.wav")),
+            Some(captured),
+            || {
+                source_called = true;
+                Some(current)
+            },
+        );
+        assert_eq!(fallback, Some(current));
+        assert!(source_called);
+    }
+
+    #[test]
+    fn an_admitted_missing_grid_stays_missing_for_live_retargets() {
+        let path = Path::new("sample.wav");
+        let current = super::PlaybackMetronomeGrid {
+            frames: 96_000,
+            origin_frame: 24_000,
+        };
+        let mut source_called = false;
+        let selected = captured_metronome_grid_or_source(path, Some(path), None, || {
+            source_called = true;
+            Some(current)
+        });
+        assert_eq!(selected, None);
+        assert!(!source_called);
+
+        let mut source_called = false;
+        let fallback =
+            captured_metronome_grid_or_source(path, Some(Path::new("other.wav")), None, || {
+                source_called = true;
+                Some(current)
+            });
+        assert_eq!(fallback, Some(current));
+        assert!(source_called);
+    }
+
+    #[test]
+    fn metronome_pending_state_separates_unconfirmed_enable_from_loop_only_updates() {
+        assert!(metronome_target_is_pending(Some(4), None, false));
+        assert!(!metronome_target_is_pending(None, None, false));
+        assert!(!metronome_target_is_pending(Some(4), Some(4), true));
+        assert!(metronome_target_is_pending(None, Some(4), true));
+    }
+
+    #[test]
     fn pending_playback_intent_tracks_the_latest_quantized_volume() {
         let mut intent = PlaybackIntent {
             start: 0.0,
@@ -1771,6 +2305,7 @@ mod tests {
             volume: 1.0,
             path: PathBuf::from("sample.wav"),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         intent.set_volume(0.7346);
         assert_eq!(intent.volume, 0.735);
@@ -1874,6 +2409,7 @@ mod tests {
             volume: 1.0,
             path: path.clone(),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         let span = playback_span_for_intent(&one_shot).expect("seeked one-shot has a span");
         assert_eq!(span, WaveformPlayRegion::new(0.4, 1.0).unwrap());
@@ -1903,6 +2439,7 @@ mod tests {
             volume: 1.0,
             path: PathBuf::from("sample.wav"),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         reconcile_playback_intent_mode(Some(&mut intent), true);
         assert_eq!(intent.region, WaveformPlayRegion::new(0.4, 1.0));
@@ -1927,6 +2464,7 @@ mod tests {
             volume: 1.0,
             path: PathBuf::from("sample.wav"),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         reconcile_playback_intent_mode(Some(&mut intent), true);
         let resume = accepted_resume_intent(&intent, 0.75);
@@ -1939,30 +2477,6 @@ mod tests {
             }
         );
         assert_eq!(resume.volume, 0.75);
-    }
-
-    #[test]
-    fn live_loop_toggle_uses_confirmed_mode_before_saved_policy() {
-        assert!(!next_loop_toggle_target(false, true, None, None));
-        assert!(next_loop_toggle_target(true, true, Some(false), None));
-        assert!(!next_loop_toggle_target(true, false, Some(true), None));
-        assert!(!next_loop_toggle_target(
-            true,
-            false,
-            Some(false),
-            Some(true)
-        ));
-    }
-
-    #[test]
-    fn normalized_pending_loop_target_inverts_the_latest_request() {
-        assert!(!next_loop_toggle_target(
-            true,
-            false,
-            Some(false),
-            Some(true)
-        ));
-        assert!(next_loop_toggle_target(true, true, Some(true), Some(false)));
     }
 
     #[test]
@@ -2027,6 +2541,135 @@ mod tests {
         let accepted = accepted.expect("accepted play");
         assert!(!accepted.looped);
         assert_eq!(accepted.region, Some(span));
+    }
+
+    #[test]
+    fn playback_reducer_requires_the_complete_loop_and_metronome_tuple() {
+        let path = PathBuf::from("sample.wav");
+        let desired = super::PlaybackDesiredState {
+            looped: true,
+            metronome_beat_count: Some(8),
+        };
+        let mut accepted = Some(sample_intent(&path, false));
+        let mut pending = Some(sample_pending_playback_retarget(&path, 11, desired));
+
+        let partial = reduce_playback_retarget_progress(
+            &mut pending,
+            &mut accepted,
+            11,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+            true,
+            false,
+            Some(42),
+            true,
+            Some(4),
+        );
+        assert_eq!(
+            partial,
+            super::LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: false,
+            }
+        );
+        assert!(pending.is_none());
+        assert!(accepted.as_ref().expect("accepted play").looped);
+
+        let mut accepted = Some(sample_intent(&path, false));
+        let mut pending = Some(sample_pending_playback_retarget(&path, 12, desired));
+        let confirmed = reduce_playback_retarget_progress(
+            &mut pending,
+            &mut accepted,
+            12,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+            true,
+            false,
+            Some(42),
+            true,
+            Some(8),
+        );
+        assert_eq!(
+            confirmed,
+            super::LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: true,
+            }
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn playback_reducer_ignores_an_old_tuple_ack_after_a_newer_target() {
+        let path = PathBuf::from("sample.wav");
+        let first = super::PlaybackDesiredState {
+            looped: true,
+            metronome_beat_count: Some(4),
+        };
+        let newest = super::PlaybackDesiredState {
+            looped: false,
+            metronome_beat_count: Some(8),
+        };
+        let mut accepted = Some(sample_intent(&path, false));
+        let mut pending = None;
+        admit_loop_retarget(
+            &mut pending,
+            sample_pending_playback_retarget(&path, 11, first),
+        );
+        admit_loop_retarget(
+            &mut pending,
+            sample_pending_playback_retarget(&path, 12, newest),
+        );
+
+        let stale_failure = reduce_playback_retarget_progress(
+            &mut pending,
+            &mut accepted,
+            11,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+            true,
+            true,
+            Some(42),
+            true,
+            Some(4),
+        );
+        assert_eq!(stale_failure, super::LoopRetargetProgressOutcome::Ignored);
+        assert_eq!(
+            pending.as_ref().map(|pending| pending.desired),
+            Some(newest)
+        );
+        assert!(!accepted.as_ref().expect("accepted play").looped);
+
+        let confirmed = reduce_playback_retarget_progress(
+            &mut pending,
+            &mut accepted,
+            13,
+            Some(42),
+            7,
+            3,
+            Some(path.as_path()),
+            Some(path.as_path()),
+            true,
+            false,
+            Some(42),
+            false,
+            Some(8),
+        );
+        assert_eq!(
+            confirmed,
+            super::LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: true,
+            }
+        );
+        assert!(pending.is_none());
+        assert!(!accepted.as_ref().expect("accepted play").looped);
     }
 
     #[test]

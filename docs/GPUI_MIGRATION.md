@@ -1997,3 +1997,9 @@ Core now exposes deterministic random-section units and the native `f32` range c
 ### Windows fade and metronome-backend validation, 2026-09-09
 
 Windows run `34318763629` succeeded at `572aa5a3008cdf4634ee6093e1771aa2011352a9`: core/media/platform library tests, combined GPUI application/browser test compilation and browser tests passed. This run predates the last-window shutdown fix, the explicit Reson test step and the GPUI metronome UI. Those later changes require a newer run; native Windows input acceptance remains separate.
+
+### GPUI metronome control and complete live transport updates, 2026-09-09
+
+The compact toolbar now includes the native metronome glyph and beat-guide divisions. Metronome enable/count and loop changes share one complete desired transport tuple through live retargeting and normalized-audition preparation. Active presentation uses runtime confirmation with a distinct pending state. Each admitted playback retains its source-frame grid, including unavailable metadata, so later focus/selection/metadata changes cannot shift the active grid.
+
+Output resume retains the complete admitted or confirmed configuration on its intent, with newer fence-valid normalized and runtime updates taking precedence. Repeated device changes can recover a still-current queued/deferred normalized resume; explicit stop and changed waveform generations reject it. Independent review found these resume races and the corrections passed focused re-review. All 340 UI tests passed with one existing benchmark ignored; application checking, formatting and diff checks passed. Native audible metronome acceptance remains outstanding.

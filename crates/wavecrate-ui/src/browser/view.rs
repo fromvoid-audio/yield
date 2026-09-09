@@ -20,6 +20,7 @@ use super::context_menu;
 use super::curation;
 use super::display_labels;
 use super::file_drag;
+use super::metronome;
 use super::motion;
 use super::normalized_audition;
 use super::shortcut_help;
@@ -507,6 +508,15 @@ impl Render for Browser {
         });
         let beat_guides_enabled = self.beat_guides_enabled;
         let beat_guides_color = color(if beat_guides_enabled {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
+        let metronome_enabled = self.metronome_toolbar_enabled();
+        let metronome_pending = self.metronome_toolbar_pending();
+        let metronome_color = color(if metronome_pending {
+            theme.colors.warning
+        } else if metronome_enabled {
             theme.colors.accent
         } else {
             theme.colors.text_muted
@@ -1085,6 +1095,27 @@ impl Render for Browser {
                     )
                     .child(
                         div()
+                            .id("metronome-toolbar")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(metronome::tooltip)
+                            })
+                            .on_click(cx.listener(Self::toggle_metronome_from_toolbar))
+                            .child(metronome::render_icon(metronome_color)),
+                    )
+                    .child(
+                        div()
                             .flex_none()
                             .w(px(220.0))
                             .on_mouse_down(
@@ -1480,6 +1511,7 @@ mod tests {
             volume: 0.8,
             path: path.clone(),
             origin: transport::PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         browser.update(cx, |view, _| {
             view.waveform = Some(inert_preview());
@@ -1568,6 +1600,7 @@ mod tests {
             volume: 0.8,
             path: path.clone(),
             origin: transport::PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         browser.update(cx, |view, _| {
             view.waveform = Some(inert_preview());
@@ -1717,6 +1750,7 @@ mod tests {
             volume: 0.8,
             path: path.clone(),
             origin: transport::PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         browser.update(cx, |view, _| {
             assert!(view.source_registry_task.is_none());
@@ -1882,6 +1916,7 @@ mod tests {
             volume: 0.7,
             path: path.clone(),
             origin: transport::PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         browser.update(cx, |view, _| {
             view.waveform = Some(inert_preview());

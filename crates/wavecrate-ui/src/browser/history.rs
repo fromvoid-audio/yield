@@ -305,6 +305,7 @@ fn history_playback_intent(
         volume: super::volume::quantize_volume(volume),
         path: entry.path().to_path_buf(),
         origin: PlaybackIntentOrigin::HistoryReplay,
+        resume_desired: None,
     }
 }
 
@@ -382,6 +383,7 @@ mod tests {
             volume: 1.0,
             path: PathBuf::from("plain.wav"),
             origin: PlaybackIntentOrigin::Explicit,
+            resume_desired: None,
         };
         assert_eq!(playback_history_span(&plain), (0.25, 1.0));
 
