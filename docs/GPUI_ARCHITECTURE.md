@@ -86,9 +86,11 @@ and refresh discard identities no longer visible. Plain pointer focus clears
 explicit membership, while plain arrow focus preserves it. Source and folder
 navigation clear batch membership. These choices remain session-only.
 
-Gain/fade, reverse and mute edit preparation also belongs to `wavecrate-media`. It retains a source
-handle, validates the captured WAV revision before decoding and after encoding,
-and prepares whole-file float WAV bytes in a fresh caller-owned sink. The caller
+Gain/fade, reverse, mute, trim and crop preparation belong to `wavecrate-media`.
+The service retains a source handle, validates the captured WAV revision before decoding and after encoding,
+and prepares float WAV bytes in a fresh caller-owned sink. Trim removes selected
+frames; crop keeps selected frames. These operations currently require bounds
+within existing audio and reject an empty result. The caller
 sets a decoded-buffer budget subject to a 256 MiB ceiling and runs the operation
 off the UI thread. Failure requires discarding the output, including a source
 revision failure after finalization. Prepared bytes confer no publication,

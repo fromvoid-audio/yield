@@ -19,6 +19,10 @@ pub enum WavEditOperation {
     Reverse,
     /// Replace selected samples with positive zero while preserving the file length.
     Mute,
+    /// Remove selected existing frames, joining the retained prefix and suffix.
+    Trim,
+    /// Keep only selected existing frames; silence outside the source is not supported here.
+    Crop,
 }
 
 /// A revision-fenced edit of a half-open selection within a whole WAV file.
@@ -49,6 +53,9 @@ impl WavEditPreparationRequest {
         operation: WavEditOperation,
     ) -> Result<Self, String> {
         WavSpanExportRequest::new(context.clone(), range)?;
+        if operation == WavEditOperation::Trim && range.len() == context.total_frames {
+            return Err(String::from("trimming the entire WAV would leave no audio"));
+        }
         Ok(Self {
             context,
             range,
@@ -61,7 +68,9 @@ impl WavEditPreparationRequest {
 ///
 /// `decoded_byte_budget` bounds the decoded f32 buffer, additionally capped by
 /// [`MAX_WAV_EDIT_DECODED_BYTES`]. The caller must run this blocking work off the UI thread.
-/// Output retains all frames/channels and uses native unclipped 32-bit float encoding.
+/// Output retains channels and sample rate and uses native unclipped 32-bit float encoding.
+/// Trim removes selected frames; crop retains only selected frames. Other operations retain
+/// the original frame count. Selection bounds must lie within existing audio.
 /// The source is checked before decoding, before output and after finalization. A successful
 /// result is only a prepared payload, not a durable file operation or publication authority.
 /// Any error requires discarding the output, including a stale-source error after finalization.
@@ -154,6 +163,16 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
                 check_cancel(cancellation)
             })?;
         }
+        WavEditOperation::Trim | WavEditOperation::Crop => {
+            let channels = usize::from(context.spec.channels);
+            retain_edit_frames(
+                &mut samples,
+                request.range.start_frame * channels,
+                request.range.end_frame * channels,
+                request.operation,
+                || check_cancel(cancellation),
+            )?;
+        }
     }
     recheck(context, &opened, cancellation)?;
     crate::encode_edited_wav_with_cancel(
@@ -178,6 +197,41 @@ fn checked_sample_count(context: &WaveformDetailContext, budget: usize) -> Resul
         return Err(String::from("WAV edit exceeds decoded memory budget"));
     }
     Ok(sample_count)
+}
+
+// Inputs are validated sample offsets. Forward copy order preserves unread source samples
+// even when a chunk overlaps its destination. No second decoded buffer is allocated.
+fn retain_edit_frames(
+    samples: &mut Vec<f32>,
+    start: usize,
+    end: usize,
+    operation: WavEditOperation,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
+    let (source_start, destination_start, count, output_len) = match operation {
+        WavEditOperation::Trim => (
+            end,
+            start,
+            samples.len() - end,
+            samples.len() - (end - start),
+        ),
+        WavEditOperation::Crop => (start, 0, end - start, end - start),
+        _ => unreachable!("only trim and crop change frame count"),
+    };
+    if source_start != destination_start {
+        for offset in (0..count).step_by(4096) {
+            check()?;
+            let chunk_len = (count - offset).min(4096);
+            samples.copy_within(
+                source_start + offset..source_start + offset + chunk_len,
+                destination_start + offset,
+            );
+        }
+    }
+    check()?;
+    samples.truncate(output_len);
+    Ok(())
 }
 
 // Called only with a validated complete-frame slice. Cancellation leaves a partial buffer
@@ -211,7 +265,7 @@ fn apply_frame_operation(
                 block.fill(0.0);
             }
         }
-        WavEditOperation::GainAndFades(_) => unreachable!("gain/fades use the existing transform"),
+        _ => unreachable!("only reverse and mute use this transform"),
     }
     check()
 }
@@ -308,6 +362,130 @@ mod tests {
             reader.spec(),
             reader.samples::<f32>().collect::<Result<_, _>>().unwrap(),
         )
+    }
+
+    #[test]
+    fn trim_and_crop_preserve_stereo_frames_and_source() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("retain.wav");
+        let original = [1, 11, 2, 12, 3, 13, 4, 14, 5, 15, 6, 16];
+        write_int(&path, &original, 2, 16);
+        let source_bytes = fs::read(&path).unwrap();
+        for (operation, start, end, expected) in [
+            (
+                WavEditOperation::Trim,
+                1,
+                3,
+                vec![1, 11, 4, 14, 5, 15, 6, 16],
+            ),
+            (
+                WavEditOperation::Trim,
+                0,
+                2,
+                vec![3, 13, 4, 14, 5, 15, 6, 16],
+            ),
+            (
+                WavEditOperation::Trim,
+                4,
+                6,
+                vec![1, 11, 2, 12, 3, 13, 4, 14],
+            ),
+            (WavEditOperation::Crop, 1, 4, vec![2, 12, 3, 13, 4, 14]),
+            (WavEditOperation::Crop, 0, 6, original.to_vec()),
+        ] {
+            let request = WavEditPreparationRequest::with_operation(
+                request(&path).context,
+                WaveformDetailRange {
+                    start_frame: start,
+                    end_frame: end,
+                },
+                operation,
+            )
+            .unwrap();
+            let mut output = Cursor::new(Vec::new());
+            prepare_wav_edit(&request, 48, &mut output).unwrap();
+            let (spec, actual) = read_output(output);
+            assert_eq!(spec.channels, 2);
+            assert_eq!(spec.sample_rate, 1_000);
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .map(|value| *value as f32 / 32768.0)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        }
+    }
+
+    #[test]
+    fn whole_file_trim_is_rejected_at_construction_and_execution() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("whole.wav");
+        write_int(&path, &[1, 2, 3, 4], 2, 16);
+        let mut request = request(&path);
+        assert!(
+            WavEditPreparationRequest::with_operation(
+                request.context.clone(),
+                request.range,
+                WavEditOperation::Trim
+            )
+            .is_err()
+        );
+        request.operation = WavEditOperation::Trim;
+        let mut output = Cursor::new(Vec::new());
+        let error = prepare_wav_edit(&request, 16, &mut output).unwrap_err();
+        assert!(error.contains("no audio"));
+        assert!(output.get_ref().is_empty());
+    }
+
+    #[test]
+    fn retention_handles_overlapping_chunks_without_allocating_another_buffer() {
+        let original: Vec<f32> = (0..12_000).map(|value| value as f32).collect();
+        for operation in [WavEditOperation::Trim, WavEditOperation::Crop] {
+            let mut samples = original.clone();
+            let pointer = samples.as_ptr();
+            let capacity = samples.capacity();
+            let (start, end) = if operation == WavEditOperation::Trim {
+                (2, 4)
+            } else {
+                (2, 11_998)
+            };
+            let expected: Vec<_> = if operation == WavEditOperation::Trim {
+                original[..start]
+                    .iter()
+                    .chain(&original[end..])
+                    .copied()
+                    .collect()
+            } else {
+                original[start..end].to_vec()
+            };
+            retain_edit_frames(&mut samples, start, end, operation, || Ok(())).unwrap();
+            assert_eq!(samples, expected);
+            assert_eq!(samples.as_ptr(), pointer);
+            assert_eq!(samples.capacity(), capacity);
+
+            let mut samples = original.clone();
+            let mut checks = 0;
+            let result = retain_edit_frames(&mut samples, start, end, operation, || {
+                checks += 1;
+                if checks == 3 {
+                    Err(String::from("canceled fixture"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.unwrap_err().contains("canceled"));
+            assert_eq!(samples.len(), original.len());
+            assert_eq!(
+                samples
+                    .iter()
+                    .zip(&original)
+                    .filter(|(left, right)| left != right)
+                    .count(),
+                4096
+            );
+        }
     }
 
     #[test]
