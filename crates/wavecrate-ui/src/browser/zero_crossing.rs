@@ -35,6 +35,11 @@ pub(super) struct ZeroCrossingIntent {
     pub(super) request: WavZeroCrossingSnapRequest,
     /// Selection kind and raw normalized bounds shown before the snapped result is accepted.
     pub(super) raw: ZeroCrossingBounds,
+    /// Captured edit resize effects used to rebuild the final settings after a late snap.
+    pub(super) edit_resize_effects: Option<(
+        wavecrate_core::WaveformEditRegion,
+        wavecrate_core::WaveformEditSettings,
+    )>,
 }
 
 /// Selection bounds shared by playback and edit snapping without clamping edit margins.
@@ -85,12 +90,27 @@ impl ZeroCrossingIntent {
         start: f64,
         end: f64,
     ) -> Option<Self> {
+        Self::new_with_edit_resize_effects(generation, context, kind, start, end, None)
+    }
+
+    fn new_with_edit_resize_effects(
+        generation: u64,
+        context: WaveformDetailContext,
+        kind: WaveformSelectionKind,
+        start: f64,
+        end: f64,
+        edit_resize_effects: Option<(
+            wavecrate_core::WaveformEditRegion,
+            wavecrate_core::WaveformEditSettings,
+        )>,
+    ) -> Option<Self> {
         let raw = ZeroCrossingBounds::new(kind, start, end)?;
         let request = WavZeroCrossingSnapRequest::new(context, raw.start, raw.end).ok()?;
         Some(Self {
             generation,
             request,
             raw,
+            edit_resize_effects,
         })
     }
 
@@ -99,12 +119,17 @@ impl ZeroCrossingIntent {
         generation: u64,
         context: &WaveformDetailContext,
         raw: ZeroCrossingBounds,
+        edit_resize_effects: Option<(
+            wavecrate_core::WaveformEditRegion,
+            wavecrate_core::WaveformEditSettings,
+        )>,
     ) -> bool {
         self.generation == generation
             && self.raw == raw
             && self.request.context == *context
             && self.request.start_ratio == raw.start
             && self.request.end_ratio == raw.end
+            && self.edit_resize_effects == edit_resize_effects
     }
 }
 
@@ -249,11 +274,26 @@ impl ZeroCrossingState {
         start: f64,
         end: f64,
     ) -> Option<ZeroCrossingBounds> {
+        self.ready_for_with_edit_resize_effects(generation, context, kind, start, end, None)
+    }
+
+    fn ready_for_with_edit_resize_effects(
+        &self,
+        generation: u64,
+        context: &WaveformDetailContext,
+        kind: WaveformSelectionKind,
+        start: f64,
+        end: f64,
+        edit_resize_effects: Option<(
+            wavecrate_core::WaveformEditRegion,
+            wavecrate_core::WaveformEditSettings,
+        )>,
+    ) -> Option<ZeroCrossingBounds> {
         let raw = ZeroCrossingBounds::new(kind, start, end)?;
         self.ready.as_ref().and_then(|ready| {
             ready
                 .intent
-                .matches_context_and_raw(generation, context, raw)
+                .matches_context_and_raw(generation, context, raw, edit_resize_effects)
                 .then_some(ready.snapped)
         })
     }
@@ -388,13 +428,40 @@ fn intent_for_raw(
     ZeroCrossingIntent::new(browser.waveform_generation, context, kind, start, end)
 }
 
+fn intent_for_raw_with_edit_resize_effects(
+    browser: &Browser,
+    kind: WaveformSelectionKind,
+    start: f64,
+    end: f64,
+    edit_resize_effects: Option<(
+        wavecrate_core::WaveformEditRegion,
+        wavecrate_core::WaveformEditSettings,
+    )>,
+) -> Option<ZeroCrossingIntent> {
+    let context = browser.waveform.as_ref()?.detail_context.as_ref()?.clone();
+    ZeroCrossingIntent::new_with_edit_resize_effects(
+        browser.waveform_generation,
+        context,
+        kind,
+        start,
+        end,
+        edit_resize_effects,
+    )
+}
+
 fn drag_intent(browser: &Browser, drag: WaveformRegionDrag) -> Option<ZeroCrossingIntent> {
     let bpm_snap = browser.bpm_snap_settings();
     if !drag.zero_crossing_applies(bpm_snap) {
         return None;
     }
     let (start, end) = drag.preview_bounds_with_bpm(bpm_snap)?;
-    intent_for_raw(browser, drag.selection_kind(), start, end)
+    intent_for_raw_with_edit_resize_effects(
+        browser,
+        drag.selection_kind(),
+        start,
+        end,
+        drag.edit_resize_effects(),
+    )
 }
 
 /// Return the raw or exact snapped preview for a live waveform drag.
@@ -447,12 +514,13 @@ pub(super) fn preview_drag_edit_region(
     Some(
         browser
             .zero_crossing
-            .ready_for(
+            .ready_for_with_edit_resize_effects(
                 browser.waveform_generation,
                 context,
                 WaveformSelectionKind::Edit,
                 raw.start(),
                 raw.end(),
+                drag.edit_resize_effects(),
             )
             .and_then(ZeroCrossingBounds::as_edit)
             .unwrap_or(raw),
@@ -503,13 +571,24 @@ pub(super) fn commit_or_schedule(
     raw: WaveformPlayRegion,
     cx: &mut Context<Browser>,
 ) {
-    commit_or_schedule_bounds(browser, WaveformSelectionKind::Play, raw.start, raw.end, cx);
+    commit_or_schedule_bounds(
+        browser,
+        WaveformSelectionKind::Play,
+        raw.start,
+        raw.end,
+        None,
+        cx,
+    );
 }
 
 /// Commit a released edit region immediately, then refine it when an exact snap is ready.
 pub(super) fn commit_or_schedule_edit(
     browser: &mut Browser,
     raw: wavecrate_core::WaveformEditRegion,
+    edit_resize_effects: Option<(
+        wavecrate_core::WaveformEditRegion,
+        wavecrate_core::WaveformEditSettings,
+    )>,
     cx: &mut Context<Browser>,
 ) {
     commit_or_schedule_bounds(
@@ -517,6 +596,7 @@ pub(super) fn commit_or_schedule_edit(
         WaveformSelectionKind::Edit,
         raw.start(),
         raw.end(),
+        edit_resize_effects,
         cx,
     );
 }
@@ -526,21 +606,33 @@ fn commit_or_schedule_bounds(
     kind: WaveformSelectionKind,
     start: f64,
     end: f64,
+    edit_resize_effects: Option<(
+        wavecrate_core::WaveformEditRegion,
+        wavecrate_core::WaveformEditSettings,
+    )>,
     cx: &mut Context<Browser>,
 ) {
-    apply_bounds(browser, kind, start, end);
+    apply_bounds(browser, kind, start, end, None);
     if !browser.zero_crossing.enabled() {
         browser.zero_crossing_queued = None;
         browser.zero_crossing.cancel_for_interruption();
         return;
     }
-    let Some(intent) = intent_for_raw(browser, kind, start, end) else {
+    let Some(intent) =
+        intent_for_raw_with_edit_resize_effects(browser, kind, start, end, edit_resize_effects)
+    else {
         browser.zero_crossing.cancel_for_interruption();
         browser.zero_crossing_queued = None;
         return;
     };
     if let Some(snapped) = browser.zero_crossing.take_ready_for(&intent) {
-        apply_bounds(browser, snapped.kind, snapped.start, snapped.end);
+        apply_bounds(
+            browser,
+            snapped.kind,
+            snapped.start,
+            snapped.end,
+            intent.edit_resize_effects,
+        );
         browser.zero_crossing.take_pending_commit(&intent);
         return;
     }
@@ -550,13 +642,28 @@ fn commit_or_schedule_bounds(
     schedule_intent(browser, intent, cx);
 }
 
-fn apply_bounds(browser: &mut Browser, kind: WaveformSelectionKind, start: f64, end: f64) {
+fn apply_bounds(
+    browser: &mut Browser,
+    kind: WaveformSelectionKind,
+    start: f64,
+    end: f64,
+    edit_resize_effects: Option<(
+        wavecrate_core::WaveformEditRegion,
+        wavecrate_core::WaveformEditSettings,
+    )>,
+) {
     match kind {
         WaveformSelectionKind::Play => {
             browser.waveform_play_region = WaveformPlayRegion::new(start, end);
         }
         WaveformSelectionKind::Edit => {
-            browser.waveform_edit_region = wavecrate_core::WaveformEditRegion::new(start, end);
+            let next = wavecrate_core::WaveformEditRegion::new(start, end);
+            if let Some((baseline, settings)) = edit_resize_effects
+                && let Some(next_region) = next
+            {
+                browser.waveform_edit_settings = settings.for_resized_region(baseline, next_region);
+            }
+            browser.waveform_edit_region = next;
         }
     }
 }
@@ -611,7 +718,13 @@ fn finish(
     match browser.zero_crossing.finish(job, result) {
         Some(Ok(snapped)) => {
             if browser.zero_crossing.pending_commit_matches(&intent) {
-                apply_bounds(browser, snapped.kind, snapped.start, snapped.end);
+                apply_bounds(
+                    browser,
+                    snapped.kind,
+                    snapped.start,
+                    snapped.end,
+                    intent.edit_resize_effects,
+                );
                 browser.zero_crossing.take_pending_commit(&intent);
             } else if browser
                 .waveform_region_drag
@@ -738,6 +851,72 @@ mod tests {
             state.ready_for(7, &changed, WaveformSelectionKind::Play, 0.2, 0.6),
             None
         );
+    }
+
+    #[test]
+    fn ready_edit_snap_requires_the_original_resize_effects() {
+        let context = context();
+        let baseline = wavecrate_core::WaveformEditRegion::new(0.1, 0.7).unwrap();
+        let settings = wavecrate_core::WaveformEditSettings::new(
+            0.5,
+            Some(wavecrate_core::WaveformEditFade::new(0.25, 0.5, 0.1, 0.8).unwrap()),
+            None,
+        )
+        .unwrap();
+        let metadata = Some((baseline, settings));
+        let exact = ZeroCrossingIntent::new_with_edit_resize_effects(
+            7,
+            context.clone(),
+            WaveformSelectionKind::Edit,
+            0.2,
+            0.6,
+            metadata,
+        )
+        .unwrap();
+        let snapped = ZeroCrossingBounds::new(WaveformSelectionKind::Edit, 0.21, 0.59).unwrap();
+        let mut state = ZeroCrossingState::default();
+        state.set_ready(exact.clone(), snapped);
+        assert_eq!(
+            state.ready_for_with_edit_resize_effects(
+                7,
+                &context,
+                WaveformSelectionKind::Edit,
+                0.2,
+                0.6,
+                metadata
+            ),
+            Some(snapped)
+        );
+        let changed = Some((
+            baseline,
+            wavecrate_core::WaveformEditSettings::new(0.75, settings.fade_in(), None).unwrap(),
+        ));
+        assert_eq!(
+            state.ready_for_with_edit_resize_effects(
+                7,
+                &context,
+                WaveformSelectionKind::Edit,
+                0.2,
+                0.6,
+                changed
+            ),
+            None
+        );
+        assert_eq!(
+            state.ready_for_with_edit_resize_effects(
+                7,
+                &context,
+                WaveformSelectionKind::Edit,
+                0.2,
+                0.6,
+                None
+            ),
+            None
+        );
+        let mut different = exact.clone();
+        different.edit_resize_effects = changed;
+        assert_eq!(state.take_ready_for(&different), None);
+        assert_eq!(state.take_ready_for(&exact), Some(snapped));
     }
 
     #[test]

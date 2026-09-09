@@ -302,6 +302,18 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
         description: "Drag vertically to preview edit gain",
     },
     ShortcutRow {
+        keys: "Fade handles",
+        description: "Drag horizontally to shape fades and their outer extensions",
+    },
+    ShortcutRow {
+        keys: "Outer gain handle",
+        description: "Drag vertically to set the gain outside the edit selection",
+    },
+    ShortcutRow {
+        keys: "Double-click extension",
+        description: "Clear that fade's outer extension",
+    },
+    ShortcutRow {
         keys: "Z",
         description: "Zoom the waveform to the play selection",
     },

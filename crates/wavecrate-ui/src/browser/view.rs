@@ -1445,7 +1445,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use gpui::{Modifiers, TestAppContext, point, px};
+    use gpui::{Modifiers, MouseDownEvent, TestAppContext, point, px};
+    use wavecrate_core::{WaveformEditFade, WaveformEditSettings};
     use wavecrate_media::WaveformPreview;
 
     use super::super::transport;
@@ -1459,6 +1460,245 @@ mod tests {
             total_frames: 48_000,
             detail_context: None,
         }
+    }
+
+    #[gpui::test]
+    fn root_fade_pointer_routes_both_buttons_without_touching_playback(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-fade-test.wav");
+        let play_region = waveform::WaveformPlayRegion::new(0.15, 0.85).expect("play region");
+        let edit_region = wavecrate_core::WaveformEditRegion::new(0.2, 0.8).expect("edit region");
+        let fade_in = WaveformEditFade::new(0.25, 0.65, 0.2, 0.7).expect("fade in");
+        let fade_out = WaveformEditFade::new(0.3, 0.35, 0.15, 0.4).expect("fade out");
+        let edit_settings =
+            WaveformEditSettings::new(1.4, Some(fade_in), Some(fade_out)).expect("edit settings");
+        let accepted = transport::PlaybackIntent {
+            start: 0.3,
+            region: Some(play_region),
+            looped: true,
+            volume: 0.8,
+            path: path.clone(),
+            origin: transport::PlaybackIntentOrigin::Explicit,
+        };
+        browser.update(cx, |view, _| {
+            view.waveform = Some(inert_preview());
+            view.waveform_play_region = Some(play_region);
+            view.waveform_edit_region = Some(edit_region);
+            view.waveform_edit_settings = edit_settings;
+            view.playing_path = Some(path.clone());
+            view.accepted_playback_intent = Some(accepted.clone());
+            view.playback_epoch = 29;
+        });
+        cx.refresh().expect("refresh inert browser");
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("waveform").expect("waveform bounds");
+        let at = |ratio: f64, y: f32| {
+            point(
+                bounds.origin.x + bounds.size.width * ratio as f32,
+                bounds.origin.y + px(y),
+            )
+        };
+        let modifiers = Modifiers::none();
+
+        // The leading inner endpoint is the first standard handle and accepts the primary
+        // button. Its drag changes only the fade length.
+        let leading_start = at(0.35, 5.0);
+        let leading_end = at(0.42, 5.0);
+        cx.simulate_mouse_down(leading_start, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(leading_end, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(leading_end, MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            let fade = view
+                .waveform_edit_settings
+                .fade_in()
+                .expect("leading fade remains present");
+            assert!((fade.length() - (0.42_f32 - 0.2) / 0.6).abs() < 1.0e-5);
+            assert_eq!(fade.curve(), fade_in.curve());
+            assert_eq!(fade.mute(), fade_in.mute());
+            assert_eq!(fade.outer_gain(), fade_in.outer_gain());
+            assert_eq!(view.waveform_edit_settings.fade_out(), Some(fade_out));
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 29);
+        });
+
+        // The trailing inner endpoint accepts the secondary button through the same shared drag
+        // owner, while keeping the edit selection and playback state independent.
+        let trailing_start = at(0.62, 5.0);
+        let trailing_end = at(0.58, 5.0);
+        cx.simulate_mouse_down(trailing_start, MouseButton::Right, modifiers);
+        cx.simulate_mouse_move(trailing_end, MouseButton::Right, modifiers);
+        cx.simulate_mouse_up(trailing_end, MouseButton::Right, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            let fade = view
+                .waveform_edit_settings
+                .fade_out()
+                .expect("trailing fade remains present");
+            assert!((fade.length() - (0.8_f32 - 0.58) / 0.6).abs() < 1.0e-5);
+            assert_eq!(fade.curve(), fade_out.curve());
+            assert_eq!(fade.mute(), fade_out.mute());
+            assert_eq!(fade.outer_gain(), fade_out.outer_gain());
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 29);
+        });
+    }
+
+    #[gpui::test]
+    fn root_fade_button_loss_cancels_without_committing_effects(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/inert-fade-cancel-test.wav");
+        let play_region = waveform::WaveformPlayRegion::new(0.1, 0.9).expect("play region");
+        let edit_region = wavecrate_core::WaveformEditRegion::new(0.2, 0.8).expect("edit region");
+        let fade_in = WaveformEditFade::new(0.25, 0.65, 0.2, 0.7).expect("fade in");
+        let fade_out = WaveformEditFade::new(0.3, 0.35, 0.15, 0.4).expect("fade out");
+        let edit_settings =
+            WaveformEditSettings::new(1.4, Some(fade_in), Some(fade_out)).expect("edit settings");
+        let accepted = transport::PlaybackIntent {
+            start: 0.3,
+            region: Some(play_region),
+            looped: true,
+            volume: 0.8,
+            path: path.clone(),
+            origin: transport::PlaybackIntentOrigin::Explicit,
+        };
+        browser.update(cx, |view, _| {
+            view.waveform = Some(inert_preview());
+            view.waveform_play_region = Some(play_region);
+            view.waveform_edit_region = Some(edit_region);
+            view.waveform_edit_settings = edit_settings;
+            view.playing_path = Some(path.clone());
+            view.accepted_playback_intent = Some(accepted.clone());
+            view.playback_epoch = 31;
+        });
+        cx.refresh().expect("refresh inert browser");
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("waveform").expect("waveform bounds");
+        let at = |ratio: f64| {
+            point(
+                bounds.origin.x + bounds.size.width * ratio as f32,
+                bounds.origin.y + px(5.0),
+            )
+        };
+        let modifiers = Modifiers::none();
+        let start = at(0.35);
+        let moved = at(0.48);
+        cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(moved, MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(
+                view.waveform_region_drag
+                    .is_some_and(|drag| drag.is_edit_fade())
+            );
+            assert_eq!(view.waveform_edit_settings, edit_settings);
+        });
+
+        // Losing the button cancels the shared drag owner before its preview can become a commit.
+        cx.simulate_mouse_move(moved, None, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.waveform_region_drag.is_none());
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert_eq!(view.waveform_edit_settings, edit_settings);
+            assert_eq!(view.waveform_play_region, Some(play_region));
+            assert_eq!(view.accepted_playback_intent.as_ref(), Some(&accepted));
+            assert_eq!(view.playback_epoch, 31);
+        });
+    }
+
+    #[gpui::test]
+    fn root_fade_double_click_clears_only_standard_outer_mute(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let edit_region = wavecrate_core::WaveformEditRegion::new(0.35, 0.75).expect("edit region");
+        let fade_in = WaveformEditFade::new(0.25, 0.65, 0.2, 1.0).expect("fade in");
+        let settings = WaveformEditSettings::new(1.4, Some(fade_in), None).expect("edit settings");
+        browser.update(cx, |view, _| {
+            view.waveform = Some(inert_preview());
+            view.waveform_edit_region = Some(edit_region);
+            view.waveform_edit_settings = settings;
+        });
+        cx.refresh().expect("refresh inert browser");
+        cx.run_until_parked();
+
+        let bounds = cx.debug_bounds("waveform").expect("waveform bounds");
+        let outer_ratio = edit_region.start() - edit_region.width() * f64::from(fade_in.mute());
+        let standard_outer = point(
+            bounds.origin.x + bounds.size.width * outer_ratio as f32,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let modifiers = Modifiers::none();
+        cx.simulate_event(MouseDownEvent {
+            position: standard_outer,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(standard_outer, MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            let cleared = view
+                .waveform_edit_settings
+                .fade_in()
+                .expect("cleared fade remains present");
+            assert_eq!(cleared.length(), fade_in.length());
+            assert_eq!(cleared.curve(), fade_in.curve());
+            assert_eq!(cleared.mute(), 0.0);
+            assert_eq!(cleared.outer_gain(), fade_in.outer_gain());
+            assert_eq!(view.waveform_edit_settings.gain(), settings.gain());
+            assert_eq!(view.waveform_edit_region, Some(edit_region));
+            assert!(view.waveform_region_drag.is_none());
+        });
+
+        // Restore a muted fade whose vertical outer-gain handle overlaps the centerline handle.
+        // The larger vertical target has priority, and its double click must leave mute intact.
+        let outer_gain_settings = WaveformEditSettings::new(
+            settings.gain(),
+            Some(
+                WaveformEditFade::new(fade_in.length(), fade_in.curve(), fade_in.mute(), 0.0)
+                    .expect("outer-gain test fade"),
+            ),
+            None,
+        )
+        .expect("outer-gain settings");
+        browser.update(cx, |view, _| {
+            view.waveform_edit_settings = outer_gain_settings;
+        });
+        cx.refresh().expect("refresh restored fade");
+        cx.run_until_parked();
+        let outer_gain = point(
+            bounds.origin.x + bounds.size.width * outer_ratio as f32,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        cx.simulate_event(MouseDownEvent {
+            position: outer_gain,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(outer_gain, MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert_eq!(
+                view.waveform_edit_settings
+                    .fade_in()
+                    .expect("vertical handle fade")
+                    .mute(),
+                fade_in.mute()
+            );
+            assert!(view.waveform_region_drag.is_none());
+        });
     }
 
     #[gpui::test]

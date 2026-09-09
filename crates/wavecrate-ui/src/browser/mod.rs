@@ -63,6 +63,7 @@ mod view;
 mod volume;
 mod waveform;
 mod waveform_detail;
+mod waveform_fades;
 mod waveform_scrollbar;
 mod zero_crossing;
 
@@ -261,6 +262,7 @@ pub(crate) struct Browser {
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
     waveform_render_cache: waveform::WaveformRenderCache,
+    waveform_fade_render_cache: waveform_fades::WaveformFadeRenderCache,
     waveform_detail: waveform_detail::WaveformDetailState,
     zero_crossing: zero_crossing::ZeroCrossingState,
     bpm_snap_enabled: bool,
@@ -272,6 +274,7 @@ pub(crate) struct Browser {
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_edit_region: Option<WaveformEditRegion>,
     waveform_edit_settings: WaveformEditSettings,
+    waveform_fade_hover: Option<waveform_fades::WaveformEditFadeHit>,
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
     waveform_pan_drag: Option<waveform::WaveformPanDrag>,
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
@@ -476,6 +479,7 @@ impl Browser {
             waveform: None,
             waveform_error: None,
             waveform_render_cache: waveform::WaveformRenderCache::default(),
+            waveform_fade_render_cache: waveform_fades::WaveformFadeRenderCache::default(),
             waveform_detail: waveform_detail::WaveformDetailState::default(),
             zero_crossing: zero_crossing::ZeroCrossingState::default(),
             bpm_snap_enabled: false,
@@ -487,6 +491,7 @@ impl Browser {
             waveform_play_region: None,
             waveform_edit_region: None,
             waveform_edit_settings: waveform::default_edit_settings(),
+            waveform_fade_hover: None,
             waveform_region_drag: None,
             waveform_pan_drag: None,
             waveform_scrollbar_drag: None,
