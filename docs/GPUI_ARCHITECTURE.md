@@ -266,12 +266,17 @@ Runtime request identities remain separate from desired target generations.
 Acknowledgements may update confirmed state, but an older response cannot clear
 or replace a newer desired target. Confirmation requires configured source-frame
 bounds, loop mode and metronome state, together with identity/generation fences.
-Later progress must expose the same configuration because a disposable retarget
-response may be lost. Output resume captures the newest valid desired target,
+Later progress must expose the same configuration and the last successfully
+applied retarget request ID because a disposable retarget response may be lost.
+The returned frame denominator belongs to the configured playback plan; it is
+not a promise of exact underlying WAV length. Confirm using that persistent
+request identity and valid returned frame bounds, without duplicating the
+runtime's floating-point quantization in the UI. Output resume captures the newest valid desired target,
 then an admitted runtime target, then confirmed state, retaining current volume.
 
-Duration edits preserve the authoritative current position when it lies inside
-the new span; otherwise they seek to its start. Resolve that policy in the runtime
+Duration edits preserve the authoritative current frame when it lies inside
+the new span before the native end guard (one percent of the plan denominator);
+otherwise they seek to its start. Resolve that policy in the runtime
 at dispatch, including missing or nonfinite progress, rather than using the UI
 cursor. This contract applies to one-shot and looped playback. Invalid or unchanged
 editor drafts do not submit transport changes.
