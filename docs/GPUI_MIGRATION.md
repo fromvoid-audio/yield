@@ -1925,3 +1925,7 @@ Core now exposes finite validated gain/fade settings. Media applies the native g
 Validation: 121 core tests and 61 media tests passed, including stereo, linear/S curves, outer extensions, frame clipping, single-frame fades, invalid settings and bounded partial cancellation. Scoped checks, formatting and diff validation passed. Primary inspection compared the transform with the active native Enter-effects implementation. UI fade controls, WAV encoding, durable replacement and undo remain separate work.
 
 Core settings also now implement the native asymmetric gain pointer mapping and outer-gain vertical mapping as immutable baseline operations. They preserve other fade settings, clamp finite extremes and retain the native nonfinite-input fallback. All 124 core tests, the core check and scoped formatting passed. These helpers prepare the next edit-control UI slice.
+
+### Windows browser-test follow-up
+
+Run `34292837280` passed core/media/platform tests and the application check, then ran the browser suite: 284 passed, 11 failed and one was ignored. Five waveform-detail failures came from the fixture retaining its temporary writer while media correctly requested a write-excluding read lease. The fixture now retains only `TempPath` cleanup ownership, closing the writer before preview loading; all eight focused detail tests passed locally. The remaining root-identity failures are under investigation. This run did not time out.

@@ -701,7 +701,7 @@ mod tests {
         );
     }
 
-    fn test_preview() -> (tempfile::NamedTempFile, WaveformPreview) {
+    fn test_preview() -> (tempfile::TempPath, WaveformPreview) {
         use std::io::Write;
 
         const SAMPLE_COUNT: usize = 100_000;
@@ -727,8 +727,10 @@ mod tests {
             .tempfile()
             .expect("temporary WAV");
         file.write_all(&bytes).expect("write temporary WAV");
-        let preview = wavecrate_media::load_waveform_preview(file.path()).expect("preview");
-        (file, preview)
+        // Retain cleanup ownership while closing the writer before the Windows read lease.
+        let path = file.into_temp_path();
+        let preview = wavecrate_media::load_waveform_preview(&path).expect("preview");
+        (path, preview)
     }
 
     #[test]
