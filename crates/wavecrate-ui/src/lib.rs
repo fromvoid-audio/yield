@@ -33,6 +33,12 @@ const WINDOW_HEIGHT: f32 = 720.0;
 pub fn run(initial_root: Option<PathBuf>) {
     Application::new().run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("ctrl-q", Quit, None),
