@@ -72,7 +72,8 @@ impl PlaybackMetronomeConfig {
         self
     }
 
-    pub(crate) fn beat_count(self) -> u16 {
+    /// Return the effective beat count after configuration normalization.
+    pub fn beat_count(self) -> u16 {
         self.beat_count
     }
 

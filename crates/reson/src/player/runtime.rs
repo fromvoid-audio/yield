@@ -320,8 +320,9 @@ pub struct PlaybackRuntimeProgress {
     pub configured_span_request_id: Option<PlaybackRequestId>,
     /// Configured beat count for the active sample metronome.
     ///
-    /// This is `None` when the metronome is disabled, playback is inactive, or
-    /// the active source cannot expose its playback-span control.
+    /// This is retained after a successful play or span retarget, including for
+    /// lazy sources that cannot expose a live playback-span control. It is
+    /// `None` when the metronome is disabled or playback is inactive.
     pub metronome_beat_count: Option<u16>,
     /// The last successfully started current play request, if one exists.
     ///
@@ -591,7 +592,13 @@ impl PlaybackRuntime {
         player: AudioPlayer,
         config: PlaybackRuntimeConfig,
     ) -> Result<Self, std::io::Error> {
-        spawn_executor(AudioPlayerPlaybackExecutor { player }, config)
+        spawn_executor(
+            AudioPlayerPlaybackExecutor {
+                player,
+                configured_metronome_beat_count: None,
+            },
+            config,
+        )
     }
 }
 
@@ -1132,6 +1139,11 @@ struct PlaybackRuntimeStartedData {
 
 struct AudioPlayerPlaybackExecutor {
     player: AudioPlayer,
+    // The runtime owns `player` and applies every play/retarget configuration,
+    // so this records the exact metronome configuration that crossed that
+    // successful control-thread boundary. AudioPlayer's public readback stays
+    // focused on live span controls, which lazy sources intentionally lack.
+    configured_metronome_beat_count: Option<u16>,
 }
 
 impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
@@ -1139,6 +1151,10 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         &mut self,
         request: PlaybackRuntimeRequest,
     ) -> Result<PlaybackRuntimeStartedData, String> {
+        // A replacement attempt must not report a metronome configuration from
+        // the previous playback lifetime if setup fails.
+        self.configured_metronome_beat_count = None;
+        let configured_metronome_beat_count = request.metronome.map(|config| config.beat_count());
         self.player.set_volume(request.volume);
         self.player.set_stream_policy(request.stream_policy);
         self.player
@@ -1155,6 +1171,7 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             request.replace_policy,
             request.metronome,
         )?;
+        self.configured_metronome_beat_count = configured_metronome_beat_count;
         Ok(PlaybackRuntimeStartedData {
             output,
             playback_start,
@@ -1163,10 +1180,12 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
 
     fn stop(&mut self) -> Result<(), String> {
         self.player.stop();
+        self.configured_metronome_beat_count = None;
         Ok(())
     }
 
     fn retarget_span(&mut self, update: PlaybackRuntimeSpanUpdate) -> Result<f32, String> {
+        let configured_metronome_beat_count = update.metronome.map(|config| config.beat_count());
         self.player
             .set_playback_gain(runtime_playback_gain_for_player(
                 update.playback_gain,
@@ -1194,6 +1213,7 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
                     update.metronome,
                 )?;
         }
+        self.configured_metronome_beat_count = configured_metronome_beat_count;
         Ok(update
             .offset
             .clamp(update.start.min(update.end), update.start.max(update.end))
@@ -1223,9 +1243,10 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             (
                 self.player.playback_span_frames(),
                 self.player.track_total_frames(),
-                self.player.metronome_beat_count(),
+                self.configured_metronome_beat_count,
             )
         } else {
+            self.configured_metronome_beat_count = None;
             (None, None, None)
         };
         PlaybackRuntimeProgress {
@@ -3940,7 +3961,7 @@ mod tests {
     }
 
     #[test]
-    fn real_executor_publishes_retargeted_plan_tuple_through_later_progress() {
+    fn real_executor_publishes_configured_metronome_for_lazy_wav_retargets() {
         const SAMPLE_RATE: u32 = 1_000;
         const DURATION: f32 = 1.003;
 
@@ -3953,14 +3974,21 @@ mod tests {
         };
         let runtime = PlaybackRuntime::spawn(player, PlaybackRuntimeConfig::default())
             .expect("spawn runtime with real executor");
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("lazy-runtime.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create WAV");
+        for _ in 0..1_003 {
+            writer.write_sample(0_i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize WAV");
         let request = PlaybackRuntimeRequest {
-            source: PlaybackRuntimeSource::DecodedSamples {
-                audio_bytes: Arc::from([]),
-                samples: Arc::from(vec![0.0_f32; 1_003]),
-                duration: DURATION,
-                sample_rate: SAMPLE_RATE,
-                channels: 1,
-            },
+            source: PlaybackRuntimeSource::WavFile { path: path.clone() },
             mode: PlaybackRuntimeMode::Looped {
                 start: 0.0,
                 end: 1.0,
@@ -3974,17 +4002,27 @@ mod tests {
             edit_fade: None,
             metronome: Some(PlaybackMetronomeConfig::new(7).with_source_cycle(400, 3)),
         };
-        let playback_id = runtime.handle.try_play(request).expect("play");
+        let playback_id = runtime.handle.try_play(request.clone()).expect("play");
         assert!(matches!(
             runtime.events.recv().expect("started event"),
             PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let play_poll_id = runtime.handle.try_poll_progress().expect("play poll");
+        assert!(matches!(
+            runtime.events.recv().expect("play progress"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == play_poll_id
+                    && progress.active
+                    && progress.playback_request_id == Some(playback_id)
+                    && progress.metronome_beat_count == Some(7)
         ));
 
         let mut update = span_update(0.123, 0.876, true);
         update.seek_if_outside = true;
         update.metronome = Some(PlaybackMetronomeConfig::new(7).with_source_cycle(400, 3));
         let expected_plan = PlaybackSpanPlan::new(
-            PlaybackSourceIdentity::new(PlaybackSourceKind::Bytes, None),
+            PlaybackSourceIdentity::new(PlaybackSourceKind::File, None),
             PlaybackChannelLayout::new(1, SAMPLE_RATE).expect("layout"),
             PlaybackSpanRequest::new(
                 update.start as f32,
@@ -4024,6 +4062,31 @@ mod tests {
             }
             event => panic!("expected later progress, got {event:?}"),
         }
+
+        let mut failed_request = request;
+        failed_request.source = PlaybackRuntimeSource::WavFile {
+            path: root.path().join("missing-runtime.wav"),
+        };
+        failed_request.metronome = Some(PlaybackMetronomeConfig::new(3));
+        let failed_play_id = runtime
+            .handle
+            .try_play(failed_request)
+            .expect("failed play");
+        assert!(matches!(
+            runtime.events.recv().expect("failed play event"),
+            PlaybackRuntimeEvent::Failed { id, .. } if id == failed_play_id
+        ));
+        let failed_poll_id = runtime
+            .handle
+            .try_poll_progress()
+            .expect("failed play poll");
+        assert!(matches!(
+            runtime.events.recv().expect("failed play progress"),
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == failed_poll_id
+                    && progress.playback_request_id.is_none()
+                    && progress.metronome_beat_count.is_none()
+        ));
 
         let stop_id = runtime.handle.try_stop().expect("stop");
         assert!(matches!(

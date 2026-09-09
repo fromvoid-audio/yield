@@ -74,6 +74,11 @@ pub(super) struct PendingLoopRetarget {
     pub(super) retarget_id: u64,
     pub(super) request: PlaybackRetargetRequest,
     pub(super) metronome_grid: Option<PlaybackMetronomeGrid>,
+    /// Metronome count the runtime should expose for this admitted update.
+    ///
+    /// This is captured from the exact runtime configuration at admission, after its beat-count
+    /// normalization, independently of the optimistic logical target.
+    pub(super) effective_metronome_beat_count: Option<u16>,
 }
 
 /// The one progress poll admitted by the browser monitor at a time.
@@ -82,6 +87,13 @@ pub(super) struct PendingProgressPoll {
     pub(super) request_id: u64,
     pub(super) playback_epoch: u64,
     pub(super) sent_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlaybackRetargetAcknowledgement {
+    configured_span_request_id: Option<u64>,
+    playback_span_frames: Option<(u64, u64)>,
+    track_total_frames: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,6 +504,7 @@ impl Browser {
                 metronome_grid,
             ),
         };
+        let effective_metronome_beat_count = update.metronome.map(|config| config.beat_count());
         match handle.try_retarget_active_span(accepted_playback_id, update) {
             Ok(retarget_id) => {
                 self.playback_metronome_grid = metronome_grid;
@@ -502,6 +515,7 @@ impl Browser {
                         retarget_id: retarget_id.get(),
                         request,
                         metronome_grid,
+                        effective_metronome_beat_count,
                     },
                 );
                 self.ensure_playback_monitor(cx);
@@ -1212,6 +1226,13 @@ impl Browser {
             progress.playback_request_id.map(PlaybackRequestId::get),
             progress.looping,
             progress.metronome_beat_count,
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: progress
+                    .configured_span_request_id
+                    .map(PlaybackRequestId::get),
+                playback_span_frames: progress.playback_span_frames,
+                track_total_frames: progress.track_total_frames,
+            },
         );
         match outcome {
             LoopRetargetProgressOutcome::Ignored => {}
@@ -1661,6 +1682,20 @@ fn apply_pending_loop_retarget_to_resume(
 }
 
 #[cfg(test)]
+fn acknowledgement_for_pending(pending: &PendingLoopRetarget) -> PlaybackRetargetAcknowledgement {
+    let span = pending.request.target.span;
+    let total_frames = 100_u64;
+    PlaybackRetargetAcknowledgement {
+        configured_span_request_id: Some(pending.retarget_id),
+        playback_span_frames: Some((
+            (span.start * total_frames as f64).round() as u64,
+            (span.end * total_frames as f64).round() as u64,
+        )),
+        track_total_frames: Some(total_frames),
+    }
+}
+
+#[cfg(test)]
 fn reduce_loop_retarget_progress(
     pending: &mut Option<PendingLoopRetarget>,
     accepted: &mut Option<PlaybackIntent>,
@@ -1675,6 +1710,10 @@ fn reduce_loop_retarget_progress(
     playback_id: Option<u64>,
     looping: bool,
 ) -> LoopRetargetProgressOutcome {
+    let acknowledgement = pending
+        .as_ref()
+        .map(acknowledgement_for_pending)
+        .unwrap_or_default();
     reduce_playback_retarget_progress(
         pending,
         accepted,
@@ -1689,6 +1728,7 @@ fn reduce_loop_retarget_progress(
         playback_id,
         looping,
         None,
+        acknowledgement,
     )
 }
 
@@ -1706,6 +1746,7 @@ fn reduce_playback_retarget_progress(
     playback_id: Option<u64>,
     looping: bool,
     metronome_beat_count: Option<u16>,
+    acknowledgement: PlaybackRetargetAcknowledgement,
 ) -> LoopRetargetProgressOutcome {
     let Some(current) = pending.as_ref() else {
         return LoopRetargetProgressOutcome::Ignored;
@@ -1733,19 +1774,47 @@ fn reduce_playback_retarget_progress(
         *pending = None;
         return LoopRetargetProgressOutcome::Inactive;
     }
+    let Some(applied_span) = runtime_playback_region(acknowledgement, current.retarget_id) else {
+        return LoopRetargetProgressOutcome::Ignored;
+    };
+    if metronome_beat_count != current.effective_metronome_beat_count {
+        return LoopRetargetProgressOutcome::Ignored;
+    }
     let target = current.request.target;
+    if looping != target.desired.looped {
+        return LoopRetargetProgressOutcome::Ignored;
+    }
     let path = current.request.anchor.path.clone();
     *pending = None;
     if let Some(intent) = accepted.as_mut()
         && intent.path == path
     {
         intent.looped = looping;
-        intent.region = Some(target.span);
+        intent.region = Some(applied_span);
     }
     LoopRetargetProgressOutcome::Confirmed {
         desired_matches: looping == target.desired.looped
             && metronome_beat_count == target.desired.metronome_beat_count,
     }
+}
+
+fn runtime_playback_region(
+    acknowledgement: PlaybackRetargetAcknowledgement,
+    expected_request_id: u64,
+) -> Option<WaveformPlayRegion> {
+    if acknowledgement.configured_span_request_id != Some(expected_request_id) {
+        return None;
+    }
+    let ((start_frame, end_frame), total_frames) = (
+        acknowledgement.playback_span_frames?,
+        acknowledgement.track_total_frames?,
+    );
+    if start_frame >= end_frame || end_frame > total_frames || total_frames == 0 {
+        return None;
+    }
+    let start = start_frame as f64 / total_frames as f64;
+    let end = end_frame as f64 / total_frames as f64;
+    WaveformPlayRegion::new(start, end)
 }
 
 fn playback_progress_disposition(
@@ -1908,12 +1977,12 @@ mod tests {
     use super::{
         LoopRetargetProgressOutcome, PendingLoopRetarget, PendingProgressPoll,
         PlaybackCursorInterpolation, PlaybackIntent, PlaybackIntentOrigin,
-        PlaybackProgressDisposition, PlaybackRetargetAnchor, PlaybackRetargetRequest,
-        accepted_resume_intent, admit_loop_retarget, apply_pending_loop_retarget_to_resume,
-        audio_output_resume_is_current, authoritative_cursor_progress,
-        captured_metronome_grid_or_source, cursor_interpolation, fallback_metronome_target,
-        metronome_target_is_pending, normalized_playback_start, pending_resume_intent,
-        playback_mode_for_intent, playback_progress_disposition,
+        PlaybackProgressDisposition, PlaybackRetargetAcknowledgement, PlaybackRetargetAnchor,
+        PlaybackRetargetRequest, accepted_resume_intent, admit_loop_retarget,
+        apply_pending_loop_retarget_to_resume, audio_output_resume_is_current,
+        authoritative_cursor_progress, captured_metronome_grid_or_source, cursor_interpolation,
+        fallback_metronome_target, metronome_target_is_pending, normalized_playback_start,
+        pending_resume_intent, playback_mode_for_intent, playback_progress_disposition,
         playback_request_number_is_current, playback_retarget_anchor_matches,
         playback_span_for_intent, playback_span_matches_preparation, preferred_metronome_grid,
         preview_cursor_ratio, progress_poll_has_expired, progress_poll_is_current,
@@ -1980,7 +2049,35 @@ mod tests {
                 },
             },
             metronome_grid: None,
+            effective_metronome_beat_count: desired.metronome_beat_count,
         }
+    }
+
+    fn reduce_ack(
+        pending: &mut Option<PendingLoopRetarget>,
+        accepted: &mut Option<PlaybackIntent>,
+        response_id: u64,
+        looping: bool,
+        metronome_beat_count: Option<u16>,
+        acknowledgement: PlaybackRetargetAcknowledgement,
+    ) -> LoopRetargetProgressOutcome {
+        let path = Path::new("sample.wav");
+        super::reduce_playback_retarget_progress(
+            pending,
+            accepted,
+            response_id,
+            Some(42),
+            7,
+            3,
+            Some(path),
+            Some(path),
+            true,
+            false,
+            Some(42),
+            looping,
+            metronome_beat_count,
+            acknowledgement,
+        )
     }
 
     #[test]
@@ -2837,15 +2934,15 @@ mod tests {
             Some(42),
             true,
             Some(4),
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(11),
+                playback_span_frames: Some((40, 100)),
+                track_total_frames: Some(100),
+            },
         );
-        assert_eq!(
-            partial,
-            super::LoopRetargetProgressOutcome::Confirmed {
-                desired_matches: false,
-            }
-        );
-        assert!(pending.is_none());
-        assert!(accepted.as_ref().expect("accepted play").looped);
+        assert_eq!(partial, super::LoopRetargetProgressOutcome::Ignored);
+        assert!(pending.is_some());
+        assert!(!accepted.as_ref().expect("accepted play").looped);
 
         let mut accepted = Some(sample_intent(&path, false));
         let mut pending = Some(sample_pending_playback_retarget(&path, 12, desired));
@@ -2863,6 +2960,11 @@ mod tests {
             Some(42),
             true,
             Some(8),
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(12),
+                playback_span_frames: Some((40, 100)),
+                track_total_frames: Some(100),
+            },
         );
         assert_eq!(
             confirmed,
@@ -2871,6 +2973,139 @@ mod tests {
             }
         );
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn playback_reducer_requires_the_runtime_applied_plan_before_promoting_state() {
+        let path = PathBuf::from("sample.wav");
+        let desired = super::PlaybackDesiredState {
+            looped: true,
+            metronome_beat_count: Some(8),
+        };
+        let invalid_acknowledgements = [
+            PlaybackRetargetAcknowledgement::default(),
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(10),
+                playback_span_frames: Some((20, 80)),
+                track_total_frames: Some(100),
+            },
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(11),
+                playback_span_frames: None,
+                track_total_frames: Some(100),
+            },
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(11),
+                playback_span_frames: Some((80, 20)),
+                track_total_frames: Some(100),
+            },
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(11),
+                playback_span_frames: Some((20, 101)),
+                track_total_frames: Some(100),
+            },
+        ];
+        for acknowledgement in invalid_acknowledgements {
+            let mut accepted = Some(sample_intent(&path, false));
+            let accepted_before = accepted.clone();
+            let mut pending = Some(sample_pending_playback_retarget(&path, 11, desired));
+            assert_eq!(
+                reduce_ack(
+                    &mut pending,
+                    &mut accepted,
+                    12,
+                    true,
+                    Some(8),
+                    acknowledgement,
+                ),
+                LoopRetargetProgressOutcome::Ignored
+            );
+            assert!(pending.is_some());
+            assert_eq!(accepted, accepted_before);
+        }
+
+        for (looping, metronome_beat_count) in [(false, Some(8)), (true, Some(4))] {
+            let mut accepted = Some(sample_intent(&path, false));
+            let accepted_before = accepted.clone();
+            let mut pending = Some(sample_pending_playback_retarget(&path, 11, desired));
+            assert_eq!(
+                reduce_ack(
+                    &mut pending,
+                    &mut accepted,
+                    12,
+                    looping,
+                    metronome_beat_count,
+                    PlaybackRetargetAcknowledgement {
+                        configured_span_request_id: Some(11),
+                        playback_span_frames: Some((20, 80)),
+                        track_total_frames: Some(100),
+                    },
+                ),
+                LoopRetargetProgressOutcome::Ignored
+            );
+            assert!(pending.is_some());
+            assert_eq!(accepted, accepted_before);
+        }
+
+        let mut accepted = Some(sample_intent(&path, false));
+        let mut pending = Some(sample_pending_playback_retarget(&path, 11, desired));
+        assert_eq!(
+            reduce_ack(
+                &mut pending,
+                &mut accepted,
+                12,
+                true,
+                Some(8),
+                PlaybackRetargetAcknowledgement {
+                    configured_span_request_id: Some(11),
+                    playback_span_frames: Some((20, 80)),
+                    track_total_frames: Some(100),
+                },
+            ),
+            LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: true,
+            }
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            accepted.expect("accepted playback").region,
+            WaveformPlayRegion::new(0.2, 0.8)
+        );
+    }
+
+    #[test]
+    fn playback_reducer_accepts_disabled_effective_metronome_without_waiting() {
+        let path = PathBuf::from("sample.wav");
+        let desired = super::PlaybackDesiredState {
+            looped: true,
+            metronome_beat_count: Some(8),
+        };
+        let mut pending = sample_pending_playback_retarget(&path, 11, desired);
+        pending.effective_metronome_beat_count = None;
+        let mut pending = Some(pending);
+        let mut accepted = Some(sample_intent(&path, false));
+        assert_eq!(
+            reduce_ack(
+                &mut pending,
+                &mut accepted,
+                11,
+                true,
+                None,
+                PlaybackRetargetAcknowledgement {
+                    configured_span_request_id: Some(11),
+                    playback_span_frames: Some((40, 100)),
+                    track_total_frames: Some(100),
+                },
+            ),
+            LoopRetargetProgressOutcome::Confirmed {
+                desired_matches: false,
+            }
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            accepted.expect("accepted playback").region,
+            WaveformPlayRegion::new(0.4, 1.0)
+        );
     }
 
     #[test]
@@ -2909,6 +3144,11 @@ mod tests {
             Some(42),
             true,
             Some(4),
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(11),
+                playback_span_frames: Some((40, 100)),
+                track_total_frames: Some(100),
+            },
         );
         assert_eq!(stale_failure, super::LoopRetargetProgressOutcome::Ignored);
         assert_eq!(
@@ -2933,6 +3173,11 @@ mod tests {
             Some(42),
             false,
             Some(8),
+            PlaybackRetargetAcknowledgement {
+                configured_span_request_id: Some(12),
+                playback_span_frames: Some((40, 100)),
+                track_total_frames: Some(100),
+            },
         );
         assert_eq!(
             confirmed,

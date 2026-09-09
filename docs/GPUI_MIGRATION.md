@@ -2083,3 +2083,12 @@ Live retargets now retain a logical generation and playback ID, path, playback e
 Lifecycle stabilization fixed optimistic metronome fallback after a failed enable: confirmed disabled state remains disabled, with accepted resume configuration preferred over preferences when confirmation is unavailable. Stale completion/failure cannot clear a newer normalized target; failure of the current target clears only its logical ownership. Runtime acknowledgement consumption and interactive timing editing remain pending.
 
 The full UI suite passed 367 tests with one existing benchmark ignored. A subsequent focused GPUI regression also passed, covering an older accepted-span update during newer preparation, supersession, stale completion/failure, and clearing only the current failed target. Complementary tests cover old runtime replies, repeated output resume and confirmed-disabled fallback. UI/application checks, formatting and diff checks passed. This is deterministic UI/state validation, not audible runtime acceptance. The compact input's rendered 18-pixel height was separately verified before/after focus in an isolated checkout.
+
+
+### Runtime acknowledgement integration, 2026-09-09
+
+The browser confirms retargets only when the persistent configured request identity, valid source-plan frame tuple, loop state and effective submitted metronome configuration agree. A later poll can acknowledge a dropped immediate reply. Accepted spans are projected from the runtime plan denominator rather than the requested preview span; incomplete or mismatched metadata remains pending without optimistic promotion.
+
+The runtime executor now retains successful metronome configuration for lazy WAV playback, whose static metronome cannot be read through a live span control. Replacement attempts, stop and inactive playback clear this metadata; successful retargets update it. The public AudioPlayer live-control accessor keeps its existing semantics.
+
+Validation passed: 214 Reson tests, 43 focused browser transport tests, application checking, formatting and diff checks. The real-output lazy-WAV regression explicitly skipped because no audio output device was available. Audible acceptance and interactive timing editing remain outstanding.
