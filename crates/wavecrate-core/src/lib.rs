@@ -20,6 +20,7 @@ mod selection;
 mod tag_category;
 mod tag_filter;
 mod tag_input;
+mod waveform_edit_effects;
 mod waveform_edit_region;
 mod waveform_region;
 mod waveform_viewport;
@@ -54,6 +55,7 @@ pub use tag_filter::{
 pub use tag_input::{
     MAX_TAG_INPUT_BYTES, MAX_TAG_LABEL_BYTES, MAX_TAGS_PER_COMMIT, TagInputError, parse_tag_input,
 };
+pub use waveform_edit_effects::{WaveformEditFade, WaveformEditSettings};
 pub use waveform_edit_region::WaveformEditRegion;
 pub use waveform_region::WaveformRegion;
 pub use waveform_viewport::WaveformViewport;
