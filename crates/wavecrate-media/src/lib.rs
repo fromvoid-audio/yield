@@ -28,7 +28,7 @@ pub use detail::{
     WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
 };
 pub use edit_preparation::{
-    MAX_WAV_EDIT_DECODED_BYTES, WavEditPreparationRequest, prepare_wav_edit,
+    MAX_WAV_EDIT_DECODED_BYTES, WavEditOperation, WavEditPreparationRequest, prepare_wav_edit,
     prepare_wav_edit_with_cancel,
 };
 pub use edited_wav::{encode_edited_wav, encode_edited_wav_with_cancel};

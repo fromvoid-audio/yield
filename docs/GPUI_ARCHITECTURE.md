@@ -86,7 +86,7 @@ and refresh discard identities no longer visible. Plain pointer focus clears
 explicit membership, while plain arrow focus preserves it. Source and folder
 navigation clear batch membership. These choices remain session-only.
 
-Gain/fade edit preparation also belongs to `wavecrate-media`. It retains a source
+Gain/fade, reverse and mute edit preparation also belongs to `wavecrate-media`. It retains a source
 handle, validates the captured WAV revision before decoding and after encoding,
 and prepares whole-file float WAV bytes in a fresh caller-owned sink. The caller
 sets a decoded-buffer budget subject to a 256 MiB ceiling and runs the operation

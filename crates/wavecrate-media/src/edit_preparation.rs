@@ -1,4 +1,4 @@
-//! Revision-checked preparation of whole-file gain/fade edits, without publication.
+//! Revision-checked preparation of whole-file selection edits, without publication.
 
 use std::io::{Seek, Write};
 use std::sync::atomic::AtomicBool;
@@ -10,15 +10,26 @@ use crate::{WavSpanExportRequest, WaveformDetailContext, WaveformDetailRange, de
 /// Hard ceiling for the interleaved decoded buffer used by edit preparation (256 MiB).
 pub const MAX_WAV_EDIT_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
-/// A revision-fenced gain/fade edit of a half-open selection within a whole WAV file.
+/// Native selection operations supported by unpublished WAV preparation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WavEditOperation {
+    /// Apply gain and inner/outer fades with the reference editor's sample arithmetic.
+    GainAndFades(WaveformEditSettings),
+    /// Reverse complete selected frames, preserving channel order within each frame.
+    Reverse,
+    /// Replace selected samples with positive zero while preserving the file length.
+    Mute,
+}
+
+/// A revision-fenced edit of a half-open selection within a whole WAV file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WavEditPreparationRequest {
     /// Source identity, revision and format captured before background admission.
     pub context: WaveformDetailContext,
     /// Existing source frames to edit; outer fades may also change adjacent frames.
     pub range: WaveformDetailRange,
-    /// Validated native gain and fade parameters.
-    pub settings: WaveformEditSettings,
+    /// Operation to apply to the selected frames.
+    pub operation: WavEditOperation,
 }
 
 impl WavEditPreparationRequest {
@@ -28,11 +39,20 @@ impl WavEditPreparationRequest {
         range: WaveformDetailRange,
         settings: WaveformEditSettings,
     ) -> Result<Self, String> {
+        Self::with_operation(context, range, WavEditOperation::GainAndFades(settings))
+    }
+
+    /// Validate a selected operation without decoding or writing audio.
+    pub fn with_operation(
+        context: WaveformDetailContext,
+        range: WaveformDetailRange,
+        operation: WavEditOperation,
+    ) -> Result<Self, String> {
         WavSpanExportRequest::new(context.clone(), range)?;
         Ok(Self {
             context,
             range,
-            settings,
+            operation,
         })
     }
 }
@@ -67,7 +87,11 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
 ) -> Result<(), String> {
     check_cancel(cancellation)?;
     // Public request fields are revalidated at execution, not trusted after construction.
-    WavEditPreparationRequest::new(request.context.clone(), request.range, request.settings)?;
+    WavEditPreparationRequest::with_operation(
+        request.context.clone(),
+        request.range,
+        request.operation,
+    )?;
     let context = &request.context;
     let sample_count = checked_sample_count(context, decoded_byte_budget)?;
     crate::edited_wav::checked_spec(
@@ -112,15 +136,25 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
         }
     }
     recheck(context, &opened, cancellation)?;
-    crate::apply_waveform_edit_effects_with_cancel(
-        &mut samples,
-        usize::from(context.spec.channels),
-        context.spec.sample_rate,
-        request.range.start_frame,
-        request.range.end_frame,
-        request.settings,
-        cancellation,
-    )?;
+    match request.operation {
+        WavEditOperation::GainAndFades(settings) => crate::apply_waveform_edit_effects_with_cancel(
+            &mut samples,
+            usize::from(context.spec.channels),
+            context.spec.sample_rate,
+            request.range.start_frame,
+            request.range.end_frame,
+            settings,
+            cancellation,
+        )?,
+        WavEditOperation::Reverse | WavEditOperation::Mute => {
+            let channels = usize::from(context.spec.channels);
+            let selected = &mut samples
+                [request.range.start_frame * channels..request.range.end_frame * channels];
+            apply_frame_operation(selected, channels, request.operation, || {
+                check_cancel(cancellation)
+            })?;
+        }
+    }
     recheck(context, &opened, cancellation)?;
     crate::encode_edited_wav_with_cancel(
         &samples,
@@ -144,6 +178,42 @@ fn checked_sample_count(context: &WaveformDetailContext, budget: usize) -> Resul
         return Err(String::from("WAV edit exceeds decoded memory budget"));
     }
     Ok(sample_count)
+}
+
+// Called only with a validated complete-frame slice. Cancellation leaves a partial buffer
+// that the preparation caller discards before encoding.
+fn apply_frame_operation(
+    selected: &mut [f32],
+    channels: usize,
+    operation: WavEditOperation,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
+    match operation {
+        WavEditOperation::Reverse => {
+            let frames = selected.len() / channels;
+            let mut changed = 0;
+            for left in 0..frames / 2 {
+                let right = frames - 1 - left;
+                for channel in 0..channels {
+                    if changed == 4096 {
+                        check()?;
+                        changed = 0;
+                    }
+                    selected.swap(left * channels + channel, right * channels + channel);
+                    changed += 2;
+                }
+            }
+        }
+        WavEditOperation::Mute => {
+            for block in selected.chunks_mut(4096) {
+                check()?;
+                block.fill(0.0);
+            }
+        }
+        WavEditOperation::GainAndFades(_) => unreachable!("gain/fades use the existing transform"),
+    }
+    check()
 }
 
 fn check_cancel(cancellation: Option<&AtomicBool>) -> Result<(), String> {
@@ -241,6 +311,93 @@ mod tests {
     }
 
     #[test]
+    fn reverse_preserves_stereo_pairs_and_unselected_frames() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reverse.wav");
+        write_int(&path, &[1, 11, 2, 12, 3, 13, 4, 14, 5, 15, 6, 16], 2, 16);
+        for (start, end, expected) in [
+            (1, 4, [1, 11, 4, 14, 3, 13, 2, 12, 5, 15, 6, 16]),
+            (1, 5, [1, 11, 5, 15, 4, 14, 3, 13, 2, 12, 6, 16]),
+            (2, 3, [1, 11, 2, 12, 3, 13, 4, 14, 5, 15, 6, 16]),
+        ] {
+            let request = WavEditPreparationRequest::with_operation(
+                request(&path).context,
+                WaveformDetailRange {
+                    start_frame: start,
+                    end_frame: end,
+                },
+                WavEditOperation::Reverse,
+            )
+            .unwrap();
+            let mut output = Cursor::new(Vec::new());
+            prepare_wav_edit(&request, 48, &mut output).unwrap();
+            let (spec, actual) = read_output(output);
+            assert_eq!(spec.channels, 2);
+            assert_eq!(actual, expected.map(|value| value as f32 / 32768.0));
+        }
+    }
+
+    #[test]
+    fn mute_changes_only_selected_frames_to_positive_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mute.wav");
+        let original = [-0.0_f32, 2.0, -1.0, 0.5, 3.0, -0.25, 0.75, -2.0];
+        let mut source = Cursor::new(Vec::new());
+        crate::encode_edited_wav(&original, 2, 48_000, &mut source).unwrap();
+        fs::write(&path, source.into_inner()).unwrap();
+        let mut request = request(&path);
+        request.operation = WavEditOperation::Mute;
+        request.range = WaveformDetailRange {
+            start_frame: 1,
+            end_frame: 3,
+        };
+        let mut output = Cursor::new(Vec::new());
+        prepare_wav_edit(&request, 32, &mut output).unwrap();
+        let (_, actual) = read_output(output);
+        let expected = [-0.0_f32, 2.0, 0.0, 0.0, 0.0, 0.0, 0.75, -2.0];
+        assert_eq!(
+            actual.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            expected.map(f32::to_bits)
+        );
+        assert_eq!(fs::read(&path).unwrap(), {
+            let mut unchanged = Cursor::new(Vec::new());
+            crate::encode_edited_wav(&original, 2, 48_000, &mut unchanged).unwrap();
+            unchanged.into_inner()
+        });
+    }
+
+    #[test]
+    fn frame_operations_check_cancellation_inside_large_frames() {
+        for operation in [WavEditOperation::Reverse, WavEditOperation::Mute] {
+            let mut samples: Vec<f32> = (1..=20_000).map(|value| value as f32).collect();
+            let original = samples.clone();
+            let mut checks = 0;
+            let stop_at = if operation == WavEditOperation::Mute {
+                3
+            } else {
+                2
+            };
+            let result = apply_frame_operation(&mut samples, 10_000, operation, || {
+                checks += 1;
+                if checks == stop_at {
+                    Err(String::from("canceled fixture"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.unwrap_err().contains("canceled"));
+            assert_eq!(
+                samples
+                    .iter()
+                    .zip(original)
+                    .filter(|(left, right)| **left != *right)
+                    .count(),
+                4096
+            );
+        }
+    }
+
+    #[test]
     fn integer_formats_use_native_normalization_without_downmixing() {
         let dir = TempDir::new().unwrap();
         for bits in [8, 16, 24, 32] {
@@ -293,12 +450,14 @@ mod tests {
             start_frame: 8,
             end_frame: 24,
         };
-        request.settings = WaveformEditSettings::new(
-            2.0,
-            Some(WaveformEditFade::new(0.0, 0.0, 0.25, 0.5).unwrap()),
-            Some(WaveformEditFade::new(0.0, 0.0, 0.25, 0.5).unwrap()),
-        )
-        .unwrap();
+        request.operation = WavEditOperation::GainAndFades(
+            WaveformEditSettings::new(
+                2.0,
+                Some(WaveformEditFade::new(0.0, 0.0, 0.25, 0.5).unwrap()),
+                Some(WaveformEditFade::new(0.0, 0.0, 0.25, 0.5).unwrap()),
+            )
+            .unwrap(),
+        );
         let mut output = Cursor::new(Vec::new());
         prepare_wav_edit(&request, 256, &mut output).unwrap();
         let (_, actual) = read_output(output);
