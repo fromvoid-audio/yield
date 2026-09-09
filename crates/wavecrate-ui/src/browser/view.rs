@@ -23,6 +23,7 @@ use super::file_drag;
 use super::metronome;
 use super::motion;
 use super::normalized_audition;
+use super::random_audition;
 use super::shortcut_help;
 use super::tag_filter;
 use super::volume;
@@ -508,6 +509,11 @@ impl Render for Browser {
         });
         let beat_guides_enabled = self.beat_guides_enabled;
         let beat_guides_color = color(if beat_guides_enabled {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
+        let random_color = color(if self.random_audition_sticky {
             theme.colors.accent
         } else {
             theme.colors.text_muted
@@ -1116,6 +1122,33 @@ impl Render for Browser {
                     )
                     .child(
                         div()
+                            .id("random-audition-toolbar")
+                            .debug_selector(|| String::from("random-audition-toolbar"))
+                            .flex_none()
+                            .flex()
+                            .opacity(if self.random_audition_available() {
+                                1.0
+                            } else {
+                                0.45
+                            })
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .when(!self.shortcut_help.is_open(), |control| {
+                                control.tooltip(random_audition::tooltip)
+                            })
+                            .on_click(cx.listener(Self::random_audition_from_toolbar))
+                            .child(random_audition::render_icon(random_color)),
+                    )
+                    .child(
+                        div()
                             .flex_none()
                             .w(px(220.0))
                             .on_mouse_down(
@@ -1491,6 +1524,36 @@ mod tests {
             total_frames: 48_000,
             detail_context: None,
         }
+    }
+
+    #[gpui::test]
+    fn random_toolbar_command_precedes_shift_without_starting_playback(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, _| view.waveform = Some(inert_preview()));
+        cx.refresh().expect("refresh random toolbar");
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("random-audition-toolbar")
+            .expect("random toolbar");
+        let center = point(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let modifiers = Modifiers {
+            platform: true,
+            shift: true,
+            ..Modifiers::none()
+        };
+        cx.simulate_mouse_down(center, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(center, MouseButton::Left, modifiers);
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.random_audition_sticky);
+            assert!(view.random_audition_pending.is_none());
+            assert!(view.playback_init_intent.is_none());
+            assert!(view.waveform_play_region.is_none());
+        });
     }
 
     #[gpui::test]

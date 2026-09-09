@@ -670,6 +670,7 @@ impl Browser {
         intent: PlaybackIntent,
         cx: &mut Context<Self>,
     ) {
+        self.random_audition_pending = None;
         super::zero_crossing::cancel_for_interruption(self);
         self.zero_crossing_queued = None;
         let Some(start) = normalized_playback_start(intent.start) else {
@@ -878,6 +879,7 @@ impl Browser {
     }
 
     pub(super) fn stop_playback(&mut self) {
+        self.random_audition_pending = None;
         super::zero_crossing::cancel_for_interruption(self);
         self.zero_crossing_queued = None;
         self.cancel_normalized_audition();

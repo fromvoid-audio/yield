@@ -228,8 +228,20 @@ struct ShortcutSection {
 
 const GENERAL_ROWS: &[ShortcutRow] = &[
     ShortcutRow {
+        keys: "Random button",
+        description: "Play a random section of the selected sample",
+    },
+    ShortcutRow {
+        keys: "Shift + Random",
+        description: "Choose a listed sample, then a random section",
+    },
+    ShortcutRow {
+        keys: "Cmd/Ctrl + Random",
+        description: "Toggle sticky random sections for Space",
+    },
+    ShortcutRow {
         keys: "Space",
-        description: "Play or stop the focused sample",
+        description: "Play/stop; random section in sticky mode",
     },
     ShortcutRow {
         keys: "Esc",

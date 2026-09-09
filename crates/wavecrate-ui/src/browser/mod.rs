@@ -48,6 +48,7 @@ mod metronome;
 mod motion;
 mod normalized_audition;
 mod preferences;
+mod random_audition;
 mod shortcut_help;
 mod sidebar;
 mod source_recovery;
@@ -269,6 +270,8 @@ pub(crate) struct Browser {
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
+    random_audition_sticky: bool,
+    random_audition_pending: Option<random_audition::PendingRandomAudition>,
     metronome_enabled: bool,
     playback_metronome_beat_count: Option<u16>,
     playback_metronome_confirmed: bool,
@@ -492,6 +495,8 @@ impl Browser {
             bpm_snap_enabled: false,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
+            random_audition_sticky: false,
+            random_audition_pending: None,
             metronome_enabled: false,
             playback_metronome_beat_count: None,
             playback_metronome_confirmed: false,
@@ -694,6 +699,7 @@ impl Browser {
     }
 
     fn cancel_waveform_load(&mut self) {
+        self.random_audition_pending = None;
         self.waveform_detail.cancel();
         zero_crossing::cancel_for_interruption(self);
         if let Some(cancellation) = self.waveform_cancel.take() {
@@ -1452,6 +1458,7 @@ impl Browser {
         origin: SelectionOrigin,
         cx: &mut Context<Self>,
     ) {
+        self.random_audition_pending = None;
         self.invalidate_file_handoff();
         tag_chips::invalidate(self);
         self.start_source_registry_poll(cx);
@@ -1527,6 +1534,7 @@ impl Browser {
                         view.waveform_error = Some(error);
                     }
                 }
+                view.finish_pending_random_audition(cx);
                 cx.notify();
             });
         }));
@@ -1711,6 +1719,27 @@ impl Browser {
     ) {
         self.beat_guides_enabled = !self.beat_guides_enabled;
         cx.notify();
+    }
+
+    fn random_audition_available(&self) -> bool {
+        self.waveform.is_some() || self.selected.is_some() || !self.entries.is_empty()
+    }
+
+    fn random_audition_from_toolbar(
+        &mut self,
+        event: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.random_audition_available() {
+            return;
+        }
+        let modifiers = event.modifiers();
+        if modifiers.platform || (!cfg!(target_os = "macos") && modifiers.control) {
+            self.toggle_sticky_random_audition(cx);
+        } else {
+            self.request_random_audition(modifiers.shift, cx);
+        }
     }
 
     fn toggle_metronome_from_toolbar(
@@ -2140,6 +2169,7 @@ impl Browser {
             return;
         }
         match key {
+            "space" if self.random_audition_sticky => self.request_random_audition(false, cx),
             "space" => self.toggle_playback(cx),
             "l" | "L" => self.toggle_loop(cx),
             "x" if !shift && !secondary => self.toggle_focused_selection(cx),
@@ -2288,6 +2318,54 @@ mod tests {
     use std::path::PathBuf;
     use wavecrate_core::{AudioFile, AudioFileId};
     use wavecrate_library::sample_sources::{SampleSource, SourceId};
+
+    #[gpui::test]
+    fn explicit_actions_cancel_a_pending_random_load(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        browser.update(cx, |view, cx| {
+            let path = PathBuf::from("/tmp/inert-random.wav");
+            view.entries = vec![AudioFile {
+                path: path.clone(),
+                relative_path: PathBuf::from("inert-random.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            let pending = || super::random_audition::PendingRandomAudition {
+                generation: 0,
+                path: path.clone(),
+                units: wavecrate_core::RandomAuditionUnits::new(0.25, 0.5),
+            };
+            view.random_audition_pending = Some(pending());
+            view.select_entry(0, None, SelectionOrigin::Passive, cx);
+            assert!(view.random_audition_pending.is_none());
+            view.random_audition_pending = Some(pending());
+            view.stop_playback();
+            assert!(view.random_audition_pending.is_none());
+            view.random_audition_pending = Some(pending());
+            view.request_playback_intent(
+                super::transport::PlaybackIntent {
+                    start: f64::NAN,
+                    region: None,
+                    looped: false,
+                    volume: 1.0,
+                    path: path.clone(),
+                    origin: super::transport::PlaybackIntentOrigin::Explicit,
+                    resume_desired: None,
+                },
+                cx,
+            );
+            assert!(view.random_audition_pending.is_none());
+            view.random_audition_pending = Some(pending());
+            view.cancel_waveform_load();
+            assert!(view.random_audition_pending.is_none());
+        });
+    }
 
     #[test]
     fn invalid_theme_keeps_the_last_good_path() {
