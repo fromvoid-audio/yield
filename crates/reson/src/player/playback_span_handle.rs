@@ -136,6 +136,14 @@ impl PlaybackSpanHandle {
     pub(crate) fn applied_metronome_revision(&self) -> u64 {
         self.shared.applied_metronome.revision()
     }
+
+    pub(crate) fn current_metronome_beat_count(&self) -> Option<u16> {
+        let snapshot = self.shared.pending.try_snapshot()?;
+        snapshot
+            .metronome
+            .enabled
+            .then_some(snapshot.metronome.beat_count)
+    }
 }
 
 impl PlaybackControlMailbox {
@@ -485,6 +493,24 @@ mod tests {
 
         assert_eq!(snapshot.metronome.anchor_frame, 150);
         assert_eq!(snapshot.metronome.anchor_phase_frames, 100);
+    }
+
+    #[test]
+    fn current_metronome_beat_count_reads_the_published_snapshot() {
+        let plan = span_plan(0, 100, 0);
+        let handle = PlaybackSpanHandle::from_plan_with_metronome(&plan, None);
+
+        assert_eq!(handle.current_metronome_beat_count(), None);
+
+        handle.update_from_plan(&plan, None, Some(PlaybackMetronomeConfig::new(4)));
+        assert_eq!(handle.current_metronome_beat_count(), Some(4));
+        assert!(!handle.applied_metronome().enabled());
+
+        handle.update_from_plan(&plan, None, Some(PlaybackMetronomeConfig::new(7)));
+        assert_eq!(handle.current_metronome_beat_count(), Some(7));
+
+        handle.update_from_plan(&plan, None, None);
+        assert_eq!(handle.current_metronome_beat_count(), None);
     }
 
     #[test]

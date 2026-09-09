@@ -293,6 +293,11 @@ pub struct PlaybackRuntimeProgress {
     pub looping: bool,
     pub progress: Option<f32>,
     pub error: Option<String>,
+    /// Configured beat count for the active sample metronome.
+    ///
+    /// This is `None` when the metronome is disabled, playback is inactive, or
+    /// the active source cannot expose its playback-span control.
+    pub metronome_beat_count: Option<u16>,
     /// The last successfully started current play request, if one exists.
     ///
     /// The runtime retains this identity after natural completion; inspect [`Self::active`] to
@@ -1189,6 +1194,7 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             looping: self.player.is_looping(),
             progress: self.player.progress(),
             error: self.player.take_error(),
+            metronome_beat_count: self.player.metronome_beat_count(),
             playback_request_id: None,
         }
     }
@@ -1894,6 +1900,7 @@ mod tests {
                     looping: false,
                     progress: Some(0.25),
                     error: None,
+                    metronome_beat_count: None,
                     playback_request_id: None,
                 })),
                 dropped: Arc::new(AtomicBool::new(false)),
@@ -2095,6 +2102,34 @@ mod tests {
             playback_gains.lock().expect("playback gains").as_slice(),
             &[(0.5, None)]
         );
+    }
+
+    #[test]
+    fn playback_runtime_progress_reports_metronome_count_with_request_identity() {
+        let executor = FakeExecutor::new(vec![]);
+        executor
+            .progress_state()
+            .lock()
+            .expect("progress lock")
+            .metronome_beat_count = Some(4);
+        let runtime =
+            spawn_executor(executor, PlaybackRuntimeConfig::default()).expect("spawn runtime");
+
+        let playback_id = runtime.handle.try_play(test_request(0.0)).expect("play");
+        assert!(matches!(
+            runtime.events.recv().expect("started event"),
+            PlaybackRuntimeEvent::Started(PlaybackRuntimeStarted { id, .. }) if id == playback_id
+        ));
+
+        let poll_id = runtime.handle.try_poll_progress().expect("poll");
+        let event = runtime.events.recv().expect("progress event");
+        assert!(matches!(
+            event,
+            PlaybackRuntimeEvent::Progress { id, progress }
+                if id == poll_id
+                    && progress.playback_request_id == Some(playback_id)
+                    && progress.metronome_beat_count == Some(4)
+        ));
     }
 
     #[test]

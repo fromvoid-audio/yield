@@ -1979,3 +1979,7 @@ Validation: the full UI suite passed 325 tests with one existing ignored benchma
 ### Metronome source-frame foundation, 2026-09-09
 
 Reson now offers `PlaybackMetronomeConfig::with_source_cycle` to anchor a click grid to decoded source frames. Both static and live plans resolve the phase from their actual clamped source position, preserving the grid when the runtime advances a non-seeking retarget beyond the UI request position. Existing relative-cycle behavior remains unchanged. All 194 Reson library tests and checking passed, including before-origin/extreme arithmetic, seek, wrap, static/live agreement and compatibility. Independent review found no meaningful issue. The GPUI metronome toggle and transport acknowledgement are follow-on work.
+
+### Metronome transport readback, 2026-09-09
+
+Runtime progress now carries the configured metronome beat count together with playback request identity. The accessor reads the coherently published span configuration, avoiding a lagging audio-thread-applied value during retarget acknowledgement, and returns no count for inactive/disabled/unavailable transport. All 196 Reson library tests and checking passed; independent review found no meaningful issue. This is the acknowledgement foundation for the GPUI metronome control, which remains in progress.

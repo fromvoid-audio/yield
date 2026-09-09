@@ -72,6 +72,19 @@ impl AudioPlayer {
         self.looping
     }
 
+    /// Return the configured beat count for the active sample metronome.
+    ///
+    /// Returns `None` when playback is inactive, the metronome is disabled, or
+    /// the active source does not expose a live playback span.
+    pub fn metronome_beat_count(&self) -> Option<u16> {
+        if !self.is_playing() {
+            return None;
+        }
+        self.active_playback_span
+            .as_ref()?
+            .current_metronome_beat_count()
+    }
+
     /// Return the active playback span in seconds.
     #[doc(hidden)]
     pub fn play_span(&self) -> Option<(f32, f32)> {
