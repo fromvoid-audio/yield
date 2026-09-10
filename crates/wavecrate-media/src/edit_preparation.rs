@@ -45,6 +45,43 @@ pub struct WavEditPreparationRequest {
 }
 
 impl WavEditPreparationRequest {
+    /// Resolve a waveform edit selection using native floor-start/ceil-end frame coverage.
+    ///
+    /// `Crop` preserves signed bounds and becomes `CropWithSilence`. Gain/fades, reverse,
+    /// mute and trim use only the source intersection and reject wholly absent audio.
+    /// An explicit `CropWithSilence` operation is rejected because it already carries bounds;
+    /// use `with_padded_crop` for frame-authored requests instead.
+    pub fn from_edit_region(
+        context: WaveformDetailContext,
+        region: wavecrate_core::WaveformEditRegion,
+        operation: WavEditOperation,
+    ) -> Result<Self, String> {
+        if operation == WavEditOperation::Crop {
+            let (start, end) = region
+                .signed_frame_bounds(context.total_frames)
+                .ok_or_else(|| String::from("crop selection cannot be represented in frames"))?;
+            return Self::with_padded_crop(context, start, end);
+        }
+        if matches!(operation, WavEditOperation::CropWithSilence { .. }) {
+            return Err(String::from(
+                "frame-authored crops require with_padded_crop",
+            ));
+        }
+        let (start_frame, end_frame) = region
+            .existing_frame_bounds(context.total_frames)
+            .ok_or_else(|| {
+                String::from("edit selection is outside audio or cannot be represented in frames")
+            })?;
+        Self::with_operation(
+            context,
+            WaveformDetailRange {
+                start_frame,
+                end_frame,
+            },
+            operation,
+        )
+    }
+
     /// Validate the format and exact selection without decoding or writing audio.
     pub fn new(
         context: WaveformDetailContext,
@@ -441,6 +478,97 @@ mod tests {
             reader.spec(),
             reader.samples::<f32>().collect::<Result<_, _>>().unwrap(),
         )
+    }
+
+    #[test]
+    fn waveform_regions_drive_crop_padding_and_existing_audio_edits() {
+        use wavecrate_core::WaveformEditRegion;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("region.wav");
+        write_int(&path, &[1, 2, 3, 4, 5, 6, 7, 8], 1, 16);
+        let context = request(&path).context;
+        let crop = WavEditPreparationRequest::from_edit_region(
+            context.clone(),
+            WaveformEditRegion::new(-0.25, 0.375).unwrap(),
+            WavEditOperation::Crop,
+        )
+        .unwrap();
+        assert_eq!(
+            crop.operation,
+            WavEditOperation::CropWithSilence {
+                start_frame: -2,
+                end_frame: 3
+            }
+        );
+        let mut output = Cursor::new(Vec::new());
+        prepare_wav_edit(&crop, 32, &mut output).unwrap();
+        assert_eq!(
+            read_output(output).1,
+            [0, 0, 1, 2, 3].map(|value| value as f32 / 32768.0)
+        );
+
+        let mute = WavEditPreparationRequest::from_edit_region(
+            context,
+            WaveformEditRegion::new(-0.25, 0.26).unwrap(),
+            WavEditOperation::Mute,
+        )
+        .unwrap();
+        assert_eq!(
+            mute.range,
+            WaveformDetailRange {
+                start_frame: 0,
+                end_frame: 3
+            }
+        );
+        let mut output = Cursor::new(Vec::new());
+        prepare_wav_edit(&mute, 32, &mut output).unwrap();
+        assert_eq!(
+            read_output(output).1,
+            [0, 0, 0, 4, 5, 6, 7, 8].map(|value| value as f32 / 32768.0)
+        );
+    }
+
+    #[test]
+    fn waveform_region_admission_rejects_absent_audio_and_conflicting_crop_bounds() {
+        use wavecrate_core::WaveformEditRegion;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("outside.wav");
+        write_int(&path, &[1, 2, 3, 4], 1, 16);
+        let context = request(&path).context;
+        for operation in [
+            WavEditOperation::Mute,
+            WavEditOperation::Reverse,
+            WavEditOperation::Trim,
+            WavEditOperation::GainAndFades(WaveformEditSettings::new(1.0, None, None).unwrap()),
+        ] {
+            assert!(
+                WavEditPreparationRequest::from_edit_region(
+                    context.clone(),
+                    WaveformEditRegion::new(1.0, 2.0).unwrap(),
+                    operation
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            WavEditPreparationRequest::from_edit_region(
+                context.clone(),
+                WaveformEditRegion::new(1.0, 2.0).unwrap(),
+                WavEditOperation::Crop
+            )
+            .is_ok()
+        );
+        assert!(
+            WavEditPreparationRequest::from_edit_region(
+                context,
+                WaveformEditRegion::new(0.0, 1.0).unwrap(),
+                WavEditOperation::CropWithSilence {
+                    start_frame: 0,
+                    end_frame: 1
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

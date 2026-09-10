@@ -49,6 +49,38 @@ impl WaveformEditRegion {
         self.end - self.start
     }
 
+    /// Resolve authored coordinates to signed half-open sample frames.
+    ///
+    /// Start is floored and end is ceiled, matching the reference editor. A nonempty region
+    /// covers at least one frame. Empty sources and unrepresentable products return `None`
+    /// rather than saturating extreme coordinates onto unrelated audio.
+    pub fn signed_frame_bounds(self, total_frames: usize) -> Option<(i64, i64)> {
+        if total_frames == 0 || i64::try_from(total_frames).is_err() {
+            return None;
+        }
+        let start = (self.start * total_frames as f64).floor();
+        let end = (self.end * total_frames as f64).ceil();
+        // i64::MAX rounds up to 2^63 in f64, so the upper bound must be exclusive.
+        let fits = |value: f64| {
+            value.is_finite() && value >= i64::MIN as f64 && value < -(i64::MIN as f64)
+        };
+        if !fits(start) || !fits(end) {
+            return None;
+        }
+        let start = start as i64;
+        let end = (end as i64).max(start.checked_add(1)?);
+        Some((start, end))
+    }
+
+    /// Resolve the selected existing audio frames, rejecting wholly out-of-source selections.
+    pub fn existing_frame_bounds(self, total_frames: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.signed_frame_bounds(total_frames)?;
+        let total = i64::try_from(total_frames).ok()?;
+        let start = start.clamp(0, total) as usize;
+        let end = end.clamp(0, total) as usize;
+        (end > start).then_some((start, end))
+    }
+
     /// Move this baseline by a normalized pointer delta without clamping to the audio interval.
     ///
     /// The original region is unchanged and both endpoints are translated by the same delta.
@@ -98,6 +130,61 @@ impl WaveformEditRegion {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_conversion_covers_touched_frames_and_preserves_padding() {
+        use super::WaveformEditRegion;
+        let region = WaveformEditRegion::new(-0.25, 1.125).unwrap();
+        assert_eq!(region.signed_frame_bounds(8), Some((-2, 9)));
+        assert_eq!(region.existing_frame_bounds(8), Some((0, 8)));
+        assert_eq!(
+            WaveformEditRegion::new(0.125, 0.126)
+                .unwrap()
+                .signed_frame_bounds(8),
+            Some((1, 2))
+        );
+        assert_eq!(
+            WaveformEditRegion::new(0.126, 0.375)
+                .unwrap()
+                .signed_frame_bounds(8),
+            Some((1, 3))
+        );
+        assert_eq!(
+            WaveformEditRegion::new(1.0, 1.25)
+                .unwrap()
+                .existing_frame_bounds(8),
+            None
+        );
+        assert_eq!(
+            WaveformEditRegion::new(-0.5, 0.0)
+                .unwrap()
+                .existing_frame_bounds(8),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_conversion_rejects_empty_sources_and_unrepresentable_coordinates() {
+        use super::WaveformEditRegion;
+        assert_eq!(
+            WaveformEditRegion::new(0.0, 1.0)
+                .unwrap()
+                .signed_frame_bounds(0),
+            None
+        );
+        assert_eq!(
+            WaveformEditRegion::new(0.0, f64::MAX)
+                .unwrap()
+                .signed_frame_bounds(2),
+            None
+        );
+        assert_eq!(
+            WaveformEditRegion::new(0.0, -(i64::MIN as f64))
+                .unwrap()
+                .signed_frame_bounds(1),
+            None
+        );
+    }
+
     use super::WaveformEditRegion;
     use crate::WaveformRegion;
 
