@@ -2192,3 +2192,15 @@ existing-claim overflow, legacy serialized payloads and retained-descriptor
 identity after unlink. The GPUI application check, formatting and diff checks
 passed. OPT-1473 remains incomplete and blocked; subsequent implementation selects
 unblocked Linear tickets first.
+
+### Shared preview and audition format policy, 2026-09-11
+
+Corrected OPT-1483's original premise: the retained shared audio policy explicitly
+supports WAV only, with other recognized extensions excluded from supported audio.
+Preview and audition now call that canonical policy rather than independent
+extension checks, also rejecting macOS AppleDouble sidecars before decode.
+Cancellation still takes precedence in preview admission. No codec expansion was
+introduced; native audible acceptance remains OPT-1492.
+
+Validation: the preview admission regression and four canonical format-policy
+tests passed, as did the GPUI application check, formatting and diff checks.

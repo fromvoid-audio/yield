@@ -448,9 +448,7 @@ pub(crate) fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
 }
 
 fn is_wav_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    wavecrate_library::sample_sources::is_supported_audio(path)
 }
 
 #[cfg(test)]
@@ -711,6 +709,30 @@ mod tests {
         std::fs::write(&text_path, b"audio").expect("write text");
         let text_error = load_waveform_preview(&text_path).expect_err("non-wav must fail");
         assert!(text_error.contains("requires WAV"));
+    }
+
+    #[test]
+    fn preview_admission_uses_shared_format_policy_before_file_io() {
+        for name in ["kick.wav", "KICK.WAV"] {
+            assert!(is_wav_path(Path::new(name)));
+        }
+        for name in [
+            "._kick.wav",
+            "nested/._KICK.WAV",
+            "loop.aif",
+            "loop.aiff",
+            "loop.flac",
+            "loop.mp3",
+        ] {
+            let error = load_waveform_preview(Path::new(name)).expect_err("unsupported admission");
+            assert!(error.contains("requires WAV"), "{name}: {error}");
+        }
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            load_waveform_preview_with_cancel(Path::new("._kick.wav"), Some(&cancelled))
+                .unwrap_err(),
+            "waveform preview canceled"
+        );
     }
 
     #[test]

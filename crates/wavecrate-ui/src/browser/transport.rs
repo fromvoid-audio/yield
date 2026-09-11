@@ -831,11 +831,7 @@ impl Browser {
         let path = entry.path.clone();
         self.playback_policy
             .prepare(entry.stable_id(), entry.playback_type);
-        if !path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
-        {
+        if !wavecrate_library::sample_sources::is_supported_audio(&path) {
             self.playback_status = "Audition currently supports WAV files".to_string();
             return None;
         }
