@@ -1745,7 +1745,9 @@ fn render_candidate(
                     .hover(move |style| style.bg(remove_hover))
                     .active(move |style| style.bg(remove_pressed))
             })
-            .tooltip(super::tag_dictionary::remove_definition_tooltip)
+            .when(browser.hover_help_visible(), |element| {
+                element.tooltip(super::tag_dictionary::remove_definition_tooltip)
+            })
             .on_click(cx.listener(move |view, _, _, cx| {
                 cx.stop_propagation();
                 if remove_enabled {

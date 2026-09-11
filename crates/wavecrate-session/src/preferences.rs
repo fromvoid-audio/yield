@@ -16,6 +16,10 @@ const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
 const MAX_AUDIO_OUTPUT_NAME_BYTES: usize = 1024;
 const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
+fn default_help_tooltips_enabled() -> bool {
+    true
+}
+
 fn default_autoplay_selection() -> bool {
     true
 }
@@ -95,6 +99,9 @@ pub struct UiPreferences {
     /// Whether a newly focused sample may start playback.
     #[serde(default = "default_autoplay_selection")]
     pub autoplay_selection: bool,
+    /// Whether hover help is shown throughout the browser.
+    #[serde(default = "default_help_tooltips_enabled")]
+    pub help_tooltips_enabled: bool,
     /// Whether audition playback loops its active region.
     #[serde(default)]
     pub loop_enabled: bool,
@@ -116,6 +123,7 @@ impl Default for UiPreferences {
             theme: Theme::default(),
             theme_source_path: None,
             autoplay_selection: true,
+            help_tooltips_enabled: true,
             loop_enabled: false,
             normalized_audition_enabled: false,
             output_volume: 1.0,
@@ -280,6 +288,8 @@ pub enum PreferencePatch {
     SetMotionEnabled(bool),
     /// Change the selection autoplay preference.
     SetAutoplaySelection(bool),
+    /// Change global hover-help visibility.
+    SetHelpTooltipsEnabled(bool),
     /// Change the audition loop preference.
     SetLoopEnabled(bool),
     /// Change the peak-normalized audition preference.
@@ -306,6 +316,7 @@ impl PreferencePatch {
             }
             Self::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = enabled,
             Self::SetAutoplaySelection(enabled) => preferences.autoplay_selection = enabled,
+            Self::SetHelpTooltipsEnabled(enabled) => preferences.help_tooltips_enabled = enabled,
             Self::SetLoopEnabled(enabled) => preferences.loop_enabled = enabled,
             Self::SetNormalizedAuditionEnabled(enabled) => {
                 preferences.normalized_audition_enabled = enabled;
@@ -897,5 +908,52 @@ mod tests {
             UiPreferences::from_payload(&payload),
             Err(PreferenceError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn help_tooltips_legacy_default_round_trip_and_reset() {
+        let mut payload = serde_json::to_value(UiPreferences::default()).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("help_tooltips_enabled");
+        let mut preferences = UiPreferences::from_payload(&payload.to_string()).unwrap();
+        assert!(preferences.help_tooltips_enabled);
+        let original = preferences.clone();
+        assert!(
+            PreferencePatch::SetHelpTooltipsEnabled(false)
+                .apply(&mut preferences)
+                .unwrap()
+        );
+        assert!(
+            !PreferencePatch::SetHelpTooltipsEnabled(false)
+                .apply(&mut preferences)
+                .unwrap()
+        );
+        let restored = UiPreferences::from_payload(&preferences.to_payload().unwrap()).unwrap();
+        assert!(!restored.help_tooltips_enabled);
+        assert_eq!(restored.theme, original.theme);
+        assert_eq!(restored.audio_output, original.audio_output);
+        PreferencePatch::Reset.apply(&mut preferences).unwrap();
+        assert!(preferences.help_tooltips_enabled);
+    }
+
+    #[test]
+    fn help_tooltips_preload_edits_preserve_order_and_other_saved_settings() {
+        let mut saved = UiPreferences::default();
+        saved.output_volume = 0.25;
+        let mut coordinator = PreferenceCoordinator::new();
+        for (id, enabled) in [(1, false), (2, true), (3, false)] {
+            coordinator.queue_patch(
+                PreferenceRequestId(id),
+                PreferencePatch::SetHelpTooltipsEnabled(enabled),
+            );
+        }
+        let outcomes = coordinator.load_valid(saved);
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        let current = coordinator.snapshot();
+        assert!(!current.help_tooltips_enabled);
+        assert_eq!(current.output_volume, 0.25);
     }
 }

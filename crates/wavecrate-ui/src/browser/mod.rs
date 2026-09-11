@@ -321,6 +321,7 @@ pub(crate) struct Browser {
     playback_policy: PlaybackLoopPolicy,
     accepted_playback_intent: Option<transport::PlaybackIntent>,
     autoplay_selection: bool,
+    help_tooltips_enabled: bool,
     playback_history: PlaybackNavigationHistory,
     latest_playback_request_id: Option<PlaybackRequestId>,
     next_playback_retarget_generation: u64,
@@ -564,6 +565,7 @@ impl Browser {
             playback_policy: PlaybackLoopPolicy::default(),
             accepted_playback_intent: None,
             autoplay_selection: true,
+            help_tooltips_enabled: true,
             playback_history: PlaybackNavigationHistory::default(),
             latest_playback_request_id: None,
             next_playback_retarget_generation: 0,
@@ -1844,6 +1846,28 @@ impl Browser {
         cx.notify();
     }
 
+    fn hover_help_visible(&self) -> bool {
+        self.help_tooltips_enabled && !self.shortcut_help.is_open()
+    }
+
+    fn toggle_help_tooltips(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let enabled = !self.help_tooltips_enabled;
+        if !self.submit_preference_patch(PreferencePatch::SetHelpTooltipsEnabled(enabled), cx) {
+            return;
+        }
+        self.help_tooltips_enabled = enabled;
+        cx.notify();
+    }
+
     fn toggle_autoplay(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
@@ -2000,6 +2024,7 @@ impl Browser {
         cx.set_global(ActiveTheme::default());
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
         self.autoplay_selection = true;
+        self.help_tooltips_enabled = true;
         let previous_loop_mode = self.playback_policy.enabled();
         self.playback_policy.reset(false);
         let loop_mode_changed = previous_loop_mode != self.playback_policy.enabled();

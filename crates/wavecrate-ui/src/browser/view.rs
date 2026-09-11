@@ -438,6 +438,35 @@ impl Browser {
                         "Autoplay Off"
                     }),
             )
+            .child(
+                div()
+                    .id("toggle-help-tooltips")
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
+                    .px(px(theme.spacing.control_gap))
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .text_color(if settings_editable {
+                        color(if self.help_tooltips_enabled {
+                            theme.colors.accent
+                        } else {
+                            theme.colors.text_muted
+                        })
+                    } else {
+                        color(theme.colors.text_disabled)
+                    })
+                    .when(settings_editable, |element| {
+                        element
+                            .cursor_pointer()
+                            .on_click(cx.listener(Self::toggle_help_tooltips))
+                    })
+                    .child(if self.help_tooltips_enabled {
+                        "Help tips On"
+                    } else {
+                        "Help tips Off"
+                    }),
+            )
             .child(div().flex_1())
             .child(format!(
                 "{} · {}",
@@ -1050,7 +1079,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(similar_sections::tooltip)
                             })
                             .on_click(
@@ -1081,7 +1110,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(waveform::bpm_snap_tooltip)
                             })
                             .on_click(cx.listener(Self::toggle_bpm_snap_from_toolbar))
@@ -1102,7 +1131,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(zero_crossing::tooltip)
                             })
                             .on_click(cx.listener(Self::toggle_zero_crossing_from_toolbar))
@@ -1123,7 +1152,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(waveform::beat_guides_tooltip)
                             })
                             .on_click(cx.listener(Self::toggle_beat_guides_from_toolbar))
@@ -1140,7 +1169,7 @@ impl Render for Browser {
                             .bg(color(theme.colors.surface_overlay))
                             .border(px(theme.spacing.border_width))
                             .border_color(color(theme.colors.border_emphasis))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(waveform::beat_count_tooltip)
                             })
                             .child(self.beat_count_input.clone()),
@@ -1160,7 +1189,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(metronome::tooltip)
                             })
                             .on_click(cx.listener(Self::toggle_metronome_from_toolbar))
@@ -1187,7 +1216,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(random_audition::tooltip)
                             })
                             .on_click(cx.listener(Self::random_audition_from_toolbar))
@@ -1229,7 +1258,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(normalized_audition::normalized_audition_tooltip)
                             })
                             .on_click(cx.listener(Self::toggle_normalized_audition_from_toolbar))
@@ -1328,7 +1357,7 @@ impl Render for Browser {
                             .border_color(color(theme.colors.border_emphasis))
                             .hover(move |style| style.bg(color(toolbar_hover)))
                             .active(move |style| style.bg(color(toolbar_pressed)))
-                            .when(!self.shortcut_help.is_open(), |control| {
+                            .when(self.hover_help_visible(), |control| {
                                 control.tooltip(shortcut_help::shortcut_help_tooltip)
                             })
                             .on_click(cx.listener(Self::toggle_shortcut_help_from_toolbar))

@@ -319,6 +319,9 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         }
         PreferencePatch::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = *enabled,
         PreferencePatch::SetAutoplaySelection(enabled) => preferences.autoplay_selection = *enabled,
+        PreferencePatch::SetHelpTooltipsEnabled(enabled) => {
+            preferences.help_tooltips_enabled = *enabled
+        }
         PreferencePatch::SetLoopEnabled(enabled) => preferences.loop_enabled = *enabled,
         PreferencePatch::SetNormalizedAuditionEnabled(enabled) => {
             preferences.normalized_audition_enabled = *enabled;
@@ -460,6 +463,7 @@ impl Browser {
         let effective = self.preferences.effective();
         let autoplay_was_enabled = self.autoplay_selection;
         self.autoplay_selection = effective.autoplay_selection;
+        self.help_tooltips_enabled = effective.help_tooltips_enabled;
         self.playback_policy
             .apply_preference(effective.loop_enabled);
         self.apply_preference_volume(effective.output_volume);
@@ -687,5 +691,29 @@ mod tests {
         assert!(!state.normalized_audition_enabled());
         state.queue_for_test(1, PreferencePatch::SetNormalizedAuditionEnabled(true));
         assert!(state.normalized_audition_enabled());
+    }
+
+    #[test]
+    fn help_tooltips_pending_edits_survive_load_and_reset_in_order() {
+        let mut state = PreferenceState::new();
+        state.queue_for_test(1, PreferencePatch::SetHelpTooltipsEnabled(false));
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        assert!(!state.effective().help_tooltips_enabled);
+        state.queue_for_test(2, PreferencePatch::Reset);
+        assert!(state.effective().help_tooltips_enabled);
+        state.queue_for_test(3, PreferencePatch::SetHelpTooltipsEnabled(false));
+        assert!(!state.effective().help_tooltips_enabled);
+    }
+
+    #[test]
+    fn help_tooltips_persistence_outage_keeps_session_value_and_blocks_new_edits() {
+        let mut state = PreferenceState::new();
+        state.queue_for_test(1, PreferencePatch::SetHelpTooltipsEnabled(false));
+        state.mark_unavailable(&SessionError::Preference("write failed".to_string()));
+        assert!(!state.effective().help_tooltips_enabled);
+        assert!(!state.can_submit(&PreferencePatch::SetHelpTooltipsEnabled(true)));
+        assert!(state.can_submit(&PreferencePatch::Reset));
+        assert!(!state.has_pending());
+        assert!(state.status().contains("save failed"));
     }
 }

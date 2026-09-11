@@ -2204,3 +2204,41 @@ introduced; native audible acceptance remains OPT-1492.
 
 Validation: the preview admission regression and four canonical format-policy
 tests passed, as did the GPUI application check, formatting and diff checks.
+
+### Settings parity inventory (OPT-1489), 2026-09-11
+
+Compared the active reference settings projection and dispatch with GPUI controls.
+This is an inventory of remaining work, not blanket settings acceptance.
+
+| Reference control | GPUI evidence / remaining boundary |
+| --- | --- |
+| Audio backend, output and sample rate | `browser/audio_output.rs` already enumerates, applies and persists all three through `SetAudioOutput`; no replacement implementation needed. |
+| Volume and normalized audition | Existing toolbar/runtime controls and session preferences; audible acceptance remains separate. |
+| Global hover-help toggle | Implemented through a persisted Help tips On/Off control in the existing settings strip. The shortcut-help modal remains a separate workflow. |
+| Rating decay | Reference `settings/window/panels/projection.rs` and settings dispatch expose it; the GPUI session has no matching setting or rating-decay engine integration yet. |
+| Trash folder choose/clear | Reference control exists; GPUI needs a typed setting and safe physical-curation integration, not a view-owned filesystem action. |
+| Global storage usage | Reference usage projection exists; no GPUI session storage-accounting query is implemented. |
+| Clear rebuildable caches | Reference maintenance action exists; GPUI needs artifact-owner admission/retirement before enabling this destructive control. |
+| Theme, motion, autoplay and loop | Existing GPUI settings; preserve their ordered persistence and blocked-profile behavior. |
+
+The reference general panel is not reproduced by the current compact settings
+strips. Its outstanding settings and service boundaries keep OPT-1489 open. No
+inactive legacy feature or unsupported audio format is added by this inventory.
+
+
+### Global hover-help preference, 2026-09-11
+
+Added `help_tooltips_enabled` to the existing ordered preference pipeline, with
+legacy documents defaulting to enabled and Reset restoring that default. The
+compact settings strip exposes Help tips On/Off. All current toolbar and
+tag-library tooltip registrations honor the flag and shortcut-help modal
+suppression. Shortcut-help commands remain available when hover help is disabled.
+No filesystem work or repeated preference cloning was added to rendering.
+
+Validation: 20 session preference tests and nine UI preference tests passed,
+including legacy defaults, serialization, queued load ordering, Reset, and
+persistence-outage behavior. The application check, formatting and diff checks
+passed. A stale session dependency initially broke the UI test build; a targeted
+session-package clean and rebuild resolved it without source changes. Native
+hover/layout acceptance was not performed, and OPT-1489 remains open for the
+General controls listed above.
