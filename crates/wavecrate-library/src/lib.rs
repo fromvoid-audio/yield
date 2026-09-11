@@ -7,6 +7,8 @@
 pub mod app_dirs;
 /// Shared structured debug diagnostics helpers for storage-owned seams.
 pub mod diagnostics;
+/// Pre-intent durable capacity discovery and accounting.
+pub mod durable_capacity;
 mod env_flags;
 /// Stable cross-platform filesystem-object identity helpers.
 pub mod filesystem_identity;

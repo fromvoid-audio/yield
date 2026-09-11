@@ -2175,3 +2175,20 @@ Validation: all 95 media tests passed with one existing ignored probe. End-to-en
 The inherited journal recovery suite now exercises the real non-Windows finalizer in addition to its test-only publication substitute. Repeated recovery with unavailable publication retains staged bytes/object identity and the journal, does not create a target, and preserves source catalogue metadata. When a target already names the staged object, unavailable cleanup retains both paths and the journal and does not advance source catalogue removal. Neither case reports completion.
 
 Validation: all 21 journal-recovery tests passed, including two new production-path regressions; formatting and diff checks passed. Fixtures use isolated temporary roots and the actual production reconciliation entrypoint. No production mutation behavior or schema changed. These tests establish fail-closed retention in the inherited recovery layer; they do not qualify a macOS publication primitive or satisfy the newer durable edit/undo journal contract. Production macOS publication and cleanup remain disabled.
+
+### Shared durable capacity foundation, 2026-09-11
+
+Extracted the native journal's renderer-neutral capacity plan types, allocation
+rounding/aggregation and descriptor-derived volume facts into
+`wavecrate-library::durable_capacity`. Serialized fields, legacy defaults and
+protected-space accounting are preserved. The archived native shape adapter is
+unchanged; active journal admission/completion wiring is still pending. Capacity
+plans are observations and logical claims, not physical reservations or permission
+to publish. This slice charges destination staging only and does not establish
+universal recovery-capacity admission. Unsupported platform discovery stays closed.
+
+Validation: eight focused tests passed, including conflicting volume facts,
+existing-claim overflow, legacy serialized payloads and retained-descriptor
+identity after unlink. The GPUI application check, formatting and diff checks
+passed. OPT-1473 remains incomplete and blocked; subsequent implementation selects
+unblocked Linear tickets first.
