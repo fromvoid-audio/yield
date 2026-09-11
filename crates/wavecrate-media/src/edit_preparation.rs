@@ -23,6 +23,11 @@ pub enum WavEditOperation {
     Trim,
     /// Keep only selected existing frames; silence outside the source is not supported here.
     Crop,
+    /// Rotate the whole file by signed frames, wrapping at the ends without changing length.
+    Slide {
+        /// Positive offsets move audio right; negative offsets move it left.
+        frame_offset: i64,
+    },
     /// Keep a signed half-open frame span, padding portions outside the source with silence.
     CropWithSilence {
         /// Inclusive start frame; negative values select silence before the source.
@@ -38,7 +43,7 @@ pub struct WavEditPreparationRequest {
     /// Source identity, revision and format captured before background admission.
     pub context: WaveformDetailContext,
     /// Existing source frames to edit; outer fades may also change adjacent frames.
-    /// For `CropWithSilence`, this must be the whole source; signed bounds live in the operation.
+    /// For `CropWithSilence` and `Slide`, this must be the whole source.
     pub range: WaveformDetailRange,
     /// Operation to apply to the selected frames.
     pub operation: WavEditOperation,
@@ -49,8 +54,7 @@ impl WavEditPreparationRequest {
     ///
     /// `Crop` preserves signed bounds and becomes `CropWithSilence`. Gain/fades, reverse,
     /// mute and trim use only the source intersection and reject wholly absent audio.
-    /// An explicit `CropWithSilence` operation is rejected because it already carries bounds;
-    /// use `with_padded_crop` for frame-authored requests instead.
+    /// Frame-authored crops and whole-file slides use their dedicated constructors instead.
     pub fn from_edit_region(
         context: WaveformDetailContext,
         region: wavecrate_core::WaveformEditRegion,
@@ -62,9 +66,12 @@ impl WavEditPreparationRequest {
                 .ok_or_else(|| String::from("crop selection cannot be represented in frames"))?;
             return Self::with_padded_crop(context, start, end);
         }
-        if matches!(operation, WavEditOperation::CropWithSilence { .. }) {
+        if matches!(
+            operation,
+            WavEditOperation::CropWithSilence { .. } | WavEditOperation::Slide { .. }
+        ) {
             return Err(String::from(
-                "frame-authored crops require with_padded_crop",
+                "frame-authored crops and whole-file slides require their dedicated constructors",
             ));
         }
         let (start_frame, end_frame) = region
@@ -98,6 +105,11 @@ impl WavEditPreparationRequest {
         operation: WavEditOperation,
     ) -> Result<Self, String> {
         WavSpanExportRequest::new(context.clone(), range)?;
+        if matches!(operation, WavEditOperation::Slide { .. })
+            && (range.start_frame != 0 || range.end_frame != context.total_frames)
+        {
+            return Err(String::from("slide requires the whole source range"));
+        }
         if operation == WavEditOperation::Trim && range.len() == context.total_frames {
             return Err(String::from("trimming the entire WAV would leave no audio"));
         }
@@ -146,6 +158,15 @@ impl WavEditPreparationRequest {
                 end_frame,
             },
         )
+    }
+
+    /// Prepare a whole-file cyclic shift in exact frames, preserving all channels and samples.
+    pub fn with_slide(context: WaveformDetailContext, frame_offset: i64) -> Result<Self, String> {
+        let range = WaveformDetailRange {
+            start_frame: 0,
+            end_frame: context.total_frames,
+        };
+        Self::with_operation(context, range, WavEditOperation::Slide { frame_offset })
     }
 }
 
@@ -284,6 +305,14 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
                 .expect("validated padded crop plan")
                 .apply(&mut samples, || check_cancel(cancellation))?;
         }
+        WavEditOperation::Slide { frame_offset } => {
+            slide_frames(
+                &mut samples,
+                usize::from(context.spec.channels),
+                frame_offset,
+                || check_cancel(cancellation),
+            )?;
+        }
     }
     recheck(context, &opened, cancellation)?;
     crate::encode_edited_wav_with_cancel(
@@ -303,6 +332,30 @@ fn checked_sample_count(context: &WaveformDetailContext, budget: usize) -> Resul
         .ok_or_else(|| String::from("WAV edit sample count overflows"))?;
     check_sample_budget(sample_count, budget)?;
     Ok(sample_count)
+}
+
+fn slide_frames(
+    samples: &mut [f32],
+    channels: usize,
+    frame_offset: i64,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
+    let frames = samples.len() / channels;
+    if frames <= 1 {
+        return Ok(());
+    }
+    let total =
+        i64::try_from(frames).map_err(|_| String::from("slide frame count is too large"))?;
+    let right = frame_offset.rem_euclid(total) as usize;
+    if right == 0 {
+        return Ok(());
+    }
+    // Three frame reversals perform a cyclic rotation without a second sample buffer.
+    apply_frame_operation(samples, channels, WavEditOperation::Reverse, &mut check)?;
+    let (prefix, suffix) = samples.split_at_mut(right * channels);
+    apply_frame_operation(prefix, channels, WavEditOperation::Reverse, &mut check)?;
+    apply_frame_operation(suffix, channels, WavEditOperation::Reverse, &mut check)
 }
 
 fn check_sample_budget(sample_count: usize, budget: usize) -> Result<(), String> {
@@ -478,6 +531,74 @@ mod tests {
             reader.spec(),
             reader.samples::<f32>().collect::<Result<_, _>>().unwrap(),
         )
+    }
+
+    #[test]
+    fn slide_wraps_stereo_frames_for_signed_and_extreme_offsets() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("slide.wav");
+        let original = [1, 11, 2, 12, 3, 13, 4, 14];
+        write_int(&path, &original, 2, 16);
+        let source_bytes = fs::read(&path).unwrap();
+        for (offset, expected) in [
+            (1, [4, 14, 1, 11, 2, 12, 3, 13]),
+            (-1, [2, 12, 3, 13, 4, 14, 1, 11]),
+            (0, original),
+            (4, original),
+            (-4, original),
+            (i64::MIN, original),
+            (i64::MAX, [2, 12, 3, 13, 4, 14, 1, 11]),
+        ] {
+            let request =
+                WavEditPreparationRequest::with_slide(request(&path).context, offset).unwrap();
+            let mut output = Cursor::new(Vec::new());
+            prepare_wav_edit(&request, 32, &mut output).unwrap();
+            let (spec, actual) = read_output(output);
+            assert_eq!(spec.channels, 2);
+            assert_eq!(actual, expected.map(|value| value as f32 / 32768.0));
+            assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        }
+        let mut request = WavEditPreparationRequest::with_slide(request(&path).context, 1).unwrap();
+        request.range.start_frame = 1;
+        let mut output = Cursor::new(Vec::new());
+        assert!(prepare_wav_edit(&request, 32, &mut output).is_err());
+        assert!(output.get_ref().is_empty());
+    }
+
+    #[test]
+    fn slide_checks_cancellation_through_each_reversal_without_allocating() {
+        let original: Vec<f32> = (0..30_000).map(|value| value as f32).collect();
+        let mut samples = original.clone();
+        let pointer = samples.as_ptr();
+        let mut checks = 0;
+        slide_frames(&mut samples, 3, 1302, || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        let mut expected = original.clone();
+        expected.rotate_right(1302 * 3);
+        assert_eq!(samples, expected);
+        assert_eq!(samples.as_ptr(), pointer);
+        for stop_at in 1..=checks {
+            let mut samples = original.clone();
+            let mut visited = 0;
+            assert!(
+                slide_frames(&mut samples, 3, 1302, || {
+                    visited += 1;
+                    if visited == stop_at {
+                        Err(String::from("canceled fixture"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+            assert_eq!(visited, stop_at);
+        }
+        let mut single = [-0.0_f32, 1.0];
+        slide_frames(&mut single, 2, i64::MIN, || Ok(())).unwrap();
+        assert_eq!(single.map(f32::to_bits), [-0.0_f32, 1.0].map(f32::to_bits));
     }
 
     #[test]

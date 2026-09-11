@@ -86,7 +86,7 @@ and refresh discard identities no longer visible. Plain pointer focus clears
 explicit membership, while plain arrow focus preserves it. Source and folder
 navigation clear batch membership. These choices remain session-only.
 
-Gain/fade, reverse, mute, trim and crop preparation belong to `wavecrate-media`.
+Gain/fade, reverse, mute, trim, crop and whole-file slide preparation belong to `wavecrate-media`.
 The service retains a source handle, validates the captured WAV revision before decoding and after encoding,
 and prepares float WAV bytes in a fresh caller-owned sink. Trim removes selected
 frames; crop keeps selected frames. `CropWithSilence` accepts signed frame bounds

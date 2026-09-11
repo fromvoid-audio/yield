@@ -2163,3 +2163,9 @@ Core edit regions now resolve to signed frame bounds using the reference floor-s
 `WavEditPreparationRequest::from_edit_region` connects those conversions to preparation: Crop preserves signed bounds for silence padding, while gain/fades, reverse, mute and trim use the source intersection. Explicit frame-authored padded crops retain their separate constructor so two competing sets of bounds cannot be supplied. No UI command is activated by this adapter.
 
 Validation: seven focused core region tests and all 93 media tests passed, with one existing media probe ignored. Tests cover fractional-frame coverage, signed padding, invalid coordinates, exact prepared crop/mute output, wholly absent audio and conflicting crop bounds. Application checking, formatting and diff checks passed. Durable publication, undo and UI command integration remain separate.
+
+### Whole-file audio slide preparation
+
+Prepared edits now support `with_slide(context, frame_offset)`, matching the reference cyclic frame rotation. Positive offsets wrap audio to the right and negative offsets to the left; modulo normalization handles offsets beyond the file length, including signed integer extremes. Three cancellable in-place frame reversals preserve channel order without a second audio buffer. Whole-file bounds are required and revalidated, while selection-based construction rejects a slide to avoid ambiguous scope. All samples and the original frame count remain represented in Float32 output, with existing source revision and memory checks.
+
+Validation: all 95 media tests passed with one existing ignored probe. End-to-end cases cover stereo wrapping, positive/negative/zero/full-cycle and extreme offsets, source preservation and invalid partial-file requests. Internal checks cover all cancellation boundaries, unchanged allocation and a single-frame no-op. Application checking, formatting and diff checks passed. Durable publication, undo and UI activation remain separate.
