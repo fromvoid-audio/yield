@@ -14,6 +14,8 @@ mod copy_recovery;
 mod malformed_rows;
 mod move_recovery;
 mod offline_source_retry;
+#[cfg(not(windows))]
+mod production_finalization;
 
 struct MoveRecoveryFixture {
     _temp: TempDir,
