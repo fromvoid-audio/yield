@@ -958,11 +958,12 @@ mod tests {
     use crate::test_runtime::TestRuntimeGuard;
 
     struct Fixture {
-        _runtime: TestRuntimeGuard,
-        _base: TempDir,
-        _config: ConfigBaseGuard,
-        _profile: PersistenceProfileGuard,
         owner: WritableProfileGuard,
+        _profile: PersistenceProfileGuard,
+        _config: ConfigBaseGuard,
+        _base: TempDir,
+        // Release test serialization only after handles, overrides, and files are gone.
+        _runtime: TestRuntimeGuard,
     }
 
     fn fixture() -> Fixture {
