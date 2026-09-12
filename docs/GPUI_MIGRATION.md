@@ -2279,5 +2279,21 @@ confirmed the ten-week timestamp advance and retained one-week remainder.
 
 Local verification: 393 UI tests passed (one existing ignored test), including
 preference-failure and focus regressions; the GPUI binary built successfully.
-The catalog, session and Unix storage suites passed their targeted verification.
-Windows cleanup qualification and CI evidence will be recorded after that gate.
+The catalog (91), session (56) and Unix storage (14) suites passed. The final
+Unix-only follow-up `84c6abaa9` rechecks cancellation, profile ownership and cache
+identity after terminal counting, with a deterministic replacement regression.
+
+[Windows CI run 34691785444](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34691785444)
+passed on `840979eabc622a293f2eeed48199b74464541688`: 9 native cache tests,
+83 catalog tests, 55 session tests, shared audio/core/media/platform suites,
+GPUI application compilation and 392 UI tests (one existing ignored).
+The subsequent Unix-only follow-up changes no Windows execution paths and passed
+the macOS storage and session suites above. Windows cleanup qualification covers
+handle-relative creation, traversal and disposition, reparse exclusion,
+cancellation, root replacement and final-count identity validation. Independent
+reviews accepted the rating integration and maintenance safeguards.
+
+OPT-1489 is implemented and validated. Its settings-specific owner routes satisfy
+the relevant portions of OPT-1343 and OPT-1353 without closing those broader
+migrations. Physical trash moves, full native Windows/installer acceptance and
+the remaining GPUI release gates stay with their separately tracked tickets.
