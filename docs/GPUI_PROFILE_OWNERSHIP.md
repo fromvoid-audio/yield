@@ -200,8 +200,10 @@ unowned writes remain gated behind tests or `test-support`.
 Validation passed 52 readiness tests in normal and test-support builds, the
 production admission regression, and GPUI compilation. The ownership regression
 invalidates the retained binding from a SQLite update hook after a real row
-write and verifies rollback. Windows CI includes that portable regression;
-Windows validation for this addition is pending. These checks establish profile
+write and verifies rollback. Windows storage validation, including that portable
+regression, passed on `9aa0a74e1` in
+[`34714685207`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34714685207).
+These checks establish profile
 ownership, not physical source lease or main database-file identity authority.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
