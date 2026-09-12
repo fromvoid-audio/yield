@@ -21,6 +21,7 @@ use thiserror::Error;
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
+use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::model::{MAX_RECORD_BYTES, OperationDisposition, OperationId, OperationPhase};
@@ -556,28 +557,11 @@ fn open_database_file(
     name: &Path,
     path: &Path,
 ) -> Result<(File, bool), OperationJournalStoreError> {
-    match root.open_file_nofollow(name, false) {
-        Ok(file) => Ok((file, false)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match root.open_file_nofollow(name, true) {
-                Ok(file) => Ok((file, true)),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => root
-                    .open_file_nofollow(name, false)
-                    .map(|file| (file, false))
-                    .map_err(|source| io_error(path, source)),
-                Err(source) => Err(io_error(path, source)),
-            }
-        }
-        Err(source) => Err(io_error(path, source)),
-    }
+    sqlite_identity::open_database_handle(root, name, path).map_err(map_identity_error)
 }
 
 fn ensure_regular_file(file: &File, path: &Path) -> Result<(), OperationJournalStoreError> {
-    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
-    if !metadata.is_file() {
-        return Err(audit_error(path, "journal database is not a regular file"));
-    }
-    Ok(())
+    sqlite_identity::ensure_regular_file(file, path).map_err(map_identity_error)
 }
 
 struct PreexistingRollbackJournal {
@@ -984,29 +968,14 @@ fn validate_database_file_identity(
     database_path: &Path,
     expected_identity: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let file = root
-        .open_file_nofollow(Path::new(JOURNAL_DATABASE_FILE_NAME), false)
-        .map_err(|source| {
-            if source.kind() == io::ErrorKind::NotFound {
-                OperationJournalStoreError::DatabaseReplaced {
-                    path: database_path.to_path_buf(),
-                }
-            } else {
-                io_error(database_path, source)
-            }
-        })?;
-    ensure_regular_file(&file, database_path)?;
-    let actual_identity = stable_filesystem_identity_from_open_file(&file).ok_or_else(|| {
-        OperationJournalStoreError::IdentityCheckUnavailable {
-            reason: String::from("stable identity is unavailable for the open journal file"),
-        }
-    })?;
-    if actual_identity != expected_identity {
-        return Err(OperationJournalStoreError::DatabaseReplaced {
-            path: database_path.to_path_buf(),
-        });
-    }
-    Ok(())
+    sqlite_identity::validate_database_file_identity_with_unavailable_reason(
+        root,
+        Path::new(JOURNAL_DATABASE_FILE_NAME),
+        database_path,
+        expected_identity,
+        "stable identity is unavailable for the open journal file",
+    )
+    .map_err(map_identity_error)
 }
 
 fn validate_connection_identity(
@@ -1015,97 +984,27 @@ fn validate_connection_identity(
     path: &Path,
     expected_identity: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    #[cfg(unix)]
-    {
-        let mut moved = 0_i32;
-        let return_code = unsafe {
-            // Connection::handle is valid for the duration of this borrow. SQLite writes only
-            // the boolean result into moved; the operation does not retain any pointer.
-            rusqlite::ffi::sqlite3_file_control(
-                connection.handle(),
-                c"main".as_ptr(),
-                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
-                (&mut moved as *mut i32).cast(),
-            )
-        };
-        if return_code != rusqlite::ffi::SQLITE_OK {
-            return Err(OperationJournalStoreError::IdentityCheckUnavailable {
-                reason: format!("SQLITE_FCNTL_HAS_MOVED returned {return_code}"),
-            });
-        }
-        if moved != 0 {
-            return Err(OperationJournalStoreError::DatabaseReplaced {
-                path: path.to_path_buf(),
-            });
-        }
-        let _ = expected_identity;
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        use std::ptr::null_mut;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
-
-        let mut native_handle = HANDLE(null_mut());
-        let return_code = unsafe {
-            // SQLite returns a borrowed native handle. We inspect it and never close or wrap it
-            // in an owning Rust file object.
-            rusqlite::ffi::sqlite3_file_control(
-                connection.handle(),
-                c"main".as_ptr(),
-                rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
-                (&mut native_handle as *mut HANDLE).cast(),
-            )
-        };
-        if return_code != rusqlite::ffi::SQLITE_OK {
-            return Err(OperationJournalStoreError::IdentityCheckUnavailable {
-                reason: format!("SQLITE_FCNTL_WIN32_GET_HANDLE returned {return_code}"),
-            });
-        }
-        if native_handle.is_invalid() {
-            return Err(OperationJournalStoreError::IdentityCheckUnavailable {
-                reason: String::from("SQLite returned an invalid native file handle"),
-            });
-        }
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        unsafe { GetFileInformationByHandle(native_handle, &mut information) }.map_err(
-            |error| OperationJournalStoreError::IdentityCheckUnavailable {
-                reason: format!("GetFileInformationByHandle failed: {error}"),
-            },
-        )?;
-        let actual_identity = format_windows_identity(&information);
-        if actual_identity != expected_identity {
-            return Err(OperationJournalStoreError::ConnectionIdentityMismatch {
-                path: path.to_path_buf(),
-                reason: String::from("SQLite native handle identifies a different file"),
-            });
-        }
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (connection, path, expected_identity);
-        Err(OperationJournalStoreError::IdentityCheckUnavailable {
-            reason: String::from("no verified SQLite connection identity control exists"),
-        })
-    }
+    sqlite_identity::validate_connection_identity(connection, path, expected_identity)
+        .map_err(map_identity_error)
 }
 
-#[cfg(windows)]
-fn format_windows_identity(
-    information: &windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION,
-) -> String {
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    let creation_time = (u64::from(information.ftCreationTime.dwHighDateTime) << 32)
-        | u64::from(information.ftCreationTime.dwLowDateTime);
-    format!(
-        "windows:{}:{}:{}",
-        information.dwVolumeSerialNumber, file_index, creation_time
-    )
+fn map_identity_error(error: DatabaseIdentityError) -> OperationJournalStoreError {
+    match error {
+        DatabaseIdentityError::Io { path, source } => io_error(&path, source),
+        DatabaseIdentityError::NotRegular { path } => {
+            audit_error(&path, "journal database is not a regular file")
+        }
+        DatabaseIdentityError::Replaced { path } => {
+            OperationJournalStoreError::DatabaseReplaced { path }
+        }
+        DatabaseIdentityError::Unavailable { reason, .. } => {
+            OperationJournalStoreError::IdentityCheckUnavailable { reason }
+        }
+        DatabaseIdentityError::ConnectionMismatch { path, reason } => {
+            OperationJournalStoreError::ConnectionIdentityMismatch { path, reason }
+        }
+        DatabaseIdentityError::UnsafeSidecar { path, reason } => audit_error(&path, reason),
+    }
 }
 
 fn io_error(path: &Path, source: io::Error) -> OperationJournalStoreError {

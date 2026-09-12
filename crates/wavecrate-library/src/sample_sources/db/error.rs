@@ -101,6 +101,60 @@ pub enum SourceDirectoryTruthError {
     },
 }
 
+/// Typed failures from the retained identity proof for a profile-owned source database.
+///
+/// These outcomes are intentionally separate from the older path-policy error. A replacement or
+/// unavailable identity primitive must remain distinguishable to callers; the textual diagnostic
+/// is supplementary context and never a takeover or admission decision.
+#[derive(Debug, Error)]
+pub enum SourceDatabaseIdentityError {
+    /// A filesystem operation failed while checking the retained database path.
+    #[error("could not inspect source database identity at {path}: {source}")]
+    Io {
+        /// Path involved in the failed identity check.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The retained database path or opened handle is not a regular file.
+    #[error("source database identity path is not a regular file: {path}")]
+    NotRegular {
+        /// Path whose file type was rejected.
+        path: PathBuf,
+    },
+    /// The retained database pathname now identifies a different file or no file.
+    #[error("source database file was replaced: {path}")]
+    Replaced {
+        /// Path whose identity changed.
+        path: PathBuf,
+    },
+    /// The host or SQLite VFS cannot provide the required identity primitive.
+    #[error("source database identity is unavailable at {path}: {reason}")]
+    Unavailable {
+        /// Path being checked.
+        path: PathBuf,
+        /// Bounded diagnostic describing the unavailable primitive.
+        reason: String,
+    },
+    /// SQLite's native connection handle identifies a different file.
+    #[error("source database connection identity mismatch at {path}: {reason}")]
+    ConnectionMismatch {
+        /// Path being checked.
+        path: PathBuf,
+        /// Bounded diagnostic describing the mismatch.
+        reason: String,
+    },
+    /// A source database WAL or shared-memory sidecar violates the existing path policy.
+    #[error("source database sidecar is unsafe at {path}: {reason}")]
+    UnsafeSidecar {
+        /// Sidecar path rejected by the source path policy.
+        path: PathBuf,
+        /// Stable policy reason.
+        reason: &'static str,
+    },
+}
+
 /// Errors returned when managing a source database.
 #[derive(Debug, Error)]
 pub enum SourceDbError {
@@ -289,6 +343,9 @@ pub enum SourceDbError {
     /// The retained profile capability could not safely host an external catalog database.
     #[error("Profile-owned catalog database root is unavailable: {0}")]
     ProfileOwnership(#[from] crate::app_dirs::ProfileOwnershipError),
+    /// A retained profile-owned source database identity check failed.
+    #[error(transparent)]
+    DatabaseIdentity(#[from] SourceDatabaseIdentityError),
     /// Failed to move a source DB from its legacy filename to the current filename.
     #[error("Could not migrate source database from {from} to {to}: {source}")]
     RenameLegacyDatabase {
@@ -298,5 +355,13 @@ pub enum SourceDbError {
         to: PathBuf,
         /// Underlying IO error.
         source: std::io::Error,
+    },
+    /// A profile-owned open found a legacy database that would require an ambient pathname rename.
+    #[error("Profile-owned source database requires a bound legacy migration from {from} to {to}")]
+    LegacyDatabaseMigrationRequiresBoundRoot {
+        /// Legacy source DB path retained for a future descriptor-bound migration.
+        from: PathBuf,
+        /// Current source DB path that was not created or modified.
+        to: PathBuf,
     },
 }

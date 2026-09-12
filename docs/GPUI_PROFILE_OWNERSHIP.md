@@ -206,6 +206,25 @@ regression, passed on `9aa0a74e1` in
 These checks establish profile
 ownership, not physical source lease or main database-file identity authority.
 
+Profile-owned source databases now retain a no-follow main-file identity proof.
+Their opener validates the bound directory before file creation, opens SQLite
+without `CREATE`, and checks the retained pathname and native connection identity
+before pragmas, schema setup, and later mutations. Readiness borrows this proof;
+snapshot writer connections must match the original identity and cannot recreate
+a missing database. Replacement, unavailable checks, and native-handle mismatch
+have typed errors. Legacy layouts requiring pathname migration are retained with
+a migration-required error. WAL/SHM symlinks and nonregular entries are rejected;
+regular WAL handling and the existing source SQLite configuration are unchanged.
+
+The source and journal share the platform identity primitives while keeping their
+own opening and recovery policies. Seven focused identity regressions and seven
+production admission tests passed, including actual-write readiness rollback and
+snapshot rejection with no output. The earlier local pass covered a 51-test source
+database subset, 47 readiness tests, and 35 journal store tests (one subprocess
+helper ignored). GPUI compilation and formatting passed. Windows CI validation is
+pending; local Windows cross-compilation lacked the MSVC tools and headers. This
+milestone does not implement physical source leases or qualify WAL durability.
+
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
 operation admission, checkpointing, and recovery execution remain requirements

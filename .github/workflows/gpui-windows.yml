@@ -70,6 +70,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-library --lib readiness_ownership --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p wavecrate-library --lib source_database_identity --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-library --lib sqlite_wal --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test profile-owned settings maintenance

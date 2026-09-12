@@ -70,7 +70,7 @@ pub(super) fn claim_readiness_target_owned(
     now: i64,
     lease_duration_seconds: i64,
 ) -> Result<Option<ClaimedReadinessWork>, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let lease_expires_at = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let candidate = tx
@@ -191,7 +191,7 @@ pub(super) fn claim_readiness_target_owned(
         eligibility,
     )) = candidate
     else {
-        ownership.validate()?;
+        ownership.validate(&tx)?;
         tx.commit()?;
         return Ok(None);
     };
@@ -241,7 +241,7 @@ pub(super) fn claim_readiness_target_owned(
         content_generation: requested.content_generation.clone(),
         eligibility: decode_eligibility(eligibility)?,
     };
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(Some(ClaimedReadinessWork {
         target,
@@ -276,7 +276,7 @@ pub(super) fn renew_readiness_lease_owned(
     now: i64,
     lease_duration_seconds: i64,
 ) -> Result<ReadinessLeaseRenewalOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let requested_deadline = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let changed = tx.execute(
@@ -354,7 +354,7 @@ pub(super) fn renew_readiness_lease_owned(
         ],
         |row| row.get(0),
     )?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(ReadinessLeaseRenewalOutcome::Renewed { lease_expires_at })
 }
@@ -410,7 +410,7 @@ pub(super) fn complete_readiness_work_with_artifact_ref_owned(
     completed_at: i64,
     artifact_ref: &str,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     if artifact_ref.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactReference {
             source_id: claim.target.source_id.clone(),
@@ -434,7 +434,7 @@ fn complete_readiness_work_inner(
     completed_at: i64,
     artifact_ref: Option<&str>,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let changed = finish_claim_update(
         &tx,
@@ -475,7 +475,7 @@ fn complete_readiness_work_inner(
             artifact.completed_at,
         ],
     )?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(ArtifactPublishOutcome::Recorded)
 }
@@ -513,7 +513,7 @@ pub(super) fn fail_readiness_work_owned(
     failed_at: i64,
     retry_policy: ReadinessRetryPolicy,
 ) -> Result<ReadinessFailureOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let failure_attempt = match classification {
         ReadinessFailureClassification::Retryable => Some(
             claim
@@ -576,7 +576,7 @@ pub(super) fn fail_readiness_work_owned(
     if stored_classification == ReadinessFailureClassification::Unsupported {
         apply_unsupported_target_delta(&tx, claim, failed_at)?;
     }
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -736,7 +736,7 @@ pub(super) fn cancel_readiness_work_owned(
     reason: &str,
     cancelled_at: i64,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     return_claim_to_pending_owned(
         connection,
         ownership,
@@ -869,7 +869,7 @@ fn return_claim_to_pending_owned(
     now: i64,
     cancellation_reason: Option<&str>,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (set_clause, extras) = if let Some(reason) = cancellation_reason {
         (
@@ -889,7 +889,7 @@ fn return_claim_to_pending_owned(
         tx.rollback()?;
         return Ok(ReadinessWorkMutationOutcome::RejectedStale);
     }
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(ReadinessWorkMutationOutcome::Recorded)
 }

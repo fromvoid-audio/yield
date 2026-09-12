@@ -11,6 +11,9 @@ pub enum ReadinessError {
     /// The retained profile-owned database context no longer matches its acquired identities.
     #[error("Readiness profile ownership validation failed: {0}")]
     ProfileOwnership(#[from] crate::app_dirs::ProfileOwnershipError),
+    /// The retained SQLite connection or path no longer identifies its profile-owned database.
+    #[error("Readiness database identity validation failed: {0}")]
+    DatabaseIdentity(#[from] crate::sample_sources::db::SourceDatabaseIdentityError),
     /// The caller cancelled a potentially long readiness database operation.
     #[error("Readiness operation cancelled")]
     Cancelled,

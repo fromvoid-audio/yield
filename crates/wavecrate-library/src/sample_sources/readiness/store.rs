@@ -598,13 +598,13 @@ impl<'connection> ReadinessStore<'connection> {
         source_id: &str,
         now: i64,
     ) -> Result<(), ReadinessError> {
-        self.ownership.validate()?;
+        self.ownership.validate(&*self.connection)?;
         let tx = self.connection.transaction()?;
         tx.execute(
             "UPDATE source_readiness_sources SET availability = 'offline', readiness_revision = readiness_revision + 1, updated_at = ?2 WHERE source_id = ?1 AND availability != 'offline'",
             params![source_id, now],
         )?;
-        self.ownership.validate()?;
+        self.ownership.validate(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -614,7 +614,7 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         scope_ids: &BTreeSet<String>,
     ) -> Result<(), ReadinessError> {
-        self.ownership.validate()?;
+        self.ownership.validate(&*self.connection)?;
         let tx = self.connection.transaction()?;
         for scope_id in scope_ids {
             tx.execute(
@@ -622,7 +622,7 @@ impl<'connection> ReadinessStore<'connection> {
                 [scope_id],
             )?;
         }
-        self.ownership.validate()?;
+        self.ownership.validate(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -655,7 +655,7 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         is_unsupported: impl Fn(&str) -> bool,
     ) -> Result<usize, ReadinessError> {
-        self.ownership.validate()?;
+        self.ownership.validate(&*self.connection)?;
         let failures = {
             let mut statement = self.connection.prepare(
                 "SELECT id, COALESCE(last_error, '') FROM analysis_jobs WHERE readiness_managed = 1 AND status = 'failed' AND failure_code IS NULL AND failure_kind IN ('retryable', 'permanent')",
@@ -666,7 +666,7 @@ impl<'connection> ReadinessStore<'connection> {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        self.ownership.validate()?;
+        self.ownership.validate(&*self.connection)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -682,7 +682,7 @@ impl<'connection> ReadinessStore<'connection> {
         changed += tx.execute(
             "UPDATE analysis_jobs AS dependent SET failure_kind = 'unsupported', failure_code = 'legacy_prerequisite_unsupported', retry_at = NULL WHERE dependent.readiness_managed = 1 AND dependent.status = 'failed' AND dependent.failure_code IS NULL AND dependent.failure_kind IN ('retryable', 'permanent') AND dependent.readiness_stage = 'embedding_aspects' AND dependent.last_error = 'embedding feature prerequisite is not durable yet' AND EXISTS (SELECT 1 FROM analysis_jobs AS prerequisite WHERE prerequisite.readiness_managed = 1 AND prerequisite.source_id = dependent.source_id AND prerequisite.readiness_scope_kind = dependent.readiness_scope_kind AND prerequisite.readiness_scope_id = dependent.readiness_scope_id AND prerequisite.readiness_stage = 'analysis_features' AND prerequisite.content_generation = dependent.content_generation AND prerequisite.status = 'failed' AND prerequisite.failure_kind = 'unsupported')", [],
         )?;
-        self.ownership.validate()?;
+        self.ownership.validate(&tx)?;
         tx.commit()?;
         Ok(changed)
     }
@@ -692,7 +692,7 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         source_id: &str,
     ) -> Result<ReadinessCompatibilityCleanup, ReadinessError> {
-        self.ownership.validate()?;
+        self.ownership.validate(&*self.connection)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -705,7 +705,7 @@ impl<'connection> ReadinessStore<'connection> {
         let mut changed = tx.execute("DELETE FROM analysis_jobs WHERE source_id = ?1 AND readiness_managed = 1 AND readiness_stage = 'playback_summary'", [source_id])?;
         changed += tx.execute("DELETE FROM source_readiness_artifacts WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
         changed += tx.execute("DELETE FROM source_readiness_targets WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
-        self.ownership.validate()?;
+        self.ownership.validate(&tx)?;
         tx.commit()?;
         Ok(ReadinessCompatibilityCleanup {
             changed,
@@ -719,7 +719,7 @@ impl<'connection> ReadinessStore<'connection> {
         source_id: &str,
         now: i64,
     ) -> Result<ReadinessCompatibilityCleanup, ReadinessError> {
-        self.ownership.validate()?;
+        self.ownership.validate(&*self.connection)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -736,7 +736,7 @@ impl<'connection> ReadinessStore<'connection> {
         )?;
         changed += tx.execute("DELETE FROM source_readiness_artifacts WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
         changed += tx.execute("DELETE FROM source_readiness_targets WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
-        self.ownership.validate()?;
+        self.ownership.validate(&tx)?;
         tx.commit()?;
         Ok(ReadinessCompatibilityCleanup {
             changed,

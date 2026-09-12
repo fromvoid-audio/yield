@@ -2,6 +2,7 @@ use super::*;
 
 mod cleanup;
 mod filenames;
+mod identity;
 mod open_roles;
 mod schema;
 mod user_library;

@@ -82,7 +82,7 @@ pub(super) fn replace_readiness_targets_owned(
     updated_at: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     validate_contract_version(contract_version)?;
     validate_targets(source_id, source_generation, targets, cancel)?;
     let membership = membership_from_targets(targets);
@@ -172,7 +172,7 @@ pub(super) fn replace_readiness_targets_owned(
            )",
         [source_id],
     )?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -192,7 +192,7 @@ pub(super) fn apply_readiness_target_delta_owned(
     updated_at: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<ReadinessDeltaPublicationOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     validate_contract_version(contract_version)?;
     if similarity_artifact_version.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactVersion {
@@ -411,7 +411,7 @@ pub(super) fn apply_readiness_target_delta_owned(
         ],
     )?);
     cancellation_checkpoint(cancel)?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(ReadinessDeltaPublicationOutcome::Applied {
         membership_generation,
@@ -433,7 +433,7 @@ pub(super) fn publish_readiness_artifact_owned(
     ownership: &ReadinessOwnership<'_>,
     artifact: &ReadinessArtifact,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     if artifact.artifact_version.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactVersion {
             source_id: artifact.source_id.clone(),
@@ -515,7 +515,7 @@ pub(super) fn publish_readiness_artifact_owned(
             artifact.completed_at,
         ],
     )?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(ArtifactPublishOutcome::Recorded)
 }
@@ -537,7 +537,7 @@ pub(super) fn invalidate_readiness_artifact_owned(
     ownership: &ReadinessOwnership<'_>,
     target: &ReadinessTarget,
 ) -> Result<bool, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let tx = connection.transaction()?;
     let changed = tx.execute(
         "DELETE FROM source_readiness_artifacts AS artifact
@@ -577,7 +577,7 @@ pub(super) fn invalidate_readiness_artifact_owned(
             target.source_generation,
         ],
     )?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(changed == 1)
 }
@@ -590,7 +590,7 @@ pub(super) fn requeue_source_analysis_owned(
     source_id: &str,
     requested_at: i64,
 ) -> Result<usize, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let analysis_stages = "('analysis_features', 'embedding_aspects', 'similarity_layout')";
     let sample_target = "EXISTS (
@@ -658,7 +658,7 @@ pub(super) fn requeue_source_analysis_owned(
          WHERE source_id = ?1",
         params![source_id, requested_at],
     )?;
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(changed)
 }
@@ -702,7 +702,7 @@ pub(super) fn persist_readiness_deficits_owned(
     cancel: Option<&AtomicBool>,
     progress: &mut dyn FnMut(super::super::ReadinessProgress),
 ) -> Result<usize, ReadinessError> {
-    ownership.validate()?;
+    ownership.validate(&*connection)?;
     cancellation_checkpoint(cancel)?;
     let mut unique = BTreeSet::new();
     let tx = connection.transaction()?;
@@ -740,7 +740,7 @@ pub(super) fn persist_readiness_deficits_owned(
             TargetPersistenceAction::Skip => 0,
         };
     }
-    ownership.validate()?;
+    ownership.validate(&tx)?;
     tx.commit()?;
     Ok(changed)
 }

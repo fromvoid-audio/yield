@@ -33,6 +33,7 @@ mod replay_authority;
 pub(crate) use replay_authority::ValidatedReplayAuthority;
 /// SQLite schema management for sample source databases.
 pub mod schema;
+pub(crate) mod sqlite_identity;
 /// Durable per-source tag catalog and sample assignment helpers.
 pub mod tags;
 mod telemetry;
@@ -51,7 +52,7 @@ pub use content_audit::{
     ContentAuditCheckpoint, ContentAuditEntryState, ContentAuditForwardCandidate,
     ContentAuditReport, ContentAuditRetryCandidate, ContentAuditSkipReason,
 };
-pub use error::{SourceDbError, SourceDirectoryTruthError};
+pub use error::{SourceDatabaseIdentityError, SourceDbError, SourceDirectoryTruthError};
 pub(crate) use open::SourceDatabaseOpenMode;
 #[cfg(test)]
 pub(crate) use open::open_source_database;
@@ -161,6 +162,37 @@ pub(crate) trait DatabaseRootBindingGuard: Send + Sync {
     ) -> Result<(), ProfileOwnershipError>;
 }
 
+pub(super) fn map_database_identity_error(
+    error: sqlite_identity::DatabaseIdentityError,
+) -> SourceDbError {
+    SourceDbError::DatabaseIdentity(source_database_identity_error(error))
+}
+
+pub(super) fn source_database_identity_error(
+    error: sqlite_identity::DatabaseIdentityError,
+) -> SourceDatabaseIdentityError {
+    match error {
+        sqlite_identity::DatabaseIdentityError::Io { path, source } => {
+            SourceDatabaseIdentityError::Io { path, source }
+        }
+        sqlite_identity::DatabaseIdentityError::NotRegular { path } => {
+            SourceDatabaseIdentityError::NotRegular { path }
+        }
+        sqlite_identity::DatabaseIdentityError::Replaced { path } => {
+            SourceDatabaseIdentityError::Replaced { path }
+        }
+        sqlite_identity::DatabaseIdentityError::Unavailable { path, reason } => {
+            SourceDatabaseIdentityError::Unavailable { path, reason }
+        }
+        sqlite_identity::DatabaseIdentityError::ConnectionMismatch { path, reason } => {
+            SourceDatabaseIdentityError::ConnectionMismatch { path, reason }
+        }
+        sqlite_identity::DatabaseIdentityError::UnsafeSidecar { path, reason } => {
+            SourceDatabaseIdentityError::UnsafeSidecar { path, reason }
+        }
+    }
+}
+
 /// Borrowed ownership context for readiness mutations.
 ///
 /// This context deliberately borrows the capabilities retained by a [`SourceDatabase`] rather
@@ -169,28 +201,55 @@ pub(crate) trait DatabaseRootBindingGuard: Send + Sync {
 pub(crate) struct ReadinessOwnership<'a> {
     profile_guard: Option<&'a WritableProfileGuard>,
     database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
+    database_file_binding: Option<&'a sqlite_identity::DatabaseFileBinding>,
 }
 
 impl<'a> ReadinessOwnership<'a> {
     pub(crate) fn new(
         profile_guard: Option<&'a WritableProfileGuard>,
         database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
+        database_file_binding: Option<&'a sqlite_identity::DatabaseFileBinding>,
     ) -> Self {
         Self {
             profile_guard,
             database_root_binding,
+            database_file_binding,
         }
     }
 
     pub(crate) fn unowned() -> Self {
-        Self::new(None, None)
+        Self::new(None, None, None)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
+    pub(crate) fn validate(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
         match (self.profile_guard, self.database_root_binding) {
-            (Some(profile_guard), Some(database_root_binding)) => database_root_binding
-                .validate_profile_guard(profile_guard)
-                .map_err(crate::sample_sources::readiness::ReadinessError::ProfileOwnership),
+            (Some(profile_guard), Some(database_root_binding)) => {
+                database_root_binding
+                    .validate_profile_guard(profile_guard)
+                    .map_err(crate::sample_sources::readiness::ReadinessError::ProfileOwnership)?;
+                match self.database_file_binding {
+                    Some(database_file_binding) => {
+                        database_file_binding.validate(connection).map_err(|error| {
+                            crate::sample_sources::readiness::ReadinessError::DatabaseIdentity(
+                                source_database_identity_error(error),
+                            )
+                        })
+                    }
+                    None => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        {
+                            Ok(())
+                        }
+                        #[cfg(not(any(test, feature = "test-support")))]
+                        {
+                            Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired)
+                        }
+                    }
+                }
+            }
             (None, None) => {
                 #[cfg(any(test, feature = "test-support"))]
                 {
@@ -213,6 +272,7 @@ pub struct SourceDatabase {
     root: PathBuf,
     telemetry_label: &'static str,
     database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
+    database_file_binding: Option<Arc<sqlite_identity::DatabaseFileBinding>>,
     profile_guard: Option<WritableProfileGuard>,
 }
 
@@ -222,6 +282,7 @@ pub struct SourceDatabase {
 pub struct SourceDatabaseWriteFence {
     connection: Connection,
     _database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
+    _database_file_binding: Option<Arc<sqlite_identity::DatabaseFileBinding>>,
     _profile_guard: Option<WritableProfileGuard>,
 }
 
@@ -267,6 +328,7 @@ impl SourceDatabase {
         let ownership = ReadinessOwnership::new(
             self.profile_guard.as_ref(),
             self.database_root_binding.as_deref(),
+            self.database_file_binding.as_deref(),
         );
         Ok(
             crate::sample_sources::readiness::ReadinessStore::from_owned_connection(
@@ -421,45 +483,45 @@ impl SourceDatabase {
                     path: self.db_path.clone(),
                     reason: "source database path has no parent directory",
                 })?;
-        let (validated, retained_profile_guard, retained_database_root_binding) =
-            match (&self.profile_guard, &self.database_root_binding) {
-                (Some(profile_guard), Some(database_root_binding)) => {
-                    self.validate_profile_guard(profile_guard)?;
-                    let validated = open::open_source_database_with_profile_guard(
-                        &self.root,
-                        database_root,
-                        profile_guard,
-                        open::SourceDatabaseOpenMode::Full,
-                    )?;
-                    self.validate_profile_guard(profile_guard)?;
-                    let retained_profile_guard =
-                        profile_guard.try_clone().map_err(SourceDbError::from)?;
-                    (
-                        validated,
-                        Some(retained_profile_guard),
-                        Some(Arc::clone(database_root_binding)),
-                    )
-                }
-                (None, None) => (
-                    open::open_source_database_with_database_root(
-                        &self.root,
-                        database_root,
-                        false,
-                        open::SourceDatabaseOpenMode::Full,
-                    )?,
-                    None,
-                    None,
-                ),
-                _ => return Err(SourceDbError::ProfileOwnershipRequired),
-            };
-        let writer_connection = validated.connection;
+        let validated = match (&self.profile_guard, &self.database_root_binding) {
+            (Some(profile_guard), Some(_database_root_binding)) => {
+                self.validate_profile_owned_mutation()?;
+                let expected_database = self
+                    .database_file_binding
+                    .as_deref()
+                    .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+                open::open_source_database_with_profile_guard(
+                    &self.root,
+                    Arc::clone(expected_database.root()),
+                    profile_guard,
+                    open::SourceDatabaseOpenMode::Full,
+                    Some(expected_database),
+                )?
+            }
+            (None, None) => open::open_source_database_with_database_root(
+                &self.root,
+                database_root,
+                false,
+                open::SourceDatabaseOpenMode::Full,
+            )?,
+            _ => return Err(SourceDbError::ProfileOwnershipRequired),
+        };
+        validated.validate_profile_owned_mutation()?;
+        let SourceDatabase {
+            connection: writer_connection,
+            database_root_binding,
+            database_file_binding,
+            profile_guard,
+            ..
+        } = validated;
         writer_connection
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(SourceDbError::from)?;
         Ok(SourceDatabaseWriteFence {
             connection: writer_connection,
-            _database_root_binding: retained_database_root_binding,
-            _profile_guard: retained_profile_guard,
+            _database_root_binding: database_root_binding,
+            _database_file_binding: database_file_binding,
+            _profile_guard: profile_guard,
         })
     }
 
@@ -530,18 +592,42 @@ impl SourceDatabase {
         self
     }
 
-    pub(crate) fn retain_profile_guard(mut self, profile_guard: WritableProfileGuard) -> Self {
-        self.profile_guard = Some(profile_guard);
-        self
-    }
-
     pub(crate) fn validate_profile_owned_mutation(&self) -> Result<(), SourceDbError> {
         match (&self.profile_guard, &self.database_root_binding) {
-            (Some(profile_guard), Some(_)) => self.validate_profile_guard(profile_guard),
+            (Some(profile_guard), Some(_)) => {
+                self.validate_profile_guard(profile_guard)?;
+                match self.database_file_binding.as_deref() {
+                    Some(database_file_binding) => database_file_binding
+                        .validate(&self.connection)
+                        .map_err(map_database_identity_error),
+                    None => {
+                        #[cfg(any(test, feature = "test-support"))]
+                        {
+                            Ok(())
+                        }
+                        #[cfg(not(any(test, feature = "test-support")))]
+                        {
+                            Err(SourceDbError::ProfileOwnershipRequired)
+                        }
+                    }
+                }
+            }
             #[cfg(any(test, feature = "test-support"))]
             (None, _) => Ok(()),
             _ => Err(SourceDbError::ProfileOwnershipRequired),
         }
+    }
+
+    pub(crate) fn validate_profile_owned_open(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), SourceDbError> {
+        self.validate_profile_guard(profile_guard)?;
+        self.database_file_binding
+            .as_deref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)?
+            .validate(&self.connection)
+            .map_err(map_database_identity_error)
     }
 
     /// Revalidate the retained profile-owned database namespace before an operation.
@@ -622,19 +708,14 @@ impl SourceDatabase {
             profile_child.as_ref(),
         )
         .map_err(SourceDbError::from)?;
-        let retained_profile_guard = profile_guard.try_clone().map_err(SourceDbError::from)?;
         let database = open::open_source_database_with_profile_guard(
             root.as_ref(),
-            binding.path(),
+            Arc::new(binding),
             profile_guard,
             open::SourceDatabaseOpenMode::Full,
+            None,
         )?;
-        binding
-            .validate_profile_guard(profile_guard)
-            .map_err(SourceDbError::from)?;
-        Ok(database
-            .retain_database_root_binding(Arc::new(binding))
-            .retain_profile_guard(retained_profile_guard))
+        Ok(database)
     }
 
     /// Open an existing database for UI-owned read access.
