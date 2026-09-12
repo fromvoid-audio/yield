@@ -19,6 +19,7 @@ use thiserror::Error;
 use wavecrate_library::app_dirs::{
     AppRootGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
+use wavecrate_library::operation_journal::OperationJournalStore;
 use wavecrate_library::sample_sources::{
     GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
     GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceRegistrySnapshot,
@@ -160,6 +161,9 @@ pub enum SessionError {
     /// Persistence could not be acquired or became unavailable.
     #[error("session persistence unavailable: {0}")]
     Persistence(String),
+    /// Retained operation-journal data needs recovery before ordinary writable startup.
+    #[error("session operation-journal recovery unavailable: {0}")]
+    RecoveryUnavailable(String),
     /// A queued library operation failed.
     #[error("session library operation failed: {0}")]
     Library(String),
@@ -878,10 +882,11 @@ fn sources_equal(left: &[SampleSource], right: &[SampleSource]) -> bool {
 }
 
 struct Persistence {
-    writable: Option<WritableProfileGuard>,
     maintenance: MaintenanceService,
-    writer: Option<GlobalLibraryWriter>,
     catalog: Option<Arc<CatalogService>>,
+    writer: Option<GlobalLibraryWriter>,
+    journal: Option<OperationJournalStore>,
+    writable: Option<WritableProfileGuard>,
     load: Option<Receiver<Result<SourceRegistrySnapshot, LibraryError>>>,
     preference_load: Option<Receiver<Result<Option<String>, LibraryError>>>,
     pending_adds: HashMap<RequestId, PendingAdd>,
@@ -906,6 +911,7 @@ impl Persistence {
             maintenance: MaintenanceService::new(maintenance_admission),
             writer: None,
             catalog: None,
+            journal: None,
             load: None,
             preference_load: None,
             pending_adds: HashMap::new(),
@@ -928,16 +934,22 @@ impl Persistence {
         };
         if persistence.unavailable.is_none() {
             match WritableProfileGuard::acquire_current() {
-                Ok(writable) => match GlobalLibraryWriter::start(&writable) {
-                    Ok(writer) => {
-                        vocabulary::install(
-                            &vocabulary_slot,
-                            writer.profile_tag_vocabulary_client(),
-                        );
-                        persistence.writable = Some(writable);
-                        persistence.writer = Some(writer);
-                    }
-                    Err(error) => persistence.unavailable = Some(session_from_start_error(error)),
+                Ok(writable) => match open_session_journal(&writable) {
+                    Ok(journal) => match GlobalLibraryWriter::start(&writable) {
+                        Ok(writer) => {
+                            vocabulary::install(
+                                &vocabulary_slot,
+                                writer.profile_tag_vocabulary_client(),
+                            );
+                            persistence.writable = Some(writable);
+                            persistence.journal = Some(journal);
+                            persistence.writer = Some(writer);
+                        }
+                        Err(error) => {
+                            persistence.unavailable = Some(session_from_start_error(error))
+                        }
+                    },
+                    Err(error) => persistence.unavailable = Some(error),
                 },
                 Err(error) => persistence.unavailable = Some(session_from_profile_error(error)),
             }
@@ -1009,8 +1021,49 @@ impl Persistence {
         self.load = None;
         self.pending_adds.clear();
         self.preference_unavailable = None;
+        // The journal owns a cloned profile guard and child lease. Release it after all ordinary
+        // writers and catalog/maintenance workers have stopped, but before the session's final
+        // profile guard is dropped.
+        self.journal.take();
         self.writable.take();
     }
+}
+
+impl Drop for Persistence {
+    fn drop(&mut self) {
+        // Keep the shutdown ordering even when the worker exits through an early return or an
+        // unwind. Catalog and global-writer workers must stop before the journal's retained child
+        // lease and profile clone are released.
+        self.shutdown();
+    }
+}
+
+fn open_session_journal(
+    writable: &WritableProfileGuard,
+) -> Result<OperationJournalStore, SessionError> {
+    let journal = OperationJournalStore::open(writable).map_err(|error| {
+        SessionError::Persistence(format!("operation journal unavailable: {error}"))
+    })?;
+    let page = journal
+        .scan_recovery_page(None)
+        .map_err(|error| match error {
+            wavecrate_library::operation_journal::RecoveryScanError::Store(store_error) => {
+                SessionError::RecoveryUnavailable(format!(
+                    "operation journal audit required: {store_error}"
+                ))
+            }
+            wavecrate_library::operation_journal::RecoveryScanError::RequiresAudit { reason } => {
+                SessionError::RecoveryUnavailable(format!(
+                    "operation journal audit required: {reason}"
+                ))
+            }
+        })?;
+    if !page.entries().is_empty() {
+        return Err(SessionError::RecoveryUnavailable(String::from(
+            "this profile contains operations that require recovery before writable access can resume",
+        )));
+    }
+    Ok(journal)
 }
 
 fn session_from_profile_error(error: ProfileOwnershipError) -> SessionError {
@@ -2368,6 +2421,10 @@ mod tests {
         AppRootGuard, ConfigBaseGuard, PROFILE_DIR_NAME, ProfileOwnershipError,
         WritableProfileGuard,
     };
+    use wavecrate_library::operation_journal::{
+        JOURNAL_DATABASE_FILE_NAME, JOURNAL_DATABASE_ROOT_NAME, OperationId, OperationJournalStore,
+        decode,
+    };
     use wavecrate_library::sample_sources::{SourceId, SourceMetadataStorage};
 
     const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "WAVECRATE_SESSION_OWNER_PROFILE_ROOT";
@@ -2499,6 +2556,69 @@ mod tests {
             .join(GPUI_DEVELOPMENT_PROFILE);
         fs::create_dir_all(&root).expect("profile root");
         fs::canonicalize(root).expect("canonical profile root")
+    }
+
+    const PENDING_INTENT_RECORD: &[u8] = br#"{
+  "schema_version": 3,
+  "operation_id": "01234567-89ab-cdef-0123-456789abcdef",
+  "intent": {"actor": "User", "kind": "FileMutation", "label": "session fixture"},
+  "universal_intent": {
+    "parent_operation_id": null,
+    "command_kind": "CreateFile",
+    "user_status_key": "operation.status.create-file",
+    "participants": {
+      "descriptors": [{
+        "id": "fedcba98-7654-3210-fedc-ba9876543210",
+        "kind": "GlobalLibrary",
+        "requirement": "Required",
+        "source_fence": null,
+        "artifact_key": null
+      }],
+      "checkpoints": [{
+        "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+        "state": "Pending",
+        "committed_revision": null,
+        "diagnostic_code": null
+      }]
+    }
+  },
+  "phase": "IntentDurable",
+  "disposition": "None",
+  "payload": {"source": "session fixture"},
+  "capacity_plan": {
+    "volumes": [{
+      "identity": {"device": 1},
+      "allocation_unit": 1,
+      "allocation_class": "DestinationStaging",
+      "logical_bytes": 1,
+      "allocated_bytes": 1,
+      "protected_free_bytes": 268435456
+    }]
+  },
+  "created_unix_ms": 31,
+  "updated_unix_ms": 32
+}"#;
+
+    fn journal_database_path(profile_root: &Path) -> PathBuf {
+        profile_root
+            .join(JOURNAL_DATABASE_ROOT_NAME)
+            .join(JOURNAL_DATABASE_FILE_NAME)
+    }
+
+    fn seed_pending_journal(profile_root: &Path) -> OperationId {
+        let app_root_guard = AppRootGuard::set(profile_root.to_path_buf()).expect("app root");
+        let profile_guard =
+            WritableProfileGuard::acquire_current().expect("fixture profile ownership");
+        let journal = OperationJournalStore::open(&profile_guard).expect("fixture journal open");
+        let record = decode(PENDING_INTENT_RECORD).expect("pending intent fixture decodes");
+        let operation_id = record.operation_id;
+        journal
+            .insert_intent(&record)
+            .expect("pending intent fixture persists");
+        drop(journal);
+        drop(profile_guard);
+        drop(app_root_guard);
+        operation_id
     }
 
     fn write_test_wav(path: &Path) {
@@ -2755,6 +2875,176 @@ mod tests {
         });
         assert_eq!(restored.len(), 1);
         reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
+    fn session_journal_reopens_after_orderly_shutdown() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_session_owner_slots(&service);
+
+        let journal_path = journal_database_path(&profile_root);
+        assert!(
+            journal_path.is_file(),
+            "session should open its journal before writers"
+        );
+        service.shutdown().expect("session shutdown");
+
+        let app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
+        let profile_guard =
+            WritableProfileGuard::acquire_current().expect("profile ownership after shutdown");
+        let journal = OperationJournalStore::open(&profile_guard).expect("journal reopens");
+        assert!(
+            journal
+                .get(OperationId::new())
+                .expect("empty journal point read")
+                .is_none()
+        );
+        drop(journal);
+        drop(profile_guard);
+        drop(app_root_guard);
+    }
+
+    #[test]
+    fn persistence_drop_stops_external_catalog_before_releasing_journal() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let catalog_slot = Arc::new(Mutex::new(CatalogSlot::loading()));
+        let vocabulary_slot = Arc::new(Mutex::new(VocabularySlot::loading()));
+        let maintenance_admission = Arc::new(MaintenanceAdmission::new());
+        let (persistence, _root_guard, _profile_guard) = Persistence::start(
+            Some(profile_root.clone()),
+            Arc::clone(&catalog_slot),
+            Arc::clone(&vocabulary_slot),
+            maintenance_admission,
+        );
+        let external_catalog = persistence
+            .catalog
+            .as_ref()
+            .expect("catalog started")
+            .clone();
+        drop(persistence);
+
+        assert_eq!(
+            external_catalog.submit(CatalogCommand::ReadSnapshot {
+                source_id: SourceId::from_string("drop-order"),
+                expected_revision: None,
+            }),
+            Err(wavecrate_catalog::CatalogSubmitError::Closed)
+        );
+        drop(external_catalog);
+        drop(catalog_slot);
+        drop(vocabulary_slot);
+
+        let profile_guard = WritableProfileGuard::acquire_current()
+            .expect("profile released after persistence drop");
+        let journal = OperationJournalStore::open(&profile_guard).expect("journal reopens");
+        drop(journal);
+        drop(profile_guard);
+    }
+
+    #[test]
+    fn corrupt_operation_journal_blocks_writers_and_preserves_bytes() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let journal_path = journal_database_path(&profile_root);
+        fs::create_dir_all(journal_path.parent().expect("journal directory"))
+            .expect("journal directory");
+        let retained = b"corrupt operation journal bytes".to_vec();
+        fs::write(&journal_path, &retained).expect("corrupt journal fixture");
+
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::Persistence(reason),
+                    ..
+                } if reason.contains("operation journal unavailable")
+            )
+        });
+        assert!(matches!(
+            service.catalog_status(),
+            CatalogStatus::Unavailable { ref reason }
+                if reason.contains("operation journal unavailable")
+        ));
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("journal-blocked")]),
+            Err(VocabularySubmitError::Unavailable(reason))
+                if reason.contains("operation journal unavailable")
+        ));
+        assert!(!profile_root.join("library.db").exists());
+        assert_eq!(
+            fs::read(&journal_path).expect("retained journal bytes"),
+            retained
+        );
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::Persistence(reason)))
+                if reason.contains("operation journal unavailable")
+        ));
+    }
+
+    #[test]
+    fn pending_operation_journal_blocks_ordinary_writers_and_remains_reopenable() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let operation_id = seed_pending_journal(&profile_root);
+        let journal_path = journal_database_path(&profile_root);
+        let retained_database = fs::read(&journal_path).expect("journal bytes");
+
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::RecoveryUnavailable(reason),
+                    ..
+                } if reason.contains("require recovery")
+            )
+        });
+        assert!(matches!(
+            service.catalog_status(),
+            CatalogStatus::Unavailable { ref reason }
+                if reason.contains("recovery unavailable")
+        ));
+        assert!(matches!(
+            service.lookup_profile_tag_categories(vec![String::from("recovery-blocked")]),
+            Err(VocabularySubmitError::Unavailable(reason))
+                if reason.contains("recovery unavailable")
+        ));
+        assert!(!profile_root.join("library.db").exists());
+        assert_eq!(
+            fs::read(&journal_path).expect("journal remains retained"),
+            retained_database
+        );
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::RecoveryUnavailable(reason)))
+                if reason.contains("require recovery")
+        ));
+
+        let app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
+        let profile_guard =
+            WritableProfileGuard::acquire_current().expect("profile ownership after blocked start");
+        let journal = OperationJournalStore::open(&profile_guard).expect("journal reopens");
+        assert!(
+            journal
+                .get(operation_id)
+                .expect("retained intent point read")
+                .is_some()
+        );
+        drop(journal);
+        drop(profile_guard);
+        drop(app_root_guard);
     }
 
     #[test]
@@ -4011,6 +4301,8 @@ mod tests {
         let profile_root = profile_root(&temp);
         let mut owner = spawn_session_owner_helper(&profile_root);
         wait_for_session_owner_ready(&mut owner);
+        let journal_path = journal_database_path(&profile_root);
+        let journal_before = fs::read(&journal_path).expect("owner-created journal");
 
         {
             let _app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
@@ -4069,6 +4361,11 @@ mod tests {
             Err(ShutdownError::Session(SessionError::Persistence(reason)))
                 if reason.contains("profile is owned by another process")
         ));
+        assert_eq!(
+            fs::read(&journal_path).expect("journal after losing process"),
+            journal_before,
+            "losing process must not open or mutate the journal"
+        );
 
         release_session_owner_helper(&mut owner);
         wait_for_session_owner_exit(&mut owner);
@@ -4228,6 +4525,7 @@ mod tests {
             maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
             writer: None,
             catalog: None,
+            journal: None,
             load: None,
             preference_load: None,
             pending_adds: HashMap::new(),
@@ -4294,6 +4592,7 @@ mod tests {
             maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
             writer: None,
             catalog: None,
+            journal: None,
             load: None,
             preference_load: None,
             pending_adds: HashMap::new(),

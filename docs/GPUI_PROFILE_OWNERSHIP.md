@@ -154,16 +154,32 @@ Windows storage validation passed on `aa135f587` in
 Retry/cancellation metadata, typed command arguments, full multi-class capacity
 claims, execution transitions, and recovery execution remain unfinished.
 
+The GPUI session now opens the profile-owned operation journal after acquiring
+the profile guard and before starting the global writer or catalog. It scans one
+bounded recovery page; an empty page permits ordinary startup, while any row or
+audit error reports `RecoveryUnavailable` and leaves both writable services
+uninstalled. This is a temporary fail-closed gate until recovery execution and
+phase transitions exist. The session retains the journal through maintenance,
+catalog, and writer shutdown, then releases it before the final profile owner.
+Journal rows are never deleted, replayed, or treated as execution authority by
+this startup check. Focused session lifecycle tests cover empty-journal reopen,
+retained/corrupt journal blocking, external catalog-handle drop ordering, and a
+losing profile process leaving the journal untouched.
+All 61 session tests and GPUI compilation passed on macOS; the pending-recovery
+test also passed after review of the user-facing status wording. Windows
+validation of this lifecycle addition is pending.
+
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
 the durable physical-source identity, lease, expiry, stale-worker fencing and
 independent source-conflict implementation. An unavailable profile must never
 be mislabeled as a source-lease conflict.
 
-OPT-1337 owns universal journal integration. Opening that journal before the
-global writer, admitting durable operations, and checkpointing before final
-shutdown remain requirements for that integration. Existing legacy journal
-recovery does not establish a universal coordinator. OPT-1473 must consume
-the completed contracts rather than bypass these remaining requirements.
+OPT-1337 owns universal journal integration. The session now opens that journal
+before the global writer and closes it before final profile release, but durable
+operation admission, checkpointing, and recovery execution remain requirements
+for the completed integration. Existing legacy journal recovery does not
+establish a universal coordinator. OPT-1473 must consume the completed
+contracts rather than bypass these remaining requirements.
 
 Shutdown closes admission and stops maintenance/catalog work before closing
 the global writer. Retained guard clones keep profile ownership alive until
