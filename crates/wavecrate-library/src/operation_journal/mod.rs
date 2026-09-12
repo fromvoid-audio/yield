@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod evidence;
 pub mod model;
+pub mod participants;
 pub mod store;
 pub mod validation;
 
@@ -28,6 +29,13 @@ pub use evidence::{
 pub use model::{
     CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, OperationActor, OperationDisposition, OperationId,
     OperationIntent, OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
+};
+
+pub use participants::{
+    MAX_ARTIFACT_REFERENCE_BYTES, MAX_DIAGNOSTIC_CODE_BYTES, MAX_PARTICIPANTS,
+    MAX_SOURCE_IDENTITY_BYTES, ParticipantCheckpoint, ParticipantCheckpointState,
+    ParticipantDescriptor, ParticipantId, ParticipantKind, ParticipantRequirement, ParticipantSet,
+    ParticipantTextField, ParticipantTextViolation, ParticipantValidationError, StoredSourceFence,
 };
 
 pub use store::recovery::{

@@ -106,8 +106,8 @@ retained ownership, duplicate IDs, malformed/oversized records, and replacement
 both during opening and before writes. Windows storage validation passed in
 [`34707094509`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34707094509)
 at store commit `3534c37b6`, including journal tests and production profile
-admission. Phase updates, universal participants, recovery
-scanning, and session startup/shutdown integration remain open.
+admission. Phase updates, universal participants, recovery execution, and
+session startup/shutdown integration remain open.
 
 Recovery observation now uses indexed sequence paging with at most 16 rows and
 2 MiB of encoded records per page. Malformed, unsupported, oversized, or
@@ -118,6 +118,16 @@ checks database work against a 4096-row prefix, and byte-budget tests verify
 that deferred rows appear on the next page. All 55 operation-journal module tests
 and GPUI compilation passed for this addition. This is read-only observation,
 not legacy-file import, replay, participant reconciliation, or recovery admission.
+Windows storage validation for recovery paging passed in
+[`34708286537`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34708286537)
+at `e17684aa2`.
+
+The pure participant model adds bounded descriptors, source identity/revision/lease
+observations, and one checkpoint per participant. Only optional rebuildable
+artifacts can be deferred; required work cannot be silently dropped. Malformed
+decoded inventories never report required completion. Eleven focused tests and
+GPUI compilation passed. These values are not yet part of a new persisted record
+schema and do not implement live source leases or authorize phase transitions.
 
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
 the durable physical-source identity, lease, expiry, stale-worker fencing and
