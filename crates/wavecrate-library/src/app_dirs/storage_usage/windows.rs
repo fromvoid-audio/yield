@@ -280,7 +280,6 @@ pub(super) fn clear(
         &mut is_cancelled,
     )
     .map_err(|error| map_count_error(error, &outcome))?;
-    outcome.remaining_entries_known = true;
 
     // The final count traverses the retained cache handle while the configured name remains
     // mutable. Re-check it after counting as well as before, so a replacement during the
@@ -288,6 +287,7 @@ pub(super) fn clear(
     super::check_cancelled(&mut is_cancelled, &outcome)?;
     namespace.ensure_profile(&outcome)?;
     verify_current_cache_identity(namespace, &outcome)?;
+    outcome.remaining_entries_known = true;
 
     if outcome.remaining_entries != 0 {
         return Err(CacheMaintenanceError::Incomplete {
