@@ -103,8 +103,10 @@ pre-existing rollback journal is not yet enabled.
 The initial storage checkpoint passed 45 focused journal tests, GPUI compilation,
 formatting, and diff checks on macOS. Tests cover normal reopen persistence,
 retained ownership, duplicate IDs, malformed/oversized records, and replacement
-both during opening and before writes. Windows execution for this checkpoint
-must be recorded separately. Phase updates, universal participants, recovery
+both during opening and before writes. Windows storage validation passed in
+[`34707094509`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34707094509)
+at store commit `3534c37b6`, including journal tests and production profile
+admission. Phase updates, universal participants, recovery
 scanning, and session startup/shutdown integration remain open.
 
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
