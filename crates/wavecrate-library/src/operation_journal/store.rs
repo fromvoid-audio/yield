@@ -29,6 +29,9 @@ use super::validation::{RecordConsistency, classify_record};
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
 
+#[cfg(test)]
+mod process_tests;
+
 /// The filename of the profile-local operation journal database.
 pub const JOURNAL_DATABASE_FILE_NAME: &str = "journal.sqlite3";
 /// The profile child directory that owns the operation journal database.
@@ -42,6 +45,7 @@ const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_USER_VERSION_OFFSET: usize = 60;
 const SQLITE_APPLICATION_ID_OFFSET: usize = 68;
+const SQLITE_ROLLBACK_HEADER_BYTES: usize = 28;
 const SQLITE_JOURNAL_SUFFIX: &str = "-journal";
 const SQLITE_WAL_SUFFIX: &str = "-wal";
 const SQLITE_SHM_SUFFIX: &str = "-shm";
@@ -233,7 +237,7 @@ impl OperationJournalStore {
 
         let database_name = Path::new(JOURNAL_DATABASE_FILE_NAME);
         let database_path = database_root.path().join(database_name);
-        reject_unexpected_sidecars(&database_root, &database_path, false)?;
+        let rollback_journal = inspect_preexisting_sidecars(&database_root, &database_path)?;
 
         let (mut file, created) =
             open_database_file(&database_root, database_name, &database_path)?;
@@ -265,6 +269,7 @@ impl OperationJournalStore {
         if let Some(gate) = before_sqlite_open {
             gate(&database_path);
         }
+        validate_pre_sqlite_sidecars(&database_root, &database_path, rollback_journal.as_ref())?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(&database_path, flags)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQLITE_VALUE_LIMIT)?;
@@ -276,6 +281,7 @@ impl OperationJournalStore {
             &database_identity,
         )?;
         validate_database_file_identity(&database_root, &database_path, &database_identity)?;
+        validate_pre_sqlite_sidecars(&database_root, &database_path, rollback_journal.as_ref())?;
         drop(file);
 
         if created {
@@ -284,6 +290,13 @@ impl OperationJournalStore {
         } else {
             validate_existing_schema(&connection, &database_path)?;
             configure_connection(&connection)?;
+        }
+        if let Some(rollback_journal) = rollback_journal.as_ref() {
+            validate_rollback_journal_identity(
+                &database_root,
+                &database_path,
+                &rollback_journal.identity,
+            )?;
         }
         validate_connection_identity(
             &connection,
@@ -294,6 +307,7 @@ impl OperationJournalStore {
         verify_connection_configuration(&connection, &database_path)?;
         database_root.sync_namespace(profile_guard)?;
         database_root.validate_profile_guard(profile_guard)?;
+        drop(rollback_journal);
 
         // Clone only after every open, header, schema, pragma, and identity check has succeeded.
         // The clone is the final retained owner moved into the store.
@@ -562,6 +576,167 @@ fn ensure_regular_file(file: &File, path: &Path) -> Result<(), OperationJournalS
     let metadata = file.metadata().map_err(|source| io_error(path, source))?;
     if !metadata.is_file() {
         return Err(audit_error(path, "journal database is not a regular file"));
+    }
+    Ok(())
+}
+
+struct PreexistingRollbackJournal {
+    _file: File,
+    identity: String,
+}
+
+fn validate_pre_sqlite_sidecars(
+    root: &BoundDatabaseRoot,
+    database_path: &Path,
+    expected: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    let observed = inspect_preexisting_sidecars(root, database_path)?;
+    match (expected, observed) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(observed)) if expected.identity == observed.identity => Ok(()),
+        (Some(_), None) => Err(audit_error(
+            database_path,
+            "validated SQLite rollback sidecar disappeared before database open",
+        )),
+        (None, Some(_)) => Err(audit_error(
+            database_path,
+            "SQLite rollback sidecar appeared before database open",
+        )),
+        (Some(_), Some(_)) => Err(audit_error(
+            database_path,
+            "validated SQLite rollback sidecar was replaced before database open",
+        )),
+    }
+}
+
+fn inspect_preexisting_sidecars(
+    root: &BoundDatabaseRoot,
+    database_path: &Path,
+) -> Result<Option<PreexistingRollbackJournal>, OperationJournalStoreError> {
+    let mut rollback_journal = None;
+    for suffix in [SQLITE_JOURNAL_SUFFIX, SQLITE_WAL_SUFFIX, SQLITE_SHM_SUFFIX] {
+        let name = format!("{JOURNAL_DATABASE_FILE_NAME}{suffix}");
+        match root.symlink_metadata(Path::new(&name)) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(audit_error(
+                        database_path,
+                        format!("SQLite sidecar {name} is a symlink"),
+                    ));
+                }
+                if !metadata.is_file() {
+                    return Err(audit_error(
+                        database_path,
+                        format!("SQLite sidecar {name} is not a regular file"),
+                    ));
+                }
+                if suffix != SQLITE_JOURNAL_SUFFIX {
+                    return Err(audit_error(
+                        database_path,
+                        format!("unexpected SQLite sidecar {name} is present"),
+                    ));
+                }
+                let mut file = root
+                    .open_file_nofollow(Path::new(&name), false)
+                    .map_err(|source| io_error(database_path, source))?;
+                validate_inactive_rollback_journal(&mut file, database_path, &name)?;
+                let identity =
+                    stable_filesystem_identity_from_open_file(&file).ok_or_else(|| {
+                        OperationJournalStoreError::RequiresAudit {
+                            path: database_path.to_path_buf(),
+                            reason: format!(
+                                "stable identity is unavailable for SQLite sidecar {name}"
+                            ),
+                        }
+                    })?;
+                rollback_journal = Some(PreexistingRollbackJournal {
+                    _file: file,
+                    identity,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(database_path, source)),
+        }
+    }
+    Ok(rollback_journal)
+}
+
+fn validate_inactive_rollback_journal(
+    file: &mut File,
+    database_path: &Path,
+    sidecar_name: &str,
+) -> Result<(), OperationJournalStoreError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error(database_path, source))?;
+    if !metadata.is_file() {
+        return Err(audit_error(
+            database_path,
+            format!("SQLite sidecar {sidecar_name} is not a regular file"),
+        ));
+    }
+    let length = metadata.len();
+    if length == 0 {
+        return Ok(());
+    }
+    if length < SQLITE_ROLLBACK_HEADER_BYTES as u64 {
+        return Err(audit_error(
+            database_path,
+            format!("SQLite rollback sidecar {sidecar_name} is an ambiguous {length}-byte file"),
+        ));
+    }
+    let mut header = [0_u8; SQLITE_ROLLBACK_HEADER_BYTES];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut header))
+        .map_err(|source| io_error(database_path, source))?;
+    if header.iter().any(|byte| *byte != 0) {
+        return Err(audit_error(
+            database_path,
+            format!("SQLite rollback sidecar {sidecar_name} has an active or ambiguous header"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rollback_journal_identity(
+    root: &BoundDatabaseRoot,
+    database_path: &Path,
+    expected_identity: &str,
+) -> Result<(), OperationJournalStoreError> {
+    let sidecar_name = format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_JOURNAL_SUFFIX}");
+    let metadata = match root.symlink_metadata(Path::new(&sidecar_name)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(io_error(database_path, source)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(audit_error(
+            database_path,
+            format!("SQLite sidecar {sidecar_name} is a symlink"),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(audit_error(
+            database_path,
+            format!("SQLite sidecar {sidecar_name} is not a regular file"),
+        ));
+    }
+    let file = root
+        .open_file_nofollow(Path::new(&sidecar_name), false)
+        .map_err(|source| io_error(database_path, source))?;
+    let mut file = file;
+    validate_inactive_rollback_journal(&mut file, database_path, &sidecar_name)?;
+    let actual_identity = stable_filesystem_identity_from_open_file(&file).ok_or_else(|| {
+        OperationJournalStoreError::RequiresAudit {
+            path: database_path.to_path_buf(),
+            reason: format!("stable identity is unavailable for SQLite sidecar {sidecar_name}"),
+        }
+    })?;
+    if actual_identity != expected_identity {
+        return Err(audit_error(
+            database_path,
+            format!("SQLite sidecar {sidecar_name} was replaced while opening the database"),
+        ));
     }
     Ok(())
 }
@@ -975,6 +1150,8 @@ impl From<EncodeError> for OperationJournalStoreError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::io::Write;
 
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1399,6 +1576,153 @@ mod tests {
         ));
         assert_eq!(fs::read(&target).expect("target unchanged"), b"untouched");
         fs::remove_file(sidecar).expect("remove only fixture symlink before SQLite closes");
+    }
+
+    #[test]
+    fn inactive_rollback_sidecar_variants_allow_restart() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = intent_record(OperationId::new());
+        store.insert_intent(&record).expect("persist intent");
+        drop(store);
+
+        let sidecar = database_path(&fixture.owner).with_file_name("journal.sqlite3-journal");
+        for contents in [Vec::new(), vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES]] {
+            fs::write(&sidecar, &contents).expect("write inactive rollback sidecar");
+            let reopened = OperationJournalStore::open(&fixture.owner)
+                .expect("inactive rollback sidecar is safe to reopen");
+            assert_eq!(
+                reopened
+                    .get(record.operation_id)
+                    .expect("read persisted intent"),
+                Some(record.clone())
+            );
+            drop(reopened);
+            if sidecar.exists() {
+                fs::remove_file(&sidecar).expect("remove inactive rollback sidecar");
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_rollback_sidecars_are_retained_unchanged() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        drop(store);
+        let sidecar = database_path(&fixture.owner).with_file_name("journal.sqlite3-journal");
+        let cases = [vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES - 1], {
+            let mut bytes = vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES];
+            bytes[0] = 1;
+            bytes
+        }];
+        for contents in cases {
+            fs::write(&sidecar, &contents).expect("write ambiguous rollback sidecar");
+            let error = OperationJournalStore::open(&fixture.owner)
+                .expect_err("ambiguous rollback sidecar requires audit");
+            assert!(matches!(
+                error,
+                OperationJournalStoreError::RequiresAudit { .. }
+            ));
+            assert_eq!(fs::read(&sidecar).expect("read retained sidecar"), contents);
+            fs::remove_file(&sidecar).expect("remove retained sidecar fixture");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_sidecar_replacement_between_validation_and_open_is_rejected() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        drop(store);
+        let sidecar = database_path(&fixture.owner).with_file_name("journal.sqlite3-journal");
+        fs::write(&sidecar, vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES])
+            .expect("write inactive rollback sidecar");
+        let replacement = vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES];
+        let gate = |path: &Path| {
+            let sidecar = path.with_file_name("journal.sqlite3-journal");
+            fs::rename(&sidecar, sidecar.with_extension("displaced"))
+                .expect("displace validated sidecar");
+            fs::write(&sidecar, &replacement).expect("install replacement sidecar");
+        };
+        let error = OperationJournalStore::open_inner(&fixture.owner, Some(&gate))
+            .expect_err("replaced rollback sidecar requires audit");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::RequiresAudit { reason, .. }
+                if reason.contains("sidecar") && reason.contains("replaced")
+        ));
+        assert_eq!(
+            fs::read(&sidecar).expect("read retained replacement"),
+            replacement
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_sidecar_header_change_on_same_file_is_rejected_before_sqlite_open() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        drop(store);
+        let database = database_path(&fixture.owner);
+        let before_database = fs::read(&database).expect("read original database");
+        let sidecar = database.with_file_name("journal.sqlite3-journal");
+        fs::write(&sidecar, vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES])
+            .expect("write inactive rollback sidecar");
+        let gate = |path: &Path| {
+            let sidecar = path.with_file_name("journal.sqlite3-journal");
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&sidecar)
+                .expect("open sidecar without replacement");
+            file.write_all(&[1]).expect("make sidecar header active");
+        };
+        let error = OperationJournalStore::open_inner(&fixture.owner, Some(&gate))
+            .expect_err("same-file active rollback sidecar requires audit");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::RequiresAudit { reason, .. }
+                if reason.contains("active") || reason.contains("ambiguous")
+        ));
+        assert_eq!(
+            fs::read(&database).expect("read retained database"),
+            before_database
+        );
+        let mut expected_sidecar = vec![0_u8; SQLITE_ROLLBACK_HEADER_BYTES];
+        expected_sidecar[0] = 1;
+        assert_eq!(
+            fs::read(&sidecar).expect("read retained sidecar"),
+            expected_sidecar
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_appearing_rollback_sidecar_is_rejected_before_sqlite_open() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        drop(store);
+        let database = database_path(&fixture.owner);
+        let before_database = fs::read(&database).expect("read original database");
+        let sidecar = database.with_file_name("journal.sqlite3-journal");
+        let replacement = vec![1_u8; SQLITE_ROLLBACK_HEADER_BYTES];
+        let gate = |path: &Path| {
+            fs::write(path.with_file_name("journal.sqlite3-journal"), &replacement)
+                .expect("install newly appearing sidecar");
+        };
+        let error = OperationJournalStore::open_inner(&fixture.owner, Some(&gate))
+            .expect_err("newly appearing rollback sidecar requires audit");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::RequiresAudit { .. }
+        ));
+        assert_eq!(
+            fs::read(&database).expect("read retained database"),
+            before_database
+        );
+        assert_eq!(
+            fs::read(&sidecar).expect("read retained sidecar"),
+            replacement
+        );
     }
 
     #[test]

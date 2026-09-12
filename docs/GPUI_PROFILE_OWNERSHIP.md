@@ -97,8 +97,16 @@ Windows relies on the bundled SQLite VFS for committed file content and has no
 independently verified directory-entry power-loss guarantee. SQLite's actual
 open file is checked using platform file controls in addition to root and
 pathname identity checks. Unknown headers, unsupported schemas, and unexpected
-sidecars remain retained for audit. In particular, automatic recovery of a
-pre-existing rollback journal is not yet enabled.
+sidecars remain retained for audit. A pre-existing rollback journal is accepted
+only when it is a regular file that is empty or has an entirely zeroed 28-byte
+header. Its identity and inactive state are checked before SQLite executes SQL.
+Active, truncated, replaced, and otherwise ambiguous sidecars remain retained;
+this does not enable hot-journal replay.
+
+A subprocess test commits an intent, is forcibly terminated, and proves that a
+new profile owner can reopen the acknowledged record. The restart addition passed
+32 store tests (plus one ignored subprocess helper), GPUI compilation, formatting,
+and diff checks on macOS. Windows validation of this addition is pending.
 
 The initial storage checkpoint passed 45 focused journal tests, GPUI compilation,
 formatting, and diff checks on macOS. Tests cover normal reopen persistence,
