@@ -60,6 +60,7 @@ fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidat
         ));
     }
 
+    validate_phase_disposition(record.phase, record.disposition)?;
     if record.schema_version == SCHEMA_V2 {
         validate_schema_v2_phase_evidence_record(record)?;
     }
@@ -137,6 +138,48 @@ fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidat
     publication_validation?;
 
     Ok(RecordValidation::Consistent)
+}
+
+fn validate_phase_disposition(
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+) -> Result<(), String> {
+    use OperationDisposition as D;
+    use OperationPhase as P;
+    // This checks the stored shape only. Transition guards and participant evidence must
+    // separately establish why an otherwise legal retry, cancellation, or terminal state exists.
+    let legal = match phase {
+        P::IntentDurable | P::Prepared => {
+            matches!(
+                disposition,
+                D::None | D::RetryPending | D::CancelRequestedBeforePublish
+            )
+        }
+        P::FilesystemStaged => matches!(
+            disposition,
+            D::None | D::RetryPending | D::PartialNeedsRetry | D::CancelRequestedBeforePublish
+        ),
+        P::FilesystemPublished | P::SourceReconciled => matches!(
+            disposition,
+            D::None
+                | D::RetryPending
+                | D::PartialNeedsRetry
+                | D::AuditRequired
+                | D::CancelRequestedAfterPublish
+        ),
+        P::GlobalReconciled | P::ProjectionPublished | P::ReadinessScheduled => matches!(
+            disposition,
+            D::None | D::RetryPending | D::AuditRequired | D::CancelRequestedAfterPublish
+        ),
+        P::Terminal => disposition.is_terminal(),
+    };
+    if legal {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid phase/disposition pairing: {phase:?}/{disposition:?}"
+        ))
+    }
 }
 
 fn validate_capacity_plan_option(plan: Option<&DurableCapacityPlan>) -> Result<(), String> {
@@ -1111,6 +1154,29 @@ mod tests {
     fn complete_decoded_record_is_consistent() {
         let record = complete_record();
         assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+    }
+
+    #[test]
+    fn impossible_statuses_are_rejected_even_for_legacy_records() {
+        for (phase, disposition) in [
+            ("IntentDurable", "Succeeded"),
+            ("IntentDurable", "CancelRequestedAfterPublish"),
+            ("Terminal", "None"),
+            ("Terminal", "RetryPending"),
+            ("GlobalReconciled", "PartialNeedsRetry"),
+            ("SourceReconciled", "CancelRequestedBeforePublish"),
+        ] {
+            let mut fixture = value(V1_EMPTY_FIXTURE);
+            fixture["phase"] = Value::from(phase);
+            fixture["disposition"] = Value::from(disposition);
+            assert!(
+                matches!(
+                    classify_record(&decode_value(fixture)),
+                    RecordConsistency::Invalid(reason) if reason.contains("phase/disposition")
+                ),
+                "{phase}/{disposition}"
+            );
+        }
     }
 
     #[test]
