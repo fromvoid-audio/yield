@@ -1,5 +1,7 @@
 //! On-disk usage reporting for the global database and rebuildable cache.
 
+#[cfg(all(test, not(windows)))]
+use std::cell::RefCell;
 #[cfg(not(windows))]
 use std::ffi::OsString;
 use std::{
@@ -210,6 +212,45 @@ impl DisposableCacheNamespace {
                 .iter()
                 .any(|candidate| paths_overlap(cache, candidate))
         })
+    }
+
+    #[cfg(not(windows))]
+    fn verify_current_cache_identity(
+        &self,
+        outcome: &CacheClearOutcome,
+    ) -> Result<(), CacheMaintenanceError> {
+        let current_cache = match self
+            .profile_root
+            .open_dir_nofollow(Path::new(CACHE_DIR_NAME))
+        {
+            Ok(directory) => directory,
+            Err(error) if entry_changed_before_open(&error) => {
+                return Err(cache_namespace_replaced(
+                    *outcome,
+                    format!("cache path changed: {error}"),
+                ));
+            }
+            Err(error) => {
+                return Err(cache_io(
+                    outcome,
+                    self.cache_path(),
+                    format!("reopen cache path for identity check: {error}"),
+                ));
+            }
+        };
+        let current_identity = identity_from_dir(&current_cache).ok_or_else(|| {
+            CacheMaintenanceError::Unsupported {
+                outcome: *outcome,
+                reason: String::from("stable cache identity unavailable during final check"),
+            }
+        })?;
+        if current_identity != self.cache_identity {
+            return Err(cache_namespace_replaced(
+                *outcome,
+                String::from("cache path names a replacement directory"),
+            ));
+        }
+        Ok(())
     }
 
     /// Remove disposable entries from the captured namespace without blocking the caller.
@@ -467,37 +508,7 @@ impl DisposableCacheNamespace {
 
             check_cancelled(&mut is_cancelled, &outcome)?;
             self.ensure_profile(&outcome)?;
-            let current_cache = match self
-                .profile_root
-                .open_dir_nofollow(Path::new(CACHE_DIR_NAME))
-            {
-                Ok(directory) => directory,
-                Err(error) if entry_changed_before_open(&error) => {
-                    return Err(cache_namespace_replaced(
-                        outcome,
-                        format!("cache path changed: {error}"),
-                    ));
-                }
-                Err(error) => {
-                    return Err(cache_io(
-                        &outcome,
-                        self.cache_path(),
-                        format!("reopen cache path for identity check: {error}"),
-                    ));
-                }
-            };
-            let current_identity = identity_from_dir(&current_cache).ok_or_else(|| {
-                CacheMaintenanceError::Unsupported {
-                    outcome,
-                    reason: String::from("stable cache identity unavailable during final check"),
-                }
-            })?;
-            if current_identity != self.cache_identity {
-                return Err(cache_namespace_replaced(
-                    outcome,
-                    String::from("cache path names a replacement directory"),
-                ));
-            }
+            self.verify_current_cache_identity(&outcome)?;
 
             outcome.remaining_entries = count_entries(
                 &self.profile,
@@ -512,6 +523,16 @@ impl DisposableCacheNamespace {
                 &mut is_cancelled,
             )
             .map_err(|error| map_count_error(error, &outcome))?;
+
+            #[cfg(all(test, not(windows)))]
+            run_final_count_hook();
+
+            // Counting uses the retained cache handle while its configured name remains mutable.
+            // Recheck cancellation, profile ownership, and the configured identity before
+            // publishing the count or claiming that the captured namespace is empty.
+            check_cancelled(&mut is_cancelled, &outcome)?;
+            self.ensure_profile(&outcome)?;
+            self.verify_current_cache_identity(&outcome)?;
             outcome.remaining_entries_known = true;
             if outcome.remaining_entries != 0 {
                 return Err(CacheMaintenanceError::Incomplete {
@@ -719,6 +740,36 @@ fn count_entries(
         }
     }
     Ok(count)
+}
+
+#[cfg(all(test, not(windows)))]
+thread_local! {
+    static FINAL_COUNT_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+}
+
+#[cfg(all(test, not(windows)))]
+struct FinalCountHookGuard;
+
+#[cfg(all(test, not(windows)))]
+impl Drop for FinalCountHookGuard {
+    fn drop(&mut self) {
+        FINAL_COUNT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+fn install_final_count_hook(hook: impl FnMut() + 'static) -> FinalCountHookGuard {
+    FINAL_COUNT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    FinalCountHookGuard
+}
+
+#[cfg(all(test, not(windows)))]
+fn run_final_count_hook() {
+    FINAL_COUNT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 #[cfg(not(windows))]
@@ -1490,6 +1541,52 @@ mod tests {
             41
         );
         assert!(cache.is_dir(), "captured cache root remains in place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_cache_clear_rechecks_root_after_terminal_count() {
+        use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
+        use crate::test_runtime::TestRuntimeGuard;
+
+        let _runtime = TestRuntimeGuard::acquire();
+        let base = tempfile::tempdir_in(
+            fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root"),
+        )
+        .expect("create profile base");
+        let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile_guard = PersistenceProfileGuard::named("maintenance-final-count-replacement");
+        let profile = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::create_dir_all(&cache).expect("cache root");
+        fs::write(cache.join("captured.cache"), [0_u8; 19]).expect("captured payload");
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture cache namespace");
+        let relocated = profile.profile_root().join("cache-final-relocated");
+        let replacement = cache.clone();
+        let relocated_for_hook = relocated.clone();
+        let _hook = super::install_final_count_hook(move || {
+            fs::rename(&replacement, &relocated_for_hook)
+                .expect("relocate captured cache during count");
+            fs::create_dir_all(&replacement).expect("replacement cache root during count");
+            fs::write(replacement.join("replacement.cache"), [0_u8; 23])
+                .expect("replacement payload during count");
+        });
+
+        let error = namespace
+            .clear(|| false)
+            .expect_err("replacement during final count must fail closed");
+        let CacheMaintenanceError::NamespaceReplaced { outcome, .. } = error else {
+            panic!("expected namespace replacement");
+        };
+        assert!(outcome.namespace_replaced);
+        assert!(outcome.incomplete);
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.removed_bytes, 19);
+        assert!(!outcome.remaining_entries_known);
+        assert_eq!(fs::read(cache.join("replacement.cache")).unwrap().len(), 23);
+        assert!(relocated.is_dir());
     }
 
     #[cfg(unix)]
