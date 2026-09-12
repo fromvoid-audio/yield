@@ -106,7 +106,9 @@ this does not enable hot-journal replay.
 A subprocess test commits an intent, is forcibly terminated, and proves that a
 new profile owner can reopen the acknowledged record. The restart addition passed
 32 store tests (plus one ignored subprocess helper), GPUI compilation, formatting,
-and diff checks on macOS. Windows validation of this addition is pending.
+and diff checks on macOS. Windows storage validation passed in
+[`34709638982`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34709638982)
+at `87887937b`, including the subprocess restart test and participant model.
 
 The initial storage checkpoint passed 45 focused journal tests, GPUI compilation,
 formatting, and diff checks on macOS. Tests cover normal reopen persistence,
