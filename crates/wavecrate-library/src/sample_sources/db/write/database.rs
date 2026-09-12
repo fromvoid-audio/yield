@@ -167,20 +167,21 @@ impl SourceDatabase {
 
     /// Start a write batch that wraps related mutations in a single transaction.
     pub fn write_batch(&self) -> Result<SourceWriteBatch<'_>, SourceDbError> {
+        // Validate before SQLite reserves the writer and before any caller mutation can run.
+        self.validate_profile_owned_mutation()?;
         // Acquire the writer lock up front so mixed scan/metadata workloads wait
         // on SQLite's busy timeout instead of failing partway through the batch.
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(map_sql_error)?;
         Ok(SourceWriteBatch {
             tx,
-            db_path: self.db_path.clone(),
+            owner: self,
             paths_revision_dirty: false,
             identities_revision_dirty: false,
             index_revision_dirty: false,
             manifest_touched_paths: std::collections::BTreeSet::new(),
             source_index_changes: std::collections::BTreeMap::new(),
             manifest_audit_completed: false,
-            telemetry_label: self.telemetry_label,
         })
     }
 

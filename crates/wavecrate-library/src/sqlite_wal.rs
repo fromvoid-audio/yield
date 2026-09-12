@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 /// SQL fragment that applies the shared WAL-health settings for write-capable DBs.
 pub(crate) const WORKLOAD_WAL_PRAGMAS_SQL: &str = "PRAGMA wal_autocheckpoint=4096;
@@ -24,7 +24,6 @@ pub(crate) const WORKLOAD_WAL_PRAGMAS_SQL: &str = "PRAGMA wal_autocheckpoint=409
 
 const PASSIVE_CHECKPOINT_TRIGGER_BYTES: u64 = 32 * 1024 * 1024;
 const PASSIVE_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(15);
-const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SLOW_CHECKPOINT_THRESHOLD: Duration = Duration::from_millis(50);
 
 /// Apply the shared write-capable WAL policy to one SQLite connection.
@@ -44,14 +43,15 @@ struct PassiveCheckpointStats {
     checkpointed_frames: i64,
 }
 
-/// Attempt one best-effort passive checkpoint when the WAL file is both large
-/// enough and old enough to justify maintenance.
+/// Attempt one best-effort passive checkpoint on an already-owned SQLite connection
+/// when its WAL file is both large enough and old enough to justify maintenance.
 ///
 /// This is intentionally conservative:
 /// - it never runs for small WAL files
 /// - it is throttled per database file
 /// - it uses `PASSIVE` so readers win if they are still holding snapshots
 pub(crate) fn maybe_checkpoint_database_file(
+    connection: &Connection,
     db_path: &Path,
     database_kind: &'static str,
     role: &'static str,
@@ -69,7 +69,7 @@ pub(crate) fn maybe_checkpoint_database_file(
     }
 
     let started_at = Instant::now();
-    let result = open_checkpoint_connection(db_path).and_then(run_passive_checkpoint);
+    let result = run_passive_checkpoint(connection);
     let elapsed = started_at.elapsed();
     let wal_bytes_after = wal_file_size(&wal_path).unwrap_or(0);
     match result {
@@ -133,16 +133,7 @@ fn claim_checkpoint_window(db_path: &Path, now: Instant) -> bool {
     true
 }
 
-fn open_checkpoint_connection(db_path: &Path) -> rusqlite::Result<Connection> {
-    if path_is_symlink(db_path).unwrap_or(false) {
-        return Err(rusqlite::Error::InvalidPath(db_path.to_path_buf()));
-    }
-    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
-    Ok(connection)
-}
-
-fn run_passive_checkpoint(connection: Connection) -> rusqlite::Result<PassiveCheckpointStats> {
+fn run_passive_checkpoint(connection: &Connection) -> rusqlite::Result<PassiveCheckpointStats> {
     connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
         Ok(PassiveCheckpointStats {
             busy: row.get::<_, i64>(0)? != 0,
@@ -183,14 +174,13 @@ fn wal_path_for(db_path: &Path) -> PathBuf {
     PathBuf::from(wal_name)
 }
 
-fn path_is_symlink(path: &Path) -> std::io::Result<bool> {
-    std::fs::symlink_metadata(path).map(|metadata| metadata.file_type().is_symlink())
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn wal_file_size_ignores_symlinked_wal_sidecar() {
         let dir = tempfile::tempdir().unwrap();
@@ -202,5 +192,36 @@ mod tests {
         std::os::unix::fs::symlink(&outside_wal, &wal_path).unwrap();
 
         assert_eq!(wal_file_size(&wal_path), None);
+    }
+
+    #[test]
+    fn checkpoint_uses_borrowed_connection_without_opening_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("database.sqlite");
+        let wal_path = wal_path_for(&db_path);
+        let wal_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        wal_file.set_len(PASSIVE_CHECKPOINT_TRIGGER_BYTES).unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        let used_owned_connection = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = used_owned_connection.clone();
+        connection.progress_handler(
+            1,
+            Some(move || {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                false
+            }),
+        );
+
+        maybe_checkpoint_database_file(&connection, &db_path, "test", "borrowed");
+
+        assert!(used_owned_connection.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !db_path.exists(),
+            "checkpointing must not create or reopen a database at the pathname"
+        );
     }
 }

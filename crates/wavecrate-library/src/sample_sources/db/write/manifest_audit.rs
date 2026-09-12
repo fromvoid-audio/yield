@@ -30,6 +30,7 @@ impl SourceDatabase {
         started_at: i64,
         limit: usize,
     ) -> Result<(Vec<PathBuf>, usize), SourceDbError> {
+        self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
@@ -63,6 +64,7 @@ impl SourceDatabase {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(map_sql_error)?;
+        self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)?;
         let paths = raw_paths
             .into_iter()
@@ -95,6 +97,7 @@ impl SourceDatabase {
         if paths.is_empty() {
             return Ok(0);
         }
+        self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
@@ -119,6 +122,7 @@ impl SourceDatabase {
                 [],
             )
             .map_err(map_sql_error)?;
+        self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)?;
         Ok(inserted)
     }
@@ -128,6 +132,7 @@ impl SourceDatabase {
         if paths.is_empty() {
             return Ok(());
         }
+        self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
@@ -150,6 +155,7 @@ impl SourceDatabase {
                 [],
             )
             .map_err(map_sql_error)?;
+        self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)
     }
 }

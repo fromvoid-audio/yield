@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{SourceDatabase, SourceDbError};
@@ -44,6 +44,7 @@ pub(crate) fn insert_entry(
     db: &SourceDatabase,
     entry: &FileOpJournalEntry,
 ) -> Result<(), SourceDbError> {
+    db.validate_profile_owned_mutation()?;
     let target_relative = normalize_relative_path(&entry.target_relative)?;
     let staged_relative = match entry.staged_relative.as_ref() {
         Some(path) => Some(normalize_relative_path(path)?),
@@ -75,7 +76,8 @@ pub(crate) fn insert_entry(
         None => None,
     };
     let file_identity = entry.file_identity.clone();
-    db.connection
+    let transaction = begin_owned_transaction(db)?;
+    transaction
         .execute(
             "INSERT INTO file_ops_journal (
                  id, op_type, stage, source_root, source_relative, target_relative,
@@ -109,6 +111,8 @@ pub(crate) fn insert_entry(
             ],
         )
         .map_err(map_sql_error)?;
+    db.validate_profile_owned_mutation()?;
+    transaction.commit().map_err(map_sql_error)?;
     Ok(())
 }
 
@@ -120,12 +124,14 @@ pub(crate) fn update_stage(
     file_size: Option<u64>,
     modified_ns: Option<i64>,
 ) -> Result<(), SourceDbError> {
+    db.validate_profile_owned_mutation()?;
     let file_identity = if file_size.is_some() || modified_ns.is_some() {
         file_identity_for_row(db, id)?
     } else {
         None
     };
-    db.connection
+    let transaction = begin_owned_transaction(db)?;
+    transaction
         .execute(
             "UPDATE file_ops_journal
              SET stage = ?1,
@@ -142,15 +148,27 @@ pub(crate) fn update_stage(
             ],
         )
         .map_err(map_sql_error)?;
+    db.validate_profile_owned_mutation()?;
+    transaction.commit().map_err(map_sql_error)?;
     Ok(())
 }
 
 /// Remove a resolved journal entry after reconciliation.
 pub(crate) fn remove_entry(db: &SourceDatabase, id: &str) -> Result<(), SourceDbError> {
-    db.connection
+    db.validate_profile_owned_mutation()?;
+    let transaction = begin_owned_transaction(db)?;
+    transaction
         .execute("DELETE FROM file_ops_journal WHERE id = ?1", params![id])
         .map_err(map_sql_error)?;
+    db.validate_profile_owned_mutation()?;
+    transaction.commit().map_err(map_sql_error)?;
     Ok(())
+}
+
+fn begin_owned_transaction(db: &SourceDatabase) -> Result<Transaction<'_>, SourceDbError> {
+    db.validate_profile_owned_mutation()?;
+    Transaction::new_unchecked(&db.connection, TransactionBehavior::Immediate)
+        .map_err(map_sql_error)
 }
 
 /// Load all pending journal entries for reconciliation.

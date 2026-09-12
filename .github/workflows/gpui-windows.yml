@@ -63,6 +63,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test operation journal
         run: cargo test --locked -p wavecrate-library --lib operation_journal --no-default-features
+      - name: Test source mutation ownership
+        shell: pwsh
+        run: |
+          cargo test --locked -p wavecrate-library --lib profile_mutation_guard --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p wavecrate-library --lib sqlite_wal --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test profile-owned settings maintenance
         shell: pwsh
         run: |

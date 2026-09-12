@@ -195,14 +195,17 @@ impl Drop for SourceDatabaseWriteFence {
 /// Groups multiple database writes into one transaction using cached statements.
 pub struct SourceWriteBatch<'conn> {
     tx: Transaction<'conn>,
-    db_path: PathBuf,
+    /// The source database whose retained profile capability authorizes this transaction.
+    ///
+    /// Keeping this borrow with the SQLite transaction lets every commit boundary revalidate the
+    /// same profile root and database-child binding that were checked before `BEGIN`.
+    owner: &'conn SourceDatabase,
     paths_revision_dirty: bool,
     identities_revision_dirty: bool,
     index_revision_dirty: bool,
     manifest_touched_paths: BTreeSet<PathBuf>,
     source_index_changes: BTreeMap<PathBuf, Option<SourceIndexEntry>>,
     manifest_audit_completed: bool,
-    telemetry_label: &'static str,
 }
 
 impl SourceDatabase {
@@ -721,21 +724,46 @@ impl SourceDatabase {
         &self.root
     }
 
-    /// Evaluate the shared WAL maintenance policy for one source DB root.
+    /// Retain the source-compatible path-only WAL maintenance entrypoint.
     ///
-    /// This is a best-effort passive checkpoint: it only runs after the WAL has
-    /// already grown beyond the steady-state target, it is throttled per source
-    /// DB file, and it yields immediately if active readers still own older WAL
-    /// snapshots.
+    /// This helper intentionally does nothing for writable roles. A pathname-only
+    /// reopen cannot prove the retained profile/database identity and would bypass
+    /// the writable ownership boundary. Owned [`SourceDatabase`] writes invoke the
+    /// same best-effort passive policy through their retained connection instead.
+    #[deprecated(
+        note = "WAL maintenance requires a retained SourceDatabase; owned writes checkpoint automatically"
+    )]
     pub fn maybe_checkpoint_wal(root: impl AsRef<Path>, role: SourceDatabaseConnectionRole) {
         if role.uses_read_only_connection() {
             return;
         }
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &super::database_path_for(root.as_ref()),
-            "source_db",
-            role.label(),
+        // This compatibility helper predates the profile-owned writer boundary and has no
+        // retained connection to which a checkpoint can be safely attached. Mutating a database
+        // by reopening this pathname would bypass the retained profile/root identity checks, so
+        // all production checkpoint calls now go through `maybe_checkpoint_owned_wal` below.
+        tracing::debug!(
+            target: "perf::source_db",
+            root = %root.as_ref().display(),
+            role = role.label(),
+            "Skipping WAL checkpoint without an owned source connection"
         );
+    }
+
+    /// Attempt the shared WAL maintenance policy through this retained source connection.
+    ///
+    /// The post-commit owner check keeps a replaced profile/database child from triggering any
+    /// maintenance after the write boundary has become invalid. A failed check is deliberately
+    /// ignored here: the data transaction has already committed, so the maintenance is simply
+    /// skipped rather than reported as a write failure.
+    pub(super) fn maybe_checkpoint_owned_wal(&self) {
+        if self.validate_profile_owned_mutation().is_ok() {
+            crate::sqlite_wal::maybe_checkpoint_database_file(
+                &self.connection,
+                &self.db_path,
+                "source_db",
+                self.telemetry_label,
+            );
+        }
     }
 
     fn apply_pragmas(&self, busy_timeout_ms: u64) -> Result<(), SourceDbError> {

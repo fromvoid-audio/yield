@@ -175,6 +175,20 @@ the durable physical-source identity, lease, expiry, stale-worker fencing and
 independent source-conflict implementation. An unavailable profile must never
 be mislabeled as a source-lease conflict.
 
+Source write batches now revalidate retained profile/database-child ownership
+before `BEGIN` and immediately before commit. Direct content/manifest audit,
+directory cleanup, and source file-journal mutations use the same checks.
+Replacement during a batch rejects commit and rolls back metadata and revision
+changes. WAL maintenance uses the already-owned connection and skips maintenance
+when post-commit ownership validation fails; the legacy path-only checkpoint
+entrypoint is deprecated and performs no writes. This does not yet validate a
+physical source lease or database-file identity. Readiness mutation APIs accepting
+raw connections still require a guard-bearing contract.
+
+The addition passed 283 source database tests, including four ownership
+regressions, plus two WAL tests and GPUI compilation on macOS. Windows CI now
+includes the portable ownership and WAL regressions; its result is pending.
+
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
 operation admission, checkpointing, and recovery execution remain requirements

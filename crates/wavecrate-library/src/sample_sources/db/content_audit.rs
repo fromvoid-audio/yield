@@ -160,6 +160,7 @@ impl SourceDatabase {
         now: i64,
         manifest_revision: u64,
     ) -> Result<ContentAuditCheckpoint, SourceDbError> {
+        self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
@@ -210,6 +211,7 @@ impl SourceDatabase {
                 },
             )
             .map_err(map_sql_error)?;
+        self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)?;
         Ok(checkpoint)
     }

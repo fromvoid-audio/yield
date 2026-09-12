@@ -1,10 +1,18 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tempfile::TempDir;
 
-use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
-use crate::sample_sources::db::SourceDirectoryTruthState;
+use super::helpers::revision_value;
+use crate::app_dirs::{
+    ConfigBaseGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
+};
+use crate::sample_sources::db::file_ops_journal::{CopyJournalEntryInit, FileOpJournalEntry};
+use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthState};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
@@ -30,7 +38,6 @@ impl CurationFixture {
         Self::new_with_profile_child(None)
     }
 
-    #[cfg(unix)]
     fn new_profile_bound() -> Self {
         Self::new_with_profile_child(Some(PathBuf::from("curation-profile-bound")))
     }
@@ -111,6 +118,30 @@ impl CurationFixture {
             &self.root_identity,
             updates,
         )
+    }
+}
+
+/// Test-only binding whose retained identity can be invalidated on every host.
+///
+/// Unix tests below exercise actual profile-child replacement. This seam keeps the same
+/// profile-bound database path while proving the mutation fence does not depend on a particular
+/// platform's rename semantics.
+struct ControllableDatabaseRootBinding {
+    valid: Arc<AtomicBool>,
+}
+
+impl DatabaseRootBindingGuard for ControllableDatabaseRootBinding {
+    fn validate_profile_guard(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), ProfileOwnershipError> {
+        if self.valid.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(ProfileOwnershipError::ProfileRootReplaced {
+                path: profile_guard.profile_root().to_path_buf(),
+            })
+        }
     }
 }
 
@@ -787,6 +818,155 @@ fn profile_bound_curation_rejects_replaced_database_child_atomically() {
     );
     assert_eq!(continuity_state(&fixture.database), initial_continuity);
     assert!(child_path.join("sentinel").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_mutation_guard_rejects_replaced_profile_root_before_batch() {
+    let fixture = CurationFixture::new_profile_bound();
+    let profile_root = fixture.profile_guard.profile_root().to_path_buf();
+    let displaced = profile_root.with_file_name("curation-profile-root-moved");
+    std::fs::rename(&profile_root, &displaced).expect("orphan retained profile root");
+    std::fs::create_dir(&profile_root).expect("replacement profile root");
+
+    let result = fixture.database.write_batch();
+    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert_eq!(revision_value(&fixture.database), fixture.revision as i64);
+}
+
+#[test]
+fn profile_mutation_guard_enforces_begin_and_commit_on_all_platforms() {
+    let mut fixture = CurationFixture::new_profile_bound();
+    let valid = Arc::new(AtomicBool::new(true));
+    fixture.database =
+        fixture
+            .database
+            .retain_database_root_binding(Arc::new(ControllableDatabaseRootBinding {
+                valid: Arc::clone(&valid),
+            }));
+
+    let before_revision = revision_value(&fixture.database);
+    let before_tag = fixture
+        .database
+        .entry_for_path(Path::new("one.wav"))
+        .unwrap()
+        .unwrap()
+        .tag;
+    valid.store(false, Ordering::SeqCst);
+    let result = fixture.database.write_batch();
+    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert_eq!(revision_value(&fixture.database), before_revision);
+
+    valid.store(true, Ordering::SeqCst);
+    let mut batch = fixture.database.write_batch().expect("profile-owned batch");
+    batch
+        .set_tag(Path::new("one.wav"), Rating::KEEP_1)
+        .expect("metadata mutation");
+    valid.store(false, Ordering::SeqCst);
+    let result = batch.commit();
+    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert_eq!(revision_value(&fixture.database), before_revision);
+    assert_eq!(
+        fixture
+            .database
+            .entry_for_path(Path::new("one.wav"))
+            .unwrap()
+            .unwrap()
+            .tag,
+        before_tag
+    );
+
+    valid.store(true, Ordering::SeqCst);
+    fixture
+        .database
+        .set_tag(Path::new("one.wav"), Rating::KEEP_1)
+        .expect("valid profile-owned write");
+    assert_eq!(
+        fixture
+            .database
+            .entry_for_path(Path::new("one.wav"))
+            .unwrap()
+            .unwrap()
+            .tag,
+        Rating::KEEP_1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_mutation_guard_rolls_back_batch_after_database_child_replacement() {
+    let fixture = CurationFixture::new_profile_bound();
+    let profile_child = fixture.profile_child.as_ref().expect("profile-bound child");
+    let child_path = fixture.profile_guard.profile_root().join(profile_child);
+    let moved_path = fixture
+        .profile_guard
+        .profile_root()
+        .join("curation-profile-mid-batch-moved");
+    let before_revision = revision_value(&fixture.database);
+    let before_tag = fixture
+        .database
+        .entry_for_path(Path::new("one.wav"))
+        .unwrap()
+        .unwrap()
+        .tag;
+
+    let mut batch = fixture.database.write_batch().expect("profile-owned batch");
+    batch
+        .set_tag(Path::new("one.wav"), Rating::KEEP_1)
+        .expect("metadata mutation");
+    std::fs::rename(&child_path, &moved_path).expect("orphan retained database child");
+    std::fs::create_dir(&child_path).expect("replacement database child");
+
+    let result = batch.commit();
+    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert_eq!(revision_value(&fixture.database), before_revision);
+    assert_eq!(
+        fixture
+            .database
+            .entry_for_path(Path::new("one.wav"))
+            .unwrap()
+            .unwrap()
+            .tag,
+        before_tag
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_mutation_guard_rejects_direct_journal_insert_after_child_replacement() {
+    let fixture = CurationFixture::new_profile_bound();
+    let profile_child = fixture.profile_child.as_ref().expect("profile-bound child");
+    let child_path = fixture.profile_guard.profile_root().join(profile_child);
+    let moved_path = fixture
+        .profile_guard
+        .profile_root()
+        .join("curation-profile-journal-moved");
+    std::fs::rename(&child_path, &moved_path).expect("orphan retained database child");
+    std::fs::create_dir(&child_path).expect("replacement database child");
+
+    let entry = FileOpJournalEntry::new_copy(
+        String::from("profile-guard-journal"),
+        CopyJournalEntryInit {
+            target_relative: PathBuf::from("target.wav"),
+            staged_relative: PathBuf::from(".wavecrate-staged-target.wav"),
+            tag: Rating::KEEP_1,
+            looped: false,
+            locked: false,
+            last_played_at: None,
+            last_curated_at: None,
+        },
+    )
+    .expect("journal entry");
+
+    let result =
+        crate::sample_sources::db::file_ops_journal::insert_entry(&fixture.database, &entry);
+    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert!(
+        crate::sample_sources::db::file_ops_journal::list_entries(&fixture.database)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
 }
 
 #[test]

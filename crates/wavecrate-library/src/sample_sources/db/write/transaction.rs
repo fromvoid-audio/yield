@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
@@ -56,6 +56,14 @@ enum DirectoryTruthActivationMode {
 }
 
 impl SourceWriteBatch<'_> {
+    /// Revalidate the retained source owner immediately before committing this transaction.
+    ///
+    /// The transaction is rolled back by its drop guard when the profile root or database child
+    /// was replaced while the batch was open.
+    pub(super) fn validate_profile_owned_mutation(&self) -> Result<(), SourceDbError> {
+        self.owner.validate_profile_owned_mutation()
+    }
+
     /// Borrow the active SQLite transaction for the narrow curation commit path.
     pub(super) fn curation_transaction(&self) -> &rusqlite::Transaction<'_> {
         &self.tx
@@ -72,10 +80,10 @@ impl SourceWriteBatch<'_> {
         {
             return Err(SourceDbError::Unexpected);
         }
-        let db_path = self.db_path.clone();
-        let telemetry_label = self.telemetry_label;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
+        owner.maybe_checkpoint_owned_wal();
         Ok(())
     }
 
@@ -279,10 +287,10 @@ impl SourceWriteBatch<'_> {
             expected_source_revision,
             DirectoryTruthActivationMode::AllowIdempotent,
         )?;
-        let db_path = batch.db_path.clone();
-        let telemetry_label = batch.telemetry_label;
+        let owner = batch.owner;
+        batch.validate_profile_owned_mutation()?;
         batch.tx.commit().map_err(map_sql_error)?;
-        checkpoint_source_database(&db_path, telemetry_label);
+        owner.maybe_checkpoint_owned_wal();
         Ok(publication)
     }
 
@@ -313,10 +321,10 @@ impl SourceWriteBatch<'_> {
             return Err(SourceDbError::Unexpected);
         }
 
-        let db_path = self.db_path.clone();
-        let telemetry_label = self.telemetry_label;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        checkpoint_source_database(&db_path, telemetry_label);
+        owner.maybe_checkpoint_owned_wal();
         Ok(SourceDirectoryTruthCommitResult {
             publication,
             manifest_snapshot,
@@ -537,12 +545,10 @@ impl SourceWriteBatch<'_> {
     /// Commit all batched operations atomically.
     pub fn commit(self) -> Result<(), SourceDbError> {
         self.prepare_commit()?;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &self.db_path,
-            "source_db",
-            self.telemetry_label,
-        );
+        owner.maybe_checkpoint_owned_wal();
         Ok(())
     }
 
@@ -561,12 +567,10 @@ impl SourceWriteBatch<'_> {
         if self.index_revision_dirty {
             SourceDatabase::bump_source_index_revision(&self.tx)?;
         }
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &self.db_path,
-            "source_db",
-            self.telemetry_label,
-        );
+        owner.maybe_checkpoint_owned_wal();
         Ok(())
     }
 
@@ -580,12 +584,10 @@ impl SourceWriteBatch<'_> {
     ) -> Result<(u64, Vec<SourceManifestEntry>), SourceDbError> {
         self.prepare_commit()?;
         let snapshot = manifest_snapshot(&self.tx)?;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &self.db_path,
-            "source_db",
-            self.telemetry_label,
-        );
+        owner.maybe_checkpoint_owned_wal();
         Ok(snapshot)
     }
 
@@ -605,12 +607,10 @@ impl SourceWriteBatch<'_> {
         }
         self.prepare_commit()?;
         let (revision, snapshot) = manifest_snapshot(&self.tx)?;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &self.db_path,
-            "source_db",
-            self.telemetry_label,
-        );
+        owner.maybe_checkpoint_owned_wal();
         Ok((
             SourceAuditCommit::new(revision, committed_root_identity, audit_request.cloned()),
             snapshot,
@@ -657,10 +657,10 @@ impl SourceWriteBatch<'_> {
             META_LAST_AUTHORITATIVE_AUDIT_REVISION,
             &revision.to_string(),
         )?;
-        let db_path = self.db_path.clone();
-        let telemetry_label = self.telemetry_label;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
+        owner.maybe_checkpoint_owned_wal();
         Ok((
             SourceAuditCommit::new(revision, committed_root_identity, audit_request.cloned()),
             snapshot,
@@ -696,12 +696,10 @@ impl SourceWriteBatch<'_> {
             let (_, snapshot) = manifest_snapshot(&self.tx)?;
             (Vec::new(), Some(snapshot))
         };
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &self.db_path,
-            "source_db",
-            self.telemetry_label,
-        );
+        owner.maybe_checkpoint_owned_wal();
         Ok(ManifestCommitResult {
             revision,
             touched_path_changes: changes,
@@ -734,12 +732,10 @@ impl SourceWriteBatch<'_> {
                 Ok((normalized, entry))
             })
             .collect::<Result<Vec<_>, SourceDbError>>()?;
+        let owner = self.owner;
+        self.validate_profile_owned_mutation()?;
         self.tx.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(
-            &self.db_path,
-            "source_db",
-            self.telemetry_label,
-        );
+        owner.maybe_checkpoint_owned_wal();
         Ok(ManifestCommitResult {
             revision,
             touched_path_changes: changes,
@@ -962,10 +958,6 @@ fn validate_generation_counts(
         .into());
     }
     Ok(())
-}
-
-fn checkpoint_source_database(db_path: &Path, telemetry_label: &'static str) {
-    crate::sqlite_wal::maybe_checkpoint_database_file(db_path, "source_db", telemetry_label);
 }
 
 fn manifest_snapshot(

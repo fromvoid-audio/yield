@@ -354,6 +354,7 @@ impl SourceDatabase {
                 more_work: true,
             });
         }
+        self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
@@ -414,10 +415,9 @@ impl SourceDatabase {
                 )
                 .map_err(map_sql_error)?
         };
-        let db_path = self.db_path.clone();
-        let telemetry_label = self.telemetry_label;
+        self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
+        self.maybe_checkpoint_owned_wal();
         Ok(SourceDirectoryTruthCleanup {
             deleted_entries: usize::try_from(deleted_entries)
                 .map_err(|_| SourceDbError::Unexpected)?,
@@ -602,6 +602,7 @@ impl SourceDatabase {
                 more_work: self.has_inactive_directory_generations()?,
             });
         }
+        self.validate_profile_owned_mutation()?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
                 .map_err(map_sql_error)?;
@@ -689,10 +690,9 @@ impl SourceDatabase {
             )
             .map_err(map_sql_error)?
             != 0;
-        let db_path = self.db_path.clone();
-        let telemetry_label = self.telemetry_label;
+        self.validate_profile_owned_mutation()?;
         transaction.commit().map_err(map_sql_error)?;
-        crate::sqlite_wal::maybe_checkpoint_database_file(&db_path, "source_db", telemetry_label);
+        self.maybe_checkpoint_owned_wal();
         Ok(SourceDirectoryTruthCleanup {
             deleted_entries,
             deleted_generations,
