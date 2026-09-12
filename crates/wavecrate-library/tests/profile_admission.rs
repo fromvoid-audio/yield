@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use rusqlite::Connection;
 use tempfile::{TempDir, tempdir};
 use wavecrate_library::sample_sources::db::file_ops_journal;
 use wavecrate_library::{
@@ -11,6 +12,10 @@ use wavecrate_library::{
     sample_sources::{
         DB_FILE_NAME, LibraryError, SourceDatabase, SourceDatabaseConnectionRole, SourceDbError,
         library::{self, LibraryState},
+        readiness::{
+            ReadinessClassification, ReadinessDeficit, ReadinessError, ReadinessStage,
+            ReadinessStore, ReadinessTarget, ReadinessTargetPublication, SourceAvailability,
+        },
     },
 };
 
@@ -350,4 +355,164 @@ fn readonly_open_reports_missing_database_without_creating_one() {
             if path == source_root.path().join(DB_FILE_NAME)
     ));
     assert_no_source_database_files(&source_root);
+}
+
+#[test]
+fn readiness_ownership_raw_mutations_fail_without_side_effects() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path.clone()).expect("app root override");
+    let profile_child = "readiness-ownership";
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let mut database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        profile_child,
+    )
+    .expect("profile-owned source database");
+
+    let target = ReadinessTarget::source(
+        "readiness-ownership-source",
+        ReadinessStage::SimilarityLayout,
+        "layout-v1",
+        1,
+        "membership-v1",
+    );
+    let targets = [target.clone()];
+    let publication = ReadinessTargetPublication::new(
+        "readiness-ownership-source",
+        1,
+        1,
+        SourceAvailability::Active,
+        "readiness-contract-v1",
+        &targets,
+        1,
+    );
+
+    {
+        let mut owned_store = database.readiness_store().expect("owned readiness store");
+        owned_store
+            .publish_targets(&publication)
+            .expect("owned readiness publication");
+        owned_store
+            .persist_deficits(
+                &[ReadinessDeficit {
+                    target: target.clone(),
+                    reason: ReadinessClassification::Pending,
+                    enqueued_at: None,
+                }],
+                1,
+            )
+            .expect("owned readiness work queue");
+        assert!(
+            owned_store
+                .source_exists("readiness-ownership-source")
+                .expect("read readiness source")
+        );
+    }
+
+    let database_path = app_root_path.join(profile_child).join(DB_FILE_NAME);
+    let mut raw_connection = Connection::open(&database_path).expect("raw readiness connection");
+    let row_count = |connection: &Connection| {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_readiness_sources WHERE source_id = ?1",
+                ["readiness-ownership-source"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read readiness row count")
+    };
+    assert_eq!(row_count(&raw_connection), 1);
+    {
+        let mut raw_store = ReadinessStore::new(&mut raw_connection);
+        assert!(
+            raw_store
+                .source_exists("readiness-ownership-source")
+                .expect("raw readiness existence query")
+        );
+        assert_eq!(
+            raw_store
+                .source_state("readiness-ownership-source")
+                .expect("raw readiness state query")
+                .expect("raw readiness source state")
+                .availability,
+            SourceAvailability::Active
+        );
+    }
+
+    let raw_publish_error = ReadinessStore::new(&mut raw_connection)
+        .publish_targets(&publication)
+        .expect_err("raw readiness publication must require profile ownership");
+    assert!(matches!(
+        raw_publish_error,
+        ReadinessError::OwnershipRequired
+    ));
+    assert_eq!(row_count(&raw_connection), 1);
+
+    let job_state = |connection: &Connection| {
+        connection
+            .query_row(
+                "SELECT status, readiness_claim_generation, lease_expires_at
+                 FROM analysis_jobs
+                 WHERE source_id = ?1
+                   AND readiness_managed = 1
+                   AND readiness_scope_kind = 'source'
+                   AND readiness_scope_id = ?1
+                   AND readiness_stage = 'similarity_layout'",
+                ["readiness-ownership-source"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .expect("read readiness claim state")
+    };
+    let pending_job_state = job_state(&raw_connection);
+    assert_eq!(
+        pending_job_state,
+        (String::from("pending"), 0, None),
+        "published target should start unclaimed"
+    );
+    let raw_claim_error = ReadinessStore::new(&mut raw_connection)
+        .claim(&targets[0], 4, 60)
+        .expect_err("raw readiness claim must require profile ownership");
+    assert!(matches!(raw_claim_error, ReadinessError::OwnershipRequired));
+    assert_eq!(
+        job_state(&raw_connection),
+        pending_job_state,
+        "rejected raw claim must not change durable claim state"
+    );
+
+    let raw_error = ReadinessStore::new(&mut raw_connection)
+        .mark_temporarily_unavailable("readiness-ownership-source", 2)
+        .expect_err("raw readiness mutation must require profile ownership");
+    assert!(matches!(raw_error, ReadinessError::OwnershipRequired));
+    assert_eq!(row_count(&raw_connection), 1);
+    assert_eq!(
+        raw_connection
+            .query_row(
+                "SELECT availability FROM source_readiness_sources WHERE source_id = ?1",
+                ["readiness-ownership-source"],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read unchanged readiness state"),
+        "active"
+    );
+
+    let mut owned_store = database.readiness_store().expect("owned readiness store");
+    owned_store
+        .mark_temporarily_unavailable("readiness-ownership-source", 3)
+        .expect("owned readiness mutation");
+    assert_eq!(
+        owned_store
+            .source_state("readiness-ownership-source")
+            .expect("read owned readiness state")
+            .expect("source state")
+            .availability,
+        SourceAvailability::Offline
+    );
 }

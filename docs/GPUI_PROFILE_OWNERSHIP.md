@@ -182,14 +182,27 @@ Replacement during a batch rejects commit and rolls back metadata and revision
 changes. WAL maintenance uses the already-owned connection and skips maintenance
 when post-commit ownership validation fails; the legacy path-only checkpoint
 entrypoint is deprecated and performs no writes. This does not yet validate a
-physical source lease or database-file identity. Readiness mutation APIs accepting
-raw connections still require a guard-bearing contract.
+physical source lease or database-file identity.
 
 The addition passed 283 source database tests, including four ownership
 regressions, plus two WAL tests and GPUI compilation on macOS. Windows CI now
 includes the portable ownership and WAL regressions. After gating Unix-only test
 imports, Windows storage validation passed on `449082c4d` in
 [`34713357213`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34713357213).
+
+Readiness writes now borrow the retained ownership context through
+`SourceDatabase::readiness_store()`. Publication, work claims and completion,
+artifact invalidation, and cleanup validate ownership before transactions and
+before commit. In production builds, a raw `ReadinessStore::new` connection can
+serve queries but returns `OwnershipRequired` for mutations. Fixture-only
+unowned writes remain gated behind tests or `test-support`.
+
+Validation passed 52 readiness tests in normal and test-support builds, the
+production admission regression, and GPUI compilation. The ownership regression
+invalidates the retained binding from a SQLite update hook after a real row
+write and verifies rollback. Windows CI includes that portable regression;
+Windows validation for this addition is pending. These checks establish profile
+ownership, not physical source lease or main database-file identity authority.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable

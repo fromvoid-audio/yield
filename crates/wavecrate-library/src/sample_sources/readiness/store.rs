@@ -22,6 +22,7 @@ use super::{
     ReadinessRetryPolicy, ReadinessSnapshot, ReadinessStage, ReadinessTarget,
     ReadinessWorkMutationOutcome, ReadinessWorkStats, SourceAvailability,
 };
+use crate::sample_sources::db::ReadinessOwnership;
 use crate::sample_sources::readiness::ArtifactPublishOutcome;
 
 /// Typed request for atomically publishing a source's complete desired readiness set.
@@ -124,6 +125,7 @@ pub enum ReadinessDeltaPublicationOutcome {
 /// exposes domain operations rather than readiness table access.
 pub struct ReadinessStore<'connection> {
     connection: &'connection mut Connection,
+    ownership: ReadinessOwnership<'connection>,
 }
 
 /// The result of an idempotent compatibility cleanup after its transaction commits.
@@ -152,8 +154,27 @@ pub struct ReadinessSourceState {
 
 impl<'connection> ReadinessStore<'connection> {
     /// Bind readiness persistence to one caller-selected source database connection.
+    ///
+    /// This constructor is suitable for read-only queries. In normal builds, mutation methods
+    /// return [`ReadinessError::OwnershipRequired`]; use
+    /// [`crate::sample_sources::db::SourceDatabase::readiness_store`]
+    /// through a profile-owned source database for writes.
     pub fn new(connection: &'connection mut Connection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            ownership: ReadinessOwnership::unowned(),
+        }
+    }
+
+    /// Bind readiness persistence to a source database's retained ownership context.
+    pub(crate) fn from_owned_connection(
+        connection: &'connection mut Connection,
+        ownership: ReadinessOwnership<'connection>,
+    ) -> Self {
+        Self {
+            connection,
+            ownership,
+        }
     }
 
     /// Atomically publish one complete, validated target generation.
@@ -161,8 +182,9 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         publication: &ReadinessTargetPublication<'_>,
     ) -> Result<(), ReadinessError> {
-        persistence::replace_readiness_targets_inner(
+        persistence::replace_readiness_targets_owned(
             self.connection,
+            &self.ownership,
             publication.source_id,
             publication.source_generation,
             publication.readiness_revision,
@@ -180,8 +202,9 @@ impl<'connection> ReadinessStore<'connection> {
         publication: &ReadinessTargetPublication<'_>,
         cancel: &AtomicBool,
     ) -> Result<(), ReadinessError> {
-        persistence::replace_readiness_targets_inner(
+        persistence::replace_readiness_targets_owned(
             self.connection,
+            &self.ownership,
             publication.source_id,
             publication.source_generation,
             publication.readiness_revision,
@@ -199,8 +222,9 @@ impl<'connection> ReadinessStore<'connection> {
         publication: &ReadinessTargetDeltaPublication<'_>,
         cancel: &AtomicBool,
     ) -> Result<ReadinessDeltaPublicationOutcome, ReadinessError> {
-        persistence::apply_readiness_target_delta_inner(
+        persistence::apply_readiness_target_delta_owned(
             self.connection,
+            &self.ownership,
             publication.source_id,
             publication.source_generation,
             publication.readiness_revision,
@@ -269,8 +293,9 @@ impl<'connection> ReadinessStore<'connection> {
         deficits: &[ReadinessDeficit],
         created_at: i64,
     ) -> Result<usize, ReadinessError> {
-        persistence::persist_readiness_deficits_inner(
+        persistence::persist_readiness_deficits_owned(
             self.connection,
+            &self.ownership,
             deficits,
             created_at,
             None,
@@ -286,8 +311,9 @@ impl<'connection> ReadinessStore<'connection> {
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(super::ReadinessProgress),
     ) -> Result<usize, ReadinessError> {
-        persistence::persist_readiness_deficits_inner(
+        persistence::persist_readiness_deficits_owned(
             self.connection,
+            &self.ownership,
             deficits,
             created_at,
             Some(cancel),
@@ -302,7 +328,13 @@ impl<'connection> ReadinessStore<'connection> {
         now: i64,
         lease_duration_seconds: i64,
     ) -> Result<Option<ClaimedReadinessWork>, ReadinessError> {
-        work::claim_readiness_target(self.connection, target, now, lease_duration_seconds)
+        work::claim_readiness_target_owned(
+            self.connection,
+            &self.ownership,
+            target,
+            now,
+            lease_duration_seconds,
+        )
     }
     /// Renew an active claim without changing its generation.
     pub fn renew_lease(
@@ -311,7 +343,13 @@ impl<'connection> ReadinessStore<'connection> {
         now: i64,
         lease_duration_seconds: i64,
     ) -> Result<ReadinessLeaseRenewalOutcome, ReadinessError> {
-        work::renew_readiness_lease(self.connection, claim, now, lease_duration_seconds)
+        work::renew_readiness_lease_owned(
+            self.connection,
+            &self.ownership,
+            claim,
+            now,
+            lease_duration_seconds,
+        )
     }
     /// Publish a claimed completion without an external artifact reference.
     pub fn complete(
@@ -319,7 +357,7 @@ impl<'connection> ReadinessStore<'connection> {
         claim: &ClaimedReadinessWork,
         completed_at: i64,
     ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-        work::complete_readiness_work(self.connection, claim, completed_at)
+        work::complete_readiness_work_owned(self.connection, &self.ownership, claim, completed_at)
     }
     /// Publish a claimed completion with its durable artifact reference.
     pub fn complete_with_artifact_ref(
@@ -328,8 +366,9 @@ impl<'connection> ReadinessStore<'connection> {
         completed_at: i64,
         artifact_ref: &str,
     ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-        work::complete_readiness_work_with_artifact_ref(
+        work::complete_readiness_work_with_artifact_ref_owned(
             self.connection,
+            &self.ownership,
             claim,
             completed_at,
             artifact_ref,
@@ -345,8 +384,9 @@ impl<'connection> ReadinessStore<'connection> {
         failed_at: i64,
         retry_policy: ReadinessRetryPolicy,
     ) -> Result<ReadinessFailureOutcome, ReadinessError> {
-        work::fail_readiness_work(
+        work::fail_readiness_work_owned(
             self.connection,
+            &self.ownership,
             claim,
             classification,
             code,
@@ -361,7 +401,7 @@ impl<'connection> ReadinessStore<'connection> {
         claim: &ClaimedReadinessWork,
         released_at: i64,
     ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-        work::release_readiness_work(self.connection, claim, released_at)
+        work::release_readiness_work_owned(self.connection, &self.ownership, claim, released_at)
     }
     /// Return a current claim to pending work with a cancellation diagnostic.
     pub fn cancel(
@@ -370,14 +410,20 @@ impl<'connection> ReadinessStore<'connection> {
         reason: &str,
         cancelled_at: i64,
     ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-        work::cancel_readiness_work(self.connection, claim, reason, cancelled_at)
+        work::cancel_readiness_work_owned(
+            self.connection,
+            &self.ownership,
+            claim,
+            reason,
+            cancelled_at,
+        )
     }
     /// Invalidate an exact artifact only when its target remains current.
     pub fn invalidate_artifact(
         &mut self,
         target: &ReadinessTarget,
     ) -> Result<bool, ReadinessError> {
-        persistence::invalidate_readiness_artifact(self.connection, target)
+        persistence::invalidate_readiness_artifact_owned(self.connection, &self.ownership, target)
     }
 
     /// Invalidate source-owned analysis outputs and requeue their exact current
@@ -387,7 +433,12 @@ impl<'connection> ReadinessStore<'connection> {
         source_id: &str,
         requested_at: i64,
     ) -> Result<usize, ReadinessError> {
-        persistence::requeue_source_analysis(self.connection, source_id, requested_at)
+        persistence::requeue_source_analysis_owned(
+            self.connection,
+            &self.ownership,
+            source_id,
+            requested_at,
+        )
     }
     /// Load queue and lease-recovery telemetry for the current durable work set.
     pub fn work_stats(&mut self, now: i64) -> Result<ReadinessWorkStats, ReadinessError> {
@@ -408,7 +459,7 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         artifact: &ReadinessArtifact,
     ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-        persistence::publish_readiness_artifact(self.connection, artifact)
+        persistence::publish_readiness_artifact_owned(self.connection, &self.ownership, artifact)
     }
 
     /// Whether the readiness schema required for source processing is present.
@@ -547,10 +598,14 @@ impl<'connection> ReadinessStore<'connection> {
         source_id: &str,
         now: i64,
     ) -> Result<(), ReadinessError> {
-        self.connection.execute(
+        self.ownership.validate()?;
+        let tx = self.connection.transaction()?;
+        tx.execute(
             "UPDATE source_readiness_sources SET availability = 'offline', readiness_revision = readiness_revision + 1, updated_at = ?2 WHERE source_id = ?1 AND availability != 'offline'",
             params![source_id, now],
         )?;
+        self.ownership.validate()?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -559,12 +614,16 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         scope_ids: &BTreeSet<String>,
     ) -> Result<(), ReadinessError> {
+        self.ownership.validate()?;
+        let tx = self.connection.transaction()?;
         for scope_id in scope_ids {
-            self.connection.execute(
+            tx.execute(
                 "DELETE FROM analysis_jobs WHERE readiness_managed = 1 AND readiness_scope_id = ?1 AND status != 'running'",
                 [scope_id],
             )?;
         }
+        self.ownership.validate()?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -596,6 +655,7 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         is_unsupported: impl Fn(&str) -> bool,
     ) -> Result<usize, ReadinessError> {
+        self.ownership.validate()?;
         let failures = {
             let mut statement = self.connection.prepare(
                 "SELECT id, COALESCE(last_error, '') FROM analysis_jobs WHERE readiness_managed = 1 AND status = 'failed' AND failure_code IS NULL AND failure_kind IN ('retryable', 'permanent')",
@@ -606,6 +666,7 @@ impl<'connection> ReadinessStore<'connection> {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        self.ownership.validate()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -621,6 +682,7 @@ impl<'connection> ReadinessStore<'connection> {
         changed += tx.execute(
             "UPDATE analysis_jobs AS dependent SET failure_kind = 'unsupported', failure_code = 'legacy_prerequisite_unsupported', retry_at = NULL WHERE dependent.readiness_managed = 1 AND dependent.status = 'failed' AND dependent.failure_code IS NULL AND dependent.failure_kind IN ('retryable', 'permanent') AND dependent.readiness_stage = 'embedding_aspects' AND dependent.last_error = 'embedding feature prerequisite is not durable yet' AND EXISTS (SELECT 1 FROM analysis_jobs AS prerequisite WHERE prerequisite.readiness_managed = 1 AND prerequisite.source_id = dependent.source_id AND prerequisite.readiness_scope_kind = dependent.readiness_scope_kind AND prerequisite.readiness_scope_id = dependent.readiness_scope_id AND prerequisite.readiness_stage = 'analysis_features' AND prerequisite.content_generation = dependent.content_generation AND prerequisite.status = 'failed' AND prerequisite.failure_kind = 'unsupported')", [],
         )?;
+        self.ownership.validate()?;
         tx.commit()?;
         Ok(changed)
     }
@@ -630,6 +692,7 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         source_id: &str,
     ) -> Result<ReadinessCompatibilityCleanup, ReadinessError> {
+        self.ownership.validate()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -642,6 +705,7 @@ impl<'connection> ReadinessStore<'connection> {
         let mut changed = tx.execute("DELETE FROM analysis_jobs WHERE source_id = ?1 AND readiness_managed = 1 AND readiness_stage = 'playback_summary'", [source_id])?;
         changed += tx.execute("DELETE FROM source_readiness_artifacts WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
         changed += tx.execute("DELETE FROM source_readiness_targets WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
+        self.ownership.validate()?;
         tx.commit()?;
         Ok(ReadinessCompatibilityCleanup {
             changed,
@@ -655,6 +719,7 @@ impl<'connection> ReadinessStore<'connection> {
         source_id: &str,
         now: i64,
     ) -> Result<ReadinessCompatibilityCleanup, ReadinessError> {
+        self.ownership.validate()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -671,6 +736,7 @@ impl<'connection> ReadinessStore<'connection> {
         )?;
         changed += tx.execute("DELETE FROM source_readiness_artifacts WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
         changed += tx.execute("DELETE FROM source_readiness_targets WHERE source_id = ?1 AND stage = 'playback_summary'", [source_id])?;
+        self.ownership.validate()?;
         tx.commit()?;
         Ok(ReadinessCompatibilityCleanup {
             changed,

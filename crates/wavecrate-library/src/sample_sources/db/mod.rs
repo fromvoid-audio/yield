@@ -161,6 +161,51 @@ pub(crate) trait DatabaseRootBindingGuard: Send + Sync {
     ) -> Result<(), ProfileOwnershipError>;
 }
 
+/// Borrowed ownership context for readiness mutations.
+///
+/// This context deliberately borrows the capabilities retained by a [`SourceDatabase`] rather
+/// than cloning or reacquiring them. A raw readiness connection can still serve read queries, but
+/// it has no context that can authorize a mutation in a normal build.
+pub(crate) struct ReadinessOwnership<'a> {
+    profile_guard: Option<&'a WritableProfileGuard>,
+    database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
+}
+
+impl<'a> ReadinessOwnership<'a> {
+    pub(crate) fn new(
+        profile_guard: Option<&'a WritableProfileGuard>,
+        database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
+    ) -> Self {
+        Self {
+            profile_guard,
+            database_root_binding,
+        }
+    }
+
+    pub(crate) fn unowned() -> Self {
+        Self::new(None, None)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
+        match (self.profile_guard, self.database_root_binding) {
+            (Some(profile_guard), Some(database_root_binding)) => database_root_binding
+                .validate_profile_guard(profile_guard)
+                .map_err(crate::sample_sources::readiness::ReadinessError::ProfileOwnership),
+            (None, None) => {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    Ok(())
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired)
+                }
+            }
+            _ => Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired),
+        }
+    }
+}
+
 /// SQLite wrapper that stores wav metadata for a single source folder.
 pub struct SourceDatabase {
     connection: Connection,
@@ -209,6 +254,28 @@ pub struct SourceWriteBatch<'conn> {
 }
 
 impl SourceDatabase {
+    /// Borrow a readiness store authorized by this database's retained profile ownership.
+    ///
+    /// The returned store borrows both the SQLite connection and the retained profile/database
+    /// capabilities. Mutations revalidate those capabilities before beginning work and before
+    /// committing it; a raw [`crate::sample_sources::readiness::ReadinessStore::new`] store
+    /// remains suitable for read-only queries and fails closed for mutations in normal builds.
+    pub fn readiness_store(
+        &mut self,
+    ) -> Result<crate::sample_sources::readiness::ReadinessStore<'_>, SourceDbError> {
+        self.validate_profile_owned_mutation()?;
+        let ownership = ReadinessOwnership::new(
+            self.profile_guard.as_ref(),
+            self.database_root_binding.as_deref(),
+        );
+        Ok(
+            crate::sample_sources::readiness::ReadinessStore::from_owned_connection(
+                &mut self.connection,
+                ownership,
+            ),
+        )
+    }
+
     /// Read the identity and exact revision of the last complete manifest audit.
     ///
     /// Both values are written by the same audit transaction. A partially present or malformed

@@ -5,6 +5,7 @@ use tempfile::tempdir;
 
 mod metadata;
 mod opening;
+mod readiness;
 mod snapshot;
 
 fn with_home_env_override<T>(home: &Path, test: impl FnOnce() -> T) -> T {

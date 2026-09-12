@@ -5,6 +5,12 @@ use super::super::model::{ReadinessScopeKind, ReadinessStage};
 /// Errors returned by the durable readiness contract.
 #[derive(Debug, Error)]
 pub enum ReadinessError {
+    /// A readiness mutation was attempted without a retained profile-owned database context.
+    #[error("Readiness mutation requires retained profile ownership")]
+    OwnershipRequired,
+    /// The retained profile-owned database context no longer matches its acquired identities.
+    #[error("Readiness profile ownership validation failed: {0}")]
+    ProfileOwnership(#[from] crate::app_dirs::ProfileOwnershipError),
     /// The caller cancelled a potentially long readiness database operation.
     #[error("Readiness operation cancelled")]
     Cancelled,

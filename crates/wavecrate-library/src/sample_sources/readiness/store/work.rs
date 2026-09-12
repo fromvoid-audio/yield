@@ -8,6 +8,7 @@ use super::super::model::{
 };
 use super::super::snapshot::ArtifactPublishOutcome;
 use super::error::ReadinessError;
+use crate::sample_sources::db::ReadinessOwnership;
 
 pub(crate) fn readiness_generation_is_known_unsupported(
     connection: &Connection,
@@ -46,12 +47,30 @@ pub(crate) fn readiness_generation_is_known_unsupported(
 /// File targets remain claimable across unrelated source-generation changes when their stable
 /// identity, stage, artifact version, and content generation are unchanged. The returned target is
 /// always refreshed from the current desired-state row.
+#[cfg(test)]
 pub(crate) fn claim_readiness_target(
     connection: &mut Connection,
     requested: &ReadinessTarget,
     now: i64,
     lease_duration_seconds: i64,
 ) -> Result<Option<ClaimedReadinessWork>, ReadinessError> {
+    claim_readiness_target_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        requested,
+        now,
+        lease_duration_seconds,
+    )
+}
+
+pub(super) fn claim_readiness_target_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    requested: &ReadinessTarget,
+    now: i64,
+    lease_duration_seconds: i64,
+) -> Result<Option<ClaimedReadinessWork>, ReadinessError> {
+    ownership.validate()?;
     let lease_expires_at = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let candidate = tx
@@ -172,6 +191,7 @@ pub(crate) fn claim_readiness_target(
         eligibility,
     )) = candidate
     else {
+        ownership.validate()?;
         tx.commit()?;
         return Ok(None);
     };
@@ -221,6 +241,7 @@ pub(crate) fn claim_readiness_target(
         content_generation: requested.content_generation.clone(),
         eligibility: decode_eligibility(eligibility)?,
     };
+    ownership.validate()?;
     tx.commit()?;
     Ok(Some(ClaimedReadinessWork {
         target,
@@ -232,12 +253,30 @@ pub(crate) fn claim_readiness_target(
 }
 
 /// Renew an unexpired claim without changing its claim generation.
+#[cfg(test)]
 pub(crate) fn renew_readiness_lease(
     connection: &mut Connection,
     claim: &ClaimedReadinessWork,
     now: i64,
     lease_duration_seconds: i64,
 ) -> Result<ReadinessLeaseRenewalOutcome, ReadinessError> {
+    renew_readiness_lease_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        claim,
+        now,
+        lease_duration_seconds,
+    )
+}
+
+pub(super) fn renew_readiness_lease_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    now: i64,
+    lease_duration_seconds: i64,
+) -> Result<ReadinessLeaseRenewalOutcome, ReadinessError> {
+    ownership.validate()?;
     let requested_deadline = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let changed = tx.execute(
@@ -315,29 +354,63 @@ pub(crate) fn renew_readiness_lease(
         ],
         |row| row.get(0),
     )?;
+    ownership.validate()?;
     tx.commit()?;
     Ok(ReadinessLeaseRenewalOutcome::Renewed { lease_expires_at })
 }
 
 /// Atomically publish the exact claimed artifact and mark its work row complete.
+#[cfg(test)]
 pub(crate) fn complete_readiness_work(
     connection: &mut Connection,
     claim: &ClaimedReadinessWork,
     completed_at: i64,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    complete_readiness_work_inner(connection, claim, completed_at, None)
+    complete_readiness_work_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        claim,
+        completed_at,
+    )
+}
+
+pub(super) fn complete_readiness_work_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    completed_at: i64,
+) -> Result<ArtifactPublishOutcome, ReadinessError> {
+    complete_readiness_work_inner(connection, ownership, claim, completed_at, None)
 }
 
 /// Atomically publish a cache-backed artifact reference and mark its exact work row complete.
 ///
 /// The reference is stored beside the source/path/content generations so later reconciliation can
 /// retire the exact app-global payload after edits, moves, deletion, or cache pruning.
+#[cfg(test)]
 pub(crate) fn complete_readiness_work_with_artifact_ref(
     connection: &mut Connection,
     claim: &ClaimedReadinessWork,
     completed_at: i64,
     artifact_ref: &str,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
+    complete_readiness_work_with_artifact_ref_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        claim,
+        completed_at,
+        artifact_ref,
+    )
+}
+
+pub(super) fn complete_readiness_work_with_artifact_ref_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    completed_at: i64,
+    artifact_ref: &str,
+) -> Result<ArtifactPublishOutcome, ReadinessError> {
+    ownership.validate()?;
     if artifact_ref.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactReference {
             source_id: claim.target.source_id.clone(),
@@ -345,15 +418,23 @@ pub(crate) fn complete_readiness_work_with_artifact_ref(
             stage: claim.target.stage,
         });
     }
-    complete_readiness_work_inner(connection, claim, completed_at, Some(artifact_ref))
+    complete_readiness_work_inner(
+        connection,
+        ownership,
+        claim,
+        completed_at,
+        Some(artifact_ref),
+    )
 }
 
 fn complete_readiness_work_inner(
     connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
     claim: &ClaimedReadinessWork,
     completed_at: i64,
     artifact_ref: Option<&str>,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
+    ownership.validate()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let changed = finish_claim_update(
         &tx,
@@ -394,11 +475,13 @@ fn complete_readiness_work_inner(
             artifact.completed_at,
         ],
     )?;
+    ownership.validate()?;
     tx.commit()?;
     Ok(ArtifactPublishOutcome::Recorded)
 }
 
 /// Record a classified failure, applying bounded backoff to retryable failures.
+#[cfg(test)]
 pub(crate) fn fail_readiness_work(
     connection: &mut Connection,
     claim: &ClaimedReadinessWork,
@@ -408,6 +491,29 @@ pub(crate) fn fail_readiness_work(
     failed_at: i64,
     retry_policy: ReadinessRetryPolicy,
 ) -> Result<ReadinessFailureOutcome, ReadinessError> {
+    fail_readiness_work_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        claim,
+        classification,
+        code,
+        reason,
+        failed_at,
+        retry_policy,
+    )
+}
+
+pub(super) fn fail_readiness_work_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    classification: ReadinessFailureClassification,
+    code: &str,
+    reason: &str,
+    failed_at: i64,
+    retry_policy: ReadinessRetryPolicy,
+) -> Result<ReadinessFailureOutcome, ReadinessError> {
+    ownership.validate()?;
     let failure_attempt = match classification {
         ReadinessFailureClassification::Retryable => Some(
             claim
@@ -470,6 +576,7 @@ pub(crate) fn fail_readiness_work(
     if stored_classification == ReadinessFailureClassification::Unsupported {
         apply_unsupported_target_delta(&tx, claim, failed_at)?;
     }
+    ownership.validate()?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -582,23 +689,57 @@ fn apply_unsupported_target_delta(
 }
 
 /// Voluntarily release a current claim back to pending without deleting durable work.
+#[cfg(test)]
 pub(crate) fn release_readiness_work(
     connection: &mut Connection,
     claim: &ClaimedReadinessWork,
     released_at: i64,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-    return_claim_to_pending(connection, claim, released_at, None)
+    release_readiness_work_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        claim,
+        released_at,
+    )
+}
+
+pub(super) fn release_readiness_work_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    released_at: i64,
+) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
+    return_claim_to_pending_owned(connection, ownership, claim, released_at, None)
 }
 
 /// Cancel in-flight execution back to pending while retaining a cancellation diagnostic.
+#[cfg(test)]
 pub(crate) fn cancel_readiness_work(
     connection: &mut Connection,
     claim: &ClaimedReadinessWork,
     reason: &str,
     cancelled_at: i64,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-    return_claim_to_pending(
+    cancel_readiness_work_owned(
         connection,
+        &ReadinessOwnership::unowned(),
+        claim,
+        reason,
+        cancelled_at,
+    )
+}
+
+pub(super) fn cancel_readiness_work_owned(
+    connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+    reason: &str,
+    cancelled_at: i64,
+) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
+    ownership.validate()?;
+    return_claim_to_pending_owned(
+        connection,
+        ownership,
         claim,
         cancelled_at,
         Some(normalized_reason(reason)),
@@ -721,12 +862,14 @@ fn readiness_work_stats_for_source_inner(
     })
 }
 
-fn return_claim_to_pending(
+fn return_claim_to_pending_owned(
     connection: &mut Connection,
+    ownership: &ReadinessOwnership<'_>,
     claim: &ClaimedReadinessWork,
     now: i64,
     cancellation_reason: Option<&str>,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
+    ownership.validate()?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (set_clause, extras) = if let Some(reason) = cancellation_reason {
         (
@@ -746,6 +889,7 @@ fn return_claim_to_pending(
         tx.rollback()?;
         return Ok(ReadinessWorkMutationOutcome::RejectedStale);
     }
+    ownership.validate()?;
     tx.commit()?;
     Ok(ReadinessWorkMutationOutcome::Recorded)
 }
