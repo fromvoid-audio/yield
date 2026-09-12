@@ -187,7 +187,9 @@ raw connections still require a guard-bearing contract.
 
 The addition passed 283 source database tests, including four ownership
 regressions, plus two WAL tests and GPUI compilation on macOS. Windows CI now
-includes the portable ownership and WAL regressions; its result is pending.
+includes the portable ownership and WAL regressions. After gating Unix-only test
+imports, Windows storage validation passed on `449082c4d` in
+[`34713357213`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34713357213).
 
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
