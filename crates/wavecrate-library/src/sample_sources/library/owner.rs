@@ -406,7 +406,7 @@ impl GlobalLibraryWriter {
         (writer, gate)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn start_with_binding_open_gate_for_test(
         profile_guard: &WritableProfileGuard,
     ) -> (Self, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
@@ -422,7 +422,7 @@ impl GlobalLibraryWriter {
         (writer, ready, release)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn start_with_post_command_gate_for_test(
         profile_guard: &WritableProfileGuard,
     ) -> (Self, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {

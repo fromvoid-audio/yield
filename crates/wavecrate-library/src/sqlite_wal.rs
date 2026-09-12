@@ -187,11 +187,10 @@ fn path_is_symlink(path: &Path) -> std::io::Result<bool> {
     std::fs::symlink_metadata(path).map(|metadata| metadata.file_type().is_symlink())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn wal_file_size_ignores_symlinked_wal_sidecar() {
         let dir = tempfile::tempdir().unwrap();

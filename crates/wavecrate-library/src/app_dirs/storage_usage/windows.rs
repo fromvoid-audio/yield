@@ -9,6 +9,11 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(test)]
+use std::{
+    cell::RefCell,
+    sync::{Mutex, OnceLock},
+};
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
@@ -27,9 +32,9 @@ use windows::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
             FILE_DIRECTORY_FILE, FILE_ID_BOTH_DIR_INFORMATION, FILE_OPEN,
-            FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-            FileIdBothDirectoryInformation, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
-            NtQueryDirectoryFile,
+            FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT, FileIdBothDirectoryInformation,
+            NTCREATEFILE_CREATE_OPTIONS, NtCreateFile, NtQueryDirectoryFile,
         },
     },
     Win32::{
@@ -52,6 +57,7 @@ use windows::{
 
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
+use super::super::profile_ownership::WritableProfileGuard;
 use super::{
     CacheClearOutcome, CacheMaintenanceError, DisposableCacheNamespace, MAX_MAINTENANCE_DEPTH,
     MAX_MAINTENANCE_ENTRIES, MAX_MAINTENANCE_OPEN_HANDLES, StorageUsageError, cache_io,
@@ -86,6 +92,24 @@ pub(super) fn open_cache_root(profile_root: &Dir) -> io::Result<CacheRoot> {
     Ok(CacheRoot { file: cache })
 }
 
+/// Open the fixed cache child, creating it through the retained profile handle when absent.
+pub(super) fn open_or_create_cache_root(profile_root: &Dir) -> io::Result<CacheRoot> {
+    let profile_file = profile_root.try_clone()?.into_std_file();
+    let cache = open_relative_file(
+        &profile_file,
+        OsStr::new(CACHE_DIR_NAME),
+        OpenKind::CreateDirectory,
+    )?;
+    let information = file_information(&cache)?;
+    if !is_directory(information.attributes) || is_reparse_point(information.attributes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache child is not a non-reparse directory",
+        ));
+    }
+    Ok(CacheRoot { file: cache })
+}
+
 /// Return the stable identity of a handle-retained cache root.
 pub(super) fn identity_from_root(root: &CacheRoot) -> Option<String> {
     stable_filesystem_identity_from_open_file(&root.file)
@@ -108,8 +132,11 @@ pub(super) fn clear(
             format!("clone cache root: {error}"),
         )
     })?;
-    let root = NativeDir::new(root_file)
-        .map_err(|error| map_native_clear_error(error, &outcome, namespace.cache_path()))?;
+    let root = {
+        let mut check = || native_walk_check(&namespace.profile, &mut is_cancelled);
+        NativeDir::new_checked(root_file, &mut check)
+            .map_err(|error| map_native_clear_error(error, &outcome, namespace.cache_path()))?
+    };
     let mut frames = vec![ClearFrame {
         directory: root,
         display_path: namespace.cache_path(),
@@ -195,7 +222,8 @@ pub(super) fn clear(
 
             let child = {
                 let parent = frames.last().expect("root frame remains until final check");
-                open_directory_entry(&parent.directory, &entry)
+                let mut check = || native_walk_check(&namespace.profile, &mut is_cancelled);
+                open_directory_entry(&parent.directory, &entry, &mut check)
                     .map_err(|error| map_verify_error(error, &outcome, path.clone()))?
             };
             frames.push(ClearFrame {
@@ -238,33 +266,7 @@ pub(super) fn clear(
     super::check_cancelled(&mut is_cancelled, &outcome)?;
     namespace.ensure_profile(&outcome)?;
 
-    let current_cache = match open_cache_root(&namespace.profile_root) {
-        Ok(root) => root,
-        Err(error) if likely_namespace_replacement(&error) => {
-            return Err(cache_namespace_replaced(
-                outcome,
-                format!("cache path changed: {error}"),
-            ));
-        }
-        Err(error) => {
-            return Err(cache_io(
-                &outcome,
-                namespace.cache_path(),
-                format!("reopen cache path for identity check: {error}"),
-            ));
-        }
-    };
-    let current_identity =
-        identity_from_root(&current_cache).ok_or_else(|| CacheMaintenanceError::Unsupported {
-            outcome,
-            reason: String::from("stable cache identity unavailable during final check"),
-        })?;
-    if current_identity != namespace.cache_identity {
-        return Err(cache_namespace_replaced(
-            outcome,
-            String::from("cache path names a replacement directory"),
-        ));
-    }
+    verify_current_cache_identity(namespace, &outcome)?;
 
     outcome.remaining_entries = count_entries(
         namespace,
@@ -279,6 +281,14 @@ pub(super) fn clear(
     )
     .map_err(|error| map_count_error(error, &outcome))?;
     outcome.remaining_entries_known = true;
+
+    // The final count traverses the retained cache handle while the configured name remains
+    // mutable. Re-check it after counting as well as before, so a replacement during the
+    // terminal observation cannot be reported as a successful clear.
+    super::check_cancelled(&mut is_cancelled, &outcome)?;
+    namespace.ensure_profile(&outcome)?;
+    verify_current_cache_identity(namespace, &outcome)?;
+
     if outcome.remaining_entries != 0 {
         return Err(CacheMaintenanceError::Incomplete {
             outcome,
@@ -294,10 +304,13 @@ pub(super) fn bounded_directory_size(
     profile: &super::super::profile_ownership::WritableProfileGuard,
     root: CacheRoot,
     display_path: PathBuf,
-    is_cancelled: &mut impl FnMut() -> bool,
+    mut is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<u64, StorageUsageError> {
-    let root =
-        NativeDir::new(root.file).map_err(|error| map_native_usage_error(error, &display_path))?;
+    let root = {
+        let mut check = || native_walk_check(profile, &mut is_cancelled);
+        NativeDir::new_checked(root.file, &mut check)
+            .map_err(|error| map_native_usage_error(error, &display_path))?
+    };
     let mut stack = vec![UsageFrame {
         directory: root,
         display_path,
@@ -360,7 +373,8 @@ pub(super) fn bounded_directory_size(
             }
             let child = {
                 let parent = stack.last().expect("stack checked above");
-                open_directory_entry(&parent.directory, &entry)
+                let mut check = || native_walk_check(profile, &mut is_cancelled);
+                open_directory_entry(&parent.directory, &entry, &mut check)
                     .map_err(|error| map_verify_usage_error(error, &path))?
             };
             stack.push(UsageFrame {
@@ -400,6 +414,49 @@ pub(super) fn bounded_directory_size(
     Ok(total)
 }
 
+#[cfg(test)]
+static FINAL_COUNT_HOOK: OnceLock<Mutex<Option<Box<dyn FnMut() + Send>>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_PAGE_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(super) struct FinalCountHookGuard;
+
+#[cfg(test)]
+impl Drop for FinalCountHookGuard {
+    fn drop(&mut self) {
+        if let Some(hook) = FINAL_COUNT_HOOK.get() {
+            *hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_final_count_hook(hook: impl FnMut() + Send + 'static) -> FinalCountHookGuard {
+    let slot = FINAL_COUNT_HOOK.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    FinalCountHookGuard
+}
+
+#[cfg(test)]
+pub(super) struct NativePageHookGuard;
+
+#[cfg(test)]
+impl Drop for NativePageHookGuard {
+    fn drop(&mut self) {
+        NATIVE_PAGE_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_native_page_hook(hook: impl FnMut() + 'static) -> NativePageHookGuard {
+    NATIVE_PAGE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    NativePageHookGuard
+}
+
 #[derive(Debug)]
 struct ClearFrame {
     directory: NativeDir,
@@ -429,8 +486,11 @@ struct NativeDir {
 }
 
 impl NativeDir {
-    fn new(file: File) -> Result<Self, NativeError> {
-        let entries = NativeReadDir::new(&file)?;
+    fn new_checked(
+        file: File,
+        check: &mut impl FnMut() -> Result<(), NativeError>,
+    ) -> Result<Self, NativeError> {
+        let entries = NativeReadDir::new_checked(&file, check)?;
         Ok(Self { file, entries })
     }
 }
@@ -442,13 +502,18 @@ struct NativeReadDir {
 }
 
 impl NativeReadDir {
-    fn new(directory: &File) -> Result<Self, NativeError> {
+    fn new_checked(
+        directory: &File,
+        check: &mut impl FnMut() -> Result<(), NativeError>,
+    ) -> Result<Self, NativeError> {
+        check()?;
         let parent = file_information(directory).map_err(NativeError::Io)?;
         let mut buffer = vec![0_u64; ENUMERATION_BUFFER_BYTES / size_of::<u64>()];
         let mut entries = Vec::new();
         let mut restart_scan = true;
 
         loop {
+            check()?;
             let mut status_block = IO_STATUS_BLOCK::default();
             let status = unsafe {
                 NtQueryDirectoryFile(
@@ -499,6 +564,9 @@ impl NativeReadDir {
             if entries.len() > MAX_MAINTENANCE_ENTRIES {
                 return Err(NativeError::Bounds);
             }
+            #[cfg(test)]
+            run_native_page_hook();
+            check()?;
         }
 
         Ok(Self { entries, next: 0 })
@@ -543,13 +611,16 @@ struct FileInformation {
 #[derive(Clone, Copy, Debug)]
 enum OpenKind {
     Directory,
+    CreateDirectory,
     Leaf,
 }
 
 #[derive(Debug)]
 enum NativeError {
     Bounds,
+    Cancelled,
     Io(io::Error),
+    Profile(String),
 }
 
 #[derive(Debug)]
@@ -565,6 +636,18 @@ enum CountError {
     Bounds(&'static str, usize),
     NamespaceReplaced(String),
     Io(PathBuf, String),
+}
+
+fn native_walk_check(
+    profile: &WritableProfileGuard,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), NativeError> {
+    if is_cancelled() {
+        return Err(NativeError::Cancelled);
+    }
+    profile
+        .validate_current()
+        .map_err(|error| NativeError::Profile(error.to_string()))
 }
 
 fn open_relative_file(parent: &File, name: &OsStr, kind: OpenKind) -> io::Result<File> {
@@ -600,7 +683,7 @@ fn open_relative_file(parent: &File, name: &OsStr, kind: OpenKind) -> io::Result
     let mut handle = HANDLE::default();
     let mut status_block = IO_STATUS_BLOCK::default();
     let desired_access: FILE_ACCESS_RIGHTS = match kind {
-        OpenKind::Directory => {
+        OpenKind::Directory | OpenKind::CreateDirectory => {
             DELETE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
         }
         OpenKind::Leaf => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -609,9 +692,13 @@ fn open_relative_file(parent: &File, name: &OsStr, kind: OpenKind) -> io::Result
         | FILE_OPEN_FOR_BACKUP_INTENT
         | FILE_SYNCHRONOUS_IO_NONALERT
         | match kind {
-            OpenKind::Directory => FILE_DIRECTORY_FILE,
+            OpenKind::Directory | OpenKind::CreateDirectory => FILE_DIRECTORY_FILE,
             OpenKind::Leaf => NTCREATEFILE_CREATE_OPTIONS(0),
         };
+    let disposition = match kind {
+        OpenKind::CreateDirectory => FILE_OPEN_IF,
+        OpenKind::Directory | OpenKind::Leaf => FILE_OPEN,
+    };
     let status = unsafe {
         NtCreateFile(
             &mut handle,
@@ -621,7 +708,7 @@ fn open_relative_file(parent: &File, name: &OsStr, kind: OpenKind) -> io::Result
             None,
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN,
+            disposition,
             create_options,
             None,
             0,
@@ -655,7 +742,11 @@ fn open_entry_handle(parent: &NativeDir, entry: &NativeEntry) -> Result<File, Na
     }
 }
 
-fn open_directory_entry(parent: &NativeDir, entry: &NativeEntry) -> Result<NativeDir, VerifyError> {
+fn open_directory_entry(
+    parent: &NativeDir,
+    entry: &NativeEntry,
+    check: &mut impl FnMut() -> Result<(), NativeError>,
+) -> Result<NativeDir, VerifyError> {
     let file = open_relative_file(&parent.file, &entry.name, OpenKind::Directory)
         .map_err(|error| VerifyError::Native(NativeError::Io(error)))?;
     let information =
@@ -669,7 +760,7 @@ fn open_directory_entry(parent: &NativeDir, entry: &NativeEntry) -> Result<Nativ
             entry.name.to_string_lossy()
         )));
     }
-    NativeDir::new(file).map_err(VerifyError::Native)
+    NativeDir::new_checked(file, check).map_err(VerifyError::Native)
 }
 
 fn open_and_verify_entry(
@@ -814,8 +905,13 @@ fn count_entries(
     root_file: File,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<u64, CountError> {
-    let root = NativeDir::new(root_file)
-        .map_err(|error| map_native_count_error(error, namespace.cache_path()))?;
+    let root = {
+        let mut check = || native_walk_check(&namespace.profile, is_cancelled);
+        NativeDir::new_checked(root_file, &mut check)
+            .map_err(|error| map_native_count_error(error, namespace.cache_path()))?
+    };
+    #[cfg(test)]
+    run_final_count_hook();
     let mut stack = vec![UsageFrame {
         directory: root,
         display_path: namespace.cache_path(),
@@ -864,11 +960,15 @@ fn count_entries(
             ));
         }
         let parent = stack.last().expect("stack checked above");
-        let child =
-            open_directory_entry(&parent.directory, &entry).map_err(|error| match error {
-                VerifyError::NamespaceReplaced(reason) => CountError::NamespaceReplaced(reason),
-                VerifyError::Native(error) => map_native_count_error(error, path.clone()),
-            })?;
+        let child = {
+            let mut check = || native_walk_check(&namespace.profile, is_cancelled);
+            open_directory_entry(&parent.directory, &entry, &mut check).map_err(
+                |error| match error {
+                    VerifyError::NamespaceReplaced(reason) => CountError::NamespaceReplaced(reason),
+                    VerifyError::Native(error) => map_native_count_error(error, path.clone()),
+                },
+            )?
+        };
         stack.push(UsageFrame {
             directory: child,
             display_path: path,
@@ -876,6 +976,26 @@ fn count_entries(
         });
     }
     Ok(count)
+}
+
+#[cfg(test)]
+fn run_final_count_hook() {
+    let Some(slot) = FINAL_COUNT_HOOK.get() else {
+        return;
+    };
+    let mut hook = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hook) = hook.as_mut() {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn run_native_page_hook() {
+    NATIVE_PAGE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 }
 
 fn map_count_error(error: CountError, outcome: &CacheClearOutcome) -> CacheMaintenanceError {
@@ -917,6 +1037,11 @@ fn map_native_clear_error(
             kind: "entries",
             limit: MAX_MAINTENANCE_ENTRIES,
         },
+        NativeError::Cancelled => CacheMaintenanceError::Cancelled { outcome: *outcome },
+        NativeError::Profile(reason) => CacheMaintenanceError::ProfileChanged {
+            outcome: *outcome,
+            reason,
+        },
         NativeError::Io(error) => cache_io(outcome, path, error.to_string()),
     }
 }
@@ -924,6 +1049,8 @@ fn map_native_clear_error(
 fn map_native_count_error(error: NativeError, path: PathBuf) -> CountError {
     match error {
         NativeError::Bounds => CountError::Bounds("entries", MAX_MAINTENANCE_ENTRIES),
+        NativeError::Cancelled => CountError::Cancelled,
+        NativeError::Profile(reason) => CountError::Profile(reason),
         NativeError::Io(error) => CountError::Io(path, error.to_string()),
     }
 }
@@ -934,6 +1061,8 @@ fn map_native_usage_error(error: NativeError, path: &PathBuf) -> StorageUsageErr
             kind: "entries",
             limit: MAX_MAINTENANCE_ENTRIES,
         },
+        NativeError::Cancelled => StorageUsageError::Cancelled,
+        NativeError::Profile(reason) => StorageUsageError::ProfileChanged(reason),
         NativeError::Io(error) => {
             StorageUsageError::Io(format!("failed to read {}: {error}", path.display()))
         }
@@ -948,6 +1077,8 @@ fn map_verify_usage_error(error: VerifyError, path: &PathBuf) -> StorageUsageErr
                 kind: "entries",
                 limit: MAX_MAINTENANCE_ENTRIES,
             },
+            NativeError::Cancelled => StorageUsageError::Cancelled,
+            NativeError::Profile(reason) => StorageUsageError::ProfileChanged(reason),
             NativeError::Io(error) => {
                 StorageUsageError::Io(format!("failed to read {}: {error}", path.display()))
             }
@@ -965,6 +1096,40 @@ fn ntstatus_error(status: NTSTATUS) -> io::Error {
     } else {
         io::Error::from_raw_os_error(error as i32)
     }
+}
+
+fn verify_current_cache_identity(
+    namespace: &DisposableCacheNamespace,
+    outcome: &CacheClearOutcome,
+) -> Result<(), CacheMaintenanceError> {
+    let current_cache = match open_cache_root(&namespace.profile_root) {
+        Ok(root) => root,
+        Err(error) if likely_namespace_replacement(&error) => {
+            return Err(cache_namespace_replaced(
+                *outcome,
+                format!("cache path changed: {error}"),
+            ));
+        }
+        Err(error) => {
+            return Err(cache_io(
+                outcome,
+                namespace.cache_path(),
+                format!("reopen cache path for identity check: {error}"),
+            ));
+        }
+    };
+    let current_identity =
+        identity_from_root(&current_cache).ok_or_else(|| CacheMaintenanceError::Unsupported {
+            outcome: *outcome,
+            reason: String::from("stable cache identity unavailable during final check"),
+        })?;
+    if current_identity != namespace.cache_identity {
+        return Err(cache_namespace_replaced(
+            *outcome,
+            String::from("cache path names a replacement directory"),
+        ));
+    }
+    Ok(())
 }
 
 fn likely_namespace_replacement(error: &io::Error) -> bool {

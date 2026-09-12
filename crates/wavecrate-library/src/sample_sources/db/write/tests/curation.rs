@@ -17,6 +17,7 @@ struct CurationFixture {
     _config_base: ConfigBaseGuard,
     _profile: PersistenceProfileGuard,
     _source: TempDir,
+    #[cfg(unix)]
     profile_child: Option<PathBuf>,
     database: SourceDatabase,
     profile_guard: WritableProfileGuard,
@@ -29,6 +30,7 @@ impl CurationFixture {
         Self::new_with_profile_child(None)
     }
 
+    #[cfg(unix)]
     fn new_profile_bound() -> Self {
         Self::new_with_profile_child(Some(PathBuf::from("curation-profile-bound")))
     }
@@ -83,6 +85,7 @@ impl CurationFixture {
             _config_base: config_base,
             _profile: profile,
             _source: source,
+            #[cfg(unix)]
             profile_child,
             database,
             profile_guard,

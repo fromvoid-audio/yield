@@ -534,8 +534,7 @@ impl DisposableCacheNamespace {
         let cache_root = match windows::open_cache_root(&profile_root) {
             Ok(cache_root) => cache_root,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                profile.open_child_dir(Path::new(CACHE_DIR_NAME))?;
-                windows::open_cache_root(&profile_root).map_err(|source| {
+                windows::open_or_create_cache_root(&profile_root).map_err(|source| {
                     super::ProfileOwnershipError::Io {
                         path: profile_path.join(CACHE_DIR_NAME),
                         source,
@@ -1646,5 +1645,258 @@ mod tests {
         assert!(namespace.conflicts_with_path(profile.profile_root()));
         assert!(namespace.conflicts_with_path(&alias));
         assert!(!namespace.conflicts_with_path(&profile.profile_root().join("logs")));
+    }
+
+    #[cfg(windows)]
+    fn windows_profile_fixture(
+        name: &str,
+    ) -> (
+        crate::test_runtime::TestRuntimeGuard,
+        tempfile::TempDir,
+        crate::app_dirs::ConfigBaseGuard,
+        crate::app_dirs::PersistenceProfileGuard,
+        WritableProfileGuard,
+    ) {
+        let runtime = crate::test_runtime::TestRuntimeGuard::acquire();
+        let base = tempfile::tempdir_in(
+            fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root"),
+        )
+        .expect("create profile base");
+        let base_guard = crate::app_dirs::ConfigBaseGuard::set(base.path().to_path_buf());
+        let profile_guard = crate::app_dirs::PersistenceProfileGuard::named(name);
+        let profile = WritableProfileGuard::acquire_current().expect("profile ownership");
+        (runtime, base, base_guard, profile_guard, profile)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_creates_missing_cache_and_clears_nested_regular_entries() {
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-missing");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        assert!(!cache.exists());
+
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture and create cache namespace");
+        assert!(cache.is_dir());
+        fs::create_dir_all(cache.join("nested/deeper")).expect("nested cache tree");
+        fs::write(cache.join("nested/deeper/first.cache"), [0_u8; 11])
+            .expect("first cache payload");
+        fs::write(cache.join("second.cache"), [0_u8; 7]).expect("second cache payload");
+
+        let outcome = namespace.clear(|| false).expect("clear captured cache");
+
+        assert_eq!(outcome.removed_files, 2);
+        assert_eq!(outcome.removed_bytes, 18);
+        assert_eq!(outcome.remaining_entries, 0);
+        assert!(outcome.remaining_entries_known);
+        assert!(!outcome.incomplete);
+        assert!(!outcome.namespace_replaced);
+        assert!(cache.is_dir(), "captured cache root remains in place");
+        assert!(!cache.join("nested").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_clear_removes_reparse_entries_without_following_targets() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-reparse");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::create_dir_all(&cache).expect("cache root");
+        let external = tempfile::tempdir().expect("external root");
+        fs::write(external.path().join("external.cache"), [0_u8; 97]).expect("external payload");
+        fs::write(external.path().join("external.wav"), [0_u8; 89]).expect("external file");
+        symlink_dir(external.path(), cache.join("external-dir")).expect("directory reparse link");
+        symlink_file(
+            external.path().join("external.wav"),
+            cache.join("external-file"),
+        )
+        .expect("file reparse link");
+
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture cache namespace");
+        let outcome = namespace.clear(|| false).expect("clear reparse entries");
+
+        assert_eq!(outcome.removed_files, 2);
+        assert_eq!(outcome.removed_bytes, 0);
+        assert_eq!(outcome.remaining_entries, 0);
+        assert!(outcome.remaining_entries_known);
+        assert!(!outcome.incomplete);
+        assert_eq!(
+            fs::read(external.path().join("external.cache"))
+                .unwrap()
+                .len(),
+            97
+        );
+        assert_eq!(
+            fs::read(external.path().join("external.wav"))
+                .unwrap()
+                .len(),
+            89
+        );
+        assert!(cache.is_dir());
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_clear_reports_replaced_root_and_preserves_replacement() {
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-root-replacement");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::create_dir_all(&cache).expect("cache root");
+        fs::write(cache.join("captured.cache"), [0_u8; 19]).expect("captured payload");
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture cache namespace");
+
+        let relocated = profile.profile_root().join("cache-relocated");
+        fs::rename(&cache, &relocated).expect("relocate captured cache");
+        fs::create_dir_all(&cache).expect("replacement cache root");
+        fs::write(cache.join("replacement.cache"), [0_u8; 23]).expect("replacement payload");
+
+        let error = namespace
+            .clear(|| false)
+            .expect_err("replacement must fail closed");
+        let CacheMaintenanceError::NamespaceReplaced { outcome, .. } = error else {
+            panic!("expected namespace replacement");
+        };
+        assert!(outcome.namespace_replaced);
+        assert!(outcome.incomplete);
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.removed_bytes, 19);
+        assert!(!outcome.remaining_entries_known);
+        assert_eq!(fs::read(cache.join("replacement.cache")).unwrap().len(), 23);
+        assert!(relocated.is_dir());
+        assert!(!relocated.join("captured.cache").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_clear_rechecks_root_after_terminal_count() {
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-final-replacement");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::create_dir_all(&cache).expect("cache root");
+        fs::write(cache.join("captured.cache"), [0_u8; 19]).expect("captured payload");
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture cache namespace");
+        let relocated = profile.profile_root().join("cache-final-relocated");
+        let replacement = cache.clone();
+        let relocated_for_hook = relocated.clone();
+        let _hook = super::windows::install_final_count_hook(move || {
+            fs::rename(&replacement, &relocated_for_hook)
+                .expect("relocate captured cache during count");
+            fs::create_dir_all(&replacement).expect("replacement cache root during count");
+            fs::write(replacement.join("replacement.cache"), [0_u8; 23])
+                .expect("replacement payload during count");
+        });
+
+        let error = namespace
+            .clear(|| false)
+            .expect_err("replacement during final count must fail closed");
+        let CacheMaintenanceError::NamespaceReplaced { outcome, .. } = error else {
+            panic!("expected namespace replacement");
+        };
+        assert!(outcome.namespace_replaced);
+        assert!(outcome.incomplete);
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.removed_bytes, 19);
+        assert!(!outcome.remaining_entries_known);
+        assert_eq!(fs::read(cache.join("replacement.cache")).unwrap().len(), 23);
+        assert!(relocated.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_clear_cancels_between_native_enumeration_pages() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-page-cancellation");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::create_dir_all(&cache).expect("cache root");
+        for index in 0..2_000 {
+            fs::write(cache.join(format!("entry-{index:04}.cache")), [0_u8; 1])
+                .expect("page cancellation payload");
+        }
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture cache namespace");
+
+        let page_hook_fired = Arc::new(AtomicBool::new(false));
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let fired_by_hook = Arc::clone(&page_hook_fired);
+        let cancel_by_hook = Arc::clone(&cancellation_requested);
+        let _page_hook = super::windows::install_native_page_hook(move || {
+            if !fired_by_hook.swap(true, Ordering::SeqCst) {
+                cancel_by_hook.store(true, Ordering::SeqCst);
+            }
+        });
+        let error = namespace
+            .clear(|| cancellation_requested.load(Ordering::SeqCst))
+            .expect_err("cancellation between native pages must stop cleanup");
+        let CacheMaintenanceError::Cancelled { outcome } = error else {
+            panic!("expected cancellation");
+        };
+        assert!(page_hook_fired.load(Ordering::SeqCst));
+        assert_eq!(outcome.removed_files, 0);
+        assert!(outcome.incomplete);
+        assert!(!outcome.remaining_entries_known);
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 2_000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_clear_cancellation_reports_completed_entries_only() {
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-cancellation");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::create_dir_all(&cache).expect("cache root");
+        let first = cache.join("first.cache");
+        let second = cache.join("second.cache");
+        fs::write(&first, [0_u8; 31]).expect("first payload");
+        fs::write(&second, [0_u8; 37]).expect("second payload");
+        let namespace = profile
+            .capture_disposable_cache_namespace()
+            .expect("capture cache namespace");
+
+        let error = namespace
+            .clear(|| first.exists() != second.exists())
+            .expect_err("cancellation must stop cleanup");
+        let CacheMaintenanceError::Cancelled { outcome } = error else {
+            panic!("expected cancellation");
+        };
+        assert_eq!(outcome.removed_files, 1);
+        assert!(outcome.removed_bytes == 31 || outcome.removed_bytes == 37);
+        assert!(outcome.incomplete);
+        assert!(!outcome.remaining_entries_known);
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_rejects_regular_cache_root_without_touching_it() {
+        let (_runtime, _base, _base_guard, _profile_guard, profile) =
+            windows_profile_fixture("windows-cache-unexpected-root");
+        let cache = profile.profile_root().join(CACHE_DIR_NAME);
+        fs::write(&cache, b"cache-root-file").expect("unexpected cache root file");
+
+        let error = profile
+            .capture_disposable_cache_namespace()
+            .expect_err("regular cache root must be rejected");
+        assert!(error.to_string().contains("cache"));
+        assert_eq!(
+            fs::read(&cache).expect("cache root after rejection"),
+            b"cache-root-file"
+        );
     }
 }
