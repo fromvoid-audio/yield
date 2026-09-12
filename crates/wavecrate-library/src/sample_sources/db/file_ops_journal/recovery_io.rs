@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use cap_fs_ext::OpenOptionsFollowExt;
 use cap_primitives::ambient_authority;
 #[cfg(windows)]
 use cap_primitives::fs::OpenOptionsExt;
@@ -547,6 +548,78 @@ pub(crate) struct BoundDatabaseRoot {
 impl BoundDatabaseRoot {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Open one direct child through the retained database-root capability.
+    ///
+    /// SQLite is given the resulting descriptor's namespace alias, while all file creation and
+    /// final-component checks stay anchored to this retained capability. The final component is
+    /// never followed when it is a symlink.
+    pub(crate) fn open_file_nofollow(&self, name: &Path, create_new: bool) -> io::Result<fs::File> {
+        let components = relative_components(name).map_err(io::Error::other)?;
+        if components.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile database child file name must be one normal component",
+            ));
+        }
+        let directory = cap_std::fs::Dir::from_std_file(self._capability.try_clone()?);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
+        if create_new {
+            options.create_new(true);
+        }
+        directory
+            .open_with(name, &options)
+            .map(|file| file.into_std())
+    }
+
+    /// Inspect one direct child without following a final symlink.
+    pub(crate) fn symlink_metadata(&self, name: &Path) -> io::Result<cap_std::fs::Metadata> {
+        let components = relative_components(name).map_err(io::Error::other)?;
+        if components.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "profile database child file name must be one normal component",
+            ));
+        }
+        let directory = cap_std::fs::Dir::from_std_file(self._capability.try_clone()?);
+        directory.symlink_metadata(name)
+    }
+
+    /// Flush the retained profile and child directory entries before a durable child-file write.
+    pub(crate) fn sync_namespace(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), ProfileOwnershipError> {
+        #[cfg(windows)]
+        {
+            // SQLite's bundled Windows VFS flushes committed database content. Windows directory
+            // handles do not provide a portable, verified equivalent of Unix fsync for this
+            // namespace, so the store deliberately makes no stronger power-loss claim here.
+            let _ = (self, profile_guard);
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        {
+            let profile_root = profile_guard.profile_root_dir()?;
+            profile_root.into_std_file().sync_all().map_err(|source| {
+                profile_binding_error(
+                    profile_guard,
+                    format!("failed to flush profile namespace: {source}"),
+                )
+            })?;
+            self._capability
+                .try_clone()
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| {
+                    profile_binding_error(
+                        profile_guard,
+                        format!("failed to flush operation-journal namespace: {source}"),
+                    )
+                })
+        }
     }
 
     pub(crate) fn for_profile_guard(

@@ -83,6 +83,30 @@ capability; a read-only database handle does not authorize that writable reopen.
 
 ## Remaining integration contracts
 
+The active `operation_journal::OperationJournalStore` now retains a profile clone
+and an exclusive child lease until its SQLite connection closes. It provides
+bounded point reads and initial intent insertion with a monotonic sequence;
+duplicate identities cannot overwrite existing records. Its receipt proves a
+SQLite commit and post-commit identity checks, not coordinator admission or
+filesystem publication authority. New intents require a consistent capacity
+plan, but this store does not acquire capacity claims or queue permits.
+
+The dedicated database uses DELETE journaling, exclusive locking, and
+`synchronous=EXTRA`. Unix opening flushes the retained profile/child namespace;
+Windows relies on the bundled SQLite VFS for committed file content and has no
+independently verified directory-entry power-loss guarantee. SQLite's actual
+open file is checked using platform file controls in addition to root and
+pathname identity checks. Unknown headers, unsupported schemas, and unexpected
+sidecars remain retained for audit. In particular, automatic recovery of a
+pre-existing rollback journal is not yet enabled.
+
+The initial storage checkpoint passed 45 focused journal tests, GPUI compilation,
+formatting, and diff checks on macOS. Tests cover normal reopen persistence,
+retained ownership, duplicate IDs, malformed/oversized records, and replacement
+both during opening and before writes. Windows execution for this checkpoint
+must be recorded separately. Phase updates, universal participants, recovery
+scanning, and session startup/shutdown integration remain open.
+
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
 the durable physical-source identity, lease, expiry, stale-worker fencing and
 independent source-conflict implementation. An unavailable profile must never

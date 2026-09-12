@@ -1,12 +1,14 @@
 //! Profile-local durable operation-journal values and bounded codec.
 //!
-//! This module exposes the stable identity, intent, phase, disposition, stored evidence, and
-//! strict persisted-record codec. It does not open files, acquire ownership, publish filesystem
-//! entries, or interpret journal data as mutation authority.
+//! The model, evidence, codec, and consistency validator remain storage-neutral: they do not
+//! acquire ownership, publish filesystem entries, or interpret journal data as mutation
+//! authority. The separate store module adds the profile-owned SQLite persistence boundary and
+//! retains those capabilities for the lifetime of its connection.
 
 pub mod codec;
 pub mod evidence;
 pub mod model;
+pub mod store;
 pub mod validation;
 
 pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
@@ -28,4 +30,9 @@ pub use model::{
     OperationIntent, OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
 };
 
+pub use store::{
+    JOURNAL_APPLICATION_ID, JOURNAL_DATABASE_FILE_NAME, JOURNAL_DATABASE_ROOT_NAME,
+    JOURNAL_SCHEMA_VERSION, JournalInsertReceipt, OperationJournalStore,
+    OperationJournalStoreError,
+};
 pub use validation::{RecordConsistency, classify_record};
