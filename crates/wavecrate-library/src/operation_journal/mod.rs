@@ -30,6 +30,11 @@ pub use model::{
     OperationIntent, OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
 };
 
+pub use store::recovery::{
+    MAX_RECOVERY_BYTES_PER_PAGE, MAX_RECOVERY_ROWS_PER_PAGE, RecoveryCursor, RecoveryEntry,
+    RecoveryField, RecoveryKey, RecoveryPage, RecoveryRetentionReason, RecoveryRowOutcome,
+    RecoveryScanError,
+};
 pub use store::{
     JOURNAL_APPLICATION_ID, JOURNAL_DATABASE_FILE_NAME, JOURNAL_DATABASE_ROOT_NAME,
     JOURNAL_SCHEMA_VERSION, JournalInsertReceipt, OperationJournalStore,

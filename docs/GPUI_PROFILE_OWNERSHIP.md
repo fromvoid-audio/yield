@@ -109,6 +109,16 @@ at store commit `3534c37b6`, including journal tests and production profile
 admission. Phase updates, universal participants, recovery
 scanning, and session startup/shutdown integration remain open.
 
+Recovery observation now uses indexed sequence paging with at most 16 rows and
+2 MiB of encoded records per page. Malformed, unsupported, oversized, or
+noncanonical-key rows remain typed audit observations; unusable sequence values
+stop the scan rather than being silently skipped. SQLite's value-size limit also
+bounds materialization before Rust inspects a damaged key. A late-cursor test
+checks database work against a 4096-row prefix, and byte-budget tests verify
+that deferred rows appear on the next page. All 55 operation-journal module tests
+and GPUI compilation passed for this addition. This is read-only observation,
+not legacy-file import, replay, participant reconciliation, or recovery admission.
+
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
 the durable physical-source identity, lease, expiry, stale-worker fencing and
 independent source-conflict implementation. An unavailable profile must never

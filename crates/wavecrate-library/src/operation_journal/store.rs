@@ -14,6 +14,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
@@ -24,6 +25,9 @@ use crate::sample_sources::db::BoundDatabaseRoot;
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::model::{MAX_RECORD_BYTES, OperationDisposition, OperationId, OperationPhase};
 use super::validation::{RecordConsistency, classify_record};
+
+/// Read-only, bounded recovery paging for the profile-owned operation journal.
+pub mod recovery;
 
 /// The filename of the profile-local operation journal database.
 pub const JOURNAL_DATABASE_FILE_NAME: &str = "journal.sqlite3";
@@ -46,6 +50,10 @@ const MAX_SCHEMA_OBJECTS: i64 = 8;
 const MAX_SCHEMA_COLUMNS: usize = 8;
 const MAX_SCHEMA_INDEXES: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Keep SQLite itself from materializing an arbitrarily large key/value before the recovery
+// scanner can inspect its SQL type and length. This leaves room for the bounded JSON envelope
+// while remaining close to the persisted record limit.
+const SQLITE_VALUE_LIMIT: i32 = (MAX_RECORD_BYTES + 64 * 1024) as i32;
 
 const CREATE_JOURNAL_TABLE: &str = "CREATE TABLE operation_journal (
     operation_id TEXT NOT NULL PRIMARY KEY,
@@ -201,6 +209,17 @@ impl OperationJournalStore {
         )
     }
 
+    /// Read one bounded, read-only recovery page after an optional insertion-sequence cursor.
+    ///
+    /// The page validates the retained namespace before and after its query. Returned records
+    /// are untrusted observations and do not authorize filesystem or journal mutations.
+    pub fn scan_recovery_page(
+        &self,
+        cursor: Option<recovery::RecoveryCursor>,
+    ) -> Result<recovery::RecoveryPage, recovery::RecoveryScanError> {
+        recovery::scan_page(self, cursor)
+    }
+
     fn open_inner(
         profile_guard: &WritableProfileGuard,
         #[cfg(test)] before_sqlite_open: Option<&dyn Fn(&Path)>,
@@ -248,6 +267,7 @@ impl OperationJournalStore {
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let connection = Connection::open_with_flags(&database_path, flags)?;
+        connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, SQLITE_VALUE_LIMIT)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         validate_connection_identity(
             &connection,
@@ -412,13 +432,19 @@ impl OperationJournalStore {
         if already_present.is_some() {
             return Err(OperationJournalStoreError::DuplicateOperation { operation_id });
         }
-        let sequence = self
-            .connection
-            .query_row(
-                "SELECT COALESCE(MAX(sequence), 0) FROM operation_journal",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?
+        let previous_sequence = self.connection.query_row(
+            "SELECT MAX(sequence) FROM operation_journal",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        if previous_sequence.is_some_and(|sequence| sequence <= 0) {
+            return Err(audit_error(
+                &self.database_path,
+                "stored insertion sequence is not positive",
+            ));
+        }
+        let sequence = previous_sequence
+            .unwrap_or(0)
             .checked_add(1)
             .ok_or(OperationJournalStoreError::SequenceExhausted)?;
         self.connection.execute(
@@ -1105,6 +1131,34 @@ mod tests {
             store.insert_intent(&no_capacity),
             Err(OperationJournalStoreError::MissingCapacityPlan)
         ));
+    }
+
+    #[test]
+    fn corrupt_sequence_is_not_used_to_admit_another_intent() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let retained = intent_record(OperationId::new());
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal VALUES (?1, -1, ?2)",
+                params![
+                    retained.operation_id.to_string(),
+                    encode(&retained).expect("fixture bytes")
+                ],
+            )
+            .expect("corrupt sequence fixture");
+        let fresh = intent_record(OperationId::new());
+        assert!(matches!(
+            store.insert_intent(&fresh),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        assert!(
+            store
+                .get(fresh.operation_id)
+                .expect("lookup rejected intent")
+                .is_none()
+        );
     }
 
     #[test]
