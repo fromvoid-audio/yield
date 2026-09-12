@@ -1,7 +1,16 @@
 name: GPUI Windows checks
+run-name: GPUI Windows (${{ inputs.scope || 'full' }})
 
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        default: full
+        options:
+          - full
+          - storage
   pull_request:
     paths:
       - 'crates/**'
@@ -17,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: gpui-windows-${{ github.ref }}
+  group: gpui-windows-${{ github.ref }}-${{ inputs.scope || 'full' }}
   cancel-in-progress: true
 
 jobs:
@@ -34,19 +43,26 @@ jobs:
         shell: pwsh
         run: rustup show active-toolchain
       - name: Provision ASIO SDK
+        if: inputs.scope != 'storage'
         shell: pwsh
         run: ./scripts/internal/release/setup_windows_asio_sdk.ps1
+      - name: Check production GPUI application
+        if: inputs.scope != 'storage'
+        run: cargo check --locked -p wavecrate-gpui
+      - name: Check production storage library
+        if: inputs.scope == 'storage'
+        run: cargo check --locked -p wavecrate-library --no-default-features
       - name: Check production profile admission
         shell: pwsh
         run: |
-          cargo check --locked -p wavecrate-gpui
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-library --test profile_admission --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-library --lib app_dirs::profile_ownership --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-library --test readiness_lease_process --features test-support
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test operation journal
+        run: cargo test --locked -p wavecrate-library --lib operation_journal --no-default-features
       - name: Test profile-owned settings maintenance
         shell: pwsh
         run: |
@@ -55,8 +71,11 @@ jobs:
           cargo test --locked -p wavecrate-session -p wavecrate-catalog --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test audio, core, media and native platform
+        if: inputs.scope != 'storage'
         run: cargo test --locked -p reson -p wavecrate-core -p wavecrate-media -p wavecrate-platform --lib
       - name: Compile GPUI application and browser tests
+        if: inputs.scope != 'storage'
         run: cargo test --locked -p wavecrate-gpui -p wavecrate-ui --no-run
       - name: Test browser state and interactions
+        if: inputs.scope != 'storage'
         run: cargo test --locked -p wavecrate-ui --lib
