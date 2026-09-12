@@ -27,8 +27,10 @@ pub use evidence::{
 };
 
 pub use model::{
-    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, OperationActor, OperationDisposition, OperationId,
-    OperationIntent, OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
+    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES,
+    OperationActor, OperationDisposition, OperationId, OperationIntent, OperationKind,
+    OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, UniversalCommandKind, UniversalIntent,
+    UniversalIntentTextViolation, UniversalIntentValidationError,
 };
 
 pub use participants::{

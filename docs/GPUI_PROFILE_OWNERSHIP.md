@@ -136,8 +136,21 @@ The pure participant model adds bounded descriptors, source identity/revision/le
 observations, and one checkpoint per participant. Only optional rebuildable
 artifacts can be deferred; required work cannot be silently dropped. Malformed
 decoded inventories never report required completion. Eleven focused tests and
-GPUI compilation passed. These values are not yet part of a new persisted record
-schema and do not implement live source leases or authorize phase transitions.
+GPUI compilation passed. Schema V3 now carries these observations in a strict,
+bounded initial universal-intent envelope. V3 requires a capacity plan, object
+payload, stable status key, and pending participant checkpoints; it rejects
+legacy execution evidence and all later phases until their transition contracts
+exist. Unknown fields and unsupported command values remain retained raw bytes
+for audit rather than being accepted as execution data; metadata-only commands
+remain outside this foundation until their actor/family contract is defined. The V3 codec and store
+do not implement live source leases, queue admission, or authorize phase
+transitions.
+
+The V3 addition passed 82 focused journal tests and GPUI compilation on macOS.
+An additional recovery regression passed after review: an unsupported V3 phase
+remains byte-for-byte unchanged while a later valid intent stays observable.
+Retry/cancellation metadata, typed command arguments, full multi-class capacity
+claims, execution transitions, and recovery execution remain unfinished.
 
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
 the durable physical-source identity, lease, expiry, stale-worker fencing and

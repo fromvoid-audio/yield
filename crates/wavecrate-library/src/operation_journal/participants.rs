@@ -466,6 +466,38 @@ impl ParticipantSet {
         Ok(())
     }
 
+    /// Validate the initial checkpoint shape for a newly durable intent.
+    ///
+    /// Initial intent records describe work that has not started. Every participant therefore
+    /// has a `Pending` checkpoint without a committed revision or diagnostic. This validates
+    /// stored values only; it does not acquire a participant lease or authorize a transition.
+    pub fn validate_for_new_intent(&self) -> Result<(), ParticipantValidationError> {
+        self.validate_for_new_operation()?;
+        for checkpoint in &self.checkpoints {
+            if checkpoint.state() != ParticipantCheckpointState::Pending {
+                return Err(ParticipantValidationError::InitialCheckpointNotPending {
+                    participant_id: checkpoint.participant_id(),
+                    state: checkpoint.state(),
+                });
+            }
+            if checkpoint.committed_revision().is_some() {
+                return Err(
+                    ParticipantValidationError::InitialCheckpointRevisionForbidden {
+                        participant_id: checkpoint.participant_id(),
+                    },
+                );
+            }
+            if checkpoint.diagnostic_code().is_some() {
+                return Err(
+                    ParticipantValidationError::InitialCheckpointDiagnosticForbidden {
+                        participant_id: checkpoint.participant_id(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Borrow all stored participant descriptors.
     pub fn descriptors(&self) -> &[ParticipantDescriptor] {
         &self.descriptors
@@ -589,6 +621,28 @@ pub enum ParticipantValidationError {
     /// A newly admitted universal operation has no participants.
     #[error("a new universal operation must contain at least one participant")]
     EmptyForNewOperation,
+    /// An initial intent checkpoint must still be pending.
+    #[error(
+        "initial participant checkpoint {participant_id} has state {state:?}, expected Pending"
+    )]
+    InitialCheckpointNotPending {
+        /// Participant ID carrying the non-pending state.
+        participant_id: ParticipantId,
+        /// Stored state that is not valid for initial intent.
+        state: ParticipantCheckpointState,
+    },
+    /// Initial intent checkpoints cannot claim a committed revision.
+    #[error("initial participant checkpoint {participant_id} cannot carry a committed revision")]
+    InitialCheckpointRevisionForbidden {
+        /// Participant ID carrying the revision.
+        participant_id: ParticipantId,
+    },
+    /// Initial intent checkpoints cannot carry a diagnostic code.
+    #[error("initial participant checkpoint {participant_id} cannot carry a diagnostic code")]
+    InitialCheckpointDiagnosticForbidden {
+        /// Participant ID carrying the diagnostic.
+        participant_id: ParticipantId,
+    },
     /// Two descriptors use the same participant ID.
     #[error("duplicate participant descriptor ID {participant_id}")]
     DuplicateDescriptorId {

@@ -19,9 +19,10 @@ use super::evidence::{
     ReplacementQualificationAssessment,
 };
 use super::model::{
-    MAX_RECORD_BYTES, OperationDisposition, OperationId, OperationIntent, OperationPhase,
-    SCHEMA_V1, SCHEMA_V2,
+    MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationDisposition,
+    OperationId, OperationIntent, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, UniversalIntent,
 };
+use super::participants::MAX_PARTICIPANTS;
 use crate::durable_capacity::DurableCapacityPlan;
 
 /// One complete stored operation record.
@@ -36,6 +37,9 @@ pub struct StoredOperationRecord {
     pub operation_id: OperationId,
     /// Stored operation intent.
     pub intent: OperationIntent,
+    /// Optional V3 universal-intent observation. It is required for schema V3 and absent in
+    /// legacy V1/V2 records.
+    pub universal_intent: Option<UniversalIntent>,
     /// Last stored coordinator phase.
     pub phase: OperationPhase,
     /// Last stored disposition overlay.
@@ -111,6 +115,27 @@ pub enum EncodeError {
         /// Evidence kind that cannot be represented in schema-v1.
         kind: &'static str,
     },
+    /// Schema V3 requires the universal intent wrapper and cannot silently omit it.
+    #[error("schema-v3 requires a universal intent observation")]
+    MissingV3UniversalIntent,
+    /// Schema V3 does not carry execution evidence from the legacy waveform workflow.
+    #[error("schema-v3 cannot encode legacy execution evidence: {kind}")]
+    LegacyEvidenceInV3 {
+        /// Legacy evidence field that would be discarded.
+        kind: &'static str,
+    },
+    /// A V3 universal-intent value cannot be silently dropped while encoding a legacy schema.
+    #[error("schema-v{version} cannot encode a V3 universal intent observation")]
+    UniversalIntentInLegacy {
+        /// Legacy schema identifier that cannot carry the universal intent.
+        version: u32,
+    },
+    /// A V3 initial record violates its bounded shape or initial-state contract.
+    #[error("invalid schema-v3 universal intent record: {reason}")]
+    InvalidV3Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
     /// Serialized output exceeded the bounded record size.
     #[error("encoded operation journal record exceeds {maximum} bytes: {actual} bytes")]
     Oversize {
@@ -153,6 +178,7 @@ impl From<PersistedOperationRecordV1> for StoredOperationRecord {
             schema_version: record.schema_version,
             operation_id: OperationId::from_uuid(record.operation_id),
             intent: record.intent,
+            universal_intent: None,
             phase: record.phase,
             disposition: record.disposition,
             payload: record.payload,
@@ -175,6 +201,11 @@ impl From<PersistedOperationRecordV1> for StoredOperationRecord {
 fn persisted_v1_from_record(
     record: &StoredOperationRecord,
 ) -> Result<PersistedOperationRecordV1Ref<'_>, EncodeError> {
+    if record.universal_intent.is_some() {
+        return Err(EncodeError::UniversalIntentInLegacy {
+            version: record.schema_version,
+        });
+    }
     if record.absent_final_recovery_observation.is_some() {
         return Err(EncodeError::V2EvidenceInV1 {
             kind: "absent-final recovery observation evidence",
@@ -296,6 +327,7 @@ impl From<PersistedOperationRecordV2> for StoredOperationRecord {
             schema_version: record.schema_version,
             operation_id: OperationId::from_uuid(record.operation_id),
             intent: record.intent,
+            universal_intent: None,
             phase: record.phase,
             disposition: record.disposition,
             payload: record.payload,
@@ -313,8 +345,15 @@ impl From<PersistedOperationRecordV2> for StoredOperationRecord {
     }
 }
 
-fn persisted_v2_from_record(record: &StoredOperationRecord) -> PersistedOperationRecordV2Ref<'_> {
-    PersistedOperationRecordV2Ref {
+fn persisted_v2_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedOperationRecordV2Ref<'_>, EncodeError> {
+    if record.universal_intent.is_some() {
+        return Err(EncodeError::UniversalIntentInLegacy {
+            version: record.schema_version,
+        });
+    }
+    Ok(PersistedOperationRecordV2Ref {
         schema_version: record.schema_version,
         operation_id: record.operation_id.as_uuid(),
         intent: &record.intent,
@@ -338,7 +377,7 @@ fn persisted_v2_from_record(record: &StoredOperationRecord) -> PersistedOperatio
         replacement_qualification: record.replacement_qualification.as_ref(),
         created_unix_ms: record.created_unix_ms,
         updated_unix_ms: record.updated_unix_ms,
-    }
+    })
 }
 
 #[derive(Serialize)]
@@ -365,6 +404,129 @@ struct PersistedOperationRecordV2Ref<'a> {
 enum PersistedPreparedTargetContractV2Ref<'a> {
     ExistingExpectedIdentity(&'a PreparedWaveformRestore),
     AbsentFinalNoReplace(&'a PreparedAbsentFinalNoReplace),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperationRecordV3 {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    payload: Value,
+    capacity_plan: DurableCapacityPlan,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl From<PersistedOperationRecordV3> for StoredOperationRecord {
+    fn from(record: PersistedOperationRecordV3) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            operation_id: OperationId::from_uuid(record.operation_id),
+            intent: record.intent,
+            universal_intent: Some(record.universal_intent),
+            phase: record.phase,
+            disposition: record.disposition,
+            payload: record.payload,
+            capacity_plan: Some(record.capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            created_unix_ms: record.created_unix_ms,
+            updated_unix_ms: record.updated_unix_ms,
+        }
+    }
+}
+
+fn persisted_v3_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedOperationRecordV3Ref<'_>, EncodeError> {
+    if record.universal_intent.is_none() {
+        return Err(EncodeError::MissingV3UniversalIntent);
+    }
+    for (present, kind) in [
+        (record.prepared.is_some(), "prepared"),
+        (record.staged.is_some(), "staged"),
+        (record.published().is_some(), "published"),
+        (
+            record.absent_final_recovery_observation.is_some(),
+            "absent-final recovery observation",
+        ),
+        (
+            record.absent_final_transaction_owned_proof.is_some(),
+            "absent-final transaction-owned proof",
+        ),
+        (
+            record.absent_final_adoption_evidence.is_some(),
+            "absent-final adoption evidence",
+        ),
+        (
+            record.replacement_qualification.is_some(),
+            "replacement qualification",
+        ),
+    ] {
+        if present {
+            return Err(EncodeError::LegacyEvidenceInV3 { kind });
+        }
+    }
+    if record.phase != OperationPhase::IntentDurable {
+        return Err(EncodeError::InvalidV3Record {
+            reason: format!(
+                "schema-v3 foundation only encodes IntentDurable, found {:?}",
+                record.phase
+            ),
+        });
+    }
+    if record.disposition != OperationDisposition::None {
+        return Err(EncodeError::InvalidV3Record {
+            reason: String::from("schema-v3 initial records require the None disposition"),
+        });
+    }
+    if record.capacity_plan.is_none() {
+        return Err(EncodeError::InvalidV3Record {
+            reason: String::from("schema-v3 initial records require a capacity plan"),
+        });
+    }
+    validate_v3_initial_shape(record).map_err(|reason| EncodeError::InvalidV3Record { reason })?;
+    Ok(PersistedOperationRecordV3Ref {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("V3 universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        payload: &record.payload,
+        capacity_plan: record
+            .capacity_plan
+            .as_ref()
+            .expect("V3 capacity plan checked above"),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    })
+}
+
+#[derive(Serialize)]
+struct PersistedOperationRecordV3Ref<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    payload: &'a Value,
+    capacity_plan: &'a DurableCapacityPlan,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
 }
 
 /// Decode one bounded persisted operation record.
@@ -402,6 +564,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
             serde_json::from_value::<PersistedOperationRecordV2>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))
+        }
+        SCHEMA_V3 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v3_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedOperationRecordV3>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v3_initial_shape(&record).map_err(malformed)?;
+            Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
     }
@@ -524,8 +695,9 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
 
 /// Encode one stored record using its persisted schema and a capped writer.
 ///
-/// Encoding preserves the exact V1/V2 field and enum representation. It does not perform phase or
-/// publication-policy validation; those checks belong to the later transition/owner boundary.
+/// Encoding preserves the exact V1/V2 field and enum representation and emits the explicit V3
+/// universal-intent envelope. The V3 branch accepts only the initial durable-intent shape; later
+/// transition and publication-policy validation belongs to the owner boundary.
 pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
     let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
     let result = match record.schema_version {
@@ -534,7 +706,11 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         SCHEMA_V2 => {
-            let persisted = persisted_v2_from_record(record);
+            let persisted = persisted_v2_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V3 => {
+            let persisted = persisted_v3_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -1086,9 +1262,244 @@ fn validate_persisted_v2_object_boundaries(value: &Value) -> Result<(), &'static
     Ok(())
 }
 
+const MAX_V3_JSON_DEPTH: usize = 64;
+
+fn validate_persisted_v3_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "payload",
+            "capacity_plan",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "payload",
+        "capacity_plan",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
+    if !required_field(object, "payload")?.is_object() {
+        return Err("schema-v3 payload must be a JSON object");
+    }
+    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
+    Ok(())
+}
+
+fn validate_persisted_universal_intent_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "parent_operation_id",
+            "command_kind",
+            "user_status_key",
+            "participants",
+        ],
+    )?;
+    let parent = required_field(object, "parent_operation_id")?;
+    if !parent.is_null() && !parent.is_string() {
+        return Err("schema-v3 parent operation ID must be a UUID string or null");
+    }
+    if !required_field(object, "command_kind")?.is_string() {
+        return Err("schema-v3 command kind must be a string");
+    }
+    let status = required_field(object, "user_status_key")?
+        .as_str()
+        .ok_or("schema-v3 user status key must be a string")?;
+    if status.len() > MAX_USER_STATUS_KEY_BYTES {
+        return Err("schema-v3 user status key exceeds its byte bound");
+    }
+    let participants = strict_object(
+        required_field(object, "participants")?,
+        &["descriptors", "checkpoints"],
+    )?;
+    for field in ["descriptors", "checkpoints"] {
+        let values = required_field(participants, field)?
+            .as_array()
+            .ok_or("schema-v3 participant collection must be an array")?;
+        if values.len() > MAX_PARTICIPANTS {
+            return Err("schema-v3 participant collection exceeds its bound");
+        }
+        if values.iter().any(|value| !value.is_object()) {
+            return Err("schema-v3 participant entries must be JSON objects");
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_capacity_plan_v3_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(value, &["volumes"])?;
+    let volumes = required_field(object, "volumes")?
+        .as_array()
+        .ok_or("schema-v3 capacity volumes must be an array")?;
+    for volume in volumes {
+        let volume = strict_object(
+            volume,
+            &[
+                "identity",
+                "allocation_unit",
+                "allocation_class",
+                "logical_bytes",
+                "allocated_bytes",
+                "protected_free_bytes",
+            ],
+        )?;
+        for field in [
+            "identity",
+            "allocation_unit",
+            "allocation_class",
+            "logical_bytes",
+            "allocated_bytes",
+            "protected_free_bytes",
+        ] {
+            required_field(volume, field)?;
+        }
+        validate_persisted_volume_identity_value(required_field(volume, "identity")?)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    if record.schema_version != SCHEMA_V3 {
+        return Err(String::from("schema-v3 validation received another schema"));
+    }
+    if record.phase != OperationPhase::IntentDurable {
+        return Err(format!(
+            "schema-v3 foundation only supports IntentDurable, found {:?}",
+            record.phase
+        ));
+    }
+    if record.disposition != OperationDisposition::None {
+        return Err(String::from(
+            "schema-v3 initial records require the None disposition",
+        ));
+    }
+    if record.capacity_plan.is_none() {
+        return Err(String::from(
+            "schema-v3 initial records require a capacity plan",
+        ));
+    }
+    for (present, kind) in [
+        (record.prepared.is_some(), "prepared"),
+        (record.staged.is_some(), "staged"),
+        (record.published().is_some(), "published"),
+        (
+            record.absent_final_recovery_observation.is_some(),
+            "absent-final recovery observation",
+        ),
+        (
+            record.absent_final_transaction_owned_proof.is_some(),
+            "absent-final transaction-owned proof",
+        ),
+        (
+            record.absent_final_adoption_evidence.is_some(),
+            "absent-final adoption evidence",
+        ),
+        (
+            record.replacement_qualification.is_some(),
+            "replacement qualification",
+        ),
+    ] {
+        if present {
+            return Err(format!("schema-v3 cannot contain legacy {kind} evidence"));
+        }
+    }
+    if record.intent.label.is_empty() {
+        return Err(String::from("schema-v3 operation label must not be empty"));
+    }
+    if record.intent.label.len() > MAX_UNIVERSAL_LABEL_BYTES {
+        return Err(String::from(
+            "schema-v3 operation label exceeds its byte bound",
+        ));
+    }
+    if record.intent.label.chars().any(char::is_control) {
+        return Err(String::from(
+            "schema-v3 operation label contains a control character",
+        ));
+    }
+    if !record.payload.is_object() {
+        return Err(String::from("schema-v3 payload must be a JSON object"));
+    }
+    validate_json_depth(&record.payload, MAX_V3_JSON_DEPTH.saturating_sub(1))
+        .map_err(String::from)?;
+    if record.created_unix_ms < 0 || record.updated_unix_ms < 0 {
+        return Err(String::from("schema-v3 timestamps must be non-negative"));
+    }
+    if record.updated_unix_ms < record.created_unix_ms {
+        return Err(String::from(
+            "schema-v3 updated timestamp must not precede creation timestamp",
+        ));
+    }
+    let universal = record
+        .universal_intent
+        .as_ref()
+        .ok_or_else(|| String::from("schema-v3 record requires a universal intent"))?;
+    universal
+        .validate_for_new_intent(
+            record.operation_id,
+            record.intent.actor,
+            &record.intent.kind,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &'static str> {
+    fn visit(
+        value: &Value,
+        depth: usize,
+        maximum: usize,
+        nodes: &mut usize,
+    ) -> Result<(), &'static str> {
+        if depth > maximum {
+            return Err("schema-v3 JSON nesting exceeds its depth bound");
+        }
+        *nodes = nodes.saturating_add(1);
+        if *nodes > MAX_RECORD_BYTES {
+            return Err("schema-v3 JSON node count exceeds its bound");
+        }
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, depth.saturating_add(1), maximum, nodes)?;
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    visit(value, depth.saturating_add(1), maximum, nodes)?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    let mut nodes = 0;
+    visit(value, 0, maximum, &mut nodes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_journal::UniversalCommandKind;
+    use crate::operation_journal::{RecordConsistency, classify_record};
 
     const V1_FIXTURE: &[u8] = br#"{
   "schema_version": 1,
@@ -1123,6 +1534,47 @@ mod tests {
   "replacement_qualification": null,
   "created_unix_ms": 21,
   "updated_unix_ms": 22
+}"#;
+
+    const V3_FIXTURE: &[u8] = br#"{
+  "schema_version": 3,
+  "operation_id": "01234567-89ab-cdef-0123-456789abcdef",
+  "intent": {"actor": "User", "kind": "FileMutation", "label": "v3 fixture"},
+  "universal_intent": {
+    "parent_operation_id": null,
+    "command_kind": "CreateFile",
+    "user_status_key": "operation.status.create-file",
+    "participants": {
+      "descriptors": [{
+        "id": "fedcba98-7654-3210-fedc-ba9876543210",
+        "kind": "GlobalLibrary",
+        "requirement": "Required",
+        "source_fence": null,
+        "artifact_key": null
+      }],
+      "checkpoints": [{
+        "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+        "state": "Pending",
+        "committed_revision": null,
+        "diagnostic_code": null
+      }]
+    }
+  },
+  "phase": "IntentDurable",
+  "disposition": "None",
+  "payload": {"source": "fixture"},
+  "capacity_plan": {
+    "volumes": [{
+      "identity": {"device": 1},
+      "allocation_unit": 1,
+      "allocation_class": "DestinationStaging",
+      "logical_bytes": 1,
+      "allocated_bytes": 1,
+      "protected_free_bytes": 268435456
+    }]
+  },
+  "created_unix_ms": 31,
+  "updated_unix_ms": 32
 }"#;
 
     const ABSENT_FINAL_PUBLICATION_FIXTURE: &[u8] = br#"{
@@ -1204,6 +1656,212 @@ mod tests {
     }
 
     #[test]
+    fn pinned_v3_fixture_decodes_and_round_trips_by_value() {
+        let record = decode(V3_FIXTURE).expect("v3 fixture decodes");
+        assert_eq!(record.schema_version, SCHEMA_V3);
+        assert_eq!(record.intent.label, "v3 fixture");
+        let universal = record
+            .universal_intent
+            .as_ref()
+            .expect("v3 fixture has universal intent");
+        assert_eq!(universal.command_kind(), UniversalCommandKind::CreateFile);
+        assert_eq!(universal.user_status_key(), "operation.status.create-file");
+        assert_eq!(universal.participants().descriptors().len(), 1);
+        assert_eq!(
+            value(&encode(&record).expect("v3 fixture encodes")),
+            value(V3_FIXTURE)
+        );
+    }
+
+    #[test]
+    fn v3_requires_all_universal_fields_and_rejects_legacy_evidence() {
+        let mut missing_parent = value(V3_FIXTURE);
+        missing_parent["universal_intent"]
+            .as_object_mut()
+            .expect("universal object")
+            .remove("parent_operation_id");
+        let missing_parent_bytes = serde_json::to_vec(&missing_parent).expect("fixture encodes");
+        assert!(matches!(
+            decode(&missing_parent_bytes),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut legacy_evidence = value(V3_FIXTURE);
+        legacy_evidence["published"] = Value::Null;
+        let legacy_evidence_bytes = serde_json::to_vec(&legacy_evidence).expect("fixture encodes");
+        assert!(matches!(
+            decode(&legacy_evidence_bytes),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut missing_capacity_field = value(V3_FIXTURE);
+        missing_capacity_field["capacity_plan"]["volumes"][0]
+            .as_object_mut()
+            .expect("capacity volume object")
+            .remove("protected_free_bytes");
+        let missing_capacity_bytes =
+            serde_json::to_vec(&missing_capacity_field).expect("fixture encodes");
+        assert!(matches!(
+            decode(&missing_capacity_bytes),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut unknown_participant = value(V3_FIXTURE);
+        unknown_participant["universal_intent"]["participants"]["descriptors"][0]["unexpected"] =
+            Value::Bool(true);
+        let unknown_participant_bytes =
+            serde_json::to_vec(&unknown_participant).expect("fixture encodes");
+        assert!(matches!(
+            decode(&unknown_participant_bytes),
+            Err(DecodeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn v3_initial_shape_rejects_incompatible_command_and_non_object_payload() {
+        let mut incompatible = value(V3_FIXTURE);
+        incompatible["universal_intent"]["command_kind"] = Value::from("Undo");
+        let incompatible_bytes = serde_json::to_vec(&incompatible).expect("fixture encodes");
+        assert!(matches!(
+            decode(&incompatible_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("incompatible")
+        ));
+
+        let mut non_object_payload = value(V3_FIXTURE);
+        non_object_payload["payload"] = Value::Array(Vec::new());
+        let non_object_payload_bytes =
+            serde_json::to_vec(&non_object_payload).expect("fixture encodes");
+        assert!(matches!(
+            decode(&non_object_payload_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("payload")
+        ));
+
+        let mut later_phase = value(V3_FIXTURE);
+        later_phase["phase"] = Value::from("Prepared");
+        let later_phase_bytes = serde_json::to_vec(&later_phase).expect("fixture encodes");
+        assert!(matches!(
+            decode(&later_phase_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("IntentDurable")
+        ));
+
+        let mut later_disposition = value(V3_FIXTURE);
+        later_disposition["disposition"] = Value::from("RetryPending");
+        let later_disposition_bytes =
+            serde_json::to_vec(&later_disposition).expect("fixture encodes");
+        assert!(matches!(
+            decode(&later_disposition_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("None disposition")
+        ));
+
+        let mut long_status = value(V3_FIXTURE);
+        long_status["universal_intent"]["user_status_key"] =
+            Value::String("x".repeat(MAX_USER_STATUS_KEY_BYTES + 1));
+        let long_status_bytes = serde_json::to_vec(&long_status).expect("fixture encodes");
+        assert!(matches!(
+            decode(&long_status_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("status key")
+        ));
+
+        let mut long_label = value(V3_FIXTURE);
+        long_label["intent"]["label"] = Value::String("x".repeat(MAX_UNIVERSAL_LABEL_BYTES + 1));
+        let long_label_bytes = serde_json::to_vec(&long_label).expect("fixture encodes");
+        assert!(matches!(
+            decode(&long_label_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("label")
+        ));
+
+        let mut self_parent = value(V3_FIXTURE);
+        self_parent["universal_intent"]["parent_operation_id"] =
+            Value::from("01234567-89ab-cdef-0123-456789abcdef");
+        let self_parent_bytes = serde_json::to_vec(&self_parent).expect("fixture encodes");
+        assert!(matches!(
+            decode(&self_parent_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("itself")
+        ));
+
+        let mut invalid_timestamps = value(V3_FIXTURE);
+        invalid_timestamps["created_unix_ms"] = Value::from(10_i64);
+        invalid_timestamps["updated_unix_ms"] = Value::from(9_i64);
+        let invalid_timestamps_bytes =
+            serde_json::to_vec(&invalid_timestamps).expect("fixture encodes");
+        assert!(matches!(
+            decode(&invalid_timestamps_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("precede")
+        ));
+
+        let mut nonpending_checkpoint = value(V3_FIXTURE);
+        nonpending_checkpoint["universal_intent"]["participants"]["checkpoints"][0]["state"] =
+            Value::from("Applied");
+        let nonpending_bytes = serde_json::to_vec(&nonpending_checkpoint).expect("fixture encodes");
+        assert!(matches!(
+            decode(&nonpending_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("Pending")
+        ));
+    }
+
+    #[test]
+    fn v3_record_is_consistent_but_legacy_schema_cannot_carry_it() {
+        let record = decode(V3_FIXTURE).expect("v3 fixture decodes");
+        assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+
+        let mut legacy = record;
+        legacy.schema_version = SCHEMA_V1;
+        assert!(matches!(
+            classify_record(&legacy),
+            RecordConsistency::Invalid(reason) if reason.contains("legacy")
+        ));
+    }
+
+    #[test]
+    fn v3_rejects_excessive_depth_and_nested_capacity_unknown_fields() {
+        let mut deep_payload = Value::Null;
+        for _ in 0..65 {
+            deep_payload = Value::Array(vec![deep_payload]);
+        }
+        let mut deep = value(V3_FIXTURE);
+        deep["payload"] = serde_json::json!({"deep": deep_payload});
+        let deep_bytes = serde_json::to_vec(&deep).expect("fixture encodes");
+        assert!(matches!(
+            decode(&deep_bytes),
+            Err(DecodeError::Malformed { reason }) if reason.contains("nesting")
+        ));
+
+        let mut unknown_capacity = value(V3_FIXTURE);
+        unknown_capacity["capacity_plan"]["volumes"][0]["unexpected"] = Value::Bool(true);
+        let unknown_capacity_bytes =
+            serde_json::to_vec(&unknown_capacity).expect("fixture encodes");
+        assert!(matches!(
+            decode(&unknown_capacity_bytes),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut encoded_depth = decode(V3_FIXTURE).expect("v3 fixture decodes");
+        encoded_depth.payload = serde_json::json!({"deep": deep["payload"]["deep"].clone()});
+        assert!(matches!(
+            encode(&encoded_depth),
+            Err(EncodeError::InvalidV3Record { reason }) if reason.contains("nesting")
+        ));
+    }
+
+    #[test]
+    fn v3_encoding_never_drops_universal_or_legacy_evidence() {
+        let mut record = decode(V3_FIXTURE).expect("v3 fixture decodes");
+        record.schema_version = SCHEMA_V1;
+        assert_eq!(
+            encode(&record),
+            Err(EncodeError::UniversalIntentInLegacy { version: SCHEMA_V1 })
+        );
+        record.schema_version = SCHEMA_V2;
+        assert_eq!(
+            encode(&record),
+            Err(EncodeError::UniversalIntentInLegacy { version: SCHEMA_V2 })
+        );
+        record.schema_version = SCHEMA_V3;
+        record.universal_intent = None;
+        assert_eq!(encode(&record), Err(EncodeError::MissingV3UniversalIntent));
+    }
+
+    #[test]
     fn unsupported_version_is_distinct_from_malformed_data() {
         let mut fixture = value(V1_FIXTURE);
         fixture["schema_version"] = Value::from(99_u64);
@@ -1260,6 +1918,21 @@ mod tests {
     fn capped_writer_rejects_oversize_output() {
         let mut record = decode(V1_FIXTURE).expect("v1 fixture decodes");
         record.payload = Value::String("x".repeat(MAX_RECORD_BYTES));
+        assert!(matches!(
+            encode(&record),
+            Err(EncodeError::Oversize { maximum, .. }) if maximum == MAX_RECORD_BYTES
+        ));
+    }
+
+    #[test]
+    fn v3_wide_payload_is_rejected_with_bounded_encode_work() {
+        let mut record = decode(V3_FIXTURE).expect("v3 fixture decodes");
+        let mut payload = Map::new();
+        for index in 0..4_096 {
+            payload.insert(format!("key-{index}"), Value::String("x".repeat(256)));
+        }
+        record.payload = Value::Object(payload);
+
         assert!(matches!(
             encode(&record),
             Err(EncodeError::Oversize { maximum, .. }) if maximum == MAX_RECORD_BYTES

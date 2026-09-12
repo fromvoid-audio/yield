@@ -1219,6 +1219,55 @@ mod tests {
             .expect("decode intent fixture")
     }
 
+    fn universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
+        let value = serde_json::json!({
+            "schema_version": 3,
+            "operation_id": operation_id.as_uuid(),
+            "intent": {
+                "actor": "User",
+                "kind": "FileMutation",
+                "label": "store-v3-test"
+            },
+            "universal_intent": {
+                "parent_operation_id": null,
+                "command_kind": "CreateFile",
+                "user_status_key": "operation.status.store-v3",
+                "participants": {
+                    "descriptors": [{
+                        "id": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "kind": "GlobalLibrary",
+                        "requirement": "Required",
+                        "source_fence": null,
+                        "artifact_key": null
+                    }],
+                    "checkpoints": [{
+                        "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "state": "Pending",
+                        "committed_revision": null,
+                        "diagnostic_code": null
+                    }]
+                }
+            },
+            "phase": "IntentDurable",
+            "disposition": "None",
+            "payload": {"store": "v3"},
+            "capacity_plan": {
+                "volumes": [{
+                    "identity": {"device": 1},
+                    "allocation_unit": 1,
+                    "allocation_class": "DestinationStaging",
+                    "logical_bytes": 1,
+                    "allocated_bytes": 1,
+                    "protected_free_bytes": 268435456
+                }]
+            },
+            "created_unix_ms": 41,
+            "updated_unix_ms": 42
+        });
+        decode(&serde_json::to_vec(&value).expect("serialize universal intent fixture"))
+            .expect("decode universal intent fixture")
+    }
+
     fn database_path(owner: &WritableProfileGuard) -> PathBuf {
         owner
             .profile_root()
@@ -1277,6 +1326,38 @@ mod tests {
                 .get(second.operation_id)
                 .expect("get persisted second"),
             Some(second)
+        );
+    }
+
+    #[test]
+    fn v3_intent_insert_get_and_restart_preserve_universal_participants() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let receipt = store.insert_intent(&record).expect("insert v3 intent");
+        assert_eq!(receipt.operation_id(), record.operation_id);
+        assert_eq!(
+            record
+                .universal_intent
+                .as_ref()
+                .expect("universal intent")
+                .participants()
+                .descriptors()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.get(record.operation_id).expect("get v3 intent"),
+            Some(record.clone())
+        );
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        assert_eq!(
+            reopened
+                .get(record.operation_id)
+                .expect("get restarted v3 intent"),
+            Some(record)
         );
     }
 

@@ -1,21 +1,30 @@
 //! Pure values for the profile-local durable operation journal.
 //!
-//! This first active slice contains only the stable operation identity, intent, phase, and
-//! disposition model. It performs no filesystem I/O and grants no ownership or mutation
-//! authority. Later journal evidence and codecs can depend on these values without importing
-//! renderer or UI types.
+//! The active values include legacy operation identity/phase data and the initial V3 universal
+//! intent shape. They perform no filesystem I/O and grant no ownership or mutation authority.
+//! Later journal evidence and codecs can depend on these values without importing renderer or UI
+//! types. V3 currently describes only a newly durable intent; later transitions remain unsupported.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
+
+use super::participants::{ParticipantSet, ParticipantValidationError};
 
 /// The first persisted operation-journal schema.
 pub const SCHEMA_V1: u32 = 1;
 /// The second persisted operation-journal schema.
 pub const SCHEMA_V2: u32 = 2;
+/// The initial universal operation-journal schema.
+pub const SCHEMA_V3: u32 = 3;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
 pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// Maximum byte length of a V3 user-facing operation label.
+pub const MAX_UNIVERSAL_LABEL_BYTES: usize = 256;
+/// Maximum byte length of a V3 stable user-status key.
+pub const MAX_USER_STATUS_KEY_BYTES: usize = 128;
 
 /// Opaque identity for one operation.
 ///
@@ -89,6 +98,190 @@ pub struct OperationIntent {
     pub kind: OperationKind,
     /// Bounded user-facing label, when available.
     pub label: String,
+}
+
+/// Concrete command recorded by a V3 universal intent.
+///
+/// This list follows the documented file and transaction workflows. Adding another command is
+/// an explicit model and schema decision; unknown command values remain retained data.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum UniversalCommandKind {
+    /// Extract a rendered result from a source or waveform selection.
+    Extract,
+    /// Copy an existing file into a destination.
+    Copy,
+    /// Create a new file.
+    CreateFile,
+    /// Create a new folder.
+    CreateFolder,
+    /// Duplicate an existing file.
+    Duplicate,
+    /// Export a file to a chosen destination.
+    Export,
+    /// Rename an existing file or folder.
+    Rename,
+    /// Move a file or folder.
+    Move,
+    /// Move an item to trash.
+    Trash,
+    /// Delete an item through an explicit delete workflow.
+    Delete,
+    /// Apply an explicitly destructive audio edit.
+    DestructiveEdit,
+    /// Undo a prior user transaction.
+    Undo,
+    /// Redo a prior user transaction.
+    Redo,
+    /// Reconcile an operation observed from an external filesystem owner.
+    ExternalReconciliation,
+}
+
+/// Stored universal-intent fields added by schema V3.
+///
+/// This is an untrusted data value. It identifies the command, parent relationship, status
+/// lookup key, and participant observations needed by a future coordinator. It contains no live
+/// lease, queue admission, profile ownership, filesystem capability, or publication authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniversalIntent {
+    parent_operation_id: Option<OperationId>,
+    command_kind: UniversalCommandKind,
+    user_status_key: String,
+    participants: ParticipantSet,
+}
+
+impl UniversalIntent {
+    /// Construct a universal-intent observation after checking its bounded local fields.
+    pub fn new(
+        parent_operation_id: Option<OperationId>,
+        command_kind: UniversalCommandKind,
+        user_status_key: impl Into<String>,
+        participants: ParticipantSet,
+    ) -> Result<Self, UniversalIntentValidationError> {
+        let intent = Self {
+            parent_operation_id,
+            command_kind,
+            user_status_key: user_status_key.into(),
+            participants,
+        };
+        intent.validate_shape()?;
+        Ok(intent)
+    }
+
+    /// Validate this observation for a new `IntentDurable` record.
+    pub fn validate_for_new_intent(
+        &self,
+        operation_id: OperationId,
+        actor: OperationActor,
+        kind: &OperationKind,
+    ) -> Result<(), UniversalIntentValidationError> {
+        self.validate_shape()?;
+        if self.parent_operation_id == Some(operation_id) {
+            return Err(UniversalIntentValidationError::SelfParent);
+        }
+        if !command_matches_intent(self.command_kind, actor, kind) {
+            return Err(UniversalIntentValidationError::IncompatibleCommand {
+                command_kind: self.command_kind,
+            });
+        }
+        self.participants.validate_for_new_intent()?;
+        Ok(())
+    }
+
+    /// Return the optional parent or compound operation identity.
+    pub fn parent_operation_id(&self) -> Option<OperationId> {
+        self.parent_operation_id
+    }
+
+    /// Return the typed command kind.
+    pub const fn command_kind(&self) -> UniversalCommandKind {
+        self.command_kind
+    }
+
+    /// Return the stable status lookup key.
+    pub fn user_status_key(&self) -> &str {
+        &self.user_status_key
+    }
+
+    /// Borrow the stored participant observations.
+    pub fn participants(&self) -> &ParticipantSet {
+        &self.participants
+    }
+
+    fn validate_shape(&self) -> Result<(), UniversalIntentValidationError> {
+        if self.user_status_key.is_empty() {
+            return Err(UniversalIntentValidationError::InvalidUserStatusKey {
+                violation: UniversalIntentTextViolation::Empty,
+            });
+        }
+        if self.user_status_key.len() > MAX_USER_STATUS_KEY_BYTES {
+            return Err(UniversalIntentValidationError::InvalidUserStatusKey {
+                violation: UniversalIntentTextViolation::TooLong,
+            });
+        }
+        if self.user_status_key.chars().any(char::is_control) {
+            return Err(UniversalIntentValidationError::InvalidUserStatusKey {
+                violation: UniversalIntentTextViolation::ContainsControl,
+            });
+        }
+        self.participants.validate_for_new_operation()?;
+        Ok(())
+    }
+}
+
+fn command_matches_intent(
+    command_kind: UniversalCommandKind,
+    actor: OperationActor,
+    kind: &OperationKind,
+) -> bool {
+    match command_kind {
+        UniversalCommandKind::ExternalReconciliation => {
+            actor == OperationActor::ExternalFs && *kind == OperationKind::ExternalReconciliation
+        }
+        UniversalCommandKind::Undo | UniversalCommandKind::Redo => {
+            actor == OperationActor::User && *kind == OperationKind::FileHistory
+        }
+        _ => actor == OperationActor::User && *kind == OperationKind::FileMutation,
+    }
+}
+
+/// Reason a V3 status key failed its bounded text contract.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum UniversalIntentTextViolation {
+    /// The key was empty.
+    #[error("is empty")]
+    Empty,
+    /// The key exceeded [`MAX_USER_STATUS_KEY_BYTES`].
+    #[error("exceeds its byte bound")]
+    TooLong,
+    /// The key contains a NUL or another control character.
+    #[error("contains a control character")]
+    ContainsControl,
+}
+
+/// Typed validation failure for a V3 universal-intent observation.
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
+pub enum UniversalIntentValidationError {
+    /// The parent identity cannot point back to this operation.
+    #[error("a universal intent cannot name itself as its parent operation")]
+    SelfParent,
+    /// The command kind does not match the stored actor and operation family.
+    #[error(
+        "universal command {command_kind:?} is incompatible with its actor and operation family"
+    )]
+    IncompatibleCommand {
+        /// Command kind whose compatibility failed.
+        command_kind: UniversalCommandKind,
+    },
+    /// The stable status lookup key is outside its bounded text contract.
+    #[error("invalid universal user-status key: {violation}")]
+    InvalidUserStatusKey {
+        /// Bounded text failure.
+        violation: UniversalIntentTextViolation,
+    },
+    /// The participant inventory failed its bounded shape validation.
+    #[error("invalid universal participants: {0}")]
+    Participants(#[from] ParticipantValidationError),
 }
 
 /// Ordered journal phases. This foundation stores state but never executes a phase.

@@ -761,6 +761,55 @@ mod tests {
             .expect("decode intent fixture")
     }
 
+    fn universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
+        let value = serde_json::json!({
+            "schema_version": 3,
+            "operation_id": operation_id.as_uuid(),
+            "intent": {
+                "actor": "User",
+                "kind": "FileMutation",
+                "label": "recovery-v3-test"
+            },
+            "universal_intent": {
+                "parent_operation_id": null,
+                "command_kind": "CreateFile",
+                "user_status_key": "operation.status.recovery-v3",
+                "participants": {
+                    "descriptors": [{
+                        "id": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "kind": "GlobalLibrary",
+                        "requirement": "Required",
+                        "source_fence": null,
+                        "artifact_key": null
+                    }],
+                    "checkpoints": [{
+                        "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "state": "Pending",
+                        "committed_revision": null,
+                        "diagnostic_code": null
+                    }]
+                }
+            },
+            "phase": "IntentDurable",
+            "disposition": "None",
+            "payload": {"recovery": "v3"},
+            "capacity_plan": {
+                "volumes": [{
+                    "identity": {"device": 1},
+                    "allocation_unit": 1,
+                    "allocation_class": "DestinationStaging",
+                    "logical_bytes": 1,
+                    "allocated_bytes": 1,
+                    "protected_free_bytes": 268435456
+                }]
+            },
+            "created_unix_ms": 51,
+            "updated_unix_ms": 52
+        });
+        decode(&serde_json::to_vec(&value).expect("serialize universal intent fixture"))
+            .expect("decode universal intent fixture")
+    }
+
     fn insert_raw(store: &OperationJournalStore, key: &str, sequence: i64, record: &[u8]) {
         store
             .connection
@@ -788,6 +837,61 @@ mod tests {
         assert!(page.is_done());
         assert_eq!(page.next_cursor(), None);
         assert_eq!(page.encoded_bytes(), 0);
+    }
+
+    #[test]
+    fn recovery_scan_classifies_v3_intent_as_consistent_observation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        store.insert_intent(&record).expect("insert v3 intent");
+
+        let page = store.scan_recovery_page(None).expect("scan v3 intent");
+        assert!(page.is_done());
+        assert_eq!(page.entries().len(), 1);
+        assert_eq!(page.entries()[0].sequence(), 1);
+        assert_eq!(
+            page.entries()[0].outcome(),
+            &RecoveryRowOutcome::Consistent(record)
+        );
+    }
+
+    #[test]
+    fn unsupported_v3_phase_is_retained_unchanged_without_hiding_later_intents() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encode(&record).expect("encode V3 intent"))
+                .expect("parse fixture");
+        value["phase"] = serde_json::Value::from("Prepared");
+        let retained = serde_json::to_vec(&value).expect("encode unsupported phase");
+        insert_raw(&store, &record.operation_id.to_string(), 1, &retained);
+        let later = universal_intent_record(OperationId::new());
+        store.insert_intent(&later).expect("insert later intent");
+
+        let page = store
+            .scan_recovery_page(None)
+            .expect("scan retained V3 row");
+        assert!(page.is_done());
+        assert_eq!(page.entries().len(), 2);
+        assert!(matches!(
+            page.entries()[0].outcome(),
+            RecoveryRowOutcome::Retained(RecoveryRetentionReason::Malformed { .. })
+        ));
+        assert_eq!(
+            page.entries()[1].outcome(),
+            &RecoveryRowOutcome::Consistent(later)
+        );
+        let unchanged: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                [record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained bytes");
+        assert_eq!(unchanged, retained);
     }
 
     #[test]
