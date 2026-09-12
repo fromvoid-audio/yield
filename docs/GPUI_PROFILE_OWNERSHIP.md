@@ -62,10 +62,13 @@ a canonical isolated profile rather than enabling fixture write access for the
 UI dependency graph. Ownership tests read diagnostics through the retained lock
 handle, matching Windows exclusive-lock semantics.
 The complete library unit suite subsequently passed 536 tests (one subprocess
-helper ignored outside dispatch). The current Windows validation run is
+helper ignored outside dispatch). Windows validation passed in
 [`34702160315`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34702160315),
-against `1a8fbafa5`; the earlier run was cancelled after the test fixes and is
-not acceptance evidence.
+against `1a8fbafa5`, including production profile admission, profile-owned
+settings maintenance, audio/core/media/platform tests, GPUI compilation, and
+browser state/interaction tests. The earlier run was cancelled after the test
+fixes and is not acceptance evidence. This run predates the subsequent neutral
+journal-model extraction.
 
 Legacy fixture creation remains available only under library unit-test
 configuration or the explicit `test-support` feature. That feature must not

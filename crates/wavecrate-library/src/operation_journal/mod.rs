@@ -1,11 +1,14 @@
-//! Profile-local durable operation-journal values.
+//! Profile-local durable operation-journal values and bounded codec.
 //!
-//! This module currently exposes the stable identity, intent, phase, and disposition model. It
-//! does not open files, acquire ownership, publish filesystem entries, or interpret journal data
-//! as mutation authority.
+//! This module exposes the stable identity, intent, phase, disposition, stored evidence, and
+//! strict persisted-record codec. It does not open files, acquire ownership, publish filesystem
+//! entries, or interpret journal data as mutation authority.
 
+pub mod codec;
 pub mod evidence;
 pub mod model;
+
+pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 
 pub use evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalObservation, AbsentFinalRecoveryObservation,
@@ -20,6 +23,6 @@ pub use evidence::{
 };
 
 pub use model::{
-    CURRENT_SCHEMA_VERSION, OperationActor, OperationDisposition, OperationId, OperationIntent,
-    OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
+    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, OperationActor, OperationDisposition, OperationId,
+    OperationIntent, OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
 };

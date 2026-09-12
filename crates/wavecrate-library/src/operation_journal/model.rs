@@ -14,6 +14,8 @@ pub const SCHEMA_V1: u32 = 1;
 pub const SCHEMA_V2: u32 = 2;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
+/// Maximum number of bytes accepted for one persisted operation record.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 /// Opaque identity for one operation.
 ///
