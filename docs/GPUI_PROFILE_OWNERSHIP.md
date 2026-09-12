@@ -149,6 +149,8 @@ transitions.
 The V3 addition passed 82 focused journal tests and GPUI compilation on macOS.
 An additional recovery regression passed after review: an unsupported V3 phase
 remains byte-for-byte unchanged while a later valid intent stays observable.
+Windows storage validation passed on `aa135f587` in
+[`34711107753`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34711107753).
 Retry/cancellation metadata, typed command arguments, full multi-class capacity
 claims, execution transitions, and recovery execution remain unfinished.
 
