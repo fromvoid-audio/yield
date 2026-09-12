@@ -2356,14 +2356,126 @@ fn drain_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::time::Instant;
+    use std::{
+        fs,
+        io::{self, BufRead, BufReader, Write},
+        process::{Child, ChildStdin, Command, Stdio},
+        sync::mpsc::Receiver,
+        time::Instant,
+    };
     use tempfile::TempDir;
     use wavecrate_library::app_dirs::{
         AppRootGuard, ConfigBaseGuard, PROFILE_DIR_NAME, ProfileOwnershipError,
         WritableProfileGuard,
     };
     use wavecrate_library::sample_sources::{SourceId, SourceMetadataStorage};
+
+    const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "WAVECRATE_SESSION_OWNER_PROFILE_ROOT";
+
+    struct SessionOwnerHelperProcess {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        ready_rx: Receiver<Result<(), String>>,
+        eof_rx: Receiver<()>,
+    }
+
+    impl Drop for SessionOwnerHelperProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_session_owner_helper(profile_root: &Path) -> SessionOwnerHelperProcess {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg("tests::session_owner_process_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(SESSION_OWNER_PROFILE_ROOT_ENV, profile_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn session owner helper");
+        let stdin = child.stdin.take().expect("session helper stdin");
+        let stdout = child.stdout.take().expect("session helper stdout");
+        let stderr = child.stderr.take().expect("session helper stderr");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (eof_tx, eof_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let ready = loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        break Err(String::from("session owner helper exited before handshake"));
+                    }
+                    Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                    Ok(_) => continue,
+                    Err(error) => {
+                        break Err(format!("failed to read session owner handshake: {error}"));
+                    }
+                }
+            };
+            let _ = ready_tx.send(ready);
+            let _ = io::copy(&mut reader, &mut io::sink());
+            let _ = eof_tx.send(());
+        });
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let _ = io::copy(&mut reader, &mut io::sink());
+        });
+        SessionOwnerHelperProcess {
+            child,
+            stdin: Some(stdin),
+            ready_rx,
+            eof_rx,
+        }
+    }
+
+    fn wait_for_session_owner_ready(helper: &mut SessionOwnerHelperProcess) {
+        match helper.ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("session owner helper handshake failed: {error}"),
+            Err(error) => panic!("timed out waiting for session owner helper: {error}"),
+        }
+    }
+
+    fn release_session_owner_helper(helper: &mut SessionOwnerHelperProcess) {
+        let mut stdin = helper.stdin.take().expect("session owner helper stdin");
+        writeln!(stdin, "release").expect("send session owner release");
+        stdin.flush().expect("flush session owner release");
+    }
+
+    fn wait_for_session_owner_exit(helper: &mut SessionOwnerHelperProcess) {
+        if helper.eof_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            panic!("timed out waiting for session owner helper to exit");
+        }
+        let status = helper.child.wait().expect("wait for session owner helper");
+        assert!(
+            status.success(),
+            "session owner helper exit status: {status}"
+        );
+    }
+
+    fn wait_for_session_owner_slots(service: &SourceRegistryService) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(service.catalog_status(), CatalogStatus::Ready)
+                && matches!(service.vocabulary_status(), VocabularyStatus::Available)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for session owner slots"
+            );
+            thread::yield_now();
+        }
+    }
 
     fn root(temp: &TempDir, name: &str) -> CanonicalSourceRoot {
         CanonicalSourceRoot::new(
@@ -3890,6 +4002,101 @@ mod tests {
             Err(ShutdownError::Session(SessionError::Persistence(_)))
         ));
         owner.shutdown().expect("owner shutdown");
+    }
+
+    #[test]
+    fn cross_process_profile_owner_conflict_leaves_session_slots_uninstalled() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let mut owner = spawn_session_owner_helper(&profile_root);
+        wait_for_session_owner_ready(&mut owner);
+
+        {
+            let _app_root_guard = AppRootGuard::set(profile_root.clone()).expect("app root");
+            let error = WritableProfileGuard::acquire_current()
+                .expect_err("the child process should own the profile");
+            assert!(matches!(
+                error,
+                ProfileOwnershipError::ProfileOwnedByAnotherProcess { path }
+                    if path == profile_root.join("profile-owner.lock")
+            ));
+        }
+
+        let mut contender = SourceRegistryService::start_inner(Some(profile_root.clone()))
+            .expect("contender service");
+        wait_for_event(&contender, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::Persistence(reason),
+                    ..
+                } if reason.contains("profile is owned by another process")
+            )
+        });
+        assert!(matches!(
+            contender.catalog_status(),
+            CatalogStatus::Unavailable { ref reason }
+                if reason.contains("profile is owned by another process")
+        ));
+        assert!(matches!(
+            contender.vocabulary_status(),
+            VocabularyStatus::Unavailable { ref reason }
+                if reason.contains("profile is owned by another process")
+        ));
+        assert!(
+            matches!(
+                contender.submit_catalog(CatalogCommand::Register {
+                    source_id: SourceId::from_string("non-owner-catalog"),
+                    canonical_root: profile_root.clone(),
+                    lifecycle_generation: 1,
+                }),
+                Err(CatalogSubmitError::Unavailable(reason))
+                    if reason.contains("profile is owned by another process")
+            ),
+            "catalog commands must remain unavailable for a non-owner session"
+        );
+        assert!(
+            matches!(
+                contender.lookup_profile_tag_categories(vec![String::from("non-owner-vocabulary")]),
+                Err(VocabularySubmitError::Unavailable(reason))
+                    if reason.contains("profile is owned by another process")
+            ),
+            "global writer vocabulary commands must remain unavailable for a non-owner session"
+        );
+        assert!(matches!(
+            contender.shutdown(),
+            Err(ShutdownError::Session(SessionError::Persistence(reason)))
+                if reason.contains("profile is owned by another process")
+        ));
+
+        release_session_owner_helper(&mut owner);
+        wait_for_session_owner_exit(&mut owner);
+    }
+
+    #[test]
+    #[ignore = "spawned by the cross-process session ownership test"]
+    fn session_owner_process_helper() {
+        let profile_root = PathBuf::from(
+            std::env::var_os(SESSION_OWNER_PROFILE_ROOT_ENV)
+                .expect("session owner helper profile root"),
+        );
+        let mut service = SourceRegistryService::start_inner(Some(profile_root))
+            .expect("session owner helper service");
+        wait_for_session_owner_slots(&service);
+        println!("READY");
+        io::stdout()
+            .flush()
+            .expect("flush session owner helper handshake");
+
+        let mut command = String::new();
+        io::stdin()
+            .read_line(&mut command)
+            .expect("read session owner helper command");
+        match command.trim() {
+            "release" => service.shutdown().expect("session owner helper shutdown"),
+            _ => panic!("unexpected session owner helper command"),
+        }
     }
 
     #[test]

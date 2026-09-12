@@ -11,6 +11,7 @@ use std::{
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, ambient_authority};
 use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
+use uuid::Uuid;
 
 const PROFILE_OWNER_LOCK_FILE_NAME: &str = "profile-owner.lock";
 
@@ -83,6 +84,7 @@ pub struct WritableProfileGuard {
     profile_identity: String,
     lock_path: PathBuf,
     lock_identity: String,
+    owner_identity: String,
     root_dir: Dir,
     _lock_file: File,
     catalog_leases: Arc<Mutex<HashSet<String>>>,
@@ -125,12 +127,17 @@ impl WritableProfileGuard {
             })?;
         let profile_identity = identity_for_root(&profile_root, &root_dir)?;
         let lock_file = acquire_lock(&root_dir, &lock_path)?;
+        // Generate this only after the OS lock has been acquired. The diagnostic is never used
+        // as an ownership authority; the live descriptor lock remains the sole authority.
+        let owner_identity = Uuid::new_v4().to_string();
+        let lock_file = write_diagnostic(lock_file, &lock_path, &owner_identity)?;
         let lock_identity = identity_for_lock(&lock_path, &lock_file)?;
         let guard = Self {
             profile_root,
             profile_identity,
             lock_path,
             lock_identity,
+            owner_identity,
             root_dir,
             _lock_file: lock_file,
             catalog_leases: Arc::new(Mutex::new(HashSet::new())),
@@ -142,6 +149,15 @@ impl WritableProfileGuard {
     /// Return the profile root protected by this guard.
     pub fn profile_root(&self) -> &Path {
         &self.profile_root
+    }
+
+    /// Return the opaque identity for this successful profile-owner acquisition.
+    ///
+    /// Cloned guards retain the same identity. A later acquisition after all guards
+    /// are dropped receives a fresh identity. This value is diagnostic and useful
+    /// for future owner/coordinator fences; it is never used to decide ownership.
+    pub fn owner_identity(&self) -> &str {
+        &self.owner_identity
     }
 
     /// Return the identity captured from the retained profile-root capability.
@@ -175,6 +191,7 @@ impl WritableProfileGuard {
             profile_identity: self.profile_identity.clone(),
             lock_path: self.lock_path.clone(),
             lock_identity: self.lock_identity.clone(),
+            owner_identity: self.owner_identity.clone(),
             root_dir,
             _lock_file: lock_file,
             catalog_leases: Arc::clone(&self.catalog_leases),
@@ -437,9 +454,21 @@ fn open_lock_file(root_dir: &Dir, create: bool) -> io::Result<File> {
         .map(|file| file.into_std())
 }
 
-fn write_diagnostic(mut file: File, path: &Path) -> Result<File, ProfileOwnershipError> {
+fn write_diagnostic(
+    mut file: File,
+    path: &Path,
+    owner_identity: &str,
+) -> Result<File, ProfileOwnershipError> {
     file.set_len(0)
-        .and_then(|_| file.write_all(format!("version=1\npid={}\n", std::process::id()).as_bytes()))
+        .and_then(|_| {
+            file.write_all(
+                format!(
+                    "version=2\npid={}\nowner_id={owner_identity}\n",
+                    std::process::id()
+                )
+                .as_bytes(),
+            )
+        })
         .and_then(|_| file.sync_all())
         .map_err(|source| ProfileOwnershipError::Io {
             path: path.to_path_buf(),
@@ -481,7 +510,7 @@ fn acquire_lock(root_dir: &Dir, path: &Path) -> Result<File, ProfileOwnershipErr
         });
     }
 
-    write_diagnostic(file, path)
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -529,7 +558,7 @@ fn acquire_lock(root_dir: &Dir, path: &Path) -> Result<File, ProfileOwnershipErr
         });
     }
 
-    write_diagnostic(file, path)
+    Ok(file)
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -546,7 +575,18 @@ mod tests {
         app_dirs::{APP_DIR_NAME, ConfigBaseGuard, PROFILE_DIR_NAME, PersistenceProfileGuard},
         test_runtime::TestRuntimeGuard,
     };
-    use std::fs;
+    use std::{
+        fs,
+        io::{self, BufRead, BufReader, Write},
+        process::{Child, ChildStdin, Command, Stdio},
+        sync::mpsc::{self, Receiver},
+        thread,
+        time::Duration,
+    };
+
+    const CONFIG_HOME_ENV: &str = "WAVECRATE_CONFIG_HOME";
+    const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
+    const OWNER_HELPER_MODE_ENV: &str = "WAVECRATE_PROFILE_OWNER_HELPER_MODE";
 
     fn test_runtime() -> TestRuntimeGuard {
         TestRuntimeGuard::acquire()
@@ -563,6 +603,104 @@ mod tests {
         base.join(APP_DIR_NAME).join(PROFILE_DIR_NAME).join(profile)
     }
 
+    struct OwnerHelperProcess {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        ready_rx: Receiver<Result<(), String>>,
+        eof_rx: Receiver<()>,
+    }
+
+    impl Drop for OwnerHelperProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    fn spawn_owner_helper(base: &std::path::Path, profile: &str, mode: &str) -> OwnerHelperProcess {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .arg("--exact")
+            .arg("app_dirs::profile_ownership::tests::profile_owner_process_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(CONFIG_HOME_ENV, base)
+            .env(CONFIG_PROFILE_ENV, profile)
+            .env(OWNER_HELPER_MODE_ENV, mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn profile owner helper");
+        let stdin = child.stdin.take().expect("helper stdin");
+        let stdout = child.stdout.take().expect("helper stdout");
+        let stderr = child.stderr.take().expect("helper stderr");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (eof_tx, eof_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let ready = loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        break Err(String::from("profile owner helper exited before handshake"));
+                    }
+                    Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                    Ok(_) => continue,
+                    Err(error) => {
+                        break Err(format!(
+                            "failed to read profile owner helper handshake: {error}"
+                        ));
+                    }
+                }
+            };
+            let _ = ready_tx.send(ready);
+            let _ = io::copy(&mut reader, &mut io::sink());
+            let _ = eof_tx.send(());
+        });
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let _ = io::copy(&mut reader, &mut io::sink());
+        });
+        OwnerHelperProcess {
+            child,
+            stdin: Some(stdin),
+            ready_rx,
+            eof_rx,
+        }
+    }
+
+    fn release_owner_helper(helper: &mut OwnerHelperProcess, command: &str) {
+        let mut stdin = helper.stdin.take().expect("profile owner helper stdin");
+        writeln!(stdin, "{command}").expect("send profile owner helper command");
+        stdin.flush().expect("flush profile owner helper command");
+    }
+
+    fn wait_for_owner_helper_ready(helper: &mut OwnerHelperProcess) {
+        match helper.ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                panic!("profile owner helper handshake failed: {error}");
+            }
+            Err(error) => {
+                panic!("timed out waiting for profile owner helper handshake: {error}");
+            }
+        }
+    }
+
+    fn wait_for_owner_helper(helper: &mut OwnerHelperProcess, expected_success: bool) {
+        if helper.eof_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            panic!("timed out waiting for profile owner helper to exit");
+        }
+        let status = helper.child.wait().expect("wait for profile owner helper");
+        assert_eq!(
+            status.success(),
+            expected_success,
+            "profile owner helper exit status"
+        );
+    }
+
     #[test]
     fn active_profile_owner_conflicts_without_replacing_lock_contents() {
         let _runtime = test_runtime();
@@ -572,6 +710,11 @@ mod tests {
         let holder = WritableProfileGuard::acquire_current().expect("profile holder");
         let lock_path = holder.profile_root().join(PROFILE_OWNER_LOCK_FILE_NAME);
         let contents = fs::read(&lock_path).expect("owner diagnostic");
+        assert!(String::from_utf8_lossy(&contents).contains("version=2\n"));
+        assert!(
+            String::from_utf8_lossy(&contents)
+                .contains(&format!("owner_id={}\n", holder.owner_identity()))
+        );
 
         let error = WritableProfileGuard::acquire_current().expect_err("active owner conflict");
 
@@ -583,6 +726,93 @@ mod tests {
             fs::read(lock_path).expect("owner diagnostic after conflict"),
             contents
         );
+    }
+
+    #[test]
+    fn owner_identity_is_retained_by_clones_and_changes_after_reacquisition() {
+        let _runtime = test_runtime();
+        let base = profile_base();
+        let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile_guard = PersistenceProfileGuard::named("ownership-generation");
+        let holder = WritableProfileGuard::acquire_current().expect("profile holder");
+        let owner_identity = holder.owner_identity().to_owned();
+        assert!(Uuid::parse_str(&owner_identity).is_ok());
+        let clone = holder.try_clone().expect("profile clone");
+        assert_eq!(clone.owner_identity(), owner_identity);
+        drop(clone);
+        drop(holder);
+
+        let reopened = WritableProfileGuard::acquire_current().expect("reopen profile");
+        assert!(Uuid::parse_str(reopened.owner_identity()).is_ok());
+        assert_ne!(reopened.owner_identity(), owner_identity);
+    }
+
+    #[test]
+    fn cross_process_profile_owner_conflict_is_typed_and_release_allows_reopen() {
+        let _runtime = test_runtime();
+        let base = profile_base();
+        let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
+        let profile = "ownership-process-release";
+        let _profile_guard = PersistenceProfileGuard::named(profile);
+        let mut helper = spawn_owner_helper(base.path(), profile, "release");
+        wait_for_owner_helper_ready(&mut helper);
+
+        let lock_path = profile_root(base.path(), profile).join(PROFILE_OWNER_LOCK_FILE_NAME);
+        let error = WritableProfileGuard::acquire_current().expect_err("cross-process conflict");
+        assert!(matches!(
+            error,
+            ProfileOwnershipError::ProfileOwnedByAnotherProcess { path } if path == lock_path
+        ));
+
+        release_owner_helper(&mut helper, "release");
+        wait_for_owner_helper(&mut helper, true);
+        let reopened = WritableProfileGuard::acquire_current().expect("reopen after release");
+        assert_eq!(reopened.profile_root(), profile_root(base.path(), profile));
+    }
+
+    #[test]
+    fn cross_process_profile_owner_exit_releases_lock() {
+        let _runtime = test_runtime();
+        let base = profile_base();
+        let _base_guard = ConfigBaseGuard::set(base.path().to_path_buf());
+        let profile = "ownership-process-crash";
+        let _profile_guard = PersistenceProfileGuard::named(profile);
+        let mut helper = spawn_owner_helper(base.path(), profile, "exit");
+        wait_for_owner_helper_ready(&mut helper);
+
+        let lock_path = profile_root(base.path(), profile).join(PROFILE_OWNER_LOCK_FILE_NAME);
+        let error = WritableProfileGuard::acquire_current().expect_err("cross-process conflict");
+        assert!(matches!(
+            error,
+            ProfileOwnershipError::ProfileOwnedByAnotherProcess { path } if path == lock_path
+        ));
+
+        release_owner_helper(&mut helper, "exit");
+        wait_for_owner_helper(&mut helper, false);
+        let reopened = WritableProfileGuard::acquire_current().expect("reopen after crash");
+        assert_eq!(reopened.profile_root(), profile_root(base.path(), profile));
+    }
+
+    #[test]
+    #[ignore = "spawned by the cross-process profile ownership tests"]
+    fn profile_owner_process_helper() {
+        let mode = std::env::var(OWNER_HELPER_MODE_ENV).expect("profile owner helper mode");
+        let _guard = WritableProfileGuard::acquire_current().expect("profile owner helper lock");
+        println!("READY");
+        io::stdout()
+            .flush()
+            .expect("flush profile owner helper handshake");
+        let mut command = String::new();
+        io::stdin()
+            .read_line(&mut command)
+            .expect("read profile owner helper command");
+        match (mode.as_str(), command.trim()) {
+            ("release", "release") => {}
+            // Exit without running Rust destructors so the OS, rather than guard Drop, releases
+            // the descriptor lock. This exercises abrupt process release without crash dialogs.
+            ("exit", "exit") => std::process::exit(73),
+            _ => panic!("unexpected profile owner helper command"),
+        }
     }
 
     #[test]
@@ -616,7 +846,12 @@ mod tests {
         assert_eq!(guard.profile_root(), root);
         assert_eq!(
             fs::read(lock_path).expect("fresh owner diagnostic"),
-            format!("version=1\npid={}\n", std::process::id()).as_bytes()
+            format!(
+                "version=2\npid={}\nowner_id={}\n",
+                std::process::id(),
+                guard.owner_identity()
+            )
+            .as_bytes()
         );
     }
 
