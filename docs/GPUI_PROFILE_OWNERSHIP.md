@@ -61,6 +61,11 @@ The full UI and catalog suites also passed (394 UI tests, one existing ignored;
 a canonical isolated profile rather than enabling fixture write access for the
 UI dependency graph. Ownership tests read diagnostics through the retained lock
 handle, matching Windows exclusive-lock semantics.
+The complete library unit suite subsequently passed 536 tests (one subprocess
+helper ignored outside dispatch). The current Windows validation run is
+[`34702160315`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34702160315),
+against `1a8fbafa5`; the earlier run was cancelled after the test fixes and is
+not acceptance evidence.
 
 Legacy fixture creation remains available only under library unit-test
 configuration or the explicit `test-support` feature. That feature must not

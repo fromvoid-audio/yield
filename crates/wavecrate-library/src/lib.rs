@@ -12,6 +12,8 @@ pub mod durable_capacity;
 mod env_flags;
 /// Stable cross-platform filesystem-object identity helpers.
 pub mod filesystem_identity;
+/// Storage-neutral profile operation identities, intents, phases, and dispositions.
+pub mod operation_journal;
 /// Sample-source identifiers and persistent storage helpers.
 pub mod sample_sources;
 /// Optional SQLite extension loader shared by storage code.
