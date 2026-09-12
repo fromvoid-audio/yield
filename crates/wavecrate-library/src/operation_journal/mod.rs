@@ -4,7 +4,20 @@
 //! does not open files, acquire ownership, publish filesystem entries, or interpret journal data
 //! as mutation authority.
 
+pub mod evidence;
 pub mod model;
+
+pub use evidence::{
+    AbsentFinalAdoptionEvidence, AbsentFinalObservation, AbsentFinalRecoveryObservation,
+    AbsentFinalTransactionOwnedProof, FilesystemPublishedWaveformRestore,
+    FilesystemStagedParticipant, FilesystemStagedWaveformRestore, ObservedFilesystemClassification,
+    PreparedAbsentFinalNoReplace, PreparedFileEvidence, PreparedLeafLocator,
+    PreparedObjectIdentity, PreparedRestoreDirection, PreparedRestoreEvidence,
+    PreparedStagingLocator, PreparedTargetContract, PreparedWaveformRestore, RecordedRootLocator,
+    ReplaceExpectedIdentity, ReplacementCandidateAssessment, ReplacementCandidatePrimitive,
+    ReplacementMissingInvariant, ReplacementPlatformFamily, ReplacementQualificationAssessment,
+    ReplacementQualificationDecision, ReplacementQualificationRetryCondition, VolumeIdentity,
+};
 
 pub use model::{
     CURRENT_SCHEMA_VERSION, OperationActor, OperationDisposition, OperationId, OperationIntent,
