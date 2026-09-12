@@ -116,8 +116,8 @@ retained ownership, duplicate IDs, malformed/oversized records, and replacement
 both during opening and before writes. Windows storage validation passed in
 [`34707094509`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34707094509)
 at store commit `3534c37b6`, including journal tests and production profile
-admission. Phase updates, universal participants, recovery execution, and
-session startup/shutdown integration remain open.
+admission. Phase updates, participant execution, and recovery execution remain
+open; later checkpoints below cover persisted participants and session lifecycle.
 
 Recovery observation now uses indexed sequence paging with at most 16 rows and
 2 MiB of encoded records per page. Malformed, unsupported, oversized, or
@@ -166,8 +166,9 @@ this startup check. Focused session lifecycle tests cover empty-journal reopen,
 retained/corrupt journal blocking, external catalog-handle drop ordering, and a
 losing profile process leaving the journal untouched.
 All 61 session tests and GPUI compilation passed on macOS; the pending-recovery
-test also passed after review of the user-facing status wording. Windows
-validation of this lifecycle addition is pending.
+test also passed after review of the user-facing status wording. Windows storage
+validation passed on `42610b214` in
+[`34711763569`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34711763569).
 
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
 the durable physical-source identity, lease, expiry, stale-worker fencing and
