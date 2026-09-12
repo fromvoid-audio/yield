@@ -221,8 +221,10 @@ own opening and recovery policies. Seven focused identity regressions and seven
 production admission tests passed, including actual-write readiness rollback and
 snapshot rejection with no output. The earlier local pass covered a 51-test source
 database subset, 47 readiness tests, and 35 journal store tests (one subprocess
-helper ignored). GPUI compilation and formatting passed. Windows CI validation is
-pending; local Windows cross-compilation lacked the MSVC tools and headers. This
+helper ignored). GPUI compilation and formatting passed. Windows storage
+validation passed on `10bd70527` in
+[`34717029864`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34717029864);
+local Windows cross-compilation lacked the MSVC tools and headers. This
 milestone does not implement physical source leases or qualify WAL durability.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
