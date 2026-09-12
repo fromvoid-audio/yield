@@ -18,3 +18,4 @@ wavecrate-library.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+wavecrate-library = { workspace = true, features = ["test-support"] }

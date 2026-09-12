@@ -75,6 +75,9 @@ const KNOWN_SOURCES_KEY: &str = "known_sources_v1";
 static LIBRARY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Load all sources from the global library database, creating it if missing.
+///
+/// Normal builds reject this path-only helper with [`LibraryError::ProfileOwnershipRequired`];
+/// the profile-owned session writer is the writable entrypoint.
 pub fn load() -> Result<LibraryState, LibraryError> {
     let started_at = Instant::now();
     let _guard = lock_library();
@@ -85,6 +88,8 @@ pub fn load() -> Result<LibraryState, LibraryError> {
 }
 
 /// Persist sources to the global library database, replacing existing rows.
+///
+/// Normal builds reject this path-only helper with [`LibraryError::ProfileOwnershipRequired`].
 pub fn save(state: &LibraryState) -> Result<(), LibraryError> {
     let started_at = Instant::now();
     let _guard = lock_library();
@@ -95,6 +100,8 @@ pub fn save(state: &LibraryState) -> Result<(), LibraryError> {
 }
 
 /// Open a connection to the library DB with schema + migrations applied.
+///
+/// Normal builds reject this path-only helper with [`LibraryError::ProfileOwnershipRequired`].
 pub fn open_connection() -> Result<Connection, LibraryError> {
     let started_at = Instant::now();
     let _guard = lock_library();

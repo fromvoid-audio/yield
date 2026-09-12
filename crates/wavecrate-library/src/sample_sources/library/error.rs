@@ -9,6 +9,9 @@ use super::tag_vocabulary::ProfileTagVocabularyInputError;
 /// Errors returned when operating on the library database.
 #[derive(Debug, Error)]
 pub enum LibraryError {
+    /// Writable library database access requires an already-acquired profile ownership capability.
+    #[error("profile ownership is required for writable library database access")]
+    ProfileOwnershipRequired,
     /// No suitable application directory was available.
     #[error("No suitable config directory available for library database")]
     NoConfigDir,

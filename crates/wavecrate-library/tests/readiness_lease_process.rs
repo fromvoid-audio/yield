@@ -1,5 +1,7 @@
 //! Process-boundary coverage for durable readiness lease ownership and recovery.
 
+#![cfg(feature = "test-support")]
+
 use std::{
     fs,
     path::{Path, PathBuf},

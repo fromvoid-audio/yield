@@ -17,3 +17,4 @@ wavecrate-source-watcher = { path = "../wavecrate-source-watcher" }
 [dev-dependencies]
 hound.workspace = true
 tempfile = "3.23.0"
+wavecrate-library = { path = "../wavecrate-library", features = ["test-support"] }

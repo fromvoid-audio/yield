@@ -63,6 +63,7 @@ pub(super) fn open_read_only_source_database(
         root: root.to_path_buf(),
         telemetry_label: role.label(),
         database_root_binding: None,
+        profile_guard: None,
     };
     let pragmas_started = std::time::Instant::now();
     if let Err(err) = db.apply_read_only_pragmas(role) {

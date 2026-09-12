@@ -60,6 +60,11 @@ pub fn list_entries(db: &SourceDatabase) -> Result<ListedJournalEntries, SourceD
 }
 
 /// Reconcile all pending file ops against the filesystem and database.
+///
+/// Normal builds require a profile-owned source database before recovery can reach any
+/// filesystem finalizer. Fixture builds retain their legacy test-only recovery route.
 pub fn reconcile_pending_ops(db: &SourceDatabase) -> Result<FileOpReconcileSummary, String> {
+    db.validate_profile_owned_mutation()
+        .map_err(|error| error.to_string())?;
     reconcile::reconcile_pending_ops(db)
 }

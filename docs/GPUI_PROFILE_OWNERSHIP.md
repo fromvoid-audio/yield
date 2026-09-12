@@ -28,6 +28,45 @@ checks passed on macOS. Windows runtime coverage was not executed locally.
 These are profile-boundary checks, not source-lease or universal-journal
 acceptance.
 
+## Production database admission
+
+Path-only source write opens and legacy global-library convenience opens return
+`ProfileOwnershipRequired` in normal builds, before creating directories,
+opening writable SQLite connections, or applying schema changes. This is an
+admission error, not a conflict with another process. Read-only access remains
+available. The catalog's explicit guard-bearing opener and the profile-owned
+global writer are the production write routes.
+Public file-operation recovery validates this same retained authority before
+reaching filesystem finalization; a read-only journal handle cannot authorize
+recovery mutations.
+
+Authorized source databases retain a clone of the profile owner for their
+entire lifetime. A snapshot write fence must also retain the profile owner and
+database-root binding until its reservation is released, even if the original
+database is dropped. Passing a guard only during construction is insufficient.
+
+The macOS production admission integration suite passed six tests covering
+path-only rejection without filesystem effects, retained profile and child-lease
+lifetimes, root replacement, and read-only versus owned snapshot/recovery
+admission. Focused suites passed: 9 snapshot, 26 journal, 27 database opening,
+10 profile ownership, and 4 catalog profile tests. The full session suite passed
+57 tests (one subprocess helper ignored outside dispatch); the existing
+readiness process test passed with its fixture feature explicitly enabled.
+The production GPUI check, formatting, diff check, and normal dependency-feature
+inspection passed. Windows CI includes separate production admission and
+fixture-enabled readiness lanes; execution evidence must be recorded separately.
+
+Legacy fixture creation remains available only under library unit-test
+configuration or the explicit `test-support` feature. That feature must not
+appear in the normal GPUI dependency graph. The standalone `profile_admission`
+integration lane exercises the library without fixture support; running only
+fixture-enabled unit tests cannot establish production admission correctness.
+
+This boundary does not implicitly acquire a profile, adopt a source, or enable
+legacy standalone scanners to write. Their callers must use an owner-routed
+workflow. An owned database may open a snapshot reservation through its retained
+capability; a read-only database handle does not authorize that writable reopen.
+
 ## Remaining integration contracts
 
 A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns

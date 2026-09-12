@@ -19,6 +19,7 @@ tracing = "0.1.41"
 [dev-dependencies]
 filetime = "0.2.26"
 tempfile = "3.23.0"
+wavecrate-library = { path = "../wavecrate-library", features = ["test-support"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.176"

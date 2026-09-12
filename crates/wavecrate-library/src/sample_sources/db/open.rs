@@ -2,6 +2,8 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::app_dirs::WritableProfileGuard;
+
 mod paths;
 mod read_only;
 
@@ -34,6 +36,7 @@ pub(super) fn open_source_database_for_role_with_database_root(
     if role.uses_read_only_connection() || should_open_source_db_read_only() {
         return open_read_only_source_database(root, database_root, role);
     }
+    require_profile_ownership()?;
     open_source_database_with_flags(
         root,
         database_root,
@@ -65,6 +68,7 @@ pub(crate) fn open_source_database_with_database_root(
             SourceDatabaseConnectionRole::UiRead,
         );
     }
+    require_profile_ownership()?;
     open_source_database_with_flags(
         root,
         database_root,
@@ -73,6 +77,41 @@ pub(crate) fn open_source_database_with_database_root(
         mode.label(),
         DEFAULT_WRITABLE_BUSY_TIMEOUT_MS,
     )
+}
+
+/// Open a writable source database through an already-owned profile capability.
+///
+/// This low-level opener validates the supplied capability; its authorized caller retains clones
+/// of the capability and database-root namespace on the returned database. Path-only writable
+/// entrypoints must use [`require_profile_ownership`] instead and therefore fail closed in normal
+/// builds.
+pub(super) fn open_source_database_with_profile_guard(
+    root: &Path,
+    database_root: &Path,
+    profile_guard: &WritableProfileGuard,
+    mode: SourceDatabaseOpenMode,
+) -> Result<SourceDatabase, SourceDbError> {
+    profile_guard
+        .validate_current()
+        .map_err(SourceDbError::from)?;
+    open_source_database_with_flags(
+        root,
+        database_root,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        mode,
+        mode.label(),
+        DEFAULT_WRITABLE_BUSY_TIMEOUT_MS,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn require_profile_ownership() -> Result<(), SourceDbError> {
+    Ok(())
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn require_profile_ownership() -> Result<(), SourceDbError> {
+    Err(SourceDbError::ProfileOwnershipRequired)
 }
 
 fn open_source_database_with_flags(
@@ -139,6 +178,7 @@ fn open_source_database_with_flags(
         root: root.to_path_buf(),
         telemetry_label,
         database_root_binding: None,
+        profile_guard: None,
     };
     let pragmas_started = std::time::Instant::now();
     if let Err(err) = db.apply_pragmas(busy_timeout_ms) {

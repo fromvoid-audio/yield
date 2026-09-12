@@ -26,6 +26,7 @@ pub(super) struct LibraryDatabase {
 
 impl LibraryDatabase {
     pub(super) fn open() -> Result<Self, LibraryError> {
+        require_profile_ownership()?;
         let db_path = database_path()?;
         Self::open_at(&db_path)
     }
@@ -103,6 +104,16 @@ impl LibraryDatabase {
     pub(super) fn into_connection(self) -> Connection {
         self.connection
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn require_profile_ownership() -> Result<(), LibraryError> {
+    Ok(())
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn require_profile_ownership() -> Result<(), LibraryError> {
+    Err(LibraryError::ProfileOwnershipRequired)
 }
 
 fn validate_database_entries(database_root: &Path) -> Result<(), LibraryError> {

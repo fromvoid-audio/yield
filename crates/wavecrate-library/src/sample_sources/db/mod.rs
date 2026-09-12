@@ -3,6 +3,7 @@ use std::time::Duration;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use rusqlite::{Connection, Transaction};
@@ -153,7 +154,7 @@ pub struct SourceAuditMetadata {
 /// Recovery and profile-owned writers supply platform-specific implementations when SQLite must
 /// open through a descriptor-bound namespace. This is intentionally private to the library's
 /// database implementation; ordinary callers continue to use pathname-based opening.
-pub(crate) trait DatabaseRootBindingGuard: Send {
+pub(crate) trait DatabaseRootBindingGuard: Send + Sync {
     fn validate_profile_guard(
         &self,
         profile_guard: &WritableProfileGuard,
@@ -166,7 +167,8 @@ pub struct SourceDatabase {
     db_path: PathBuf,
     root: PathBuf,
     telemetry_label: &'static str,
-    database_root_binding: Option<Box<dyn DatabaseRootBindingGuard>>,
+    database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
+    profile_guard: Option<WritableProfileGuard>,
 }
 
 /// Owned source-database writer reservation retained across an asynchronous snapshot handoff.
@@ -174,6 +176,8 @@ pub struct SourceDatabase {
 /// Dropping the fence releases the SQLite `BEGIN IMMEDIATE` transaction without changing data.
 pub struct SourceDatabaseWriteFence {
     connection: Connection,
+    _database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
+    _profile_guard: Option<WritableProfileGuard>,
 }
 
 impl fmt::Debug for SourceDatabaseWriteFence {
@@ -272,6 +276,9 @@ impl SourceDatabase {
     ///
     /// This preserves the complete schema and cleanup behavior used by the
     /// legacy `open` entrypoint while making write intent explicit to callers.
+    /// Normal builds reject this path-only entrypoint with
+    /// [`SourceDbError::ProfileOwnershipRequired`]; use a profile-owned session or catalog
+    /// opener for writable access. Fixture builds retain this entrypoint for isolated tests.
     pub fn open_for_source_write(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         let root = root.as_ref();
         open::open_source_database(
@@ -296,6 +303,9 @@ impl SourceDatabase {
     ///
     /// SQLite's online backup API coordinates with source-local writers and includes committed
     /// WAL-resident pages without requiring a global checkpoint. The destination must not exist.
+    /// Acquiring its writable reservation returns [`SourceDbError::ProfileOwnershipRequired`] in
+    /// normal builds for path-only databases; profile-owned catalog databases retain their
+    /// acquired capability while taking the snapshot.
     pub fn snapshot_to_path(&self, destination: &Path) -> Result<(), SourceDbError> {
         self.snapshot_to_path_with_write_fence(destination)
             .map(drop)
@@ -306,6 +316,8 @@ impl SourceDatabase {
     /// The returned fence must remain alive until the caller either publishes or abandons the
     /// snapshot. This closes the post-snapshot window where a later source mutation could commit
     /// to the old root before an asynchronous remap result is applied.
+    /// Path-only databases return [`SourceDbError::ProfileOwnershipRequired`] in normal builds.
+    /// Profile-owned catalog databases retain their acquired capability in the returned fence.
     pub fn snapshot_to_path_with_write_fence(
         &self,
         destination: &Path,
@@ -339,18 +351,45 @@ impl SourceDatabase {
                     path: self.db_path.clone(),
                     reason: "source database path has no parent directory",
                 })?;
-        let validated = open::open_source_database_with_database_root(
-            &self.root,
-            database_root,
-            false,
-            open::SourceDatabaseOpenMode::Full,
-        )?;
+        let (validated, retained_profile_guard, retained_database_root_binding) =
+            match (&self.profile_guard, &self.database_root_binding) {
+                (Some(profile_guard), Some(database_root_binding)) => {
+                    self.validate_profile_guard(profile_guard)?;
+                    let validated = open::open_source_database_with_profile_guard(
+                        &self.root,
+                        database_root,
+                        profile_guard,
+                        open::SourceDatabaseOpenMode::Full,
+                    )?;
+                    self.validate_profile_guard(profile_guard)?;
+                    let retained_profile_guard =
+                        profile_guard.try_clone().map_err(SourceDbError::from)?;
+                    (
+                        validated,
+                        Some(retained_profile_guard),
+                        Some(Arc::clone(database_root_binding)),
+                    )
+                }
+                (None, None) => (
+                    open::open_source_database_with_database_root(
+                        &self.root,
+                        database_root,
+                        false,
+                        open::SourceDatabaseOpenMode::Full,
+                    )?,
+                    None,
+                    None,
+                ),
+                _ => return Err(SourceDbError::ProfileOwnershipRequired),
+            };
         let writer_connection = validated.connection;
         writer_connection
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(SourceDbError::from)?;
         Ok(SourceDatabaseWriteFence {
             connection: writer_connection,
+            _database_root_binding: retained_database_root_binding,
+            _profile_guard: retained_profile_guard,
         })
     }
 
@@ -398,6 +437,8 @@ impl SourceDatabase {
     /// `root` remains the audio root used for relative paths and scans, while
     /// `database_root` owns the `.wavecrate.db` file.
     /// Open a writable external source database for general source-owned mutations.
+    /// Normal builds reject this path-only entrypoint with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_source_write_with_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -413,10 +454,24 @@ impl SourceDatabase {
     /// Retain a verified database-root namespace until this connection is closed.
     pub(crate) fn retain_database_root_binding(
         mut self,
-        binding: Box<dyn DatabaseRootBindingGuard>,
+        binding: Arc<dyn DatabaseRootBindingGuard>,
     ) -> Self {
         self.database_root_binding = Some(binding);
         self
+    }
+
+    pub(crate) fn retain_profile_guard(mut self, profile_guard: WritableProfileGuard) -> Self {
+        self.profile_guard = Some(profile_guard);
+        self
+    }
+
+    pub(crate) fn validate_profile_owned_mutation(&self) -> Result<(), SourceDbError> {
+        match (&self.profile_guard, &self.database_root_binding) {
+            (Some(profile_guard), Some(_)) => self.validate_profile_guard(profile_guard),
+            #[cfg(any(test, feature = "test-support"))]
+            (None, _) => Ok(()),
+            _ => Err(SourceDbError::ProfileOwnershipRequired),
+        }
     }
 
     /// Revalidate the retained profile-owned database namespace before an operation.
@@ -440,11 +495,17 @@ impl SourceDatabase {
     }
 
     /// Open a startup-friendly database for a background job.
+    ///
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_background_job(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         Self::open_with_role(root, SourceDatabaseConnectionRole::JobWorker)
     }
 
     /// Open a startup-friendly external database for a background job.
+    ///
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_background_job_with_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -457,11 +518,17 @@ impl SourceDatabase {
     }
 
     /// Open a startup-friendly database owned by source scanning.
+    ///
+    /// This path-only alias returns [`SourceDbError::ProfileOwnershipRequired`] in normal builds;
+    /// read-only roles remain available through their explicit read entrypoints.
     pub fn open_for_scan(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         Self::open_for_background_job(root)
     }
 
     /// Open a startup-friendly external database owned by source scanning.
+    ///
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_scan_with_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -473,7 +540,8 @@ impl SourceDatabase {
     ///
     /// The child is created and retained through the profile capability, so callers cannot
     /// accidentally create a source-local `.wavecrate.db` while building an app-owned catalog.
-    /// The returned database retains the descriptor-bound child capability for its lifetime.
+    /// The returned database retains the descriptor-bound child capability and a cloned profile
+    /// owner for its lifetime.
     pub fn open_for_catalog_with_profile_guard(
         root: impl AsRef<Path>,
         profile_guard: &crate::app_dirs::WritableProfileGuard,
@@ -484,16 +552,19 @@ impl SourceDatabase {
             profile_child.as_ref(),
         )
         .map_err(SourceDbError::from)?;
-        let database = open::open_source_database_with_database_root(
+        let retained_profile_guard = profile_guard.try_clone().map_err(SourceDbError::from)?;
+        let database = open::open_source_database_with_profile_guard(
             root.as_ref(),
             binding.path(),
-            false,
+            profile_guard,
             open::SourceDatabaseOpenMode::Full,
         )?;
         binding
             .validate_profile_guard(profile_guard)
             .map_err(SourceDbError::from)?;
-        Ok(database.retain_database_root_binding(Box::new(binding)))
+        Ok(database
+            .retain_database_root_binding(Arc::new(binding))
+            .retain_profile_guard(retained_profile_guard))
     }
 
     /// Open an existing database for UI-owned read access.
@@ -514,6 +585,9 @@ impl SourceDatabase {
     }
 
     /// Open a source database for deferred schema and cleanup maintenance.
+    ///
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_maintenance(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         Self::open_with_role(root, SourceDatabaseConnectionRole::Maintenance)
     }
@@ -523,6 +597,8 @@ impl SourceDatabase {
     /// This keeps the caller's intent visible at the call site so UI reads,
     /// worker writes, and deferred maintenance do not silently share the same
     /// writable open behavior.
+    /// Writable roles return [`SourceDbError::ProfileOwnershipRequired`] in normal builds because
+    /// this path-only API carries no profile capability; read-only roles remain available.
     pub fn open_with_role(
         root: impl AsRef<Path>,
         role: SourceDatabaseConnectionRole,
@@ -531,6 +607,8 @@ impl SourceDatabase {
     }
 
     /// Open a source database using an explicit role and database root.
+    ///
+    /// Writable roles return [`SourceDbError::ProfileOwnershipRequired`] in normal builds.
     pub fn open_with_role_and_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -547,6 +625,8 @@ impl SourceDatabase {
     ///
     /// This makes direct user edits visible at the call site without requiring
     /// callers to know the generic writable connection profile.
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_user_metadata_write(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         open::open_source_database_for_role(
             root.as_ref(),
@@ -555,6 +635,9 @@ impl SourceDatabase {
     }
 
     /// Open a writable external source database for an explicit user metadata edit.
+    ///
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_user_metadata_write_with_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -571,6 +654,8 @@ impl SourceDatabase {
     /// This profile uses a short busy timeout so low-value last-played metadata
     /// cannot sit behind source scans or analysis work and delay interactive
     /// sample auditioning.
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_for_playback_history_write_with_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -583,6 +668,9 @@ impl SourceDatabase {
     }
 
     /// Open a raw startup-friendly connection for a background job.
+    ///
+    /// Normal builds reject this path-only writable alias with
+    /// [`SourceDbError::ProfileOwnershipRequired`].
     pub fn open_connection_for_background_job(
         root: impl AsRef<Path>,
     ) -> Result<Connection, SourceDbError> {
@@ -590,6 +678,9 @@ impl SourceDatabase {
     }
 
     /// Open a raw SQLite connection using one explicit runtime role profile.
+    ///
+    /// Writable roles return [`SourceDbError::ProfileOwnershipRequired`] in normal builds;
+    /// read-only roles remain available.
     pub fn open_connection_with_role(
         root: impl AsRef<Path>,
         role: SourceDatabaseConnectionRole,
@@ -599,6 +690,8 @@ impl SourceDatabase {
     }
 
     /// Open a raw SQLite connection using one explicit role and database root.
+    ///
+    /// Writable roles return [`SourceDbError::ProfileOwnershipRequired`] in normal builds.
     pub fn open_connection_with_role_and_database_root(
         root: impl AsRef<Path>,
         database_root: impl AsRef<Path>,
@@ -613,6 +706,7 @@ impl SourceDatabase {
     /// This is intentionally limited to callers that already resolved a separate, existing
     /// metadata root. Treating that directory as the operational root avoids recreating or
     /// validating the absent audio directory while still applying the requested connection role.
+    /// Writable roles return [`SourceDbError::ProfileOwnershipRequired`] in normal builds.
     pub fn open_unavailable_source_metadata_connection(
         database_root: impl AsRef<Path>,
         role: SourceDatabaseConnectionRole,

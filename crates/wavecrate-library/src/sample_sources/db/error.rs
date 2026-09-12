@@ -104,6 +104,9 @@ pub enum SourceDirectoryTruthError {
 /// Errors returned when managing a source database.
 #[derive(Debug, Error)]
 pub enum SourceDbError {
+    /// Writable source database access requires an already-acquired profile ownership capability.
+    #[error("profile ownership is required for writable source database access")]
+    ProfileOwnershipRequired,
     /// The provided root path is not a directory.
     #[error("Source folder is not a directory: {0}")]
     InvalidRoot(PathBuf),

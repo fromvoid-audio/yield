@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use cap_primitives::ambient_authority;
 #[cfg(windows)]
@@ -932,7 +933,7 @@ impl RecoverySourceDatabases for SourceDatabaseRecoveryAccess {
             SourceDatabase::open_for_source_write_with_database_root(&root.path, &bound_path)
                 .map_err(|error| format!("Failed to open source DB for recovery: {error}"))?;
         root.revalidate_named_root()?;
-        Ok(database.retain_database_root_binding(Box::new(binding)))
+        Ok(database.retain_database_root_binding(Arc::new(binding)))
     }
 }
 
