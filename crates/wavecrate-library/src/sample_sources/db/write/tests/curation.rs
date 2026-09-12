@@ -11,6 +11,7 @@ use super::helpers::revision_value;
 use crate::app_dirs::{
     ConfigBaseGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
+#[cfg(unix)]
 use crate::sample_sources::db::file_ops_journal::{CopyJournalEntryInit, FileOpJournalEntry};
 use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthState};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
