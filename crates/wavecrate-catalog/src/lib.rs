@@ -3032,19 +3032,40 @@ fn register_source(
         );
         return;
     }
-    // The profile child lease is retained by the previous database connection. Release that
-    // connection before opening the replacement generation; the admission token has already
-    // invalidated any audit that used the old projection.
-    sources.remove(&source_id);
+    // The profile child lease is retained by the previous database connection. A different root
+    // is an explicit catalog handoff: stop its watcher, consume the old connection, and advance
+    // the retained lease while keeping the catalog database and its data in place. Same-root
+    // registrations retain the existing close-and-reopen behavior, including its strict identity
+    // checks for an in-place replacement.
+    let previous = sources.remove(&source_id);
     if let Some(test_gate) = test_gate {
         test_gate.remove_watcher_signals(&source_id);
     }
     let profile_child = catalog_profile_child(&source_id);
-    let database = match SourceDatabase::open_for_catalog_with_profile_guard(
-        &canonical_root,
-        profile_guard,
-        &profile_child,
-    ) {
+    let database_result = match previous {
+        Some(mut previous) if previous.root != canonical_root => {
+            if let Some(mut watcher) = previous.watcher.take() {
+                watcher.close();
+            }
+            previous
+                .database
+                .retarget_catalog_root(&canonical_root, profile_guard)
+        }
+        Some(previous) => {
+            drop(previous);
+            SourceDatabase::open_for_catalog_with_profile_guard(
+                &canonical_root,
+                profile_guard,
+                &profile_child,
+            )
+        }
+        None => SourceDatabase::open_for_catalog_with_profile_guard(
+            &canonical_root,
+            profile_guard,
+            &profile_child,
+        ),
+    };
+    let database = match database_result {
         Ok(database) => database,
         Err(error) => {
             emit_failure(
@@ -3267,10 +3288,13 @@ fn request_audit(
     if let Some(test_gate) = test_gate {
         test_gate.before_audit();
     }
-    let result = maintain_catalog_database(&source.database, profile_guard, Some(&token), || {
-        token.load(Ordering::Acquire)
-    })
-    .and_then(|()| audit_source(source, profile_guard, &source_id, &token));
+    let result = preflight_audit_root(source, &source_id)
+        .and_then(|()| {
+            maintain_catalog_database(&source.database, profile_guard, Some(&token), || {
+                token.load(Ordering::Acquire)
+            })
+        })
+        .and_then(|()| audit_source(source, profile_guard, &source_id, &token));
     match result {
         Ok(snapshot) => {
             source.known_root_identity = Some(snapshot.root_identity.clone());
@@ -3711,6 +3735,40 @@ fn catalog_maintenance_error(error: ScanError) -> CatalogError {
         ScanError::Io { source, .. } => CatalogError::ProfileUnavailable(source.to_string()),
         error => CatalogError::Database(error.to_string()),
     }
+}
+
+fn preflight_audit_root(
+    source: &RegisteredSource,
+    source_id: &SourceId,
+) -> Result<(), CatalogError> {
+    let current_identity = match source_root_identity(&source.root) {
+        Ok(identity) => identity,
+        Err(CatalogError::StaleRootGeneration { detail, .. }) => {
+            return Err(CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail,
+            });
+        }
+        Err(CatalogError::InvalidRoot(path)) => {
+            return Err(CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: format!(
+                    "registered source root is no longer a directory: {}",
+                    path.display()
+                ),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(known) = &source.known_root_identity
+        && known != &current_identity
+    {
+        return Err(CatalogError::StaleRootGeneration {
+            source_id: source_id.clone(),
+            detail: String::from("root identity differs from the retained catalog snapshot"),
+        });
+    }
+    Ok(())
 }
 
 fn audit_source(
@@ -8583,7 +8641,7 @@ mod tests {
         ));
         service.shutdown();
         let database = SourceDatabase::open_for_catalog_with_profile_guard(
-            fixture.root.path(),
+            replacement_root.path(),
             &fixture.guard,
             catalog_profile_child(&source_id),
         )

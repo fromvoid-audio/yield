@@ -346,6 +346,9 @@ pub enum SourceDbError {
     /// A retained profile-owned source database identity check failed.
     #[error(transparent)]
     DatabaseIdentity(#[from] SourceDatabaseIdentityError),
+    /// A retained physical-source lease could not be acquired or validated.
+    #[error(transparent)]
+    SourceLease(#[from] super::source_lease::SourceLeaseError),
     /// Failed to move a source DB from its legacy filename to the current filename.
     #[error("Could not migrate source database from {from} to {to}: {source}")]
     RenameLegacyDatabase {

@@ -1115,6 +1115,7 @@ fn profile_error_path(error: &ProfileOwnershipError) -> PathBuf {
     match error {
         ProfileOwnershipError::ProfileRootReplaced { path }
         | ProfileOwnershipError::ProfileOwnerLockReplaced { path }
+        | ProfileOwnershipError::SourceRootReplaced { path }
         | ProfileOwnershipError::ProfileOwnedByAnotherProcess { path }
         | ProfileOwnershipError::Io { path, .. }
         | ProfileOwnershipError::NotRegularFile { path }

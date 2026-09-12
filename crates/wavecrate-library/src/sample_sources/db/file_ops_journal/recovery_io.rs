@@ -482,6 +482,7 @@ impl RecoveryRoot {
                 identity: self.identity.clone(),
                 profile_identity: self.identity.clone(),
                 named_path: None,
+                namespace_kind: BoundDatabaseRootNamespace::Profile,
                 _lease: None,
             });
         }
@@ -498,6 +499,7 @@ impl RecoveryRoot {
                 identity: self.identity.clone(),
                 profile_identity: self.identity.clone(),
                 named_path: None,
+                namespace_kind: BoundDatabaseRootNamespace::Profile,
                 _lease: None,
             })
         }
@@ -542,7 +544,14 @@ pub(crate) struct BoundDatabaseRoot {
     identity: String,
     profile_identity: String,
     named_path: Option<PathBuf>,
+    namespace_kind: BoundDatabaseRootNamespace,
     _lease: Option<ProfileChildLease>,
+}
+
+#[derive(Clone, Copy)]
+enum BoundDatabaseRootNamespace {
+    Profile,
+    ExternalSource,
 }
 
 impl BoundDatabaseRoot {
@@ -652,6 +661,7 @@ impl BoundDatabaseRoot {
             identity: expected_identity.to_owned(),
             profile_identity: expected_identity.to_owned(),
             named_path: Some(profile_guard.profile_root().to_path_buf()),
+            namespace_kind: BoundDatabaseRootNamespace::Profile,
             _lease: None,
         })
     }
@@ -718,8 +728,75 @@ impl BoundDatabaseRoot {
             identity,
             profile_identity: profile_guard.profile_root_identity().to_owned(),
             named_path: Some(profile_guard.profile_root().join(child)),
+            namespace_kind: BoundDatabaseRootNamespace::Profile,
             _lease: Some(lease),
         })
+    }
+
+    /// Bind an external source-root namespace to a profile owner.
+    ///
+    /// The profile owner and external source root are retained and revalidated independently.
+    /// This capability allows two profiles to address one physical source database while keeping
+    /// source-root replacement distinguishable from replacement of the profile itself.
+    pub(crate) fn for_external_source_root(
+        profile_guard: &WritableProfileGuard,
+        source_root: &Path,
+    ) -> Result<Self, ProfileOwnershipError> {
+        profile_guard.validate_current()?;
+        let capability = open_root_nofollow(source_root).map_err(|source| {
+            profile_binding_error(
+                profile_guard,
+                format!(
+                    "failed to open external source root {} without following symlinks: {source}",
+                    source_root.display()
+                ),
+            )
+        })?;
+        let identity = root_identity_from_open_file(&capability).map_err(|source| {
+            profile_binding_error(
+                profile_guard,
+                format!(
+                    "failed to inspect external source root {}: {source}",
+                    source_root.display()
+                ),
+            )
+        })?;
+
+        #[cfg(windows)]
+        let capability = windows_database_root_binding(source_root, &identity)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+
+        #[cfg(windows)]
+        let path = windows_final_path(&capability)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+
+        #[cfg(not(windows))]
+        let path = database_root_alias(&capability, source_root, &identity)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+
+        validate_database_root_alias(&capability, &path, &identity)
+            .map_err(|error| profile_binding_error(profile_guard, error))?;
+        Ok(Self {
+            path,
+            _capability: capability,
+            identity,
+            profile_identity: profile_guard.profile_root_identity().to_owned(),
+            named_path: Some(source_root.to_path_buf()),
+            namespace_kind: BoundDatabaseRootNamespace::ExternalSource,
+            _lease: None,
+        })
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Return whether this binding is the retained profile-child namespace used by catalog data.
+    ///
+    /// External source roots intentionally cannot be retargeted through a catalog handoff: their
+    /// physical-source ownership must be reacquired through the ordinary external-source path.
+    pub(crate) fn is_profile_namespace(&self) -> bool {
+        matches!(self.namespace_kind, BoundDatabaseRootNamespace::Profile)
     }
 
     pub(crate) fn validate_profile_guard(
@@ -747,8 +824,17 @@ impl BoundDatabaseRoot {
                 )
             })?;
             if named_identity != self.identity {
-                return Err(ProfileOwnershipError::ProfileRootReplaced {
-                    path: named_path.clone(),
+                return Err(match self.namespace_kind {
+                    BoundDatabaseRootNamespace::Profile => {
+                        ProfileOwnershipError::ProfileRootReplaced {
+                            path: named_path.clone(),
+                        }
+                    }
+                    BoundDatabaseRootNamespace::ExternalSource => {
+                        ProfileOwnershipError::SourceRootReplaced {
+                            path: named_path.clone(),
+                        }
+                    }
                 });
             }
         }

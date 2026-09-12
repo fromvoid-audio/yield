@@ -64,6 +64,7 @@ pub(super) fn open_read_only_source_database(
         telemetry_label: role.label(),
         database_root_binding: None,
         database_file_binding: None,
+        source_lease: None,
         profile_guard: None,
     };
     let pragmas_started = std::time::Instant::now();

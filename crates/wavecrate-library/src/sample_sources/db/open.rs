@@ -9,7 +9,7 @@ mod read_only;
 
 use super::{
     BoundDatabaseRoot, SOURCE_DB_READ_ONLY_ENV, SourceDatabase, SourceDatabaseConnectionRole,
-    SourceDbError, sqlite_identity, telemetry, util,
+    SourceDbError, source_lease, sqlite_identity, telemetry, util,
 };
 use read_only::open_read_only_source_database;
 
@@ -98,6 +98,27 @@ pub(super) fn open_source_database_with_profile_guard(
         profile_guard,
         mode,
         expected_database,
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+pub(super) fn open_source_database_with_profile_guard_and_lease(
+    root: &Path,
+    database_root: Arc<BoundDatabaseRoot>,
+    profile_guard: &WritableProfileGuard,
+    mode: SourceDatabaseOpenMode,
+    expected_database: &sqlite_identity::DatabaseFileBinding,
+    source_lease: Arc<source_lease::SourceLease>,
+) -> Result<SourceDatabase, SourceDbError> {
+    open_source_database_with_profile_guard_inner(
+        root,
+        database_root,
+        profile_guard,
+        mode,
+        Some(expected_database),
+        Some(source_lease),
         #[cfg(test)]
         None,
     )
@@ -118,6 +139,7 @@ pub(super) fn open_source_database_with_profile_guard_for_test(
         profile_guard,
         mode,
         expected_database,
+        None,
         before_sqlite_open,
     )
 }
@@ -128,6 +150,7 @@ fn open_source_database_with_profile_guard_inner(
     profile_guard: &WritableProfileGuard,
     mode: SourceDatabaseOpenMode,
     expected_database: Option<&sqlite_identity::DatabaseFileBinding>,
+    existing_source_lease: Option<Arc<source_lease::SourceLease>>,
     #[cfg(test)] before_sqlite_open: Option<&dyn Fn(&Path)>,
 ) -> Result<SourceDatabase, SourceDbError> {
     profile_guard
@@ -141,7 +164,19 @@ fn open_source_database_with_profile_guard_inner(
     let db_path = database_root.path().join(database_name);
     database_root
         .validate_profile_guard(profile_guard)
-        .map_err(SourceDbError::from)?;
+        .map_err(map_database_root_open_error)?;
+    let media_root_binding = match existing_source_lease.as_ref() {
+        Some(source_lease) => {
+            source_lease
+                .validate_media_root(profile_guard)
+                .map_err(SourceDbError::from)?;
+            source_lease.media_root_binding()
+        }
+        None => Arc::new(
+            BoundDatabaseRoot::for_external_source_root(profile_guard, root)
+                .map_err(SourceDbError::from)?,
+        ),
+    };
     if let Some(expected_database) = expected_database {
         expected_database
             .validate_path()
@@ -154,6 +189,27 @@ fn open_source_database_with_profile_guard_inner(
     }
     sqlite_identity::validate_source_sidecars(&database_root, database_name, &db_path)
         .map_err(super::map_database_identity_error)?;
+    let lease_reservation = if existing_source_lease.is_none() {
+        Some(
+            source_lease::SourceLeaseReservation::acquire(
+                Arc::clone(&database_root),
+                Arc::clone(&media_root_binding),
+                profile_guard,
+            )
+            .map_err(SourceDbError::from)?,
+        )
+    } else {
+        None
+    };
+    if !current_database_exists
+        && lease_reservation
+            .as_ref()
+            .is_some_and(|reservation| !reservation.is_fresh())
+    {
+        return Err(SourceDbError::SourceLease(
+            source_lease::SourceLeaseError::DatabaseMissingWithExistingLease { path: db_path },
+        ));
+    }
 
     let opened = match expected_database {
         Some(_) => {
@@ -186,6 +242,13 @@ fn open_source_database_with_profile_guard_inner(
         }
     }
 
+    let database_file_binding = Arc::new(sqlite_identity::DatabaseFileBinding::new(
+        Arc::clone(&database_root),
+        database_name,
+        &db_path,
+        opened.identity.clone(),
+    ));
+
     #[cfg(test)]
     if let Some(gate) = before_sqlite_open {
         gate(&db_path);
@@ -201,7 +264,31 @@ fn open_source_database_with_profile_guard_inner(
     .map_err(super::map_database_identity_error)?;
     database_root
         .validate_profile_guard(profile_guard)
-        .map_err(SourceDbError::from)?;
+        .map_err(map_database_root_open_error)?;
+    let source_lease = match (existing_source_lease, lease_reservation) {
+        (Some(source_lease), None) => {
+            source_lease
+                .validate_before_open(profile_guard, &database_file_binding)
+                .map_err(SourceDbError::from)?;
+            Some(source_lease)
+        }
+        (None, Some(reservation)) => Some(
+            reservation
+                .bootstrap(
+                    profile_guard,
+                    Arc::clone(&database_file_binding),
+                    opened.created,
+                )
+                .map_err(SourceDbError::from)?,
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(SourceDbError::Unexpected);
+        }
+    };
+    database_root
+        .validate_profile_guard(profile_guard)
+        .map_err(map_database_root_open_error)?;
     let connect_started = std::time::Instant::now();
     let connection = match Connection::open_with_flags(
         &db_path,
@@ -247,12 +334,6 @@ fn open_source_database_with_profile_guard_inner(
     drop(opened.file);
 
     let root_binding: Arc<dyn super::DatabaseRootBindingGuard> = database_root.clone();
-    let database_file_binding = Arc::new(sqlite_identity::DatabaseFileBinding::new(
-        database_root,
-        database_name,
-        &db_path,
-        opened.identity,
-    ));
     let db = SourceDatabase {
         connection,
         db_path: db_path.clone(),
@@ -260,6 +341,7 @@ fn open_source_database_with_profile_guard_inner(
         telemetry_label: mode.label(),
         database_root_binding: Some(root_binding),
         database_file_binding: Some(database_file_binding),
+        source_lease,
         profile_guard: Some(profile_guard.try_clone().map_err(SourceDbError::from)?),
     };
     db.validate_profile_owned_open(profile_guard)?;
@@ -282,6 +364,17 @@ fn require_profile_ownership() -> Result<(), SourceDbError> {
 #[cfg(not(any(test, feature = "test-support")))]
 fn require_profile_ownership() -> Result<(), SourceDbError> {
     Err(SourceDbError::ProfileOwnershipRequired)
+}
+
+fn map_database_root_open_error(error: crate::app_dirs::ProfileOwnershipError) -> SourceDbError {
+    match error {
+        crate::app_dirs::ProfileOwnershipError::SourceRootReplaced { path } => {
+            SourceDbError::SourceLease(source_lease::SourceLeaseError::DatabaseRootReplaced {
+                path,
+            })
+        }
+        other => SourceDbError::ProfileOwnership(other),
+    }
 }
 
 fn open_source_database_with_flags(
@@ -349,6 +442,7 @@ fn open_source_database_with_flags(
         telemetry_label,
         database_root_binding: None,
         database_file_binding: None,
+        source_lease: None,
         profile_guard: None,
     };
     initialize_source_database(db, root, mode, telemetry_label, busy_timeout_ms)

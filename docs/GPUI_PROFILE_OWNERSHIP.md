@@ -170,10 +170,10 @@ test also passed after review of the user-facing status wording. Windows storage
 validation passed on `42610b214` in
 [`34711763569`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34711763569).
 
-A profile acquisition UUID is not a monotonic source-lease epoch. OPT-1349 owns
-the durable physical-source identity, lease, expiry, stale-worker fencing and
-independent source-conflict implementation. An unavailable profile must never
-be mislabeled as a source-lease conflict.
+A profile acquisition UUID is not a monotonic source-lease epoch. The physical
+lease foundation below supplies OPT-1336's independent source-conflict contract;
+OPT-1349 still owns propagation through asynchronous work and publication.
+An unavailable profile must never be mislabeled as a source-lease conflict.
 
 Source write batches now revalidate retained profile/database-child ownership
 before `BEGIN` and immediately before commit. Direct content/manifest audit,
@@ -226,6 +226,59 @@ validation passed on `10bd70527` in
 [`34717029864`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34717029864);
 local Windows cross-compilation lacked the MSVC tools and headers. This
 milestone does not implement physical source leases or qualify WAL durability.
+
+## Physical source ownership
+
+Profile-authorized source opens acquire a separate operating-system lock in the
+database namespace before opening writable SQLite. An additive singleton lease
+table binds the media root, database directory, main file, lock sidecar, profile
+root and profile lock identities to an acquisition UUID and monotonic epoch.
+The media root and database directory are distinct capabilities: profile-local
+catalog databases keep their existing placement. An explicit guard-bearing
+external-source opener allows independent profiles to contend for the same
+physical database and receive a typed source conflict.
+
+Snapshot fences share the retained lease. Ordinary connections close before
+the final lease release, and its control connection closes before the OS lock
+and profile owner. Consuming `SourceDatabase::close` reports release failures;
+outstanding snapshots keep ownership until they drop. Implicit cleanup logs a
+release failure and retains the durable record for conservative recovery.
+
+Mutation admission validates identities and the durable owner/epoch. Healthy
+leases avoid renewal writes; near-expiry or idle leases renew before beginning
+the caller transaction. Commit checks cannot renew inside that transaction.
+Renewal uses a retained control connection with a bounded busy timeout and
+`synchronous=EXTRA`; macOS also requests and verifies `fullfsync`.
+This is not a power-loss qualification of source WAL storage.
+
+A released row can advance to a new owner. An expired active row can be reclaimed
+only with matching live source identities and the same retained profile-root
+and profile-lock identities. The OS locks must also be available. Expiry alone
+cannot establish that a foreign profile owner is no longer live. Unknown schema,
+missing prior lease state, identity replacement and malformed rows remain audit
+errors; reopening cannot reset an established epoch or recreate its missing DB.
+Lease schema and row reads are bounded and validated before control writes.
+
+Explicit catalog source swaps consume the previous database owner. For a
+profile-child database with no snapshot holders, the handoff closes the ordinary
+connection and atomically advances the lease epoch, acquisition UUID and media
+root binding through the retained control connection. The OS lock remains held;
+the old and new root capabilities and unchanged database identity are validated
+before commit. External databases cannot use this catalog-only transition.
+Ordinary opens still reject a different root. Catalog audits check root identity
+before maintenance so accidental replacement reports a stale-root outcome.
+
+Full asynchronous scanner, watcher and catalog publication fencing remains
+OPT-1349 work. A database transaction fence alone does not reject every late
+result already queued outside the database.
+
+The lease and handoff milestone passed 33 source identity tests, seven production
+admission tests, all 91 catalog tests and 61 session tests (one subprocess helper
+ignored outside dispatch). GPUI compilation, formatting and diff checks passed
+on macOS. Tests include independent-profile subprocess conflicts, abrupt-owner
+expiry recovery, unchanged malformed-state retention, actual control-connection
+write counts for healthy renewal, and implicit drop with an outstanding SQLite
+transaction. Windows storage validation remains pending for this milestone.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable

@@ -14,6 +14,9 @@ pub enum ReadinessError {
     /// The retained SQLite connection or path no longer identifies its profile-owned database.
     #[error("Readiness database identity validation failed: {0}")]
     DatabaseIdentity(#[from] crate::sample_sources::db::SourceDatabaseIdentityError),
+    /// The retained physical-source lease could not be acquired or validated.
+    #[error("Readiness source lease validation failed: {0}")]
+    SourceLease(#[from] crate::sample_sources::db::SourceLeaseError),
     /// The caller cancelled a potentially long readiness database operation.
     #[error("Readiness operation cancelled")]
     Cancelled,

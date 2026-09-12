@@ -83,6 +83,10 @@ pub(crate) struct DatabaseFileBinding {
 }
 
 impl DatabaseFileBinding {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Build a retained main-file proof from a file opened through `root`.
     pub(crate) fn new(
         root: Arc<BoundDatabaseRoot>,

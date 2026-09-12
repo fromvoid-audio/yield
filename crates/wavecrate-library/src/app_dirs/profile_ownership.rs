@@ -53,6 +53,12 @@ pub enum ProfileOwnershipError {
         /// Profile lock path whose identity changed.
         path: PathBuf,
     },
+    /// An explicitly bound external source root no longer matches its acquired identity.
+    #[error("external source root was replaced after binding: {path}")]
+    SourceRootReplaced {
+        /// External source-root path whose identity changed.
+        path: PathBuf,
+    },
     /// The host could not provide a stable identity for the retained capability.
     #[error("profile ownership identity unavailable at {path}")]
     IdentityUnavailable {
@@ -163,6 +169,11 @@ impl WritableProfileGuard {
     /// Return the identity captured from the retained profile-root capability.
     pub(crate) fn profile_root_identity(&self) -> &str {
         &self.profile_identity
+    }
+
+    /// Return the identity captured from the retained profile-owner lock file.
+    pub(crate) fn profile_lock_identity(&self) -> &str {
+        &self.lock_identity
     }
 
     /// Clone this acquired profile capability for another profile-owned participant.

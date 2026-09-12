@@ -1,8 +1,16 @@
-use std::path::Path;
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
+use uuid::Uuid;
 
 use super::*;
-use crate::app_dirs::{AppRootGuard, WritableProfileGuard};
+use crate::app_dirs::{
+    AppRootGuard, ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard,
+};
 #[cfg(unix)]
 use crate::sample_sources::database_path_for;
 use crate::sample_sources::db::file_ops_journal::BoundDatabaseRoot;
@@ -13,6 +21,1011 @@ use crate::sample_sources::readiness::{
 };
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const SOURCE_LEASE_HELPER_BASE_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_BASE";
+const SOURCE_LEASE_HELPER_PROFILE_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_PROFILE";
+const SOURCE_LEASE_HELPER_SOURCE_ROOT_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_SOURCE_ROOT";
+const SOURCE_LEASE_HELPER_DATABASE_ROOT_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_DATABASE_ROOT";
+const SOURCE_LEASE_HELPER_MODE_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_MODE";
+
+struct SourceLeaseHelperProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    ready_rx: Receiver<Result<(), String>>,
+    eof_rx: Receiver<()>,
+}
+
+impl Drop for SourceLeaseHelperProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_source_lease_helper(
+    base: &Path,
+    profile: &str,
+    source_root: &Path,
+    database_root: &Path,
+    mode: &str,
+) -> SourceLeaseHelperProcess {
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .arg("--exact")
+        .arg("sample_sources::db::source_db_mod_tests::opening::identity::source_lease_process_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(SOURCE_LEASE_HELPER_BASE_ENV, base)
+        .env(SOURCE_LEASE_HELPER_PROFILE_ENV, profile)
+        .env(SOURCE_LEASE_HELPER_SOURCE_ROOT_ENV, source_root)
+        .env(SOURCE_LEASE_HELPER_DATABASE_ROOT_ENV, database_root)
+        .env(SOURCE_LEASE_HELPER_MODE_ENV, mode)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn source lease helper");
+    let stdin = child.stdin.take().expect("source lease helper stdin");
+    let stdout = child.stdout.take().expect("source lease helper stdout");
+    let stderr = child.stderr.take().expect("source lease helper stderr");
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (eof_tx, eof_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let ready = loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break Err(String::from("source lease helper exited before handshake")),
+                Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                Ok(_) => continue,
+                Err(error) => break Err(format!("source lease helper handshake failed: {error}")),
+            }
+        };
+        let _ = ready_tx.send(ready);
+        let _ = io::copy(&mut reader, &mut io::sink());
+        let _ = eof_tx.send(());
+    });
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let _ = io::copy(&mut reader, &mut io::sink());
+    });
+    SourceLeaseHelperProcess {
+        child,
+        stdin: Some(stdin),
+        ready_rx,
+        eof_rx,
+    }
+}
+
+fn wait_for_source_lease_helper_ready(helper: &mut SourceLeaseHelperProcess) {
+    match helper.ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("source lease helper handshake failed: {error}"),
+        Err(error) => panic!("timed out waiting for source lease helper: {error}"),
+    }
+}
+
+fn finish_source_lease_helper(
+    helper: &mut SourceLeaseHelperProcess,
+    command: &str,
+    expected_success: bool,
+) {
+    let mut stdin = helper
+        .stdin
+        .take()
+        .expect("source lease helper command pipe");
+    writeln!(stdin, "{command}").expect("send source lease helper command");
+    stdin.flush().expect("flush source lease helper command");
+    helper
+        .eof_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("source lease helper exit");
+    let status = helper.child.wait().expect("wait for source lease helper");
+    assert_eq!(
+        status.success(),
+        expected_success,
+        "source lease helper status"
+    );
+}
+
+#[test]
+fn source_database_identity_lease_releases_and_advances_epoch() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let profile_child = "identity-source-lease-reopen";
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        profile_child,
+    )
+    .expect("profile-owned source database");
+    database
+        .set_metadata("lease-preserved", "source-data")
+        .expect("source data before lease release");
+    let database_path = profile_guard
+        .profile_root()
+        .join(profile_child)
+        .join(DB_FILE_NAME);
+    let (epoch, state, owner_identity): (i64, String, String) = database
+        .connection
+        .query_row(
+            "SELECT lease_epoch, state, owner_identity FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("active source lease row");
+    assert_eq!(epoch, 1);
+    assert_eq!(state, "active");
+    assert!(Uuid::parse_str(&owner_identity).is_ok());
+    drop(database);
+
+    let released = Connection::open(&database_path)
+        .expect("reopen source database for lease inspection")
+        .query_row(
+            "SELECT lease_epoch, state FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("released source lease row");
+    assert_eq!(released, (1, String::from("released")));
+
+    let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        profile_child,
+    )
+    .expect("reopen profile-owned source database");
+    let (reopened_epoch, reopened_owner_identity) = reopened
+        .connection
+        .query_row(
+            "SELECT lease_epoch, owner_identity FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("reopened source lease row");
+    assert_eq!(reopened_epoch, 2);
+    assert!(Uuid::parse_str(&reopened_owner_identity).is_ok());
+    assert_ne!(reopened_owner_identity, owner_identity);
+    assert_eq!(
+        reopened
+            .get_metadata("lease-preserved")
+            .expect("preserved source data")
+            .as_deref(),
+        Some("source-data")
+    );
+}
+
+#[test]
+fn source_database_identity_catalog_handoff_advances_epoch_and_preserves_data() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let replacement_root = tempdir().expect("replacement source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "identity-catalog-handoff",
+    )
+    .expect("profile-owned catalog database");
+    database
+        .set_metadata("handoff-preserved", "source-data")
+        .expect("source data before handoff");
+    let (old_epoch, old_owner, old_media_root): (i64, String, String) = database
+        .connection
+        .query_row(
+            "SELECT lease_epoch, owner_identity, media_root_identity
+             FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("active lease before handoff");
+
+    let database = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .expect("catalog root handoff");
+    let (new_epoch, new_owner, new_media_root): (i64, String, String) = database
+        .connection
+        .query_row(
+            "SELECT lease_epoch, owner_identity, media_root_identity
+             FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("active lease after handoff");
+    assert_eq!(new_epoch, old_epoch + 1);
+    assert_ne!(new_owner, old_owner);
+    assert_ne!(new_media_root, old_media_root);
+    assert_eq!(
+        database
+            .get_metadata("handoff-preserved")
+            .expect("preserved source data")
+            .as_deref(),
+        Some("source-data")
+    );
+    assert_eq!(database.root(), replacement_root.path());
+}
+
+#[test]
+fn source_database_identity_catalog_handoff_rejects_live_snapshot_fence() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let replacement_root = tempdir().expect("replacement source root");
+    let destination_root = tempdir().expect("snapshot destination root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "identity-catalog-handoff-snapshot",
+    )
+    .expect("profile-owned catalog database");
+    let fence = database
+        .snapshot_to_path_with_write_fence(&destination_root.path().join("snapshot.db"))
+        .expect("snapshot fence");
+    let error = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .err()
+        .expect("live snapshot must reject catalog handoff");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SnapshotsActive)
+    ));
+    drop(fence);
+}
+
+#[test]
+fn source_database_identity_external_handoff_is_unsupported() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let replacement_root = tempdir().expect("replacement source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("profile-owned external source database");
+    let error = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .err()
+        .expect("external source handoff must be unsupported");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::Unsupported { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_catalog_handoff_rejects_replaced_media_or_database_root() {
+    let app_root = tempdir().expect("app root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+
+    let source_root = tempdir().expect("source root");
+    let replacement_root = tempdir().expect("replacement source root");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "identity-catalog-handoff-media-replacement",
+    )
+    .expect("profile-owned catalog database");
+    let displaced_source_root = source_root.path().with_extension("displaced");
+    std::fs::rename(source_root.path(), &displaced_source_root)
+        .expect("displace source root before handoff");
+    std::fs::create_dir(source_root.path()).expect("replace source root before handoff");
+    let error = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .err()
+        .expect("replaced media root must reject handoff");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SourceRootReplaced { .. })
+    ));
+    std::fs::remove_dir(source_root.path()).expect("remove replacement source root");
+    std::fs::rename(displaced_source_root, source_root.path()).expect("restore source root");
+
+    let source_root = tempdir().expect("second source root");
+    let replacement_root = tempdir().expect("second replacement source root");
+    let profile_child = "identity-catalog-handoff-database-replacement";
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        profile_child,
+    )
+    .expect("second profile-owned catalog database");
+    let child_path = profile_guard.profile_root().join(profile_child);
+    let displaced_child = profile_guard
+        .profile_root()
+        .join(format!("{profile_child}.displaced"));
+    std::fs::rename(&child_path, &displaced_child).expect("displace database root before handoff");
+    std::fs::create_dir(&child_path).expect("replace database root before handoff");
+    let error = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .err()
+        .expect("replaced database root must reject handoff");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::DatabaseRootReplaced { .. })
+    ));
+    std::fs::remove_dir(&child_path).expect("remove replacement database root");
+    std::fs::rename(displaced_child, child_path).expect("restore database root");
+}
+
+#[test]
+fn source_database_identity_lease_implicit_drop_closes_connection_before_release() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    database
+        .connection
+        .execute_batch(
+            "BEGIN EXCLUSIVE;
+             UPDATE metadata SET value = 'rolled-back-on-drop' WHERE key = 'drop-order-marker';",
+        )
+        .expect("hold an ordinary connection write transaction");
+
+    drop(database);
+
+    let state: String = Connection::open(&database_path)
+        .expect("reopen source database after implicit drop")
+        .query_row(
+            "SELECT state FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("released source lease row");
+    assert_eq!(state, "released");
+}
+
+#[test]
+fn source_database_identity_lease_conflicts_on_one_external_source() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("first external source database");
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("the source lease must reject a second writer"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::WritableSourceOwnedByAnotherProcess { .. })
+    ));
+    drop(database);
+}
+
+#[test]
+fn source_database_identity_lease_conflicts_across_profile_processes() {
+    let base = tempfile::tempdir().expect("profile base");
+    let base_path = std::fs::canonicalize(base.path()).expect("canonical profile base");
+    let source_root = tempfile::tempdir().expect("source root");
+    let database_root = tempfile::tempdir().expect("database root");
+    let _base_guard = ConfigBaseGuard::set(base_path.clone());
+    let _profile_selection = PersistenceProfileGuard::named("lease-process-parent");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("parent profile owner");
+    let mut helper = spawn_source_lease_helper(
+        &base_path,
+        "lease-process-child",
+        source_root.path(),
+        database_root.path(),
+        "release",
+    );
+    wait_for_source_lease_helper_ready(&mut helper);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("a second profile process must not acquire the source lease"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::WritableSourceOwnedByAnotherProcess { .. })
+    ));
+
+    finish_source_lease_helper(&mut helper, "release", true);
+    let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("source lease after the other process released it");
+    drop(reopened);
+}
+
+#[test]
+fn source_database_identity_lease_recovers_same_profile_after_abrupt_expired_exit() {
+    let base = tempfile::tempdir().expect("profile base");
+    let base_path = std::fs::canonicalize(base.path()).expect("canonical profile base");
+    let source_root = tempfile::tempdir().expect("source root");
+    let database_root = tempfile::tempdir().expect("database root");
+    let _base_guard = ConfigBaseGuard::set(base_path.clone());
+    let _profile_selection = PersistenceProfileGuard::named("lease-process-crash");
+    let mut helper = spawn_source_lease_helper(
+        &base_path,
+        "lease-process-crash",
+        source_root.path(),
+        database_root.path(),
+        "crash",
+    );
+    wait_for_source_lease_helper_ready(&mut helper);
+    finish_source_lease_helper(&mut helper, "crash", false);
+
+    let profile_guard = WritableProfileGuard::acquire_current().expect("reacquire profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("same-profile expired lease takeover");
+    let epoch = database
+        .connection
+        .query_row(
+            "SELECT lease_epoch FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("recovered lease epoch");
+    assert_eq!(epoch, 2);
+}
+
+#[test]
+fn source_database_identity_lease_rejects_unexpired_reclaim() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("initial external source database");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    drop(database);
+    let connection = Connection::open(&database_path).expect("lease row database");
+    connection
+        .execute(
+            "UPDATE source_lease
+             SET state = 'active', released_at = NULL, expires_at = ?1
+             WHERE singleton = 1",
+            [i64::MAX],
+        )
+        .expect("make active lease unexpired");
+    drop(connection);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("unexpired source lease must not be reclaimed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::LeaseNotExpired { .. })
+    ));
+}
+
+#[test]
+fn source_database_identity_lease_rejects_foreign_expired_reclaim() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("initial external source database");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    drop(database);
+    let connection = Connection::open(&database_path).expect("lease row database");
+    let acquired_at = connection
+        .query_row(
+            "SELECT acquired_at FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("lease acquisition timestamp");
+    connection
+        .execute(
+            "UPDATE source_lease
+             SET profile_root_identity = 'foreign-profile', state = 'active',
+                 released_at = NULL, expires_at = ?1
+             WHERE singleton = 1",
+            [acquired_at],
+        )
+        .expect("make foreign lease expired");
+    drop(connection);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("foreign expired source lease must not be reclaimed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::LivenessUnverified { .. })
+    ));
+}
+
+#[test]
+fn source_database_identity_lease_fence_survives_original_drop() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let destination_root = tempdir().expect("snapshot root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let destination = destination_root.path().join("snapshot.db");
+    let fence = database
+        .snapshot_to_path_with_write_fence(&destination)
+        .expect("snapshot write fence");
+    drop(database);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("snapshot fence must retain the source lease"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::WritableSourceOwnedByAnotherProcess { .. })
+    ));
+    drop(fence);
+    let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("source lease after snapshot fence release");
+    drop(reopened);
+}
+
+#[test]
+fn source_database_identity_close_waits_for_snapshot_fence_before_release() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let destination_root = tempdir().expect("snapshot root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let destination = destination_root.path().join("snapshot.db");
+    let fence = database
+        .snapshot_to_path_with_write_fence(&destination)
+        .expect("snapshot write fence");
+    let error = database
+        .close()
+        .expect_err("close must retain a live snapshot lease");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SnapshotsActive)
+    ));
+    drop(fence);
+
+    let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("source lease after fence close");
+    reopened.close().expect("explicit source close");
+}
+
+#[test]
+fn source_database_identity_lease_rejects_changed_epoch_before_mutation() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    database
+        .connection
+        .execute(
+            "UPDATE source_lease SET lease_epoch = lease_epoch + 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("advance lease epoch behind the retained owner");
+
+    let error = database
+        .set_metadata("lease-stale-epoch", "must-not-write")
+        .expect_err("stale source lease epoch must reject mutation");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::Superseded { .. })
+    ));
+    assert_eq!(
+        database
+            .get_metadata("lease-stale-epoch")
+            .expect("read stale epoch marker"),
+        None
+    );
+}
+
+#[test]
+fn source_database_identity_lease_renews_after_idle_before_mutation() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    database
+        .connection
+        .execute(
+            "UPDATE source_lease SET expires_at = acquired_at WHERE singleton = 1",
+            [],
+        )
+        .expect("expire source lease while owner remains live");
+
+    database
+        .set_metadata("lease-renewed", "after-idle")
+        .expect("live owner should renew before mutation");
+    let (acquired_at, expires_at) = database
+        .connection
+        .query_row(
+            "SELECT acquired_at, expires_at FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("renewed lease expiry");
+    assert!(expires_at > acquired_at);
+    assert_eq!(
+        database
+            .get_metadata("lease-renewed")
+            .expect("renewed marker"),
+        Some(String::from("after-idle"))
+    );
+}
+
+#[test]
+fn source_database_identity_lease_does_not_renew_healthy_writes() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let control_changes_before = database
+        .source_lease_control_total_changes_for_tests()
+        .expect("physical source lease")
+        .expect("control change count");
+    let expiry_before: i64 = database
+        .connection
+        .query_row(
+            "SELECT expires_at FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("initial lease expiry");
+
+    database
+        .set_metadata("healthy-renewal-one", "one")
+        .expect("first healthy source write");
+    let expiry_after_first: i64 = database
+        .connection
+        .query_row(
+            "SELECT expires_at FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("lease expiry after first healthy write");
+    database
+        .set_metadata("healthy-renewal-two", "two")
+        .expect("second healthy source write");
+    let expiry_after_second: i64 = database
+        .connection
+        .query_row(
+            "SELECT expires_at FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("lease expiry after second healthy write");
+
+    assert_eq!(expiry_after_first, expiry_before);
+    assert_eq!(expiry_after_second, expiry_before);
+    assert_eq!(
+        database
+            .source_lease_control_total_changes_for_tests()
+            .expect("physical source lease")
+            .expect("control change count"),
+        control_changes_before,
+        "healthy source writes must not renew the retained lease"
+    );
+}
+
+#[test]
+fn source_database_identity_lease_rejects_unknown_database_layout_unchanged() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    let connection = Connection::open(&database_path).expect("unknown source database");
+    connection
+        .execute_batch("PRAGMA user_version = 0;")
+        .expect("unknown source database version");
+    drop(connection);
+    let before = std::fs::read(&database_path).expect("unknown database bytes before open");
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("unknown source database layout must not be adopted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::MigrationRequired { .. })
+    ));
+    assert_eq!(
+        std::fs::read(&database_path).expect("unknown database bytes after open"),
+        before
+    );
+    let remaining = Connection::open(&database_path)
+        .expect("reopen unknown source database")
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_lease'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("inspect unknown source schema");
+    assert_eq!(remaining, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_lease_rejects_source_root_replacement() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let displaced = database_root.path().with_extension("displaced");
+    std::fs::rename(database_root.path(), &displaced).expect("displace source root");
+    std::fs::create_dir(database_root.path()).expect("replacement source root");
+
+    let error = database
+        .set_metadata("lease-stale-root", "must-not-write")
+        .expect_err("replaced source root must reject mutation");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::DatabaseRootReplaced { .. })
+    ));
+    assert!(!database_root.path().join(DB_FILE_NAME).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_lease_retains_media_root_separately_from_database_root() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let (media_root_identity, database_root_identity): (String, String) = database
+        .connection
+        .query_row(
+            "SELECT media_root_identity, database_root_identity
+             FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("stored source-root identities");
+    assert!(!media_root_identity.is_empty());
+    assert!(!database_root_identity.is_empty());
+    assert_ne!(media_root_identity, database_root_identity);
+
+    let displaced = source_root.path().with_extension("displaced");
+    std::fs::rename(source_root.path(), &displaced).expect("displace media source root");
+    std::fs::create_dir(source_root.path()).expect("replacement media source root");
+
+    let error = database
+        .set_metadata("media-root-replacement", "must-not-write")
+        .expect_err("replaced media source root must reject mutation");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SourceRootReplaced { .. })
+    ));
+    assert_eq!(
+        database
+            .get_metadata("media-root-replacement")
+            .expect("read rejected marker"),
+        None
+    );
+    assert!(database_root.path().join(DB_FILE_NAME).is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_lease_rejects_sidecar_replacement() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let lock_path = database_root.path().join(".wavecrate-source-lease.lock");
+    let displaced = database_root
+        .path()
+        .join(".wavecrate-source-lease.lock.old");
+    std::fs::rename(&lock_path, &displaced).expect("displace source lease sidecar");
+    let replacement_bytes = b"replacement source lease sidecar";
+    std::fs::write(&lock_path, replacement_bytes).expect("replacement source lease sidecar");
+
+    let error = database
+        .set_metadata("lease-stale-sidecar", "must-not-write")
+        .expect_err("replaced source lease sidecar must reject mutation");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SidecarReplaced { .. })
+    ));
+    assert_eq!(
+        std::fs::read(&lock_path).expect("replacement sidecar bytes"),
+        replacement_bytes
+    );
+}
+
+#[test]
+#[ignore = "spawned by physical-source lease process tests"]
+fn source_lease_process_helper() {
+    let base = PathBuf::from(
+        std::env::var(SOURCE_LEASE_HELPER_BASE_ENV).expect("source lease helper base"),
+    );
+    let profile =
+        std::env::var(SOURCE_LEASE_HELPER_PROFILE_ENV).expect("source lease helper profile");
+    let source_root = PathBuf::from(
+        std::env::var(SOURCE_LEASE_HELPER_SOURCE_ROOT_ENV)
+            .expect("source lease helper source root"),
+    );
+    let database_root = PathBuf::from(
+        std::env::var(SOURCE_LEASE_HELPER_DATABASE_ROOT_ENV)
+            .expect("source lease helper database root"),
+    );
+    let mode = std::env::var(SOURCE_LEASE_HELPER_MODE_ENV).expect("source lease helper mode");
+    let _base_guard = ConfigBaseGuard::set(base);
+    let _profile_selection = PersistenceProfileGuard::named(profile);
+    let profile_guard = WritableProfileGuard::acquire_current().expect("helper profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        &source_root,
+        &profile_guard,
+        &database_root,
+    )
+    .expect("helper source database");
+    println!("READY");
+    io::stdout()
+        .flush()
+        .expect("flush source lease helper handshake");
+    let mut command = String::new();
+    io::stdin()
+        .read_line(&mut command)
+        .expect("read source lease helper command");
+    match (mode.as_str(), command.trim()) {
+        ("release", "release") => drop(database),
+        ("crash", "crash") => {
+            database
+                .connection
+                .execute(
+                    "UPDATE source_lease
+                     SET state = 'active', released_at = NULL, expires_at = acquired_at
+                     WHERE singleton = 1",
+                    [],
+                )
+                .expect("expire source lease before abrupt exit");
+            // Exit without Rust destructors so both OS locks are released by the kernel while the
+            // active durable row remains available for the same-profile recovery test.
+            std::process::exit(73);
+        }
+        _ => panic!("unexpected source lease helper command"),
+    }
+}
 
 #[test]
 fn source_database_identity_rejects_profile_legacy_layout_without_renaming() {
@@ -149,6 +1162,321 @@ fn source_database_identity_does_not_recreate_missing_original() {
     assert!(!database_path.exists());
 }
 
+#[test]
+fn source_database_identity_lease_does_not_recreate_database_with_existing_sidecar() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let lock_path = database_root.path().join(".wavecrate-source-lease.lock");
+    let lock_bytes = b"preexisting source lease diagnostic";
+    std::fs::write(&lock_path, lock_bytes).expect("preexisting lease sidecar");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("missing database with an existing sidecar must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::DatabaseMissingWithExistingLease { .. })
+    ));
+    assert!(!database_path.exists());
+    assert_eq!(
+        std::fs::read(&lock_path).expect("retained lease sidecar"),
+        lock_bytes
+    );
+}
+
+#[test]
+fn source_database_identity_lease_missing_row_is_retained_without_rebootstrap() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    database
+        .connection
+        .execute("DELETE FROM source_lease", [])
+        .expect("remove lease row for retention fixture");
+    drop(database);
+    let before = std::fs::read(&database_path).expect("database bytes before retry");
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("missing lease row must not reset epoch one"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::LeaseStateUnavailable { .. })
+    ));
+    assert_eq!(
+        std::fs::read(&database_path).expect("retained database bytes"),
+        before
+    );
+    let row_count: i64 = rusqlite::Connection::open(&database_path)
+        .expect("inspect retained database")
+        .query_row("SELECT COUNT(*) FROM source_lease", [], |row| row.get(0))
+        .expect("retained lease table");
+    assert_eq!(row_count, 0);
+}
+
+#[test]
+fn source_database_identity_lease_bootstraps_fresh_sidecar_on_current_legacy_schema() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+
+    let legacy = SourceDatabase::open_for_source_write(database_root.path())
+        .expect("seed current legacy source schema");
+    legacy
+        .set_metadata("legacy-row", "preserve-me")
+        .expect("seed current legacy source row");
+    drop(legacy);
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    let lease_path = database_root.path().join(".wavecrate-source-lease.lock");
+    let legacy_row: String = Connection::open(&database_path)
+        .expect("inspect current legacy source database")
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'legacy-row'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("current legacy source row");
+    assert_eq!(legacy_row, "preserve-me");
+
+    let diagnostic_sidecar = b"prior source lease sidecar";
+    std::fs::write(&lease_path, diagnostic_sidecar).expect("preexisting source sidecar");
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("preexisting sidecar must not initialize a missing lease table"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::LeaseStateUnavailable { .. })
+    ));
+    assert_eq!(
+        std::fs::read(&lease_path).expect("retained diagnostic sidecar"),
+        diagnostic_sidecar
+    );
+    assert_eq!(
+        Connection::open(&database_path)
+            .expect("reopen current legacy source database")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_lease'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("inspect missing lease table"),
+        0
+    );
+
+    std::fs::remove_file(&lease_path).expect("remove diagnostic sidecar");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("fresh sidecar may initialize current legacy schema");
+    assert_eq!(
+        database
+            .get_metadata("legacy-row")
+            .expect("preserved current legacy source row")
+            .as_deref(),
+        Some("preserve-me")
+    );
+    let (epoch, state): (i64, String) = database
+        .connection
+        .query_row(
+            "SELECT lease_epoch, state FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("newly bootstrapped lease row");
+    assert_eq!((epoch, state), (1, String::from("active")));
+}
+
+#[test]
+fn source_database_identity_rejects_wrong_current_base_schema_without_mutation() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+
+    let fixtures = [
+        (
+            "metadata",
+            "CREATE TABLE metadata (key BLOB PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE wav_files (
+                 path TEXT PRIMARY KEY,
+                 file_size INTEGER NOT NULL,
+                 modified_ns INTEGER NOT NULL
+             );",
+        ),
+        (
+            "wav_files",
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE wav_files (
+                 path TEXT PRIMARY KEY,
+                 file_size TEXT NOT NULL,
+                 modified_ns INTEGER NOT NULL
+             );",
+        ),
+    ];
+
+    for (fixture_name, schema_sql) in fixtures {
+        let database_root = tempdir().expect("database root");
+        let database_path = database_root.path().join(DB_FILE_NAME);
+        let connection = Connection::open(&database_path).expect("wrong-shape database");
+        connection
+            .execute_batch(schema_sql)
+            .expect("wrong-shape schema");
+        connection
+            .pragma_update(None, "user_version", current_schema_version())
+            .expect("current schema stamp");
+        drop(connection);
+        let before = std::fs::read(&database_path).expect("wrong-shape bytes before open");
+
+        let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+            source_root.path(),
+            &profile_guard,
+            database_root.path(),
+        ) {
+            Ok(_) => panic!("{fixture_name} wrong-shape schema must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                SourceDbError::SourceLease(SourceLeaseError::SchemaUnavailable { .. })
+            ),
+            "{fixture_name} wrong-shape error: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&database_path).expect("wrong-shape bytes after open"),
+            before,
+            "{fixture_name} database must remain unchanged"
+        );
+        let lease_table_count: i64 = Connection::open(&database_path)
+            .expect("inspect wrong-shape database")
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'source_lease'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect lease table absence");
+        assert_eq!(
+            lease_table_count, 0,
+            "{fixture_name} lease bootstrap must not mutate schema"
+        );
+    }
+}
+
+#[test]
+fn source_database_identity_lease_rejects_lease_trigger_without_mutating_database() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    database
+        .set_metadata("trigger-preservation", "before-trigger")
+        .expect("source marker before trigger");
+    drop(database);
+
+    let direct = Connection::open(&database_path).expect("open source database for fixture");
+    direct
+        .execute_batch(
+            "CREATE TRIGGER source_lease_audit
+             AFTER UPDATE ON source_lease
+             BEGIN
+                 SELECT 1;
+             END;",
+        )
+        .expect("install source lease trigger fixture");
+    drop(direct);
+    let sqlite_artifacts = |path: &Path| {
+        [
+            String::new(),
+            String::from("-wal"),
+            String::from("-shm"),
+            String::from("-journal"),
+        ]
+        .into_iter()
+        .map(|suffix| {
+            let artifact = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                PathBuf::from(name)
+            };
+            (artifact.clone(), std::fs::read(&artifact).ok())
+        })
+        .collect::<Vec<_>>()
+    };
+    let before = sqlite_artifacts(&database_path);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("lease schema trigger must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SchemaUnavailable { .. })
+    ));
+    assert_eq!(sqlite_artifacts(&database_path), before);
+
+    let retained = Connection::open(&database_path)
+        .expect("reopen retained source database")
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'trigger-preservation'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("retained source marker");
+    assert_eq!(retained, "before-trigger");
+}
+
 #[cfg(unix)]
 #[test]
 fn source_database_identity_rejects_replacement_before_readiness_mutation() {
@@ -185,6 +1513,37 @@ fn source_database_identity_rejects_replacement_before_readiness_mutation() {
         std::fs::read(&database_path).expect("replacement bytes"),
         replacement_bytes
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_readiness_reports_database_root_replacement() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let mut database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let mut readiness = database.readiness_store().expect("owned readiness store");
+    let displaced = database_root.path().with_extension("displaced");
+    std::fs::rename(database_root.path(), &displaced).expect("displace database root");
+    std::fs::create_dir(database_root.path()).expect("replacement database root");
+
+    let error = readiness
+        .mark_temporarily_unavailable("database-root-replacement", 1)
+        .expect_err("replaced database root must reject readiness mutation");
+    assert!(matches!(
+        error,
+        ReadinessError::SourceLease(SourceLeaseError::DatabaseRootReplaced { .. })
+    ));
+    drop(readiness);
+    drop(database);
 }
 
 #[cfg(unix)]

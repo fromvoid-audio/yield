@@ -33,7 +33,9 @@ mod replay_authority;
 pub(crate) use replay_authority::ValidatedReplayAuthority;
 /// SQLite schema management for sample source databases.
 pub mod schema;
+mod source_lease;
 pub(crate) mod sqlite_identity;
+pub use source_lease::SourceLeaseError;
 /// Durable per-source tag catalog and sample assignment helpers.
 pub mod tags;
 mod telemetry;
@@ -202,6 +204,7 @@ pub(crate) struct ReadinessOwnership<'a> {
     profile_guard: Option<&'a WritableProfileGuard>,
     database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
     database_file_binding: Option<&'a sqlite_identity::DatabaseFileBinding>,
+    source_lease: Option<&'a source_lease::SourceLease>,
 }
 
 impl<'a> ReadinessOwnership<'a> {
@@ -209,16 +212,18 @@ impl<'a> ReadinessOwnership<'a> {
         profile_guard: Option<&'a WritableProfileGuard>,
         database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
         database_file_binding: Option<&'a sqlite_identity::DatabaseFileBinding>,
+        source_lease: Option<&'a source_lease::SourceLease>,
     ) -> Self {
         Self {
             profile_guard,
             database_root_binding,
             database_file_binding,
+            source_lease,
         }
     }
 
     pub(crate) fn unowned() -> Self {
-        Self::new(None, None, None)
+        Self::new(None, None, None, None)
     }
 
     pub(crate) fn validate(
@@ -229,14 +234,33 @@ impl<'a> ReadinessOwnership<'a> {
             (Some(profile_guard), Some(database_root_binding)) => {
                 database_root_binding
                     .validate_profile_guard(profile_guard)
-                    .map_err(crate::sample_sources::readiness::ReadinessError::ProfileOwnership)?;
+                    .map_err(map_readiness_database_root_error)?;
                 match self.database_file_binding {
                     Some(database_file_binding) => {
-                        database_file_binding.validate(connection).map_err(|error| {
-                            crate::sample_sources::readiness::ReadinessError::DatabaseIdentity(
-                                source_database_identity_error(error),
-                            )
-                        })
+                        database_file_binding
+                            .validate(connection)
+                            .map_err(|error| {
+                                crate::sample_sources::readiness::ReadinessError::DatabaseIdentity(
+                                    source_database_identity_error(error),
+                                )
+                            })?;
+                        match self.source_lease {
+                            Some(source_lease) => source_lease
+                                .prepare_for_mutation(connection)
+                                .map_err(crate::sample_sources::readiness::ReadinessError::from),
+                            None => {
+                                #[cfg(any(test, feature = "test-support"))]
+                                {
+                                    Ok(())
+                                }
+                                #[cfg(not(any(test, feature = "test-support")))]
+                                {
+                                    Err(crate::sample_sources::readiness::ReadinessError::SourceLease(
+                                        source_lease::SourceLeaseError::Required,
+                                    ))
+                                }
+                            }
+                        }
                     }
                     None => {
                         #[cfg(any(test, feature = "test-support"))]
@@ -267,12 +291,14 @@ impl<'a> ReadinessOwnership<'a> {
 
 /// SQLite wrapper that stores wav metadata for a single source folder.
 pub struct SourceDatabase {
+    /// Declared first so the ordinary SQLite connection closes before lease release.
     connection: Connection,
     db_path: PathBuf,
     root: PathBuf,
     telemetry_label: &'static str,
     database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
     database_file_binding: Option<Arc<sqlite_identity::DatabaseFileBinding>>,
+    source_lease: Option<Arc<source_lease::SourceLease>>,
     profile_guard: Option<WritableProfileGuard>,
 }
 
@@ -280,9 +306,11 @@ pub struct SourceDatabase {
 ///
 /// Dropping the fence releases the SQLite `BEGIN IMMEDIATE` transaction without changing data.
 pub struct SourceDatabaseWriteFence {
+    /// Declared first so rollback/connection close precedes lease release during implicit drop.
     connection: Connection,
     _database_root_binding: Option<Arc<dyn DatabaseRootBindingGuard>>,
     _database_file_binding: Option<Arc<sqlite_identity::DatabaseFileBinding>>,
+    _source_lease: Option<Arc<source_lease::SourceLease>>,
     _profile_guard: Option<WritableProfileGuard>,
 }
 
@@ -315,6 +343,120 @@ pub struct SourceWriteBatch<'conn> {
 }
 
 impl SourceDatabase {
+    /// Close this source connection and release its physical-source lease.
+    ///
+    /// The ordinary SQLite connection is dropped before the retained lease row is marked released.
+    /// A live snapshot fence keeps the lease alive, so this consuming call closes the connection
+    /// and returns [`SourceLeaseError::SnapshotsActive`]; callers must drop the fence and reopen
+    /// the source when they need to release it. Drop remains a best-effort fallback that logs a
+    /// failed release and leaves the durable row for conservative recovery.
+    pub fn close(self) -> Result<(), SourceDbError> {
+        let SourceDatabase {
+            connection,
+            source_lease,
+            ..
+        } = self;
+        let snapshots_active = source_lease
+            .as_ref()
+            .is_some_and(|lease| Arc::strong_count(lease) > 1);
+        drop(connection);
+        if snapshots_active {
+            drop(source_lease);
+            return Err(SourceDbError::SourceLease(
+                source_lease::SourceLeaseError::SnapshotsActive,
+            ));
+        }
+        let result = match source_lease.as_deref() {
+            Some(lease) => lease.release().map_err(SourceDbError::from),
+            None => Ok(()),
+        };
+        drop(source_lease);
+        result
+    }
+
+    /// Retarget a profile-owned catalog database to a new, explicitly verified source root.
+    ///
+    /// This consuming operation is the catalog's higher-generation handoff boundary. It keeps
+    /// the profile-child database namespace and its physical-source sidecar lease, advances the
+    /// durable lease epoch, and reopens the ordinary connection against the same database file.
+    /// External/source-local databases and databases with a live snapshot fence cannot be
+    /// retargeted. On failure the database connection has been consumed; the retained SQLite and
+    /// filesystem data remain in place and the lease is released conservatively by its owner.
+    pub fn retarget_catalog_root(
+        self,
+        new_root: impl AsRef<Path>,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<Self, SourceDbError> {
+        let new_root = new_root.as_ref();
+        let source_lease = self
+            .source_lease
+            .as_ref()
+            .ok_or(SourceDbError::SourceLease(
+                source_lease::SourceLeaseError::Required,
+            ))?;
+        if !source_lease.is_profile_child_namespace() {
+            return Err(SourceDbError::SourceLease(
+                source_lease::SourceLeaseError::Unsupported {
+                    path: source_lease.database_root_binding().path().to_path_buf(),
+                },
+            ));
+        }
+        if Arc::strong_count(source_lease) != 1 {
+            return Err(SourceDbError::SourceLease(
+                source_lease::SourceLeaseError::SnapshotsActive,
+            ));
+        }
+        let expected_database = self
+            .database_file_binding
+            .as_deref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        source_lease
+            .prepare_for_mutation(&self.connection)
+            .map_err(SourceDbError::from)?;
+        source_lease
+            .validate_before_open(profile_guard, expected_database)
+            .map_err(SourceDbError::from)?;
+        let new_media_root = Arc::new(
+            BoundDatabaseRoot::for_external_source_root(profile_guard, new_root)
+                .map_err(SourceDbError::from)?,
+        );
+
+        let SourceDatabase {
+            connection,
+            database_root_binding,
+            database_file_binding,
+            source_lease,
+            profile_guard: owned_profile_guard,
+            ..
+        } = self;
+        // The ordinary connection must be gone before the retained control connection performs
+        // the handoff transaction. This also closes any abandoned source transaction.
+        drop(connection);
+        drop(database_root_binding);
+        drop(owned_profile_guard);
+        let expected_database =
+            database_file_binding.ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        let source_lease = source_lease.ok_or(SourceDbError::SourceLease(
+            source_lease::SourceLeaseError::Required,
+        ))?;
+        let mut source_lease = Arc::try_unwrap(source_lease).map_err(|_| {
+            SourceDbError::SourceLease(source_lease::SourceLeaseError::SnapshotsActive)
+        })?;
+        source_lease
+            .retarget_catalog_root(Arc::clone(&new_media_root), profile_guard)
+            .map_err(SourceDbError::from)?;
+        let source_lease = Arc::new(source_lease);
+        let database_root = source_lease.database_root_binding();
+        open::open_source_database_with_profile_guard_and_lease(
+            new_root,
+            database_root,
+            profile_guard,
+            open::SourceDatabaseOpenMode::Full,
+            &expected_database,
+            source_lease,
+        )
+    }
+
     /// Borrow a readiness store authorized by this database's retained profile ownership.
     ///
     /// The returned store borrows both the SQLite connection and the retained profile/database
@@ -329,6 +471,7 @@ impl SourceDatabase {
             self.profile_guard.as_ref(),
             self.database_root_binding.as_deref(),
             self.database_file_binding.as_deref(),
+            self.source_lease.as_deref(),
         );
         Ok(
             crate::sample_sources::readiness::ReadinessStore::from_owned_connection(
@@ -336,6 +479,16 @@ impl SourceDatabase {
                 ownership,
             ),
         )
+    }
+
+    /// Return the retained lease control connection's change count for ownership tests.
+    #[cfg(test)]
+    pub(crate) fn source_lease_control_total_changes_for_tests(
+        &self,
+    ) -> Option<Result<u64, SourceLeaseError>> {
+        self.source_lease
+            .as_deref()
+            .map(source_lease::SourceLease::control_total_changes_for_tests)
     }
 
     /// Read the identity and exact revision of the last complete manifest audit.
@@ -490,12 +643,17 @@ impl SourceDatabase {
                     .database_file_binding
                     .as_deref()
                     .ok_or(SourceDbError::ProfileOwnershipRequired)?;
-                open::open_source_database_with_profile_guard(
+                let source_lease = self
+                    .source_lease
+                    .as_ref()
+                    .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+                open::open_source_database_with_profile_guard_and_lease(
                     &self.root,
                     Arc::clone(expected_database.root()),
                     profile_guard,
                     open::SourceDatabaseOpenMode::Full,
-                    Some(expected_database),
+                    expected_database,
+                    Arc::clone(source_lease),
                 )?
             }
             (None, None) => open::open_source_database_with_database_root(
@@ -511,6 +669,7 @@ impl SourceDatabase {
             connection: writer_connection,
             database_root_binding,
             database_file_binding,
+            source_lease,
             profile_guard,
             ..
         } = validated;
@@ -521,6 +680,7 @@ impl SourceDatabase {
             connection: writer_connection,
             _database_root_binding: database_root_binding,
             _database_file_binding: database_file_binding,
+            _source_lease: source_lease,
             _profile_guard: profile_guard,
         })
     }
@@ -583,6 +743,30 @@ impl SourceDatabase {
         )
     }
 
+    /// Open a writable source database in an explicitly profile-owned external namespace.
+    ///
+    /// The profile guard authorizes the database-root binding and remains retained by the
+    /// returned database. The physical-source lease is acquired before the SQLite connection is
+    /// opened, so two profile-owned callers cannot concurrently mutate the same source database.
+    pub fn open_for_source_write_with_profile_guard(
+        root: impl AsRef<Path>,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+        database_root: impl AsRef<Path>,
+    ) -> Result<Self, SourceDbError> {
+        let database_root = file_ops_journal::BoundDatabaseRoot::for_external_source_root(
+            profile_guard,
+            database_root.as_ref(),
+        )
+        .map_err(SourceDbError::from)?;
+        open::open_source_database_with_profile_guard(
+            root.as_ref(),
+            Arc::new(database_root),
+            profile_guard,
+            open::SourceDatabaseOpenMode::Full,
+            None,
+        )
+    }
+
     /// Retain a verified database-root namespace until this connection is closed.
     pub(crate) fn retain_database_root_binding(
         mut self,
@@ -597,9 +781,28 @@ impl SourceDatabase {
             (Some(profile_guard), Some(_)) => {
                 self.validate_profile_guard(profile_guard)?;
                 match self.database_file_binding.as_deref() {
-                    Some(database_file_binding) => database_file_binding
-                        .validate(&self.connection)
-                        .map_err(map_database_identity_error),
+                    Some(database_file_binding) => {
+                        database_file_binding
+                            .validate(&self.connection)
+                            .map_err(map_database_identity_error)?;
+                        match self.source_lease.as_deref() {
+                            Some(source_lease) => source_lease
+                                .prepare_for_mutation(&self.connection)
+                                .map_err(SourceDbError::from),
+                            None => {
+                                #[cfg(any(test, feature = "test-support"))]
+                                {
+                                    Ok(())
+                                }
+                                #[cfg(not(any(test, feature = "test-support")))]
+                                {
+                                    Err(SourceDbError::SourceLease(
+                                        source_lease::SourceLeaseError::Required,
+                                    ))
+                                }
+                            }
+                        }
+                    }
                     None => {
                         #[cfg(any(test, feature = "test-support"))]
                         {
@@ -627,7 +830,24 @@ impl SourceDatabase {
             .as_deref()
             .ok_or(SourceDbError::ProfileOwnershipRequired)?
             .validate(&self.connection)
-            .map_err(map_database_identity_error)
+            .map_err(map_database_identity_error)?;
+        match self.source_lease.as_deref() {
+            Some(source_lease) => source_lease
+                .validate_current(&self.connection)
+                .map_err(SourceDbError::from),
+            None => {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    Ok(())
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    Err(SourceDbError::SourceLease(
+                        source_lease::SourceLeaseError::Required,
+                    ))
+                }
+            }
+        }
     }
 
     /// Revalidate the retained profile-owned database namespace before an operation.
@@ -642,7 +862,7 @@ impl SourceDatabase {
         if let Some(binding) = self.database_root_binding.as_ref() {
             binding
                 .validate_profile_guard(profile_guard)
-                .map_err(SourceDbError::from)
+                .map_err(map_database_root_validation_error)
         } else {
             profile_guard
                 .validate_current()
@@ -966,6 +1186,30 @@ impl SourceDatabase {
 
     fn into_connection(self) -> Connection {
         self.connection
+    }
+}
+
+fn map_database_root_validation_error(error: ProfileOwnershipError) -> SourceDbError {
+    match error {
+        ProfileOwnershipError::SourceRootReplaced { path } => {
+            SourceDbError::SourceLease(source_lease::SourceLeaseError::DatabaseRootReplaced {
+                path,
+            })
+        }
+        other => SourceDbError::ProfileOwnership(other),
+    }
+}
+
+fn map_readiness_database_root_error(
+    error: ProfileOwnershipError,
+) -> crate::sample_sources::readiness::ReadinessError {
+    match error {
+        ProfileOwnershipError::SourceRootReplaced { path } => {
+            crate::sample_sources::readiness::ReadinessError::SourceLease(
+                source_lease::SourceLeaseError::DatabaseRootReplaced { path },
+            )
+        }
+        other => crate::sample_sources::readiness::ReadinessError::ProfileOwnership(other),
     }
 }
 
