@@ -6,6 +6,8 @@ use uuid::Uuid;
 mod audio_support;
 /// Per-source database helpers.
 pub mod db;
+/// Renderer-neutral platform policy for staged file finalization.
+pub mod finalization;
 /// Global library database helpers.
 pub mod library;
 /// Durable source-readiness and convergence coordination contracts.
@@ -33,6 +35,10 @@ pub use db::{
     SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag,
     SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
     SourceTagWrite, SourceWriteCommand, WavEntry,
+};
+pub use finalization::{
+    StagedFileFinalizationCapabilities, StagedFinalizationAvailability,
+    StagedFinalizationUnsupportedReason, staged_file_finalization_capabilities,
 };
 pub use library::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterQueueError,

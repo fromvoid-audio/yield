@@ -471,6 +471,11 @@ bound atomic no-replace claim remains the separate gate for `FilesystemPublished
 
 For a destination classified as local and supported, the target sequences are:
 
+The macOS row is a target contract, not an availability claim. The
+[OPT-1474 decision](GPUI_MACOS_PUBLICATION_DECISION.md) retains unsupported
+production staged publication and cleanup on macOS under the existing threat
+boundary; no exclusive-namespace trust exception is adopted.
+
 | Profile | Ordered target sequence and resulting claims |
 | --- | --- |
 | macOS/local POSIX | Use live source/staging/final device or volume identities and the actual source-to-staging primitive. Only when source=staging=final and every applicable transfer is qualified atomic may the sequence be considered for `WholePublicationAtomic`: 1. Open the verified no-follow target-root capability and create or receive the staging object beside the final name. 2. Validate staged identity/length or hash. 3. Durably record `CopyValidated`; a crash before this checkpoint leaves `FilesystemStaged` and must not advance toward publication, adoption, publish-ready treatment, or recovery continuation toward final publication. Recovery may preserve, retry, or audit staging; independently qualified, capability-bound cancellation/rollback cleanup may remove unvalidated staging only when followed by verified absence and durable capacity release. 4. Synchronize the staged file with `F_FULLFSYNC` where supported; if unavailable or rejected, use `fsync` and record downgraded synchronization evidence. 5. Use the qualified descriptor-relative atomic no-replace final claim; an existing final entry is a collision, not a replacement. 6. Synchronize destination directory metadata where supported and record unsupported-directory-sync evidence otherwise. 7. Reopen the claimed final through the same capability, verify identity/content, and record ownership. Record `AtomicNamespace`; record `WholePublicationAtomic` only for the qualified all-atomic sequence. Any bytewise source-to-staging copy, even same-volume, uses `NonAtomicCopyValidatePublish` and records `WholePublicationNonAtomic`. |

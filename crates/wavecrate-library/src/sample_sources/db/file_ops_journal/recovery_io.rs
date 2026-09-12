@@ -16,6 +16,10 @@ use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileG
 use crate::filesystem_identity::{
     stable_filesystem_identity, stable_filesystem_identity_from_open_file,
 };
+use crate::sample_sources::finalization::{
+    StagedFinalizationAvailability, StagedFinalizationUnsupportedReason,
+    staged_file_finalization_capabilities,
+};
 use crate::timestamps::system_time_to_unix_nanos;
 
 use super::super::{DatabaseRootBindingGuard, SourceDatabase};
@@ -59,6 +63,11 @@ impl StagedFileFinalizer for PlatformStagedFileFinalizer {
         staged: &OpenedFile,
         target_relative: &Path,
     ) -> Result<StagedFinalization, String> {
+        let availability = staged_file_finalization_capabilities().publication;
+        if let StagedFinalizationAvailability::Unsupported(reason) = availability {
+            return Err(unsupported_publication_error(reason));
+        }
+
         #[cfg(windows)]
         {
             root.ensure_parent(target_relative)?;
@@ -88,7 +97,8 @@ impl StagedFileFinalizer for PlatformStagedFileFinalizer {
         #[cfg(not(windows))]
         {
             let _ = (root, staged_relative, staged, target_relative);
-            Err("descriptor-bound staged finalization is unsupported on this platform; retaining staged data and journal".to_string())
+            let _ = availability;
+            Err("descriptor-bound staged finalization is unavailable despite platform capability policy; retaining staged data and journal".to_string())
         }
     }
 
@@ -98,6 +108,11 @@ impl StagedFileFinalizer for PlatformStagedFileFinalizer {
         _staged_relative: &Path,
         staged: &OpenedFile,
     ) -> Result<(), String> {
+        let availability = staged_file_finalization_capabilities().cleanup;
+        if let StagedFinalizationAvailability::Unsupported(reason) = availability {
+            return Err(unsupported_cleanup_error(reason));
+        }
+
         #[cfg(windows)]
         {
             windows_finalization::delete_by_handle(&staged.capability).map_err(|error| {
@@ -109,9 +124,22 @@ impl StagedFileFinalizer for PlatformStagedFileFinalizer {
         #[cfg(not(windows))]
         {
             let _ = staged;
-            Err("descriptor-bound staged cleanup is unsupported on this platform; retaining staged data and journal".to_string())
+            let _ = availability;
+            Err("descriptor-bound staged cleanup is unavailable despite platform capability policy; retaining staged data and journal".to_string())
         }
     }
+}
+
+fn unsupported_publication_error(reason: StagedFinalizationUnsupportedReason) -> String {
+    format!(
+        "descriptor-bound staged finalization is unsupported on this platform ({reason}); retaining staged data and journal"
+    )
+}
+
+fn unsupported_cleanup_error(reason: StagedFinalizationUnsupportedReason) -> String {
+    format!(
+        "descriptor-bound staged cleanup is unsupported on this platform ({reason}); retaining staged data and journal"
+    )
 }
 
 #[cfg(test)]

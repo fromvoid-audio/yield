@@ -2314,3 +2314,25 @@ reduced-motion scenes are linked in the matrix. The existing reference palette,
 hover/focus and loading timings were verified rather than retuned. OPT-1490 is
 complete; final long-session, accessibility, platform and release gates retain
 their separate scope.
+
+### macOS publication contract decision (OPT-1474), 2026-09-12
+
+The [platform decision](GPUI_MACOS_PUBLICATION_DECISION.md) retains unsupported
+macOS staged publication and cleanup under the existing ownership contract.
+It rejects an implicit exclusive staging namespace assumption. The library's
+platform capability policy distinguishes publication from cleanup and makes
+the boundary available to future GPUI operation admission. Prepared WAV output
+remains unpublished and independent of these capabilities.
+
+This resolves the decision scope of OPT-1474, not macOS destructive-editing
+parity. OPT-1475 and OPT-1479 must preserve explicit unsupported outcomes; the
+OPT-1500 full-parity gate cannot count them as implemented mutation support.
+Windows primitive availability is not universal workflow or durability
+qualification. Broad qualification remains OPT-1360.
+
+Validation on macOS: 26 file-operation journal tests and 13 tests selected by
+the overlapping finalization filter passed, along with the library check,
+workspace formatting and diff checks. Independent ownership review found no
+actionable issue. Windows-specific checks were not rerun; its primitive
+implementation is unchanged. See the decision document for the tested failure
+matrix and retained-evidence assertions.
