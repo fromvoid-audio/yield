@@ -56,6 +56,12 @@ The production GPUI check, formatting, diff check, and normal dependency-feature
 inspection passed. Windows CI includes separate production admission and
 fixture-enabled readiness lanes; execution evidence must be recorded separately.
 
+The full UI and catalog suites also passed (394 UI tests, one existing ignored;
+91 catalog tests). Tag-completion fixtures use the guarded catalog opener under
+a canonical isolated profile rather than enabling fixture write access for the
+UI dependency graph. Ownership tests read diagnostics through the retained lock
+handle, matching Windows exclusive-lock semantics.
+
 Legacy fixture creation remains available only under library unit-test
 configuration or the explicit `test-support` feature. That feature must not
 appear in the normal GPUI dependency graph. The standalone `profile_admission`

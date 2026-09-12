@@ -1677,8 +1677,20 @@ mod tests {
         tag_count: usize,
     ) -> (TempDir, SourceDatabase, SourceTagPage, SourceTagPage) {
         let directory = tempdir().expect("temporary source directory");
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path())
-            .expect("source database");
+        let profile_root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical fixture root");
+        let _app_root = wavecrate_library::app_dirs::AppRootGuard::set(profile_root)
+            .expect("fixture profile root");
+        let owner = wavecrate_library::app_dirs::WritableProfileGuard::acquire_current()
+            .expect("fixture profile owner");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            directory.path(),
+            &owner,
+            Path::new("catalog"),
+        )
+        .expect("source database");
         let mut batch = database.write_batch().expect("source write batch");
         batch
             .upsert_file(Path::new("one.wav"), 10, 5)
