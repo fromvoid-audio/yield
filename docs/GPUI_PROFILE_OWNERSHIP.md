@@ -278,7 +278,11 @@ ignored outside dispatch). GPUI compilation, formatting and diff checks passed
 on macOS. Tests include independent-profile subprocess conflicts, abrupt-owner
 expiry recovery, unchanged malformed-state retention, actual control-connection
 write counts for healthy renewal, and implicit drop with an outstanding SQLite
-transaction. Windows storage validation remains pending for this milestone.
+transaction. Windows storage validation passed on `c6dc01b11` in
+[`34723711255`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34723711255),
+including production admission, journal, source identity/lease and session/catalog
+checks. This completes OPT-1336's ownership foundation; OPT-1349 publication
+fencing and OPT-1337 coordinator execution remain separate unfinished work.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
