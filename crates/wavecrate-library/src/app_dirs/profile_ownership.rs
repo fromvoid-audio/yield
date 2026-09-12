@@ -577,7 +577,7 @@ mod tests {
     };
     use std::{
         fs,
-        io::{self, BufRead, BufReader, Write},
+        io::{self, BufRead, BufReader, Read, Seek, Write},
         process::{Child, ChildStdin, Command, Stdio},
         sync::mpsc::{self, Receiver},
         thread,
@@ -601,6 +601,14 @@ mod tests {
 
     fn profile_root(base: &std::path::Path, profile: &str) -> PathBuf {
         base.join(APP_DIR_NAME).join(PROFILE_DIR_NAME).join(profile)
+    }
+
+    fn read_locked_diagnostic(file: &File) -> io::Result<Vec<u8>> {
+        let mut file = file;
+        file.rewind()?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        Ok(contents)
     }
 
     struct OwnerHelperProcess {
@@ -709,7 +717,7 @@ mod tests {
         let _profile_guard = PersistenceProfileGuard::named("ownership-conflict");
         let holder = WritableProfileGuard::acquire_current().expect("profile holder");
         let lock_path = holder.profile_root().join(PROFILE_OWNER_LOCK_FILE_NAME);
-        let contents = fs::read(&lock_path).expect("owner diagnostic");
+        let contents = read_locked_diagnostic(&holder._lock_file).expect("owner diagnostic");
         assert!(String::from_utf8_lossy(&contents).contains("version=2\n"));
         assert!(
             String::from_utf8_lossy(&contents)
@@ -723,7 +731,7 @@ mod tests {
             ProfileOwnershipError::ProfileOwnedByAnotherProcess { path } if path == lock_path
         ));
         assert_eq!(
-            fs::read(lock_path).expect("owner diagnostic after conflict"),
+            read_locked_diagnostic(&holder._lock_file).expect("owner diagnostic after conflict"),
             contents
         );
     }
@@ -845,7 +853,7 @@ mod tests {
 
         assert_eq!(guard.profile_root(), root);
         assert_eq!(
-            fs::read(lock_path).expect("fresh owner diagnostic"),
+            read_locked_diagnostic(&guard._lock_file).expect("fresh owner diagnostic"),
             format!(
                 "version=2\npid={}\nowner_id={}\n",
                 std::process::id(),
