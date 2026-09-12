@@ -2530,7 +2530,7 @@ mod tests {
             Err(RootError::NotAbsolute(_))
         ));
         assert!(matches!(
-            CanonicalSourceRoot::new(PathBuf::from("/tmp/../source")),
+            CanonicalSourceRoot::new(std::env::temp_dir().join("..").join("source")),
             Err(RootError::ContainsParent(_))
         ));
     }

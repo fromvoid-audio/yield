@@ -663,7 +663,7 @@ mod tests {
         let mut preferences = UiPreferences::default();
         preferences.theme.name = String::from("Saved");
         preferences.theme.colors.accent = Color::rgb(1, 2, 3);
-        preferences.theme_source_path = Some(PathBuf::from("/tmp/custom theme.json"));
+        preferences.theme_source_path = Some(std::env::temp_dir().join("custom theme.json"));
         preferences.autoplay_selection = false;
         preferences.loop_enabled = true;
         preferences.normalized_audition_enabled = true;
