@@ -2297,3 +2297,20 @@ OPT-1489 is implemented and validated. Its settings-specific owner routes satisf
 the relevant portions of OPT-1343 and OPT-1353 without closing those broader
 migrations. Physical trash moves, full native Windows/installer acceptance and
 the remaining GPUI release gates stay with their separately tracked tickets.
+
+### Reference appearance and animation acceptance (OPT-1490), 2026-09-12
+
+Completed the [reference contract and native scene matrix](GPUI_VISUAL_ACCEPTANCE.md).
+The sidebar uses compact source, Type and Rating rows, reference-style rating
+swatches and inline Scope/Refresh actions. Its auxiliary region scrolls at short
+heights while preserving folder space. The toolbar search field shrinks and clips
+its text so Settings/Help stay reachable at minimum width; long shortcut-help
+descriptions wrap instead of clipping.
+
+Validation: 394 UI tests passed (one existing ignored), including a 2x-scale
+minimum-window scrolling regression; all 21 design/theme tests and the GPUI build
+passed. Native standard/minimum/expanded, General, Audio, shortcut-help and
+reduced-motion scenes are linked in the matrix. The existing reference palette,
+hover/focus and loading timings were verified rather than retuned. OPT-1490 is
+complete; final long-session, accessibility, platform and release gates retain
+their separate scope.
