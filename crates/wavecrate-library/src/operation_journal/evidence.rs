@@ -333,9 +333,9 @@ pub(crate) enum FinalNamespaceClaim {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ReopenedFinalEvidence {
     /// Reopened final identity.
-    identity: PreparedObjectIdentity,
+    pub(crate) identity: PreparedObjectIdentity,
     /// Reopened final content evidence.
-    content: PreparedFileEvidence,
+    pub(crate) content: PreparedFileEvidence,
 }
 
 /// Stored publication evidence value.

@@ -7,6 +7,7 @@
 pub mod codec;
 pub mod evidence;
 pub mod model;
+pub mod validation;
 
 pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 
@@ -26,3 +27,5 @@ pub use model::{
     CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, OperationActor, OperationDisposition, OperationId,
     OperationIntent, OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2,
 };
+
+pub use validation::{RecordConsistency, classify_record};
