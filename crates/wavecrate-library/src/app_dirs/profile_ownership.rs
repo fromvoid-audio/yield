@@ -238,6 +238,16 @@ impl WritableProfileGuard {
             })
     }
 
+    /// Capture the profile-owned rebuildable cache namespace for a bounded maintenance task.
+    ///
+    /// The returned namespace retains a cloned profile capability and the cache directory
+    /// capability. It does not consult process-global profile resolution after this call.
+    pub fn capture_disposable_cache_namespace(
+        &self,
+    ) -> Result<super::DisposableCacheNamespace, ProfileOwnershipError> {
+        super::storage_usage::DisposableCacheNamespace::capture(self)
+    }
+
     /// Create or open one direct child directory relative to the retained profile capability.
     pub fn open_child_dir(&self, child: &Path) -> Result<Dir, ProfileOwnershipError> {
         let child_name =

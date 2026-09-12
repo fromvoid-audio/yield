@@ -28,7 +28,11 @@ pub use resolution::{
     app_root_dir, config_base_dir_path, ensure_test_config_base, persistence_mode,
     resolve_persistence, set_app_root_override,
 };
-pub use storage_usage::{GlobalStorageUsage, global_storage_usage};
+pub use storage_usage::{
+    CacheClearOutcome, CacheMaintenanceError, DisposableCacheNamespace, GlobalStorageUsage,
+    MAX_MAINTENANCE_DEPTH, MAX_MAINTENANCE_ENTRIES, MAX_MAINTENANCE_OPEN_HANDLES,
+    StorageUsageError, global_storage_usage, global_storage_usage_for_profile,
+};
 
 /// Name of the application directory that lives under the OS config root.
 pub const APP_DIR_NAME: &str = ".wavecrate";

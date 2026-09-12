@@ -228,6 +228,36 @@ These are normative target invariants.
     as applicable, and never falls back to pathname move, hard-link, unlink, replace, or cleanup
     helpers.
 
+### Disposable cache namespace disposition
+
+Artifact maintenance may clear an explicitly designated `DisposableCacheNamespace`
+using its captured directory identity as the deletion selector instead of a
+transaction-owned identity for each payload. This is a distinct artifact-store
+operation, not a relaxation of user-file publication or cleanup requirements.
+
+The namespace must be the fixed `cache` child opened without following links from
+a held profile-root capability. The owner retains its identity and directory
+handle, excludes configured source/trash namespaces and durable metadata, logs,
+handoff, recovery and journal storage, and serializes clear against producer and
+protection-setting admission. Everything admitted into this dedicated namespace
+is disposable rebuildable content; it must never store user or recovery data.
+
+A captured subtree remains part of the selected disposable object set if renamed
+during maintenance. Pre-operation path revalidation is not an atomic guarantee of
+current pathname containment. Implementations must operate on retained directory
+capabilities, never reopen a replacement pathname for mutation, never follow a
+symlink/reparse boundary, and retain the cache root itself. A root replacement or
+incomplete traversal must produce an explicit incomplete/replaced outcome, not
+"cleared". The replacement namespace and all excluded storage remain untouched.
+
+Clear closes producer admission, retires existing work, advances the namespace
+generation and fences stale completions before deletion. Bounded traversal,
+cancellation, failure preservation, final emptiness and platform-specific handle
+behavior require qualification. Unsupported platforms return a typed
+unsupported-disposition error without a pathname fallback. This contract alone is
+not qualification evidence and does not authorize the legacy path-based cache
+helper in the GPUI application.
+
 ## Identities, lifecycle, and revision fences
 
 ### Typed identities

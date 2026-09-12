@@ -2207,23 +2207,28 @@ tests passed, as did the GPUI application check, formatting and diff checks.
 
 ### Settings parity inventory (OPT-1489), 2026-09-11
 
-Compared the active reference settings projection and dispatch with GPUI controls.
-This is an inventory of remaining work, not blanket settings acceptance.
+Compared the active [reference projection](../reference/radiant/src/native_app/app_chrome/settings/window/panels/projection.rs)
+and [settings dispatch](../reference/radiant/src/native_app/shell/message_dispatch/settings.rs)
+with the GPUI controls. The table covers every active reference settings row and
+auxiliary settings action; validation is recorded separately below.
 
-| Reference control | GPUI evidence / remaining boundary |
+| Reference control | GPUI implementation / boundary |
 | --- | --- |
-| Audio backend, output and sample rate | `browser/audio_output.rs` already enumerates, applies and persists all three through `SetAudioOutput`; no replacement implementation needed. |
-| Volume and normalized audition | Existing toolbar/runtime controls and session preferences; audible acceptance remains separate. |
-| Global hover-help toggle | Implemented through a persisted Help tips On/Off control in the existing settings strip. The shortcut-help modal remains a separate workflow. |
-| Rating decay | Reference `settings/window/panels/projection.rs` and settings dispatch expose it; the GPUI session has no matching setting or rating-decay engine integration yet. |
-| Trash folder choose/clear | Reference control exists; GPUI needs a typed setting and safe physical-curation integration, not a view-owned filesystem action. |
-| Global storage usage | Reference usage projection exists; no GPUI session storage-accounting query is implemented. |
-| Clear rebuildable caches | Reference maintenance action exists; GPUI needs artifact-owner admission/retirement before enabling this destructive control. |
-| Theme, motion, autoplay and loop | Existing GPUI settings; preserve their ordered persistence and blocked-profile behavior. |
+| Audio backend, output, sample rate and errors | [Audio output panel](../crates/wavecrate-ui/src/browser/audio_output.rs) enumerates, applies and persists all three through `SetAudioOutput`. |
+| Volume and normalized audition | [Toolbar](../crates/wavecrate-ui/src/browser/view.rs) and [ordered preferences](../crates/wavecrate-session/src/preferences.rs); audible acceptance remains OPT-1492. |
+| Global hover-help toggle | [Persisted Help tips On/Off](../crates/wavecrate-ui/src/browser/preferences.rs); [shortcut help](../crates/wavecrate-ui/src/browser/shortcut_help.rs) remains independent. |
+| Rating decay | [General panel](../crates/wavecrate-ui/src/browser/general_settings.rs), [durable preferences](../crates/wavecrate-session/src/preferences.rs), [browser continuation](../crates/wavecrate-ui/src/browser/rating_decay.rs), and [catalog owner](../crates/wavecrate-catalog/src/rating_decay.rs) implement the validated 1–52 week setting and bounded maintenance. |
+| Trash folder choose/clear | [General panel](../crates/wavecrate-ui/src/browser/general_settings.rs) and [typed SetTrashFolder](../crates/wavecrate-session/src/preferences.rs) persist the destination. [Maintenance admission](../crates/wavecrate-session/src/maintenance.rs) protects it from cache cleanup. Physical file moves remain OPT-1481; choosing a destination does not move sample files. |
+| Global storage usage | [General panel](../crates/wavecrate-ui/src/browser/general_settings.rs) calls [request_storage_usage](../crates/wavecrate-session/src/maintenance.rs), which measures database sidecars and cache through the [held profile capability](../crates/wavecrate-library/src/app_dirs/storage_usage.rs). |
+| Clear rebuildable caches | [clear_rebuildable_cache](../crates/wavecrate-session/src/maintenance.rs) uses the [disposable-cache namespace owner](../crates/wavecrate-library/src/app_dirs/storage_usage.rs), with cancellation, protection admission and explicit incomplete outcomes. |
+| Theme, motion, autoplay and loop | Existing [settings strip](../crates/wavecrate-ui/src/browser/view.rs) and [preference projection](../crates/wavecrate-ui/src/browser/preferences.rs) preserve ordered persistence and blocked-profile behavior. |
 
-The reference general panel is not reproduced by the current compact settings
-strips. Its outstanding settings and service boundaries keep OPT-1489 open. No
-inactive legacy feature or unsupported audio format is added by this inventory.
+The General controls sit below the theme strip, with Close and Escape/focus
+restoration. The Audio panel retains its device and error routes. Shortcut help
+remains a separate modal. No active About/support pane is defined by the reference
+projection or `SettingsMessage`; inactive legacy UI experiments are explicitly
+excluded. Full platform/input/accessibility acceptance remains tracked in
+OPT-1493, OPT-1494 and OPT-1496.
 
 
 ### Global hover-help preference, 2026-09-11
@@ -2242,3 +2247,37 @@ passed. A stale session dependency initially broke the UI test build; a targeted
 session-package clean and rebuild resolved it without source changes. Native
 hover/layout acceptance was not performed, and OPT-1489 remains open for the
 General controls listed above.
+
+
+### General settings implementation and native checks (OPT-1489), 2026-09-12
+
+Added rating-decay interval, native trash-folder choose/clear, profile storage
+usage and rebuildable-cache cleanup to General. Preferences validate before
+mutation and persistence, retain legacy defaults, and reject maintenance authority
+from optimistic or failed saves. Rating decay uses bounded catalog-owner pages,
+source/root/revision fences and one captured clock per run. It skips locked,
+missing and nonpositive-rated files, preserves elapsed-time remainder and refreshes
+the authoritative projection after admitted writes even when preferences change.
+
+Storage and cleanup run off the UI thread under the held profile owner. Cache
+admission excludes configured sources and trash destinations and serializes
+protection changes. Cancellation, replacement and bounded traversal produce
+truthful partial outcomes; they cannot report successful zero remaining entries
+without a final identity and emptiness check. The broad original artifact-store
+and source-writer migrations remain separate; these settings use dedicated GPUI
+owner routes rather than copying the legacy direct-I/O helpers.
+
+The gear now preserves prior focus on mouse-down, allowing Escape to restore the
+filename input. A constrained-height browser body retains the status bar when
+General is open. Native macOS checks on an isolated profile verified General
+layout, Escape followed by search typing, 4→5 week persistence, Help tips Off,
+trash picker/clear, storage refresh, empty-cache success, independent shortcut
+help, Audio panel open/Escape, restart persistence and clean process exit.
+An aged positive rating fell from 3 to 1 for two elapsed five-week intervals;
+the locked counterpart and its timestamp stayed unchanged. SQLite inspection
+confirmed the ten-week timestamp advance and retained one-week remainder.
+
+Local verification: 393 UI tests passed (one existing ignored test), including
+preference-failure and focus regressions; the GPUI binary built successfully.
+The catalog, session and Unix storage suites passed their targeted verification.
+Windows cleanup qualification and CI evidence will be recorded after that gate.

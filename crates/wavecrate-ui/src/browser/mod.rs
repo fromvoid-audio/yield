@@ -42,6 +42,7 @@ mod curation;
 mod directory_open;
 mod display_labels;
 mod file_drag;
+mod general_settings;
 mod handoff;
 mod history;
 mod metronome;
@@ -51,6 +52,7 @@ mod played_ranges;
 mod playmark_timing;
 mod preferences;
 mod random_audition;
+mod rating_decay;
 mod shortcut_help;
 mod sidebar;
 mod similar_sections;
@@ -349,6 +351,7 @@ pub(crate) struct Browser {
     catalog_projection_task: Option<Task<()>>,
     catalog_projection_cancel: Option<Arc<AtomicBool>>,
     catalog_metadata: catalog_metadata::CatalogMetadataState,
+    rating_decay: rating_decay::RatingDecayState,
     display_labels: display_labels::DisplayLabelsState,
     source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
@@ -382,6 +385,7 @@ pub(crate) struct Browser {
     theme_load: ThemeLoadState,
     theme_task: Option<Task<()>>,
     theme_settings_open: bool,
+    general_settings: general_settings::GeneralSettings,
     audio_settings_open: bool,
     shortcut_help: shortcut_help::ShortcutHelpState,
     audio_output_focus_handle: FocusHandle,
@@ -593,6 +597,7 @@ impl Browser {
             catalog_projection_task: None,
             catalog_projection_cancel: None,
             catalog_metadata: catalog_metadata::CatalogMetadataState::default(),
+            rating_decay: rating_decay::RatingDecayState::default(),
             display_labels: display_labels::DisplayLabelsState::default(),
             source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
@@ -632,6 +637,7 @@ impl Browser {
             theme_load: ThemeLoadState::default(),
             theme_task: None,
             theme_settings_open: false,
+            general_settings: general_settings::GeneralSettings::default(),
             audio_settings_open: false,
             shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
             audio_output_focus_handle: cx.focus_handle(),
@@ -1814,16 +1820,21 @@ impl Browser {
     fn toggle_theme_settings(
         &mut self,
         _: &ClickEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.theme_settings_open = !self.theme_settings_open;
         if self.theme_settings_open {
+            self.close_general_settings(window, cx);
+        } else {
+            self.general_settings.previous_focus = window.focused(cx);
+            self.theme_settings_open = true;
             self.audio_settings_open = false;
             self.audio_output_dropdown = None;
             self.cancel_audio_output_options();
+            self.refresh_global_storage(cx);
+            window.focus(&self.focus_handle);
+            cx.notify();
         }
-        cx.notify();
     }
 
     pub(super) fn toggle_motion(
@@ -2025,6 +2036,9 @@ impl Browser {
         self.theme_status = "Wavecrate Editorial Terminal".to_string();
         self.autoplay_selection = true;
         self.help_tooltips_enabled = true;
+        self.general_settings.rating_decay_weeks = wavecrate_session::DEFAULT_RATING_DECAY_WEEKS;
+        self.general_settings.trash_folder = None;
+        self.general_settings.invalidate_picker();
         let previous_loop_mode = self.playback_policy.enabled();
         self.playback_policy.reset(false);
         let loop_mode_changed = previous_loop_mode != self.playback_policy.enabled();
@@ -2226,6 +2240,11 @@ impl Browser {
                 return;
             }
             shortcut_help::KeyAction::Ignore => {}
+        }
+        if self.theme_settings_open && key == "escape" {
+            self.close_general_settings(window, cx);
+            cx.stop_propagation();
+            return;
         }
         if self.handle_context_menu_key_down(event, window, cx) {
             return;

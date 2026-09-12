@@ -33,6 +33,19 @@ pub enum SourceCurationUpdate {
         /// Rating to persist.
         rating: Rating,
     },
+    /// Set a keep/trash rating and an explicit curation timestamp atomically.
+    ///
+    /// This is used by bounded maintenance paths that calculate elapsed periods from a
+    /// revision-fenced metadata page. It avoids replacing the calculated timestamp with the
+    /// wall-clock time of the write transaction.
+    SetRatingAndLastCuratedAt {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+        /// Rating to persist.
+        rating: Rating,
+        /// Timestamp advanced by the maintenance operation.
+        last_curated_at: i64,
+    },
     /// Set whether the keep rating is locked for one live source member.
     SetLocked {
         /// Source-relative file locator.
@@ -89,6 +102,7 @@ impl SourceCurationUpdate {
         match self {
             Self::SetLastPlayedAt { path, .. }
             | Self::SetRating { path, .. }
+            | Self::SetRatingAndLastCuratedAt { path, .. }
             | Self::SetLocked { path, .. }
             | Self::AddCollection { path, .. }
             | Self::RemoveCollection { path, .. }
@@ -175,6 +189,14 @@ impl SourceDatabase {
                 },
                 SourceCurationUpdate::SetRating { path, rating } => {
                     batch.set_tag(path.as_path(), *rating)?;
+                }
+                SourceCurationUpdate::SetRatingAndLastCuratedAt {
+                    path,
+                    rating,
+                    last_curated_at,
+                } => {
+                    batch.set_tag(path.as_path(), *rating)?;
+                    batch.set_last_curated_at(path.as_path(), *last_curated_at)?;
                 }
                 SourceCurationUpdate::SetLocked { path, locked } => {
                     batch.set_locked(path.as_path(), *locked)?;
@@ -278,7 +300,10 @@ fn normalize_update_paths(updates: &[SourceCurationUpdate]) -> Result<Vec<String
 fn validate_update_values(updates: &[SourceCurationUpdate]) -> Result<(), SourceDbError> {
     for update in updates {
         match update {
-            SourceCurationUpdate::SetRating { rating, .. } if !(-3..=3).contains(&rating.val()) => {
+            SourceCurationUpdate::SetRating { rating, .. }
+            | SourceCurationUpdate::SetRatingAndLastCuratedAt { rating, .. }
+                if !(-3..=3).contains(&rating.val()) =>
+            {
                 return Err(SourceDbError::Unexpected);
             }
             SourceCurationUpdate::AddCollection { collection, .. }

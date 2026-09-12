@@ -429,7 +429,8 @@ fn submit_source_page(
             CatalogSubmitError::InvalidWavMetadataRequest(_)
             | CatalogSubmitError::InvalidCurationRequest(_)
             | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
-            | CatalogSubmitError::InvalidTagFilterRequest(_),
+            | CatalogSubmitError::InvalidTagFilterRequest(_)
+            | CatalogSubmitError::InvalidRatingDecayRequest(_),
         ) => {
             browser.tag_completion.source_target = None;
             browser.tag_completion.source_ready = true;

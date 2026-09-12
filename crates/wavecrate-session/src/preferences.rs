@@ -16,6 +16,17 @@ const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
 const MAX_AUDIO_OUTPUT_NAME_BYTES: usize = 1024;
 const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Default interval between positive-rating decay steps, in weeks.
+pub const DEFAULT_RATING_DECAY_WEEKS: u16 = 4;
+/// Shortest supported rating-decay interval.
+pub const MIN_RATING_DECAY_WEEKS: u16 = 1;
+/// Longest supported rating-decay interval.
+pub const MAX_RATING_DECAY_WEEKS: u16 = 52;
+
+fn default_rating_decay_weeks() -> u16 {
+    DEFAULT_RATING_DECAY_WEEKS
+}
+
 fn default_help_tooltips_enabled() -> bool {
     true
 }
@@ -99,6 +110,12 @@ pub struct UiPreferences {
     /// Whether a newly focused sample may start playback.
     #[serde(default = "default_autoplay_selection")]
     pub autoplay_selection: bool,
+    /// Interval between positive-rating decay steps, in weeks.
+    #[serde(default = "default_rating_decay_weeks")]
+    pub rating_decay_weeks: u16,
+    /// Optional destination for physical trash operations; persistence grants no file authority.
+    #[serde(default)]
+    pub trash_folder: Option<PathBuf>,
     /// Whether hover help is shown throughout the browser.
     #[serde(default = "default_help_tooltips_enabled")]
     pub help_tooltips_enabled: bool,
@@ -124,6 +141,8 @@ impl Default for UiPreferences {
             theme_source_path: None,
             autoplay_selection: true,
             help_tooltips_enabled: true,
+            rating_decay_weeks: DEFAULT_RATING_DECAY_WEEKS,
+            trash_folder: None,
             loop_enabled: false,
             normalized_audition_enabled: false,
             output_volume: 1.0,
@@ -145,6 +164,8 @@ impl UiPreferences {
         if let Some(path) = self.theme_source_path.as_deref() {
             validate_theme_source_path(path)?;
         }
+        validate_rating_decay_weeks(self.rating_decay_weeks)?;
+        validate_trash_folder(self.trash_folder.as_deref())?;
         validate_output_volume(self.output_volume)?;
         self.audio_output.validate()?;
         Ok(Self { theme, ..self })
@@ -197,6 +218,14 @@ pub enum PreferenceError {
     /// The optional theme reload path exceeded the bounded payload policy.
     #[error("theme source path exceeds the {MAX_THEME_SOURCE_PATH_BYTES}-byte limit")]
     ThemeSourcePathTooLarge,
+    /// The decay interval was outside the reference application's supported range.
+    #[error("rating decay must be between 1 and 52 weeks")]
+    InvalidRatingDecay,
+    /// The configured trash destination was not a bounded absolute normal path.
+    #[error(
+        "trash folder must be an absolute UTF-8 path without parent traversal or NUL, at most 16384 bytes"
+    )]
+    InvalidTrashFolder,
     /// The output volume was not a finite value in the inclusive 0..=1 range.
     #[error("output volume must be finite and between 0 and 1")]
     InvalidOutputVolume,
@@ -274,6 +303,29 @@ fn validate_audio_output_name(
     Ok(())
 }
 
+fn validate_rating_decay_weeks(weeks: u16) -> Result<(), PreferenceError> {
+    if !(MIN_RATING_DECAY_WEEKS..=MAX_RATING_DECAY_WEEKS).contains(&weeks) {
+        return Err(PreferenceError::InvalidRatingDecay);
+    }
+    Ok(())
+}
+
+fn validate_trash_folder(path: Option<&Path>) -> Result<(), PreferenceError> {
+    if let Some(path) = path {
+        let text = path.to_str().ok_or(PreferenceError::InvalidTrashFolder)?;
+        if !path.is_absolute()
+            || text.len() > 16384
+            || text.contains('\0')
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(PreferenceError::InvalidTrashFolder);
+        }
+    }
+    Ok(())
+}
+
 /// One typed user intent applied to the loaded preference document.
 #[derive(Clone, Debug)]
 pub enum PreferencePatch {
@@ -288,6 +340,10 @@ pub enum PreferencePatch {
     SetMotionEnabled(bool),
     /// Change the selection autoplay preference.
     SetAutoplaySelection(bool),
+    /// Change the reference rating-decay interval.
+    SetRatingDecayWeeks(u16),
+    /// Set or clear the configured trash destination; file operations resolve authority separately.
+    SetTrashFolder(Option<PathBuf>),
     /// Change global hover-help visibility.
     SetHelpTooltipsEnabled(bool),
     /// Change the audition loop preference.
@@ -316,6 +372,14 @@ impl PreferencePatch {
             }
             Self::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = enabled,
             Self::SetAutoplaySelection(enabled) => preferences.autoplay_selection = enabled,
+            Self::SetRatingDecayWeeks(weeks) => {
+                validate_rating_decay_weeks(weeks)?;
+                preferences.rating_decay_weeks = weeks;
+            }
+            Self::SetTrashFolder(path) => {
+                validate_trash_folder(path.as_deref())?;
+                preferences.trash_folder = path;
+            }
             Self::SetHelpTooltipsEnabled(enabled) => preferences.help_tooltips_enabled = enabled,
             Self::SetLoopEnabled(enabled) => preferences.loop_enabled = enabled,
             Self::SetNormalizedAuditionEnabled(enabled) => {
@@ -955,5 +1019,58 @@ mod tests {
         let current = coordinator.snapshot();
         assert!(!current.help_tooltips_enabled);
         assert_eq!(current.output_volume, 0.25);
+    }
+
+    #[test]
+    fn general_settings_legacy_defaults_and_persistence() {
+        let mut payload = serde_json::to_value(UiPreferences::default()).unwrap();
+        for field in ["rating_decay_weeks", "trash_folder"] {
+            payload.as_object_mut().unwrap().remove(field);
+        }
+        let mut preferences = UiPreferences::from_payload(&payload.to_string()).unwrap();
+        assert_eq!(preferences.rating_decay_weeks, 4);
+        assert_eq!(preferences.trash_folder, None);
+        PreferencePatch::SetRatingDecayWeeks(52)
+            .apply(&mut preferences)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().to_path_buf();
+        PreferencePatch::SetTrashFolder(Some(folder.clone()))
+            .apply(&mut preferences)
+            .unwrap();
+        let restored = UiPreferences::from_payload(&preferences.to_payload().unwrap()).unwrap();
+        assert_eq!(restored.rating_decay_weeks, 52);
+        assert_eq!(restored.trash_folder, Some(folder));
+        PreferencePatch::SetTrashFolder(None)
+            .apply(&mut preferences)
+            .unwrap();
+        assert_eq!(preferences.trash_folder, None);
+        PreferencePatch::Reset.apply(&mut preferences).unwrap();
+        assert_eq!(preferences.rating_decay_weeks, 4);
+    }
+
+    #[test]
+    fn invalid_general_settings_reject_before_mutation() {
+        let mut preferences = UiPreferences::default();
+        let original = preferences.clone();
+        for weeks in [0, 53, u16::MAX] {
+            assert_eq!(
+                PreferencePatch::SetRatingDecayWeeks(weeks).apply(&mut preferences),
+                Err(PreferenceError::InvalidRatingDecay)
+            );
+            assert_eq!(preferences, original);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for path in [
+            PathBuf::from("relative"),
+            directory.path().join("../outside"),
+            directory.path().join("bad\0name"),
+        ] {
+            assert_eq!(
+                PreferencePatch::SetTrashFolder(Some(path)).apply(&mut preferences),
+                Err(PreferenceError::InvalidTrashFolder)
+            );
+            assert_eq!(preferences, original);
+        }
     }
 }

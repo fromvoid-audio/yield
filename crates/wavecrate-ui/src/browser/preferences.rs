@@ -104,6 +104,19 @@ impl PreferenceState {
         self.terminal
     }
 
+    /// Return whether the loaded preference baseline is safe for durable maintenance work.
+    ///
+    /// A preference snapshot is only an input to maintenance after the session has acknowledged
+    /// every optimistic patch. Keeping this gate here prevents individual maintenance lanes from
+    /// accidentally treating an optimistic UI value as durable authority.
+    pub(super) fn ready_for_maintenance(&self) -> bool {
+        self.loaded
+            && self.valid
+            && self.pending.is_empty()
+            && !self.terminal
+            && !self.blocked_until_reset
+    }
+
     pub(super) fn effective(&self) -> UiPreferences {
         let mut preferences = self.baseline.clone();
         for pending in &self.pending {
@@ -319,6 +332,8 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         }
         PreferencePatch::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = *enabled,
         PreferencePatch::SetAutoplaySelection(enabled) => preferences.autoplay_selection = *enabled,
+        PreferencePatch::SetRatingDecayWeeks(weeks) => preferences.rating_decay_weeks = *weeks,
+        PreferencePatch::SetTrashFolder(path) => preferences.trash_folder = path.clone(),
         PreferencePatch::SetHelpTooltipsEnabled(enabled) => {
             preferences.help_tooltips_enabled = *enabled
         }
@@ -391,12 +406,22 @@ impl Browser {
                     return false;
                 }
                 self.apply_preference_projection(cx);
+                let _ = self.maybe_start_rating_decay(cx);
                 true
             }
-            PreferenceEvent::Persisted { revision } => self.preferences.mark_persisted(revision),
+            PreferenceEvent::Persisted { revision } => {
+                let changed = self.preferences.mark_persisted(revision);
+                if changed {
+                    let _ = self.maybe_start_rating_decay(cx);
+                }
+                changed
+            }
             PreferenceEvent::RequestApplied { request, revision } => {
                 let changed = self.preferences.mark_applied(request, revision);
                 self.apply_preference_projection(cx);
+                if changed {
+                    let _ = self.maybe_start_rating_decay(cx);
+                }
                 changed
             }
             PreferenceEvent::RequestFailed { request, error } => {
@@ -418,6 +443,7 @@ impl Browser {
                         self.theme_load.reject(generation);
                     }
                     self.apply_preference_projection(cx);
+                    let _ = self.maybe_start_rating_decay(cx);
                 }
                 failed.is_some()
             }
@@ -426,6 +452,7 @@ impl Browser {
                 let generation = self.theme_load.generation;
                 self.theme_load.reject(generation);
                 self.apply_preference_projection(cx);
+                super::rating_decay::cancel_for_preference_change(self);
                 true
             }
             PreferenceEvent::PersistenceUnavailable { error, .. } => {
@@ -437,6 +464,7 @@ impl Browser {
                 let generation = self.theme_load.generation;
                 self.theme_load.reject(generation);
                 self.apply_preference_projection(cx);
+                super::rating_decay::cancel_for_preference_change(self);
                 true
             }
             PreferenceEvent::Closed => {
@@ -448,6 +476,7 @@ impl Browser {
                 let generation = self.theme_load.generation;
                 self.theme_load.reject(generation);
                 self.apply_preference_projection(cx);
+                super::rating_decay::cancel_for_preference_change(self);
                 true
             }
         }
@@ -464,6 +493,8 @@ impl Browser {
         let autoplay_was_enabled = self.autoplay_selection;
         self.autoplay_selection = effective.autoplay_selection;
         self.help_tooltips_enabled = effective.help_tooltips_enabled;
+        self.general_settings.rating_decay_weeks = effective.rating_decay_weeks;
+        self.general_settings.trash_folder = effective.trash_folder.clone();
         self.playback_policy
             .apply_preference(effective.loop_enabled);
         self.apply_preference_volume(effective.output_volume);
@@ -528,6 +559,7 @@ impl Browser {
         match result {
             Ok(request) => {
                 self.preferences.queue(request, patch);
+                super::rating_decay::cancel_for_preference_change(self);
                 self.start_preferences_poll(cx);
                 true
             }
@@ -691,6 +723,30 @@ mod tests {
         assert!(!state.normalized_audition_enabled());
         state.queue_for_test(1, PreferencePatch::SetNormalizedAuditionEnabled(true));
         assert!(state.normalized_audition_enabled());
+    }
+
+    #[test]
+    fn maintenance_requires_loaded_valid_and_durable_preferences() {
+        let mut state = PreferenceState::new();
+        assert!(!state.ready_for_maintenance());
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        assert!(state.ready_for_maintenance());
+        state.queue_for_test(1, PreferencePatch::SetRatingDecayWeeks(8));
+        assert!(!state.ready_for_maintenance());
+        state.mark_applied_for_test(1, 1);
+        state.mark_persisted_for_test(1);
+        assert!(state.ready_for_maintenance());
+        state.load_failed(String::from("malformed"));
+        assert!(!state.ready_for_maintenance());
+    }
+
+    #[test]
+    fn failed_optimistic_preferences_cannot_authorize_maintenance() {
+        let mut state = PreferenceState::new();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        state.queue_for_test(1, PreferencePatch::SetRatingDecayWeeks(8));
+        state.mark_unavailable(&SessionError::Preference("write failed".to_string()));
+        assert!(!state.ready_for_maintenance());
     }
 
     #[test]

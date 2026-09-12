@@ -7,7 +7,7 @@ use super::super::util::map_sql_error;
 use super::super::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
     META_WAV_PATHS_REVISION, Rating, SampleCollection, SampleSoundType, SourceDatabase,
-    SourceDbError, SourcePlaybackType,
+    SourceDbError, SourceDirectoryTruthError, SourcePlaybackType,
 };
 use super::decode::{
     decode_path_row, decode_relative_path, table_has_columns, wav_file_has_column,
@@ -466,7 +466,11 @@ impl SourceDatabase {
             .transpose()?
             .unwrap_or_default();
         if revision != expected_revision {
-            return Err(SourceDbError::Unexpected);
+            return Err(SourceDirectoryTruthError::StaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            }
+            .into());
         }
         let wav_columns = super::super::schema::table_columns(&transaction, "wav_files")?;
         let collection_columns =

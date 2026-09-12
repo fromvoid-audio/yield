@@ -81,6 +81,32 @@ impl SourceRegistryGlobal {
             .reset_preferences()
     }
 
+    /// Query storage through the profile-owned maintenance service.
+    pub(crate) fn request_storage_usage(
+        &self,
+    ) -> Result<
+        wavecrate_session::MaintenanceRequest<wavecrate_session::GlobalStorageUsage>,
+        SubmitError,
+    > {
+        self.service
+            .as_ref()
+            .ok_or(SubmitError::Closed)?
+            .request_storage_usage()
+    }
+
+    /// Clear the captured disposable cache namespace through its owner.
+    pub(crate) fn clear_rebuildable_cache(
+        &self,
+    ) -> Result<
+        wavecrate_session::MaintenanceRequest<wavecrate_session::CacheClearOutcome>,
+        SubmitError,
+    > {
+        self.service
+            .as_ref()
+            .ok_or(SubmitError::Closed)?
+            .clear_rebuildable_cache()
+    }
+
     /// Return the current state of the independently-owned source catalog.
     pub(crate) fn catalog_status(&self) -> CatalogStatus {
         self.service

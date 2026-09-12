@@ -167,6 +167,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> bool {
         super::source_recovery::cancel_for_source_change(self);
+        super::rating_decay::cancel_for_source_change(self);
         super::tags::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
@@ -326,6 +327,7 @@ impl Browser {
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
         super::source_recovery::cancel_for_source_change(self);
+        super::rating_decay::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -409,6 +411,7 @@ impl Browser {
                 self.catalog_pending_command = None;
                 self.catalog_pending_removes.clear();
                 super::source_recovery::cancel_for_source_change(self);
+                super::rating_decay::cancel_for_source_change(self);
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -437,7 +440,8 @@ impl Browser {
                     | CatalogSubmitError::InvalidCurationRequest(_)
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
-                    | CatalogSubmitError::InvalidDisplayLabelsRequest(_),
+                    | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => {
                     return false;
                 }
@@ -484,11 +488,14 @@ impl Browser {
                     | CatalogSubmitError::InvalidCurationRequest(_)
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
-                    | CatalogSubmitError::InvalidDisplayLabelsRequest(_),
+                    | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => return false,
             }
         }
-        self.retry_catalog_metadata(cx)
+        let mut changed = self.retry_catalog_metadata(cx);
+        changed |= super::rating_decay::retry(self, cx);
+        changed
     }
 
     fn handle_catalog_unavailable(&mut self, reason: String, cx: &mut Context<Self>) -> bool {
@@ -496,6 +503,7 @@ impl Browser {
             self.catalog_pending_command = None;
             self.catalog_pending_removes.clear();
             super::source_recovery::cancel_for_source_change(self);
+            super::rating_decay::cancel_for_source_change(self);
             super::tag_chips::cancel_for_source_change(self);
             super::tag_completion::cancel_for_source_change(self, cx);
             self.display_labels.cancel_for_source_change();
@@ -506,6 +514,7 @@ impl Browser {
         self.catalog_pending_command = None;
         self.catalog_pending_removes.clear();
         super::source_recovery::cancel_for_source_change(self);
+        super::rating_decay::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
@@ -531,6 +540,10 @@ impl Browser {
         event: CatalogEvent,
         cx: &mut Context<Self>,
     ) -> bool {
+        super::rating_decay::observe_snapshot(self, &event);
+        if super::rating_decay::apply_catalog_event(self, &event, cx) {
+            return true;
+        }
         if matches!(
             &event,
             CatalogEvent::TagPageReady { .. } | CatalogEvent::TagPageFailed { .. }
@@ -558,7 +571,11 @@ impl Browser {
             // Compound outcomes belong to their source lifecycle even after the browser has
             // switched to another source. Consume them before the active projection fence so a
             // later receipt cannot be mistaken for a new source's metadata.
-            return self.apply_curation_event(&event, cx);
+            let consumed = self.apply_curation_event(&event, cx);
+            if consumed {
+                let _ = self.maybe_start_rating_decay(cx);
+            }
+            return consumed;
         }
         if let CatalogEvent::Failed {
             operation: CatalogOperation::Register,
@@ -578,6 +595,7 @@ impl Browser {
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
                 super::source_recovery::cancel_for_source_change(self);
+                super::rating_decay::cancel_for_source_change(self);
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -615,6 +633,7 @@ impl Browser {
                 true
             }
             CatalogEvent::AuditCommitted { .. } => {
+                super::rating_decay::note_audit_committed(self);
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = None;
@@ -639,7 +658,9 @@ impl Browser {
             | CatalogEvent::TagFilterReady { .. }
             | CatalogEvent::TagFilterFailed { .. }
             | CatalogEvent::DisplayLabelsReady { .. }
-            | CatalogEvent::DisplayLabelsFailed { .. } => false,
+            | CatalogEvent::DisplayLabelsFailed { .. }
+            | CatalogEvent::RatingDecayProgress { .. }
+            | CatalogEvent::RatingDecayFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
@@ -871,6 +892,9 @@ impl Browser {
             )
         };
         self.restore_projection_focus(restore_id, restore_position, cx);
+        if audit_ready {
+            let _ = self.maybe_start_rating_decay(cx);
+        }
     }
 }
 
@@ -955,6 +979,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::CurationFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::RatingDecayProgress {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::RatingDecayFailed {
             source_id,
             lifecycle_generation,
             ..
@@ -1171,6 +1205,7 @@ pub(super) fn catalog_poll_needed(browser: &Browser) -> bool {
         || is_catalog_busy(browser)
         || browser.catalog_metadata.poll_needed()
         || browser.curation_state.has_pending_outcomes()
+        || super::rating_decay::poll_needed(browser)
 }
 
 #[cfg(test)]

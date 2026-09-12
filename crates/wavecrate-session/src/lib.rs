@@ -25,14 +25,15 @@ use wavecrate_library::sample_sources::{
 };
 
 mod catalog;
+mod maintenance;
 mod preferences;
 mod vocabulary;
 
 pub use catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogDisplayLabelsRequestError, CatalogError,
-    CatalogEvent, CatalogOperation, CatalogStatus, CatalogSubmitError,
-    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogEvent, CatalogOperation, CatalogRatingDecayRequestError, CatalogStatus,
+    CatalogSubmitError, CatalogTagFilterRequestError, CatalogTagPageQuery,
+    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
     MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
@@ -44,10 +45,18 @@ pub use catalog::{
     SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
+use maintenance::{
+    MaintenanceAdmission, MaintenanceKind, MaintenanceReservation, MaintenanceService,
+};
 use vocabulary::VocabularySlot;
 
+pub use maintenance::{
+    CacheClearOutcome, GlobalStorageUsage, MaintenanceError, MaintenanceRequest,
+};
+
 pub use preferences::{
-    AudioOutputPreferences, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
+    AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, MAX_RATING_DECAY_WEEKS,
+    MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
     PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
@@ -176,6 +185,9 @@ pub enum SubmitError {
     /// The worker command queue is full.
     #[error("source session command queue is full")]
     Full,
+    /// A storage or cache maintenance operation is already admitted.
+    #[error("a maintenance operation is already active")]
+    MaintenanceActive,
     /// The service has closed command admission.
     #[error("source session service is closed")]
     Closed,
@@ -244,6 +256,7 @@ pub enum RegistryEvent {
 pub struct SourceRegistryService {
     commands: Mutex<Option<SyncSender<Command>>>,
     closed: AtomicBool,
+    maintenance_admission: Arc<MaintenanceAdmission>,
     next_request: AtomicU64,
     next_preference_request: AtomicU64,
     next_vocabulary_request: AtomicU64,
@@ -262,6 +275,12 @@ impl SourceRegistryService {
 
     /// Submit a source root for durable registration.
     pub fn add_root(&self, root: CanonicalSourceRoot) -> Result<RequestId, SubmitError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SubmitError::Closed);
+        }
+        if self.maintenance_admission.clear_reserved() {
+            return Err(SubmitError::MaintenanceActive);
+        }
         self.submit(|request| Command::AddRoot { request, root })
     }
 
@@ -279,6 +298,14 @@ impl SourceRegistryService {
         &self,
         patch: PreferencePatch,
     ) -> Result<PreferenceRequestId, SubmitError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SubmitError::Closed);
+        }
+        if matches!(&patch, PreferencePatch::SetTrashFolder(_))
+            && self.maintenance_admission.clear_reserved()
+        {
+            return Err(SubmitError::MaintenanceActive);
+        }
         let request = PreferenceRequestId::from_raw(
             self.next_preference_request.fetch_add(1, Ordering::Relaxed),
         );
@@ -289,6 +316,53 @@ impl SourceRegistryService {
     /// Submit an explicit reset of the persisted preference document.
     pub fn reset_preferences(&self) -> Result<PreferenceRequestId, SubmitError> {
         self.patch_preferences(PreferencePatch::Reset)
+    }
+
+    /// Request a bounded measurement of the retained profile's database and cache footprint.
+    pub fn request_storage_usage(
+        &self,
+    ) -> Result<MaintenanceRequest<GlobalStorageUsage>, SubmitError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SubmitError::Closed);
+        }
+        let reservation = self
+            .maintenance_admission
+            .reserve(MaintenanceKind::StorageUsage)
+            .ok_or(SubmitError::MaintenanceActive)?;
+        let cancel = reservation.cancel_token();
+        let generation = reservation.generation();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.submit_command(Command::StorageUsage {
+            reservation,
+            result: result_tx,
+        })?;
+        Ok(MaintenanceRequest::new(result_rx, cancel, generation))
+    }
+
+    /// Request removal of entries in the captured profile-owned rebuildable cache namespace.
+    pub fn clear_rebuildable_cache(
+        &self,
+    ) -> Result<MaintenanceRequest<CacheClearOutcome>, SubmitError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SubmitError::Closed);
+        }
+        let reservation = self
+            .maintenance_admission
+            .reserve(MaintenanceKind::CacheClear)
+            .ok_or(SubmitError::MaintenanceActive)?;
+        let cancel = reservation.cancel_token();
+        let generation = reservation.generation();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.submit_command(Command::ClearRebuildableCache {
+            reservation,
+            result: result_tx,
+        })?;
+        Ok(MaintenanceRequest::new(result_rx, cancel, generation))
+    }
+
+    /// Return the latest monotonic generation assigned to a maintenance request.
+    pub fn maintenance_generation(&self) -> u64 {
+        self.maintenance_admission.generation()
     }
 
     /// Return the current lifecycle state of the session-facing profile tag vocabulary.
@@ -451,6 +525,8 @@ impl SourceRegistryService {
         let worker_catalog = Arc::clone(&catalog);
         let vocabulary = Arc::new(Mutex::new(VocabularySlot::loading()));
         let worker_vocabulary = Arc::clone(&vocabulary);
+        let maintenance_admission = Arc::new(MaintenanceAdmission::new());
+        let worker_maintenance_admission = Arc::clone(&maintenance_admission);
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-source-session"))
             .spawn(move || {
@@ -461,6 +537,7 @@ impl SourceRegistryService {
                     app_root_override,
                     worker_catalog,
                     worker_vocabulary,
+                    worker_maintenance_admission,
                     initialization_gate,
                 )
             })
@@ -468,6 +545,7 @@ impl SourceRegistryService {
         Ok(Self {
             commands: Mutex::new(Some(command_tx)),
             closed: AtomicBool::new(false),
+            maintenance_admission,
             next_request: AtomicU64::new(1),
             next_preference_request: AtomicU64::new(1),
             next_vocabulary_request: AtomicU64::new(1),
@@ -520,6 +598,14 @@ enum Command {
     PatchPreferences {
         request: PreferenceRequestId,
         patch: PreferencePatch,
+    },
+    StorageUsage {
+        reservation: MaintenanceReservation,
+        result: SyncSender<Result<GlobalStorageUsage, MaintenanceError>>,
+    },
+    ClearRebuildableCache {
+        reservation: MaintenanceReservation,
+        result: SyncSender<Result<CacheClearOutcome, MaintenanceError>>,
     },
     Shutdown {
         acknowledgement: SyncSender<Result<(), SessionError>>,
@@ -691,6 +777,23 @@ impl Coordinator {
         SourceRegistrySnapshot::new(self.current.clone())
     }
 
+    fn maintenance_source_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self
+            .current
+            .iter()
+            .map(|source| source.root.clone())
+            .collect::<Vec<_>>();
+        roots.extend(self.edits.iter().filter_map(|edit| match edit {
+            Edit::Add {
+                root, source: None, ..
+            } => Some(root.as_path().to_path_buf()),
+            Edit::Add { .. } | Edit::Remove { .. } => None,
+        }));
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
     fn is_dirty(&self) -> bool {
         self.revision != self.durable_revision
     }
@@ -776,6 +879,7 @@ fn sources_equal(left: &[SampleSource], right: &[SampleSource]) -> bool {
 
 struct Persistence {
     writable: Option<WritableProfileGuard>,
+    maintenance: MaintenanceService,
     writer: Option<GlobalLibraryWriter>,
     catalog: Option<Arc<CatalogService>>,
     load: Option<Receiver<Result<SourceRegistrySnapshot, LibraryError>>>,
@@ -794,10 +898,12 @@ impl Persistence {
         app_root_override: Option<PathBuf>,
         catalog_slot: Arc<Mutex<CatalogSlot>>,
         vocabulary_slot: Arc<Mutex<VocabularySlot>>,
+        maintenance_admission: Arc<MaintenanceAdmission>,
     ) -> (Self, Option<AppRootGuard>, PersistenceProfileGuard) {
         let profile_guard = PersistenceProfileGuard::named(GPUI_DEVELOPMENT_PROFILE);
         let mut persistence = Self {
             writable: None,
+            maintenance: MaintenanceService::new(maintenance_admission),
             writer: None,
             catalog: None,
             load: None,
@@ -889,6 +995,7 @@ impl Persistence {
     }
 
     fn shutdown(&mut self) {
+        self.maintenance.shutdown();
         if let Some(catalog) = self.catalog.take() {
             catalog.shutdown();
         }
@@ -925,6 +1032,7 @@ fn run_worker(
     app_root_override: Option<PathBuf>,
     catalog_slot: Arc<Mutex<CatalogSlot>>,
     vocabulary_slot: Arc<Mutex<VocabularySlot>>,
+    maintenance_admission: Arc<MaintenanceAdmission>,
     initialization_gate: Option<Arc<std::sync::Barrier>>,
 ) -> Result<(), SessionError> {
     if let Some(initialization_gate) = initialization_gate {
@@ -934,6 +1042,7 @@ fn run_worker(
         app_root_override,
         Arc::clone(&catalog_slot),
         Arc::clone(&vocabulary_slot),
+        maintenance_admission,
     );
     let mut coordinator = Coordinator::new();
     let mut preference_coordinator = PreferenceCoordinator::new();
@@ -1086,6 +1195,17 @@ fn run_worker(
         }
         match command {
             Command::AddRoot { request, root } => {
+                if persistence.maintenance.clear_reserved() {
+                    fail_request(
+                        &event_tx,
+                        &mut unfinalized_requests,
+                        request,
+                        SessionError::Library(String::from(
+                            "source registration paused while cache cleanup is active",
+                        )),
+                    );
+                    continue;
+                }
                 coordinator.add_edit(request, root.clone());
                 persistence.pending_adds.insert(
                     request,
@@ -1123,6 +1243,19 @@ fn run_worker(
                 coordinator.compact_if_resolved(!persistence.pending_adds.is_empty());
             }
             Command::PatchPreferences { request, patch } => {
+                if matches!(&patch, PreferencePatch::SetTrashFolder(_))
+                    && persistence.maintenance.clear_reserved()
+                {
+                    fail_preference_request(
+                        &preference_event_tx,
+                        &mut unfinalized_preference_requests,
+                        request,
+                        SessionError::Preference(String::from(
+                            "trash-folder changes are paused while cache cleanup is active",
+                        )),
+                    );
+                    continue;
+                }
                 let output_volume_patch = matches!(&patch, PreferencePatch::SetOutputVolume(_));
                 match preference_coordinator.apply_loaded_patch(request, patch) {
                     Ok(changed) if preference_coordinator.loaded() => {
@@ -1156,6 +1289,35 @@ fn run_worker(
                         SessionError::Preference(error.to_string()),
                     ),
                 }
+            }
+            Command::StorageUsage {
+                reservation,
+                result,
+            } => {
+                persistence.maintenance.start_storage(
+                    persistence.writable.as_ref(),
+                    reservation,
+                    result,
+                );
+            }
+            Command::ClearRebuildableCache {
+                reservation,
+                result,
+            } => {
+                if !coordinator.loaded || !preference_coordinator.loaded() {
+                    let _ = result.send(Err(MaintenanceError::NotReady));
+                    drop(reservation);
+                    continue;
+                }
+                let source_roots = coordinator.maintenance_source_roots();
+                let preferences = preference_coordinator.snapshot();
+                persistence.maintenance.start_clear(
+                    persistence.writable.as_ref(),
+                    &source_roots,
+                    preferences.trash_folder.as_deref(),
+                    reservation,
+                    result,
+                );
             }
             Command::Shutdown { acknowledgement } => {
                 vocabulary::close(&vocabulary_slot);
@@ -1205,14 +1367,21 @@ fn can_block_on_command(
 fn command_request(command: &Command) -> Option<RequestId> {
     match command {
         Command::AddRoot { request, .. } | Command::RemoveRoot { request, .. } => Some(*request),
-        Command::PatchPreferences { .. } | Command::Shutdown { .. } => None,
+        Command::PatchPreferences { .. }
+        | Command::StorageUsage { .. }
+        | Command::ClearRebuildableCache { .. }
+        | Command::Shutdown { .. } => None,
     }
 }
 
 fn preference_command_request(command: &Command) -> Option<PreferenceRequestId> {
     match command {
         Command::PatchPreferences { request, .. } => Some(*request),
-        Command::AddRoot { .. } | Command::RemoveRoot { .. } | Command::Shutdown { .. } => None,
+        Command::AddRoot { .. }
+        | Command::RemoveRoot { .. }
+        | Command::StorageUsage { .. }
+        | Command::ClearRebuildableCache { .. }
+        | Command::Shutdown { .. } => None,
     }
 }
 
@@ -2292,6 +2461,25 @@ mod tests {
         }
     }
 
+    fn wait_for_maintenance<T>(request: &MaintenanceRequest<T>) -> Result<T, MaintenanceError> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match request.try_result() {
+                Ok(result) => return result,
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for maintenance result"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("maintenance result channel disconnected")
+                }
+            }
+        }
+    }
+
     fn wait_for_catalog_ready(service: &SourceRegistryService) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2478,6 +2666,173 @@ mod tests {
         assert!(matches!(deletion, Err(VocabularySubmitError::Initializing)));
         wait_for_vocabulary_available(&service);
         service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn maintenance_admission_serializes_and_blocks_protected_admissions() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let mut service = SourceRegistryService::start_inner_with_initialization_gate_for_test(
+            Some(profile_root(&temp)),
+            Arc::clone(&gate),
+        )
+        .expect("service start");
+
+        let request = service
+            .clear_rebuildable_cache()
+            .expect("cache maintenance admission");
+        assert!(matches!(
+            service.request_storage_usage(),
+            Err(SubmitError::MaintenanceActive)
+        ));
+        assert!(matches!(
+            service.add_root(root(&temp, "blocked-source")),
+            Err(SubmitError::MaintenanceActive)
+        ));
+        assert!(matches!(
+            service.patch_preferences(PreferencePatch::SetTrashFolder(Some(
+                temp.path().join("trash"),
+            ))),
+            Err(SubmitError::MaintenanceActive)
+        ));
+
+        gate.wait();
+        assert!(matches!(
+            wait_for_maintenance(&request),
+            Err(MaintenanceError::NotReady)
+        ));
+        drop(request);
+        service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn loaded_cache_clear_rejects_source_and_trash_namespace_conflicts() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile = profile_root(&temp);
+        let cache = profile.join("cache");
+        fs::create_dir_all(&cache).expect("cache root");
+        let mut service = SourceRegistryService::start_inner(Some(profile)).expect("service start");
+        wait_for_snapshot(&service, |snapshot| snapshot.as_slice().is_empty());
+        wait_for_preference_snapshot(&service, |_| true);
+
+        let cache_root = CanonicalSourceRoot::new(cache.clone()).expect("cache source root");
+        let add_request = service
+            .add_root(cache_root.clone())
+            .expect("add cache source");
+        wait_for_snapshot(&service, |snapshot| {
+            snapshot
+                .as_slice()
+                .iter()
+                .any(|source| source.root == cache)
+        });
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::RequestApplied { request, .. } if *request == add_request
+            )
+        });
+
+        let source_conflict = service
+            .clear_rebuildable_cache()
+            .expect("source-conflict admission");
+        assert!(matches!(
+            wait_for_maintenance(&source_conflict),
+            Err(MaintenanceError::SourceRootConflict { path }) if path == cache
+        ));
+
+        let remove_request = service
+            .remove_root(cache_root)
+            .expect("remove cache source");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::RequestApplied { request, .. } if *request == remove_request
+            )
+        });
+        let trash = cache.join("trash");
+        let trash_request = service
+            .patch_preferences(PreferencePatch::SetTrashFolder(Some(trash.clone())))
+            .expect("set cache trash folder");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == trash_request
+            )
+        });
+
+        let trash_conflict = service
+            .clear_rebuildable_cache()
+            .expect("trash-conflict admission");
+        assert!(matches!(
+            wait_for_maintenance(&trash_conflict),
+            Err(MaintenanceError::TrashFolderConflict { path }) if path == trash
+        ));
+
+        let clear_trash_request = service
+            .patch_preferences(PreferencePatch::SetTrashFolder(None))
+            .expect("clear trash folder");
+        wait_for_preference_event(&service, |event| {
+            matches!(
+                event,
+                PreferenceEvent::RequestApplied { request, .. } if *request == clear_trash_request
+            )
+        });
+        service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn loaded_cache_clear_succeeds_and_releases_admission_for_storage_query() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile = profile_root(&temp);
+        let cache = profile.join("cache");
+        fs::create_dir_all(cache.join("nested")).expect("cache root");
+        fs::write(cache.join("nested/payload.cache"), [0_u8; 47]).expect("cache payload");
+        let mut service = SourceRegistryService::start_inner(Some(profile)).expect("service start");
+        wait_for_snapshot(&service, |snapshot| snapshot.as_slice().is_empty());
+        wait_for_preference_snapshot(&service, |_| true);
+
+        let clear = service.clear_rebuildable_cache().expect("cache admission");
+        let outcome = wait_for_maintenance(&clear).expect("cache clear");
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.removed_bytes, 47);
+        assert_eq!(outcome.remaining_entries, 0);
+        assert!(outcome.remaining_entries_known);
+        assert!(!outcome.incomplete);
+        assert!(cache.is_dir());
+        assert!(!cache.join("nested").exists());
+
+        let usage = service
+            .request_storage_usage()
+            .expect("storage admission after clear");
+        let usage = wait_for_maintenance(&usage).expect("storage usage");
+        assert_eq!(usage.cache_bytes, 0);
+        service.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn dropping_admitted_cache_clear_is_joined_during_shutdown() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile = profile_root(&temp);
+        let cache = profile.join("cache");
+        fs::create_dir_all(&cache).expect("cache root");
+        for index in 0..2_048_u32 {
+            fs::write(cache.join(format!("payload-{index}.cache")), [0_u8; 8])
+                .expect("cache payload");
+        }
+        let mut service = SourceRegistryService::start_inner(Some(profile)).expect("service start");
+        wait_for_snapshot(&service, |snapshot| snapshot.as_slice().is_empty());
+        wait_for_preference_snapshot(&service, |_| true);
+
+        let request = service.clear_rebuildable_cache().expect("cache admission");
+        thread::sleep(Duration::from_millis(1));
+        drop(request);
+        service
+            .shutdown()
+            .expect("shutdown joins cancelled maintenance");
     }
 
     #[test]
@@ -3425,6 +3780,9 @@ mod tests {
                 match service.add_root(source_root.clone()) {
                     Ok(_) => break,
                     Err(SubmitError::Full) => thread::sleep(Duration::from_millis(1)),
+                    Err(SubmitError::MaintenanceActive) => {
+                        panic!("maintenance unexpectedly blocked source admission")
+                    }
                     Err(SubmitError::Closed) => panic!("session closed while queueing lookups"),
                 }
             }
@@ -3434,6 +3792,9 @@ mod tests {
             match service.patch_preferences(PreferencePatch::SetLoopEnabled(true)) {
                 Ok(request) => break request,
                 Err(SubmitError::Full) => thread::sleep(Duration::from_millis(1)),
+                Err(SubmitError::MaintenanceActive) => {
+                    panic!("maintenance unexpectedly blocked preference admission")
+                }
                 Err(SubmitError::Closed) => panic!("session closed while queueing preference"),
             }
         };
@@ -3657,6 +4018,7 @@ mod tests {
         coordinator.remove_edit(second_request, second_root);
         let mut persistence = Persistence {
             writable: None,
+            maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
             writer: None,
             catalog: None,
             load: None,
@@ -3722,6 +4084,7 @@ mod tests {
         let mut preference_coordinator = PreferenceCoordinator::new();
         let mut persistence = Persistence {
             writable: None,
+            maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
             writer: None,
             catalog: None,
             load: None,

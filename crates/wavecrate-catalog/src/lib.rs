@@ -26,7 +26,7 @@ use wavecrate_library::sample_sources::db::{
 };
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use wavecrate_library::sample_sources::{
-    BrowserFileMetadata, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
+    BrowserFileMetadata, BrowserMetadataCursor, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
     SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,
     SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
     SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt,
@@ -45,6 +45,7 @@ use wavecrate_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
 mod curation;
 mod display_labels;
+mod rating_decay;
 mod root;
 mod tags;
 mod watcher;
@@ -61,6 +62,15 @@ const EVENT_CAPACITY: usize = 64;
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(25);
 const DIRECTORY_PAGE_LIMIT: usize = 256;
 const CATALOG_CHILD_PREFIX: &str = "wavecrate-catalog-";
+
+/// Default number of elapsed weeks between positive unlocked-rating decay steps.
+pub const DEFAULT_RATING_DECAY_WEEKS: u16 = rating_decay::DEFAULT_RATING_DECAY_WEEKS;
+
+/// Smallest rating-decay interval accepted by the catalog owner.
+pub const MIN_RATING_DECAY_WEEKS: u16 = rating_decay::MIN_RATING_DECAY_WEEKS;
+
+/// Largest rating-decay interval accepted by the catalog owner.
+pub const MAX_RATING_DECAY_WEEKS: u16 = rating_decay::MAX_RATING_DECAY_WEEKS;
 
 #[cfg(test)]
 struct CatalogTestGate {
@@ -511,6 +521,30 @@ pub enum CatalogCommand {
         /// Bounded library-sized curation batches.
         batches: Vec<Vec<SourceCurationUpdate>>,
     },
+    /// Apply one bounded page of positive unlocked-rating decay.
+    ///
+    /// The command reads at most one catalog-owned metadata page, then conditionally commits one
+    /// revision-fenced curation batch. Submit the returned progress event's `next_cursor` to
+    /// continue. `now_epoch_seconds` is supplied by the caller so one maintenance run can use a
+    /// single captured clock value across all pages.
+    ApplyRatingDecay {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that must still own the retained database.
+        lifecycle_generation: u64,
+        /// Exact source revision expected by the page read and optional curation transaction.
+        expected_revision: u64,
+        /// Physical source-root identity expected by the page and optional commit.
+        root_identity: RootIdentity,
+        /// Caller-assigned maintenance request identifier.
+        request_id: u64,
+        /// Number of elapsed weeks required for one rating step, from 1 through 52.
+        rating_decay_weeks: u16,
+        /// Epoch seconds captured once by the maintenance run.
+        now_epoch_seconds: i64,
+        /// Opaque cursor returned by the preceding page, if any.
+        after_cursor: Option<BrowserMetadataCursor>,
+    },
     /// Read the last coherent persisted snapshot for one source.
     ReadSnapshot {
         /// Stable source identifier.
@@ -723,6 +757,21 @@ pub enum CatalogWavMetadataRequestError {
     },
 }
 
+/// Why a rating-decay command could not be admitted.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogRatingDecayRequestError {
+    /// The requested interval is outside the bounded maintenance range.
+    #[error("rating-decay interval is {actual} weeks; expected {min}..={max}")]
+    InvalidWeeks {
+        /// Smallest accepted interval in weeks.
+        min: u16,
+        /// Largest accepted interval in weeks.
+        max: u16,
+        /// Supplied interval in weeks.
+        actual: u16,
+    },
+}
+
 /// A bounded admission failure from the catalog command queue.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogSubmitError {
@@ -747,6 +796,9 @@ pub enum CatalogSubmitError {
     /// A durable curation request failed bounded or lifecycle admission.
     #[error("invalid source curation request: {0}")]
     InvalidCurationRequest(#[from] CatalogCurationRequestError),
+    /// A rating-decay request failed bounded admission.
+    #[error("invalid rating-decay request: {0}")]
+    InvalidRatingDecayRequest(#[from] CatalogRatingDecayRequestError),
 }
 
 /// Startup failures for the profile-owned catalog worker.
@@ -1093,6 +1145,44 @@ pub enum CatalogEvent {
         /// Typed failure.
         error: CatalogError,
     },
+    /// One bounded rating-decay page completed.
+    ///
+    /// `updated_count` is the number of rows changed in the optional curation commit. A
+    /// non-`None` receipt advances `revision` by one; an empty page or a page with no eligible
+    /// rows retains `expected_revision`. Continue with `next_cursor` while it is present.
+    RatingDecayProgress {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the page.
+        lifecycle_generation: u64,
+        /// Physical source-root identity checked by the page and optional commit.
+        root_identity: RootIdentity,
+        /// Revision represented by this page outcome.
+        revision: u64,
+        /// Caller-assigned maintenance request identifier.
+        request_id: u64,
+        /// Number of metadata rows consumed from this bounded page.
+        processed_count: usize,
+        /// Number of positive unlocked ratings decayed in this page.
+        updated_count: usize,
+        /// Cursor for the next bounded page, if more rows remain.
+        next_cursor: Option<BrowserMetadataCursor>,
+        /// Durable metadata patch when this page committed updates.
+        receipt: Option<SourceCurationCommitReceipt>,
+    },
+    /// One bounded rating-decay page failed after admission.
+    RatingDecayFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Exact source revision required by the command.
+        expected_revision: u64,
+        /// Caller-assigned maintenance request identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
+    },
     /// A bounded compound curation operation reached its one terminal outcome.
     CurationOperationCompleted {
         /// Stable source identifier.
@@ -1426,6 +1516,10 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
         CatalogCommand::RequestDisplayLabels { relative_paths, .. } => {
             validate_display_labels_request(relative_paths)?
         }
+        CatalogCommand::ApplyRatingDecay {
+            rating_decay_weeks, ..
+        } => rating_decay::validate_request(*rating_decay_weeks)
+            .map_err(CatalogSubmitError::InvalidRatingDecayRequest)?,
         _ => {}
     }
     Ok(())
@@ -1668,6 +1762,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestDisplayLabels { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
+        | CatalogCommand::ApplyRatingDecay { .. }
         | CatalogCommand::ReadSnapshot { .. }
         | CatalogCommand::Remove { .. }
         | CatalogCommand::Shutdown => 1,
@@ -1686,6 +1781,9 @@ fn command_curation_payload_bytes(command: &CatalogCommand) -> usize {
             batches,
             ..
         } => curation::operation_payload_bytes(root_identity, batches),
+        CatalogCommand::ApplyRatingDecay { root_identity, .. } => {
+            rating_decay::command_payload_bytes(root_identity)
+        }
         _ => 0,
     }
 }
@@ -1695,6 +1793,7 @@ fn command_curation_update_count(command: &CatalogCommand) -> usize {
         CatalogCommand::ApplyCurationOperation { batches, .. } => {
             batches.iter().map(Vec::len).sum()
         }
+        CatalogCommand::ApplyRatingDecay { .. } => rating_decay::PAGE_SIZE,
         _ => 0,
     }
 }
@@ -1773,6 +1872,7 @@ enum AdmissionAction {
         source_id: SourceId,
         request_id: u64,
     },
+    ApplyRatingDecay,
     ReadSnapshot,
     Remove {
         source_id: SourceId,
@@ -1810,6 +1910,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
             source_id: source_id.clone(),
             request_id: *request_id,
         },
+        CatalogCommand::ApplyRatingDecay { .. } => AdmissionAction::ApplyRatingDecay,
         CatalogCommand::ReadSnapshot { .. } => AdmissionAction::ReadSnapshot,
         CatalogCommand::Remove {
             source_id,
@@ -1884,6 +1985,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         | AdmissionAction::RequestTagFilter
         | AdmissionAction::RequestDisplayLabels
         | AdmissionAction::ApplyCuration
+        | AdmissionAction::ApplyRatingDecay
         | AdmissionAction::ReadSnapshot => {}
         AdmissionAction::ApplyCurationOperation {
             source_id,
@@ -2513,6 +2615,31 @@ fn handle_command(
                 root_identity,
                 request_id,
                 batches,
+                profile_guard,
+                reservation,
+                sources,
+            );
+            false
+        }
+        CatalogCommand::ApplyRatingDecay {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            root_identity,
+            request_id,
+            rating_decay_weeks,
+            now_epoch_seconds,
+            after_cursor,
+        } => {
+            rating_decay::execute(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                root_identity,
+                request_id,
+                rating_decay_weeks,
+                now_epoch_seconds,
+                after_cursor,
                 profile_guard,
                 reservation,
                 sources,
@@ -4028,6 +4155,12 @@ fn emit_display_labels_failure(
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
     match error {
         SourceDbError::Canceled => CatalogError::Canceled,
+        SourceDbError::DirectoryTruth(
+            wavecrate_library::sample_sources::db::SourceDirectoryTruthError::StaleRevision {
+                expected,
+                actual,
+            },
+        ) => CatalogError::StaleRevision { expected, actual },
         SourceDbError::DisplayLabelStaleRevision { expected, actual } => {
             CatalogError::StaleRevision { expected, actual }
         }
@@ -4250,6 +4383,284 @@ mod tests {
             )
         }) {
             CatalogEvent::CurationCommitted { receipt, .. } => receipt,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rating_decay_commits_one_fenced_page_and_preserves_timestamp_remainder() {
+        let fixture = Fixture::new("catalog-rating-decay");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-rating-decay");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative sample path");
+        let seed_timestamp = 100_i64;
+        let seeded = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            800,
+            vec![
+                SourceCurationUpdate::SetRatingAndLastCuratedAt {
+                    path: path.clone(),
+                    rating: wavecrate_library::sample_sources::Rating::KEEP_3,
+                    last_curated_at: seed_timestamp,
+                },
+                SourceCurationUpdate::SetLastPlayedAt {
+                    path,
+                    played_at: Some(7),
+                },
+            ],
+        );
+        let period = 4_i64 * 7 * 24 * 60 * 60;
+        let first_now = seed_timestamp + period;
+        service
+            .submit(CatalogCommand::ApplyRatingDecay {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: seeded.source_revision(),
+                root_identity: seeded.root_identity().clone(),
+                request_id: 801,
+                rating_decay_weeks: 4,
+                now_epoch_seconds: first_now,
+                after_cursor: None,
+            })
+            .expect("rating-decay admission");
+        let first = match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::RatingDecayProgress {
+                    request_id: 801,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::RatingDecayProgress {
+                revision,
+                processed_count,
+                updated_count,
+                next_cursor,
+                receipt,
+                ..
+            } => {
+                assert_eq!(revision, seeded.source_revision() + 1);
+                assert_eq!(processed_count, 1);
+                assert_eq!(updated_count, 1);
+                assert!(next_cursor.is_none());
+                let receipt = receipt.expect("decay receipt");
+                assert_eq!(receipt.files().len(), 1);
+                assert_eq!(receipt.files()[0].rating.val(), 2);
+                assert_eq!(receipt.files()[0].last_curated_at, Some(first_now));
+                assert_eq!(receipt.files()[0].last_played_at, Some(7));
+                receipt
+            }
+            _ => unreachable!(),
+        };
+
+        let second_now = first_now + period + period / 2;
+        service
+            .submit(CatalogCommand::ApplyRatingDecay {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: first.source_revision(),
+                root_identity: first.root_identity().clone(),
+                request_id: 802,
+                rating_decay_weeks: 4,
+                now_epoch_seconds: second_now,
+                after_cursor: None,
+            })
+            .expect("second rating-decay admission");
+        match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::RatingDecayProgress {
+                    request_id: 802,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::RatingDecayProgress {
+                revision,
+                updated_count,
+                receipt,
+                ..
+            } => {
+                assert_eq!(revision, first.source_revision() + 1);
+                assert_eq!(updated_count, 1);
+                let receipt = receipt.expect("second decay receipt");
+                assert_eq!(receipt.files()[0].rating.val(), 1);
+                assert_eq!(receipt.files()[0].last_curated_at, Some(first_now + period));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rating_decay_refuses_stale_revision_and_root_fences() {
+        let fixture = Fixture::new("catalog-rating-decay-fences");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-rating-decay-fences");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative sample path");
+        let seeded = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            810,
+            vec![SourceCurationUpdate::SetRatingAndLastCuratedAt {
+                path,
+                rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                last_curated_at: 100,
+            }],
+        );
+        service
+            .submit(CatalogCommand::ApplyRatingDecay {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 811,
+                rating_decay_weeks: 4,
+                now_epoch_seconds: 100 + 4 * 7 * 24 * 60 * 60,
+                after_cursor: None,
+            })
+            .expect("stale revision admission");
+        match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::RatingDecayFailed {
+                    request_id: 811,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::RatingDecayFailed {
+                error: CatalogError::StaleRevision { expected, actual },
+                ..
+            } => {
+                assert_eq!(expected, snapshot.committed_revision);
+                assert_eq!(actual, seeded.source_revision());
+            }
+            event => panic!("expected stale revision, got {event:?}"),
+        }
+
+        let wrong_root = RootIdentity::from_bytes(vec![0_u8; 16]);
+        service
+            .submit(CatalogCommand::ApplyRatingDecay {
+                source_id,
+                lifecycle_generation: 1,
+                expected_revision: seeded.source_revision(),
+                root_identity: wrong_root,
+                request_id: 812,
+                rating_decay_weeks: 4,
+                now_epoch_seconds: 100 + 4 * 7 * 24 * 60 * 60,
+                after_cursor: None,
+            })
+            .expect("stale root admission");
+        match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::RatingDecayFailed {
+                    request_id: 812,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::RatingDecayFailed {
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            } => {}
+            event => panic!("expected stale root, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn rating_decay_pages_metadata_without_loading_the_whole_source() {
+        let fixture = Fixture::new("catalog-rating-decay-pages");
+        for index in 0..65 {
+            write_test_wav(
+                &fixture.root.path().join(format!("{index:02}.wav")),
+                16_000,
+                1,
+            );
+        }
+        let source_id = SourceId::from_string("source-rating-decay-pages");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        service
+            .submit(CatalogCommand::ApplyRatingDecay {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity.clone(),
+                request_id: 821,
+                rating_decay_weeks: 4,
+                now_epoch_seconds: 100,
+                after_cursor: None,
+            })
+            .expect("first page admission");
+        let first_cursor = match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::RatingDecayProgress {
+                    request_id: 821,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::RatingDecayProgress {
+                processed_count,
+                updated_count,
+                revision,
+                next_cursor,
+                receipt,
+                ..
+            } => {
+                assert_eq!(processed_count, 64);
+                assert_eq!(updated_count, 0);
+                assert_eq!(revision, snapshot.committed_revision);
+                assert!(receipt.is_none());
+                next_cursor.expect("continuation after bounded first page")
+            }
+            _ => unreachable!(),
+        };
+        service
+            .submit(CatalogCommand::ApplyRatingDecay {
+                source_id,
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                root_identity: snapshot.root_identity,
+                request_id: 822,
+                rating_decay_weeks: 4,
+                now_epoch_seconds: 100,
+                after_cursor: Some(first_cursor),
+            })
+            .expect("second page admission");
+        match receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::RatingDecayProgress {
+                    request_id: 822,
+                    ..
+                }
+            )
+        }) {
+            CatalogEvent::RatingDecayProgress {
+                processed_count,
+                updated_count,
+                next_cursor,
+                revision,
+                ..
+            } => {
+                assert_eq!(processed_count, 1);
+                assert_eq!(updated_count, 0);
+                assert!(next_cursor.is_none());
+                assert_eq!(revision, snapshot.committed_revision);
+            }
             _ => unreachable!(),
         }
     }

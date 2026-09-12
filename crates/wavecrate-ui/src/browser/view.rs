@@ -1329,6 +1329,7 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("theme-settings")
+                            .debug_selector(|| String::from("theme-settings"))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1339,6 +1340,12 @@ impl Render for Browser {
                             .border(px(theme.spacing.border_width))
                             .border_color(color(theme.colors.border_emphasis))
                             .text_size(px(theme.typography.small_size))
+                            // Keep the input focused until the click handler records it for
+                            // General Settings' Escape restoration. Without this, GPUI's
+                            // focus-tracked Browser root claims focus for the pointer press.
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.prevent_default();
+                            })
                             .on_click(cx.listener(Self::toggle_theme_settings))
                             .child("⚙"),
                     )
@@ -1367,12 +1374,16 @@ impl Render for Browser {
                     ),
             )
             .when(self.theme_settings_open, |element| {
-                element.child(self.render_theme_settings(theme.clone(), cx))
+                element
+                    .child(self.render_theme_settings(theme.clone(), cx))
+                    .child(self.render_general_settings(theme.clone(), cx))
             })
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
                     .h_full()
                     .min_w_0()
                     .child(super::sidebar::render(
@@ -1872,6 +1883,68 @@ mod tests {
             );
             assert!(
                 view.playmark_timing_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn general_settings_escape_restores_search_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            window.focus(&browser.read(app).search_input.read(app).focus_handle())
+        });
+        cx.refresh().expect("focused search");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            assert!(
+                browser
+                    .read(app)
+                    .search_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
+        let bounds = cx.debug_bounds("theme-settings").expect("settings button");
+        let center = point(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.update(|window, app| {
+            assert!(
+                browser
+                    .read(app)
+                    .search_input
+                    .read(app)
+                    .focus_handle()
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let view = browser.read(app);
+            assert!(view.theme_settings_open);
+            assert!(
+                view.general_settings
+                    .previous_focus
+                    .as_ref()
+                    .is_some_and(|focus| *focus == view.search_input.read(app).focus_handle())
+            );
+            assert!(view.focus_handle.is_focused(window));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let view = browser.read(app);
+            assert!(!view.theme_settings_open);
+            assert!(
+                view.search_input
                     .read(app)
                     .focus_handle()
                     .is_focused(window)

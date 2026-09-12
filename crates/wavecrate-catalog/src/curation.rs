@@ -238,7 +238,9 @@ pub enum CatalogCurationRequestError {
 pub(crate) fn is_durable(command: &CatalogCommand) -> bool {
     matches!(
         command,
-        CatalogCommand::ApplyCuration { .. } | CatalogCommand::ApplyCurationOperation { .. }
+        CatalogCommand::ApplyCuration { .. }
+            | CatalogCommand::ApplyCurationOperation { .. }
+            | CatalogCommand::ApplyRatingDecay { .. }
     )
 }
 
@@ -269,6 +271,11 @@ pub(crate) fn validate_submission(
             validate_operation(*request_id, fence, root_identity, batches, state, source_id)?;
             (source_id, lifecycle_generation)
         }
+        CatalogCommand::ApplyRatingDecay {
+            source_id,
+            lifecycle_generation,
+            ..
+        } => (source_id, lifecycle_generation),
         _ => return Ok(()),
     };
     let Some(desired) = state.sources.get(source_id) else {
@@ -399,7 +406,10 @@ fn validate_updates(updates: &[SourceCurationUpdate]) -> Result<(), CatalogCurat
 
 fn validate_update(update: &SourceCurationUpdate) -> Result<(), CatalogCurationRequestError> {
     match update {
-        SourceCurationUpdate::SetRating { rating, .. } if !(-3..=3).contains(&rating.val()) => {
+        SourceCurationUpdate::SetRating { rating, .. }
+        | SourceCurationUpdate::SetRatingAndLastCuratedAt { rating, .. }
+            if !(-3..=3).contains(&rating.val()) =>
+        {
             Err(CatalogCurationRequestError::InvalidRating {
                 value: rating.val(),
             })
@@ -444,6 +454,7 @@ fn update_path(update: &SourceCurationUpdate) -> &Path {
     match update {
         SourceCurationUpdate::SetLastPlayedAt { path, .. }
         | SourceCurationUpdate::SetRating { path, .. }
+        | SourceCurationUpdate::SetRatingAndLastCuratedAt { path, .. }
         | SourceCurationUpdate::SetLocked { path, .. }
         | SourceCurationUpdate::AddCollection { path, .. }
         | SourceCurationUpdate::RemoveCollection { path, .. }
@@ -792,7 +803,7 @@ fn publish_operation_outcome(
     });
 }
 
-fn execute_inner(
+pub(crate) fn execute_inner(
     source_id: &SourceId,
     lifecycle_generation: u64,
     expected_revision: u64,
@@ -970,7 +981,7 @@ fn patch_cached_snapshot(
     true
 }
 
-fn ensure_generation(
+pub(crate) fn ensure_generation(
     source_id: &SourceId,
     expected: u64,
     received: u64,
@@ -986,7 +997,7 @@ fn ensure_generation(
     }
 }
 
-fn checked_source_root_identity(
+pub(crate) fn checked_source_root_identity(
     source_id: &SourceId,
     root: &std::path::Path,
 ) -> Result<RootIdentity, CatalogError> {

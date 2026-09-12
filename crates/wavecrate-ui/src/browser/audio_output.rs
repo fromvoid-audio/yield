@@ -86,6 +86,8 @@ impl Browser {
         self.audio_output_dropdown = None;
         if self.audio_settings_open {
             self.theme_settings_open = false;
+            self.general_settings.invalidate_picker();
+            self.general_settings.previous_focus.take();
             window.focus(&self.audio_output_focus_handle);
             self.start_audio_output_options_refresh(cx);
         } else {

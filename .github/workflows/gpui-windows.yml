@@ -36,6 +36,13 @@ jobs:
       - name: Provision ASIO SDK
         shell: pwsh
         run: ./scripts/internal/release/setup_windows_asio_sdk.ps1
+      - name: Test profile-owned settings maintenance
+        shell: pwsh
+        run: |
+          cargo test --locked -p wavecrate-library --lib app_dirs::storage_usage --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p wavecrate-session -p wavecrate-catalog --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test audio, core, media and native platform
         run: cargo test --locked -p reson -p wavecrate-core -p wavecrate-media -p wavecrate-platform --lib
       - name: Compile GPUI application and browser tests
