@@ -531,6 +531,11 @@ impl Render for Browser {
         let show_last_played = column_visibility.last_played;
         let toolbar_hover = theme.interaction.hover_fill;
         let toolbar_pressed = theme.interaction.pressed_fill;
+        let toolbar_gap = if f32::from(window.bounds().size.width) < 1_120.0 {
+            theme.spacing.control_gap.min(4.0)
+        } else {
+            theme.spacing.control_gap
+        };
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
         let bpm_snap_enabled = self.bpm_snap_enabled;
@@ -984,7 +989,7 @@ impl Render for Browser {
                     .flex_none()
                     .items_center()
                     .h(px(theme.spacing.toolbar_height))
-                    .gap(px(theme.spacing.control_gap))
+                    .gap(px(toolbar_gap))
                     .px(px(theme.spacing.panel_padding))
                     .bg(color(theme.colors.surface_raised))
                     .border_b(px(theme.spacing.border_width))
@@ -1224,8 +1229,9 @@ impl Render for Browser {
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .min_w(px(80.0))
                             .w(px(220.0))
+                            .overflow_hidden()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(Self::invalidate_file_handoff_from_search_mouse),
@@ -1235,6 +1241,7 @@ impl Render for Browser {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()

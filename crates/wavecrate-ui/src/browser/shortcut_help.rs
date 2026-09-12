@@ -412,7 +412,8 @@ const SECTIONS: &[ShortcutSection] = &[
 fn render_row(row: ShortcutRow, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
-        .items_center()
+        .flex_none()
+        .items_start()
         .w_full()
         .min_h(px(theme.spacing.row_height))
         .gap(px(theme.spacing.control_gap))
@@ -426,6 +427,8 @@ fn render_row(row: ShortcutRow, theme: &Theme) -> impl IntoElement {
         .child(
             div()
                 .flex_1()
+                .min_w_0()
+                .whitespace_normal()
                 .text_color(color(theme.colors.text_primary))
                 .child(row.description),
         )

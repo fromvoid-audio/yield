@@ -69,7 +69,7 @@ fn pending_source_row(
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .pl(px(theme.spacing.row_padding_x))
-                .text_size(px(theme.typography.small_size))
+                .text_size(px(theme.typography.body_size))
                 .text_color(color(theme.colors.warning))
                 .child(label),
         )
@@ -113,7 +113,7 @@ pub(super) fn render(
                 .h(px(52.0))
                 .items_center()
                 .justify_center()
-                .text_size(px(theme.typography.small_size))
+                .text_size(px(theme.typography.body_size))
                 .text_color(color(theme.colors.text_muted))
                 .child("No sources")
         }
@@ -206,7 +206,7 @@ pub(super) fn render(
                                                         .whitespace_nowrap()
                                                         .text_ellipsis()
                                                         .pl(px(list_theme.spacing.row_padding_x))
-                                                        .text_size(px(list_theme.typography.small_size))
+                                                        .text_size(px(list_theme.typography.body_size))
                                                         .text_color(if selected {
                                                             color(list_theme.colors.text_primary)
                                                         } else {
@@ -302,7 +302,7 @@ pub(super) fn render(
             .flex_1()
             .items_center()
             .justify_center()
-            .text_size(px(theme.typography.small_size))
+            .text_size(px(theme.typography.body_size))
             .text_color(color(theme.colors.text_muted))
             .child(if browser.pending_source_label.is_some() {
                 "Scanning source…"
@@ -430,7 +430,7 @@ pub(super) fn render(
                                                 .overflow_hidden()
                                                 .whitespace_nowrap()
                                                 .text_ellipsis()
-                                                .text_size(px(list_theme.typography.small_size))
+                                                .text_size(px(list_theme.typography.body_size))
                                                 .text_color(if selected {
                                                     color(list_theme.colors.accent)
                                                 } else if row.contains_audio {
@@ -482,6 +482,9 @@ pub(super) fn render(
             ))
     };
 
+    let folder_list = folder_list
+        .min_h(px(theme.spacing.row_height * 4.0))
+        .debug_selector(|| String::from("sidebar-folder-list"));
     let scope_label = format!("Scope: {}", browser.folder_scope.label());
     let active_label = browser
         .active_source_label()
@@ -489,10 +492,105 @@ pub(super) fn render(
     let active_error = browser
         .active_source_error()
         .map(|error| format!("Error: {error}"));
+    let bottom_controls =
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .debug_selector(|| String::from("sidebar-bottom-controls"))
+            .p(px(theme.spacing.panel_padding))
+            .gap(px(theme.spacing.control_gap))
+            .child(
+                div()
+                    .flex()
+                    .w_full()
+                    .gap(px(theme.spacing.control_gap))
+                    .child(
+                        div()
+                            .id("folder-scope")
+                            .debug_selector(|| String::from("folder-scope"))
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .justify_center()
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .text_size(px(theme.typography.small_size))
+                            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                                view.toggle_folder_scope(cx)
+                            }))
+                            .child(scope_label),
+                    )
+                    .child(
+                        div()
+                            .id("refresh-source")
+                            .debug_selector(|| String::from("refresh-source"))
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .justify_center()
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .text_size(px(theme.typography.small_size))
+                            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                                view.refresh_active_source(cx)
+                            }))
+                            .child("Refresh"),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(theme.typography.small_size))
+                    .text_color(color(
+                        browser
+                            .active_source_error()
+                            .map(|_| theme.colors.danger)
+                            .unwrap_or(theme.colors.text_muted),
+                    ))
+                    .child(browser.active_folder_label()),
+            );
+    let auxiliary = div()
+        .flex()
+        .flex_col()
+        .min_h_0()
+        .w_full()
+        .debug_selector(|| String::from("sidebar-auxiliary"))
+        .id("sidebar-auxiliary")
+        .overflow_y_scroll()
+        .child(curation::render_collection_filters(
+            browser,
+            theme.clone(),
+            cx,
+        ))
+        .child(curation::render_playback_type_filters(
+            browser,
+            theme.clone(),
+            cx,
+        ))
+        .child(curation::render_rating_filters(browser, theme.clone(), cx))
+        .child(tag_filter::render(browser, theme.clone(), cx))
+        .child(tags::render(browser, theme.clone(), cx))
+        .child(tag_completion::render(browser, theme.clone(), cx))
+        .child(tag_chips::render(browser, theme.clone(), cx))
+        .child(bottom_controls);
     div()
         .flex()
         .flex_col()
         .flex_none()
+        .min_h_0()
         .w(px(theme.spacing.sidebar_width))
         .h_full()
         .bg(color(theme.colors.surface_raised))
@@ -503,9 +601,8 @@ pub(super) fn render(
                 .flex()
                 .flex_none()
                 .items_center()
-                .h(px(
-                    theme.spacing.row_height + theme.spacing.panel_padding * 2.0
-                ))
+                .h(px(theme.spacing.control_height))
+                .debug_selector(|| String::from("sidebar-source-header"))
                 .px(px(theme.spacing.panel_padding))
                 .bg(color(theme.colors.surface_overlay))
                 .border_b(px(theme.spacing.border_width))
@@ -554,73 +651,95 @@ pub(super) fn render(
             )
         })
         .child(folder_list)
-        .child(curation::render_collection_filters(
-            browser,
-            theme.clone(),
-            cx,
-        ))
-        .child(curation::render_playback_type_filters(
-            browser,
-            theme.clone(),
-            cx,
-        ))
-        .child(curation::render_rating_filters(browser, theme.clone(), cx))
-        .child(tag_filter::render(browser, theme.clone(), cx))
-        .child(tags::render(browser, theme.clone(), cx))
-        .child(tag_completion::render(browser, theme.clone(), cx))
-        .child(tag_chips::render(browser, theme.clone(), cx))
-        .child(
-            div()
-                .flex_none()
-                .p(px(theme.spacing.panel_padding))
-                .gap(px(theme.spacing.control_gap))
-                .child(
-                    div()
-                        .id("folder-scope")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(theme.spacing.control_height))
-                        .cursor_pointer()
-                        .bg(color(theme.colors.surface_overlay))
-                        .border(px(theme.spacing.border_width))
-                        .border_color(color(theme.colors.border_emphasis))
-                        .text_size(px(theme.typography.small_size))
-                        .on_click(
-                            cx.listener(|view, _: &ClickEvent, _, cx| view.toggle_folder_scope(cx)),
-                        )
-                        .child(scope_label),
-                )
-                .child(
-                    div()
-                        .id("refresh-source")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(theme.spacing.control_height))
-                        .cursor_pointer()
-                        .bg(color(theme.colors.surface_overlay))
-                        .border(px(theme.spacing.border_width))
-                        .border_color(color(theme.colors.border_emphasis))
-                        .text_size(px(theme.typography.small_size))
-                        .on_click(
-                            cx.listener(|view, _: &ClickEvent, _, cx| {
-                                view.refresh_active_source(cx)
-                            }),
-                        )
-                        .child("Refresh"),
-                )
-                .child(
-                    div()
-                        .text_size(px(theme.typography.small_size))
-                        .text_color(color(
-                            browser
-                                .active_source_error()
-                                .map(|_| theme.colors.danger)
-                                .unwrap_or(theme.colors.text_muted),
-                        ))
-                        .child(browser.active_folder_label()),
-                ),
-        )
+        .child(auxiliary)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Browser;
+    use gpui::{
+        AvailableSpace, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        VisualTestContext, point, px, size,
+    };
+    use wavecrate_core::FolderTreeRow;
+
+    fn draw_sidebar(browser: &gpui::Entity<Browser>, cx: &mut VisualTestContext) {
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(
+                AvailableSpace::Definite(px(960.0)),
+                AvailableSpace::Definite(px(560.0)),
+            ),
+            |_, _| browser.clone(),
+        );
+    }
+
+    #[gpui::test]
+    fn compact_sidebar_keeps_folder_space_and_scrolls_auxiliary_controls(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, _| assert_eq!(window.scale_factor(), 2.0));
+        cx.simulate_resize(size(px(960.0), px(560.0)));
+        browser.update(cx, |view, _| {
+            view.folder_rows_cache = vec![FolderTreeRow {
+                path: std::path::PathBuf::from("."),
+                depth: 0,
+                has_children: false,
+                expanded: true,
+                contains_audio: true,
+                audio_file_count: 1,
+            }];
+        });
+
+        draw_sidebar(&browser, cx);
+        let theme = cx.update(|_, app| crate::theme::active(app).clone());
+        let source_header = cx
+            .debug_bounds("sidebar-source-header")
+            .expect("source header bounds");
+        let folder_list = cx
+            .debug_bounds("sidebar-folder-list")
+            .expect("folder list bounds");
+        let auxiliary = cx
+            .debug_bounds("sidebar-auxiliary")
+            .expect("auxiliary bounds");
+        let scope_before = cx
+            .debug_bounds("folder-scope")
+            .expect("scope bounds before scrolling");
+        let refresh_before = cx
+            .debug_bounds("refresh-source")
+            .expect("refresh bounds before scrolling");
+
+        assert_eq!(source_header.size.height, px(theme.spacing.control_height));
+        assert!(folder_list.size.height >= px(theme.spacing.row_height * 4.0));
+        assert!(scope_before.top() >= auxiliary.top());
+        assert!(refresh_before.top() >= auxiliary.top());
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(auxiliary.origin.x + px(8.0), auxiliary.origin.y + px(8.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-400.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        draw_sidebar(&browser, cx);
+
+        let scope_after = cx
+            .debug_bounds("folder-scope")
+            .expect("scope bounds after scrolling");
+        let refresh_after = cx
+            .debug_bounds("refresh-source")
+            .expect("refresh bounds after scrolling");
+        assert!(
+            scope_after.top() < scope_before.top(),
+            "scope did not scroll: {scope_before:?} -> {scope_after:?}; auxiliary {auxiliary:?}"
+        );
+        assert!(
+            refresh_after.top() < refresh_before.top(),
+            "refresh did not scroll: {refresh_before:?} -> {refresh_after:?}; auxiliary {auxiliary:?}"
+        );
+        assert!(scope_after.bottom() <= auxiliary.bottom());
+        assert!(refresh_after.bottom() <= auxiliary.bottom());
+        assert!(scope_after.top() >= auxiliary.top());
+        assert!(refresh_after.top() >= auxiliary.top());
+    }
 }

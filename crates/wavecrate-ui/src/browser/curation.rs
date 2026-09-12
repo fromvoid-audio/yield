@@ -30,6 +30,62 @@ use crate::theme::{color, transparent};
 
 use super::{Browser, catalog, tag_chips, tag_filter};
 
+const COMPACT_FILTER_LABEL_WIDTH: f32 = 82.0;
+
+fn compact_filter_chip_width(theme: &Theme, count: usize) -> f32 {
+    let count = count.max(1) as f32;
+    let available = theme.spacing.sidebar_width
+        - theme.spacing.panel_padding * 2.0
+        - COMPACT_FILTER_LABEL_WIDTH
+        - theme.spacing.control_gap * count;
+    (available / count).max(theme.spacing.border_width)
+}
+
+fn compact_filter_row<E>(theme: &Theme, label: &'static str, controls: Vec<E>) -> gpui::Div
+where
+    E: gpui::IntoElement,
+{
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .pb(px(theme.spacing.control_gap))
+        .border_t(px(theme.spacing.border_width))
+        .border_color(color(theme.colors.border))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .w_full()
+                .h(px(theme.spacing.row_height))
+                .items_center()
+                .px(px(theme.spacing.panel_padding))
+                .gap(px(theme.spacing.control_gap))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .w(px(COMPACT_FILTER_LABEL_WIDTH))
+                        .h_full()
+                        .items_center()
+                        .text_size(px(theme.typography.small_size))
+                        .text_color(color(theme.colors.accent))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .items_center()
+                        .gap(px(theme.spacing.control_gap))
+                        .children(controls),
+                ),
+        )
+}
+
 /// The source lifecycle identity retained by curation state.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct CurationLifecycleKey {
@@ -1216,11 +1272,7 @@ pub(super) fn render_playback_type_filters(
     let active_filter = browser.view_model.playback_type_filter();
     let hover_fill = color(theme.colors.selection_hover_fill);
     let pressed_fill = color(theme.interaction.pressed_fill);
-    let chip_width = ((theme.spacing.sidebar_width
-        - theme.spacing.panel_padding * 2.0
-        - theme.spacing.control_gap * (PLAYBACK_TYPE_FILTERS.len().saturating_sub(1) as f32))
-        / PLAYBACK_TYPE_FILTERS.len() as f32)
-        .max(18.0);
+    let chip_width = compact_filter_chip_width(&theme, PLAYBACK_TYPE_FILTERS.len());
     let chips = PLAYBACK_TYPE_FILTERS
         .into_iter()
         .enumerate()
@@ -1262,34 +1314,7 @@ pub(super) fn render_playback_type_filters(
                 )
         })
         .collect::<Vec<_>>();
-    div()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .w_full()
-        .pb(px(theme.spacing.control_gap))
-        .border_t(px(theme.spacing.border_width))
-        .border_color(color(theme.colors.border))
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .h(px(theme.spacing.row_height))
-                .px(px(theme.spacing.panel_padding))
-                .text_size(px(theme.typography.small_size))
-                .text_color(color(theme.colors.text_muted))
-                .child("TYPE"),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .w_full()
-                .px(px(theme.spacing.panel_padding))
-                .gap(px(theme.spacing.control_gap))
-                .children(chips),
-        )
+    compact_filter_row(&theme, "TYPE", chips)
 }
 
 fn playback_type_filter_label(playback_type: PlaybackType) -> &'static str {
@@ -1309,18 +1334,13 @@ pub(super) fn render_rating_filters(
     let active_filter = browser.view_model.rating_filter();
     let hover_fill = color(theme.colors.selection_hover_fill);
     let pressed_fill = color(theme.interaction.pressed_fill);
-    let chip_width = ((theme.spacing.sidebar_width
-        - theme.spacing.panel_padding * 2.0
-        - theme.spacing.control_gap * (RATING_FILTER_LEVELS.len().saturating_sub(1) as f32))
-        / RATING_FILTER_LEVELS.len() as f32)
-        .max(18.0);
+    let chip_width = compact_filter_chip_width(&theme, RATING_FILTER_LEVELS.len());
     let chips = RATING_FILTER_LEVELS
         .into_iter()
         .enumerate()
         .map(|(index, level)| {
             let selected = active_filter.contains_level(level);
             let marker_color = color(rating_filter_color(level, &theme));
-            let label = rating_filter_label(level);
             div()
                 .id(("rating-filter", index))
                 .flex()
@@ -1345,68 +1365,10 @@ pub(super) fn render_rating_filters(
                         view.toggle_rating_filter(level, cx);
                     }
                 }))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(5.0))
-                        .h(px(5.0))
-                        .rounded_full()
-                        .bg(marker_color),
-                )
-                .child(
-                    div()
-                        .text_size(px(theme.typography.small_size))
-                        .text_color(if selected {
-                            color(theme.colors.text_primary)
-                        } else {
-                            color(theme.colors.text_muted)
-                        })
-                        .child(label),
-                )
+                .child(div().flex_none().w(px(10.0)).h(px(10.0)).bg(marker_color))
         })
         .collect::<Vec<_>>();
-    div()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .w_full()
-        .pb(px(theme.spacing.control_gap))
-        .border_t(px(theme.spacing.border_width))
-        .border_color(color(theme.colors.border))
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .h(px(theme.spacing.row_height))
-                .px(px(theme.spacing.panel_padding))
-                .text_size(px(theme.typography.small_size))
-                .text_color(color(theme.colors.text_muted))
-                .child("RATING"),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .w_full()
-                .px(px(theme.spacing.panel_padding))
-                .gap(px(theme.spacing.control_gap))
-                .children(chips),
-        )
-}
-
-fn rating_filter_label(level: i8) -> &'static str {
-    match level {
-        -3 => "T3",
-        -2 => "T2",
-        -1 => "T1",
-        0 => "U",
-        1 => "K1",
-        2 => "K2",
-        3 => "K3",
-        4 => "K4",
-        _ => "?",
-    }
+    compact_filter_row(&theme, "RATING", chips)
 }
 
 fn rating_filter_color(level: i8, theme: &Theme) -> wavecrate_design::Color {
