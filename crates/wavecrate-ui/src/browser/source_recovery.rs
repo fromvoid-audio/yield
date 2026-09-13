@@ -420,12 +420,19 @@ fn audit_failure(browser: &mut Browser, error: &CatalogError) {
         activation.audit_finished = true;
         activation.audit_error = Some(error.to_string());
     }
-    if let Some(intent) = browser.source_recovery.intent.as_mut() {
-        intent.phase = RecoveryPhase::WaitingRetry {
-            due: Instant::now() + OPERATION_RETRY,
-        };
+    if audit_failure_is_retryable(error) {
+        if let Some(intent) = browser.source_recovery.intent.as_mut() {
+            intent.phase = RecoveryPhase::WaitingRetry {
+                due: Instant::now() + OPERATION_RETRY,
+            };
+        }
+        set_scan_status(browser, format!("Catalog audit failed; retrying: {error}"));
+    } else {
+        // Identity and database-integrity uncertainty require an explicit audit or operator
+        // action. Dropping the recovery intent prevents an automatic retry loop or root reopen.
+        browser.source_recovery.intent = None;
+        set_scan_status(browser, format!("Catalog audit paused; {error}"));
     }
-    set_scan_status(browser, format!("Catalog audit failed; retrying: {error}"));
 }
 
 fn start_probe(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
@@ -732,7 +739,21 @@ fn set_scan_status(browser: &mut Browser, message: String) -> bool {
 fn is_root_failure(error: &CatalogError) -> bool {
     matches!(
         error,
-        CatalogError::StaleRootGeneration { .. } | CatalogError::InvalidRoot(_)
+        CatalogError::StaleRootGeneration { .. }
+            | CatalogError::InvalidRoot(_)
+            | CatalogError::SourceUnavailable(_)
+    )
+}
+
+fn audit_failure_is_retryable(error: &CatalogError) -> bool {
+    !matches!(
+        error,
+        CatalogError::ProfileUnavailable(_)
+            | CatalogError::SourceUnavailable(_)
+            | CatalogError::SourceIdentityUncertain(_)
+            | CatalogError::DatabaseIntegrityUncertain(_)
+            | CatalogError::StaleRootGeneration { .. }
+            | CatalogError::InvalidRoot(_)
     )
 }
 
@@ -879,14 +900,16 @@ use super::catalog::CatalogCommandIntent;
 mod tests {
     use super::{
         ProbeDecision, RecoveryAction, RecoveryIntent, RecoveryPhase, SourceRecoveryState,
-        audit_identity_allows_completion, classify_probe_result, coalesce_manual_refresh,
-        probe_context_matches, recovery_action_for, retire_after_audit, status_changed,
+        audit_failure_is_retryable, audit_identity_allows_completion, classify_probe_result,
+        coalesce_manual_refresh, is_root_failure, probe_context_matches, recovery_action_for,
+        retire_after_audit, status_changed,
     };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use wavecrate_library::sample_sources::{SourceId, reconciliation::RootIdentity};
+    use wavecrate_session::CatalogError;
     use wavecrate_session::resolve_source_root;
 
     #[test]
@@ -1144,5 +1167,35 @@ mod tests {
             recovery_action_for(ProbeDecision::Missing, false),
             RecoveryAction::Retry
         );
+    }
+
+    #[test]
+    fn root_recovery_and_audit_retry_policy_distinguish_uncertainty() {
+        assert!(is_root_failure(&CatalogError::SourceUnavailable(
+            String::from("offline",)
+        )));
+        assert!(is_root_failure(&CatalogError::StaleRootGeneration {
+            source_id: SourceId::from_string("source"),
+            detail: String::from("changed"),
+        }));
+        assert!(!is_root_failure(&CatalogError::SourceIdentityUncertain(
+            String::from("unknown"),
+        )));
+        assert!(!is_root_failure(&CatalogError::DatabaseIntegrityUncertain(
+            String::from("malformed"),
+        )));
+        assert!(!audit_failure_is_retryable(
+            &CatalogError::SourceIdentityUncertain(String::from("unknown"),)
+        ));
+        assert!(!audit_failure_is_retryable(
+            &CatalogError::DatabaseIntegrityUncertain(String::from("malformed"))
+        ));
+        assert!(audit_failure_is_retryable(
+            &CatalogError::SourceWriterConflict(String::from("locked"),)
+        ));
+        assert!(audit_failure_is_retryable(&CatalogError::Busy));
+        assert!(audit_failure_is_retryable(&CatalogError::Audit(
+            String::from("transient scan failure",)
+        )));
     }
 }

@@ -34,13 +34,16 @@ pub(crate) fn read_patch(
     profile_guard: &WritableProfileGuard,
 ) -> Result<WavMetadataPatch, CatalogError> {
     ensure_current(admission, source_id, lifecycle_generation, token)?;
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
 
     let snapshot = source
         .snapshot
@@ -75,7 +78,7 @@ pub(crate) fn read_patch(
     let before_revision = source
         .database
         .get_revision()
-        .map_err(super::catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if before_revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,
@@ -97,7 +100,7 @@ pub(crate) fn read_patch(
     let (subset_revision, manifest) = source
         .database
         .manifest_snapshot_with_revision_for_exact_paths(&exact_paths)
-        .map_err(super::catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if subset_revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,
@@ -120,13 +123,16 @@ pub(crate) fn read_patch(
     .map_err(|error| super::scan_wav_metadata_error(source_id, error))?;
 
     ensure_current(admission, source_id, lifecycle_generation, token)?;
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     let after_root_identity = checked_source_root_identity(source_id, &source.root)?;
     if after_root_identity != expected_root_identity {
         return Err(CatalogError::StaleRootGeneration {
@@ -137,7 +143,7 @@ pub(crate) fn read_patch(
     let after_revision = source
         .database
         .get_revision()
-        .map_err(super::catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if after_revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,

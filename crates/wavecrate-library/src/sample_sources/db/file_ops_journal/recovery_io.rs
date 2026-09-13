@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -473,9 +474,11 @@ impl RecoveryRoot {
     pub(super) fn bind_database_root(&self) -> Result<BoundDatabaseRoot, String> {
         #[cfg(windows)]
         {
-            let capability = windows_database_root_binding(&self.path, &self.identity)?;
-            let path = windows_final_path(&capability)?;
-            validate_database_root_alias(&capability, &path, &self.identity)?;
+            let capability = windows_database_root_binding(&self.path, &self.identity)
+                .map_err(|error| error.to_string())?;
+            let path = windows_final_path(&capability).map_err(|error| error.to_string())?;
+            validate_database_root_alias(&capability, &path, &self.identity)
+                .map_err(|error| error.to_string())?;
             return Ok(BoundDatabaseRoot {
                 path,
                 _capability: capability,
@@ -492,7 +495,8 @@ impl RecoveryRoot {
             let capability = self.capability.try_clone().map_err(|error| {
                 format!("failed to retain source-root capability for database recovery: {error}")
             })?;
-            let path = database_root_alias(&capability, &self.path, &self.identity)?;
+            let path = database_root_alias(&capability, &self.path, &self.identity)
+                .map_err(|error| error.to_string())?;
             Ok(BoundDatabaseRoot {
                 path,
                 _capability: capability,
@@ -551,7 +555,42 @@ pub(crate) struct BoundDatabaseRoot {
 #[derive(Clone, Copy)]
 enum BoundDatabaseRootNamespace {
     Profile,
+    ProfileChild,
     ExternalSource,
+}
+
+/// Failure while deriving or validating the descriptor-bound namespace used by a database.
+///
+/// This stays private to the binding layer so callers can distinguish a missing namespace,
+/// an uninspectable identity, and a confirmed replacement without turning path-derived strings
+/// into ownership decisions.
+#[derive(Debug)]
+enum BoundDatabaseRootError {
+    Unavailable { path: PathBuf, reason: String },
+    IdentityUnavailable { path: PathBuf, reason: String },
+    Replaced { path: PathBuf },
+}
+
+impl fmt::Display for BoundDatabaseRootError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable { path, reason } => write!(
+                formatter,
+                "source database root binding namespace is unavailable at {}: {reason}",
+                path.display()
+            ),
+            Self::IdentityUnavailable { path, reason } => write!(
+                formatter,
+                "source database root binding namespace identity is uncertain at {}: {reason}",
+                path.display()
+            ),
+            Self::Replaced { path } => write!(
+                formatter,
+                "source database root binding namespace was replaced (identity mismatch): {}",
+                path.display()
+            ),
+        }
+    }
 }
 
 impl BoundDatabaseRoot {
@@ -639,22 +678,22 @@ impl BoundDatabaseRoot {
         #[cfg(windows)]
         let capability =
             windows_database_root_binding(profile_guard.profile_root(), expected_identity)
-                .map_err(|error| profile_binding_error(profile_guard, error))?;
+                .map_err(|error| profile_binding_error(profile_guard, error.to_string()))?;
 
         #[cfg(not(windows))]
         let capability = profile_guard.profile_root_dir()?.into_std_file();
 
         #[cfg(windows)]
         let path = windows_final_path(&capability)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| profile_binding_error(profile_guard, error.to_string()))?;
 
         #[cfg(not(windows))]
         let path =
             database_root_alias(&capability, profile_guard.profile_root(), expected_identity)
-                .map_err(|error| profile_binding_error(profile_guard, error))?;
+                .map_err(|error| profile_binding_error(profile_guard, error.to_string()))?;
 
         validate_database_root_alias(&capability, &path, expected_identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| profile_binding_error(profile_guard, error.to_string()))?;
         Ok(Self {
             path,
             _capability: capability,
@@ -670,22 +709,27 @@ impl BoundDatabaseRoot {
         profile_guard: &WritableProfileGuard,
         child: &Path,
     ) -> Result<Self, ProfileOwnershipError> {
-        let (child_dir, lease) = profile_guard.open_child_dir_with_lease(child)?;
+        let child_path = profile_guard.profile_root().join(child);
+        let (child_dir, lease) = profile_guard
+            .open_child_dir_with_lease(child)
+            .map_err(|error| map_profile_child_open_error(&child_path, error))?;
         let child_identity_capability = child_dir
             .try_clone()
-            .map_err(|source| {
-                profile_binding_error(
-                    profile_guard,
-                    format!("failed to retain profile database child capability: {source}"),
-                )
-            })?
+            .map_err(
+                |source| ProfileOwnershipError::ProfileChildDatabaseRootUnavailable {
+                    path: child_path.clone(),
+                    reason: format!("failed to retain profile database child capability: {source}"),
+                },
+            )?
             .into_std_file();
         let child_identity =
             root_identity_from_open_file(&child_identity_capability).map_err(|source| {
-                profile_binding_error(
-                    profile_guard,
-                    format!("failed to inspect profile database child capability: {source}"),
-                )
+                ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+                    path: child_path.clone(),
+                    reason: format!(
+                        "failed to inspect profile database child capability: {source}"
+                    ),
+                }
             })?;
 
         #[cfg(windows)]
@@ -693,42 +737,44 @@ impl BoundDatabaseRoot {
             &profile_guard.profile_root().join(child),
             &child_identity,
         )
-        .map_err(|error| profile_binding_error(profile_guard, error))?;
+        .map_err(|error| map_profile_child_binding_error(&child_path, error))?;
 
         #[cfg(not(windows))]
         let capability = child_dir.into_std_file();
 
         let identity = root_identity_from_open_file(&capability).map_err(|source| {
-            profile_binding_error(
-                profile_guard,
-                format!("failed to inspect profile database child capability: {source}"),
-            )
+            ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+                path: child_path.clone(),
+                reason: format!("failed to inspect profile database child capability: {source}"),
+            }
         })?;
         if identity != child_identity {
-            return Err(profile_binding_error(
-                profile_guard,
-                "profile database child identity changed while opening its retained capability"
-                    .to_string(),
-            ));
+            return Err(ProfileOwnershipError::ProfileChildDatabaseRootReplaced {
+                path: child_path.clone(),
+            });
         }
 
         #[cfg(windows)]
-        let path = windows_final_path(&capability)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+        let path = windows_final_path(&capability).map_err(|reason| {
+            ProfileOwnershipError::ProfileChildDatabaseRootUnavailable {
+                path: child_path.clone(),
+                reason: reason.to_string(),
+            }
+        })?;
 
         #[cfg(not(windows))]
         let path = database_root_alias(&capability, profile_guard.profile_root(), &identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| map_profile_child_binding_error(&child_path, error))?;
 
         validate_database_root_alias(&capability, &path, &identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| map_profile_child_binding_error(&child_path, error))?;
         Ok(Self {
             path,
             _capability: capability,
             identity,
             profile_identity: profile_guard.profile_root_identity().to_owned(),
             named_path: Some(profile_guard.profile_root().join(child)),
-            namespace_kind: BoundDatabaseRootNamespace::Profile,
+            namespace_kind: BoundDatabaseRootNamespace::ProfileChild,
             _lease: Some(lease),
         })
     }
@@ -744,38 +790,38 @@ impl BoundDatabaseRoot {
     ) -> Result<Self, ProfileOwnershipError> {
         profile_guard.validate_current()?;
         let capability = open_root_nofollow(source_root).map_err(|source| {
-            profile_binding_error(
-                profile_guard,
-                format!(
-                    "failed to open external source root {} without following symlinks: {source}",
-                    source_root.display()
+            ProfileOwnershipError::ExternalSourceRootUnavailable {
+                path: source_root.to_path_buf(),
+                reason: format!(
+                    "failed to open external source root without following symlinks: {source}"
                 ),
-            )
+            }
         })?;
         let identity = root_identity_from_open_file(&capability).map_err(|source| {
-            profile_binding_error(
-                profile_guard,
-                format!(
-                    "failed to inspect external source root {}: {source}",
-                    source_root.display()
-                ),
-            )
+            ProfileOwnershipError::ExternalSourceRootIdentityUnavailable {
+                path: source_root.to_path_buf(),
+                reason: format!("failed to inspect external source root: {source}"),
+            }
         })?;
 
         #[cfg(windows)]
         let capability = windows_database_root_binding(source_root, &identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| map_external_source_binding_error(source_root, error))?;
 
         #[cfg(windows)]
-        let path = windows_final_path(&capability)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+        let path = windows_final_path(&capability).map_err(|reason| {
+            ProfileOwnershipError::ExternalSourceRootUnavailable {
+                path: source_root.to_path_buf(),
+                reason: reason.to_string(),
+            }
+        })?;
 
         #[cfg(not(windows))]
         let path = database_root_alias(&capability, source_root, &identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| map_external_source_binding_error(source_root, error))?;
 
         validate_database_root_alias(&capability, &path, &identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+            .map_err(|error| map_external_source_binding_error(source_root, error))?;
         Ok(Self {
             path,
             _capability: capability,
@@ -796,7 +842,10 @@ impl BoundDatabaseRoot {
     /// External source roots intentionally cannot be retargeted through a catalog handoff: their
     /// physical-source ownership must be reacquired through the ordinary external-source path.
     pub(crate) fn is_profile_namespace(&self) -> bool {
-        matches!(self.namespace_kind, BoundDatabaseRootNamespace::Profile)
+        matches!(
+            self.namespace_kind,
+            BoundDatabaseRootNamespace::Profile | BoundDatabaseRootNamespace::ProfileChild
+        )
     }
 
     pub(crate) fn validate_profile_guard(
@@ -806,27 +855,35 @@ impl BoundDatabaseRoot {
         profile_guard.validate_current()?;
         if let Some(named_path) = &self.named_path {
             let named_capability = open_root_nofollow(named_path).map_err(|error| {
-                profile_binding_error(
-                    profile_guard,
+                map_namespace_unavailable(
+                    self.namespace_kind,
+                    named_path,
                     format!(
-                        "failed to revalidate retained database root {} without following symlinks: {error}",
-                        named_path.display()
+                        "failed to revalidate retained database root without following symlinks: {error}"
                     ),
+                    profile_guard,
                 )
             })?;
-            let named_identity = root_identity_from_open_file(&named_capability).map_err(|error| {
-                profile_binding_error(
-                    profile_guard,
-                    format!(
-                        "failed to inspect retained database root {} during revalidation: {error}",
-                        named_path.display()
-                    ),
-                )
-            })?;
+            let named_identity =
+                root_identity_from_open_file(&named_capability).map_err(|error| {
+                    map_namespace_identity_unavailable(
+                        self.namespace_kind,
+                        named_path,
+                        format!(
+                            "failed to inspect retained database root during revalidation: {error}"
+                        ),
+                        profile_guard,
+                    )
+                })?;
             if named_identity != self.identity {
                 return Err(match self.namespace_kind {
                     BoundDatabaseRootNamespace::Profile => {
                         ProfileOwnershipError::ProfileRootReplaced {
+                            path: named_path.clone(),
+                        }
+                    }
+                    BoundDatabaseRootNamespace::ProfileChild => {
+                        ProfileOwnershipError::ProfileChildDatabaseRootReplaced {
                             path: named_path.clone(),
                         }
                     }
@@ -838,8 +895,17 @@ impl BoundDatabaseRoot {
                 });
             }
         }
-        validate_database_root_alias(&self._capability, &self.path, &self.identity)
-            .map_err(|error| profile_binding_error(profile_guard, error))?;
+        let namespace_path = self.named_path.as_deref().unwrap_or(&self.path);
+        validate_database_root_alias(&self._capability, &self.path, &self.identity).map_err(
+            |error| {
+                map_namespace_binding_error(
+                    self.namespace_kind,
+                    namespace_path,
+                    error,
+                    profile_guard,
+                )
+            },
+        )?;
         if self.profile_identity != profile_guard.profile_root_identity() {
             return Err(ProfileOwnershipError::ProfileRootReplaced {
                 path: profile_guard.profile_root().to_path_buf(),
@@ -868,12 +934,145 @@ fn profile_binding_error(
     }
 }
 
+fn map_profile_child_open_error(
+    path: &Path,
+    error: ProfileOwnershipError,
+) -> ProfileOwnershipError {
+    match error {
+        error @ (ProfileOwnershipError::Io { .. }
+        | ProfileOwnershipError::NotRegularFile { .. }) => {
+            ProfileOwnershipError::ProfileChildDatabaseRootUnavailable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }
+        }
+        error @ ProfileOwnershipError::IdentityUnavailable { .. } => {
+            ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }
+        }
+        other => other,
+    }
+}
+
+fn map_profile_child_binding_error(
+    path: &Path,
+    error: BoundDatabaseRootError,
+) -> ProfileOwnershipError {
+    match error {
+        BoundDatabaseRootError::Unavailable { reason, .. } => {
+            ProfileOwnershipError::ProfileChildDatabaseRootUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+        BoundDatabaseRootError::IdentityUnavailable { reason, .. } => {
+            ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+        BoundDatabaseRootError::Replaced { .. } => {
+            ProfileOwnershipError::ProfileChildDatabaseRootReplaced {
+                path: path.to_path_buf(),
+            }
+        }
+    }
+}
+
+fn map_external_source_binding_error(
+    path: &Path,
+    error: BoundDatabaseRootError,
+) -> ProfileOwnershipError {
+    match error {
+        BoundDatabaseRootError::Unavailable { reason, .. } => {
+            ProfileOwnershipError::ExternalSourceRootUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+        BoundDatabaseRootError::IdentityUnavailable { reason, .. } => {
+            ProfileOwnershipError::ExternalSourceRootIdentityUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+        BoundDatabaseRootError::Replaced { .. } => ProfileOwnershipError::SourceRootReplaced {
+            path: path.to_path_buf(),
+        },
+    }
+}
+
+fn map_namespace_unavailable(
+    namespace: BoundDatabaseRootNamespace,
+    path: &Path,
+    reason: String,
+    profile_guard: &WritableProfileGuard,
+) -> ProfileOwnershipError {
+    match namespace {
+        BoundDatabaseRootNamespace::Profile => profile_binding_error(profile_guard, reason),
+        BoundDatabaseRootNamespace::ProfileChild => {
+            ProfileOwnershipError::ProfileChildDatabaseRootUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+        BoundDatabaseRootNamespace::ExternalSource => {
+            ProfileOwnershipError::ExternalSourceRootUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+    }
+}
+
+fn map_namespace_identity_unavailable(
+    namespace: BoundDatabaseRootNamespace,
+    path: &Path,
+    reason: String,
+    profile_guard: &WritableProfileGuard,
+) -> ProfileOwnershipError {
+    match namespace {
+        BoundDatabaseRootNamespace::Profile => profile_binding_error(profile_guard, reason),
+        BoundDatabaseRootNamespace::ProfileChild => {
+            ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+        BoundDatabaseRootNamespace::ExternalSource => {
+            ProfileOwnershipError::ExternalSourceRootIdentityUnavailable {
+                path: path.to_path_buf(),
+                reason,
+            }
+        }
+    }
+}
+
+fn map_namespace_binding_error(
+    namespace: BoundDatabaseRootNamespace,
+    path: &Path,
+    error: BoundDatabaseRootError,
+    profile_guard: &WritableProfileGuard,
+) -> ProfileOwnershipError {
+    match namespace {
+        BoundDatabaseRootNamespace::Profile => {
+            profile_binding_error(profile_guard, error.to_string())
+        }
+        BoundDatabaseRootNamespace::ProfileChild => map_profile_child_binding_error(path, error),
+        BoundDatabaseRootNamespace::ExternalSource => {
+            map_external_source_binding_error(path, error)
+        }
+    }
+}
+
 #[cfg(not(windows))]
 fn database_root_alias(
     capability: &fs::File,
     _named_path: &Path,
     expected_identity: &str,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, BoundDatabaseRootError> {
     #[cfg(target_os = "linux")]
     let alias = {
         use std::os::unix::io::AsRawFd;
@@ -883,19 +1082,26 @@ fn database_root_alias(
     #[cfg(target_os = "macos")]
     let alias = {
         use std::os::unix::fs::MetadataExt;
-        let metadata = capability.metadata().map_err(|error| {
-            format!("failed to inspect source-root capability for /.vol binding: {error}")
-        })?;
+        let metadata =
+            capability
+                .metadata()
+                .map_err(|error| BoundDatabaseRootError::Unavailable {
+                    path: _named_path.to_path_buf(),
+                    reason: format!(
+                        "failed to inspect source-root capability for /.vol binding: {error}"
+                    ),
+                })?;
         PathBuf::from(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()))
     };
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = (capability, _named_path, expected_identity);
-        return Err(
-            "source database recovery requires a supported descriptor-bound root namespace"
+        return Err(BoundDatabaseRootError::Unavailable {
+            path: _named_path.to_path_buf(),
+            reason: "source database recovery requires a supported descriptor-bound root namespace"
                 .to_string(),
-        );
+        });
     }
 
     validate_database_root_alias(capability, &alias, expected_identity)?;
@@ -906,41 +1112,41 @@ fn validate_database_root_alias(
     capability: &fs::File,
     alias: &Path,
     expected_identity: &str,
-) -> Result<(), String> {
-    let metadata = fs::metadata(alias).map_err(|error| {
-        format!(
-            "source database root binding namespace is unavailable at {}: {error}",
-            alias.display()
-        )
+) -> Result<(), BoundDatabaseRootError> {
+    let metadata = fs::metadata(alias).map_err(|error| BoundDatabaseRootError::Unavailable {
+        path: alias.to_path_buf(),
+        reason: error.to_string(),
     })?;
     if !metadata.is_dir() {
-        return Err(format!(
-            "source database root binding namespace is not a directory: {}",
-            alias.display()
-        ));
+        return Err(BoundDatabaseRootError::Replaced {
+            path: alias.to_path_buf(),
+        });
     }
-    let capability_identity = root_identity_from_open_file(capability)
-        .map_err(|error| format!("failed to inspect bound source-root capability: {error}"))?;
+    let capability_identity = root_identity_from_open_file(capability).map_err(|error| {
+        BoundDatabaseRootError::IdentityUnavailable {
+            path: alias.to_path_buf(),
+            reason: format!("failed to inspect bound source-root capability: {error}"),
+        }
+    })?;
     let alias_identity = stable_filesystem_identity(alias, &metadata).ok_or_else(|| {
-        format!(
-            "stable identity is unavailable for source database binding namespace {}",
-            alias.display()
-        )
+        BoundDatabaseRootError::IdentityUnavailable {
+            path: alias.to_path_buf(),
+            reason: "stable identity is unavailable".to_string(),
+        }
     })?;
     if capability_identity != expected_identity || alias_identity != expected_identity {
-        return Err(format!(
-            "source database root binding identity mismatch at {} (expected {}, capability {}, alias {})",
-            alias.display(),
-            expected_identity,
-            capability_identity,
-            alias_identity
-        ));
+        return Err(BoundDatabaseRootError::Replaced {
+            path: alias.to_path_buf(),
+        });
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn windows_database_root_binding(path: &Path, expected_identity: &str) -> Result<fs::File, String> {
+fn windows_database_root_binding(
+    path: &Path,
+    expected_identity: &str,
+) -> Result<fs::File, BoundDatabaseRootError> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
@@ -954,30 +1160,31 @@ fn windows_database_root_binding(path: &Path, expected_identity: &str) -> Result
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0);
     let capability = options.open(path).map_err(|error| {
-        format!(
-            "failed to open source root with a delete-sharing barrier for database recovery {}: {error}",
-            path.display()
-        )
+        BoundDatabaseRootError::Unavailable {
+            path: path.to_path_buf(),
+            reason: format!(
+                "failed to open source root with a delete-sharing barrier for database recovery: {error}"
+            ),
+        }
     })?;
     let actual_identity = root_identity_from_open_file(&capability).map_err(|error| {
-        format!(
-            "failed to inspect source root opened for descriptor-bound database recovery {}: {error}",
-            path.display()
-        )
+        BoundDatabaseRootError::IdentityUnavailable {
+            path: path.to_path_buf(),
+            reason: format!(
+                "failed to inspect source root opened for descriptor-bound database recovery: {error}"
+            ),
+        }
     })?;
     if actual_identity != expected_identity {
-        return Err(format!(
-            "source root identity changed while opening descriptor-bound database namespace {} (expected {}, found {})",
-            path.display(),
-            expected_identity,
-            actual_identity
-        ));
+        return Err(BoundDatabaseRootError::Replaced {
+            path: path.to_path_buf(),
+        });
     }
     Ok(capability)
 }
 
 #[cfg(windows)]
-fn windows_final_path(capability: &fs::File) -> Result<PathBuf, String> {
+fn windows_final_path(capability: &fs::File) -> Result<PathBuf, BoundDatabaseRootError> {
     use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
@@ -992,10 +1199,13 @@ fn windows_final_path(capability: &fs::File) -> Result<PathBuf, String> {
             )
         };
         if length == 0 {
-            return Err(format!(
-                "failed to derive final source-root namespace from its open descriptor: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(BoundDatabaseRootError::Unavailable {
+                path: PathBuf::from("<descriptor>"),
+                reason: format!(
+                    "failed to derive final source-root namespace from its open descriptor: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
         }
         let length = length as usize;
         if length < buffer.len() {
@@ -1150,11 +1360,11 @@ mod tests {
             &identity,
         )
         .unwrap_err();
-        assert!(unavailable.contains("namespace is unavailable"));
+        assert!(unavailable.to_string().contains("namespace is unavailable"));
 
         let mismatch =
             validate_database_root_alias(&capability, other.path(), &identity).unwrap_err();
-        assert!(mismatch.contains("identity mismatch"));
+        assert!(mismatch.to_string().contains("identity mismatch"));
     }
 
     #[cfg(unix)]

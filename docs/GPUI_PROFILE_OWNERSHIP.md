@@ -391,6 +391,60 @@ selection. Stable source diagnostics and final data-preservation acceptance
 still keep OPT-1349 open; no readiness executor
 has been ported from the excluded reference application in this work.
 
+## Source diagnostics and recovery policy
+
+The binding layer distinguishes the external media root, the profile's child
+database directory, and the profile root itself. Source database and scanner
+adapters preserve that distinction into catalog errors; a second profile check
+is not used to infer that a later profile failure actually means a child failure.
+Diagnostics retain their specific cause and identify when automatic updates are
+paused.
+
+| Failure | Automatic recovery policy |
+| --- | --- |
+| Media root unavailable or confirmed replaced | Existing bounded root probes; no adoption of an unverified replacement |
+| Source identity or lease authority uncertain | Pause automatic audit retries and root reopening |
+| Database namespace, identity, schema or lease state uncertain | Pause automatic audit retries and root reopening |
+| Profile ownership unavailable | Preserve the profile-specific failure and pause automatic retries |
+| Active source writer conflict or explicit database busy | Existing bounded retries |
+| Other transient audit/database failures | Preserve existing retry behavior |
+
+Local validation passed the full library suite (671 passed, three existing
+ignored), catalog suite (98 passed), and UI suite (398 passed, one existing
+ignored). Production no-default library and GPUI compilation passed, as did
+seven production profile-admission tests and the readiness process fixture
+(one passed, one helper ignored). A final focused catalog test passed after
+review preserved the specific retired/expired lease cause in diagnostics.
+Formatting and diff checks passed.
+
+The new filesystem regressions reject missing media before database bootstrap,
+reject writes while media or a catalog child is absent, preserve the rejected
+metadata state, and permit the same owner to write after the original directory
+is restored. A combined first-lease regression preserves all seeded columns in
+ratings/history, tags, collections, readiness sources/targets/artifacts and work,
+and pending rename/file-operation recovery tables. Read-only access remains
+usable before lease bootstrap and after release.
+
+The parallel library run encountered a failure in the unchanged cwd-sensitive
+`test_runtime::tests::panic_unwind_restores_environment_and_current_directory`.
+That test passed alone, and the complete library suite passed with one test
+thread. Windows storage acceptance for the diagnostics extension remains pending.
+
+## Active publication coverage
+
+In the compiled GPUI crate graph, catalog is the asynchronous publisher of
+source database state. Scanner calls run through catalog's retained writer;
+synchronous library mutation and maintenance APIs remain within their owner's
+call stack. Catalog delivery and browser projection retain the source fence,
+while readiness claims and independent publication require their captured
+origin. Read-only media and content artifacts use their own content/revision
+checks and do not publish authoritative source database state.
+
+This inventory excludes `reference/radiant`. The future readiness executor and
+source-writer routing tickets must consume these ownership contracts when they
+enter the active crate graph. This does not establish completion of those ports
+or full GPUI feature parity.
+
 ## Journal coordination
 
 OPT-1337 owns universal journal integration. The session now opens that journal

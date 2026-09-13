@@ -904,7 +904,7 @@ impl SourceDatabase {
             profile_guard,
             database_root.as_ref(),
         )
-        .map_err(SourceDbError::from)?;
+        .map_err(open::map_database_root_open_error)?;
         open::open_source_database_with_profile_guard(
             root.as_ref(),
             Arc::new(database_root),
@@ -1074,7 +1074,7 @@ impl SourceDatabase {
             profile_guard,
             profile_child.as_ref(),
         )
-        .map_err(SourceDbError::from)?;
+        .map_err(open::map_database_root_open_error)?;
         let database = open::open_source_database_with_profile_guard(
             root.as_ref(),
             Arc::new(binding),
@@ -1338,10 +1338,24 @@ impl SourceDatabase {
 
 fn map_database_root_validation_error(error: ProfileOwnershipError) -> SourceDbError {
     match error {
-        ProfileOwnershipError::SourceRootReplaced { path } => {
+        ProfileOwnershipError::SourceRootReplaced { path }
+        | ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path } => {
             SourceDbError::SourceLease(source_lease::SourceLeaseError::DatabaseRootReplaced {
                 path,
             })
+        }
+        ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason }
+        | ProfileOwnershipError::ProfileChildDatabaseRootUnavailable { path, reason } => {
+            SourceDbError::SourceLease(source_lease::SourceLeaseError::DatabaseRootUnavailable {
+                path,
+                reason,
+            })
+        }
+        ProfileOwnershipError::ExternalSourceRootIdentityUnavailable { path, reason }
+        | ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, reason } => {
+            SourceDbError::SourceLease(
+                source_lease::SourceLeaseError::DatabaseRootIdentityUnavailable { path, reason },
+            )
         }
         other => SourceDbError::ProfileOwnership(other),
     }
@@ -1351,9 +1365,22 @@ fn map_readiness_database_root_error(
     error: ProfileOwnershipError,
 ) -> crate::sample_sources::readiness::ReadinessError {
     match error {
-        ProfileOwnershipError::SourceRootReplaced { path } => {
+        ProfileOwnershipError::SourceRootReplaced { path }
+        | ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path } => {
             crate::sample_sources::readiness::ReadinessError::SourceLease(
                 source_lease::SourceLeaseError::DatabaseRootReplaced { path },
+            )
+        }
+        ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason }
+        | ProfileOwnershipError::ProfileChildDatabaseRootUnavailable { path, reason } => {
+            crate::sample_sources::readiness::ReadinessError::SourceLease(
+                source_lease::SourceLeaseError::DatabaseRootUnavailable { path, reason },
+            )
+        }
+        ProfileOwnershipError::ExternalSourceRootIdentityUnavailable { path, reason }
+        | ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, reason } => {
+            crate::sample_sources::readiness::ReadinessError::SourceLease(
+                source_lease::SourceLeaseError::DatabaseRootIdentityUnavailable { path, reason },
             )
         }
         other => crate::sample_sources::readiness::ReadinessError::ProfileOwnership(other),

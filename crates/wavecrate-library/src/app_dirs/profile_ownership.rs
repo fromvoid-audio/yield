@@ -59,6 +59,44 @@ pub enum ProfileOwnershipError {
         /// External source-root path whose identity changed.
         path: PathBuf,
     },
+    /// An explicitly bound external source root could not be opened or inspected.
+    #[error("external source root is unavailable at {path}: {reason}")]
+    ExternalSourceRootUnavailable {
+        /// External source-root path involved in the failed operation.
+        path: PathBuf,
+        /// Stable bounded reason for the unavailable namespace.
+        reason: String,
+    },
+    /// The host could not establish a stable identity for an external source root.
+    #[error("external source root identity is uncertain at {path}: {reason}")]
+    ExternalSourceRootIdentityUnavailable {
+        /// External source-root path whose identity could not be established.
+        path: PathBuf,
+        /// Stable bounded reason for the uncertain identity.
+        reason: String,
+    },
+    /// A profile-owned child database namespace could not be opened or inspected.
+    #[error("profile child database namespace is unavailable at {path}: {reason}")]
+    ProfileChildDatabaseRootUnavailable {
+        /// Profile-child path involved in the failed operation.
+        path: PathBuf,
+        /// Stable bounded reason for the unavailable namespace.
+        reason: String,
+    },
+    /// A profile-owned child database namespace was replaced after binding.
+    #[error("profile child database namespace was replaced: {path}")]
+    ProfileChildDatabaseRootReplaced {
+        /// Profile-child path whose identity changed.
+        path: PathBuf,
+    },
+    /// The host could not establish a stable identity for a profile child namespace.
+    #[error("profile child database namespace identity is uncertain at {path}: {reason}")]
+    ProfileChildDatabaseRootIdentityUnavailable {
+        /// Profile-child path whose identity could not be established.
+        path: PathBuf,
+        /// Stable bounded reason for the uncertain identity.
+        reason: String,
+    },
     /// The host could not provide a stable identity for the retained capability.
     #[error("profile ownership identity unavailable at {path}")]
     IdentityUnavailable {

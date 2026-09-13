@@ -998,6 +998,35 @@ fn source_database_identity_lease_rejects_unknown_database_layout_unchanged() {
     assert_eq!(remaining, 0);
 }
 
+#[test]
+fn source_database_identity_lease_reports_missing_media_root_before_open_without_bootstrap() {
+    let app_root = tempdir().expect("app root");
+    let source_parent = tempdir().expect("source parent");
+    let source_root = source_parent.path().join("missing-media-root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+
+    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        &source_root,
+        &profile_guard,
+        database_root.path(),
+    ) {
+        Ok(_) => panic!("a missing media root must reject before opening the database"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SourceRootUnavailable { .. })
+    ));
+    assert!(
+        !database_path.exists(),
+        "a missing media root must not bootstrap a source database"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn source_database_identity_lease_rejects_source_root_replacement() {
@@ -1025,6 +1054,99 @@ fn source_database_identity_lease_rejects_source_root_replacement() {
         SourceDbError::SourceLease(SourceLeaseError::DatabaseRootReplaced { .. })
     ));
     assert!(!database_root.path().join(DB_FILE_NAME).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_lease_reports_missing_media_root_as_unavailable() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let displaced = source_root.path().with_extension("displaced");
+    std::fs::rename(source_root.path(), &displaced).expect("remove media source root");
+
+    let error = database
+        .set_metadata("missing-media-root", "must-not-write")
+        .expect_err("missing media root must reject mutation");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::SourceRootUnavailable { .. })
+    ));
+
+    assert_eq!(
+        database
+            .get_metadata("missing-media-root")
+            .expect("read rejected metadata key"),
+        None,
+        "rejected source-root mutation must not write metadata"
+    );
+    std::fs::rename(&displaced, source_root.path()).expect("restore media source root");
+    database
+        .set_metadata("missing-media-root", "restored")
+        .expect("same-owner mutation after media root restore");
+    assert_eq!(
+        database
+            .get_metadata("missing-media-root")
+            .expect("read restored metadata"),
+        Some(String::from("restored"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_database_identity_lease_reports_missing_profile_child_as_database_unavailable() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let profile_child = "identity-missing-database-root";
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        profile_child,
+    )
+    .expect("profile-owned catalog database");
+    let child_path = profile_guard.profile_root().join(profile_child);
+    let displaced = profile_guard
+        .profile_root()
+        .join("identity-missing-database-root-displaced");
+    std::fs::rename(&child_path, &displaced).expect("remove profile child database root");
+
+    let error = database
+        .set_metadata("missing-profile-child", "must-not-write")
+        .expect_err("missing profile child must reject mutation");
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::DatabaseRootUnavailable { .. })
+    ));
+
+    assert_eq!(
+        database
+            .get_metadata("missing-profile-child")
+            .expect("read rejected metadata key"),
+        None,
+        "rejected profile-child mutation must not write metadata"
+    );
+    std::fs::rename(&displaced, &child_path).expect("restore profile child database root");
+    database
+        .set_metadata("missing-profile-child", "restored")
+        .expect("same-owner mutation after profile child restore");
+    assert_eq!(
+        database
+            .get_metadata("missing-profile-child")
+            .expect("read restored metadata"),
+        Some(String::from("restored"))
+    );
 }
 
 #[cfg(unix)]

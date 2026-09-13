@@ -32,13 +32,16 @@ pub(crate) fn read(
     profile_guard: &WritableProfileGuard,
 ) -> Result<DisplayLabelsPatch, CatalogError> {
     ensure_current(admission, source_id, lifecycle_generation, token)?;
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
 
     let snapshot = source
         .snapshot
@@ -73,7 +76,7 @@ pub(crate) fn read(
     let before_revision = source
         .database
         .get_revision()
-        .map_err(super::catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if before_revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,
@@ -86,7 +89,7 @@ pub(crate) fn read(
     let result = source
         .database
         .display_labels_for_paths_at_revision(expected_revision, &requested_paths, token)
-        .map_err(super::catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if result.revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,
@@ -100,13 +103,16 @@ pub(crate) fn read(
     }
 
     ensure_current(admission, source_id, lifecycle_generation, token)?;
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     let after_root_identity = checked_source_root_identity(source_id, &source.root)?;
     if after_root_identity != expected_root_identity {
         return Err(CatalogError::StaleRootGeneration {
@@ -117,7 +123,7 @@ pub(crate) fn read(
     let after_revision = source
         .database
         .get_revision()
-        .map_err(super::catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if after_revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,
@@ -166,7 +172,7 @@ fn validate_live_selected_paths(
         })?;
         let normalized = normalize_relative_path(validated.as_path())
             .map(PathBuf::from)
-            .map_err(super::catalog_error_from_db)?;
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
         if snapshot
             .manifest
             .binary_search_by(|entry| entry.relative_path.cmp(&normalized))

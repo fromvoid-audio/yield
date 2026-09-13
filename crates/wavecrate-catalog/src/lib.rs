@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -22,7 +21,7 @@ use wavecrate_library::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use wavecrate_library::filesystem_identity::stable_filesystem_identity;
 use wavecrate_library::sample_sources::db::{
     SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT, SourceDirectoryEntry,
-    SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceManifestEntry,
+    SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceLeaseError, SourceManifestEntry,
 };
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use wavecrate_library::sample_sources::{
@@ -820,6 +819,21 @@ pub enum CatalogError {
     /// The profile root or its retained ownership identity failed validation.
     #[error("profile ownership unavailable: {0}")]
     ProfileUnavailable(String),
+    /// The physical source root is unavailable for the requested operation.
+    #[error("source is unavailable; check the source path: {0}")]
+    SourceUnavailable(String),
+    /// A source writer or retained source lease currently prevents the operation.
+    #[error("source writer conflict: {0}")]
+    SourceWriterConflict(String),
+    /// The source or lease identity could not be established safely.
+    #[error("automatic updates paused; verify the source identity: {0}")]
+    SourceIdentityUncertain(String),
+    /// The source database namespace or its durable integrity state is uncertain.
+    #[error("automatic updates paused; verify the catalog database: {0}")]
+    DatabaseIntegrityUncertain(String),
+    /// The catalog database reported a bounded busy/locked outcome.
+    #[error("catalog database is busy; try again")]
+    Busy,
     /// The source root was not a canonical absolute directory.
     #[error("invalid source root {0}")]
     InvalidRoot(PathBuf),
@@ -3229,7 +3243,7 @@ fn register_source(
             emit_failure(
                 reservation,
                 admission,
-                Some(source_id),
+                Some(source_id.clone()),
                 Some(lifecycle_generation),
                 CatalogOperation::Register,
                 error,
@@ -3241,7 +3255,7 @@ fn register_source(
         emit_failure(
             reservation,
             admission,
-            Some(source_id),
+            Some(source_id.clone()),
             Some(lifecycle_generation),
             CatalogOperation::Register,
             CatalogError::ProfileUnavailable(error.to_string()),
@@ -3287,10 +3301,10 @@ fn register_source(
             emit_failure(
                 reservation,
                 admission,
-                Some(source_id),
+                Some(source_id.clone()),
                 Some(lifecycle_generation),
                 CatalogOperation::Register,
-                catalog_error_from_db(error),
+                catalog_error_from_db_for_source(&source_id, error),
             );
             return;
         }
@@ -3299,10 +3313,10 @@ fn register_source(
         emit_failure(
             reservation,
             admission,
-            Some(source_id),
+            Some(source_id.clone()),
             Some(lifecycle_generation),
             CatalogOperation::Register,
-            CatalogError::ProfileUnavailable(error.to_string()),
+            catalog_error_from_db_for_source(&source_id, error),
         );
         return;
     }
@@ -3312,10 +3326,10 @@ fn register_source(
             emit_failure(
                 reservation,
                 admission,
-                Some(source_id),
+                Some(source_id.clone()),
                 Some(lifecycle_generation),
                 CatalogOperation::Register,
-                catalog_error_from_db(error),
+                catalog_error_from_db_for_source(&source_id, error),
             );
             return;
         }
@@ -3329,7 +3343,7 @@ fn register_source(
         emit_failure(
             reservation,
             admission,
-            Some(source_id),
+            Some(source_id.clone()),
             Some(lifecycle_generation),
             CatalogOperation::Register,
             error,
@@ -3552,11 +3566,7 @@ fn request_audit(
             }
         }
         Err(error) => {
-            let root_stale = matches!(
-                &error,
-                CatalogError::StaleRootGeneration { .. } | CatalogError::InvalidRoot(_)
-            );
-            let retryable = !root_stale;
+            let (retryable, root_stale) = audit_error_policy(&error);
             let published = publish_if_current(
                 admission,
                 reservation,
@@ -3580,6 +3590,23 @@ fn request_audit(
             }
         }
     }
+}
+
+fn audit_error_policy(error: &CatalogError) -> (bool, bool) {
+    let root_stale = matches!(
+        error,
+        CatalogError::StaleRootGeneration { .. }
+            | CatalogError::InvalidRoot(_)
+            | CatalogError::SourceUnavailable(_)
+    );
+    let retryable = !root_stale
+        && !matches!(
+            error,
+            CatalogError::ProfileUnavailable(_)
+                | CatalogError::SourceIdentityUncertain(_)
+                | CatalogError::DatabaseIntegrityUncertain(_)
+        );
+    (retryable, root_stale)
 }
 
 fn request_wav_metadata(
@@ -3718,17 +3745,17 @@ fn read_snapshot(
         emit_failure(
             reservation,
             admission,
-            Some(source_id),
+            Some(source_id.clone()),
             Some(source.lifecycle_generation),
             CatalogOperation::ReadSnapshot,
-            CatalogError::ProfileUnavailable(error.to_string()),
+            catalog_error_from_db_for_source(&source_id, SourceDbError::ProfileOwnership(error)),
         );
         return;
     }
     if let Err(error) = source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))
+        .map_err(|error| catalog_error_from_db_for_source(&source_id, error))
     {
         emit_failure(
             reservation,
@@ -3887,16 +3914,10 @@ impl CatalogScanWriter<'_> {
     fn validate_authority(&self) -> Result<(), ScanError> {
         self.profile_guard
             .validate_current()
-            .map_err(|error| ScanError::Io {
-                path: self.profile_guard.profile_root().to_path_buf(),
-                source: io::Error::other(error.to_string()),
-            })?;
+            .map_err(|error| ScanError::Db(SourceDbError::ProfileOwnership(error)))?;
         self.database
             .validate_profile_guard(self.profile_guard)
-            .map_err(|error| ScanError::Io {
-                path: self.profile_guard.profile_root().to_path_buf(),
-                source: io::Error::other(error.to_string()),
-            })?;
+            .map_err(ScanError::Db)?;
         Ok(())
     }
 }
@@ -3972,7 +3993,10 @@ fn maintain_catalog_database(
 fn catalog_maintenance_error(error: ScanError) -> CatalogError {
     match error {
         ScanError::Canceled => CatalogError::Canceled,
-        ScanError::Io { source, .. } => CatalogError::ProfileUnavailable(source.to_string()),
+        ScanError::Db(error) => catalog_error_from_db(error),
+        ScanError::Io { path, source } => {
+            CatalogError::DatabaseIntegrityUncertain(format!("{}: {source}", path.display()))
+        }
         error => CatalogError::Database(error.to_string()),
     }
 }
@@ -4017,13 +4041,13 @@ fn audit_source(
     source_id: &SourceId,
     token: &Arc<AtomicBool>,
 ) -> Result<CatalogSnapshot, CatalogError> {
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     let before_identity = source_root_identity(&source.root)?;
     if let Some(known) = &source.known_root_identity
         && known != &before_identity
@@ -4050,13 +4074,13 @@ fn audit_source(
     if token.load(Ordering::Acquire) {
         return Err(CatalogError::Canceled);
     }
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        catalog_error_from_db_for_source(source_id, SourceDbError::ProfileOwnership(error))
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     let after_identity = source_root_identity(&source.root)?;
     let audit_identity = audit.audit_commit.committed_root_identity().clone();
     let audit_revision = audit.audit_commit.committed_source_revision();
@@ -4069,7 +4093,7 @@ fn audit_source(
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     let mut snapshot = read_snapshot_from_database(
         &source.database,
         profile_guard,
@@ -4117,11 +4141,13 @@ fn attach_wav_metadata(
     }
     database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     if should_cancel() {
         return Err(CatalogError::Canceled);
     }
-    let current_revision = database.get_revision().map_err(catalog_error_from_db)?;
+    let current_revision = database
+        .get_revision()
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     if current_revision != snapshot.committed_revision {
         return Err(CatalogError::StaleRevision {
             expected: snapshot.committed_revision,
@@ -4153,10 +4179,10 @@ fn read_snapshot_from_database(
 ) -> Result<CatalogSnapshot, CatalogError> {
     database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     let Some(audit_metadata) = database
         .last_authoritative_audit_metadata()
-        .map_err(catalog_error_from_db)?
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?
     else {
         return Err(CatalogError::SnapshotUnavailable);
     };
@@ -4168,7 +4194,7 @@ fn read_snapshot_from_database(
     }
     let (revision, mut manifest) = database
         .manifest_snapshot_with_revision()
-        .map_err(catalog_error_from_db)?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     if audit_metadata.source_revision != revision {
         return Err(CatalogError::DirectoryTruthUnavailable(format!(
             "audit metadata revision {} does not match manifest revision {revision}",
@@ -4185,7 +4211,7 @@ fn read_snapshot_from_database(
     }
     let first_page = database
         .source_directory_truth_page(None, DIRECTORY_PAGE_LIMIT)
-        .map_err(catalog_error_from_db)?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     let (directory_generation, mut directories, mut cursor) = match first_page.state {
         SourceDirectoryTruthState::Active {
             generation,
@@ -4205,7 +4231,7 @@ fn read_snapshot_from_database(
         }
         let page: SourceDirectoryTruthPage = database
             .source_directory_truth_page(Some(&next), DIRECTORY_PAGE_LIMIT)
-            .map_err(catalog_error_from_db)?;
+            .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
         match page.state {
             SourceDirectoryTruthState::Active {
                 generation,
@@ -4220,7 +4246,9 @@ fn read_snapshot_from_database(
         directories.extend(page.entries);
         cursor = page.next_cursor;
     }
-    let final_revision = database.get_revision().map_err(catalog_error_from_db)?;
+    let final_revision = database
+        .get_revision()
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     if final_revision != revision {
         return Err(CatalogError::StaleRevision {
             expected: revision,
@@ -4229,9 +4257,10 @@ fn read_snapshot_from_database(
     }
     database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| catalog_error_from_db_for_source(source_id, error))?;
     let curation_metadata = curation::load_snapshot_curation_metadata(
         database,
+        source_id,
         revision,
         &manifest,
         &mut should_cancel,
@@ -4451,8 +4480,65 @@ fn emit_display_labels_failure(
 }
 
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
+    catalog_error_from_db_with_source(None, error)
+}
+
+pub(crate) fn catalog_error_from_db_for_source(
+    source_id: &SourceId,
+    error: SourceDbError,
+) -> CatalogError {
+    catalog_error_from_db_with_source(Some(source_id), error)
+}
+
+fn catalog_error_from_db_with_source(
+    source_id: Option<&SourceId>,
+    error: SourceDbError,
+) -> CatalogError {
+    let stale_root = |detail: String| match source_id {
+        Some(source_id) => CatalogError::StaleRootGeneration {
+            source_id: source_id.clone(),
+            detail,
+        },
+        None => CatalogError::SourceUnavailable(detail),
+    };
+    let profile_error = |error: ProfileOwnershipError| match error {
+        ProfileOwnershipError::SourceRootReplaced { path } => stale_root(format!(
+            "bound source root was replaced: {}",
+            path.display()
+        )),
+        ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason } => {
+            CatalogError::SourceUnavailable(format!("{}: {reason}", path.display()))
+        }
+        ProfileOwnershipError::ExternalSourceRootIdentityUnavailable { path, reason } => {
+            CatalogError::SourceIdentityUncertain(format!("{}: {reason}", path.display()))
+        }
+        ProfileOwnershipError::ProfileChildDatabaseRootUnavailable { path, reason } => {
+            CatalogError::DatabaseIntegrityUncertain(format!("{}: {reason}", path.display()))
+        }
+        ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path } => {
+            CatalogError::DatabaseIntegrityUncertain(format!(
+                "profile child database namespace was replaced: {}",
+                path.display()
+            ))
+        }
+        ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, reason } => {
+            CatalogError::DatabaseIntegrityUncertain(format!("{}: {reason}", path.display()))
+        }
+        ProfileOwnershipError::ProfileChildAlreadyLeased { path } => {
+            CatalogError::SourceWriterConflict(path.display().to_string())
+        }
+        ProfileOwnershipError::ProfileOwnedByAnotherProcess { path } => {
+            CatalogError::ProfileUnavailable(format!(
+                "profile is owned by another process: {}",
+                path.display()
+            ))
+        }
+        other => CatalogError::ProfileUnavailable(other.to_string()),
+    };
+
     match error {
         SourceDbError::Canceled => CatalogError::Canceled,
+        SourceDbError::Busy => CatalogError::Busy,
         SourceDbError::DirectoryTruth(
             wavecrate_library::sample_sources::db::SourceDirectoryTruthError::StaleRevision {
                 expected,
@@ -4464,6 +4550,78 @@ fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
         }
         SourceDbError::InvalidTagId { tag_id } => CatalogError::InvalidTagId { tag_id },
         SourceDbError::TagIdNotFound { tag_id } => CatalogError::TagIdNotFound { tag_id },
+        SourceDbError::ProfileOwnership(error) => profile_error(error),
+        SourceDbError::DatabaseIdentity(error) => {
+            CatalogError::DatabaseIntegrityUncertain(error.to_string())
+        }
+        SourceDbError::SourceLease(error) => match error {
+            SourceLeaseError::SourceRootReplaced { path } => stale_root(format!(
+                "bound source root was replaced: {}",
+                path.display()
+            )),
+            SourceLeaseError::SourceRootUnavailable { path, reason } => {
+                CatalogError::SourceUnavailable(format!("{}: {reason}", path.display()))
+            }
+            SourceLeaseError::SourceRootIdentityUnavailable { path, reason } => {
+                CatalogError::SourceIdentityUncertain(format!("{}: {reason}", path.display()))
+            }
+            SourceLeaseError::WritableSourceOwnedByAnotherProcess { path }
+            | SourceLeaseError::LeaseNotExpired { path, .. } => {
+                CatalogError::SourceWriterConflict(path.display().to_string())
+            }
+            SourceLeaseError::ProfileOwnership(error) => profile_error(error),
+            error @ (SourceLeaseError::DatabaseRootReplaced { .. }
+            | SourceLeaseError::DatabaseRootUnavailable { .. }
+            | SourceLeaseError::DatabaseRootIdentityUnavailable { .. }
+            | SourceLeaseError::SidecarReplaced { .. }
+            | SourceLeaseError::SchemaUnavailable { .. }
+            | SourceLeaseError::DatabaseMissingWithExistingLease { .. }
+            | SourceLeaseError::LeaseStateUnavailable { .. }
+            | SourceLeaseError::InvalidRow { .. }
+            | SourceLeaseError::SynchronousUnavailable { .. }) => {
+                CatalogError::DatabaseIntegrityUncertain(error.to_string())
+            }
+            SourceLeaseError::DatabaseIdentity(error) => {
+                CatalogError::DatabaseIntegrityUncertain(error.to_string())
+            }
+            SourceLeaseError::LivenessUnverified { path, reason } => {
+                CatalogError::SourceIdentityUncertain(format!("{}: {reason}", path.display()))
+            }
+            error @ (SourceLeaseError::Superseded { .. } | SourceLeaseError::Expired { .. }) => {
+                CatalogError::SourceIdentityUncertain(error.to_string())
+            }
+            SourceLeaseError::Busy => CatalogError::Busy,
+            error @ SourceLeaseError::SnapshotsActive => {
+                CatalogError::SourceWriterConflict(error.to_string())
+            }
+            error @ (SourceLeaseError::Required
+            | SourceLeaseError::Unsupported { .. }
+            | SourceLeaseError::ClockUnavailable
+            | SourceLeaseError::ControlUnavailable) => {
+                CatalogError::SourceIdentityUncertain(error.to_string())
+            }
+            error @ (SourceLeaseError::MigrationRequired { .. }
+            | SourceLeaseError::Sql(_)
+            | SourceLeaseError::Io { .. }) => {
+                CatalogError::DatabaseIntegrityUncertain(error.to_string())
+            }
+        },
+        SourceDbError::ExternalMetadataRoot { path, source } => {
+            CatalogError::SourceUnavailable(format!("{}: {source}", path.display()))
+        }
+        SourceDbError::InspectSourceDatabasePath { path, source }
+        | SourceDbError::ResolveSourceDatabasePath { path, source } => {
+            CatalogError::DatabaseIntegrityUncertain(format!("{}: {source}", path.display()))
+        }
+        SourceDbError::ReadOnlyDatabaseMissing(path) => {
+            CatalogError::DatabaseIntegrityUncertain(path.display().to_string())
+        }
+        SourceDbError::UnsafeSourceDatabasePath { path, reason } => {
+            CatalogError::DatabaseIntegrityUncertain(format!("{}: {reason}", path.display()))
+        }
+        error @ SourceDbError::ProfileOwnershipRequired => {
+            CatalogError::ProfileUnavailable(error.to_string())
+        }
         error => CatalogError::Database(error.to_string()),
     }
 }
@@ -4474,6 +4632,15 @@ fn scan_error(
 ) -> CatalogError {
     match error {
         wavecrate_scan::sample_sources::scanner::ScanError::Canceled => CatalogError::Canceled,
+        wavecrate_scan::sample_sources::scanner::ScanError::Db(error) => {
+            catalog_error_from_db_for_source(source_id, error)
+        }
+        wavecrate_scan::sample_sources::scanner::ScanError::StaleRootGeneration { root } => {
+            CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: format!("source root changed while scanning: {}", root.display()),
+            }
+        }
         error => CatalogError::Audit(format!("{source_id}: {error}")),
     }
 }
@@ -4492,6 +4659,9 @@ fn scan_wav_metadata_error(
                     root.display()
                 ),
             }
+        }
+        wavecrate_scan::sample_sources::scanner::ScanError::Db(error) => {
+            catalog_error_from_db_for_source(source_id, error)
         }
         error => CatalogError::Audit(format!("{source_id}: {error}")),
     }
@@ -7672,7 +7842,7 @@ mod tests {
                 event,
                 CatalogEvent::Failed {
                     operation: CatalogOperation::Audit,
-                    error: CatalogError::ProfileUnavailable(_),
+                    error: CatalogError::DatabaseIntegrityUncertain(_),
                     ..
                 }
             )
@@ -7681,7 +7851,7 @@ mod tests {
             event,
             CatalogEvent::Failed {
                 operation: CatalogOperation::Audit,
-                error: CatalogError::ProfileUnavailable(_),
+                error: CatalogError::DatabaseIntegrityUncertain(_),
                 ..
             }
         ));
@@ -7726,7 +7896,9 @@ mod tests {
 
         assert!(matches!(
             writer.try_lock_cleanup(),
-            Err(ScanError::Io { .. })
+            Err(ScanError::Db(SourceDbError::SourceLease(
+                SourceLeaseError::DatabaseRootReplaced { .. }
+            )))
         ));
         assert!(child_path.join("sentinel").is_file());
     }
@@ -7878,7 +8050,7 @@ mod tests {
 
         assert!(matches!(
             maintain_catalog_database(&database, &fixture.guard, None, || false),
-            Err(CatalogError::ProfileUnavailable(_))
+            Err(CatalogError::DatabaseIntegrityUncertain(_))
         ));
         assert!(child_path.join("sentinel").is_file());
         assert_eq!(
@@ -10467,5 +10639,176 @@ mod tests {
         assert!(matches!(event, CatalogEvent::Closed));
         assert!(matches!(events.try_recv(), Err(TryRecvError::Disconnected)));
         assert!(!events.send(CatalogEvent::Closed, 0, 0, 0));
+    }
+
+    #[test]
+    fn catalog_error_mapping_keeps_source_and_database_boundaries_distinct() {
+        let source_id = SourceId::from_string("typed-boundary");
+        let retired = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::Superseded {
+                path: PathBuf::from("catalog.db"),
+            }),
+        );
+        assert!(matches!(
+            retired,
+            CatalogError::SourceIdentityUncertain(message)
+                if message.contains("no longer current")
+        ));
+        let source_unavailable = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::SourceRootUnavailable {
+                path: PathBuf::from("/media/library"),
+                reason: String::from("root is offline"),
+            }),
+        );
+        assert!(matches!(
+            source_unavailable,
+            CatalogError::SourceUnavailable(message) if message.contains("root is offline")
+        ));
+
+        let source_replaced = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::SourceRootReplaced {
+                path: PathBuf::from("/media/library"),
+            }),
+        );
+        assert!(matches!(
+            source_replaced,
+            CatalogError::StaleRootGeneration { source_id: id, .. } if id == source_id
+        ));
+
+        let child_uncertain = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::ProfileOwnership(
+                ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+                    path: PathBuf::from("catalog"),
+                    reason: String::from("identity unavailable"),
+                },
+            ),
+        );
+        assert!(matches!(
+            child_uncertain,
+            CatalogError::DatabaseIntegrityUncertain(message)
+                if message.contains("identity unavailable")
+        ));
+
+        let writer_conflict = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::ProfileOwnership(ProfileOwnershipError::ProfileChildAlreadyLeased {
+                path: PathBuf::from("catalog"),
+            }),
+        );
+        assert!(matches!(
+            writer_conflict,
+            CatalogError::SourceWriterConflict(_)
+        ));
+
+        let profile_conflict = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::ProfileOwnership(ProfileOwnershipError::ProfileOwnedByAnotherProcess {
+                path: PathBuf::from("profile-owner.lock"),
+            }),
+        );
+        assert!(matches!(
+            profile_conflict,
+            CatalogError::ProfileUnavailable(_)
+        ));
+
+        let lease_state = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::LeaseStateUnavailable {
+                path: PathBuf::from("catalog.db"),
+                reason: "missing lease row",
+            }),
+        );
+        assert!(matches!(
+            lease_state,
+            CatalogError::DatabaseIntegrityUncertain(message)
+                if message.contains("missing lease row")
+        ));
+
+        let missing_lease = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::Required),
+        );
+        assert!(matches!(
+            missing_lease,
+            CatalogError::SourceIdentityUncertain(message)
+                if message.contains("no retained physical-source lease")
+        ));
+
+        let unsupported_lock = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::Unsupported {
+                path: PathBuf::from("catalog.lock"),
+            }),
+        );
+        assert!(matches!(
+            unsupported_lock,
+            CatalogError::SourceIdentityUncertain(message) if message.contains("unsupported")
+        ));
+
+        let migration_required = catalog_error_from_db_for_source(
+            &source_id,
+            SourceDbError::SourceLease(SourceLeaseError::MigrationRequired {
+                path: PathBuf::from("catalog.db"),
+                user_version: 7,
+            }),
+        );
+        assert!(matches!(
+            migration_required,
+            CatalogError::DatabaseIntegrityUncertain(message)
+                if message.contains("requires migration")
+        ));
+
+        let profile_required =
+            catalog_error_from_db_for_source(&source_id, SourceDbError::ProfileOwnershipRequired);
+        assert!(matches!(
+            profile_required,
+            CatalogError::ProfileUnavailable(message)
+                if message.contains("profile ownership is required")
+        ));
+    }
+
+    #[test]
+    fn audit_error_policy_recovery_matrix_is_fail_closed_for_uncertainty() {
+        let source_id = SourceId::from_string("policy");
+        assert_eq!(
+            audit_error_policy(&CatalogError::StaleRootGeneration {
+                source_id: source_id.clone(),
+                detail: String::from("changed"),
+            }),
+            (false, true)
+        );
+        assert_eq!(
+            audit_error_policy(&CatalogError::SourceUnavailable(String::from("offline"))),
+            (false, true)
+        );
+        assert_eq!(
+            audit_error_policy(&CatalogError::SourceIdentityUncertain(String::from(
+                "unknown"
+            ))),
+            (false, false)
+        );
+        assert_eq!(
+            audit_error_policy(&CatalogError::DatabaseIntegrityUncertain(String::from(
+                "malformed",
+            ))),
+            (false, false)
+        );
+        assert_eq!(
+            audit_error_policy(&CatalogError::ProfileUnavailable(String::from("lost"))),
+            (false, false)
+        );
+        assert_eq!(
+            audit_error_policy(&CatalogError::SourceWriterConflict(String::from("locked"))),
+            (true, false)
+        );
+        assert_eq!(audit_error_policy(&CatalogError::Busy), (true, false));
+        assert_eq!(
+            audit_error_policy(&CatalogError::Database(String::from("transient SQL error"))),
+            (true, false)
+        );
     }
 }

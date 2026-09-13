@@ -3,6 +3,7 @@ use super::*;
 mod cleanup;
 mod filenames;
 mod identity;
+mod lease_preservation;
 mod open_roles;
 mod schema;
 mod user_library;

@@ -9,9 +9,7 @@ use wavecrate_library::sample_sources::{
     BrowserFileMetadata, Rating, SourceCurationCommitReceipt, SourceCurationUpdate,
 };
 
-use super::{
-    CatalogError, CatalogEvent, EventReservation, RegisteredSource, SourceId, catalog_error_from_db,
-};
+use super::{CatalogError, CatalogEvent, EventReservation, RegisteredSource, SourceId};
 
 /// Maximum number of browser metadata rows inspected by one decay command.
 pub(crate) const PAGE_SIZE: usize = 64;
@@ -159,7 +157,7 @@ fn execute_inner(
         let page = source
             .database
             .browser_metadata_page(expected_revision, after_cursor, PAGE_SIZE)
-            .map_err(catalog_error_from_db)?;
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
         if page.revision != expected_revision {
             return Err(CatalogError::StaleRevision {
                 expected: expected_revision,
@@ -249,13 +247,16 @@ fn validate_source_binding(
         source.lifecycle_generation,
         lifecycle_generation,
     )?;
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
 
     let Some(snapshot) = source.snapshot.as_ref() else {
         return Err(CatalogError::SnapshotUnavailable);
@@ -300,7 +301,7 @@ fn validate_source_binding(
     let revision = source
         .database
         .get_revision()
-        .map_err(catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,

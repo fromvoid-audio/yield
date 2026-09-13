@@ -1121,6 +1121,11 @@ fn profile_error_path(error: &ProfileOwnershipError) -> PathBuf {
         | ProfileOwnershipError::NotRegularFile { path }
         | ProfileOwnershipError::IdentityUnavailable { path }
         | ProfileOwnershipError::ProfileChildAlreadyLeased { path }
+        | ProfileOwnershipError::ExternalSourceRootUnavailable { path, .. }
+        | ProfileOwnershipError::ExternalSourceRootIdentityUnavailable { path, .. }
+        | ProfileOwnershipError::ProfileChildDatabaseRootUnavailable { path, .. }
+        | ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path }
+        | ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, .. }
         | ProfileOwnershipError::Unsupported { path } => path.clone(),
         ProfileOwnershipError::AppDirectory(_) => PathBuf::new(),
     }

@@ -17,7 +17,7 @@ use wavecrate_library::sample_sources::{
 
 use super::{
     AdmissionState, CatalogCommand, CatalogError, CatalogEvent, EventReservation, RegisteredSource,
-    SourceId, catalog_error_from_db, source_root_identity,
+    SourceId, source_root_identity,
 };
 
 /// Maximum number of updates admitted by one durable curation command.
@@ -543,6 +543,7 @@ pub(crate) fn operation_payload_bytes(
 /// Load the full browser curation projection through revision-fenced pages.
 pub(crate) fn load_snapshot_curation_metadata(
     database: &SourceDatabase,
+    source_id: &SourceId,
     revision: u64,
     manifest: &[SourceManifestEntry],
     mut should_cancel: impl FnMut() -> bool,
@@ -555,7 +556,7 @@ pub(crate) fn load_snapshot_curation_metadata(
         }
         let page = database
             .browser_metadata_page(revision, cursor.as_ref(), 64)
-            .map_err(catalog_error_from_db)?;
+            .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
         if page.revision != revision {
             return Err(CatalogError::StaleRevision {
                 expected: revision,
@@ -845,13 +846,16 @@ pub(crate) fn execute_inner(
     };
     ensure_generation(source_id, source.lifecycle_generation, lifecycle_generation)?;
 
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
 
     let Some(snapshot) = source.snapshot.as_ref() else {
         return Err(CatalogError::SnapshotUnavailable);
@@ -897,7 +901,7 @@ pub(crate) fn execute_inner(
     let before_revision = source
         .database
         .get_revision()
-        .map_err(catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     if before_revision != expected_revision {
         return Err(CatalogError::StaleRevision {
             expected: expected_revision,
@@ -905,13 +909,16 @@ pub(crate) fn execute_inner(
         });
     }
 
-    profile_guard
-        .validate_current()
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+    profile_guard.validate_current().map_err(|error| {
+        super::catalog_error_from_db_for_source(
+            source_id,
+            wavecrate_library::sample_sources::SourceDbError::ProfileOwnership(error),
+        )
+    })?;
     source
         .database
         .validate_profile_guard(profile_guard)
-        .map_err(|error| CatalogError::ProfileUnavailable(error.to_string()))?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
     let before_commit_root_identity = checked_source_root_identity(source_id, &source.root)?;
     if before_commit_root_identity != *expected_root_identity {
         return Err(CatalogError::StaleRootGeneration {
@@ -928,7 +935,7 @@ pub(crate) fn execute_inner(
             expected_root_identity,
             updates,
         )
-        .map_err(catalog_error_from_db)?;
+        .map_err(|error| super::catalog_error_from_db_for_source(source_id, error))?;
 
     // The library receipt is durable authority. Any post-commit check failure only invalidates
     // the retained cache; it must never turn a successful database commit into CurationFailed.

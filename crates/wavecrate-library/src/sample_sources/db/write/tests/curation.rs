@@ -13,7 +13,9 @@ use crate::app_dirs::{
 };
 #[cfg(unix)]
 use crate::sample_sources::db::file_ops_journal::{CopyJournalEntryInit, FileOpJournalEntry};
-use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthState};
+use crate::sample_sources::db::{
+    DatabaseRootBindingGuard, SourceDirectoryTruthState, SourceLeaseError,
+};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
@@ -919,7 +921,12 @@ fn profile_mutation_guard_rolls_back_batch_after_database_child_replacement() {
     std::fs::create_dir(&child_path).expect("replacement database child");
 
     let result = batch.commit();
-    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert!(matches!(
+        result,
+        Err(SourceDbError::SourceLease(
+            SourceLeaseError::DatabaseRootReplaced { .. }
+        ))
+    ));
     assert_eq!(revision_value(&fixture.database), before_revision);
     assert_eq!(
         fixture
@@ -961,7 +968,12 @@ fn profile_mutation_guard_rejects_direct_journal_insert_after_child_replacement(
 
     let result =
         crate::sample_sources::db::file_ops_journal::insert_entry(&fixture.database, &entry);
-    assert!(matches!(result, Err(SourceDbError::ProfileOwnership(_))));
+    assert!(matches!(
+        result,
+        Err(SourceDbError::SourceLease(
+            SourceLeaseError::DatabaseRootReplaced { .. }
+        ))
+    ));
     assert!(
         crate::sample_sources::db::file_ops_journal::list_entries(&fixture.database)
             .unwrap()

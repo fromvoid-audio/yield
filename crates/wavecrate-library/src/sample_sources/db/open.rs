@@ -156,10 +156,6 @@ fn open_source_database_with_profile_guard_inner(
     profile_guard
         .validate_current()
         .map_err(SourceDbError::from)?;
-    if !root.is_dir() {
-        return Err(SourceDbError::InvalidRoot(root.to_path_buf()));
-    }
-
     let database_name = Path::new(super::DB_FILE_NAME);
     let db_path = database_root.path().join(database_name);
     database_root
@@ -174,7 +170,7 @@ fn open_source_database_with_profile_guard_inner(
         }
         None => Arc::new(
             BoundDatabaseRoot::for_external_source_root(profile_guard, root)
-                .map_err(SourceDbError::from)?,
+                .map_err(map_media_root_open_error)?,
         ),
     };
     if let Some(expected_database) = expected_database {
@@ -366,13 +362,55 @@ fn require_profile_ownership() -> Result<(), SourceDbError> {
     Err(SourceDbError::ProfileOwnershipRequired)
 }
 
-fn map_database_root_open_error(error: crate::app_dirs::ProfileOwnershipError) -> SourceDbError {
+pub(super) fn map_database_root_open_error(
+    error: crate::app_dirs::ProfileOwnershipError,
+) -> SourceDbError {
     match error {
-        crate::app_dirs::ProfileOwnershipError::SourceRootReplaced { path } => {
+        crate::app_dirs::ProfileOwnershipError::SourceRootReplaced { path }
+        | crate::app_dirs::ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path } => {
             SourceDbError::SourceLease(source_lease::SourceLeaseError::DatabaseRootReplaced {
                 path,
             })
         }
+        crate::app_dirs::ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason }
+        | crate::app_dirs::ProfileOwnershipError::ProfileChildDatabaseRootUnavailable {
+            path,
+            reason,
+        } => SourceDbError::SourceLease(source_lease::SourceLeaseError::DatabaseRootUnavailable {
+            path,
+            reason,
+        }),
+        crate::app_dirs::ProfileOwnershipError::ExternalSourceRootIdentityUnavailable {
+            path,
+            reason,
+        }
+        | crate::app_dirs::ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable {
+            path,
+            reason,
+        } => SourceDbError::SourceLease(
+            source_lease::SourceLeaseError::DatabaseRootIdentityUnavailable { path, reason },
+        ),
+        other => SourceDbError::ProfileOwnership(other),
+    }
+}
+
+fn map_media_root_open_error(error: crate::app_dirs::ProfileOwnershipError) -> SourceDbError {
+    match error {
+        crate::app_dirs::ProfileOwnershipError::SourceRootReplaced { path } => {
+            SourceDbError::SourceLease(source_lease::SourceLeaseError::SourceRootReplaced { path })
+        }
+        crate::app_dirs::ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason } => {
+            SourceDbError::SourceLease(source_lease::SourceLeaseError::SourceRootUnavailable {
+                path,
+                reason,
+            })
+        }
+        crate::app_dirs::ProfileOwnershipError::ExternalSourceRootIdentityUnavailable {
+            path,
+            reason,
+        } => SourceDbError::SourceLease(
+            source_lease::SourceLeaseError::SourceRootIdentityUnavailable { path, reason },
+        ),
         other => SourceDbError::ProfileOwnership(other),
     }
 }

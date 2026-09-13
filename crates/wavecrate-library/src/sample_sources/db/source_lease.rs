@@ -50,11 +50,43 @@ pub enum SourceLeaseError {
         /// External source-root path whose identity changed.
         path: PathBuf,
     },
+    /// The external source-root namespace could not be opened or inspected.
+    #[error("external source root is unavailable at {path}: {reason}")]
+    SourceRootUnavailable {
+        /// External source-root path involved in the failed operation.
+        path: PathBuf,
+        /// Stable bounded reason for the unavailable namespace.
+        reason: String,
+    },
+    /// The external source-root identity could not be established.
+    #[error("external source root identity is uncertain at {path}: {reason}")]
+    SourceRootIdentityUnavailable {
+        /// External source-root path whose identity could not be established.
+        path: PathBuf,
+        /// Stable bounded reason for the uncertain identity.
+        reason: String,
+    },
     /// The bound database namespace was replaced after its explicit binding was acquired.
     #[error("bound database root was replaced: {path}")]
     DatabaseRootReplaced {
         /// Database-root path whose identity changed.
         path: PathBuf,
+    },
+    /// The bound database namespace could not be opened or inspected.
+    #[error("bound database root is unavailable at {path}: {reason}")]
+    DatabaseRootUnavailable {
+        /// Database-root path involved in the failed operation.
+        path: PathBuf,
+        /// Stable bounded reason for the unavailable namespace.
+        reason: String,
+    },
+    /// The bound database-root identity could not be established.
+    #[error("bound database root identity is uncertain at {path}: {reason}")]
+    DatabaseRootIdentityUnavailable {
+        /// Database-root path whose identity could not be established.
+        path: PathBuf,
+        /// Stable bounded reason for the uncertain identity.
+        reason: String,
     },
     /// A retained SQLite database identity check failed.
     #[error(transparent)]
@@ -1881,14 +1913,29 @@ fn map_profile_error(error: ProfileOwnershipError) -> SourceLeaseError {
         ProfileOwnershipError::SourceRootReplaced { path } => {
             SourceLeaseError::SourceRootReplaced { path }
         }
+        ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason } => {
+            SourceLeaseError::SourceRootUnavailable { path, reason }
+        }
+        ProfileOwnershipError::ExternalSourceRootIdentityUnavailable { path, reason } => {
+            SourceLeaseError::SourceRootIdentityUnavailable { path, reason }
+        }
         other => SourceLeaseError::ProfileOwnership(other),
     }
 }
 
 pub(crate) fn map_database_root_error(error: ProfileOwnershipError) -> SourceLeaseError {
     match error {
-        ProfileOwnershipError::SourceRootReplaced { path } => {
+        ProfileOwnershipError::SourceRootReplaced { path }
+        | ProfileOwnershipError::ProfileChildDatabaseRootReplaced { path } => {
             SourceLeaseError::DatabaseRootReplaced { path }
+        }
+        ProfileOwnershipError::ExternalSourceRootUnavailable { path, reason }
+        | ProfileOwnershipError::ProfileChildDatabaseRootUnavailable { path, reason } => {
+            SourceLeaseError::DatabaseRootUnavailable { path, reason }
+        }
+        ProfileOwnershipError::ExternalSourceRootIdentityUnavailable { path, reason }
+        | ProfileOwnershipError::ProfileChildDatabaseRootIdentityUnavailable { path, reason } => {
+            SourceLeaseError::DatabaseRootIdentityUnavailable { path, reason }
         }
         other => SourceLeaseError::ProfileOwnership(other),
     }
@@ -1898,23 +1945,12 @@ fn validate_database_root(
     database_root: &BoundDatabaseRoot,
     profile_guard: &WritableProfileGuard,
 ) -> Result<(), SourceLeaseError> {
-    // `WritableProfileGuard::validate_current` runs first inside the binding as well, so a
-    // replaced profile root remains a profile ownership error. Once that succeeds, a
-    // `ProfileRootReplaced` result from a profile-child binding identifies the child namespace
-    // itself and is therefore surfaced as a database-root replacement.
-    profile_guard
-        .validate_current()
-        .map_err(SourceLeaseError::ProfileOwnership)?;
+    // The binding validates the profile root itself and preserves profile-root failures. Do not
+    // run a separate outer profile check and then infer a child replacement from its result: a
+    // profile can change between those two checks, and that race must remain a profile error.
     database_root
         .validate_profile_guard(profile_guard)
-        .map_err(|error| match error {
-            ProfileOwnershipError::ProfileRootReplaced { path }
-                if database_root.is_profile_namespace() =>
-            {
-                SourceLeaseError::DatabaseRootReplaced { path }
-            }
-            other => map_database_root_error(other),
-        })
+        .map_err(map_database_root_error)
 }
 
 const LEASE_TABLE_SQL: &str = "CREATE TABLE source_lease (
