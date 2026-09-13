@@ -68,7 +68,7 @@ jobs:
         run: |
           cargo test --locked -p wavecrate-library --lib profile_mutation_guard --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-library --lib readiness_ownership --no-default-features
+          cargo test --locked -p wavecrate-library --lib readiness --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-library --lib source_database_identity --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
