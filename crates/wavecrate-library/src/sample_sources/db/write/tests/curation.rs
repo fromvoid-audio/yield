@@ -12,10 +12,10 @@ use crate::app_dirs::{
     ConfigBaseGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
 #[cfg(unix)]
+use crate::sample_sources::db::SourceLeaseError;
+#[cfg(unix)]
 use crate::sample_sources::db::file_ops_journal::{CopyJournalEntryInit, FileOpJournalEntry};
-use crate::sample_sources::db::{
-    DatabaseRootBindingGuard, SourceDirectoryTruthState, SourceLeaseError,
-};
+use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthState};
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
