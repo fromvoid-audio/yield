@@ -921,5 +921,14 @@ and directly constructed records. Local validation passed 199 serialized journal
 tests (one helper ignored), including eight retained-observation tests, 50 codec,
 49 store and 15 owner tests. Library checks with and without default features,
 GPUI compilation, formatting and diff checks passed. Independent review found no
-meaningful correctness issues. Windows storage acceptance is pending. The V1
-default and SQLite schema remain unchanged.
+meaningful correctness issues. The V1 default and SQLite schema remain unchanged.
+
+Windows storage validation
+[34777623562](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34777623562)
+passed at exact commit `5e30d9a761a9e3a297284de19d6fef8b85ddf5c8`. Logs confirm
+187 journal tests (one helper ignored), including all eight retained-observation
+tests and V11 codec, owner persistence, retry/cancellation and restart coverage.
+The lane also passed 12 legacy-reader, 90 catalog, 60 session (one helper ignored),
+16 core edit-settings and five media-adapter tests. This accepts the V11 storage
+milestone; native Windows UI and restore/purge execution remain outside this
+validation scope.
