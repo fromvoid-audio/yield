@@ -356,8 +356,12 @@ after handoff, equal logical claims in simultaneously live databases, rejection
 without renewing an expired receiving lease, and legitimate same-owner renewal.
 The no-default production library check and seven profile-admission tests passed;
 the test-support readiness process fixture passed (one helper ignored).
-GPUI compilation, formatting and diff checks passed. Windows acceptance for this
-claim extension remains pending.
+GPUI compilation, formatting and diff checks passed. Windows acceptance passed
+on `84ab021fc` in
+[`34752500946`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34752500946).
+That run selected the full readiness suite (55 passed), including all three new
+claim-fence regressions. The earlier successful `b9c83f399` baseline run used a
+narrower filter and is not the regression acceptance evidence.
 
 ## Independent readiness publication
 
