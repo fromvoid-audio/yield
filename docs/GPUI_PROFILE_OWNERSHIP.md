@@ -525,7 +525,11 @@ Local validation passed: 107 journal tests (one helper ignored), three restart
 tests (one helper ignored), 61 session tests (one helper ignored), the production
 library check without default features, GPUI compilation, formatting and diff
 checks. Review identified and repaired V3/V4 foreign-field classification and
-retained retry chronology gaps; dedicated regressions cover both. Windows storage
-validation is pending. Other command families, later phase transitions, runtime
+retained retry chronology gaps; dedicated regressions cover both.
+[Windows storage validation](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34758799969)
+passed on exact `8fb486ff436e03d6e295f64439d5ede6fafce727`: 97 journal tests,
+including retry restart and both review regressions, 90 catalog tests and 60
+session tests. This is storage validation, not native Windows UI acceptance.
+Other command families, later phase transitions, runtime
 admission and compatibility import remain open under OPT-1337 and its dependent
 tickets.
