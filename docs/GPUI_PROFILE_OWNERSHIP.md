@@ -330,7 +330,10 @@ terminal outcome and reclaims all queue credits once; retirement between the
 background projection checks rejects the projection while a live owner succeeds;
 and an expired receive deadline stops stale-event draining without consuming a
 fresh queued event. Formatting and diff checks passed. Windows storage validation
-of this extension remains pending.
+passed on exact `7df74e1ca` in
+[`34750834289`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34750834289),
+including production admission, journal/source mutation ownership and
+catalog/session checks. Native Windows UI validation is outside that storage run.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
