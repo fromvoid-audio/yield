@@ -90,8 +90,12 @@ fn seed_readiness_work(root: &Path) {
         &targets,
         10,
     );
-    ReadinessStore::new(&mut connection)
-        .publish_targets(&publication)
+    let mut store = ReadinessStore::new(&mut connection);
+    let origin = store
+        .capture_publication_origin()
+        .expect("readiness publication origin");
+    store
+        .publish_targets(&origin, &publication)
         .expect("publish readiness targets");
     let snapshot = ReadinessStore::new(&mut connection)
         .reconcile(SOURCE_ID, 10)

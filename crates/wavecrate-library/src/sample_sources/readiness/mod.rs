@@ -22,10 +22,10 @@ pub use snapshot::{
 pub(crate) use store::reconcile_readiness_with_hook;
 pub use store::{
     ReadinessCompatibilityCleanup, ReadinessDeltaPublicationOutcome,
-    ReadinessEmbeddingArtifactTarget, ReadinessError, ReadinessSimilarityManifest,
-    ReadinessSimilarityManifestRequest, ReadinessSimilarityManifestRow,
-    ReadinessSimilarityPayloadContract, ReadinessSourceState, ReadinessStore,
-    ReadinessTargetDeltaPublication, ReadinessTargetPublication, ReadinessView,
+    ReadinessEmbeddingArtifactTarget, ReadinessError, ReadinessPublicationOrigin,
+    ReadinessSimilarityManifest, ReadinessSimilarityManifestRequest,
+    ReadinessSimilarityManifestRow, ReadinessSimilarityPayloadContract, ReadinessSourceState,
+    ReadinessStore, ReadinessTargetDeltaPublication, ReadinessTargetPublication, ReadinessView,
 };
 #[cfg(test)]
 pub(crate) use store::{

@@ -18,9 +18,9 @@ fn validate_claim_ownership(
     // Compare the immutable fence with the receiving store before validating the receiving
     // ownership. The latter may renew its retained lease, which must not happen for a claim that
     // is already known to belong to another source owner or epoch.
-    ownership.validate_claim_fence_identity(claim.publication_fence())?;
+    ownership.validate_publication_fence_identity(claim.publication_fence())?;
     ownership.validate(connection)?;
-    ownership.validate_claim_fence(claim.publication_fence())
+    ownership.validate_publication_fence(claim.publication_fence())
 }
 
 pub(crate) fn readiness_generation_is_known_unsupported(
@@ -84,9 +84,9 @@ pub(super) fn claim_readiness_target_owned(
     lease_duration_seconds: i64,
 ) -> Result<Option<ClaimedReadinessWork>, ReadinessError> {
     let publication_fence = ownership.publication_fence()?;
-    ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
+    ownership.validate_publication_fence_identity(publication_fence.as_ref())?;
     ownership.validate(&*connection)?;
-    ownership.validate_claim_fence(publication_fence.as_ref())?;
+    ownership.validate_publication_fence(publication_fence.as_ref())?;
     let lease_expires_at = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let candidate = tx
@@ -207,15 +207,15 @@ pub(super) fn claim_readiness_target_owned(
         eligibility,
     )) = candidate
     else {
-        ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
+        ownership.validate_publication_fence_identity(publication_fence.as_ref())?;
         ownership.validate(&tx)?;
-        ownership.validate_claim_fence(publication_fence.as_ref())?;
+        ownership.validate_publication_fence(publication_fence.as_ref())?;
         tx.commit()?;
         return Ok(None);
     };
-    ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
+    ownership.validate_publication_fence_identity(publication_fence.as_ref())?;
     ownership.validate(&tx)?;
-    ownership.validate_claim_fence(publication_fence.as_ref())?;
+    ownership.validate_publication_fence(publication_fence.as_ref())?;
     let previous_claim_generation =
         decode_counter("readiness_claim_generation", stored_claim_generation)?;
     let claim_generation = previous_claim_generation
@@ -262,9 +262,9 @@ pub(super) fn claim_readiness_target_owned(
         content_generation: requested.content_generation.clone(),
         eligibility: decode_eligibility(eligibility)?,
     };
-    ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
+    ownership.validate_publication_fence_identity(publication_fence.as_ref())?;
     ownership.validate(&tx)?;
-    ownership.validate_claim_fence(publication_fence.as_ref())?;
+    ownership.validate_publication_fence(publication_fence.as_ref())?;
     tx.commit()?;
     Ok(Some(ClaimedReadinessWork {
         target,

@@ -954,9 +954,18 @@ fn one_identity_delta_preserves_unchanged_targets_and_running_work() {
         "layout-v1",
         200,
     );
-    let outcome = ReadinessStore::new(&mut connection)
-        .publish_target_delta_with_cancel(&publication, &std::sync::atomic::AtomicBool::new(false))
+    let mut store = ReadinessStore::new(&mut connection);
+    let origin = store
+        .capture_publication_origin()
+        .expect("readiness publication origin");
+    let outcome = store
+        .publish_target_delta_with_cancel(
+            &origin,
+            &publication,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
         .expect("publish readiness delta");
+    drop(store);
     membership.remove("change", "old-hash");
     membership.remove("delete", "delete-hash");
     membership.add("change", "new-hash");
@@ -1089,15 +1098,21 @@ fn readiness_delta_generation_gap_requires_complete_publication() {
         "layout-v1",
         200,
     );
+    let mut store = ReadinessStore::new(&mut connection);
+    let origin = store
+        .capture_publication_origin()
+        .expect("readiness publication origin");
     assert_eq!(
-        ReadinessStore::new(&mut connection)
+        store
             .publish_target_delta_with_cancel(
+                &origin,
                 &publication,
                 &std::sync::atomic::AtomicBool::new(false),
             )
             .expect("attempt readiness delta"),
         ReadinessDeltaPublicationOutcome::RequiresFullPublication
     );
+    drop(store);
     let state = ReadinessStore::new(&mut connection)
         .source_state(SOURCE_ID)
         .expect("read source state")

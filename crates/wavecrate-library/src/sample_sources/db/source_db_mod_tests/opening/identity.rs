@@ -1755,17 +1755,23 @@ fn source_database_identity_rejects_replacement_during_readiness_write() {
         "membership-v1",
     );
     let targets = [target];
+    let origin = readiness
+        .capture_publication_origin()
+        .expect("readiness publication origin");
 
     let error = readiness
-        .publish_targets(&ReadinessTargetPublication::new(
-            "identity-during-readiness",
-            1,
-            1,
-            SourceAvailability::Active,
-            "readiness-contract-v1",
-            &targets,
-            1,
-        ))
+        .publish_targets(
+            &origin,
+            &ReadinessTargetPublication::new(
+                "identity-during-readiness",
+                1,
+                1,
+                SourceAvailability::Active,
+                "readiness-contract-v1",
+                &targets,
+                1,
+            ),
+        )
         .expect_err("replacement during readiness write must reject before commit");
     assert!(matches!(
         error,

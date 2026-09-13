@@ -22,7 +22,7 @@ use super::{
     ReadinessRetryPolicy, ReadinessSnapshot, ReadinessStage, ReadinessTarget,
     ReadinessWorkMutationOutcome, ReadinessWorkStats, SourceAvailability,
 };
-use crate::sample_sources::db::ReadinessOwnership;
+use crate::sample_sources::db::{ReadinessOwnership, SourcePublicationFence};
 use crate::sample_sources::readiness::ArtifactPublishOutcome;
 
 /// Typed request for atomically publishing a source's complete desired readiness set.
@@ -105,6 +105,32 @@ impl<'a> ReadinessTargetDeltaPublication<'a> {
     }
 }
 
+/// Opaque expected-source identity stamp for a readiness publication.
+///
+/// The origin retains only a weak source lease and an in-memory publication generation. It does
+/// not keep the source database, SQLite control connection, or physical-source lock alive. Capture
+/// one from the [`ReadinessStore`] at work admission and pass that same origin to the eventual
+/// publication boundary, where current ownership and the original fence are validated.
+#[derive(Clone, Debug)]
+pub struct ReadinessPublicationOrigin {
+    publication_fence: Option<SourcePublicationFence>,
+}
+
+impl ReadinessPublicationOrigin {
+    fn from_fence(publication_fence: Option<SourcePublicationFence>) -> Self {
+        Self { publication_fence }
+    }
+
+    pub(crate) fn publication_fence(&self) -> Option<&SourcePublicationFence> {
+        self.publication_fence.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unowned_fixture() -> Self {
+        Self::from_fence(None)
+    }
+}
+
 /// Result of attempting a bounded target delta.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadinessDeltaPublicationOutcome {
@@ -177,14 +203,27 @@ impl<'connection> ReadinessStore<'connection> {
         }
     }
 
+    /// Capture the expected physical-source identity for work admitted by this store.
+    ///
+    /// The returned origin is an immutable weak stamp and does not itself validate or renew
+    /// ownership. In test-only unowned fixtures it may contain no physical-source fence; normal
+    /// raw connections return [`ReadinessError::OwnershipRequired`].
+    pub fn capture_publication_origin(&self) -> Result<ReadinessPublicationOrigin, ReadinessError> {
+        self.ownership
+            .publication_fence()
+            .map(ReadinessPublicationOrigin::from_fence)
+    }
+
     /// Atomically publish one complete, validated target generation.
     pub fn publish_targets(
         &mut self,
+        origin: &ReadinessPublicationOrigin,
         publication: &ReadinessTargetPublication<'_>,
     ) -> Result<(), ReadinessError> {
         persistence::replace_readiness_targets_owned(
             self.connection,
             &self.ownership,
+            origin,
             publication.source_id,
             publication.source_generation,
             publication.readiness_revision,
@@ -199,12 +238,14 @@ impl<'connection> ReadinessStore<'connection> {
     /// Publish targets while rolling back if cancellation is observed.
     pub fn publish_targets_with_cancel(
         &mut self,
+        origin: &ReadinessPublicationOrigin,
         publication: &ReadinessTargetPublication<'_>,
         cancel: &AtomicBool,
     ) -> Result<(), ReadinessError> {
         persistence::replace_readiness_targets_owned(
             self.connection,
             &self.ownership,
+            origin,
             publication.source_id,
             publication.source_generation,
             publication.readiness_revision,
@@ -219,12 +260,14 @@ impl<'connection> ReadinessStore<'connection> {
     /// Apply a bounded readiness target delta or request a complete fallback publication.
     pub fn publish_target_delta_with_cancel(
         &mut self,
+        origin: &ReadinessPublicationOrigin,
         publication: &ReadinessTargetDeltaPublication<'_>,
         cancel: &AtomicBool,
     ) -> Result<ReadinessDeltaPublicationOutcome, ReadinessError> {
         persistence::apply_readiness_target_delta_owned(
             self.connection,
             &self.ownership,
+            origin,
             publication.source_id,
             publication.source_generation,
             publication.readiness_revision,
@@ -457,9 +500,15 @@ impl<'connection> ReadinessStore<'connection> {
     /// Publish an independently produced artifact if its target is still current.
     pub fn publish_artifact(
         &mut self,
+        origin: &ReadinessPublicationOrigin,
         artifact: &ReadinessArtifact,
     ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-        persistence::publish_readiness_artifact_owned(self.connection, &self.ownership, artifact)
+        persistence::publish_readiness_artifact_owned(
+            self.connection,
+            &self.ownership,
+            origin,
+            artifact,
+        )
     }
 
     /// Whether the readiness schema required for source processing is present.

@@ -269,12 +269,12 @@ impl<'a> ReadinessOwnership<'a> {
         }
     }
 
-    /// Compare a claim's physical-source fence with the receiving retained lease.
+    /// Compare a publication's physical-source fence with the receiving retained lease.
     ///
     /// This check is deliberately cheap and must run before current ownership validation, because
     /// that validation may renew an idle receiving lease. It reads only the weak pointer identity,
     /// immutable owner/epoch values, and the fence's in-memory liveness token.
-    pub(crate) fn validate_claim_fence_identity(
+    pub(crate) fn validate_publication_fence_identity(
         &self,
         publication_fence: Option<&source_lease::SourcePublicationFence>,
     ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
@@ -325,12 +325,12 @@ impl<'a> ReadinessOwnership<'a> {
         }
     }
 
-    /// Fully validate a claim's physical-source fence after current ownership validation.
+    /// Fully validate a publication's physical-source fence after current ownership validation.
     ///
-    /// The caller must perform [`Self::validate_claim_fence_identity`] first. This read-only
+    /// The caller must perform [`Self::validate_publication_fence_identity`] first. This read-only
     /// validation may use the issuing lease's retained control connection and is required again
     /// at each durable mutation boundary.
-    pub(crate) fn validate_claim_fence(
+    pub(crate) fn validate_publication_fence(
         &self,
         publication_fence: Option<&source_lease::SourcePublicationFence>,
     ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
@@ -347,7 +347,7 @@ impl<'a> ReadinessOwnership<'a> {
                     .validate()
                     .map_err(crate::sample_sources::readiness::ReadinessError::from)
             }
-            _ => self.validate_claim_fence_identity(publication_fence),
+            _ => self.validate_publication_fence_identity(publication_fence),
         }
     }
 

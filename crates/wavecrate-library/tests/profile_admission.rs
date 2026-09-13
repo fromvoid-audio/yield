@@ -390,10 +390,13 @@ fn readiness_ownership_raw_mutations_fail_without_side_effects() {
         1,
     );
 
-    {
+    let owned_origin = {
         let mut owned_store = database.readiness_store().expect("owned readiness store");
+        let origin = owned_store
+            .capture_publication_origin()
+            .expect("owned readiness publication origin");
         owned_store
-            .publish_targets(&publication)
+            .publish_targets(&origin, &publication)
             .expect("owned readiness publication");
         owned_store
             .persist_deficits(
@@ -410,7 +413,8 @@ fn readiness_ownership_raw_mutations_fail_without_side_effects() {
                 .source_exists("readiness-ownership-source")
                 .expect("read readiness source")
         );
-    }
+        origin
+    };
 
     let database_path = app_root_path.join(profile_child).join(DB_FILE_NAME);
     let mut raw_connection = Connection::open(&database_path).expect("raw readiness connection");
@@ -441,13 +445,22 @@ fn readiness_ownership_raw_mutations_fail_without_side_effects() {
         );
     }
 
-    let raw_publish_error = ReadinessStore::new(&mut raw_connection)
-        .publish_targets(&publication)
+    let raw_origin_error = ReadinessStore::new(&mut raw_connection)
+        .capture_publication_origin()
+        .expect_err("raw readiness origin must require profile ownership");
+    assert!(matches!(
+        raw_origin_error,
+        ReadinessError::OwnershipRequired
+    ));
+    let mut raw_store = ReadinessStore::new(&mut raw_connection);
+    let raw_publish_error = raw_store
+        .publish_targets(&owned_origin, &publication)
         .expect_err("raw readiness publication must require profile ownership");
     assert!(matches!(
         raw_publish_error,
         ReadinessError::OwnershipRequired
     ));
+    drop(raw_store);
     assert_eq!(row_count(&raw_connection), 1);
 
     let job_state = |connection: &Connection| {

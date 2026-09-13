@@ -348,8 +348,7 @@ also run at the transaction's commit boundary.
 An owned store rejects a missing or mismatched claim fence. Explicitly unowned
 fixtures retain their legacy claim construction only in test/test-support builds;
 they cannot receive an owned claim. Keeping a claim does not retain the source
-database lock. Independent readiness artifact and target publication still need
-their own physical-source proof; this claim extension does not complete OPT-1349.
+database lock.
 
 Local validation passed three focused claim-fence tests and the full library
 suite (665 passed, three existing ignored). Tests cover every terminal mutation
@@ -359,6 +358,30 @@ The no-default production library check and seven profile-admission tests passed
 the test-support readiness process fixture passed (one helper ignored).
 GPUI compilation, formatting and diff checks passed. Windows acceptance for this
 claim extension remains pending.
+
+## Independent readiness publication
+
+`ReadinessPublicationOrigin` captures an immutable expected source owner for work
+before its result is produced. Capture is cheap and does not grant writable
+authority. Artifact, full-target, cancel-aware full-target and delta publication
+require that explicit origin; publication cannot silently bind a stale result to
+a new owner. The receiving store checks identity before any lease renewal, then
+validates current ownership and the original fence before mutation and commit.
+Persisted artifact data remains unchanged.
+
+Handoff and cross-database tests preserve existing targets, source revisions and
+artifacts when the origin is stale. An expired receiving lease is unchanged on
+mismatch, while the receiving owner's own origin can renew and publish. Retaining
+an origin does not prevent source handoff. Unowned origins remain fixture-only;
+normal raw connections cannot capture one.
+
+Local validation passed two new origin regressions, the three claim regressions,
+and the full library suite (667 passed, three existing ignored). Production
+no-default compilation, seven profile-admission tests, the readiness process
+fixture (one passed, one helper ignored), GPUI compilation, formatting and diff
+checks passed. Windows acceptance remains pending. Stable source diagnostics and
+remaining integration acceptance still keep OPT-1349 open; no readiness executor
+has been ported from the excluded reference application in this work.
 
 ## Journal coordination
 

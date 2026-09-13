@@ -12,11 +12,24 @@ use super::super::{
     },
     snapshot::{ArtifactPublishOutcome, ReadinessDeficit},
 };
-use super::{ReadinessDeltaPublicationOutcome, error::ReadinessError};
+use super::{ReadinessDeltaPublicationOutcome, ReadinessPublicationOrigin, error::ReadinessError};
 use crate::sample_sources::db::ReadinessOwnership;
 
 #[cfg(test)]
 const TEST_READINESS_CONTRACT_VERSION: &str = "readiness-test-contract-v1";
+
+fn validate_publication_ownership(
+    connection: &Connection,
+    ownership: &ReadinessOwnership<'_>,
+    origin: &ReadinessPublicationOrigin,
+) -> Result<(), ReadinessError> {
+    // Compare the immutable origin with the receiving retained lease before current ownership
+    // validation, which may renew an idle receiving lease. The full issuing-fence check then
+    // runs after that validation and again at the transaction's commit boundary.
+    ownership.validate_publication_fence_identity(origin.publication_fence())?;
+    ownership.validate(connection)?;
+    ownership.validate_publication_fence(origin.publication_fence())
+}
 
 /// Atomically replace the complete desired readiness set for one source generation.
 #[cfg(test)]
@@ -55,9 +68,11 @@ pub(super) fn replace_readiness_targets_inner(
     updated_at: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), ReadinessError> {
+    let origin = ReadinessPublicationOrigin::unowned_fixture();
     replace_readiness_targets_owned(
         connection,
         &ReadinessOwnership::unowned(),
+        &origin,
         source_id,
         source_generation,
         readiness_revision,
@@ -73,6 +88,7 @@ pub(super) fn replace_readiness_targets_inner(
 pub(super) fn replace_readiness_targets_owned(
     connection: &mut Connection,
     ownership: &ReadinessOwnership<'_>,
+    origin: &ReadinessPublicationOrigin,
     source_id: &str,
     source_generation: i64,
     readiness_revision: i64,
@@ -82,12 +98,13 @@ pub(super) fn replace_readiness_targets_owned(
     updated_at: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_publication_ownership(&*connection, ownership, origin)?;
     validate_contract_version(contract_version)?;
     validate_targets(source_id, source_generation, targets, cancel)?;
     let membership = membership_from_targets(targets);
     cancellation_checkpoint(cancel)?;
     let tx = connection.transaction()?;
+    validate_publication_ownership(&tx, ownership, origin)?;
     let current_state = tx
         .query_row(
             "SELECT source_generation, readiness_revision
@@ -172,7 +189,7 @@ pub(super) fn replace_readiness_targets_owned(
            )",
         [source_id],
     )?;
-    ownership.validate(&tx)?;
+    validate_publication_ownership(&tx, ownership, origin)?;
     tx.commit()?;
     Ok(())
 }
@@ -181,6 +198,7 @@ pub(super) fn replace_readiness_targets_owned(
 pub(super) fn apply_readiness_target_delta_owned(
     connection: &mut Connection,
     ownership: &ReadinessOwnership<'_>,
+    origin: &ReadinessPublicationOrigin,
     source_id: &str,
     source_generation: i64,
     readiness_revision: i64,
@@ -192,7 +210,7 @@ pub(super) fn apply_readiness_target_delta_owned(
     updated_at: i64,
     cancel: Option<&AtomicBool>,
 ) -> Result<ReadinessDeltaPublicationOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_publication_ownership(&*connection, ownership, origin)?;
     validate_contract_version(contract_version)?;
     if similarity_artifact_version.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactVersion {
@@ -204,6 +222,7 @@ pub(super) fn apply_readiness_target_delta_owned(
     validate_delta_targets(source_id, source_generation, upsert_targets, cancel)?;
     cancellation_checkpoint(cancel)?;
     let tx = connection.transaction()?;
+    validate_publication_ownership(&tx, ownership, origin)?;
     let Some((
         current_generation,
         current_revision,
@@ -411,7 +430,7 @@ pub(super) fn apply_readiness_target_delta_owned(
         ],
     )?);
     cancellation_checkpoint(cancel)?;
-    ownership.validate(&tx)?;
+    validate_publication_ownership(&tx, ownership, origin)?;
     tx.commit()?;
     Ok(ReadinessDeltaPublicationOutcome::Applied {
         membership_generation,
@@ -425,15 +444,22 @@ pub(crate) fn publish_readiness_artifact(
     connection: &mut Connection,
     artifact: &ReadinessArtifact,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    publish_readiness_artifact_owned(connection, &ReadinessOwnership::unowned(), artifact)
+    let origin = ReadinessPublicationOrigin::unowned_fixture();
+    publish_readiness_artifact_owned(
+        connection,
+        &ReadinessOwnership::unowned(),
+        &origin,
+        artifact,
+    )
 }
 
 pub(super) fn publish_readiness_artifact_owned(
     connection: &mut Connection,
     ownership: &ReadinessOwnership<'_>,
+    origin: &ReadinessPublicationOrigin,
     artifact: &ReadinessArtifact,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_publication_ownership(&*connection, ownership, origin)?;
     if artifact.artifact_version.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactVersion {
             source_id: artifact.source_id.clone(),
@@ -449,6 +475,7 @@ pub(super) fn publish_readiness_artifact_owned(
         });
     }
     let tx = connection.transaction()?;
+    validate_publication_ownership(&tx, ownership, origin)?;
     let is_current = tx.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -515,7 +542,7 @@ pub(super) fn publish_readiness_artifact_owned(
             artifact.completed_at,
         ],
     )?;
-    ownership.validate(&tx)?;
+    validate_publication_ownership(&tx, ownership, origin)?;
     tx.commit()?;
     Ok(ArtifactPublishOutcome::Recorded)
 }

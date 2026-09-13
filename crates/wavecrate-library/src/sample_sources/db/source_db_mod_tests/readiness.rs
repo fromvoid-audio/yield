@@ -9,9 +9,10 @@ use crate::{
     sample_sources::{
         SourceLeaseError, SourcePublicationFenceError,
         readiness::{
-            ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessError,
+            ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessArtifact, ReadinessError,
             ReadinessFailureClassification, ReadinessRetryPolicy, ReadinessStage, ReadinessStore,
-            ReadinessTarget, ReadinessTargetPublication, SourceAvailability,
+            ReadinessTarget, ReadinessTargetDeltaPublication, ReadinessTargetPublication,
+            SourceAvailability,
         },
     },
 };
@@ -71,6 +72,9 @@ fn readiness_ownership_rejection_happens_before_transaction() {
     let binding = ControlledReadinessBinding::new();
     let mut database = database.retain_database_root_binding(binding.clone());
     let mut store = database.readiness_store().expect("owned readiness store");
+    let origin = store
+        .capture_publication_origin()
+        .expect("readiness publication origin");
     binding.fail.store(true, Ordering::SeqCst);
     let target = ReadinessTarget::source(
         "readiness-owned-source",
@@ -82,7 +86,7 @@ fn readiness_ownership_rejection_happens_before_transaction() {
     let targets = [target];
 
     let error = store
-        .publish_targets(&publication(&targets))
+        .publish_targets(&origin, &publication(&targets))
         .expect_err("invalidated owner must reject before begin");
     assert!(matches!(
         error,
@@ -148,6 +152,9 @@ fn readiness_ownership_rejection_before_commit_rolls_back_transaction() {
         },
     ));
     let mut store = database.readiness_store().expect("owned readiness store");
+    let origin = store
+        .capture_publication_origin()
+        .expect("readiness publication origin");
     let target = ReadinessTarget::source(
         "readiness-owned-source",
         ReadinessStage::SimilarityLayout,
@@ -158,7 +165,7 @@ fn readiness_ownership_rejection_before_commit_rolls_back_transaction() {
     let targets = [target];
 
     let error = store
-        .publish_targets(&publication(&targets))
+        .publish_targets(&origin, &publication(&targets))
         .expect_err("owner replacement before commit must reject");
     assert!(matches!(
         error,
@@ -176,6 +183,389 @@ fn readiness_ownership_rejection_before_commit_rolls_back_transaction() {
         })
         .expect("read readiness rows");
     assert_eq!(row_count, 0);
+}
+
+#[test]
+fn readiness_publication_origin_rejects_stale_artifact_and_targets_after_handoff() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let replacement_root = tempdir().expect("replacement source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let mut database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "readiness-publication-origin-handoff",
+    )
+    .expect("profile-owned source database");
+    let target = ReadinessTarget::source(
+        "readiness-owned-source",
+        ReadinessStage::SimilarityLayout,
+        "layout-v1",
+        1,
+        "membership-v1",
+    );
+    let original_origin = {
+        let mut store = database.readiness_store().expect("owned readiness store");
+        let origin = store
+            .capture_publication_origin()
+            .expect("readiness publication origin");
+        let targets = [target.clone()];
+        store
+            .publish_targets(&origin, &publication(&targets))
+            .expect("publish initial readiness target");
+        assert_eq!(
+            store
+                .publish_artifact(&origin, &ReadinessArtifact::for_target(&target, 10))
+                .expect("publish initial readiness artifact"),
+            ArtifactPublishOutcome::Recorded
+        );
+        origin
+    };
+
+    // Retaining an origin must not retain the physical lease, so the consuming handoff can still
+    // take ownership and reopen the same database while the old origin remains queued.
+    let mut database = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .expect("catalog root handoff");
+    let mut store = database
+        .readiness_store()
+        .expect("new owned readiness store");
+    let stale_artifact = ReadinessArtifact::for_target(&target, 99);
+    assert!(matches!(
+        store.publish_artifact(&original_origin, &stale_artifact),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+
+    let stale_target = ReadinessTarget::source(
+        "readiness-owned-source",
+        ReadinessStage::SimilarityLayout,
+        "layout-v2",
+        1,
+        "membership-v2",
+    );
+    let stale_targets = [stale_target];
+    let stale_publication = ReadinessTargetPublication::new(
+        "readiness-owned-source",
+        1,
+        2,
+        SourceAvailability::Active,
+        "readiness-contract-v1",
+        &stale_targets,
+        20,
+    );
+    assert!(matches!(
+        store.publish_targets(&original_origin, &stale_publication),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+    assert!(matches!(
+        store.publish_targets_with_cancel(
+            &original_origin,
+            &stale_publication,
+            &AtomicBool::new(false),
+        ),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+
+    let no_upserts: [ReadinessTarget; 0] = [];
+    let no_deleted_scope_ids: [String; 0] = [];
+    let stale_delta = ReadinessTargetDeltaPublication::new(
+        "readiness-owned-source",
+        2,
+        3,
+        SourceAvailability::Active,
+        "readiness-contract-v1",
+        &no_upserts,
+        &no_deleted_scope_ids,
+        "layout-v3",
+        30,
+    );
+    assert!(matches!(
+        store.publish_target_delta_with_cancel(
+            &original_origin,
+            &stale_delta,
+            &AtomicBool::new(false),
+        ),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+    drop(store);
+
+    let source_state: (i64, i64, String) = database
+        .connection
+        .query_row(
+            "SELECT source_generation, readiness_revision, contract_version
+             FROM source_readiness_sources
+             WHERE source_id = 'readiness-owned-source'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("unchanged readiness source state");
+    assert_eq!(source_state, (1, 1, String::from("readiness-contract-v1")));
+    let target_state: (String, String) = database
+        .connection
+        .query_row(
+            "SELECT required_version, content_generation
+             FROM source_readiness_targets
+             WHERE source_id = 'readiness-owned-source'
+               AND scope_kind = 'source'
+               AND scope_id = 'readiness-owned-source'
+               AND stage = 'similarity_layout'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("unchanged readiness target");
+    assert_eq!(
+        target_state,
+        (String::from("layout-v1"), String::from("membership-v1"))
+    );
+    let artifact_state: (String, String, i64) = database
+        .connection
+        .query_row(
+            "SELECT artifact_version, content_generation, completed_at
+             FROM source_readiness_artifacts
+             WHERE source_id = 'readiness-owned-source'
+               AND scope_kind = 'source'
+               AND scope_id = 'readiness-owned-source'
+               AND stage = 'similarity_layout'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("unchanged readiness artifact");
+    assert_eq!(
+        artifact_state,
+        (String::from("layout-v1"), String::from("membership-v1"), 10)
+    );
+
+    let mut store = database
+        .readiness_store()
+        .expect("fresh owned readiness store");
+    let fresh_origin = store
+        .capture_publication_origin()
+        .expect("fresh readiness publication origin");
+    assert_eq!(
+        store
+            .publish_artifact(&fresh_origin, &stale_artifact)
+            .expect("current origin publishes artifact"),
+        ArtifactPublishOutcome::Recorded
+    );
+}
+
+#[test]
+fn readiness_publication_origin_rejects_cross_database_publications_without_renewal() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root_a = tempdir().expect("database root a");
+    let database_root_b = tempdir().expect("database root b");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let mut database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root_a.path(),
+    )
+    .expect("database a");
+    let mut database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root_b.path(),
+    )
+    .expect("database b");
+    let target = ReadinessTarget::source(
+        "readiness-cross-publication",
+        ReadinessStage::SimilarityLayout,
+        "layout-v1",
+        1,
+        "membership-v1",
+    );
+    let publication = ReadinessTargetPublication::new(
+        "readiness-cross-publication",
+        1,
+        1,
+        SourceAvailability::Active,
+        "readiness-contract-v1",
+        std::slice::from_ref(&target),
+        1,
+    );
+    let origin_a = {
+        let mut store_a = database_a.readiness_store().expect("store a");
+        let origin = store_a
+            .capture_publication_origin()
+            .expect("database a publication origin");
+        store_a
+            .publish_targets(&origin, &publication)
+            .expect("publish target a");
+        origin
+    };
+    let mut store_b = database_b.readiness_store().expect("store b");
+    let origin_b = store_b
+        .capture_publication_origin()
+        .expect("database b publication origin");
+    store_b
+        .publish_targets(&origin_b, &publication)
+        .expect("publish target b");
+    assert_eq!(
+        store_b
+            .publish_artifact(&origin_b, &ReadinessArtifact::for_target(&target, 10))
+            .expect("publish database b artifact"),
+        ArtifactPublishOutcome::Recorded
+    );
+
+    // Keep B's store alive while expiring only its durable lease. A wrong database origin must be
+    // rejected before B's current ownership validation can renew that expired lease.
+    let lease_probe_path = database_root_b
+        .path()
+        .join(crate::sample_sources::db::DB_FILE_NAME);
+    let lease_probe = rusqlite::Connection::open(&lease_probe_path).expect("lease probe");
+    lease_probe
+        .execute(
+            "UPDATE source_lease
+             SET acquired_at = 1, expires_at = 1
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("expire database b physical lease");
+    let lease_before: (i64, i64, String, i64) = lease_probe
+        .query_row(
+            "SELECT acquired_at, expires_at, owner_identity, lease_epoch
+             FROM source_lease
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("expired database b lease");
+    let source_state_before: (i64, i64, String) = lease_probe
+        .query_row(
+            "SELECT source_generation, readiness_revision, contract_version
+             FROM source_readiness_sources
+             WHERE source_id = 'readiness-cross-publication'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("database b source state before mismatch");
+    let artifact_before: (String, String, i64) = lease_probe
+        .query_row(
+            "SELECT artifact_version, content_generation, completed_at
+             FROM source_readiness_artifacts
+             WHERE source_id = 'readiness-cross-publication'
+               AND scope_kind = 'source'
+               AND scope_id = 'readiness-cross-publication'
+               AND stage = 'similarity_layout'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("database b artifact before mismatch");
+
+    let stale_artifact = ReadinessArtifact::for_target(&target, 99);
+    assert!(matches!(
+        store_b.publish_artifact(&origin_a, &stale_artifact),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+    let replacement_target = ReadinessTarget::source(
+        "readiness-cross-publication",
+        ReadinessStage::SimilarityLayout,
+        "layout-v2",
+        1,
+        "membership-v2",
+    );
+    let replacement_targets = [replacement_target];
+    let stale_publication = ReadinessTargetPublication::new(
+        "readiness-cross-publication",
+        1,
+        2,
+        SourceAvailability::Active,
+        "readiness-contract-v1",
+        &replacement_targets,
+        20,
+    );
+    assert!(matches!(
+        store_b.publish_targets(&origin_a, &stale_publication),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+    let no_upserts: [ReadinessTarget; 0] = [];
+    let no_deleted_scope_ids: [String; 0] = [];
+    let stale_delta = ReadinessTargetDeltaPublication::new(
+        "readiness-cross-publication",
+        2,
+        3,
+        SourceAvailability::Active,
+        "readiness-contract-v1",
+        &no_upserts,
+        &no_deleted_scope_ids,
+        "layout-v3",
+        30,
+    );
+    assert!(matches!(
+        store_b.publish_target_delta_with_cancel(&origin_a, &stale_delta, &AtomicBool::new(false),),
+        Err(ReadinessError::SourcePublicationFence(
+            SourcePublicationFenceError::LeaseMismatch
+        ))
+    ));
+
+    let lease_after: (i64, i64, String, i64) = lease_probe
+        .query_row(
+            "SELECT acquired_at, expires_at, owner_identity, lease_epoch
+             FROM source_lease
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("database b lease after mismatch");
+    let source_state_after: (i64, i64, String) = lease_probe
+        .query_row(
+            "SELECT source_generation, readiness_revision, contract_version
+             FROM source_readiness_sources
+             WHERE source_id = 'readiness-cross-publication'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("database b source state after mismatch");
+    let artifact_after: (String, String, i64) = lease_probe
+        .query_row(
+            "SELECT artifact_version, content_generation, completed_at
+             FROM source_readiness_artifacts
+             WHERE source_id = 'readiness-cross-publication'
+               AND scope_kind = 'source'
+               AND scope_id = 'readiness-cross-publication'
+               AND stage = 'similarity_layout'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("database b artifact after mismatch");
+    assert_eq!(lease_after, lease_before);
+    assert_eq!(source_state_after, source_state_before);
+    assert_eq!(artifact_after, artifact_before);
+    drop(lease_probe);
+
+    assert_eq!(
+        store_b
+            .publish_artifact(&origin_b, &ReadinessArtifact::for_target(&target, 11))
+            .expect("database b own origin renews and publishes"),
+        ArtifactPublishOutcome::Recorded
+    );
+    drop(store_b);
+    let renewed_expiry = database_b
+        .connection
+        .query_row(
+            "SELECT expires_at FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("renewed database b lease");
+    assert!(renewed_expiry > 1);
 }
 
 #[test]
@@ -201,9 +591,12 @@ fn readiness_claim_fence_rejects_every_old_owner_mutation_after_catalog_handoff(
     );
     let claim = {
         let mut store = database.readiness_store().expect("owned readiness store");
+        let origin = store
+            .capture_publication_origin()
+            .expect("readiness publication origin");
         let targets = [target.clone()];
         store
-            .publish_targets(&publication(&targets))
+            .publish_targets(&origin, &publication(&targets))
             .expect("publish readiness target");
         let deficit = store
             .reconcile("readiness-owned-source", 10)
@@ -364,8 +757,11 @@ fn readiness_claim_fence_rejects_cross_database_claims_and_accepts_own_claims() 
     );
     let claim_a = {
         let mut store = database_a.readiness_store().expect("store a");
+        let origin = store
+            .capture_publication_origin()
+            .expect("readiness publication origin");
         store
-            .publish_targets(&publication)
+            .publish_targets(&origin, &publication)
             .expect("publish target a");
         let deficit = store
             .reconcile("readiness-cross-database", 10)
@@ -383,8 +779,11 @@ fn readiness_claim_fence_rejects_cross_database_claims_and_accepts_own_claims() 
             .expect("claim a available")
     };
     let mut store_b = database_b.readiness_store().expect("store b");
+    let origin_b = store_b
+        .capture_publication_origin()
+        .expect("database b publication origin");
     store_b
-        .publish_targets(&publication)
+        .publish_targets(&origin_b, &publication)
         .expect("publish target b");
     let deficit = store_b
         .reconcile("readiness-cross-database", 10)
@@ -524,9 +923,12 @@ fn readiness_claim_fence_allows_same_owner_physical_lease_renewal() {
     );
     {
         let mut store = database.readiness_store().expect("owned readiness store");
+        let origin = store
+            .capture_publication_origin()
+            .expect("readiness publication origin");
         let targets = [target.clone()];
         store
-            .publish_targets(&publication(&targets))
+            .publish_targets(&origin, &publication(&targets))
             .expect("publish readiness target");
         let deficit = store
             .reconcile("readiness-owned-source", 10)
