@@ -7,7 +7,8 @@
 //! request, V5 the first typed copy command and retry observations, and V6 the tagged command
 //! envelope. V7 adds a typed in-place WAV edit observation, V8 adds bounded namespace mutation
 //! observations, V9 adds whole-file render observations, V10 adds bounded configured-trash and
-//! retained-folder removal observations, and V11 adds retained-folder resolution observations.
+//! retained-folder removal observations, V11 adds retained-folder resolution observations, and V12
+//! adds selection-only Normalize observations.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -37,6 +38,8 @@ pub const SCHEMA_V9: u32 = 9;
 pub const SCHEMA_V10: u32 = 10;
 /// The retained-folder restore and purge command envelope schema.
 pub const SCHEMA_V11: u32 = 11;
+/// The selection-only Normalize command envelope schema.
+pub const SCHEMA_V12: u32 = 12;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.

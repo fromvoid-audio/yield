@@ -932,3 +932,32 @@ The lane also passed 12 legacy-reader, 90 catalog, 60 session (one helper ignore
 16 core edit-settings and five media-adapter tests. This accepts the V11 storage
 milestone; native Windows UI and restore/purge execution remain outside this
 validation scope.
+
+## V12 selection-normalization observations (OPT-1337)
+
+V12 distinguishes selection normalization from V9 whole-file normalization. Its
+intent records a source endpoint, strong file revision, source WAV specification,
+complete frame count, exact non-empty half-open selection, resolved edge-fade
+frame count and explicit Float32 output specification. The output preserves the
+source frame count, sample rate and channel count. The fade cannot exceed half
+the selected frames, and output WAV arithmetic remains checked.
+
+The fixed recipe normalizes the selected interleaved samples to full scale and
+crossfades their edges against the original samples. The start blend runs from
+original to normalized; the end runs from normalized to original, including the
+original one-frame end-fade behavior. Persisting resolved frames avoids
+reinterpreting UI duration settings during recovery. This does not claim that
+the original peak helper sanitizes all non-finite audio.
+
+The new family does not broaden V7 waveform-edit recipes or V9 render variants.
+These are bounded observations, not a captured audio buffer, computed peak or
+gain, live capacity reservation, replacement capability or new GPUI command.
+Actual audio preparation and UI capture remain separate implementation work.
+V12 preserves the earlier command families while older schemas reject the new
+selection-normalization arguments. Local validation passed 210 serialized journal
+tests (one helper ignored), including argument bounds, malformed records, prior
+version rejection, retry/cancellation/restart and generic owner persistence.
+Library checks with and without default features, GPUI compilation, formatting
+and diff checks passed. Primary review found no remaining issue in the new typed
+contract and version wiring. Windows storage acceptance is pending; the V1
+default and SQLite schema remain unchanged.

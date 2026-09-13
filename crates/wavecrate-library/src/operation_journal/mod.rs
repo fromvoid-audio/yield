@@ -15,6 +15,7 @@ pub mod participants;
 pub mod removal_commands;
 pub mod render_commands;
 pub mod retained_resolution_commands;
+pub mod selection_normalize_commands;
 pub mod status;
 pub mod store;
 pub mod validation;
@@ -47,6 +48,10 @@ pub use retained_resolution_commands::{
     RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedResolutionValidationError,
     RetainedRestoreConflictPolicy, RetainedRestoreIntentArgs, fingerprint_selected_entry_json,
 };
+pub use selection_normalize_commands::{
+    SelectionNormalizeEdgeFadePolicy, SelectionNormalizeIntentArgs, SelectionNormalizePeakPolicy,
+    SelectionNormalizeValidationError,
+};
 
 pub use evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalObservation, AbsentFinalRecoveryObservation,
@@ -65,8 +70,8 @@ pub use model::{
     MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationActor,
     OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
     SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
-    SCHEMA_V10, SCHEMA_V11, UniversalCommandKind, UniversalIntent, UniversalIntentTextViolation,
-    UniversalIntentValidationError,
+    SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, UniversalCommandKind, UniversalIntent,
+    UniversalIntentTextViolation, UniversalIntentValidationError,
 };
 
 pub use namespace_commands::{

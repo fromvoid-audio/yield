@@ -1482,6 +1482,8 @@ pub enum UniversalCommandArgs {
     Removal(super::removal_commands::RemovalCommandArgs),
     /// Observe one existing retained-folder restore or purge request.
     RetainedResolution(super::retained_resolution_commands::RetainedResolutionCommandArgs),
+    /// Observe one selection-only Normalize request with a full-file Float32 output.
+    SelectionNormalize(super::selection_normalize_commands::SelectionNormalizeIntentArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1496,6 +1498,7 @@ impl UniversalCommandArgs {
             Self::Render(args) => args.command_kind(),
             Self::Removal(args) => args.command_kind(),
             Self::RetainedResolution(args) => args.command_kind(),
+            Self::SelectionNormalize(args) => args.command_kind(),
         }
     }
 
@@ -1529,6 +1532,9 @@ impl UniversalCommandArgs {
             Self::RetainedResolution(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::RetainedResolution),
+            Self::SelectionNormalize(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::SelectionNormalize),
         }
     }
 }
@@ -1561,6 +1567,11 @@ pub enum UniversalCommandArgsValidationError {
     #[error("invalid retained resolution command arguments: {0}")]
     RetainedResolution(
         #[source] super::retained_resolution_commands::RetainedResolutionValidationError,
+    ),
+    /// A selection-only Normalize argument failed validation.
+    #[error("invalid selection Normalize command arguments: {0}")]
+    SelectionNormalize(
+        #[source] super::selection_normalize_commands::SelectionNormalizeValidationError,
     ),
 }
 

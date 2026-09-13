@@ -32,7 +32,7 @@ use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
-    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
 };
 use super::namespace_commands::NamespaceCommandArgs;
 use super::removal_commands::{RemovalCommandArgs, StageRetainedFolderIntentArgs, TrashIntentArgs};
@@ -42,6 +42,7 @@ use super::render_commands::{
 use super::retained_resolution_commands::{
     RetainedPurgeIntentArgs, RetainedResolutionCommandArgs, RetainedRestoreIntentArgs,
 };
+use super::selection_normalize_commands::SelectionNormalizeIntentArgs;
 use super::validation::{RecordConsistency, classify_record};
 
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
@@ -208,7 +209,7 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the pre-publication cancellation API.
     #[error(
-        "operation journal cancellation requires a V3 or V5-V11 universal intent, found schema v{schema_version}"
+        "operation journal cancellation requires a V3 or V5-V12 universal intent, found schema v{schema_version}"
     )]
     UnsupportedCancellationSchema {
         /// Schema version of the retained row.
@@ -240,13 +241,13 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the retry API.
     #[error(
-        "operation journal retry observation requires a V5-V11 coordinator record, found schema v{schema_version}"
+        "operation journal retry observation requires a V5-V12 coordinator record, found schema v{schema_version}"
     )]
     UnsupportedRetrySchema {
         /// Schema version of the retained row.
         schema_version: u32,
     },
-    /// The retained row is not eligible for a V5-V11 retry observation.
+    /// The retained row is not eligible for a V5-V12 retry observation.
     #[error("operation journal retry state is not eligible: {reason}")]
     UnsupportedRetryState {
         /// Bounded state diagnostic.
@@ -1536,6 +1537,163 @@ impl OperationJournalStore {
         )
     }
 
+    /// Persist one V12 selection-only Normalize command and return its compatibility receipt.
+    ///
+    /// V12 records the source revision, WAV layout, exact selection, resolved edge-fade frame
+    /// count, and full-file Float32 output. It performs no audio I/O, peak calculation, capacity
+    /// reservation, source lease acquisition, filesystem work, or publication.
+    pub fn persist_command_intent_v12(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v12_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V12 selection Normalize command with its exact write-stage outcome.
+    pub fn persist_command_intent_v12_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v12 selection Normalize intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v12 selection Normalize command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if !matches!(command_args, UniversalCommandArgs::SelectionNormalize(_)) {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v12 selection Normalize intent requires SelectionNormalize arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v12 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v12_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        self.insert_intent_with_outcome(&record)
+    }
+
+    /// Persist one typed V12 selection Normalize observation.
+    pub fn persist_selection_normalize_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: SelectionNormalizeIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_selection_normalize_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one typed V12 selection Normalize observation with its exact write-stage outcome.
+    pub fn persist_selection_normalize_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: SelectionNormalizeIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        self.persist_command_intent_v12_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::SelectionNormalize(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     /// Persist one typed V10 removal command.
     pub fn persist_removal_command_intent(
         &self,
@@ -1821,12 +1979,12 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
-    /// Persist a user cancellation request against a current V3 or V5-V11 universal intent.
+    /// Persist a user cancellation request against a current V3 or V5-V12 universal intent.
     ///
     /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
     /// already stored for this operation is a read-only idempotent replay and returns the current
     /// receipt without allocating another sequence. All other stale, legacy, malformed, or
-    /// unsupported rows remain unchanged. A V3 row becomes V4 while V5 and V6 rows retain their
+    /// unsupported rows remain unchanged. A V3 row becomes V4 while typed coordinator rows retain their
     /// schema so typed command and retry observations are preserved. The resulting record is
     /// intentionally non-terminal; it grants no cleanup, capacity-release, filesystem, or
     /// recovery execution authority.
@@ -1907,6 +2065,7 @@ impl OperationJournalStore {
                 | SCHEMA_V9
                 | SCHEMA_V10
                 | SCHEMA_V11
+                | SCHEMA_V12
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -1936,6 +2095,7 @@ impl OperationJournalStore {
                 | SCHEMA_V9
                 | SCHEMA_V10
                 | SCHEMA_V11
+                | SCHEMA_V12
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -1976,6 +2136,10 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V12 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
@@ -1987,6 +2151,7 @@ impl OperationJournalStore {
                 SCHEMA_V9 => "V9 IntentDurable/None or RetryPending",
                 SCHEMA_V10 => "V10 IntentDurable/None or RetryPending",
                 SCHEMA_V11 => "V11 IntentDurable/None or RetryPending",
+                SCHEMA_V12 => "V12 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -2044,7 +2209,7 @@ impl OperationJournalStore {
         })
     }
 
-    /// Persist the next typed V5-V11 retry observation using a sequence compare-and-swap.
+    /// Persist the next typed V5-V12 retry observation using a sequence compare-and-swap.
     ///
     /// An identical observation already stored for the operation is a read-only idempotent
     /// replay, even when the caller still holds an older sequence. A changed observation must
@@ -2122,7 +2287,14 @@ impl OperationJournalStore {
         }
         if matches!(
             current.record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10 | SCHEMA_V11
+            SCHEMA_V5
+                | SCHEMA_V6
+                | SCHEMA_V7
+                | SCHEMA_V8
+                | SCHEMA_V9
+                | SCHEMA_V10
+                | SCHEMA_V11
+                | SCHEMA_V12
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -2142,7 +2314,14 @@ impl OperationJournalStore {
         }
         if !matches!(
             current.record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10 | SCHEMA_V11
+            SCHEMA_V5
+                | SCHEMA_V6
+                | SCHEMA_V7
+                | SCHEMA_V8
+                | SCHEMA_V9
+                | SCHEMA_V10
+                | SCHEMA_V11
+                | SCHEMA_V12
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -2156,7 +2335,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6/V7/V8/V9/V10/V11 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7/V8/V9/V10/V11/V12 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -3315,12 +3494,13 @@ mod tests {
         RenderCommandArgs, RetainedDeleteId, RetainedFolderObservation, RetainedRecoveryRootKind,
         RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedRestoreIntentArgs,
         RetryErrorClass, RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7,
-        SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, StoredRelativePath, StoredSourceFence,
-        TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
-        WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
-        WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
-        WaveformNormalizeIntentArgs, WaveformOutputSpec, WaveformRenderOutputSpec,
-        WaveformSampleFormat, WaveformSourceSpec, fingerprint_selected_entry_json,
+        SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SelectionNormalizeIntentArgs,
+        StoredRelativePath, StoredSourceFence, TrashIntentArgs, UniversalCommandArgs,
+        UniversalCommandKind, UniversalIntent, WaveformDuplicateDoubleIntentArgs,
+        WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
+        WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformNormalizeIntentArgs,
+        WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+        fingerprint_selected_entry_json,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -3894,6 +4074,49 @@ mod tests {
         )
     }
 
+    fn v12_selection_normalize_inputs() -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        SelectionNormalizeIntentArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, intent, copy_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        let participants = copy_universal.participants().clone();
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
+            .expect("selection source spec");
+        let command_args = SelectionNormalizeIntentArgs::new(
+            copy_args.source().clone(),
+            WaveformFileRevisionObservation::new(
+                "selection-file-identity",
+                "selection-change-marker",
+                1024,
+                Some(-12_000_000_000),
+            )
+            .expect("selection file revision"),
+            source_spec,
+            10,
+            WaveformEditFrameRange::new(2, 8).expect("selection range"),
+            2,
+            WaveformOutputSpec::float32(2, 48_000),
+        )
+        .expect("selection Normalize arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::DestructiveEdit,
+            "operation.status.selection-normalize",
+            participants,
+        )
+        .expect("selection universal intent");
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+        )
+    }
+
     fn external_universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
         let mut value: serde_json::Value = serde_json::from_slice(
             &encode(&universal_intent_record(operation_id)).expect("v3 bytes"),
@@ -4231,6 +4454,111 @@ mod tests {
         assert_eq!(
             restarted.universal_command_args(),
             Some(&UniversalCommandArgs::RetainedResolution(command_args))
+        );
+        assert_eq!(restarted.retry_observation(), Some(&retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+    }
+
+    #[test]
+    fn v12_selection_normalize_insert_retry_cancel_and_restart_preserve_observation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+            v12_selection_normalize_inputs();
+        let inserted = store
+            .persist_selection_normalize_intent_with_outcome(
+                operation_id,
+                intent,
+                universal_intent,
+                command_args.clone(),
+                capacity_plan,
+                50,
+            )
+            .receipt()
+            .expect("persist V12 selection Normalize command");
+        assert_eq!(inserted.sequence(), 1);
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("selection-retry-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientAvailability,
+            "selection_unavailable",
+            None,
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist V12 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+        assert_eq!(
+            store
+                .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+                .expect("replay V12 retry"),
+            retry_receipt
+        );
+
+        let stale = RetryObservation::new(
+            2,
+            54,
+            55,
+            RetryLeaseId::new("selection-retry-2").expect("next retry lease"),
+            56,
+            RetryErrorClass::TransientContention,
+            "selection_again",
+            None,
+        )
+        .expect("next retry observation");
+        assert!(matches!(
+            store.record_retry_pending(operation_id, inserted.sequence(), stale),
+            Err(OperationJournalStoreError::StaleSequence { .. })
+        ));
+
+        let cancellation = CancellationRequestObservation::new(57).expect("cancel observation");
+        let cancel_receipt = store
+            .request_cancel_before_publish(
+                operation_id,
+                retry_receipt.sequence(),
+                cancellation.clone(),
+            )
+            .expect("persist V12 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 3);
+        assert_eq!(
+            store
+                .request_cancel_before_publish(
+                    operation_id,
+                    inserted.sequence(),
+                    cancellation.clone(),
+                )
+                .expect("replay V12 cancellation"),
+            cancel_receipt
+        );
+        let persisted = store
+            .get(operation_id)
+            .expect("get V12 selection Normalize command")
+            .expect("V12 selection Normalize row");
+        assert_eq!(persisted.schema_version, SCHEMA_V12);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::SelectionNormalize(
+                command_args.clone()
+            ))
+        );
+        assert_eq!(persisted.retry_observation(), Some(&retry));
+        assert_eq!(persisted.cancellation_request(), Some(&cancellation));
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V12 selection Normalize command")
+            .expect("restarted V12 selection Normalize row");
+        assert_eq!(restarted.schema_version, SCHEMA_V12);
+        assert_eq!(
+            restarted.universal_command_args(),
+            Some(&UniversalCommandArgs::SelectionNormalize(command_args))
         );
         assert_eq!(restarted.retry_observation(), Some(&retry));
         assert_eq!(restarted.cancellation_request(), Some(&cancellation));

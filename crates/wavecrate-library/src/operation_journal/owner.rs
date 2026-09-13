@@ -986,12 +986,13 @@ mod tests {
         OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
         ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
         RecoveryCursor, RecoveryRowOutcome, RemovalCommandArgs, RetryErrorClass, RetryLeaseId,
-        SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
-        StoredRelativePath, StoredSourceFence, TrashIntentArgs, UniversalCommandArgs,
-        UniversalCommandKind, UniversalIntent, WaveformDuplicateDoubleIntentArgs,
-        WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
-        WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformOutputSpec,
-        WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec, decode,
+        SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
+        SelectionNormalizeIntentArgs, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
+        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
+        WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
+        WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+        decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1478,6 +1479,52 @@ mod tests {
             .expect("decode V11 owner fixture")
     }
 
+    fn v12_selection_normalize_record(
+        operation_id: OperationId,
+    ) -> (StoredOperationRecord, SelectionNormalizeIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
+            .expect("selection source spec");
+        let selection_args = SelectionNormalizeIntentArgs::new(
+            copy_args.source().clone(),
+            WaveformFileRevisionObservation::new(
+                "owner-selection-file",
+                "owner-selection-change",
+                1024,
+                Some(-12_000_000_000),
+            )
+            .expect("selection file revision"),
+            source_spec,
+            10,
+            WaveformEditFrameRange::new(2, 8).expect("selection range"),
+            2,
+            WaveformOutputSpec::float32(2, 48_000),
+        )
+        .expect("selection Normalize arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::DestructiveEdit,
+            "operation.status.owner-selection-normalize",
+            participants,
+        )
+        .expect("selection Normalize universal intent");
+        let record = StoredOperationRecord::new_v12_command(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            UniversalCommandArgs::SelectionNormalize(selection_args.clone()),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, selection_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1740,6 +1787,50 @@ mod tests {
                 .expect("retained resolution universal intent")
                 .command_kind(),
             UniversalCommandKind::RestoreRetained
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v12_selection_normalize_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v12-selection-normalize");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, selection_args) = v12_selection_normalize_record(operation_id);
+        let mut request = client
+            .persist_intent(record)
+            .expect("selection Normalize admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("selection Normalize result")
+            .expect("selection Normalize worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("selection Normalize acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+        let mut lookup = client
+            .get(operation_id)
+            .expect("selection Normalize lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("selection Normalize lookup result")
+            .expect("selection Normalize lookup worker result")
+            .expect("persisted selection Normalize");
+        assert_eq!(persisted.schema_version, SCHEMA_V12);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::SelectionNormalize(selection_args))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("selection Normalize universal intent")
+                .command_kind(),
+            UniversalCommandKind::DestructiveEdit
         );
         assert!(owner.shutdown());
     }
