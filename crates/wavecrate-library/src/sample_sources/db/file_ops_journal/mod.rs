@@ -16,6 +16,7 @@ use super::{SourceDatabase, SourceDbError};
 
 mod decode;
 mod entry;
+mod reader;
 mod reconcile;
 mod recovery_io;
 mod store;
@@ -27,6 +28,12 @@ pub(crate) use recovery_io::BoundDatabaseRoot;
 pub use entry::{
     CopyJournalEntryInit, FileOpJournalEntry, FileOpStage, MoveJournalEntryInit, new_op_id,
     staged_relative_for_target,
+};
+pub use reader::{
+    LegacyJournalCursor, LegacyJournalEntry, LegacyJournalField, LegacyJournalKey,
+    LegacyJournalPage, LegacyJournalRetentionReason, LegacyJournalRowOutcome,
+    LegacyJournalScanError, MAX_LEGACY_JOURNAL_BYTES_PER_PAGE, MAX_LEGACY_JOURNAL_FIELD_BYTES,
+    MAX_LEGACY_JOURNAL_PREVIEW_BYTES, MAX_LEGACY_JOURNAL_ROWS_PER_PAGE,
 };
 /// Summary of the work performed while reconciling pending journal entries.
 pub type FileOpReconcileSummary = reconcile::FileOpReconcileSummary;
@@ -57,6 +64,18 @@ pub fn remove_entry(db: &SourceDatabase, id: &str) -> Result<(), SourceDbError> 
 /// Load all pending journal entries for reconciliation.
 pub fn list_entries(db: &SourceDatabase) -> Result<ListedJournalEntries, SourceDbError> {
     store::FileOpJournalStore::new(db).list()
+}
+
+/// Read one bounded page of legacy source-local journal rows.
+///
+/// The page requires the retained source/profile ownership boundary and performs no filesystem
+/// or journal mutation.  Decoded rows remain legacy observations; they do not become universal
+/// operation records or execution authority.
+pub fn scan_page(
+    db: &SourceDatabase,
+    cursor: Option<LegacyJournalCursor>,
+) -> Result<LegacyJournalPage, LegacyJournalScanError> {
+    reader::scan_page(db, cursor)
 }
 
 /// Reconcile all pending file ops against the filesystem and database.

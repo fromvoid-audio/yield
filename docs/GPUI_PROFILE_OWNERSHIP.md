@@ -533,3 +533,30 @@ session tests. This is storage validation, not native Windows UI acceptance.
 Other command families, later phase transitions, runtime
 admission and compatibility import remain open under OPT-1337 and its dependent
 tickets.
+
+### Bounded legacy journal observations
+
+OPT-1337 provides a separate paged reader for source-local `file_ops_journal`
+evidence. Its results distinguish decoded legacy observations from retained
+malformed or oversized rows; neither outcome grants execution authority or
+establishes a valid V5 command. Each page is bounded by row count, decoded text
+bytes and diagnostic preview bytes. Signed rowid ordering preserves visibility
+of zero and negative rowids as well as ordinary rows.
+
+The reader uses non-renewing validation of the retained source connection and a
+weak owner fence. Its cursor captures an upper rowid boundary but is not a durable
+import watermark or a snapshot across pages. Existing reconciliation remains
+unchanged. Durable import requires a separate profile-owned transaction that
+atomically records duplicate detection and the corresponding imported evidence;
+it must preserve the original source-local row and must not infer missing
+command arguments or execution authority.
+
+Each page uses a read-only rollback transaction so metadata preflight and bounded
+materialization share a consistent SQLite snapshot. Existing caller transactions
+are rejected without being consumed. Preview truncation is UTF-8 byte bounded.
+Local validation passed: all 12 reader tests, all 38 file-journal tests, the 12
+reader tests without default features, production library compilation without
+default features, GPUI compilation, formatting and diff checks. Regressions cover
+4,096-row paging, signed rowids through `i64::MAX`, concurrent same-length updates,
+weak cursor invalidation after reopening, and reads that do not renew the lease.
+A dedicated Windows reader test step is added; its validation is pending.
