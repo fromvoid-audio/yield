@@ -140,6 +140,11 @@ impl RecoveryEntry {
     pub fn outcome(&self) -> &RecoveryRowOutcome {
         &self.outcome
     }
+
+    /// Return a compact status projection of this scanner-produced row.
+    pub fn status_snapshot(&self) -> crate::operation_journal::JournalStatusSnapshot {
+        crate::operation_journal::status::from_recovery_entry(self)
+    }
 }
 
 /// One bounded read-only recovery page.
@@ -703,7 +708,10 @@ mod tests {
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use crate::operation_journal::codec::{decode, encode};
-    use crate::operation_journal::{CancellationRequestObservation, SCHEMA_V4};
+    use crate::operation_journal::{
+        CancellationRequestObservation, MAX_STATUS_DIAGNOSTIC_BYTES, OperationDisposition,
+        OperationPhase, RetainedJournalStatus, SCHEMA_V4,
+    };
     use crate::test_runtime::TestRuntimeGuard;
 
     struct Fixture {
@@ -1078,6 +1086,101 @@ mod tests {
     }
 
     #[test]
+    fn status_snapshot_retains_audit_reasons_and_never_projects_invalid_success() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+
+        let record_id = OperationId::new();
+        let key_id = OperationId::new();
+        let record = intent_record(record_id);
+        insert_raw(
+            &store,
+            &key_id.to_string(),
+            1,
+            &encode(&record).expect("encode mismatch fixture"),
+        );
+
+        let malformed_id = OperationId::new();
+        let private_marker = "/private/marker";
+        let malformed = format!(r#"{{"schema_version":3,"{private_marker}":1}}"#);
+        insert_raw(&store, &malformed_id.to_string(), 2, malformed.as_bytes());
+
+        let unsupported_id = OperationId::new();
+        insert_raw(
+            &store,
+            &unsupported_id.to_string(),
+            3,
+            br#"{"schema_version":999}"#,
+        );
+
+        let invalid_terminal_id = OperationId::new();
+        let mut invalid_terminal = intent_record(invalid_terminal_id);
+        invalid_terminal.phase = OperationPhase::Terminal;
+        invalid_terminal.disposition = OperationDisposition::Succeeded;
+        insert_raw(
+            &store,
+            &invalid_terminal_id.to_string(),
+            4,
+            &encode(&invalid_terminal).expect("encode terminal fixture"),
+        );
+
+        let page = store.scan_recovery_page(None).expect("scan retained rows");
+        assert_eq!(page.entries().len(), 4);
+
+        let mismatch = page.entries()[0].status_snapshot();
+        assert_eq!(mismatch.operation_id(), Some(key_id));
+        assert!(mismatch.observed().is_none());
+        assert!(matches!(
+            mismatch.retained().map(RetainedJournalStatus::reason),
+            Some(RecoveryRetentionReason::KeyMismatch {
+                record_operation_id
+            }) if *record_operation_id == record_id
+        ));
+
+        let malformed = page.entries()[1].status_snapshot();
+        assert!(matches!(
+            malformed.retained().map(RetainedJournalStatus::reason),
+            Some(RecoveryRetentionReason::Malformed { .. })
+        ));
+        assert!(
+            malformed
+                .retained()
+                .expect("malformed retention")
+                .diagnostic()
+                .len()
+                <= MAX_STATUS_DIAGNOSTIC_BYTES
+        );
+        assert!(
+            !malformed
+                .retained()
+                .expect("malformed retention")
+                .diagnostic()
+                .contains(private_marker)
+        );
+        assert!(!format!("{malformed:?}").contains(private_marker));
+        assert!(matches!(
+            malformed.retained().map(RetainedJournalStatus::reason),
+            Some(RecoveryRetentionReason::Malformed { reason })
+                if !reason.contains(private_marker)
+        ));
+
+        let unsupported = page.entries()[2].status_snapshot();
+        assert!(matches!(
+            unsupported.retained().map(RetainedJournalStatus::reason),
+            Some(RecoveryRetentionReason::UnsupportedCodec { version: 999 })
+        ));
+
+        let invalid_terminal = page.entries()[3].status_snapshot();
+        assert!(invalid_terminal.observed().is_none());
+        assert!(matches!(
+            invalid_terminal
+                .retained()
+                .map(RetainedJournalStatus::reason),
+            Some(RecoveryRetentionReason::LegacyMissingPublicationEvidence)
+        ));
+    }
+
+    #[test]
     fn key_mismatch_and_invalid_key_are_retained_with_bounded_keys() {
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
@@ -1112,6 +1215,13 @@ mod tests {
         assert!(
             matches!(page.entries()[1].key(), RecoveryKey::Text(value) if value == "not-an-operation-id")
         );
+        let invalid_key_status = page.entries()[1].status_snapshot();
+        assert!(matches!(
+            invalid_key_status.key(),
+            RecoveryKey::Invalid { preview, .. }
+                if preview == "operation key retained for audit"
+        ));
+        assert!(!format!("{invalid_key_status:?}").contains("not-an-operation-id"));
         assert!(matches!(
             page.entries()[2].outcome(),
             RecoveryRowOutcome::Retained(RecoveryRetentionReason::TypeInvalid {

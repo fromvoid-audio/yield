@@ -10,6 +10,7 @@ pub mod coordinator;
 pub mod evidence;
 pub mod model;
 pub mod participants;
+pub mod status;
 pub mod store;
 pub mod validation;
 
@@ -48,6 +49,11 @@ pub use participants::{
     MAX_SOURCE_IDENTITY_BYTES, ParticipantCheckpoint, ParticipantCheckpointState,
     ParticipantDescriptor, ParticipantId, ParticipantKind, ParticipantRequirement, ParticipantSet,
     ParticipantTextField, ParticipantTextViolation, ParticipantValidationError, StoredSourceFence,
+};
+
+pub use status::{
+    JournalStatusOutcome, JournalStatusSnapshot, MAX_STATUS_DIAGNOSTIC_BYTES,
+    ObservedOperationStatus, RetainedJournalStatus, RetryStatusSummary,
 };
 
 pub use store::recovery::{

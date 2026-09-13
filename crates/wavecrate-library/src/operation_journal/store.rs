@@ -1727,7 +1727,7 @@ mod tests {
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         ParticipantCheckpoint, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
         ParticipantSet, RecoveryCursor, RecoveryRowOutcome, RetryErrorClass, RetryLeaseId,
-        RetryObservation, StoredRelativePath, StoredSourceFence, UniversalCommandKind,
+        RetryObservation, SCHEMA_V1, StoredRelativePath, StoredSourceFence, UniversalCommandKind,
         UniversalIntent,
     };
     use crate::sample_sources::SourceId;
@@ -2205,6 +2205,141 @@ mod tests {
                 if actual == operation_id
         ));
         assert_eq!(journal_sequence(&store, operation_id), 5);
+    }
+
+    #[test]
+    fn status_snapshot_tracks_v5_retry_and_cancel_without_cloning_opaque_data() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+            v5_copy_inputs();
+        let inserted = store
+            .persist_copy_intent(
+                operation_id,
+                intent,
+                universal_intent,
+                command_args,
+                capacity_plan,
+                50,
+            )
+            .expect("persist v5 copy intent");
+
+        let initial = store
+            .scan_recovery_page(None)
+            .expect("scan initial status")
+            .entries()[0]
+            .status_snapshot();
+        let initial_observed = initial.observed().expect("initial observed status");
+        assert_eq!(initial.operation_id(), Some(operation_id));
+        assert_eq!(initial.sequence(), inserted.sequence());
+        assert_eq!(initial_observed.schema_version(), SCHEMA_V5);
+        assert_eq!(initial_observed.phase(), OperationPhase::IntentDurable);
+        assert_eq!(initial_observed.disposition(), OperationDisposition::None);
+        assert_eq!(
+            initial_observed.command_kind(),
+            Some(UniversalCommandKind::Copy)
+        );
+        assert_eq!(initial_observed.label(), Some("copy store test"));
+        assert_eq!(
+            initial_observed.user_status_key(),
+            Some("operation.status.copy")
+        );
+        assert!(initial_observed.retry().is_none());
+        assert!(initial_observed.cancellation_request().is_none());
+        assert!(!format!("{initial:?}").contains("payload"));
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("retry-lease-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientContention,
+            "writer_busy",
+            Some(String::from("opaque retry context")),
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist retry");
+        let retry_status = store
+            .scan_recovery_page(Some(
+                RecoveryCursor::new(inserted.sequence()).expect("initial cursor"),
+            ))
+            .expect("scan retry status")
+            .entries()[0]
+            .status_snapshot();
+        let retry_summary = retry_status
+            .observed()
+            .and_then(|status| status.retry())
+            .expect("retry summary");
+        assert_eq!(retry_status.sequence(), retry_receipt.sequence());
+        assert_eq!(retry_summary.attempt(), 1);
+        assert_eq!(retry_summary.requested_unix_ms(), 51);
+        assert_eq!(retry_summary.next_retry_unix_ms(), 52);
+        assert_eq!(retry_summary.lease_expiry_unix_ms(), 53);
+        assert_eq!(
+            retry_summary.error_class(),
+            RetryErrorClass::TransientContention
+        );
+        assert_eq!(retry_summary.diagnostic_code(), "writer_busy");
+        assert!(!format!("{retry_status:?}").contains("opaque retry context"));
+
+        let cancellation = CancellationRequestObservation::new(56).expect("cancel timestamp");
+        let cancel_receipt = store
+            .request_cancel_before_publish(operation_id, retry_receipt.sequence(), cancellation)
+            .expect("persist cancellation");
+        let cancel_status = store
+            .scan_recovery_page(Some(
+                RecoveryCursor::new(retry_receipt.sequence()).expect("retry cursor"),
+            ))
+            .expect("scan cancellation status")
+            .entries()[0]
+            .status_snapshot();
+        let cancel_observed = cancel_status.observed().expect("cancel observed status");
+        assert_eq!(cancel_status.sequence(), cancel_receipt.sequence());
+        assert_eq!(
+            cancel_observed.disposition(),
+            OperationDisposition::CancelRequestedBeforePublish
+        );
+        assert_eq!(cancel_observed.cancellation_request(), Some(cancellation));
+        assert_eq!(cancel_observed.retry(), Some(retry_summary));
+
+        // The first snapshot owns only its bounded status fields; later journal updates do not
+        // mutate or retroactively upgrade it.
+        let initial_observed = initial.observed().expect("initial status remains observed");
+        assert_eq!(initial.sequence(), inserted.sequence());
+        assert_eq!(initial_observed.disposition(), OperationDisposition::None);
+        assert!(initial_observed.retry().is_none());
+        assert!(initial_observed.cancellation_request().is_none());
+    }
+
+    #[test]
+    fn status_snapshot_keeps_legacy_retry_fields_missing() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let mut record = intent_record(OperationId::new());
+        record.disposition = OperationDisposition::RetryPending;
+        let encoded = encode(&record).expect("encode legacy retry row");
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, 1, ?2)",
+                params![record.operation_id.to_string(), encoded],
+            )
+            .expect("insert legacy retry row");
+
+        let status = store
+            .scan_recovery_page(None)
+            .expect("scan legacy retry row")
+            .entries()[0]
+            .status_snapshot();
+        let observed = status.observed().expect("legacy row is consistent");
+        assert_eq!(observed.schema_version(), SCHEMA_V1);
+        assert_eq!(observed.disposition(), OperationDisposition::RetryPending);
+        assert!(observed.retry().is_none());
+        assert!(observed.user_status_key().is_none());
     }
 
     fn journal_sequence(store: &OperationJournalStore, operation_id: OperationId) -> i64 {

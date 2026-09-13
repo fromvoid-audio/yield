@@ -563,3 +563,25 @@ The dedicated Windows reader step passed all 12 tests in
 [storage run 34760528283](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34760528283)
 on exact `d0704c333daefa17d1aee4463b0d414fa5a64287`; the full storage run
 passed as well. This is storage-scope acceptance, not native Windows UI acceptance.
+
+### Typed journal status snapshots
+
+OPT-1337 provides compact immutable status snapshots from scanner-produced
+recovery entries. Observed phase/disposition is kept distinct from retained audit
+evidence. Retry and cancellation summaries reflect only stored observations;
+legacy missing retry fields are not synthesized, and requested cancellation is
+not presented as completed cancellation.
+
+The projection carries no payload, execution capability, ownership handle or
+permission to retry. Status presentation uses bounded text and stable retention
+diagnostics while original recovery evidence remains available in the journal.
+The session recovery gate and persisted record formats remain unchanged.
+
+Status snapshots preserve the validated phase/disposition and observation sequence
+without cloning the opaque record payload. Retained reason categories remain
+typed, while malformed-record diagnostics and invalid key previews use safe
+status wording instead of copied parser content. Original recovery entries remain
+unchanged. Local validation passed: 111 journal tests (one helper ignored),
+including three focused status tests and the key-retention regression, production
+library compilation without default features, GPUI compilation, formatting and
+diff checks. Windows storage validation is pending.
