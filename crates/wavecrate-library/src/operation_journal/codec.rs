@@ -19,8 +19,9 @@ use super::evidence::{
     ReplacementQualificationAssessment,
 };
 use super::model::{
-    MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationDisposition,
-    OperationId, OperationIntent, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, UniversalIntent,
+    CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
+    MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
+    OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, UniversalIntent,
 };
 use super::participants::MAX_PARTICIPANTS;
 use crate::durable_capacity::DurableCapacityPlan;
@@ -62,6 +63,8 @@ pub struct StoredOperationRecord {
     published: Option<FilesystemPublishedWaveformRestore>,
     /// Optional stored replacement qualification assessment.
     pub replacement_qualification: Option<ReplacementQualificationAssessment>,
+    /// Optional V4 pre-publication cancellation request observation.
+    cancellation_request: Option<CancellationRequestObservation>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
     /// Stored update timestamp in Unix milliseconds.
@@ -72,6 +75,23 @@ impl StoredOperationRecord {
     /// Borrow stored publication evidence without exposing a construction path for it.
     pub fn published(&self) -> Option<&FilesystemPublishedWaveformRestore> {
         self.published.as_ref()
+    }
+
+    /// Borrow the persisted cancellation request observation, when present.
+    pub fn cancellation_request(&self) -> Option<&CancellationRequestObservation> {
+        self.cancellation_request.as_ref()
+    }
+
+    pub(crate) fn with_cancellation_request(
+        &self,
+        observation: CancellationRequestObservation,
+    ) -> Self {
+        let mut record = self.clone();
+        record.schema_version = SCHEMA_V4;
+        record.disposition = OperationDisposition::CancelRequestedBeforePublish;
+        record.updated_unix_ms = observation.requested_unix_ms();
+        record.cancellation_request = Some(observation);
+        record
     }
 }
 
@@ -136,6 +156,18 @@ pub enum EncodeError {
         /// Bounded validation diagnostic.
         reason: String,
     },
+    /// A legacy schema would silently discard a V4 cancellation observation.
+    #[error("schema-v{version} cannot encode a cancellation request observation")]
+    CancellationRequestInLegacy {
+        /// Legacy schema identifier that cannot carry the cancellation request.
+        version: u32,
+    },
+    /// A V4 cancellation-request record violates its bounded transition shape.
+    #[error("invalid schema-v4 cancellation request record: {reason}")]
+    InvalidV4Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
     /// Serialized output exceeded the bounded record size.
     #[error("encoded operation journal record exceeds {maximum} bytes: {actual} bytes")]
     Oversize {
@@ -192,6 +224,7 @@ impl From<PersistedOperationRecordV1> for StoredOperationRecord {
             absent_final_adoption_evidence: None,
             published: record.published,
             replacement_qualification: record.replacement_qualification,
+            cancellation_request: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -203,6 +236,11 @@ fn persisted_v1_from_record(
 ) -> Result<PersistedOperationRecordV1Ref<'_>, EncodeError> {
     if record.universal_intent.is_some() {
         return Err(EncodeError::UniversalIntentInLegacy {
+            version: record.schema_version,
+        });
+    }
+    if record.cancellation_request.is_some() {
+        return Err(EncodeError::CancellationRequestInLegacy {
             version: record.schema_version,
         });
     }
@@ -339,6 +377,7 @@ impl From<PersistedOperationRecordV2> for StoredOperationRecord {
             absent_final_adoption_evidence: record.absent_final_adoption_evidence,
             published: record.published,
             replacement_qualification: record.replacement_qualification,
+            cancellation_request: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -350,6 +389,11 @@ fn persisted_v2_from_record(
 ) -> Result<PersistedOperationRecordV2Ref<'_>, EncodeError> {
     if record.universal_intent.is_some() {
         return Err(EncodeError::UniversalIntentInLegacy {
+            version: record.schema_version,
+        });
+    }
+    if record.cancellation_request.is_some() {
+        return Err(EncodeError::CancellationRequestInLegacy {
             version: record.schema_version,
         });
     }
@@ -439,6 +483,7 @@ impl From<PersistedOperationRecordV3> for StoredOperationRecord {
             absent_final_adoption_evidence: None,
             published: None,
             replacement_qualification: None,
+            cancellation_request: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -470,6 +515,10 @@ fn persisted_v3_from_record(
         (
             record.replacement_qualification.is_some(),
             "replacement qualification",
+        ),
+        (
+            record.cancellation_request.is_some(),
+            "cancellation request",
         ),
     ] {
         if present {
@@ -529,6 +578,90 @@ struct PersistedOperationRecordV3Ref<'a> {
     updated_unix_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperationRecordV4 {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    payload: Value,
+    capacity_plan: DurableCapacityPlan,
+    cancellation_request: CancellationRequestObservation,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl From<PersistedOperationRecordV4> for StoredOperationRecord {
+    fn from(record: PersistedOperationRecordV4) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            operation_id: OperationId::from_uuid(record.operation_id),
+            intent: record.intent,
+            universal_intent: Some(record.universal_intent),
+            phase: record.phase,
+            disposition: record.disposition,
+            payload: record.payload,
+            capacity_plan: Some(record.capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: Some(record.cancellation_request),
+            created_unix_ms: record.created_unix_ms,
+            updated_unix_ms: record.updated_unix_ms,
+        }
+    }
+}
+
+fn persisted_v4_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedOperationRecordV4Ref<'_>, EncodeError> {
+    validate_v4_cancel_shape(record).map_err(|reason| EncodeError::InvalidV4Record { reason })?;
+    Ok(PersistedOperationRecordV4Ref {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("V4 universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        payload: &record.payload,
+        capacity_plan: record
+            .capacity_plan
+            .as_ref()
+            .expect("V4 capacity plan checked above"),
+        cancellation_request: record
+            .cancellation_request
+            .as_ref()
+            .expect("V4 cancellation request checked above"),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    })
+}
+
+#[derive(Serialize)]
+struct PersistedOperationRecordV4Ref<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    payload: &'a Value,
+    capacity_plan: &'a DurableCapacityPlan,
+    cancellation_request: &'a CancellationRequestObservation,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -572,6 +705,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v3_initial_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V4 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v4_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedOperationRecordV4>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v4_cancel_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -711,6 +853,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V3 => {
             let persisted = persisted_v3_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V4 => {
+            let persisted = persisted_v4_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -1376,6 +1522,59 @@ fn validate_persisted_capacity_plan_v3_value(value: &Value) -> Result<(), &'stat
     Ok(())
 }
 
+fn validate_persisted_cancellation_request_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(value, &["requested_unix_ms"])?;
+    let timestamp = required_field(object, "requested_unix_ms")?
+        .as_i64()
+        .ok_or("cancellation request timestamp must be a signed 64-bit integer")?;
+    if timestamp < 0 {
+        return Err("cancellation request timestamp must be non-negative");
+    }
+    Ok(())
+}
+
+fn validate_persisted_v4_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "payload",
+            "capacity_plan",
+            "cancellation_request",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "payload",
+        "capacity_plan",
+        "cancellation_request",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
+    if !required_field(object, "payload")?.is_object() {
+        return Err("schema-v4 payload must be a JSON object");
+    }
+    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
+    validate_persisted_cancellation_request_value(required_field(object, "cancellation_request")?)?;
+    Ok(())
+}
+
 pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Result<(), String> {
     if record.schema_version != SCHEMA_V3 {
         return Err(String::from("schema-v3 validation received another schema"));
@@ -1391,9 +1590,18 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
             "schema-v3 initial records require the None disposition",
         ));
     }
+    if record.cancellation_request.is_some() {
+        return Err(String::from(
+            "schema-v3 cannot contain a cancellation request",
+        ));
+    }
+    validate_universal_intent_envelope_shape(record)
+}
+
+fn validate_universal_intent_envelope_shape(record: &StoredOperationRecord) -> Result<(), String> {
     if record.capacity_plan.is_none() {
         return Err(String::from(
-            "schema-v3 initial records require a capacity plan",
+            "universal intent records require a capacity plan",
         ));
     }
     for (present, kind) in [
@@ -1418,7 +1626,9 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
         ),
     ] {
         if present {
-            return Err(format!("schema-v3 cannot contain legacy {kind} evidence"));
+            return Err(format!(
+                "universal intent record cannot contain {kind} evidence"
+            ));
         }
     }
     if record.intent.label.is_empty() {
@@ -1459,6 +1669,39 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+pub(crate) fn validate_v4_cancel_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    if record.schema_version != SCHEMA_V4 {
+        return Err(String::from("schema-v4 validation received another schema"));
+    }
+    if record.phase != OperationPhase::IntentDurable {
+        return Err(format!(
+            "schema-v4 cancellation request only supports IntentDurable, found {:?}",
+            record.phase
+        ));
+    }
+    if record.disposition != OperationDisposition::CancelRequestedBeforePublish {
+        return Err(String::from(
+            "schema-v4 cancellation records require CancelRequestedBeforePublish",
+        ));
+    }
+    if record.intent.actor != OperationActor::User {
+        return Err(String::from(
+            "schema-v4 cancellation records require a user intent",
+        ));
+    }
+    let observation = record
+        .cancellation_request
+        .ok_or_else(|| String::from("schema-v4 cancellation record requires an observation"))?;
+    observation.validate().map_err(|error| error.to_string())?;
+    if observation.requested_unix_ms() != record.updated_unix_ms {
+        return Err(String::from(
+            "schema-v4 cancellation request timestamp must equal the updated timestamp",
+        ));
+    }
+
+    validate_universal_intent_envelope_shape(record)
 }
 
 fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &'static str> {
@@ -1625,6 +1868,17 @@ mod tests {
         serde_json::from_slice(bytes).expect("fixture JSON is valid")
     }
 
+    fn v4_cancel_fixture() -> Value {
+        let mut fixture = value(V3_FIXTURE);
+        fixture["schema_version"] = Value::from(4_u64);
+        fixture["disposition"] = Value::from("CancelRequestedBeforePublish");
+        fixture["cancellation_request"] = serde_json::json!({
+            "requested_unix_ms": 40
+        });
+        fixture["updated_unix_ms"] = Value::from(40_i64);
+        fixture
+    }
+
     #[test]
     fn pinned_v1_fixture_decodes_and_round_trips_by_value() {
         let record = decode(V1_FIXTURE).expect("v1 fixture decodes");
@@ -1671,6 +1925,109 @@ mod tests {
             value(&encode(&record).expect("v3 fixture encodes")),
             value(V3_FIXTURE)
         );
+    }
+
+    #[test]
+    fn pinned_v4_cancellation_fixture_decodes_and_round_trips_by_value() {
+        let fixture = v4_cancel_fixture();
+        let bytes = serde_json::to_vec(&fixture).expect("v4 fixture encodes");
+        let record = decode(&bytes).expect("v4 cancellation fixture decodes");
+        assert_eq!(record.schema_version, SCHEMA_V4);
+        assert_eq!(
+            record.disposition,
+            OperationDisposition::CancelRequestedBeforePublish
+        );
+        assert_eq!(
+            record
+                .cancellation_request()
+                .expect("cancellation observation")
+                .requested_unix_ms(),
+            40
+        );
+        assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+        assert_eq!(
+            value(&encode(&record).expect("v4 fixture encodes")),
+            fixture
+        );
+    }
+
+    #[test]
+    fn v4_cancellation_shape_is_strict_and_bounded() {
+        let mut unknown = v4_cancel_fixture();
+        unknown["unexpected"] = Value::Bool(true);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unknown).expect("unknown field encodes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut missing = v4_cancel_fixture();
+        missing
+            .as_object_mut()
+            .expect("v4 object")
+            .remove("cancellation_request");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&missing).expect("missing field encodes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut negative = v4_cancel_fixture();
+        negative["cancellation_request"]["requested_unix_ms"] = Value::from(-1_i64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&negative).expect("negative timestamp encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("non-negative")
+        ));
+
+        let mut mismatched_update = v4_cancel_fixture();
+        mismatched_update["updated_unix_ms"] = Value::from(39_i64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&mismatched_update).expect("timestamp mismatch encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("equal")
+        ));
+
+        let mut wrong_disposition = v4_cancel_fixture();
+        wrong_disposition["disposition"] = Value::from("None");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&wrong_disposition).expect("wrong disposition encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("CancelRequestedBeforePublish")
+        ));
+
+        let mut external = v4_cancel_fixture();
+        external["intent"]["actor"] = Value::from("ExternalFs");
+        external["intent"]["kind"] = Value::from("ExternalReconciliation");
+        external["universal_intent"]["command_kind"] = Value::from("ExternalReconciliation");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&external).expect("external actor encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("user intent")
+        ));
+    }
+
+    #[test]
+    fn v4_bounded_encoder_validates_large_payload_without_cloning_the_record() {
+        let fixture = v4_cancel_fixture();
+        let mut record = decode(&serde_json::to_vec(&fixture).expect("v4 fixture encodes"))
+            .expect("v4 fixture decodes");
+        let mut payload = Map::new();
+        for index in 0..4_096 {
+            payload.insert(format!("key-{index}"), Value::String("x".repeat(256)));
+        }
+        record.payload = Value::Object(payload);
+        assert!(matches!(
+            encode(&record),
+            Err(EncodeError::Oversize { maximum, .. }) if maximum == MAX_RECORD_BYTES
+        ));
+    }
+
+    #[test]
+    fn classification_rejects_a_v4_cancellation_observation_under_a_legacy_schema() {
+        let fixture = v4_cancel_fixture();
+        let mut record = decode(&serde_json::to_vec(&fixture).expect("v4 fixture encodes"))
+            .expect("v4 fixture decodes");
+        record.schema_version = SCHEMA_V1;
+        record.universal_intent = None;
+        assert!(matches!(
+            classify_record(&record),
+            RecordConsistency::Invalid(reason) if reason.contains("cancellation request")
+        ));
     }
 
     #[test]

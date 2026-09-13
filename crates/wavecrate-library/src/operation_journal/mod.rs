@@ -27,9 +27,10 @@ pub use evidence::{
 };
 
 pub use model::{
-    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES,
-    OperationActor, OperationDisposition, OperationId, OperationIntent, OperationKind,
-    OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, UniversalCommandKind, UniversalIntent,
+    CURRENT_SCHEMA_VERSION, CancellationRequestObservation, CancellationRequestValidationError,
+    MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationActor,
+    OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, UniversalCommandKind, UniversalIntent,
     UniversalIntentTextViolation, UniversalIntentValidationError,
 };
 
@@ -47,7 +48,7 @@ pub use store::recovery::{
 };
 pub use store::{
     JOURNAL_APPLICATION_ID, JOURNAL_DATABASE_FILE_NAME, JOURNAL_DATABASE_ROOT_NAME,
-    JOURNAL_SCHEMA_VERSION, JournalInsertReceipt, OperationJournalStore,
-    OperationJournalStoreError,
+    JOURNAL_SCHEMA_VERSION, JournalCancelRequestReceipt, JournalInsertReceipt,
+    OperationJournalStore, OperationJournalStoreError,
 };
 pub use validation::{RecordConsistency, classify_record};

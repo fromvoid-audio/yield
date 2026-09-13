@@ -448,8 +448,8 @@ checks and do not publish authoritative source database state.
 
 Together with the physical lease foundation and the validated publication,
 readiness and diagnostic extensions above, this completes OPT-1349 for the
-active GPUI implementation. This inventory excludes `reference/radiant`. The future readiness executor and
-source-writer routing tickets must consume these ownership contracts when they
+active GPUI implementation. This inventory excludes `reference/radiant`. The
+future readiness executor and source-writer routing tickets must consume these ownership contracts when they
 enter the active crate graph. This does not establish completion of those ports
 or full GPUI feature parity.
 
@@ -466,3 +466,28 @@ Shutdown closes admission and stops maintenance/catalog work before closing
 the global writer. Retained guard clones keep profile ownership alive until
 their participants finish. Future journal and source-lease participants must
 preserve this ordering and release the profile owner last.
+
+### Cancellation request persistence
+
+The journal records a cancellation request while a user operation
+is still at `IntentDurable`. The V4 record retains the universal intent,
+capacity and pending participant observations, adds a typed request timestamp,
+and uses the nonterminal `CancelRequestedBeforePublish` disposition. Existing
+V1/V2/V3 records retain their encoding and interpretation.
+
+The store preserves immutable intent data, compares the expected row sequence
+before a changed update, advances the global observation sequence only for an
+actual update, and acknowledges an identical persisted replay without sequence
+churn. Namespace and connection checks surround the transaction, and success
+requires commit and readback. A cancellation request neither proves cleanup nor
+releases capacity, publishes files, or authorizes recovery execution. The
+session's retained-operation startup gate remains closed.
+
+Local validation passed: 98 journal tests (one subprocess helper ignored),
+61 session tests (one helper ignored), the production library check without
+default features, GPUI compilation, formatting and diff checks. Coverage includes
+strict V4 decoding, stale/conflicting requests, exact replay, rollback, recovery
+cursor movement, and acknowledged cancellation surviving abrupt process exit.
+Independent review found no meaningful issues. Windows storage validation is
+pending. Full coordinator admission, phase transitions and recovery execution
+remain incomplete.

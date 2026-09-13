@@ -2,8 +2,8 @@
 //!
 //! A recovery page is an observation of rows that are already in the journal. It never updates
 //! the database, opens a filesystem path from a record, or turns stored evidence into execution
-//! authority. The scan uses the insertion sequence as a keyset cursor and keeps both row count
-//! and decoded record bytes bounded.
+//! authority. The scan uses the journal-observation sequence as a keyset cursor and keeps both row
+//! count and decoded record bytes bounded.
 
 use rusqlite::types::ValueRef;
 use rusqlite::{OptionalExtension, params};
@@ -24,7 +24,7 @@ const MAX_OPERATION_KEY_BYTES: i64 = 128;
 const MAX_OPERATION_KEY_PREVIEW_BYTES: i64 = MAX_OPERATION_KEY_BYTES + 1;
 const MAX_DIAGNOSTIC_CHARS: usize = 256;
 
-/// An opaque positive insertion-sequence cursor returned by a recovery page.
+/// An opaque positive journal-observation cursor returned by a recovery page.
 ///
 /// A cursor only selects a later observation page. It is not a mutation token, admission proof,
 /// or filesystem capability.
@@ -32,7 +32,7 @@ const MAX_DIAGNOSTIC_CHARS: usize = 256;
 pub struct RecoveryCursor(i64);
 
 impl RecoveryCursor {
-    /// Create a cursor from a positive stored insertion sequence.
+    /// Create a cursor from a positive stored journal-observation sequence.
     pub fn new(sequence: i64) -> Option<Self> {
         (sequence > 0).then_some(Self(sequence))
     }
@@ -64,7 +64,7 @@ pub enum RecoveryKey {
 pub enum RecoveryField {
     /// The operation-id key column.
     OperationId,
-    /// The insertion-sequence column.
+    /// The journal-observation sequence column.
     Sequence,
     /// The encoded-record column.
     Record,
@@ -131,7 +131,7 @@ impl RecoveryEntry {
         &self.key
     }
 
-    /// Return the positive insertion sequence for this row.
+    /// Return the positive journal-observation sequence for this row.
     pub fn sequence(&self) -> i64 {
         self.sequence
     }
@@ -152,7 +152,7 @@ pub struct RecoveryPage {
 }
 
 impl RecoveryPage {
-    /// Return row observations in ascending insertion-sequence order.
+    /// Return row observations in ascending journal-observation sequence order.
     pub fn entries(&self) -> &[RecoveryEntry] {
         &self.entries
     }
@@ -399,7 +399,7 @@ fn read_candidate(row: &rusqlite::Row<'_>) -> Result<RecoveryCandidate, Recovery
     if sequence <= 0 {
         return Err(RecoveryScanError::RequiresAudit {
             reason: bounded_reason(format!(
-                "journal row {rowid} has non-positive insertion sequence {sequence}"
+                "journal row {rowid} has non-positive observation sequence {sequence}"
             )),
         });
     }
@@ -652,7 +652,9 @@ fn ensure_sequence_unique(
         count += 1;
         if count >= 2 {
             return Err(RecoveryScanError::RequiresAudit {
-                reason: bounded_reason(format!("duplicate recovery insertion sequence {sequence}")),
+                reason: bounded_reason(format!(
+                    "duplicate recovery observation sequence {sequence}"
+                )),
             });
         }
     }
@@ -701,6 +703,7 @@ mod tests {
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use crate::operation_journal::codec::{decode, encode};
+    use crate::operation_journal::{CancellationRequestObservation, SCHEMA_V4};
     use crate::test_runtime::TestRuntimeGuard;
 
     struct Fixture {
@@ -854,6 +857,33 @@ mod tests {
             page.entries()[0].outcome(),
             &RecoveryRowOutcome::Consistent(record)
         );
+    }
+
+    #[test]
+    fn recovery_cursor_reobserves_a_cancellation_row_after_its_sequence_moves() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let cursor = RecoveryCursor::new(inserted.sequence()).expect("positive recovery cursor");
+        let observation = CancellationRequestObservation::new(53).expect("request timestamp");
+        let cancellation = store
+            .request_cancel_before_publish(record.operation_id, inserted.sequence(), observation)
+            .expect("persist cancellation request");
+        assert_eq!(cancellation.sequence(), inserted.sequence() + 1);
+
+        let page = store
+            .scan_recovery_page(Some(cursor))
+            .expect("scan changed row after old cursor");
+        assert!(page.is_done());
+        assert_eq!(page.entries().len(), 1);
+        assert_eq!(page.entries()[0].sequence(), cancellation.sequence());
+        assert!(matches!(
+            page.entries()[0].outcome(),
+            RecoveryRowOutcome::Consistent(observed)
+                if observed.schema_version == SCHEMA_V4
+                    && observed.cancellation_request() == Some(&observation)
+        ));
     }
 
     #[test]

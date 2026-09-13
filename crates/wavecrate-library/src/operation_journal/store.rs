@@ -1,7 +1,7 @@
 //! Profile-owned SQLite storage for durable operation intents.
 //!
 //! This store is deliberately smaller than either the source catalog or the global library
-//! database. It owns only an operation id, a monotonic insertion sequence, and one bounded
+//! database. It owns only an operation id, a monotonic journal-observation sequence, and one bounded
 //! encoded record. A successful insert proves that these bytes reached this SQLite database; it
 //! does not admit the operation to filesystem execution or grant any other capability. The store
 //! uses one exclusive connection, DELETE rollback journaling, and synchronous EXTRA (the
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::limits::Limit;
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
@@ -24,7 +25,10 @@ use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
-use super::model::{MAX_RECORD_BYTES, OperationDisposition, OperationId, OperationPhase};
+use super::model::{
+    CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
+    OperationId, OperationPhase, SCHEMA_V3, SCHEMA_V4,
+};
 use super::validation::{RecordConsistency, classify_record};
 
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
@@ -149,6 +153,66 @@ pub enum OperationJournalStoreError {
     /// A sequence value could not be allocated without exceeding SQLite's integer range.
     #[error("operation journal sequence is exhausted")]
     SequenceExhausted,
+    /// A cancellation request must carry a positive recovery sequence expectation.
+    #[error(
+        "operation journal cancellation request requires a positive expected sequence, found {expected}"
+    )]
+    InvalidExpectedSequence {
+        /// Sequence supplied by the caller.
+        expected: i64,
+    },
+    /// The requested operation id is not present in the journal.
+    #[error("operation journal operation is not present: {operation_id}")]
+    OperationNotFound {
+        /// Operation identity that was not found.
+        operation_id: OperationId,
+    },
+    /// The journal row changed after the caller observed its sequence.
+    #[error(
+        "operation journal operation {operation_id} has sequence {actual}, expected {expected}"
+    )]
+    StaleSequence {
+        /// Operation identity whose sequence changed.
+        operation_id: OperationId,
+        /// Sequence supplied by the caller.
+        expected: i64,
+        /// Current durable sequence.
+        actual: i64,
+    },
+    /// A different cancellation request is already durable for this operation.
+    #[error(
+        "operation journal operation {operation_id} already has a different cancellation request"
+    )]
+    CancellationConflict {
+        /// Operation identity with the conflicting request.
+        operation_id: OperationId,
+    },
+    /// The requested cancellation observation is invalid at the store boundary.
+    #[error("operation journal cancellation request is invalid: {reason}")]
+    InvalidCancellationRequest {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// This schema cannot be transitioned by the pre-publication cancellation API.
+    #[error(
+        "operation journal cancellation requires a V3 universal intent, found schema v{schema_version}"
+    )]
+    UnsupportedCancellationSchema {
+        /// Schema version of the retained row.
+        schema_version: u32,
+    },
+    /// Cancellation is only a user operation in this first transition boundary.
+    #[error("operation journal cancellation is unsupported for actor {actor:?}")]
+    UnsupportedCancellationActor {
+        /// Actor carried by the durable intent.
+        actor: OperationActor,
+    },
+    /// The retained row is not an eligible V3 initial intent.
+    #[error("operation journal cancellation state is not eligible: {reason}")]
+    UnsupportedCancellationState {
+        /// Bounded state diagnostic.
+        reason: String,
+    },
 }
 
 /// Acknowledgement returned after one intent has committed and passed post-commit validation.
@@ -177,6 +241,48 @@ impl JournalInsertReceipt {
     pub fn encoded_bytes(self) -> usize {
         self.encoded_bytes
     }
+}
+
+/// Acknowledgement returned after a cancellation request has committed and passed readback.
+///
+/// The receipt proves only that the non-terminal request is durable in this profile-owned
+/// journal. It grants no cleanup, capacity-release, filesystem, or recovery execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalCancelRequestReceipt {
+    operation_id: OperationId,
+    sequence: i64,
+    encoded_bytes: usize,
+}
+
+impl JournalCancelRequestReceipt {
+    /// Return the operation id carrying the cancellation request.
+    pub fn operation_id(self) -> OperationId {
+        self.operation_id
+    }
+
+    /// Return the new or replayed journal sequence.
+    pub fn sequence(self) -> i64 {
+        self.sequence
+    }
+
+    /// Return the encoded V4 record length.
+    pub fn encoded_bytes(self) -> usize {
+        self.encoded_bytes
+    }
+}
+
+struct JournalRow {
+    sequence: i64,
+    encoded: Vec<u8>,
+    record: StoredOperationRecord,
+}
+
+enum CancelTransition {
+    Replay(JournalCancelRequestReceipt),
+    Updated {
+        receipt: JournalCancelRequestReceipt,
+        record: StoredOperationRecord,
+    },
 }
 
 /// One profile-owned operation-journal SQLite connection.
@@ -214,7 +320,7 @@ impl OperationJournalStore {
         )
     }
 
-    /// Read one bounded, read-only recovery page after an optional insertion-sequence cursor.
+    /// Read one bounded, read-only recovery page after an optional journal-observation cursor.
     ///
     /// The page validates the retained namespace before and after its query. Returned records
     /// are untrusted observations and do not authorize filesystem or journal mutations.
@@ -328,65 +434,174 @@ impl OperationJournalStore {
         operation_id: OperationId,
     ) -> Result<Option<StoredOperationRecord>, OperationJournalStoreError> {
         self.validate_namespace()?;
-        let key = operation_id.to_string();
-        let row = self
-            .connection
-            .query_row(
-                "SELECT sequence, length(record) FROM operation_journal WHERE operation_id = ?1",
-                params![key],
-                |row| {
-                    let sequence = row.get::<_, i64>(0)?;
-                    let length = row.get::<_, i64>(1)?;
-                    Ok((sequence, length))
-                },
-            )
-            .optional()?;
-        let Some((sequence, encoded_length)) = row else {
+        let Some(row) = self.read_row(operation_id)? else {
             self.validate_namespace()?;
             return Ok(None);
         };
-        if !(0..=MAX_RECORD_BYTES as i64).contains(&encoded_length) {
-            return Err(retained_error(
-                Some(operation_id),
-                format!("stored record length {encoded_length} exceeds the bounded record size"),
-            ));
+        self.validate_namespace()?;
+        Ok(Some(row.record))
+    }
+
+    /// Persist a user cancellation request against the current V3 universal intent.
+    ///
+    /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
+    /// already stored for this operation is a read-only idempotent replay and returns the current
+    /// receipt without allocating another sequence. All other stale, legacy, malformed, or
+    /// unsupported rows remain unchanged. The resulting V4 record is intentionally non-terminal;
+    /// it grants no cleanup, capacity-release, filesystem, or recovery execution authority.
+    pub fn request_cancel_before_publish(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: CancellationRequestObservation,
+    ) -> Result<JournalCancelRequestReceipt, OperationJournalStoreError> {
+        if expected_sequence <= 0 {
+            return Err(OperationJournalStoreError::InvalidExpectedSequence {
+                expected: expected_sequence,
+            });
         }
-        let encoded = self.connection.query_row(
-            "SELECT record FROM operation_journal WHERE operation_id = ?1",
-            params![operation_id.to_string()],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?;
-        if encoded.len() != encoded_length as usize || encoded.len() > MAX_RECORD_BYTES {
-            return Err(retained_error(
-                Some(operation_id),
-                String::from("stored record length changed or exceeded the bound"),
-            ));
-        }
-        let record =
-            decode(&encoded).map_err(|error| retained_decode_error(operation_id, error))?;
-        if record.operation_id != operation_id {
-            return Err(retained_error(
-                Some(operation_id),
-                String::from("record identity does not match its SQLite key"),
-            ));
-        }
-        match classify_record(&record) {
-            RecordConsistency::Consistent => {
-                if sequence <= 0 {
-                    return Err(retained_error(
-                        Some(operation_id),
-                        String::from("stored sequence is not positive"),
-                    ));
+        observation.validate().map_err(|error| {
+            OperationJournalStoreError::InvalidCancellationRequest {
+                reason: error.to_string(),
+            }
+        })?;
+
+        self.validate_namespace()?;
+        self.connection.execute_batch("BEGIN EXCLUSIVE")?;
+        let result =
+            self.request_cancel_inside_transaction(operation_id, expected_sequence, observation);
+        match result {
+            Ok(CancelTransition::Replay(receipt)) => {
+                let rollback = self.connection.execute_batch("ROLLBACK");
+                if let Err(error) = rollback {
+                    return Err(error.into());
                 }
                 self.validate_namespace()?;
-                Ok(Some(record))
+                Ok(receipt)
             }
-            RecordConsistency::LegacyMissingPublicationEvidence => Err(retained_error(
-                Some(operation_id),
-                String::from("legacy record is retained without publication evidence"),
-            )),
-            RecordConsistency::Invalid(reason) => Err(retained_error(Some(operation_id), reason)),
+            Ok(CancelTransition::Updated { receipt, record }) => {
+                if let Err(error) = self.validate_namespace_without_sidecars() {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                self.validate_namespace()?;
+                let persisted = self.get(operation_id)?;
+                if persisted.as_ref() != Some(&record) {
+                    return Err(retained_error(
+                        Some(operation_id),
+                        String::from("committed cancellation request could not be read back"),
+                    ));
+                }
+                Ok(receipt)
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
+    }
+
+    fn request_cancel_inside_transaction(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: CancellationRequestObservation,
+    ) -> Result<CancelTransition, OperationJournalStoreError> {
+        self.validate_namespace_without_sidecars()?;
+        let Some(current) = self.read_row(operation_id)? else {
+            return Err(OperationJournalStoreError::OperationNotFound { operation_id });
+        };
+
+        if current.record.schema_version == SCHEMA_V4
+            && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
+        {
+            if current.record.cancellation_request() == Some(&observation) {
+                return Ok(CancelTransition::Replay(JournalCancelRequestReceipt {
+                    operation_id,
+                    sequence: current.sequence,
+                    encoded_bytes: current.encoded.len(),
+                }));
+            }
+            return Err(OperationJournalStoreError::CancellationConflict { operation_id });
+        }
+
+        if current.sequence != expected_sequence {
+            return Err(OperationJournalStoreError::StaleSequence {
+                operation_id,
+                expected: expected_sequence,
+                actual: current.sequence,
+            });
+        }
+        if current.record.schema_version != SCHEMA_V3 {
+            return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
+                schema_version: current.record.schema_version,
+            });
+        }
+        if current.record.intent.actor != OperationActor::User {
+            return Err(OperationJournalStoreError::UnsupportedCancellationActor {
+                actor: current.record.intent.actor,
+            });
+        }
+        if current.record.phase != OperationPhase::IntentDurable
+            || current.record.disposition != OperationDisposition::None
+        {
+            return Err(OperationJournalStoreError::UnsupportedCancellationState {
+                reason: format!(
+                    "expected V3 IntentDurable/None, found {:?}/{:?}",
+                    current.record.phase, current.record.disposition
+                ),
+            });
+        }
+        if observation.requested_unix_ms() < current.record.updated_unix_ms {
+            return Err(OperationJournalStoreError::InvalidCancellationRequest {
+                reason: format!(
+                    "request timestamp {} precedes the stored update timestamp {}",
+                    observation.requested_unix_ms(),
+                    current.record.updated_unix_ms
+                ),
+            });
+        }
+
+        let next_record = current.record.with_cancellation_request(observation);
+        let encoded = encode(&next_record)?;
+        if encoded.len() > MAX_RECORD_BYTES {
+            return Err(OperationJournalStoreError::InconsistentRecord {
+                reason: format!("encoded record exceeds {MAX_RECORD_BYTES} bytes"),
+            });
+        }
+        self.validate_namespace_without_sidecars()?;
+        let sequence = self.next_sequence_inside_transaction()?;
+        let changed = self.connection.execute(
+            "UPDATE operation_journal
+             SET sequence = ?1, record = ?2
+             WHERE operation_id = ?3 AND sequence = ?4",
+            params![
+                sequence,
+                encoded.as_slice(),
+                operation_id.to_string(),
+                expected_sequence
+            ],
+        )?;
+        if changed != 1 {
+            return Err(OperationJournalStoreError::StaleSequence {
+                operation_id,
+                expected: expected_sequence,
+                actual: current.sequence,
+            });
+        }
+        self.validate_namespace_without_sidecars()?;
+        Ok(CancelTransition::Updated {
+            receipt: JournalCancelRequestReceipt {
+                operation_id,
+                sequence,
+                encoded_bytes: encoded.len(),
+            },
+            record: next_record,
+        })
     }
 
     /// Insert one internally consistent durable intent without changing any later phase.
@@ -447,21 +662,7 @@ impl OperationJournalStore {
         if already_present.is_some() {
             return Err(OperationJournalStoreError::DuplicateOperation { operation_id });
         }
-        let previous_sequence = self.connection.query_row(
-            "SELECT MAX(sequence) FROM operation_journal",
-            [],
-            |row| row.get::<_, Option<i64>>(0),
-        )?;
-        if previous_sequence.is_some_and(|sequence| sequence <= 0) {
-            return Err(audit_error(
-                &self.database_path,
-                "stored insertion sequence is not positive",
-            ));
-        }
-        let sequence = previous_sequence
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(OperationJournalStoreError::SequenceExhausted)?;
+        let sequence = self.next_sequence_inside_transaction()?;
         self.connection.execute(
             "INSERT INTO operation_journal (operation_id, sequence, record)
              VALUES (?1, ?2, ?3)",
@@ -472,6 +673,147 @@ impl OperationJournalStore {
             sequence,
             encoded_bytes: encoded.len(),
         })
+    }
+
+    fn next_sequence_inside_transaction(&self) -> Result<i64, OperationJournalStoreError> {
+        let previous_sequence = self.connection.query_row(
+            "SELECT MAX(sequence) FROM operation_journal",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        if previous_sequence.is_some_and(|sequence| sequence <= 0) {
+            return Err(audit_error(
+                &self.database_path,
+                "stored journal-observation sequence is not positive",
+            ));
+        }
+        previous_sequence
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(OperationJournalStoreError::SequenceExhausted)
+    }
+
+    /// Read one row with the same bounded key, sequence, blob, codec, and consistency checks used
+    /// by point reads. This helper deliberately performs no namespace or sidecar inspection so it
+    /// can run inside the store's exclusive transaction.
+    fn read_row(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<JournalRow>, OperationJournalStoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT typeof(operation_id), typeof(sequence), sequence,
+                        typeof(record), length(record), record
+                 FROM operation_journal WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| {
+                    let operation_id_type: String = row.get(0)?;
+                    let sequence_type: String = row.get(1)?;
+                    let sequence = match row.get_ref(2)? {
+                        ValueRef::Integer(value) => Some(value),
+                        _ => None,
+                    };
+                    let record_type: String = row.get(3)?;
+                    let record_length = match row.get_ref(4)? {
+                        ValueRef::Integer(value) => Some(value),
+                        ValueRef::Null => None,
+                        _ => None,
+                    };
+                    let encoded = match row.get_ref(5)? {
+                        ValueRef::Blob(value) => Some(value.to_vec()),
+                        _ => None,
+                    };
+                    Ok((
+                        operation_id_type,
+                        sequence_type,
+                        sequence,
+                        record_type,
+                        record_length,
+                        encoded,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((operation_id_type, sequence_type, sequence, record_type, record_length, encoded)) =
+            row
+        else {
+            return Ok(None);
+        };
+        if operation_id_type != "text" {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("operation id column must contain a SQLite TEXT key"),
+            ));
+        }
+        if sequence_type != "integer" {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("sequence column must contain a SQLite integer"),
+            ));
+        }
+        let Some(sequence) = sequence else {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("sequence column is not an SQLite integer"),
+            ));
+        };
+        if sequence <= 0 {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("stored sequence is not positive"),
+            ));
+        }
+        if record_type != "blob" {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("record column must contain a SQLite BLOB"),
+            ));
+        }
+        let Some(record_length) = record_length else {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("stored record length is NULL"),
+            ));
+        };
+        if !(0..=MAX_RECORD_BYTES as i64).contains(&record_length) {
+            return Err(retained_error(
+                Some(operation_id),
+                format!("stored record length {record_length} exceeds the bounded record size"),
+            ));
+        }
+        let Some(encoded) = encoded else {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("record column could not be read as a SQLite BLOB"),
+            ));
+        };
+        if encoded.len() != record_length as usize || encoded.len() > MAX_RECORD_BYTES {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("stored record length changed or exceeded the bound"),
+            ));
+        }
+        let record =
+            decode(&encoded).map_err(|error| retained_decode_error(operation_id, error))?;
+        if record.operation_id != operation_id {
+            return Err(retained_error(
+                Some(operation_id),
+                String::from("record identity does not match its SQLite key"),
+            ));
+        }
+        match classify_record(&record) {
+            RecordConsistency::Consistent => Ok(Some(JournalRow {
+                sequence,
+                encoded,
+                record,
+            })),
+            RecordConsistency::LegacyMissingPublicationEvidence => Err(retained_error(
+                Some(operation_id),
+                String::from("legacy record is retained without publication evidence"),
+            )),
+            RecordConsistency::Invalid(reason) => Err(retained_error(Some(operation_id), reason)),
+        }
     }
 
     fn validate_namespace(&self) -> Result<(), OperationJournalStoreError> {
@@ -1057,6 +1399,7 @@ mod tests {
 
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
+    use crate::operation_journal::RecoveryRowOutcome;
     use crate::test_runtime::TestRuntimeGuard;
 
     struct Fixture {
@@ -1167,6 +1510,19 @@ mod tests {
             .expect("decode universal intent fixture")
     }
 
+    fn external_universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &encode(&universal_intent_record(operation_id)).expect("v3 bytes"),
+        )
+        .expect("parse v3 fixture");
+        value["intent"]["actor"] = serde_json::Value::from("ExternalFs");
+        value["intent"]["kind"] = serde_json::Value::from("ExternalReconciliation");
+        value["universal_intent"]["command_kind"] =
+            serde_json::Value::from("ExternalReconciliation");
+        decode(&serde_json::to_vec(&value).expect("serialize external fixture"))
+            .expect("decode external intent fixture")
+    }
+
     fn database_path(owner: &WritableProfileGuard) -> PathBuf {
         owner
             .profile_root()
@@ -1258,6 +1614,288 @@ mod tests {
                 .expect("get restarted v3 intent"),
             Some(record)
         );
+    }
+
+    #[test]
+    fn cancellation_request_persists_v4_without_execution_authority() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+
+        let receipt = store
+            .request_cancel_before_publish(record.operation_id, inserted.sequence(), observation)
+            .expect("persist cancellation request");
+        assert_eq!(receipt.operation_id(), record.operation_id);
+        assert_eq!(receipt.sequence(), 2);
+        assert_eq!(
+            receipt.encoded_bytes(),
+            encode(
+                &store
+                    .get(record.operation_id)
+                    .expect("get canceled row")
+                    .unwrap()
+            )
+            .expect("encode persisted cancellation")
+            .len()
+        );
+
+        let persisted = store
+            .get(record.operation_id)
+            .expect("get persisted cancellation")
+            .expect("cancellation row");
+        assert_eq!(persisted.schema_version, SCHEMA_V4);
+        assert_eq!(persisted.phase, OperationPhase::IntentDurable);
+        assert_eq!(
+            persisted.disposition,
+            OperationDisposition::CancelRequestedBeforePublish
+        );
+        assert_eq!(persisted.cancellation_request(), Some(&observation));
+        assert_eq!(persisted.intent, record.intent);
+        assert_eq!(persisted.universal_intent, record.universal_intent);
+        assert_eq!(persisted.capacity_plan, record.capacity_plan);
+        assert_eq!(persisted.payload, record.payload);
+        assert_eq!(persisted.created_unix_ms, record.created_unix_ms);
+        assert_eq!(persisted.updated_unix_ms, observation.requested_unix_ms());
+
+        assert!(matches!(
+            store.insert_intent(&persisted),
+            Err(OperationJournalStoreError::InconsistentRecord { reason })
+                if reason.contains("None disposition")
+        ));
+
+        let page = store
+            .scan_recovery_page(None)
+            .expect("scan cancellation recovery row");
+        assert_eq!(page.entries().len(), 1);
+        assert_eq!(page.entries()[0].sequence(), receipt.sequence());
+        assert!(matches!(
+            page.entries()[0].outcome(),
+            RecoveryRowOutcome::Consistent(observed) if observed == &persisted
+        ));
+    }
+
+    #[test]
+    fn cancellation_request_replay_is_idempotent_and_different_request_is_rejected() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+        let receipt = store
+            .request_cancel_before_publish(record.operation_id, inserted.sequence(), observation)
+            .expect("persist cancellation request");
+
+        let replay = store
+            .request_cancel_before_publish(record.operation_id, inserted.sequence(), observation)
+            .expect("replay exact cancellation request");
+        assert_eq!(replay, receipt);
+
+        let different = CancellationRequestObservation::new(44).expect("different timestamp");
+        assert!(matches!(
+            store.request_cancel_before_publish(record.operation_id, receipt.sequence(), different),
+            Err(OperationJournalStoreError::CancellationConflict { operation_id })
+                if operation_id == record.operation_id
+        ));
+        let persisted = store
+            .get(record.operation_id)
+            .expect("get after replay conflict")
+            .expect("cancellation row");
+        assert_eq!(persisted.cancellation_request(), Some(&observation));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT sequence FROM operation_journal WHERE operation_id = ?1",
+                    params![record.operation_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read cancellation sequence"),
+            receipt.sequence()
+        );
+    }
+
+    #[test]
+    fn cancellation_request_rejects_stale_sequence_and_legacy_rows_unchanged() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let first = universal_intent_record(OperationId::new());
+        let first_receipt = store.insert_intent(&first).expect("insert first v3 intent");
+        let second = universal_intent_record(OperationId::new());
+        store
+            .insert_intent(&second)
+            .expect("insert second v3 intent");
+        let before: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![first.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read first bytes");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+        assert!(matches!(
+            store.request_cancel_before_publish(first.operation_id, first_receipt.sequence() + 1, observation),
+            Err(OperationJournalStoreError::StaleSequence { operation_id, expected, actual })
+                if operation_id == first.operation_id
+                    && expected == first_receipt.sequence() + 1
+                    && actual == first_receipt.sequence()
+        ));
+        let after: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![first.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read unchanged first bytes");
+        assert_eq!(after, before);
+
+        let legacy = intent_record(OperationId::new());
+        let legacy_receipt = store.insert_intent(&legacy).expect("insert legacy intent");
+        let legacy_before: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![legacy.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read legacy bytes");
+        assert!(matches!(
+            store.request_cancel_before_publish(
+                legacy.operation_id,
+                legacy_receipt.sequence(),
+                observation
+            ),
+            Err(OperationJournalStoreError::UnsupportedCancellationSchema { schema_version: 1 })
+        ));
+        let legacy_after: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![legacy.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read unchanged legacy bytes");
+        assert_eq!(legacy_after, legacy_before);
+
+        let external = external_universal_intent_record(OperationId::new());
+        let external_receipt = store
+            .insert_intent(&external)
+            .expect("insert external intent");
+        assert!(matches!(
+            store.request_cancel_before_publish(
+                external.operation_id,
+                external_receipt.sequence(),
+                observation
+            ),
+            Err(OperationJournalStoreError::UnsupportedCancellationActor {
+                actor: OperationActor::ExternalFs
+            })
+        ));
+    }
+
+    #[test]
+    fn cancellation_request_allocates_global_sequence_after_other_operation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let first = universal_intent_record(OperationId::new());
+        let first_receipt = store.insert_intent(&first).expect("insert first v3 intent");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+        let cancellation = store
+            .request_cancel_before_publish(
+                first.operation_id,
+                first_receipt.sequence(),
+                observation,
+            )
+            .expect("persist cancellation request");
+        let second = universal_intent_record(OperationId::new());
+        let second_receipt = store
+            .insert_intent(&second)
+            .expect("insert second v3 intent");
+        assert_eq!(cancellation.sequence(), 2);
+        assert_eq!(second_receipt.sequence(), 3);
+    }
+
+    #[test]
+    fn cancellation_request_rejects_nonpositive_expected_sequence_without_io() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+        assert!(matches!(
+            store.request_cancel_before_publish(OperationId::new(), 0, observation),
+            Err(OperationJournalStoreError::InvalidExpectedSequence { expected: 0 })
+        ));
+    }
+
+    #[test]
+    fn cancellation_request_rejects_timestamp_before_current_update() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let observation = CancellationRequestObservation::new(record.updated_unix_ms - 1)
+            .expect("earlier non-negative timestamp");
+        assert!(matches!(
+            store.request_cancel_before_publish(record.operation_id, inserted.sequence(), observation),
+            Err(OperationJournalStoreError::InvalidCancellationRequest { reason })
+                if reason.contains("precedes")
+        ));
+        assert_eq!(
+            store
+                .get(record.operation_id)
+                .expect("get unchanged intent"),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn cancellation_request_rejects_sequence_exhaustion_without_mutating_row() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let max_id = OperationId::new();
+        let max_record = universal_intent_record(max_id);
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    max_id.to_string(),
+                    i64::MAX,
+                    encode(&max_record).expect("max row bytes")
+                ],
+            )
+            .expect("insert sequence exhaustion fixture");
+        let before: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read row before exhaustion");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+        assert!(matches!(
+            store.request_cancel_before_publish(
+                record.operation_id,
+                inserted.sequence(),
+                observation
+            ),
+            Err(OperationJournalStoreError::SequenceExhausted)
+        ));
+        let after: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read row after exhaustion");
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -1458,6 +2096,32 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).expect("read replacement"), b"replacement");
         drop(store);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_replacement_is_rejected_before_cancellation_effects() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let path = database_path(&fixture.owner);
+        let displaced = path.with_extension("sqlite3.cancel-displaced");
+        fs::rename(&path, &displaced).expect("displace database");
+        let replacement = b"replacement must remain untouched";
+        fs::write(&path, replacement).expect("write replacement database");
+        let observation = CancellationRequestObservation::new(53).expect("request timestamp");
+        let error = store
+            .request_cancel_before_publish(record.operation_id, inserted.sequence(), observation)
+            .expect_err("reject cancellation against replacement");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::DatabaseReplaced { .. }
+        ));
+        assert_eq!(fs::read(&path).expect("read replacement"), replacement);
+        drop(store);
+        fs::remove_file(&path).expect("remove replacement");
+        fs::rename(displaced, path).expect("restore original database");
     }
 
     #[cfg(unix)]

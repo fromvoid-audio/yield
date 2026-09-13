@@ -17,6 +17,8 @@ pub const SCHEMA_V1: u32 = 1;
 pub const SCHEMA_V2: u32 = 2;
 /// The initial universal operation-journal schema.
 pub const SCHEMA_V3: u32 = 3;
+/// The durable pre-publication cancellation-request schema.
+pub const SCHEMA_V4: u32 = 4;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
@@ -362,6 +364,48 @@ pub enum OperationDisposition {
     FailedDataLossRisk,
 }
 
+/// A bounded observation of when a user requested cancellation before publication.
+///
+/// This value is persisted as part of a V4 journal record. It contains no live cancellation
+/// handle, ownership capability, cleanup authority, or permission to advance the operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationRequestObservation {
+    requested_unix_ms: i64,
+}
+
+impl CancellationRequestObservation {
+    /// Construct a cancellation observation with a non-negative Unix-millisecond timestamp.
+    pub const fn new(requested_unix_ms: i64) -> Result<Self, CancellationRequestValidationError> {
+        if requested_unix_ms < 0 {
+            return Err(CancellationRequestValidationError::NegativeTimestamp);
+        }
+        Ok(Self { requested_unix_ms })
+    }
+
+    /// Return the observed Unix-millisecond request time.
+    pub const fn requested_unix_ms(self) -> i64 {
+        self.requested_unix_ms
+    }
+
+    /// Validate an observation that may have come from an untrusted decoder.
+    pub const fn validate(self) -> Result<(), CancellationRequestValidationError> {
+        if self.requested_unix_ms < 0 {
+            Err(CancellationRequestValidationError::NegativeTimestamp)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Failure while constructing or validating a cancellation request observation.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum CancellationRequestValidationError {
+    /// The request timestamp cannot precede the Unix epoch.
+    #[error("cancellation request timestamp must be non-negative")]
+    NegativeTimestamp,
+}
+
 impl OperationDisposition {
     /// Return whether this disposition terminates the operation.
     pub fn is_terminal(self) -> bool {
@@ -429,5 +473,17 @@ mod tests {
             .expect("cancel disposition decodes");
         assert!(!retry.is_terminal());
         assert!(cancelled.is_terminal());
+    }
+
+    #[test]
+    fn cancellation_request_observation_is_bounded_and_opaque() {
+        let observation = CancellationRequestObservation::new(42)
+            .expect("non-negative cancellation timestamp is valid");
+        assert_eq!(observation.requested_unix_ms(), 42);
+        assert_eq!(observation.validate(), Ok(()));
+        assert_eq!(
+            CancellationRequestObservation::new(-1),
+            Err(CancellationRequestValidationError::NegativeTimestamp)
+        );
     }
 }

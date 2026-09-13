@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-use super::codec::{StoredOperationRecord, validate_v3_initial_shape};
+use super::codec::{StoredOperationRecord, validate_v3_initial_shape, validate_v4_cancel_shape};
 use super::evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalCapabilityScope, AbsentFinalObservation,
     AbsentFinalRecoveryObservation, AbsentFinalTransactionOwnedProof, FilesystemPublicationMode,
@@ -18,7 +18,9 @@ use super::evidence::{
     PreparedWaveformRestore, PublicationSynchronization, PublicationVisibility,
     ReplaceExpectedIdentity, RootPathContinuity, WholePublicationAtomicity,
 };
-use super::model::{OperationDisposition, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
+use super::model::{
+    OperationDisposition, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4,
+};
 use crate::durable_capacity::{
     DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, round_up_allocation,
 };
@@ -53,7 +55,10 @@ enum RecordValidation {
 }
 
 fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidation, String> {
-    if !matches!(record.schema_version, SCHEMA_V1 | SCHEMA_V2 | SCHEMA_V3) {
+    if !matches!(
+        record.schema_version,
+        SCHEMA_V1 | SCHEMA_V2 | SCHEMA_V3 | SCHEMA_V4
+    ) {
         return Err(format!(
             "unsupported operation journal schema version: {}",
             record.schema_version
@@ -64,6 +69,16 @@ fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidat
         validate_v3_initial_shape(record)?;
         validate_capacity_plan_option(record.capacity_plan.as_ref())?;
         return Ok(RecordValidation::Consistent);
+    }
+    if record.schema_version == SCHEMA_V4 {
+        validate_v4_cancel_shape(record)?;
+        validate_capacity_plan_option(record.capacity_plan.as_ref())?;
+        return Ok(RecordValidation::Consistent);
+    }
+    if record.cancellation_request().is_some() {
+        return Err(String::from(
+            "legacy operation-journal schemas cannot carry a cancellation request",
+        ));
     }
     if record.universal_intent.is_some() {
         return Err(String::from(

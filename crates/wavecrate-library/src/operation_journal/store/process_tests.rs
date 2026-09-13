@@ -12,13 +12,16 @@ use super::OperationJournalStore;
 use crate::app_dirs::{
     ConfigBaseGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
-use crate::operation_journal::{OperationId, StoredOperationRecord, decode};
+use crate::operation_journal::{
+    CancellationRequestObservation, OperationId, SCHEMA_V4, StoredOperationRecord, decode,
+};
 use crate::test_runtime::TestRuntimeGuard;
 
 const CONFIG_HOME_ENV: &str = "WAVECRATE_CONFIG_HOME";
 const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
 const PROFILE_NAME: &str = "operation-journal-restart";
 const OPERATION_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+const CANCEL_HELPER_ENV: &str = "WAVECRATE_JOURNAL_HELPER_CANCEL";
 
 struct ProcessFixture {
     profile_name: String,
@@ -62,7 +65,10 @@ impl Drop for JournalOwnerProcess {
     }
 }
 
-fn spawn_journal_owner_helper(fixture: &ProcessFixture) -> JournalOwnerProcess {
+fn spawn_journal_owner_helper(
+    fixture: &ProcessFixture,
+    cancel_requested: bool,
+) -> JournalOwnerProcess {
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
     command
         .arg("--exact")
@@ -71,6 +77,7 @@ fn spawn_journal_owner_helper(fixture: &ProcessFixture) -> JournalOwnerProcess {
         .arg("--nocapture")
         .env(CONFIG_HOME_ENV, fixture._base.path())
         .env(CONFIG_PROFILE_ENV, &fixture.profile_name)
+        .env(CANCEL_HELPER_ENV, if cancel_requested { "1" } else { "0" })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -155,10 +162,59 @@ fn intent_record(operation_id: OperationId) -> StoredOperationRecord {
         .expect("decode intent fixture")
 }
 
+fn universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
+    let value = serde_json::json!({
+        "schema_version": 3,
+        "operation_id": operation_id.as_uuid(),
+        "intent": {
+            "actor": "User",
+            "kind": "FileMutation",
+            "label": "restart-v3-test"
+        },
+        "universal_intent": {
+            "parent_operation_id": null,
+            "command_kind": "CreateFile",
+            "user_status_key": "operation.status.restart-v3",
+            "participants": {
+                "descriptors": [{
+                    "id": "fedcba98-7654-3210-fedc-ba9876543210",
+                    "kind": "GlobalLibrary",
+                    "requirement": "Required",
+                    "source_fence": null,
+                    "artifact_key": null
+                }],
+                "checkpoints": [{
+                    "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                    "state": "Pending",
+                    "committed_revision": null,
+                    "diagnostic_code": null
+                }]
+            }
+        },
+        "phase": "IntentDurable",
+        "disposition": "None",
+        "payload": {"restart": "v3"},
+        "capacity_plan": {
+            "volumes": [{
+                "identity": {"device": 1},
+                "allocation_unit": 1,
+                "allocation_class": "DestinationStaging",
+                "logical_bytes": 1,
+                "allocated_bytes": 1,
+                "protected_free_bytes": 268435456
+            }]
+        },
+        "created_unix_ms": 1,
+        "updated_unix_ms": 1
+    });
+    decode(&serde_json::to_vec(&value).expect("serialize universal intent fixture"))
+        .expect("decode universal intent fixture")
+}
+
 #[test]
 fn abrupt_owner_restart_retains_acknowledged_intent() {
     let fixture = ProcessFixture::new();
-    let mut helper = spawn_journal_owner_helper(&fixture);
+    let mut helper = spawn_journal_owner_helper(&fixture, false);
     let operation_id = wait_for_ready(&mut helper);
     assert_eq!(
         operation_id,
@@ -179,14 +235,53 @@ fn abrupt_owner_restart_retains_acknowledged_intent() {
 }
 
 #[test]
+fn abrupt_owner_restart_retains_acknowledged_cancellation_request() {
+    let fixture = ProcessFixture::new();
+    let mut helper = spawn_journal_owner_helper(&fixture, true);
+    let operation_id = wait_for_ready(&mut helper);
+    terminate_abruptly(&mut helper);
+
+    let owner = WritableProfileGuard::acquire_current().expect("reacquire after abrupt exit");
+    let store = OperationJournalStore::open(&owner).expect("reopen journal after abrupt exit");
+    let persisted = store
+        .get(operation_id)
+        .expect("read acknowledged cancellation request")
+        .expect("cancellation request row");
+    assert_eq!(persisted.schema_version, SCHEMA_V4);
+    assert_eq!(
+        persisted.disposition,
+        crate::operation_journal::OperationDisposition::CancelRequestedBeforePublish
+    );
+    assert_eq!(
+        persisted
+            .cancellation_request()
+            .expect("cancellation observation")
+            .requested_unix_ms(),
+        2
+    );
+}
+
+#[test]
 #[ignore = "spawned by abrupt_owner_restart_retains_acknowledged_intent"]
 fn journal_owner_process_helper() {
     let owner = WritableProfileGuard::acquire_current().expect("journal helper profile owner");
     let store = OperationJournalStore::open(&owner).expect("journal helper store");
     let operation_id = OperationId::parse(OPERATION_ID).expect("fixed operation ID");
-    store
-        .insert_intent(&intent_record(operation_id))
-        .expect("journal helper intent insert");
+    if std::env::var_os(CANCEL_HELPER_ENV).is_some_and(|value| value == "1") {
+        let record = universal_intent_record(operation_id);
+        let inserted = store
+            .insert_intent(&record)
+            .expect("journal helper intent insert");
+        let observation =
+            CancellationRequestObservation::new(2).expect("journal helper cancellation time");
+        store
+            .request_cancel_before_publish(operation_id, inserted.sequence(), observation)
+            .expect("journal helper cancellation request");
+    } else {
+        store
+            .insert_intent(&intent_record(operation_id))
+            .expect("journal helper intent insert");
+    }
     println!("READY {operation_id}");
     io::stdout()
         .flush()
