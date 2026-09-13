@@ -301,7 +301,7 @@ from stale revisions/cursors.
 
 The initial catalog-send boundary left post-queue projection and readiness
 publication uncovered. Subsequent extensions below address those boundaries;
-stable source diagnostics remain the current OPT-1349 acceptance work.
+diagnostic policy and final acceptance are recorded below.
 
 The initial publication slice passed three library fence tests, the 92-test
 catalog suite before final regression refinement, two corrected live-admission
@@ -387,8 +387,7 @@ fixture (one passed, one helper ignored), GPUI compilation, formatting and diff
 checks passed. Windows storage acceptance passed on exact `fb278b708` in
 [`34752810963`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34752810963).
 Logs confirm both new origin regressions passed within the 57-test readiness
-selection. Stable source diagnostics and final data-preservation acceptance
-still keep OPT-1349 open; no readiness executor
+selection. Diagnostic and data-preservation acceptance is recorded below; no readiness executor
 has been ported from the excluded reference application in this work.
 
 ## Source diagnostics and recovery policy
@@ -428,7 +427,14 @@ usable before lease bootstrap and after release.
 The parallel library run encountered a failure in the unchanged cwd-sensitive
 `test_runtime::tests::panic_unwind_restores_environment_and_current_directory`.
 That test passed alone, and the complete library suite passed with one test
-thread. Windows storage acceptance for the diagnostics extension remains pending.
+thread. Windows storage acceptance passed on exact `2981d22e4` in
+[`34755296770`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34755296770).
+The logs confirm the portable missing-media and first-lease preservation
+regressions passed within 28 source identity tests, and the catalog mapping and
+retry-policy regressions passed within 90 catalog tests. The run also passed
+production storage/admission, 57 readiness tests, journal and session checks.
+An initial Windows run stopped on a Unix-only test import; `2981d22e4` guards
+that import. Native Windows UI validation is outside this storage run.
 
 ## Active publication coverage
 
@@ -440,7 +446,9 @@ while readiness claims and independent publication require their captured
 origin. Read-only media and content artifacts use their own content/revision
 checks and do not publish authoritative source database state.
 
-This inventory excludes `reference/radiant`. The future readiness executor and
+Together with the physical lease foundation and the validated publication,
+readiness and diagnostic extensions above, this completes OPT-1349 for the
+active GPUI implementation. This inventory excludes `reference/radiant`. The future readiness executor and
 source-writer routing tickets must consume these ownership contracts when they
 enter the active crate graph. This does not establish completion of those ports
 or full GPUI feature parity.
