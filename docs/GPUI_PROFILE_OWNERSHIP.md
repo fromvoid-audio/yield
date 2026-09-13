@@ -801,3 +801,33 @@ codec/store/owner coverage and all three abrupt-restart regressions. The lane
 also passed 12 legacy-reader, 90 catalog, 60 session (one helper ignored), 16 core
 edit-settings and five media-adapter tests. This accepts the V8 storage milestone;
 native Windows UI and filesystem execution remain outside this validation scope.
+
+## V9 whole-file render observations (OPT-1337)
+
+V9 adds a separate render command envelope for the original whole-file Normalize
+and DuplicateDouble behavior. Normalize records one in-place source endpoint,
+strong file revision, source WAV spec, full frame count, and explicit Float32
+output preserving rate and channels. DuplicateDouble records source and distinct
+destination endpoints, strong source revision/spec/frame count, explicit output
+spec preserving the original encoding (including 8-bit, 24-bit and 32-bit
+integer), and NoReplace. Its checked frame and WAV arithmetic matches the pinned
+hound writer: PCM RIFF overhead is 36 bytes and extensible overhead is 60 bytes.
+
+DuplicateDouble accepts cross-source and different-parent destinations. It
+rejects a known same physical root/relative entry, including source-ID aliases.
+The destination metadata policy is Fresh because the original registers a new
+file entry after writing; no inherited metadata or snapshot reference is
+embedded. Both commands require fenced SourceDatabase endpoints and a required
+Filesystem participant. These are bounded observations only: no filesystem
+execution, capacity reservation, source lease, or publication authority is
+persisted.
+
+V9 preserves all V8 command variants and remains IntentDurable with None,
+RetryPending, and pre-publication cancellation observations. Codec raw bounds,
+per-version allowlists, direct and JSON foreign-version rejection, SQLite
+persistence/restart, CAS retry/cancellation, and generic owner persistence are
+covered by local tests. The serialized `operation_journal` suite passed 173
+tests with one helper ignored, including 10 render and 42 codec tests. Production
+no-default library and GPUI checks, formatting, and diff checks passed;
+independent review found no remaining issues. The existing V1 default and SQLite
+schema remain unchanged.

@@ -986,10 +986,12 @@ mod tests {
         OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
         ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
         RecoveryCursor, RecoveryRowOutcome, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6,
-        SCHEMA_V7, SCHEMA_V8, StoredRelativePath, StoredSourceFence, UniversalCommandArgs,
-        UniversalCommandKind, UniversalIntent, WaveformEditFrameRange, WaveformEditIntentArgs,
+        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, StoredRelativePath, StoredSourceFence,
+        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
         WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
-        WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec, decode,
+        WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+        decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1334,6 +1336,56 @@ mod tests {
         (record, command_args)
     }
 
+    fn v9_duplicate_double_record(
+        operation_id: OperationId,
+    ) -> (StoredOperationRecord, WaveformDuplicateDoubleIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 8, WaveformSampleFormat::Integer)
+            .expect("render source spec");
+        let command_args = WaveformDuplicateDoubleIntentArgs::new(
+            copy_args.source().clone(),
+            copy_args.destination().clone(),
+            WaveformFileRevisionObservation::new(
+                "owner-render-file",
+                "owner-render-change",
+                1024,
+                Some(12_000_000_000),
+            )
+            .expect("render file revision"),
+            source_spec,
+            10,
+            WaveformRenderOutputSpec::from_source(source_spec),
+            CopyCollisionPolicy::NoReplace,
+        )
+        .expect("duplicate-double arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Duplicate,
+            "operation.status.owner-render",
+            participants,
+        )
+        .expect("render universal intent");
+        let record = StoredOperationRecord::new_v9_command(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            UniversalCommandArgs::Render(
+                super::super::render_commands::RenderCommandArgs::DuplicateDouble(
+                    command_args.clone(),
+                ),
+            ),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, command_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1476,6 +1528,40 @@ mod tests {
                 .expect("namespace universal intent")
                 .command_kind(),
             UniversalCommandKind::Rename
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v9_render_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v9-render");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, render_args) = v9_duplicate_double_record(operation_id);
+        let mut request = client.persist_intent(record).expect("render admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("render result")
+            .expect("render worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("render acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+        let mut lookup = client.get(operation_id).expect("render lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("render lookup result")
+            .expect("render lookup worker result")
+            .expect("persisted render");
+        assert_eq!(persisted.schema_version, SCHEMA_V9);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::Render(
+                super::super::render_commands::RenderCommandArgs::DuplicateDouble(render_args)
+            ))
         );
         assert!(owner.shutdown());
     }

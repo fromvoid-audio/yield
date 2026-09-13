@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use super::coordinator::{
     CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
-    validate_persisted_copy_intent_value, validate_persisted_retry_observation_value,
-    validate_persisted_universal_command_args_value,
+    validate_persisted_copy_intent_value, validate_persisted_import_intent_value,
+    validate_persisted_retry_observation_value, validate_persisted_universal_command_args_value,
+    validate_persisted_waveform_edit_value,
 };
 use super::evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalRecoveryObservation, AbsentFinalTransactionOwnedProof,
@@ -27,10 +28,11 @@ use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, UniversalIntent,
+    SCHEMA_V8, SCHEMA_V9, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
+use super::render_commands::validate_persisted_render_command_args_value;
 use crate::durable_capacity::DurableCapacityPlan;
 
 /// One complete stored operation record.
@@ -76,7 +78,7 @@ pub struct StoredOperationRecord {
     command_args: Option<CopyIntentArgs>,
     /// Optional V5 durable retry/status observation.
     retry_observation: Option<RetryObservation>,
-    /// Optional V6/V7/V8 tagged command arguments.
+    /// Optional V6/V7/V8/V9 tagged command arguments.
     universal_command_args: Option<UniversalCommandArgs>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
@@ -235,6 +237,39 @@ impl StoredOperationRecord {
         }
     }
 
+    pub(crate) fn new_v9_command(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_V9,
+            operation_id,
+            intent,
+            universal_intent: Some(universal_intent),
+            phase: OperationPhase::IntentDurable,
+            disposition: OperationDisposition::None,
+            payload: Value::Object(Map::new()),
+            capacity_plan: Some(capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: None,
+            command_args: None,
+            retry_observation: None,
+            universal_command_args: Some(command_args),
+            created_unix_ms: timestamp_unix_ms,
+            updated_unix_ms: timestamp_unix_ms,
+        }
+    }
+
     /// Borrow stored publication evidence without exposing a construction path for it.
     pub fn published(&self) -> Option<&FilesystemPublishedWaveformRestore> {
         self.published.as_ref()
@@ -267,7 +302,7 @@ impl StoredOperationRecord {
         let mut record = self.clone();
         if !matches!(
             record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -279,7 +314,10 @@ impl StoredOperationRecord {
 
     pub(crate) fn with_retry_pending(&self, observation: RetryObservation) -> Self {
         let mut record = self.clone();
-        if !matches!(record.schema_version, SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8) {
+        if !matches!(
+            record.schema_version,
+            SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9
+        ) {
             record.schema_version = SCHEMA_V5;
         }
         record.disposition = OperationDisposition::RetryPending;
@@ -392,6 +430,12 @@ pub enum EncodeError {
     /// A V8 namespace-command record violates its bounded state or argument contract.
     #[error("invalid schema-v8 namespace command record: {reason}")]
     InvalidV8Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// A V9 whole-file render record violates its bounded state or argument contract.
+    #[error("invalid schema-v9 render command record: {reason}")]
+    InvalidV9Record {
         /// Bounded validation diagnostic.
         reason: String,
     },
@@ -1345,6 +1389,99 @@ struct PersistedOperationRecordV8Ref<'a> {
     updated_unix_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperationRecordV9 {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: UniversalCommandArgs,
+    capacity_plan: DurableCapacityPlan,
+    #[serde(default)]
+    retry_observation: Option<RetryObservation>,
+    #[serde(default)]
+    cancellation_request: Option<CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl From<PersistedOperationRecordV9> for StoredOperationRecord {
+    fn from(record: PersistedOperationRecordV9) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            operation_id: OperationId::from_uuid(record.operation_id),
+            intent: record.intent,
+            universal_intent: Some(record.universal_intent),
+            phase: record.phase,
+            disposition: record.disposition,
+            payload: Value::Object(Map::new()),
+            capacity_plan: Some(record.capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: record.cancellation_request,
+            command_args: None,
+            retry_observation: record.retry_observation,
+            universal_command_args: Some(record.universal_command_args),
+            created_unix_ms: record.created_unix_ms,
+            updated_unix_ms: record.updated_unix_ms,
+        }
+    }
+}
+
+fn persisted_v9_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedOperationRecordV9Ref<'_>, EncodeError> {
+    validate_v9_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV9Record { reason })?;
+    Ok(PersistedOperationRecordV9Ref {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("V9 universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        universal_command_args: record
+            .universal_command_args
+            .as_ref()
+            .expect("V9 command arguments checked above"),
+        capacity_plan: record
+            .capacity_plan
+            .as_ref()
+            .expect("V9 capacity plan checked above"),
+        retry_observation: record.retry_observation.as_ref(),
+        cancellation_request: record.cancellation_request.as_ref(),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    })
+}
+
+#[derive(Serialize)]
+struct PersistedOperationRecordV9Ref<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: &'a UniversalCommandArgs,
+    capacity_plan: &'a DurableCapacityPlan,
+    retry_observation: Option<&'a RetryObservation>,
+    cancellation_request: Option<&'a CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -1433,6 +1570,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v8_coordinator_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V9 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v9_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedOperationRecordV9>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v9_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -1593,6 +1739,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V8 => {
             let persisted = persisted_v8_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V9 => {
+            let persisted = persisted_v9_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -2525,6 +2675,72 @@ fn validate_persisted_v8_object_boundaries(value: &Value) -> Result<(), &'static
 }
 
 fn validate_persisted_v8_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(value, true, false)
+}
+
+fn validate_persisted_v9_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "universal_command_args",
+            "capacity_plan",
+            "retry_observation",
+            "cancellation_request",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "universal_command_args",
+        "capacity_plan",
+        "retry_observation",
+        "cancellation_request",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
+    validate_persisted_v9_universal_command_args_value(required_field(
+        object,
+        "universal_command_args",
+    )?)?;
+    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
+    if let Some(retry) = object.get("retry_observation") {
+        if !retry.is_null() {
+            validate_persisted_retry_observation_value(retry)?;
+        }
+    }
+    if let Some(cancellation) = object.get("cancellation_request") {
+        if !cancellation.is_null() {
+            validate_persisted_cancellation_request_value(cancellation)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_v9_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(value, true, true)
+}
+
+fn validate_persisted_tagged_command_args_value(
+    value: &Value,
+    allow_namespace: bool,
+    allow_render: bool,
+) -> Result<(), &'static str> {
     let object = value
         .as_object()
         .ok_or("persisted command arguments must be a tagged object")?;
@@ -2535,10 +2751,19 @@ fn validate_persisted_v8_universal_command_args_value(value: &Value) -> Result<(
         .iter()
         .next()
         .ok_or("persisted command arguments must contain exactly one variant")?;
-    if variant == "Namespace" {
-        validate_persisted_namespace_command_args_value(arguments)
-    } else {
-        validate_persisted_universal_command_args_value(value)
+    match variant.as_str() {
+        "Copy" | "DuplicateSame" => validate_persisted_copy_intent_value(arguments),
+        "Import" => validate_persisted_import_intent_value(arguments),
+        "WaveformEdit" => validate_persisted_waveform_edit_value(arguments),
+        "Namespace" if allow_namespace => {
+            validate_persisted_namespace_command_args_value(arguments)
+        }
+        "Namespace" => {
+            Err("schema-v7 command arguments cannot carry schema-v8 namespace arguments")
+        }
+        "Render" if allow_render => validate_persisted_render_command_args_value(arguments),
+        "Render" => Err("schema-v8 command arguments cannot carry schema-v9 render arguments"),
+        _ => Err("persisted command arguments contain an unknown variant"),
     }
 }
 
@@ -2864,6 +3089,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
             "schema-v6 cannot carry schema-v8 namespace arguments",
         ));
     }
+    if matches!(command_args, UniversalCommandArgs::Render(_)) {
+        return Err(String::from(
+            "schema-v6 cannot carry schema-v9 render arguments",
+        ));
+    }
     if universal.command_kind() != command_args.command_kind() {
         return Err(String::from(
             "schema-v6 universal command kind does not match tagged command arguments",
@@ -2934,18 +3164,50 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
 }
 
 pub(crate) fn validate_v7_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
-    validate_tagged_coordinator_shape(record, SCHEMA_V7, "schema-v7", false)
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V7,
+        "schema-v7",
+        &["Copy", "Import", "DuplicateSame", "WaveformEdit"],
+    )
 }
 
 pub(crate) fn validate_v8_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
-    validate_tagged_coordinator_shape(record, SCHEMA_V8, "schema-v8", true)
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V8,
+        "schema-v8",
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+        ],
+    )
+}
+
+pub(crate) fn validate_v9_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V9,
+        "schema-v9",
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+        ],
+    )
 }
 
 fn validate_tagged_coordinator_shape(
     record: &StoredOperationRecord,
     expected_schema: u32,
     schema_name: &str,
-    allow_namespace: bool,
+    allowed_variants: &[&str],
 ) -> Result<(), String> {
     if record.schema_version != expected_schema {
         return Err(format!("{schema_name} validation received another schema"));
@@ -2981,10 +3243,22 @@ fn validate_tagged_coordinator_shape(
         .universal_command_args
         .as_ref()
         .ok_or_else(|| format!("{schema_name} record requires tagged command arguments"))?;
-    if !allow_namespace && matches!(command_args, UniversalCommandArgs::Namespace(_)) {
-        return Err(format!(
-            "{schema_name} cannot carry schema-v8 namespace arguments"
-        ));
+    let variant = match command_args {
+        UniversalCommandArgs::Copy(_) => "Copy",
+        UniversalCommandArgs::Import(_) => "Import",
+        UniversalCommandArgs::DuplicateSame(_) => "DuplicateSame",
+        UniversalCommandArgs::WaveformEdit(_) => "WaveformEdit",
+        UniversalCommandArgs::Namespace(_) => "Namespace",
+        UniversalCommandArgs::Render(_) => "Render",
+    };
+    if !allowed_variants.contains(&variant) {
+        return Err(match variant {
+            "Namespace" => {
+                format!("{schema_name} cannot carry schema-v8 namespace arguments")
+            }
+            "Render" => format!("{schema_name} cannot carry schema-v9 render arguments"),
+            _ => format!("{schema_name} cannot carry {variant} arguments"),
+        });
     }
     if universal.command_kind() != command_args.command_kind() {
         return Err(format!(
@@ -3498,6 +3772,78 @@ mod tests {
         fixture
     }
 
+    fn v9_render_fixture(variant: &str) -> Value {
+        let mut fixture = v6_command_fixture("Copy");
+        let source = fixture["universal_command_args"]["Copy"]["source"].clone();
+        fixture["schema_version"] = Value::from(9_u64);
+        fixture["universal_intent"]["command_kind"] = Value::from(match variant {
+            "Normalize" => "DestructiveEdit",
+            "DuplicateDouble" => "Duplicate",
+            other => panic!("unknown V9 render fixture {other}"),
+        });
+        fixture["universal_command_args"] = match variant {
+            "Normalize" => serde_json::json!({
+                "Render": {
+                    "Normalize": {
+                        "source": source,
+                        "source_file_revision": {
+                            "filesystem_identity": "file-identity",
+                            "change_marker": "change-marker",
+                            "byte_len": 1024,
+                            "modified_unix_ns": 12000000000_i64
+                        },
+                        "source_spec": {
+                            "channels": 2,
+                            "sample_rate": 48000,
+                            "bits_per_sample": 16,
+                            "sample_format": "Integer"
+                        },
+                        "total_frames": 10,
+                        "output": {
+                            "encoding": "Float32",
+                            "channels": 2,
+                            "sample_rate": 48000
+                        }
+                    }
+                }
+            }),
+            "DuplicateDouble" => serde_json::json!({
+                "Render": {
+                    "DuplicateDouble": {
+                        "source": source,
+                        "destination": {
+                            "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                            "source_id": "source-a",
+                            "relative_path": "out_doubled.wav"
+                        },
+                        "source_file_revision": {
+                            "filesystem_identity": "file-identity",
+                            "change_marker": "change-marker",
+                            "byte_len": 1024,
+                            "modified_unix_ns": 12000000000_i64
+                        },
+                        "source_spec": {
+                            "channels": 2,
+                            "sample_rate": 48000,
+                            "bits_per_sample": 16,
+                            "sample_format": "Integer"
+                        },
+                        "total_frames": 10,
+                        "output": {
+                            "channels": 2,
+                            "sample_rate": 48000,
+                            "bits_per_sample": 16,
+                            "sample_format": "Integer"
+                        },
+                        "collision_policy": "NoReplace"
+                    }
+                }
+            }),
+            _ => unreachable!(),
+        };
+        fixture
+    }
+
     #[test]
     fn pinned_v1_fixture_decodes_and_round_trips_by_value() {
         let record = decode(V1_FIXTURE).expect("v1 fixture decodes");
@@ -3719,6 +4065,110 @@ mod tests {
             value(&encode(&waveform_record).expect("V8 waveform encodes")),
             waveform_fixture
         );
+    }
+
+    #[test]
+    fn v9_render_commands_round_trip_with_explicit_outputs() {
+        for variant in ["Normalize", "DuplicateDouble"] {
+            let fixture = v9_render_fixture(variant);
+            let bytes = serde_json::to_vec(&fixture).expect("V9 render bytes");
+            let record = decode(&bytes).expect("V9 render fixture decodes");
+            assert_eq!(record.schema_version, super::super::model::SCHEMA_V9);
+            assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+            assert!(matches!(
+                record.universal_command_args(),
+                Some(UniversalCommandArgs::Render(_))
+            ));
+            assert_eq!(value(&encode(&record).expect("V9 render encodes")), fixture);
+        }
+    }
+
+    #[test]
+    fn v9_preserves_every_prior_command_variant_family() {
+        let mut fixtures = Vec::new();
+        for variant in ["Copy", "Import", "DuplicateSame"] {
+            let mut fixture = v6_command_fixture(variant);
+            fixture["schema_version"] = Value::from(9_u64);
+            fixtures.push(fixture);
+        }
+        let mut waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        waveform["schema_version"] = Value::from(9_u64);
+        fixtures.push(waveform);
+        let mut namespace = v8_namespace_fixture("Rename");
+        namespace["schema_version"] = Value::from(9_u64);
+        fixtures.push(namespace);
+
+        for fixture in fixtures {
+            let record = decode(&serde_json::to_vec(&fixture).expect("V9 prior bytes"))
+                .expect("V9 prior command decodes");
+            assert_eq!(record.schema_version, SCHEMA_V9);
+            assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+            assert_eq!(value(&encode(&record).expect("V9 prior encodes")), fixture);
+        }
+    }
+
+    #[test]
+    fn v9_render_codec_rejects_malformed_revision_path_output_and_arithmetic() {
+        let mut invalid_revision = v9_render_fixture("Normalize");
+        invalid_revision["universal_command_args"]["Render"]["Normalize"]["source_file_revision"]
+            ["filesystem_identity"] = Value::String(String::new());
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_revision).expect("invalid revision bytes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("render file revision")
+        ));
+
+        let mut invalid_path = v9_render_fixture("Normalize");
+        invalid_path["universal_command_args"]["Render"]["Normalize"]["source"]["relative_path"] =
+            Value::from("../in.wav");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_path).expect("invalid path bytes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("render endpoint relative path")
+        ));
+
+        let mut invalid_output = v9_render_fixture("DuplicateDouble");
+        invalid_output["universal_command_args"]["Render"]["DuplicateDouble"]["output"]["bits_per_sample"] =
+            Value::from(8_u64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_output).expect("invalid output bytes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("preserve source specification")
+        ));
+
+        let mut arithmetic_overflow = v9_render_fixture("Normalize");
+        arithmetic_overflow["universal_command_args"]["Render"]["Normalize"]["total_frames"] =
+            Value::from(1_100_000_000_u64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&arithmetic_overflow).expect("overflow bytes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("output arithmetic")
+        ));
+    }
+
+    #[test]
+    fn older_schemas_reject_render_arguments_in_json_and_direct_records() {
+        let fixture = v9_render_fixture("Normalize");
+        for schema in [6_u64, 7_u64, 8_u64] {
+            let mut old_schema = fixture.clone();
+            old_schema["schema_version"] = Value::from(schema);
+            assert!(matches!(
+                decode(&serde_json::to_vec(&old_schema).expect("foreign V9 bytes")),
+                Err(DecodeError::Malformed { .. })
+            ));
+        }
+
+        let mut direct =
+            decode(&serde_json::to_vec(&fixture).expect("V9 bytes")).expect("V9 record");
+        for schema in [
+            super::super::model::SCHEMA_V6,
+            super::super::model::SCHEMA_V7,
+            super::super::model::SCHEMA_V8,
+        ] {
+            direct.schema_version = schema;
+            assert!(matches!(
+                classify_record(&direct),
+                RecordConsistency::Invalid(reason) if reason.contains("schema-v9 render")
+            ));
+            let error = encode(&direct).expect_err("older schema must reject render");
+            assert!(error.to_string().contains("schema-v9 render"));
+        }
     }
 
     #[test]

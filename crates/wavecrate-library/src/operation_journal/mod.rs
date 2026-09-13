@@ -12,6 +12,7 @@ pub mod model;
 pub mod namespace_commands;
 pub mod owner;
 pub mod participants;
+pub mod render_commands;
 pub mod status;
 pub mod store;
 pub mod validation;
@@ -49,7 +50,7 @@ pub use model::{
     CURRENT_SCHEMA_VERSION, CancellationRequestObservation, CancellationRequestValidationError,
     MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationActor,
     OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
-    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
     UniversalCommandKind, UniversalIntent, UniversalIntentTextViolation,
     UniversalIntentValidationError,
 };
@@ -61,6 +62,12 @@ pub use namespace_commands::{
     NamespaceEntryEndpoint, NamespaceEntryExpectation, NamespaceEntryKind,
     NamespaceFileExpectation, NamespaceLeafName, NamespaceLeafViolation, NamespaceMoveIntentArgs,
     NamespaceRenameIntentArgs, NamespaceTarget,
+};
+
+pub use render_commands::{
+    MAX_WAVEFORM_RENDER_FRAMES, RenderCommandArgs, RenderCommandValidationError,
+    RenderMetadataPolicy, WaveformDuplicateDoubleIntentArgs, WaveformNormalizeIntentArgs,
+    WaveformRenderOutputArithmetic, WaveformRenderOutputSpec,
 };
 
 pub use owner::{

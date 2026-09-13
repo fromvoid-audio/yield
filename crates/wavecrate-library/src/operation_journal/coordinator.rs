@@ -1476,6 +1476,8 @@ pub enum UniversalCommandArgs {
     WaveformEdit(WaveformEditIntentArgs),
     /// Rename, move, or create one bounded namespace entry.
     Namespace(NamespaceCommandArgs),
+    /// Observe one whole-file render command without executing it.
+    Render(super::render_commands::RenderCommandArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1487,6 +1489,7 @@ impl UniversalCommandArgs {
             Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
             Self::WaveformEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
             Self::Namespace(args) => args.command_kind(),
+            Self::Render(args) => args.command_kind(),
         }
     }
 
@@ -1511,6 +1514,9 @@ impl UniversalCommandArgs {
             Self::Namespace(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Namespace),
+            Self::Render(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::Render),
         }
     }
 }
@@ -1533,6 +1539,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A bounded namespace mutation argument failed validation.
     #[error("invalid namespace command arguments: {0}")]
     Namespace(#[source] NamespaceCommandValidationError),
+    /// A bounded whole-file render command argument failed validation.
+    #[error("invalid render command arguments: {0}")]
+    Render(#[source] super::render_commands::RenderCommandValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.
@@ -2032,7 +2041,7 @@ fn validate_persisted_finite_f32_bits(value: &Value) -> Result<(), &'static str>
     Ok(())
 }
 
-fn validate_persisted_import_intent_value(value: &Value) -> Result<(), &'static str> {
+pub(crate) fn validate_persisted_import_intent_value(value: &Value) -> Result<(), &'static str> {
     let object = strict_object(
         value,
         &[
