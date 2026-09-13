@@ -746,3 +746,12 @@ it assumed `SystemTime` could represent one nanosecond on Windows. Rust document
 The repair uses representable platform times and tests exact nanosecond limits in
 the shared checked-duration arithmetic separately. All five adapter tests pass
 locally after this repair; a new exact-commit Windows run is required.
+
+The repaired V7 Windows storage run
+[34769426219](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34769426219)
+passed at exact commit `c093ef7e1265faa4c664d1344902d0a63b7e046a`. Its logs confirm
+all five media adapter tests and 16 core edit-settings tests, including platform
+precision and exact-duration limits. It also passed 130 journal tests (one helper
+ignored), 12 legacy reader tests, 90 catalog tests and 60 session tests (one helper
+ignored). This accepts the V7 storage and pure-adapter milestone; it does not
+establish native UI or filesystem-publication acceptance.
