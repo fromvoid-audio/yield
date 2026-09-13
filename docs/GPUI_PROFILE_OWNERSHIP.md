@@ -584,4 +584,8 @@ status wording instead of copied parser content. Original recovery entries remai
 unchanged. Local validation passed: 111 journal tests (one helper ignored),
 including three focused status tests and the key-retention regression, production
 library compilation without default features, GPUI compilation, formatting and
-diff checks. Windows storage validation is pending.
+diff checks.
+[Windows storage validation](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34761336321)
+passed on exact `7e6e39d997b17a2984d8a4811b7f048549e11292`, including
+101 journal tests and the status, legacy-field and key-retention regressions.
+This is storage-scope acceptance, not native Windows UI acceptance.
