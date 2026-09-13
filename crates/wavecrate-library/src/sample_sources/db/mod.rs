@@ -204,7 +204,7 @@ pub(crate) struct ReadinessOwnership<'a> {
     profile_guard: Option<&'a WritableProfileGuard>,
     database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
     database_file_binding: Option<&'a sqlite_identity::DatabaseFileBinding>,
-    source_lease: Option<&'a source_lease::SourceLease>,
+    source_lease: Option<&'a Arc<source_lease::SourceLease>>,
 }
 
 impl<'a> ReadinessOwnership<'a> {
@@ -212,7 +212,7 @@ impl<'a> ReadinessOwnership<'a> {
         profile_guard: Option<&'a WritableProfileGuard>,
         database_root_binding: Option<&'a dyn DatabaseRootBindingGuard>,
         database_file_binding: Option<&'a sqlite_identity::DatabaseFileBinding>,
-        source_lease: Option<&'a source_lease::SourceLease>,
+        source_lease: Option<&'a Arc<source_lease::SourceLease>>,
     ) -> Self {
         Self {
             profile_guard,
@@ -224,6 +224,131 @@ impl<'a> ReadinessOwnership<'a> {
 
     pub(crate) fn unowned() -> Self {
         Self::new(None, None, None, None)
+    }
+
+    fn has_owned_capability(&self) -> bool {
+        self.profile_guard.is_some()
+            || self.database_root_binding.is_some()
+            || self.database_file_binding.is_some()
+            || self.source_lease.is_some()
+    }
+
+    fn has_complete_ownership(&self) -> bool {
+        self.profile_guard.is_some()
+            && self.database_root_binding.is_some()
+            && self.database_file_binding.is_some()
+            && self.source_lease.is_some()
+    }
+
+    pub(crate) fn publication_fence(
+        &self,
+    ) -> Result<
+        Option<source_lease::SourcePublicationFence>,
+        crate::sample_sources::readiness::ReadinessError,
+    > {
+        match self.source_lease {
+            Some(source_lease) if self.has_complete_ownership() => {
+                Ok(Some(source_lease.publication_fence()))
+            }
+            Some(_) => Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired),
+            None if self.has_owned_capability() => Err(
+                crate::sample_sources::readiness::ReadinessError::SourceLease(
+                    source_lease::SourceLeaseError::Required,
+                ),
+            ),
+            None => {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    Ok(None)
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired)
+                }
+            }
+        }
+    }
+
+    /// Compare a claim's physical-source fence with the receiving retained lease.
+    ///
+    /// This check is deliberately cheap and must run before current ownership validation, because
+    /// that validation may renew an idle receiving lease. It reads only the weak pointer identity,
+    /// immutable owner/epoch values, and the fence's in-memory liveness token.
+    pub(crate) fn validate_claim_fence_identity(
+        &self,
+        publication_fence: Option<&source_lease::SourcePublicationFence>,
+    ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
+        match (self.source_lease, publication_fence) {
+            (Some(source_lease), Some(publication_fence)) if self.has_complete_ownership() => {
+                if !publication_fence.matches_retained_lease(source_lease) {
+                    return Err(
+                        crate::sample_sources::readiness::ReadinessError::SourcePublicationFence(
+                            source_lease::SourcePublicationFenceError::LeaseMismatch,
+                        ),
+                    );
+                }
+                if !publication_fence.is_live() {
+                    return Err(
+                        crate::sample_sources::readiness::ReadinessError::SourcePublicationFence(
+                            source_lease::SourcePublicationFenceError::LeaseDropped,
+                        ),
+                    );
+                }
+                Ok(())
+            }
+            (Some(_), None) => Err(
+                crate::sample_sources::readiness::ReadinessError::SourceLease(
+                    source_lease::SourceLeaseError::Required,
+                ),
+            ),
+            (Some(_), Some(_)) => {
+                Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired)
+            }
+            (None, Some(_)) => {
+                Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired)
+            }
+            (None, None) if self.has_owned_capability() => Err(
+                crate::sample_sources::readiness::ReadinessError::SourceLease(
+                    source_lease::SourceLeaseError::Required,
+                ),
+            ),
+            (None, None) => {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    Ok(())
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired)
+                }
+            }
+        }
+    }
+
+    /// Fully validate a claim's physical-source fence after current ownership validation.
+    ///
+    /// The caller must perform [`Self::validate_claim_fence_identity`] first. This read-only
+    /// validation may use the issuing lease's retained control connection and is required again
+    /// at each durable mutation boundary.
+    pub(crate) fn validate_claim_fence(
+        &self,
+        publication_fence: Option<&source_lease::SourcePublicationFence>,
+    ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
+        match (self.source_lease, publication_fence) {
+            (Some(source_lease), Some(publication_fence)) if self.has_complete_ownership() => {
+                if !publication_fence.matches_retained_lease(source_lease) {
+                    return Err(
+                        crate::sample_sources::readiness::ReadinessError::SourcePublicationFence(
+                            source_lease::SourcePublicationFenceError::LeaseMismatch,
+                        ),
+                    );
+                }
+                publication_fence
+                    .validate()
+                    .map_err(crate::sample_sources::readiness::ReadinessError::from)
+            }
+            _ => self.validate_claim_fence_identity(publication_fence),
+        }
     }
 
     pub(crate) fn validate(
@@ -471,7 +596,7 @@ impl SourceDatabase {
             self.profile_guard.as_ref(),
             self.database_root_binding.as_deref(),
             self.database_file_binding.as_deref(),
-            self.source_lease.as_deref(),
+            self.source_lease.as_ref(),
         );
         Ok(
             crate::sample_sources::readiness::ReadinessStore::from_owned_connection(

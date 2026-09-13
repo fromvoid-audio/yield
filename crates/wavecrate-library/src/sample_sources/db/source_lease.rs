@@ -193,6 +193,9 @@ pub enum SourcePublicationFenceError {
     /// The durable source epoch no longer matches the result's immutable fence.
     #[error("source publication fence epoch changed")]
     EpochChanged,
+    /// The fence belongs to a different retained source lease than the receiving operation.
+    #[error("source publication fence does not belong to the retained source lease")]
+    LeaseMismatch,
     /// The retained source ownership proof failed while validating the fence.
     #[error(transparent)]
     Lease(#[from] SourceLeaseError),
@@ -287,6 +290,20 @@ impl std::fmt::Debug for SourcePublicationFence {
 }
 
 impl SourcePublicationFence {
+    /// Return whether two fences identify the same retained source owner and epoch.
+    pub(crate) fn same_claim_identity(&self, other: &Self) -> bool {
+        self.owner_identity == other.owner_identity
+            && self.lease_epoch == other.lease_epoch
+            && self.source_lease.ptr_eq(&other.source_lease)
+    }
+
+    /// Return whether this fence belongs to the receiving retained source lease.
+    pub(crate) fn matches_retained_lease(&self, source_lease: &Arc<SourceLease>) -> bool {
+        self.owner_identity == source_lease.owner_identity
+            && self.lease_epoch == source_lease.lease_epoch
+            && self.source_lease.ptr_eq(&Arc::downgrade(source_lease))
+    }
+
     /// Return whether the retained source owner is still live for this fence's generation.
     ///
     /// This is a cheap in-memory check for UI delivery boundaries. It reads only the retained

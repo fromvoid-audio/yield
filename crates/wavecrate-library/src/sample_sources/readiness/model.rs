@@ -1,3 +1,5 @@
+use crate::sample_sources::db::SourcePublicationFence;
+
 /// Stable readiness stages required for a usable source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReadinessStage {
@@ -314,8 +316,10 @@ impl ReadinessArtifact {
 ///
 /// `claim_generation` fences every lease mutation and completion, so a worker whose lease expired
 /// cannot publish after another worker has reclaimed the same target. `failure_attempts` is kept
-/// separate so benign cancellation and lease recovery never consume the retry allowance.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// separate so benign cancellation and lease recovery never consume the retry allowance. Owned
+/// claims also retain a weak physical-source fence so they cannot be applied to another database
+/// owner or epoch.
+#[derive(Clone, Debug)]
 pub struct ClaimedReadinessWork {
     /// Exact desired target captured when the work was claimed.
     pub target: ReadinessTarget,
@@ -327,9 +331,30 @@ pub struct ClaimedReadinessWork {
     pub lease_expires_at: i64,
     /// Durable state transition that made this work claimable.
     pub origin: ReadinessClaimOrigin,
+    pub(crate) publication_fence: Option<SourcePublicationFence>,
 }
 
 impl ClaimedReadinessWork {
+    /// Build a legacy claim without a physical-source fence for compatibility fixtures.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn from_legacy_fixture(
+        target: ReadinessTarget,
+        claim_generation: u32,
+        failure_attempts: u32,
+        lease_expires_at: i64,
+        origin: ReadinessClaimOrigin,
+    ) -> Self {
+        Self {
+            target,
+            claim_generation,
+            failure_attempts,
+            lease_expires_at,
+            origin,
+            publication_fence: None,
+        }
+    }
+
     /// Exact target owned by this claim generation.
     pub fn target(&self) -> &ReadinessTarget {
         &self.target
@@ -354,7 +379,29 @@ impl ClaimedReadinessWork {
     pub fn origin(&self) -> ReadinessClaimOrigin {
         self.origin
     }
+
+    /// Return the weak physical-source fence captured when this claim was issued.
+    pub(crate) fn publication_fence(&self) -> Option<&SourcePublicationFence> {
+        self.publication_fence.as_ref()
+    }
 }
+
+impl PartialEq for ClaimedReadinessWork {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.claim_generation == other.claim_generation
+            && self.failure_attempts == other.failure_attempts
+            && self.lease_expires_at == other.lease_expires_at
+            && self.origin == other.origin
+            && match (&self.publication_fence, &other.publication_fence) {
+                (Some(left), Some(right)) => left.same_claim_identity(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ClaimedReadinessWork {}
 
 /// Durable state transition that made one readiness job claimable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

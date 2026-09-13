@@ -184,13 +184,13 @@ fn crashed_process_lease_is_protected_until_expiry_and_recovered_once() {
         1
     );
 
-    let original = ClaimedReadinessWork {
-        target: analysis_target(),
-        claim_generation: 1,
-        failure_attempts: 0,
-        lease_expires_at: 20,
-        origin: ReadinessClaimOrigin::Pending,
-    };
+    let original = ClaimedReadinessWork::from_legacy_fixture(
+        analysis_target(),
+        1,
+        0,
+        20,
+        ReadinessClaimOrigin::Pending,
+    );
     let mut connection =
         SourceDatabase::open_connection_for_background_job(root.path()).expect("reopen source db");
     assert_eq!(

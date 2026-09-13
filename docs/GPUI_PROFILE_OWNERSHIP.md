@@ -335,6 +335,33 @@ passed on exact `7df74e1ca` in
 including production admission, journal/source mutation ownership and
 catalog/session checks. Native Windows UI validation is outside that storage run.
 
+## Readiness claim origin
+
+The readiness claim extension retains a weak physical-source
+fence in `ClaimedReadinessWork`. Logical target and claim generations remain
+mandatory, but do not identify the physical database owner. Claim mutation first
+compares the issuing lease with the receiving store's retained lease, before any
+receiving-lease renewal. Current ownership validation may then renew a legitimate
+same-owner idle lease, followed by full publication-fence validation. The checks
+also run at the transaction's commit boundary.
+
+An owned store rejects a missing or mismatched claim fence. Explicitly unowned
+fixtures retain their legacy claim construction only in test/test-support builds;
+they cannot receive an owned claim. Keeping a claim does not retain the source
+database lock. Independent readiness artifact and target publication still need
+their own physical-source proof; this claim extension does not complete OPT-1349.
+
+Local validation passed three focused claim-fence tests and the full library
+suite (665 passed, three existing ignored). Tests cover every terminal mutation
+after handoff, equal logical claims in simultaneously live databases, rejection
+without renewing an expired receiving lease, and legitimate same-owner renewal.
+The no-default production library check and seven profile-admission tests passed;
+the test-support readiness process fixture passed (one helper ignored).
+GPUI compilation, formatting and diff checks passed. Windows acceptance for this
+claim extension remains pending.
+
+## Journal coordination
+
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
 operation admission, checkpointing, and recovery execution remain requirements

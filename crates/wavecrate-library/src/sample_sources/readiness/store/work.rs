@@ -10,6 +10,19 @@ use super::super::snapshot::ArtifactPublishOutcome;
 use super::error::ReadinessError;
 use crate::sample_sources::db::ReadinessOwnership;
 
+fn validate_claim_ownership(
+    connection: &Connection,
+    ownership: &ReadinessOwnership<'_>,
+    claim: &ClaimedReadinessWork,
+) -> Result<(), ReadinessError> {
+    // Compare the immutable fence with the receiving store before validating the receiving
+    // ownership. The latter may renew its retained lease, which must not happen for a claim that
+    // is already known to belong to another source owner or epoch.
+    ownership.validate_claim_fence_identity(claim.publication_fence())?;
+    ownership.validate(connection)?;
+    ownership.validate_claim_fence(claim.publication_fence())
+}
+
 pub(crate) fn readiness_generation_is_known_unsupported(
     connection: &Connection,
     source_id: &str,
@@ -70,7 +83,10 @@ pub(super) fn claim_readiness_target_owned(
     now: i64,
     lease_duration_seconds: i64,
 ) -> Result<Option<ClaimedReadinessWork>, ReadinessError> {
+    let publication_fence = ownership.publication_fence()?;
+    ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
     ownership.validate(&*connection)?;
+    ownership.validate_claim_fence(publication_fence.as_ref())?;
     let lease_expires_at = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let candidate = tx
@@ -191,10 +207,15 @@ pub(super) fn claim_readiness_target_owned(
         eligibility,
     )) = candidate
     else {
+        ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
         ownership.validate(&tx)?;
+        ownership.validate_claim_fence(publication_fence.as_ref())?;
         tx.commit()?;
         return Ok(None);
     };
+    ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
+    ownership.validate(&tx)?;
+    ownership.validate_claim_fence(publication_fence.as_ref())?;
     let previous_claim_generation =
         decode_counter("readiness_claim_generation", stored_claim_generation)?;
     let claim_generation = previous_claim_generation
@@ -241,7 +262,9 @@ pub(super) fn claim_readiness_target_owned(
         content_generation: requested.content_generation.clone(),
         eligibility: decode_eligibility(eligibility)?,
     };
+    ownership.validate_claim_fence_identity(publication_fence.as_ref())?;
     ownership.validate(&tx)?;
+    ownership.validate_claim_fence(publication_fence.as_ref())?;
     tx.commit()?;
     Ok(Some(ClaimedReadinessWork {
         target,
@@ -249,6 +272,7 @@ pub(super) fn claim_readiness_target_owned(
         failure_attempts,
         lease_expires_at,
         origin,
+        publication_fence,
     }))
 }
 
@@ -276,9 +300,10 @@ pub(super) fn renew_readiness_lease_owned(
     now: i64,
     lease_duration_seconds: i64,
 ) -> Result<ReadinessLeaseRenewalOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_claim_ownership(&*connection, ownership, claim)?;
     let requested_deadline = lease_deadline(now, lease_duration_seconds)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     let changed = tx.execute(
         "UPDATE analysis_jobs
          SET lease_expires_at = MAX(lease_expires_at, ?1)
@@ -354,7 +379,7 @@ pub(super) fn renew_readiness_lease_owned(
         ],
         |row| row.get(0),
     )?;
-    ownership.validate(&tx)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     tx.commit()?;
     Ok(ReadinessLeaseRenewalOutcome::Renewed { lease_expires_at })
 }
@@ -410,7 +435,7 @@ pub(super) fn complete_readiness_work_with_artifact_ref_owned(
     completed_at: i64,
     artifact_ref: &str,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_claim_ownership(&*connection, ownership, claim)?;
     if artifact_ref.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactReference {
             source_id: claim.target.source_id.clone(),
@@ -434,8 +459,9 @@ fn complete_readiness_work_inner(
     completed_at: i64,
     artifact_ref: Option<&str>,
 ) -> Result<ArtifactPublishOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_claim_ownership(&*connection, ownership, claim)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     let changed = finish_claim_update(
         &tx,
         claim,
@@ -475,7 +501,7 @@ fn complete_readiness_work_inner(
             artifact.completed_at,
         ],
     )?;
-    ownership.validate(&tx)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     tx.commit()?;
     Ok(ArtifactPublishOutcome::Recorded)
 }
@@ -513,7 +539,7 @@ pub(super) fn fail_readiness_work_owned(
     failed_at: i64,
     retry_policy: ReadinessRetryPolicy,
 ) -> Result<ReadinessFailureOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_claim_ownership(&*connection, ownership, claim)?;
     let failure_attempt = match classification {
         ReadinessFailureClassification::Retryable => Some(
             claim
@@ -555,6 +581,7 @@ pub(super) fn fail_readiness_work_owned(
         }
     };
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     let changed = finish_claim_update(
         &tx,
         claim,
@@ -576,7 +603,7 @@ pub(super) fn fail_readiness_work_owned(
     if stored_classification == ReadinessFailureClassification::Unsupported {
         apply_unsupported_target_delta(&tx, claim, failed_at)?;
     }
-    ownership.validate(&tx)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -736,7 +763,7 @@ pub(super) fn cancel_readiness_work_owned(
     reason: &str,
     cancelled_at: i64,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_claim_ownership(&*connection, ownership, claim)?;
     return_claim_to_pending_owned(
         connection,
         ownership,
@@ -869,8 +896,9 @@ fn return_claim_to_pending_owned(
     now: i64,
     cancellation_reason: Option<&str>,
 ) -> Result<ReadinessWorkMutationOutcome, ReadinessError> {
-    ownership.validate(&*connection)?;
+    validate_claim_ownership(&*connection, ownership, claim)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     let (set_clause, extras) = if let Some(reason) = cancellation_reason {
         (
             "status = 'pending', running_at = NULL, retry_at = NULL, \
@@ -889,7 +917,7 @@ fn return_claim_to_pending_owned(
         tx.rollback()?;
         return Ok(ReadinessWorkMutationOutcome::RejectedStale);
     }
-    ownership.validate(&tx)?;
+    validate_claim_ownership(&tx, ownership, claim)?;
     tx.commit()?;
     Ok(ReadinessWorkMutationOutcome::Recorded)
 }

@@ -17,6 +17,9 @@ pub enum ReadinessError {
     /// The retained physical-source lease could not be acquired or validated.
     #[error("Readiness source lease validation failed: {0}")]
     SourceLease(#[from] crate::sample_sources::db::SourceLeaseError),
+    /// A claimed readiness unit belongs to a different physical-source owner or epoch.
+    #[error("Readiness source publication fence validation failed: {0}")]
+    SourcePublicationFence(#[from] crate::sample_sources::db::SourcePublicationFenceError),
     /// The caller cancelled a potentially long readiness database operation.
     #[error("Readiness operation cancelled")]
     Cancelled,
