@@ -488,6 +488,9 @@ Local validation passed: 98 journal tests (one subprocess helper ignored),
 default features, GPUI compilation, formatting and diff checks. Coverage includes
 strict V4 decoding, stale/conflicting requests, exact replay, rollback, recovery
 cursor movement, and acknowledged cancellation surviving abrupt process exit.
-Independent review found no meaningful issues. Windows storage validation is
-pending. Full coordinator admission, phase transitions and recovery execution
-remain incomplete.
+Independent review found no meaningful issues.
+[Windows storage validation](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34756869645)
+passed at exact commit `c800405dbc3f9263d4cc58ed31d2cdf7a4c032e5`, including
+88 journal tests and the abrupt cancellation restart regression, 90 catalog tests
+and 60 session tests. This storage run is not native Windows UI acceptance. Full
+coordinator admission, phase transitions and recovery execution remain incomplete.
