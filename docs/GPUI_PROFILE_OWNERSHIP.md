@@ -559,4 +559,7 @@ reader tests without default features, production library compilation without
 default features, GPUI compilation, formatting and diff checks. Regressions cover
 4,096-row paging, signed rowids through `i64::MAX`, concurrent same-length updates,
 weak cursor invalidation after reopening, and reads that do not renew the lease.
-A dedicated Windows reader test step is added; its validation is pending.
+The dedicated Windows reader step passed all 12 tests in
+[storage run 34760528283](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34760528283)
+on exact `d0704c333daefa17d1aee4463b0d414fa5a64287`; the full storage run
+passed as well. This is storage-scope acceptance, not native Windows UI acceptance.
