@@ -831,3 +831,13 @@ tests with one helper ignored, including 10 render and 42 codec tests. Productio
 no-default library and GPUI checks, formatting, and diff checks passed;
 independent review found no remaining issues. The existing V1 default and SQLite
 schema remain unchanged.
+
+Windows storage validation
+[34773388901](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34773388901)
+passed at exact commit `ba0ceacf21d2d6c7a205a2ac5a60eb8ee2871953`. Logs confirm
+161 journal tests (one helper ignored), including all ten render tests and V9
+compatibility, malformed-record, store replay and owner persistence coverage.
+The lane also passed 12 legacy-reader, 90 catalog, 60 session (one helper
+ignored), 16 core edit-settings and five media-adapter tests. This accepts the
+V9 storage milestone; native Windows UI and filesystem execution remain outside
+this validation scope.
