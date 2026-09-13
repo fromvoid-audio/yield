@@ -686,7 +686,14 @@ invalid nested identities and foreign fields fail closed.
 
 Local validation passed 135 journal tests (one helper ignored), including ten
 owner tests, plus production library compilation without default features, GPUI
-compilation, formatting and diff checks. Windows validation is pending.
+compilation, formatting and diff checks. Independent compatibility and durability
+review found no meaningful issues. Windows storage validation
+[34766605426](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34766605426)
+passed at exact commit `54e91717e118bd207461e68573ef80b5f346993d`. Its logs confirm
+the V6 compatibility, owner Import and retry/cancel regressions within 123 journal
+tests (one helper ignored), plus 12 legacy reader, 90 catalog and 60 session tests
+(one session helper ignored). This is storage-scope acceptance, not native UI
+acceptance.
 
 These are stored command observations, not runtime admission or permission to
 read or write a file. The SQLite schema and legacy default record version remain
