@@ -63,7 +63,8 @@ pub use store::recovery::{
 };
 pub use store::{
     JOURNAL_APPLICATION_ID, JOURNAL_DATABASE_FILE_NAME, JOURNAL_DATABASE_ROOT_NAME,
-    JOURNAL_SCHEMA_VERSION, JournalCancelRequestReceipt, JournalInsertReceipt, JournalRetryReceipt,
+    JOURNAL_SCHEMA_VERSION, JournalCancelRequestReceipt, JournalInsertFailure,
+    JournalInsertOutcome, JournalInsertReceipt, JournalInsertWriteStage, JournalRetryReceipt,
     OperationJournalStore, OperationJournalStoreError,
 };
 pub use validation::{RecordConsistency, classify_record};

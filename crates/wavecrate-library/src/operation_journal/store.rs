@@ -271,6 +271,109 @@ impl JournalInsertReceipt {
     }
 }
 
+/// The durable write boundary reached by one typed insert attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalInsertWriteStage {
+    /// Validation or transaction start failed before this attempt could mutate a row.
+    ///
+    /// This stage does not assert that the operation id is absent: a duplicate or other
+    /// pre-existing row is reported by a transaction-stage failure after it has been observed.
+    NoMutationAttempted,
+    /// The transaction was rolled back before any commit was attempted.
+    RolledBackBeforeCommit,
+    /// The rollback itself could not be confirmed, so the transaction outcome is uncertain.
+    RollbackNotConfirmed,
+    /// Commit was attempted but its durable outcome cannot be established.
+    CommitOutcomeUnknown,
+    /// Commit reported success, but namespace validation or exact readback failed afterward.
+    CommittedButNotAcknowledged,
+}
+
+/// Failure information for one typed journal insert attempt.
+#[derive(Debug, Error)]
+#[error("operation journal insert for {operation_id} failed at {stage:?}: {source}")]
+pub struct JournalInsertFailure {
+    operation_id: OperationId,
+    stage: JournalInsertWriteStage,
+    source: OperationJournalStoreError,
+    attempted_sequence: Option<i64>,
+    encoded_bytes: usize,
+    rollback_error: Option<Box<OperationJournalStoreError>>,
+}
+
+impl JournalInsertFailure {
+    /// Return the operation identity supplied to the insert attempt.
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    /// Return the durable write boundary reached before failure.
+    pub const fn stage(&self) -> JournalInsertWriteStage {
+        self.stage
+    }
+
+    /// Return the original store error from the failed operation.
+    pub fn error(&self) -> &OperationJournalStoreError {
+        &self.source
+    }
+
+    /// Return the sequence selected before a post-insert failure, when known.
+    pub const fn attempted_sequence(&self) -> Option<i64> {
+        self.attempted_sequence
+    }
+
+    /// Return the encoded record size considered by this attempt.
+    pub const fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+
+    /// Return a rollback error when rollback was attempted but not confirmed.
+    pub fn rollback_error(&self) -> Option<&OperationJournalStoreError> {
+        self.rollback_error.as_deref()
+    }
+
+    /// Consume the typed failure and return its original store error.
+    pub fn into_error(self) -> OperationJournalStoreError {
+        self.source
+    }
+}
+
+/// Outcome of an opt-in typed journal insert attempt.
+#[derive(Debug)]
+pub enum JournalInsertOutcome {
+    /// The row committed, passed full post-commit namespace validation, and matched exact
+    /// readback.
+    Committed(JournalInsertReceipt),
+    /// The attempt failed; no tentative receipt is exposed.
+    Failed(JournalInsertFailure),
+}
+
+impl JournalInsertOutcome {
+    /// Return the receipt only when the insert was fully acknowledged.
+    pub const fn receipt(&self) -> Option<JournalInsertReceipt> {
+        match self {
+            Self::Committed(receipt) => Some(*receipt),
+            Self::Failed(_) => None,
+        }
+    }
+
+    /// Borrow failure details, when the attempt did not produce an acknowledgement.
+    pub fn failure(&self) -> Option<&JournalInsertFailure> {
+        match self {
+            Self::Committed(_) => None,
+            Self::Failed(failure) => Some(failure),
+        }
+    }
+
+    /// Convert this outcome to a result while preserving typed failure details.
+    pub fn into_result(self) -> Result<JournalInsertReceipt, JournalInsertFailure> {
+        match self {
+            Self::Committed(receipt) => Ok(receipt),
+            Self::Failed(failure) => Err(failure),
+        }
+    }
+}
+
 /// Acknowledgement returned after a cancellation request has committed and passed readback.
 ///
 /// The receipt proves only that the non-terminal request is durable in this profile-owned
@@ -350,6 +453,24 @@ enum RetryTransition {
     },
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InsertTestBoundary {
+    BeforeBegin,
+    BeforePrecommitValidation,
+    Rollback,
+    Commit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+enum InsertTestDirective {
+    Continue,
+    Fail(OperationJournalStoreError),
+    FailAndLeaveForRollback(OperationJournalStoreError),
+    ExecuteThenFail(OperationJournalStoreError),
+}
+
 /// One profile-owned operation-journal SQLite connection.
 ///
 /// The retained root binding and cloned profile owner are kept until after the SQLite connection
@@ -360,6 +481,9 @@ pub struct OperationJournalStore {
     database_identity: String,
     database_root: BoundDatabaseRoot,
     profile_guard: WritableProfileGuard,
+    #[cfg(test)]
+    insert_test_hook:
+        std::sync::Mutex<Option<Box<dyn FnMut(InsertTestBoundary) -> InsertTestDirective + Send>>>,
 }
 
 impl std::fmt::Debug for OperationJournalStore {
@@ -490,6 +614,8 @@ impl OperationJournalStore {
             database_identity,
             database_root,
             profile_guard: retained_profile_guard,
+            #[cfg(test)]
+            insert_test_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -512,6 +638,9 @@ impl OperationJournalStore {
     /// This method records the typed command and its participant observations after an owning
     /// coordinator has completed any queue and capacity gates. It proves only that the V5 intent
     /// reached this journal; it does not admit filesystem execution or acquire a live capability.
+    /// As a compatibility adapter, an `Err` may be returned after COMMIT and therefore does not
+    /// prove that the operation row is absent. Claim or admission code should use
+    /// [`Self::persist_copy_intent_with_outcome`] when it needs the write-stage observation.
     pub fn persist_copy_intent(
         &self,
         operation_id: OperationId,
@@ -521,28 +650,85 @@ impl OperationJournalStore {
         capacity_plan: crate::durable_capacity::DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_copy_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V5 copy intent and expose the exact write-stage outcome.
+    ///
+    /// A `Committed` outcome is returned only after the real SQLite commit, full namespace
+    /// validation, and exact post-commit readback all succeed. A `Failed` outcome retains the
+    /// original store error and never exposes a tentative receipt. This method records a durable
+    /// intent only; it grants no filesystem admission, capacity authority, or execution token.
+    pub fn persist_copy_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: CopyIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
         if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
-            return Err(OperationJournalStoreError::InconsistentRecord {
-                reason: String::from(
-                    "schema-v5 copy intent requires a user file-mutation operation",
-                ),
-            });
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v5 copy intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
         }
         if universal_intent.command_kind() != super::model::UniversalCommandKind::Copy {
-            return Err(OperationJournalStoreError::InconsistentRecord {
-                reason: String::from("schema-v5 copy intent requires the Copy command"),
-            });
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v5 copy intent requires the Copy command"),
+                },
+                None,
+                0,
+                None,
+            );
         }
         if timestamp_unix_ms < 0 {
-            return Err(OperationJournalStoreError::InconsistentRecord {
-                reason: String::from("schema-v5 timestamps must be non-negative"),
-            });
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v5 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
         }
-        command_args
-            .validate_against_participants(universal_intent.participants())
-            .map_err(|error| OperationJournalStoreError::InconsistentRecord {
-                reason: error.to_string(),
-            })?;
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
         let record = StoredOperationRecord::new_v5_copy(
             operation_id,
             intent,
@@ -554,16 +740,44 @@ impl OperationJournalStore {
         match classify_record(&record) {
             RecordConsistency::Consistent => {}
             RecordConsistency::LegacyMissingPublicationEvidence => {
-                return Err(OperationJournalStoreError::InconsistentRecord {
-                    reason: String::from("schema-v5 copy intent has legacy publication evidence"),
-                });
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    OperationJournalStoreError::InconsistentRecord {
+                        reason: String::from(
+                            "schema-v5 copy intent has legacy publication evidence",
+                        ),
+                    },
+                    None,
+                    0,
+                    None,
+                );
             }
             RecordConsistency::Invalid(reason) => {
-                return Err(OperationJournalStoreError::InconsistentRecord { reason });
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    OperationJournalStoreError::InconsistentRecord { reason },
+                    None,
+                    0,
+                    None,
+                );
             }
         }
-        let encoded = encode(&record)?;
-        self.persist_record_with_encoded(&record, &encoded)
+        let encoded = match encode(&record) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    error.into(),
+                    None,
+                    0,
+                    None,
+                );
+            }
+        };
+        self.persist_record_with_encoded_outcome(&record, &encoded)
     }
 
     /// Persist a user cancellation request against a current V3 or V5 universal intent.
@@ -917,50 +1131,297 @@ impl OperationJournalStore {
     }
 
     /// Insert one internally consistent durable intent without changing any later phase.
+    /// As a compatibility adapter, an `Err` may be returned after COMMIT and therefore does not
+    /// prove that the operation row is absent. Claim or admission code should use
+    /// [`Self::insert_intent_with_outcome`] when it needs the write-stage observation.
     pub fn insert_intent(
         &self,
         record: &StoredOperationRecord,
     ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
-        validate_intent_record(record)?;
-        let encoded = encode(record)?;
-        if encoded.len() > MAX_RECORD_BYTES {
-            return Err(OperationJournalStoreError::InconsistentRecord {
-                reason: format!("encoded record exceeds {MAX_RECORD_BYTES} bytes"),
-            });
-        }
-
-        self.persist_record_with_encoded(record, &encoded)
+        self.insert_intent_with_outcome(record)
+            .into_result()
+            .map_err(JournalInsertFailure::into_error)
     }
 
-    fn persist_record_with_encoded(
+    /// Insert one durable intent and expose the exact write-stage outcome.
+    ///
+    /// This is the typed counterpart to [`Self::insert_intent`]. The returned receipt is exposed
+    /// only after commit, full post-commit namespace validation, and exact readback. A failed
+    /// outcome retains the original store error and never asserts that the operation id is absent.
+    pub fn insert_intent_with_outcome(
+        &self,
+        record: &StoredOperationRecord,
+    ) -> JournalInsertOutcome {
+        let operation_id = record.operation_id;
+        if let Err(error) = validate_intent_record(record) {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                error,
+                None,
+                0,
+                None,
+            );
+        }
+        let encoded = match encode(record) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    error.into(),
+                    None,
+                    0,
+                    None,
+                );
+            }
+        };
+        self.persist_record_with_encoded_outcome(record, &encoded)
+    }
+
+    fn persist_record_with_encoded_outcome(
         &self,
         record: &StoredOperationRecord,
         encoded: &[u8],
-    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
-        self.validate_namespace()?;
-        self.connection.execute_batch("BEGIN EXCLUSIVE")?;
-        let result = self.insert_inside_transaction(record, encoded);
-        match result {
-            Ok(receipt) => {
-                if let Err(error) = self.connection.execute_batch("COMMIT") {
-                    let _ = self.connection.execute_batch("ROLLBACK");
-                    return Err(error.into());
-                }
-                self.validate_namespace()?;
-                let persisted = self.get(record.operation_id)?;
-                if persisted.as_ref() != Some(record) {
-                    return Err(retained_error(
-                        Some(record.operation_id),
-                        String::from("committed journal row could not be read back identically"),
-                    ));
-                }
-                Ok(receipt)
-            }
+    ) -> JournalInsertOutcome {
+        let operation_id = record.operation_id;
+        if let Err(error) = self.validate_namespace() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                error,
+                None,
+                encoded.len(),
+                None,
+            );
+        }
+        #[cfg(test)]
+        if let Some(InsertTestDirective::Fail(error)) =
+            self.insert_test_directive(InsertTestBoundary::BeforeBegin)
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                error,
+                None,
+                encoded.len(),
+                None,
+            );
+        }
+        if let Err(error) = self.connection.execute_batch("BEGIN EXCLUSIVE") {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                error.into(),
+                None,
+                encoded.len(),
+                None,
+            );
+        }
+
+        let receipt = match self.insert_inside_transaction(record, encoded) {
+            Ok(receipt) => receipt,
             Err(error) => {
-                let _ = self.connection.execute_batch("ROLLBACK");
-                Err(error)
+                return self.rollback_insert_failure(operation_id, error, None, encoded.len());
+            }
+        };
+
+        #[cfg(test)]
+        if let Some(directive) =
+            self.insert_test_directive(InsertTestBoundary::BeforePrecommitValidation)
+        {
+            match directive {
+                InsertTestDirective::Fail(error)
+                | InsertTestDirective::FailAndLeaveForRollback(error) => {
+                    return self.rollback_insert_failure(
+                        operation_id,
+                        error,
+                        Some(receipt.sequence),
+                        encoded.len(),
+                    );
+                }
+                InsertTestDirective::Continue | InsertTestDirective::ExecuteThenFail(_) => {}
             }
         }
+        if let Err(error) = self.validate_namespace_without_sidecars() {
+            return self.rollback_insert_failure(
+                operation_id,
+                error,
+                Some(receipt.sequence),
+                encoded.len(),
+            );
+        }
+
+        #[cfg(test)]
+        let commit_directive = self.insert_test_directive(InsertTestBoundary::Commit);
+        #[cfg(test)]
+        if let Some(InsertTestDirective::Fail(error)) = commit_directive {
+            let rollback_error = self.rollback_insert_transaction();
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommitOutcomeUnknown,
+                error,
+                Some(receipt.sequence),
+                encoded.len(),
+                rollback_error,
+            );
+        }
+        #[cfg(test)]
+        if let Some(InsertTestDirective::ExecuteThenFail(error)) = commit_directive {
+            let commit_result = self.connection.execute_batch("COMMIT");
+            let rollback_error = self.rollback_insert_transaction();
+            if let Err(commit_error) = commit_result {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::CommitOutcomeUnknown,
+                    commit_error.into(),
+                    Some(receipt.sequence),
+                    encoded.len(),
+                    rollback_error,
+                );
+            }
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommitOutcomeUnknown,
+                error,
+                Some(receipt.sequence),
+                encoded.len(),
+                rollback_error,
+            );
+        }
+        if let Err(error) = self.connection.execute_batch("COMMIT") {
+            let rollback_error = self.rollback_insert_transaction();
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommitOutcomeUnknown,
+                error.into(),
+                Some(receipt.sequence),
+                encoded.len(),
+                rollback_error,
+            );
+        }
+
+        #[cfg(test)]
+        if let Some(InsertTestDirective::Fail(error)) =
+            self.insert_test_directive(InsertTestBoundary::AfterCommit)
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommittedButNotAcknowledged,
+                error,
+                Some(receipt.sequence),
+                encoded.len(),
+                None,
+            );
+        }
+        if let Err(error) = self.validate_namespace() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommittedButNotAcknowledged,
+                error,
+                Some(receipt.sequence),
+                encoded.len(),
+                None,
+            );
+        }
+        let persisted = match self.get(operation_id) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::CommittedButNotAcknowledged,
+                    error,
+                    Some(receipt.sequence),
+                    encoded.len(),
+                    None,
+                );
+            }
+        };
+        if persisted.as_ref() != Some(record) {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::CommittedButNotAcknowledged,
+                retained_error(
+                    Some(operation_id),
+                    String::from("committed journal row could not be read back identically"),
+                ),
+                Some(receipt.sequence),
+                encoded.len(),
+                None,
+            );
+        }
+        JournalInsertOutcome::Committed(receipt)
+    }
+
+    fn rollback_insert_failure(
+        &self,
+        operation_id: OperationId,
+        error: OperationJournalStoreError,
+        attempted_sequence: Option<i64>,
+        encoded_bytes: usize,
+    ) -> JournalInsertOutcome {
+        let rollback_error = self.rollback_insert_transaction();
+        let stage = if rollback_error.is_some() {
+            JournalInsertWriteStage::RollbackNotConfirmed
+        } else {
+            JournalInsertWriteStage::RolledBackBeforeCommit
+        };
+        failed_insert(
+            operation_id,
+            stage,
+            error,
+            attempted_sequence,
+            encoded_bytes,
+            rollback_error,
+        )
+    }
+
+    fn rollback_insert_transaction(&self) -> Option<Box<OperationJournalStoreError>> {
+        #[cfg(test)]
+        if let Some(directive) = self.insert_test_directive(InsertTestBoundary::Rollback) {
+            match directive {
+                InsertTestDirective::Fail(error)
+                | InsertTestDirective::FailAndLeaveForRollback(error) => {
+                    return Some(Box::new(error));
+                }
+                InsertTestDirective::ExecuteThenFail(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Some(Box::new(error));
+                }
+                InsertTestDirective::Continue => {}
+            }
+        }
+        self.connection
+            .execute_batch("ROLLBACK")
+            .err()
+            .map(|error| Box::new(OperationJournalStoreError::from(error)))
+    }
+
+    #[cfg(test)]
+    fn set_insert_test_hook<F>(&self, hook: F)
+    where
+        F: FnMut(InsertTestBoundary) -> InsertTestDirective + Send + 'static,
+    {
+        *self
+            .insert_test_hook
+            .lock()
+            .expect("insert test hook mutex") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn insert_test_directive(&self, boundary: InsertTestBoundary) -> Option<InsertTestDirective> {
+        let mut hook = self
+            .insert_test_hook
+            .lock()
+            .expect("insert test hook mutex");
+        let directive = hook.as_mut().map(|hook| hook(boundary));
+        if matches!(
+            &directive,
+            Some(InsertTestDirective::Fail(_) | InsertTestDirective::ExecuteThenFail(_))
+        ) {
+            *hook = None;
+        }
+        directive
     }
 
     fn insert_inside_transaction(
@@ -1137,6 +1598,12 @@ impl OperationJournalStore {
     }
 
     fn validate_namespace(&self) -> Result<(), OperationJournalStoreError> {
+        if !self.connection.is_autocommit() {
+            return Err(audit_error(
+                &self.database_path,
+                "operation journal connection has an active transaction",
+            ));
+        }
         self.validate_namespace_without_sidecars()?;
         // DELETE mode may retain its ordinary rollback journal while this exclusive connection
         // remains open. WAL/SHM and unsafe/non-regular entries are still rejected.
@@ -1158,6 +1625,24 @@ impl OperationJournalStore {
             &self.database_identity,
         )
     }
+}
+
+fn failed_insert(
+    operation_id: OperationId,
+    stage: JournalInsertWriteStage,
+    source: OperationJournalStoreError,
+    attempted_sequence: Option<i64>,
+    encoded_bytes: usize,
+    rollback_error: Option<Box<OperationJournalStoreError>>,
+) -> JournalInsertOutcome {
+    JournalInsertOutcome::Failed(JournalInsertFailure {
+        operation_id,
+        stage,
+        source,
+        attempted_sequence,
+        encoded_bytes,
+        rollback_error,
+    })
 }
 
 fn validate_intent_record(
@@ -1726,9 +2211,9 @@ mod tests {
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         ParticipantCheckpoint, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
-        ParticipantSet, RecoveryCursor, RecoveryRowOutcome, RetryErrorClass, RetryLeaseId,
-        RetryObservation, SCHEMA_V1, StoredRelativePath, StoredSourceFence, UniversalCommandKind,
-        UniversalIntent,
+        ParticipantSet, RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass,
+        RetryLeaseId, RetryObservation, SCHEMA_V1, StoredRelativePath, StoredSourceFence,
+        UniversalCommandKind, UniversalIntent,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1963,6 +2448,408 @@ mod tests {
             .profile_root()
             .join(JOURNAL_DATABASE_ROOT_NAME)
             .join(JOURNAL_DATABASE_FILE_NAME)
+    }
+
+    #[test]
+    fn typed_insert_outcome_acknowledges_exact_readback() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = intent_record(OperationId::new());
+
+        let outcome = store.insert_intent_with_outcome(&record);
+        let receipt = outcome.receipt().expect("fully acknowledged insert");
+        assert_eq!(receipt.operation_id(), record.operation_id);
+        assert_eq!(receipt.sequence(), 1);
+        assert_eq!(
+            store
+                .get(record.operation_id)
+                .expect("read acknowledged row"),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn typed_copy_insert_outcome_acknowledges_exact_readback() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+            v5_copy_inputs();
+
+        let outcome = store.persist_copy_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            50,
+        );
+        let receipt = outcome.receipt().expect("fully acknowledged copy insert");
+        assert_eq!(receipt.operation_id(), operation_id);
+        assert_eq!(receipt.sequence(), 1);
+        assert_eq!(
+            store
+                .get(operation_id)
+                .expect("read acknowledged copy row")
+                .map(|record| record.operation_id),
+            Some(operation_id)
+        );
+    }
+
+    #[test]
+    fn typed_insert_outcome_reports_prebegin_and_validation_failures_without_receipts() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+
+        let invalid_id = OperationId::new();
+        let mut invalid_record = intent_record(invalid_id);
+        invalid_record.phase = OperationPhase::Prepared;
+        let invalid = store.insert_intent_with_outcome(&invalid_record);
+        let failure = invalid.failure().expect("invalid argument failure");
+        assert_eq!(failure.operation_id(), invalid_id);
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::NoMutationAttempted
+        );
+        assert_eq!(failure.attempted_sequence(), None);
+        assert!(matches!(
+            failure.error(),
+            OperationJournalStoreError::NotIntentDurable {
+                phase: OperationPhase::Prepared
+            }
+        ));
+
+        let prebegin_id = OperationId::new();
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforeBegin {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced prebegin failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let prebegin = store.insert_intent_with_outcome(&intent_record(prebegin_id));
+        let failure = prebegin.failure().expect("prebegin failure");
+        assert_eq!(failure.operation_id(), prebegin_id);
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::NoMutationAttempted
+        );
+        assert_eq!(failure.attempted_sequence(), None);
+        assert!(failure.rollback_error().is_none());
+        assert!(matches!(
+            failure.error(),
+            OperationJournalStoreError::IdentityCheckUnavailable { reason }
+                if reason == "forced prebegin failure"
+        ));
+        assert!(prebegin.receipt().is_none());
+
+        let validation_id = OperationId::new();
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced precommit failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let validation = store.insert_intent_with_outcome(&intent_record(validation_id));
+        let failure = validation.failure().expect("precommit failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::RolledBackBeforeCommit
+        );
+        assert_eq!(failure.attempted_sequence(), Some(1));
+        assert!(failure.rollback_error().is_none());
+        assert!(matches!(
+            failure.error(),
+            OperationJournalStoreError::IdentityCheckUnavailable { reason }
+                if reason == "forced precommit failure"
+        ));
+        assert_eq!(
+            store.get(validation_id).expect("read rolled back row"),
+            None
+        );
+        let max_sequence: Option<i64> = store
+            .connection
+            .query_row("SELECT MAX(sequence) FROM operation_journal", [], |row| {
+                row.get(0)
+            })
+            .expect("read sequence after rollback");
+        assert_eq!(max_sequence, None);
+    }
+
+    #[test]
+    fn typed_duplicate_outcome_keeps_existing_row_without_absence_claim() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = intent_record(OperationId::new());
+        let original = store.insert_intent(&record).expect("insert original");
+
+        let outcome = store.insert_intent_with_outcome(&record);
+        let failure = outcome.failure().expect("duplicate failure");
+        assert_eq!(failure.operation_id(), record.operation_id);
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::RolledBackBeforeCommit
+        );
+        assert_eq!(failure.attempted_sequence(), None);
+        assert!(matches!(
+            failure.error(),
+            OperationJournalStoreError::DuplicateOperation { operation_id }
+                if *operation_id == record.operation_id
+        ));
+        assert_eq!(
+            store.get(record.operation_id).expect("read original"),
+            Some(record)
+        );
+        assert_eq!(
+            journal_sequence(&store, original.operation_id()),
+            original.sequence()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_insert_rejects_namespace_replacement_after_insert_and_restores_original() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let database = database_path(&fixture.owner);
+        let displaced = database.with_file_name("journal.sqlite3.insert-displaced");
+        let replacement = b"replacement database bytes".to_vec();
+        let replacement_for_hook = replacement.clone();
+        let database_for_hook = database.clone();
+        let displaced_for_hook = displaced.clone();
+        store.set_insert_test_hook(move |boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                fs::rename(&database_for_hook, &displaced_for_hook)
+                    .expect("displace database after insert");
+                fs::write(&database_for_hook, &replacement_for_hook)
+                    .expect("install replacement database");
+            }
+            InsertTestDirective::Continue
+        });
+
+        let operation_id = OperationId::new();
+        let outcome = store.insert_intent_with_outcome(&intent_record(operation_id));
+        let failure = outcome.failure().expect("namespace replacement failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::RolledBackBeforeCommit
+        );
+        assert!(matches!(
+            failure.error(),
+            OperationJournalStoreError::DatabaseReplaced { .. }
+        ));
+        assert!(failure.rollback_error().is_none());
+        assert_eq!(
+            fs::read(&database).expect("replacement remains untouched"),
+            replacement
+        );
+
+        drop(store);
+        fs::remove_file(&database).expect("remove replacement database");
+        fs::rename(&displaced, &database).expect("restore original database");
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen original");
+        assert_eq!(
+            reopened.get(operation_id).expect("read restored journal"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_insert_reports_committed_but_unacknowledged_after_namespace_replacement() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let database = database_path(&fixture.owner);
+        let displaced = database.with_file_name("journal.sqlite3.postcommit-displaced");
+        let replacement = b"replacement after commit".to_vec();
+        let replacement_for_hook = replacement.clone();
+        let database_for_hook = database.clone();
+        let displaced_for_hook = displaced.clone();
+        store.set_insert_test_hook(move |boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                fs::rename(&database_for_hook, &displaced_for_hook)
+                    .expect("displace database after commit");
+                fs::write(&database_for_hook, &replacement_for_hook)
+                    .expect("install replacement after commit");
+            }
+            InsertTestDirective::Continue
+        });
+
+        let operation_id = OperationId::new();
+        let record = intent_record(operation_id);
+        let outcome = store.insert_intent_with_outcome(&record);
+        let failure = outcome
+            .failure()
+            .expect("postcommit acknowledgement failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::CommittedButNotAcknowledged
+        );
+        assert!(matches!(
+            failure.error(),
+            OperationJournalStoreError::DatabaseReplaced { .. }
+        ));
+        assert_eq!(
+            fs::read(&database).expect("replacement remains untouched"),
+            replacement
+        );
+
+        drop(store);
+        fs::remove_file(&database).expect("remove replacement database");
+        fs::rename(&displaced, &database).expect("restore committed database");
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen committed");
+        assert_eq!(
+            reopened.get(operation_id).expect("read committed row"),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn typed_insert_keeps_unconfirmed_rollback_closed_to_public_reads_and_writes() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        store.set_insert_test_hook(|boundary| match boundary {
+            InsertTestBoundary::BeforePrecommitValidation | InsertTestBoundary::Rollback => {
+                InsertTestDirective::FailAndLeaveForRollback(
+                    OperationJournalStoreError::IdentityCheckUnavailable {
+                        reason: String::from("forced rollback uncertainty"),
+                    },
+                )
+            }
+            _ => InsertTestDirective::Continue,
+        });
+
+        let outcome = store.insert_intent_with_outcome(&intent_record(operation_id));
+        let failure = outcome.failure().expect("unconfirmed rollback failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::RollbackNotConfirmed
+        );
+        assert_eq!(failure.attempted_sequence(), Some(1));
+        assert!(matches!(
+            failure.rollback_error(),
+            Some(OperationJournalStoreError::IdentityCheckUnavailable { reason })
+                if reason == "forced rollback uncertainty"
+        ));
+
+        assert!(matches!(
+            store.get(operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("active transaction")
+        ));
+        assert!(matches!(
+            store.scan_recovery_page(None),
+            Err(RecoveryScanError::Store(OperationJournalStoreError::RequiresAudit {
+                reason, ..
+            })) if reason.contains("active transaction")
+        ));
+        let another_id = OperationId::new();
+        let another = store.insert_intent_with_outcome(&intent_record(another_id));
+        assert!(matches!(
+            another.failure().map(JournalInsertFailure::error),
+            Some(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("active transaction")
+        ));
+
+        // The test hook deliberately leaves the transaction open. Restore the hook and clean it
+        // up through the private connection before making any further public observations.
+        store.set_insert_test_hook(|_| InsertTestDirective::Continue);
+        store
+            .connection
+            .execute_batch("ROLLBACK")
+            .expect("test cleanup rollback");
+        assert_eq!(store.get(operation_id).expect("read after cleanup"), None);
+    }
+
+    #[test]
+    fn typed_insert_commit_and_postcommit_outcomes_are_conservative() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+
+        let before_commit_id = OperationId::new();
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::Commit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced commit failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let before_commit = store.insert_intent_with_outcome(&intent_record(before_commit_id));
+        let failure = before_commit.failure().expect("commit failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::CommitOutcomeUnknown
+        );
+        assert!(failure.rollback_error().is_none());
+        assert_eq!(
+            store
+                .get(before_commit_id)
+                .expect("read rolled back commit"),
+            None
+        );
+
+        let execute_then_fail_id = OperationId::new();
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::Commit {
+                InsertTestDirective::ExecuteThenFail(
+                    OperationJournalStoreError::IdentityCheckUnavailable {
+                        reason: String::from("commit result unavailable"),
+                    },
+                )
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let execute_then_fail =
+            store.insert_intent_with_outcome(&intent_record(execute_then_fail_id));
+        let failure = execute_then_fail
+            .failure()
+            .expect("execute-then-fail commit outcome");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::CommitOutcomeUnknown
+        );
+        assert!(failure.rollback_error().is_some());
+        assert_eq!(
+            store
+                .get(execute_then_fail_id)
+                .expect("read committed but unknown row")
+                .map(|record| record.operation_id),
+            Some(execute_then_fail_id)
+        );
+
+        let postcommit_id = OperationId::new();
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced acknowledgement failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let postcommit = store.insert_intent_with_outcome(&intent_record(postcommit_id));
+        let failure = postcommit
+            .failure()
+            .expect("postcommit acknowledgement failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::CommittedButNotAcknowledged
+        );
+        assert_eq!(
+            store
+                .get(postcommit_id)
+                .expect("read committed unacknowledged row")
+                .map(|record| record.operation_id),
+            Some(postcommit_id)
+        );
     }
 
     #[test]

@@ -589,3 +589,29 @@ diff checks.
 passed on exact `7e6e39d997b17a2984d8a4811b7f048549e11292`, including
 101 journal tests and the status, legacy-field and key-retention regressions.
 This is storage-scope acceptance, not native Windows UI acceptance.
+
+### Intent write outcomes
+
+Before runtime admission can manage provisional claims, callers need to distinguish
+a failed persistence attempt from a commit whose acknowledgement was lost.
+OPT-1337 provides opt-in typed insert outcomes while retaining the existing
+Result-based APIs as adapters. Failure observations distinguish work not attempted,
+a confirmed pre-commit rollback, an unconfirmed rollback, an unknown COMMIT
+outcome, and a reported commit with failed post-commit validation/readback. None
+of these failure values carries a success receipt or grants capacity-release
+authority; even a failed attempt does not prove that no preexisting row exists.
+
+The shared insert path validates its namespace immediately before COMMIT.
+The full public boundary rejects an active SQLite transaction, preventing a
+failed rollback from exposing uncommitted rows through point reads or recovery
+scans. Internal transaction validation remains separate from that public guard.
+
+Independent durability review found no material issues. Local verification passed
+all eight typed insert tests, including the final test-only addition; the
+serialized journal suite passed 118 tests (one helper ignored) before that last
+addition. Production library compilation without default features, 61 session
+tests (one helper ignored), GPUI compilation, formatting and diff checks passed.
+Fault coverage includes confirmed/unconfirmed rollback, commit errors with and
+without a persisted row, post-commit acknowledgement failure, duplicate rows,
+actual pre-commit namespace replacement and the V5 Copy adapter. Windows storage
+validation is pending. Runtime queue/capacity admission remains unimplemented.
