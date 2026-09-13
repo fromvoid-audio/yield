@@ -313,6 +313,25 @@ diff checks passed. Windows storage validation passed on `c383a2ade` in
 including production admission, source identity/publication fence tests and
 catalog/session checks. Queued delivery and readiness claim fencing remain open.
 
+The queued-delivery extension carries the same fence through
+catalog/session delivery and asynchronous browser projection. Its UI boundary
+reads a separate in-memory publication-generation token; that token owns no
+source lease, SQLite connection, or filesystem lock. Background projection still
+performs full validation before and after building the projection. Retired
+terminal receipts remain available for accounting, while stale projections are
+discarded. This extension does not establish readiness claim or independent
+artifact publication fencing.
+
+Local validation of the extension passed three library fence tests,
+94 catalog tests, 61 session tests (one existing ignored), and 396 UI tests
+(one existing ignored), plus GPUI compilation. Three additional focused tests
+passed after final review: owner retirement after enqueue preserves the exact
+terminal outcome and reclaims all queue credits once; retirement between the
+background projection checks rejects the projection while a live owner succeeds;
+and an expired receive deadline stops stale-event draining without consuming a
+fresh queued event. Formatting and diff checks passed. Windows storage validation
+of this extension remains pending.
+
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
 operation admission, checkpointing, and recovery execution remain requirements

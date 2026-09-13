@@ -6,10 +6,10 @@ pub(crate) use wavecrate_catalog::CatalogService;
 use wavecrate_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
 pub use wavecrate_catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogDisplayLabelsRequestError, CatalogError,
-    CatalogEvent, CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
-    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
-    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogCommand, CatalogCurationRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
+    CatalogError, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
+    CatalogRatingDecayRequestError, CatalogTagFilterRequestError, CatalogTagPageQuery,
+    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
     MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
@@ -134,6 +134,29 @@ pub(crate) fn try_recv_event(slot: &Arc<Mutex<CatalogSlot>>) -> Result<CatalogEv
     };
     match service.try_recv_event() {
         Ok(event) => Ok(event),
+        Err(error @ TryRecvError::Disconnected) => {
+            mark_closed(slot, &service);
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn try_recv_delivery(
+    slot: &Arc<Mutex<CatalogSlot>>,
+) -> Result<CatalogDelivery, TryRecvError> {
+    let service = {
+        let slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &slot.status {
+            CatalogStatus::Loading | CatalogStatus::Unavailable { .. } => {
+                return Err(TryRecvError::Empty);
+            }
+            CatalogStatus::Closed => slot.service.clone().ok_or(TryRecvError::Disconnected)?,
+            CatalogStatus::Ready => slot.service.clone().ok_or(TryRecvError::Disconnected)?,
+        }
+    };
+    match service.try_recv_delivery() {
+        Ok(delivery) => Ok(delivery),
         Err(error @ TryRecvError::Disconnected) => {
             mark_closed(slot, &service);
             Err(error)

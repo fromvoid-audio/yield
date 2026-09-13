@@ -1237,6 +1237,66 @@ pub enum CatalogEvent {
     Closed,
 }
 
+/// One catalog event together with the source-publication fence retained at worker admission.
+///
+/// Source-scoped successful results carry a fence through queueing and asynchronous browser
+/// projection. Consumers may use [`Self::into_parts_if_live`] at a delivery boundary; stale
+/// projections are discarded while terminal receipt outcomes are downgraded to
+/// [`CatalogPublicationStatus::NonProjectable`] so accounting is preserved.
+#[derive(Debug)]
+pub struct CatalogDelivery {
+    event: CatalogEvent,
+    publication_fence: Option<SourcePublicationFence>,
+}
+
+impl CatalogDelivery {
+    fn new(event: CatalogEvent, publication_fence: Option<SourcePublicationFence>) -> Self {
+        Self {
+            event,
+            publication_fence,
+        }
+    }
+
+    /// Return the event and retained fence when the source generation is still live.
+    ///
+    /// This performs only the fence's cheap in-memory liveness check. A stale source projection
+    /// returns `None`; a stale terminal receipt remains available with its publication status
+    /// downgraded to [`CatalogPublicationStatus::NonProjectable`]. The returned fence is useful
+    /// to asynchronous background projection, where callers must still run [`SourcePublicationFence::validate`]
+    /// before and after slow work.
+    pub fn into_parts_if_live(self) -> Option<(CatalogEvent, Option<SourcePublicationFence>)> {
+        let CatalogDelivery {
+            mut event,
+            publication_fence,
+        } = self;
+        if publication_fence
+            .as_ref()
+            .is_none_or(SourcePublicationFence::is_live)
+        {
+            return Some((event, publication_fence));
+        }
+
+        let terminal = match &mut event {
+            CatalogEvent::CurationCommitted { publication, .. }
+            | CatalogEvent::RatingDecayProgress { publication, .. }
+            | CatalogEvent::CurationOperationCompleted { publication, .. } => {
+                *publication = CatalogPublicationStatus::NonProjectable;
+                true
+            }
+            _ => false,
+        };
+        terminal.then_some((event, publication_fence))
+    }
+
+    /// Return the event when it can be exposed through the legacy raw-event API.
+    ///
+    /// This uses the same cheap delivery-boundary check as [`Self::into_parts_if_live`], dropping
+    /// stale projections and retaining stale terminal receipts as non-projectable outcomes.
+    pub fn into_event_if_live(self) -> Option<CatalogEvent> {
+        self.into_parts_if_live().map(|(event, _)| event)
+    }
+}
+
 struct RegisteredSource {
     root: PathBuf,
     lifecycle_generation: u64,
@@ -1305,6 +1365,7 @@ struct EventQueue {
 
 struct QueuedEvent {
     event: CatalogEvent,
+    publication_fence: Option<SourcePublicationFence>,
     curation_payload_bytes: usize,
     curation_update_count: usize,
     tag_read_payload_bytes: usize,
@@ -1344,9 +1405,27 @@ impl EventHub {
         }
     }
 
+    #[cfg(test)]
     fn send(
         &self,
         event: CatalogEvent,
+        curation_payload_bytes: usize,
+        curation_update_count: usize,
+        tag_read_payload_bytes: usize,
+    ) -> bool {
+        self.send_with_fence(
+            event,
+            None,
+            curation_payload_bytes,
+            curation_update_count,
+            tag_read_payload_bytes,
+        )
+    }
+
+    fn send_with_fence(
+        &self,
+        event: CatalogEvent,
+        publication_fence: Option<SourcePublicationFence>,
         curation_payload_bytes: usize,
         curation_update_count: usize,
         tag_read_payload_bytes: usize,
@@ -1360,6 +1439,7 @@ impl EventHub {
         }
         queue.events.push_back(QueuedEvent {
             event,
+            publication_fence,
             curation_payload_bytes,
             curation_update_count,
             tag_read_payload_bytes,
@@ -1378,6 +1458,7 @@ impl EventHub {
         }
         queue.events.push_back(QueuedEvent {
             event: CatalogEvent::Closed,
+            publication_fence: None,
             curation_payload_bytes: 0,
             curation_update_count: 0,
             tag_read_payload_bytes: 0,
@@ -1387,14 +1468,30 @@ impl EventHub {
         true
     }
 
+    #[cfg(test)]
     fn try_recv(&self) -> Result<(CatalogEvent, usize, usize, usize), TryRecvError> {
+        loop {
+            let (delivery, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
+                self.try_recv_delivery()?;
+            if let Some(event) = delivery.into_event_if_live() {
+                return Ok((
+                    event,
+                    curation_payload_bytes,
+                    curation_update_count,
+                    tag_read_payload_bytes,
+                ));
+            }
+        }
+    }
+
+    fn try_recv_delivery(&self) -> Result<(CatalogDelivery, usize, usize, usize), TryRecvError> {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(event) = queue.events.pop_front() {
             return Ok((
-                event.event,
+                CatalogDelivery::new(event.event, event.publication_fence),
                 event.curation_payload_bytes,
                 event.curation_update_count,
                 event.tag_read_payload_bytes,
@@ -1407,17 +1504,17 @@ impl EventHub {
         }
     }
 
-    fn recv_timeout(
+    fn recv_delivery_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<(CatalogEvent, usize, usize, usize), mpsc::RecvTimeoutError> {
+    ) -> Result<(CatalogDelivery, usize, usize, usize), mpsc::RecvTimeoutError> {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(event) = queue.events.pop_front() {
             return Ok((
-                event.event,
+                CatalogDelivery::new(event.event, event.publication_fence),
                 event.curation_payload_bytes,
                 event.curation_update_count,
                 event.tag_read_payload_bytes,
@@ -1432,7 +1529,7 @@ impl EventHub {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(event) = queue.events.pop_front() {
             return Ok((
-                event.event,
+                CatalogDelivery::new(event.event, event.publication_fence),
                 event.curation_payload_bytes,
                 event.curation_update_count,
                 event.tag_read_payload_bytes,
@@ -1460,9 +1557,18 @@ struct EventReservation<'a> {
 
 impl EventReservation<'_> {
     fn publish(&mut self, event: CatalogEvent) {
+        self.publish_with_fence(event, None);
+    }
+
+    fn publish_with_fence(
+        &mut self,
+        event: CatalogEvent,
+        publication_fence: Option<SourcePublicationFence>,
+    ) {
         assert!(
-            self.hub.send(
+            self.hub.send_with_fence(
                 event,
+                publication_fence,
                 self.curation_payload_bytes,
                 self.curation_update_count,
                 self.tag_read_payload_bytes,
@@ -2129,7 +2235,7 @@ pub(crate) fn publish_source_if_current(
     if !publication_is_current_state(&state, source_id, lifecycle_generation, token) {
         return false;
     }
-    reservation.publish(event);
+    reservation.publish_with_fence(event, Some(source.publication_fence.clone()));
     true
 }
 
@@ -2143,6 +2249,7 @@ pub(crate) fn publish_source_receipt(
     event: impl FnOnce(CatalogPublicationStatus) -> CatalogEvent,
 ) -> bool {
     let mut publication = CatalogPublicationStatus::NonProjectable;
+    let publication_fence = source.map(|source| source.publication_fence.clone());
     if let Some(source) = source.filter(|source| {
         source.lifecycle_generation == lifecycle_generation
             && publication_is_current(admission, source_id, lifecycle_generation, token)
@@ -2157,7 +2264,7 @@ pub(crate) fn publish_source_receipt(
     if !publication_is_current_state(&state, source_id, lifecycle_generation, token) {
         publication = CatalogPublicationStatus::NonProjectable;
     }
-    reservation.publish(event(publication));
+    reservation.publish_with_fence(event(publication), publication_fence);
     true
 }
 
@@ -2338,16 +2445,41 @@ impl CatalogService {
         }
     }
 
-    /// Read the next worker event without blocking.
-    pub fn try_recv_event(&self) -> Result<CatalogEvent, TryRecvError> {
-        let (event, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
-            self.events.try_recv()?;
+    /// Read the next queued worker delivery without blocking.
+    pub fn try_recv_delivery(&self) -> Result<CatalogDelivery, TryRecvError> {
+        let (delivery, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
+            self.events.try_recv_delivery()?;
         self.release_event_credit(
             curation_payload_bytes,
             curation_update_count,
             tag_read_payload_bytes,
         );
-        Ok(event)
+        Ok(delivery)
+    }
+
+    /// Read the next worker event without blocking.
+    pub fn try_recv_event(&self) -> Result<CatalogEvent, TryRecvError> {
+        loop {
+            let delivery = self.try_recv_delivery()?;
+            if let Some(event) = delivery.into_event_if_live() {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Read the next queued worker delivery with a bounded wait.
+    pub fn recv_delivery_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<CatalogDelivery, mpsc::RecvTimeoutError> {
+        let (delivery, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
+            self.events.recv_delivery_timeout(timeout)?;
+        self.release_event_credit(
+            curation_payload_bytes,
+            curation_update_count,
+            tag_read_payload_bytes,
+        );
+        Ok(delivery)
     }
 
     /// Read the next worker event with a bounded wait.
@@ -2355,14 +2487,17 @@ impl CatalogService {
         &self,
         timeout: Duration,
     ) -> Result<CatalogEvent, mpsc::RecvTimeoutError> {
-        let (event, curation_payload_bytes, curation_update_count, tag_read_payload_bytes) =
-            self.events.recv_timeout(timeout)?;
-        self.release_event_credit(
-            curation_payload_bytes,
-            curation_update_count,
-            tag_read_payload_bytes,
-        );
-        Ok(event)
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let delivery = self.recv_delivery_timeout(remaining)?;
+            if let Some(event) = delivery.into_event_if_live() {
+                return Ok(event);
+            }
+            if Instant::now() >= deadline {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+        }
     }
 
     fn release_event_credit(
@@ -6474,6 +6609,7 @@ mod tests {
             watcher: None,
             watcher_schedule: WatcherSchedule::new(false),
         };
+        assert!(source.publication_fence.is_live());
         assert!(source.publication_fence.validate().is_ok());
 
         let hub = EventHub::new();
@@ -6498,6 +6634,7 @@ mod tests {
             },
         ));
         source.publication_fence = stale_publication_fence;
+        assert!(!source.publication_fence.is_live());
         assert!(source.publication_fence.validate().is_err());
         assert!(!publish_source_if_current(
             &admission,
@@ -6511,7 +6648,15 @@ mod tests {
                 lifecycle_generation: 1,
             },
         ));
-        let (event, _, _, _) = hub.try_recv().expect("fresh fence publication");
+        let (delivery, _, _, _) = hub.try_recv_delivery().expect("fresh fence publication");
+        let (event, publication_fence) = delivery
+            .into_parts_if_live()
+            .expect("fresh source projection remains deliverable");
+        assert!(
+            publication_fence
+                .expect("source projection retains publication fence")
+                .is_live()
+        );
         assert!(matches!(
             event,
             CatalogEvent::Registered {
@@ -6520,6 +6665,59 @@ mod tests {
             } if event_source == source_id
         ));
         assert!(matches!(hub.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn queued_source_projection_drops_after_owner_retirement_without_retaining_lease() {
+        let fixture = Fixture::new("catalog-publication-delivery-retirement");
+        let source_id = SourceId::from_string("source-publication-delivery-retirement");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("profile catalog database");
+        let publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence");
+        assert!(publication_fence.is_live());
+
+        let hub = EventHub::new();
+        assert!(hub.send_with_fence(
+            CatalogEvent::SnapshotReady {
+                snapshot: CatalogSnapshot {
+                    source_id: source_id.clone(),
+                    root_identity:
+                        source_root_identity(fixture.root.path()).expect("source root identity"),
+                    lifecycle_generation: 1,
+                    committed_revision: 0,
+                    directory_generation: 0,
+                    manifest: Vec::new(),
+                    directories: Vec::new(),
+                    wav_metadata: BTreeMap::new(),
+                    curation_metadata: BTreeMap::new(),
+                },
+            },
+            Some(publication_fence.clone()),
+            0,
+            0,
+            0,
+        ));
+
+        drop(database);
+        assert!(!publication_fence.is_live());
+        let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("queued delivery does not retain the source lease");
+        drop(reopened);
+
+        let (delivery, ..) = hub
+            .try_recv_delivery()
+            .expect("retired source delivery remains queued");
+        assert!(delivery.into_parts_if_live().is_none());
     }
 
     #[test]
@@ -6588,6 +6786,12 @@ mod tests {
             watcher: None,
             watcher_schedule: WatcherSchedule::new(false),
         };
+        assert!(publication_is_current(
+            &admission,
+            &source_id,
+            1,
+            Some(&token)
+        ));
         assert!(source.publication_fence.validate().is_err());
 
         let hub = EventHub::new();
@@ -6614,7 +6818,15 @@ mod tests {
                 publication,
             },
         ));
-        let (event, _, _, _) = hub.try_recv().expect("stale receipt publication");
+        let (delivery, _, _, _) = hub.try_recv_delivery().expect("stale receipt publication");
+        let (event, publication_fence) = delivery
+            .into_parts_if_live()
+            .expect("stale terminal receipt is retained");
+        assert!(
+            !publication_fence
+                .expect("receipt retains source publication fence")
+                .is_live()
+        );
         assert!(matches!(
             event,
             CatalogEvent::CurationOperationCompleted {
@@ -6626,6 +6838,314 @@ mod tests {
             } if event_source == source_id && event_outcome == outcome
         ));
         assert!(matches!(hub.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn queued_current_source_receipt_downgrades_after_retirement_and_releases_credits() {
+        let fixture = Fixture::new("catalog-publication-receipt-queued");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-publication-receipt-queued");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let outcome = {
+            service
+                .submit(curation_operation(
+                    &source_id,
+                    1,
+                    &snapshot.root_identity,
+                    902,
+                    SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                    vec![vec![SourceCurationUpdate::SetRating {
+                        path,
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                    }]],
+                ))
+                .expect("curation operation admission");
+            receive_curation_operation(&service, 902)
+        };
+        assert!(outcome.is_success());
+        assert_eq!(outcome.committed_batches().len(), 1);
+        service.shutdown();
+
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen profile catalog database");
+        let publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence");
+        assert!(publication_fence.is_live());
+        let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
+        let token = Arc::new(AtomicBool::new(false));
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        admission.lock().expect("admission lock").sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: Some(Arc::clone(&token)),
+                last_curation_request_id: None,
+            },
+        );
+        let source = RegisteredSource {
+            root: fixture.root.path().to_path_buf(),
+            lifecycle_generation: 1,
+            database,
+            publication_fence,
+            known_root_identity: Some(root_identity),
+            snapshot: Some(snapshot),
+            attempt_token: Some(Arc::clone(&token)),
+            curation_lineage: None,
+            watcher: None,
+            watcher_schedule: WatcherSchedule::new(false),
+        };
+
+        let hub = Arc::new(EventHub::new());
+        let (commands, _command_receiver) = mpsc::sync_channel(1);
+        let delivery_service = CatalogService {
+            commands,
+            events: Arc::clone(&hub),
+            admission: Arc::clone(&admission),
+            worker: Mutex::new(None),
+        };
+        let terminal_credits = (17, 3, 11);
+        {
+            let mut state = admission.lock().expect("admission lock");
+            state.event_budget += 1;
+            state.curation_payload_bytes += terminal_credits.0;
+            state.curation_update_count += terminal_credits.1;
+            state.tag_read_payload_bytes += terminal_credits.2;
+        }
+        {
+            let mut reservation = EventReservation {
+                hub: hub.as_ref(),
+                admission: &admission,
+                remaining: 1,
+                curation_payload_bytes: terminal_credits.0,
+                curation_update_count: terminal_credits.1,
+                tag_read_payload_bytes: terminal_credits.2,
+            };
+            assert!(publish_source_receipt(
+                &admission,
+                &mut reservation,
+                &source_id,
+                1,
+                Some(&token),
+                Some(&source),
+                |publication| {
+                    assert_eq!(publication, CatalogPublicationStatus::Current);
+                    CatalogEvent::CurationOperationCompleted {
+                        source_id: source_id.clone(),
+                        lifecycle_generation: 1,
+                        request_id: 902,
+                        outcome: outcome.clone(),
+                        publication,
+                    }
+                },
+            ));
+        }
+
+        let projection_credits = (5, 2, 7);
+        {
+            let mut state = admission.lock().expect("admission lock");
+            state.event_budget += 1;
+            state.curation_payload_bytes += projection_credits.0;
+            state.curation_update_count += projection_credits.1;
+            state.tag_read_payload_bytes += projection_credits.2;
+        }
+        let mut projection_reservation = EventReservation {
+            hub: hub.as_ref(),
+            admission: &admission,
+            remaining: 1,
+            curation_payload_bytes: projection_credits.0,
+            curation_update_count: projection_credits.1,
+            tag_read_payload_bytes: projection_credits.2,
+        };
+        projection_reservation.publish_with_fence(
+            CatalogEvent::Registered {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            },
+            Some(source.publication_fence.clone()),
+        );
+
+        let queued_fence = source.publication_fence.clone();
+        drop(source);
+        assert!(!queued_fence.is_live());
+        assert_eq!(
+            admission_state(&admission, |state| {
+                (
+                    state.event_budget,
+                    state.curation_payload_bytes,
+                    state.curation_update_count,
+                    state.tag_read_payload_bytes,
+                )
+            }),
+            (3, 22, 5, 18)
+        );
+
+        let terminal_delivery = delivery_service
+            .try_recv_delivery()
+            .expect("queued terminal receipt");
+        let (terminal_event, terminal_fence) = terminal_delivery
+            .into_parts_if_live()
+            .expect("retired terminal receipt remains deliverable");
+        assert!(
+            !terminal_fence
+                .expect("terminal receipt retains source fence")
+                .is_live()
+        );
+        assert!(matches!(
+            terminal_event,
+            CatalogEvent::CurationOperationCompleted {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                request_id: 902,
+                outcome: event_outcome,
+                publication: CatalogPublicationStatus::NonProjectable,
+            } if event_source == source_id && event_outcome == outcome
+        ));
+        assert_eq!(
+            admission_state(&admission, |state| {
+                (
+                    state.event_budget,
+                    state.curation_payload_bytes,
+                    state.curation_update_count,
+                    state.tag_read_payload_bytes,
+                )
+            }),
+            (2, 5, 2, 7)
+        );
+
+        let projection_delivery = delivery_service
+            .try_recv_delivery()
+            .expect("queued stale projection");
+        assert!(projection_delivery.into_parts_if_live().is_none());
+        assert_eq!(
+            admission_state(&admission, |state| {
+                (
+                    state.event_budget,
+                    state.curation_payload_bytes,
+                    state.curation_update_count,
+                    state.tag_read_payload_bytes,
+                )
+            }),
+            (1, 0, 0, 0)
+        );
+        assert!(matches!(
+            delivery_service.try_recv_delivery(),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(
+            admission_state(&admission, |state| {
+                (
+                    state.event_budget,
+                    state.curation_payload_bytes,
+                    state.curation_update_count,
+                    state.tag_read_payload_bytes,
+                )
+            }),
+            (1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn stale_catalog_event_timeout_honors_zero_deadline_after_delivery() {
+        let fixture = Fixture::new("catalog-publication-timeout");
+        let source_id = SourceId::from_string("source-publication-timeout");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("profile catalog database");
+        let publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence");
+        let hub = Arc::new(EventHub::new());
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        let stale_credits = (3, 1, 2);
+        let fresh_credits = (5, 2, 4);
+        {
+            let mut state = admission.lock().expect("admission lock");
+            state.event_budget += 2;
+            state.curation_payload_bytes += stale_credits.0 + fresh_credits.0;
+            state.curation_update_count += stale_credits.1 + fresh_credits.1;
+            state.tag_read_payload_bytes += stale_credits.2 + fresh_credits.2;
+        }
+        assert!(hub.send_with_fence(
+            CatalogEvent::Registered {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            },
+            Some(publication_fence.clone()),
+            stale_credits.0,
+            stale_credits.1,
+            stale_credits.2,
+        ));
+        assert!(hub.send_with_fence(
+            CatalogEvent::Registered {
+                source_id: source_id.clone(),
+                lifecycle_generation: 2,
+            },
+            None,
+            fresh_credits.0,
+            fresh_credits.1,
+            fresh_credits.2,
+        ));
+        drop(database);
+        assert!(!publication_fence.is_live());
+
+        let (commands, _command_receiver) = mpsc::sync_channel(1);
+        let service = CatalogService {
+            commands,
+            events: Arc::clone(&hub),
+            admission: Arc::clone(&admission),
+            worker: Mutex::new(None),
+        };
+        assert!(matches!(
+            service.recv_event_timeout(Duration::ZERO),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(
+            admission_state(&admission, |state| {
+                (
+                    state.event_budget,
+                    state.curation_payload_bytes,
+                    state.curation_update_count,
+                    state.tag_read_payload_bytes,
+                )
+            }),
+            (2, fresh_credits.0, fresh_credits.1, fresh_credits.2),
+            "zero timeout consumes only the stale delivery"
+        );
+        assert!(matches!(
+            service.try_recv_event(),
+            Ok(CatalogEvent::Registered {
+                source_id: event_source,
+                lifecycle_generation: 2,
+            }) if event_source == source_id
+        ));
+        assert_eq!(
+            admission_state(&admission, |state| {
+                (
+                    state.event_budget,
+                    state.curation_payload_bytes,
+                    state.curation_update_count,
+                    state.tag_read_payload_bytes,
+                )
+            }),
+            (1, 0, 0, 0),
+            "the fresh sentinel retains its credit until its dequeue"
+        );
+        assert!(matches!(
+            service.try_recv_delivery(),
+            Err(TryRecvError::Empty)
+        ));
     }
 
     #[test]

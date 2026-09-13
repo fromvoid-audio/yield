@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -182,7 +183,8 @@ pub enum SourceLeaseError {
 /// authority.
 #[derive(Debug, Error)]
 pub enum SourcePublicationFenceError {
-    /// The source lease was dropped or replaced, so this result can no longer be published.
+    /// The source lease was dropped, released, or replaced, so this result can no longer be
+    /// published.
     #[error("source publication fence lease is no longer alive")]
     LeaseDropped,
     /// The durable owner identity no longer matches the result's immutable fence.
@@ -239,19 +241,39 @@ pub(crate) struct SourceLease {
     lock_file: File,
     owner_identity: String,
     lease_epoch: i64,
+    publication_liveness: Arc<PublicationLiveness>,
     profile_guard: WritableProfileGuard,
 }
 
 /// Immutable proof that a source result belongs to one live owner and source epoch.
 ///
-/// The fence is deliberately weak: retaining it cannot keep a physical-source lease or its
-/// SQLite control connection alive. Call [`Self::validate`] immediately before publishing a
-/// source-scoped result. Validation performs read-only checks through the retained control
-/// connection and never renews a lease or reopens a database pathname.
+/// The fence retains only an in-memory publication-generation token and a weak source lease, so
+/// retaining it cannot keep a physical-source lease or its SQLite control connection alive. Call
+/// [`Self::validate`] immediately before publishing a source-scoped result. Validation performs
+/// read-only checks through the retained control connection and never renews a lease or reopens a
+/// database pathname.
+#[derive(Clone)]
 pub struct SourcePublicationFence {
     owner_identity: String,
     lease_epoch: i64,
     source_lease: Weak<SourceLease>,
+    publication_liveness: Arc<PublicationLiveness>,
+}
+
+struct PublicationLiveness {
+    owner_identity: String,
+    lease_epoch: i64,
+    live: AtomicBool,
+}
+
+impl PublicationLiveness {
+    fn new(owner_identity: String, lease_epoch: i64) -> Self {
+        Self {
+            owner_identity,
+            lease_epoch,
+            live: AtomicBool::new(true),
+        }
+    }
 }
 
 impl std::fmt::Debug for SourcePublicationFence {
@@ -265,6 +287,19 @@ impl std::fmt::Debug for SourcePublicationFence {
 }
 
 impl SourcePublicationFence {
+    /// Return whether the retained source owner is still live for this fence's generation.
+    ///
+    /// This is a cheap in-memory check for UI delivery boundaries. It reads only the retained
+    /// publication-generation token and immutable owner/epoch values; it never upgrades the weak
+    /// source lease and performs no SQLite, filesystem, or mutex I/O. It is not writable authority
+    /// or full filesystem qualification; background publishers must continue to call
+    /// [`Self::validate`].
+    pub fn is_live(&self) -> bool {
+        self.publication_liveness.live.load(Ordering::Acquire)
+            && self.publication_liveness.owner_identity == self.owner_identity
+            && self.publication_liveness.lease_epoch == self.lease_epoch
+    }
+
     /// Validate the immutable owner/epoch against the retained lease and durable source state.
     ///
     /// This check is read-only and does not renew the lease. A successful result means the fence
@@ -275,7 +310,15 @@ impl SourcePublicationFence {
             .source_lease
             .upgrade()
             .ok_or(SourcePublicationFenceError::LeaseDropped)?;
-        source_lease.validate_publication_fence(&self.owner_identity, self.lease_epoch)
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped);
+        }
+        let result =
+            source_lease.validate_publication_fence(&self.owner_identity, self.lease_epoch);
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped);
+        }
+        result
     }
 }
 
@@ -391,6 +434,8 @@ impl SourceLeaseReservation {
         let profile_guard = profile_guard
             .try_clone()
             .map_err(SourceLeaseError::ProfileOwnership)?;
+        let publication_liveness =
+            Arc::new(PublicationLiveness::new(owner_identity.clone(), epoch));
         Ok(Arc::new(SourceLease {
             control_connection: Mutex::new(control),
             database_root: self.database_root,
@@ -402,6 +447,7 @@ impl SourceLeaseReservation {
             lock_file: self.lock_file,
             owner_identity,
             lease_epoch: epoch,
+            publication_liveness,
             profile_guard,
         }))
     }
@@ -466,6 +512,7 @@ impl SourceLease {
             owner_identity: self.owner_identity.clone(),
             lease_epoch: self.lease_epoch,
             source_lease: Arc::downgrade(self),
+            publication_liveness: Arc::clone(&self.publication_liveness),
         }
     }
 
@@ -556,6 +603,9 @@ impl SourceLease {
         let expires_at = now
             .checked_add(LEASE_DURATION_SECONDS)
             .ok_or(SourceLeaseError::ClockUnavailable)?;
+        self.publication_liveness
+            .live
+            .store(false, Ordering::Release);
         let transaction = control
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql_error)?;
@@ -646,6 +696,10 @@ impl SourceLease {
         self.media_root = new_media_root;
         self.owner_identity = next_owner_identity;
         self.lease_epoch = next_epoch;
+        self.publication_liveness = Arc::new(PublicationLiveness::new(
+            self.owner_identity.clone(),
+            self.lease_epoch,
+        ));
         Ok(())
     }
 
@@ -802,6 +856,9 @@ impl SourceLease {
 
     /// Mark this owner released using its retained control connection.
     pub(crate) fn release(&self) -> Result<(), SourceLeaseError> {
+        self.publication_liveness
+            .live
+            .store(false, Ordering::Release);
         let mut control = self
             .control_connection
             .lock()
@@ -959,6 +1016,9 @@ impl SourceLease {
 
 impl Drop for SourceLease {
     fn drop(&mut self) {
+        self.publication_liveness
+            .live
+            .store(false, Ordering::Release);
         // This uses the retained authorized control connection. It never reopens a pathname.
         // Explicit release remains the fallible shutdown API; a crash or failed cleanup leaves an
         // active durable row for conservative recovery after the sidecar lock is released.

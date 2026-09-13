@@ -5,8 +5,8 @@ use std::sync::mpsc::TryRecvError;
 use gpui::{BorrowAppContext, Global, Subscription};
 use wavecrate_library::sample_sources::SampleSource;
 use wavecrate_session::{
-    CanonicalSourceRoot, CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
-    PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
+    CanonicalSourceRoot, CatalogCommand, CatalogDelivery, CatalogEvent, CatalogStatus,
+    CatalogSubmitError, PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
     ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
     ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt, RegistryEvent, RequestId,
     SourceRegistryService, SubmitError, VocabularyRequest, VocabularyStatus, VocabularySubmitError,
@@ -182,6 +182,7 @@ impl SourceRegistryGlobal {
     }
 
     /// Drain catalog events without waiting for the background worker.
+    #[allow(dead_code)]
     pub(crate) fn drain_catalog_events(&self, events: &mut Vec<CatalogEvent>) -> bool {
         let Some(service) = self.service.as_ref() else {
             return false;
@@ -190,6 +191,21 @@ impl SourceRegistryGlobal {
         for _ in 0..MAX_EVENTS_PER_TICK {
             match service.try_recv_catalog() {
                 Ok(event) => events.push(event),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
+            }
+        }
+        true
+    }
+
+    /// Drain catalog deliveries while retaining each source-publication fence for the browser.
+    pub(crate) fn drain_catalog_deliveries(&self, deliveries: &mut Vec<CatalogDelivery>) -> bool {
+        let Some(service) = self.service.as_ref() else {
+            return false;
+        };
+        const MAX_EVENTS_PER_TICK: usize = 64;
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            match service.try_recv_catalog_delivery() {
+                Ok(delivery) => deliveries.push(delivery),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
             }
         }
@@ -308,12 +324,12 @@ impl Browser {
         for event in events {
             changed |= self.apply_source_registry_event(event, cx);
         }
-        let mut catalog_events = Vec::new();
+        let mut catalog_deliveries = Vec::new();
         let catalog_events_capped = cx.update_global::<SourceRegistryGlobal, _>(|global, _| {
-            global.drain_catalog_events(&mut catalog_events)
+            global.drain_catalog_deliveries(&mut catalog_deliveries)
         });
-        for event in catalog_events {
-            changed |= self.apply_catalog_event(event, cx);
+        for delivery in catalog_deliveries {
+            changed |= self.apply_catalog_delivery(delivery, cx);
         }
         changed |= tags::poll(self, cx);
         changed |= tag_chips::poll(self, cx);

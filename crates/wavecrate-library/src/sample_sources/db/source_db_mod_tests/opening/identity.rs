@@ -220,6 +220,7 @@ fn source_database_identity_publication_fence_is_read_only_and_weak() {
     let fence = database
         .source_publication_fence()
         .expect("publication fence");
+    assert!(fence.is_live());
     fence.validate().expect("live publication fence");
     let changes_after = database
         .source_lease_control_total_changes_for_tests()
@@ -228,6 +229,7 @@ fn source_database_identity_publication_fence_is_read_only_and_weak() {
     assert_eq!(changes_after, changes_before);
 
     drop(database);
+    assert!(!fence.is_live());
     assert!(matches!(
         fence.validate(),
         Err(SourcePublicationFenceError::LeaseDropped)
@@ -318,6 +320,7 @@ fn source_database_identity_publication_fence_is_invalidated_by_catalog_handoff(
     let old_fence = database
         .source_publication_fence()
         .expect("old publication fence");
+    assert!(old_fence.is_live());
     let database = database
         .retarget_catalog_root(replacement_root.path(), &profile_guard)
         .expect("catalog root handoff");
@@ -326,9 +329,11 @@ fn source_database_identity_publication_fence_is_invalidated_by_catalog_handoff(
         old_fence.validate(),
         Err(SourcePublicationFenceError::LeaseDropped)
     ));
+    assert!(!old_fence.is_live());
     let new_fence = database
         .source_publication_fence()
         .expect("new publication fence");
+    assert!(new_fence.is_live());
     new_fence.validate().expect("new live publication fence");
 }
 

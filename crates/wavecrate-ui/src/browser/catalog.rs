@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gpui::{BorrowAppContext, Context};
 use wavecrate_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree, PlaybackType};
 use wavecrate_library::sample_sources::{
-    BrowserFileMetadata, SourceId, SourcePlaybackType, reconciliation::RootIdentity,
+    BrowserFileMetadata, SourceId, SourcePlaybackType, SourcePublicationFence,
+    reconciliation::RootIdentity,
 };
 use wavecrate_session::{
-    CatalogCommand, CatalogEvent, CatalogOperation, CatalogPublicationStatus, CatalogStatus,
-    CatalogSubmitError, VerifiedSourceRoot,
+    CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
+    CatalogStatus, CatalogSubmitError, VerifiedSourceRoot,
 };
 
 use super::source_registry::SourceRegistryGlobal;
@@ -535,9 +536,31 @@ impl Browser {
         true
     }
 
+    /// Apply one queued catalog delivery after its cheap source-publication liveness check.
+    pub(super) fn apply_catalog_delivery(
+        &mut self,
+        delivery: CatalogDelivery,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((event, publication_fence)) = delivery.into_parts_if_live() else {
+            return false;
+        };
+        self.apply_catalog_event_with_fence(event, publication_fence, cx)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn apply_catalog_event(
         &mut self,
         event: CatalogEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.apply_catalog_event_with_fence(event, None, cx)
+    }
+
+    fn apply_catalog_event_with_fence(
+        &mut self,
+        event: CatalogEvent,
+        publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
         super::rating_decay::observe_snapshot(self, &event);
@@ -637,7 +660,7 @@ impl Browser {
                 true
             }
             CatalogEvent::SnapshotReady { .. } => {
-                self.start_catalog_projection(event, cx);
+                self.start_catalog_projection(event, publication_fence, cx);
                 true
             }
             CatalogEvent::AuditCommitted { .. } => {
@@ -652,7 +675,7 @@ impl Browser {
                     activation.root_identity = Some(snapshot.root_identity.clone());
                 }
                 self.scan_status = "Catalog audit committed…".to_string();
-                self.start_catalog_projection(event, cx);
+                self.start_catalog_projection(event, publication_fence, cx);
                 true
             }
             CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
@@ -711,7 +734,12 @@ impl Browser {
         }
     }
 
-    fn start_catalog_projection(&mut self, event: CatalogEvent, cx: &mut Context<Self>) {
+    fn start_catalog_projection(
+        &mut self,
+        event: CatalogEvent,
+        publication_fence: Option<SourcePublicationFence>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(activation) = self.catalog_activation.as_ref() else {
             return;
         };
@@ -726,11 +754,19 @@ impl Browser {
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = Arc::clone(&cancellation);
+        let worker_publication_fence = publication_fence.clone();
         self.catalog_projection_cancel = Some(Arc::clone(&cancellation));
         self.catalog_projection_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { project_catalog_event(event, root, &worker_cancellation) })
+                .spawn(async move {
+                    project_catalog_event_with_fence(
+                        event,
+                        root,
+                        &worker_cancellation,
+                        worker_publication_fence,
+                    )
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 let current_token = view
@@ -743,6 +779,12 @@ impl Browser {
                 }
                 view.catalog_projection_cancel = None;
                 view.catalog_projection_task = None;
+                if publication_fence
+                    .as_ref()
+                    .is_some_and(|fence| !fence.is_live())
+                {
+                    return;
+                }
                 if !view.catalog_activation.as_ref().is_some_and(|activation| {
                     activation.source_id == source_id
                         && activation.lifecycle_generation == lifecycle_generation
@@ -1059,11 +1101,34 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
     }
 }
 
+#[allow(dead_code)]
 fn project_catalog_event(
     event: CatalogEvent,
     root: PathBuf,
     cancellation: &AtomicBool,
 ) -> Result<CatalogProjection, String> {
+    project_catalog_event_with_fence(event, root, cancellation, None)
+}
+
+fn project_catalog_event_with_fence(
+    event: CatalogEvent,
+    root: PathBuf,
+    cancellation: &AtomicBool,
+    publication_fence: Option<SourcePublicationFence>,
+) -> Result<CatalogProjection, String> {
+    project_catalog_event_with_fence_observer(event, root, cancellation, publication_fence, || {})
+}
+
+fn project_catalog_event_with_fence_observer<F>(
+    event: CatalogEvent,
+    root: PathBuf,
+    cancellation: &AtomicBool,
+    publication_fence: Option<SourcePublicationFence>,
+    after_initial_validation: F,
+) -> Result<CatalogProjection, String>
+where
+    F: FnOnce(),
+{
     let snapshot = match event {
         CatalogEvent::SnapshotReady { snapshot } | CatalogEvent::AuditCommitted { snapshot } => {
             snapshot
@@ -1073,6 +1138,12 @@ fn project_catalog_event(
     if cancellation.load(Ordering::Acquire) {
         return Err("catalog projection canceled".to_string());
     }
+    if let Some(fence) = publication_fence.as_ref() {
+        fence
+            .validate()
+            .map_err(|error| format!("catalog publication fence invalid: {error}"))?;
+    }
+    after_initial_validation();
     let source_id = snapshot.source_id;
     let lifecycle_generation = snapshot.lifecycle_generation;
     let root_identity = snapshot.root_identity;
@@ -1140,6 +1211,11 @@ fn project_catalog_event(
         return Err("catalog projection canceled".to_string());
     }
     let tree = FolderTree::from_scan(&directory_paths, &entries);
+    if let Some(fence) = publication_fence.as_ref() {
+        fence
+            .validate()
+            .map_err(|error| format!("catalog publication fence invalid: {error}"))?;
+    }
     Ok(CatalogProjection {
         source_id,
         lifecycle_generation,
@@ -1264,7 +1340,7 @@ pub(super) fn catalog_poll_needed(browser: &Browser) -> bool {
 mod tests {
     use super::{
         CatalogActivation, CatalogCommandIntent, CatalogFileFacts, project_catalog_event,
-        validate_relative_path,
+        project_catalog_event_with_fence_observer, validate_relative_path,
     };
     use super::{
         CatalogProjection, catalog_event_identity, coalesce_catalog_remove,
@@ -1273,11 +1349,16 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::tempdir;
     use wavecrate_catalog::CatalogWavMetadata;
     use wavecrate_core::{AudioFile, FolderTree, PlaybackType};
+    use wavecrate_library::app_dirs::{
+        ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard,
+    };
     use wavecrate_library::sample_sources::{
-        BrowserFileMetadata, Rating, SampleCollection, SourceId, SourcePlaybackType,
-        db::SourceDirectoryEntry,
+        BrowserFileMetadata, Rating, SampleCollection, SourceDatabase, SourceId,
+        SourceManifestEntry, SourcePlaybackType, db::SourceDirectoryEntry,
     };
 
     #[test]
@@ -1441,6 +1522,89 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("canceled"));
+    }
+
+    #[test]
+    fn catalog_projection_rechecks_retired_fence_after_background_work() {
+        let config_root = tempdir().expect("temporary config root");
+        let _base = ConfigBaseGuard::set(
+            config_root
+                .path()
+                .canonicalize()
+                .expect("canonical config root"),
+        );
+        let _profile = PersistenceProfileGuard::named("ui-catalog-publication-fence");
+        let profile_guard =
+            WritableProfileGuard::acquire_current().expect("fixture profile ownership");
+        let source_root = tempdir().expect("temporary source root");
+        let source_id = SourceId::from_string("ui-catalog-publication-fence");
+        let snapshot = || wavecrate_catalog::CatalogSnapshot {
+            source_id: source_id.clone(),
+            root_identity:
+                wavecrate_library::sample_sources::reconciliation::RootIdentity::from_bytes(
+                    b"projection-root".to_vec(),
+                ),
+            lifecycle_generation: 1,
+            committed_revision: 0,
+            directory_generation: 0,
+            manifest: vec![SourceManifestEntry {
+                relative_path: PathBuf::from("one.wav"),
+                file_identity: Some(String::from("file-identity")),
+                content_hash: None,
+                file_size: 16,
+                modified_ns: 1,
+            }],
+            directories: Vec::new(),
+            wav_metadata: BTreeMap::new(),
+            curation_metadata: BTreeMap::new(),
+        };
+
+        let live_database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &profile_guard,
+            Path::new("catalog-projection-live"),
+        )
+        .expect("live catalog database");
+        let live_fence = live_database
+            .source_publication_fence()
+            .expect("live publication fence");
+        let cancellation = AtomicBool::new(false);
+        let live_projection = project_catalog_event_with_fence_observer(
+            wavecrate_session::CatalogEvent::SnapshotReady {
+                snapshot: snapshot(),
+            },
+            source_root.path().to_path_buf(),
+            &cancellation,
+            Some(live_fence),
+            || {},
+        )
+        .expect("live projection remains deliverable");
+        assert_eq!(live_projection.entries.len(), 1);
+        drop(live_database);
+
+        let retired_database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &profile_guard,
+            Path::new("catalog-projection-retired"),
+        )
+        .expect("retired catalog database");
+        let retired_fence = retired_database
+            .source_publication_fence()
+            .expect("retired publication fence");
+        let error = match project_catalog_event_with_fence_observer(
+            wavecrate_session::CatalogEvent::SnapshotReady {
+                snapshot: snapshot(),
+            },
+            source_root.path().to_path_buf(),
+            &cancellation,
+            Some(retired_fence.clone()),
+            move || drop(retired_database),
+        ) {
+            Ok(_) => panic!("retired publication must fail the final background check"),
+            Err(error) => error,
+        };
+        assert!(error.contains("catalog publication fence invalid"));
+        assert!(!retired_fence.is_live());
     }
 
     #[test]

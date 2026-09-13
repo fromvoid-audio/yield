@@ -31,10 +31,11 @@ mod preferences;
 mod vocabulary;
 
 pub use catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogDisplayLabelsRequestError, CatalogError,
-    CatalogEvent, CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
-    CatalogStatus, CatalogSubmitError, CatalogTagFilterRequestError, CatalogTagPageQuery,
-    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogCommand, CatalogCurationRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
+    CatalogError, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
+    CatalogRatingDecayRequestError, CatalogStatus, CatalogSubmitError,
+    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
+    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
     MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
@@ -465,6 +466,11 @@ impl SourceRegistryService {
     /// Poll one catalog event without waiting for startup or worker I/O.
     pub fn try_recv_catalog(&self) -> Result<CatalogEvent, TryRecvError> {
         catalog::try_recv_event(&self.catalog)
+    }
+
+    /// Poll one catalog delivery with its retained source-publication fence.
+    pub fn try_recv_catalog_delivery(&self) -> Result<CatalogDelivery, TryRecvError> {
+        catalog::try_recv_delivery(&self.catalog)
     }
 
     /// Close command admission, drain the final baseline/lookups/save, and synchronously join.
