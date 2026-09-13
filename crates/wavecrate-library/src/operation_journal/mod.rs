@@ -9,6 +9,7 @@ pub mod codec;
 pub mod coordinator;
 pub mod evidence;
 pub mod model;
+pub mod owner;
 pub mod participants;
 pub mod status;
 pub mod store;
@@ -42,6 +43,13 @@ pub use model::{
     OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
     SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, UniversalCommandKind, UniversalIntent,
     UniversalIntentTextViolation, UniversalIntentValidationError,
+};
+
+pub use owner::{
+    OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY, OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES,
+    OPERATION_JOURNAL_OWNER_RESULT_CAPACITY, OperationJournalClient, OperationJournalOwner,
+    OperationJournalOwnerError, OperationJournalOwnerQueueError, OperationJournalOwnerStartError,
+    OperationJournalOwnerStatus, OperationJournalRequest, OperationJournalRequestError,
 };
 
 pub use participants::{

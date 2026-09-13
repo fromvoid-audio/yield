@@ -622,14 +622,38 @@ replacement tests are Unix-only and were covered locally. The full storage run
 also passed; this does not establish native Windows UI acceptance. Runtime
 queue/capacity admission remains unimplemented.
 
-### Bounded journal storage owner (in progress)
+### Bounded journal storage owner
 
-The next OPT-1337 implementation moves the already-open, recovery-checked journal
-from session persistence into one storage worker. The boundary must bound both
-queued payloads and outstanding results, serialize all journal operations, and
-drain submitted writes before releasing the journal child lease. Client and
-result handles must not extend the profile lease after the worker has stopped.
+Session persistence moves the already-open, recovery-checked journal into one
+storage worker. The boundary bounds both queued payloads and outstanding results,
+serializes journal operations, and drains submitted writes before releasing the
+journal child lease. Client and result handles do not extend the profile lease
+after the worker has stopped.
 Dropping a result abandons observation, not the submitted write.
+
+The implementation uses 32 queue slots, a 4 MiB queued-input budget and 32
+outstanding result permits shared by all clients. Initial records use the bounded
+journal codec before enqueueing; retry and cancellation observations are validated
+and serialized into owned bounded bytes. Result permits remain charged until the
+caller consumes or drops the result handle. The worker blocks on its command
+channel while idle; closing the last internal sender wakes it to finish draining
+without depending on external clients being dropped.
+
+Session availability requires the journal worker to be available. Shutdown uses
+an atomic lifecycle transition so a concurrent worker panic cannot be overwritten
+by `Closing` and reported as a clean drain. Worker failure remains `Unavailable`
+for retained clients after resource release. Independent review confirmed the
+repair to this race; a deterministic test pauses shutdown after its lifecycle
+read, triggers a real worker panic, then resumes the compare-and-swap.
+
+Local validation passed nine owner tests. They cover queue/result saturation and
+refunds, abandoned results that still persist, retained-client shutdown and lease
+release, invalid decoded inputs, the shutdown race, and a successful V5 Copy
+intent/retry/cancellation/recovery round trip. The broader journal suite passed
+128 tests (one helper ignored) before the final two regression replacements;
+61 session tests (one helper ignored), production library compilation without
+default features and GPUI compilation also passed. Windows storage validation is
+pending for this owner implementation.
 
 This storage queue is distinct from universal operation admission. Submitting a
 storage request does not acknowledge an operation as `Accepted`, reserve disk

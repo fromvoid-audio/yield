@@ -19,7 +19,9 @@ use thiserror::Error;
 use wavecrate_library::app_dirs::{
     AppRootGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
-use wavecrate_library::operation_journal::OperationJournalStore;
+use wavecrate_library::operation_journal::{
+    OperationJournalOwner, OperationJournalOwnerStatus, OperationJournalStore,
+};
 use wavecrate_library::sample_sources::{
     GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
     GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceRegistrySnapshot,
@@ -891,7 +893,7 @@ struct Persistence {
     maintenance: MaintenanceService,
     catalog: Option<Arc<CatalogService>>,
     writer: Option<GlobalLibraryWriter>,
-    journal: Option<OperationJournalStore>,
+    journal: Option<OperationJournalOwner>,
     writable: Option<WritableProfileGuard>,
     load: Option<Receiver<Result<SourceRegistrySnapshot, LibraryError>>>,
     preference_load: Option<Receiver<Result<Option<String>, LibraryError>>>,
@@ -941,18 +943,25 @@ impl Persistence {
         if persistence.unavailable.is_none() {
             match WritableProfileGuard::acquire_current() {
                 Ok(writable) => match open_session_journal(&writable) {
-                    Ok(journal) => match GlobalLibraryWriter::start(&writable) {
-                        Ok(writer) => {
-                            vocabulary::install(
-                                &vocabulary_slot,
-                                writer.profile_tag_vocabulary_client(),
-                            );
-                            persistence.writable = Some(writable);
-                            persistence.journal = Some(journal);
-                            persistence.writer = Some(writer);
-                        }
+                    Ok(journal) => match OperationJournalOwner::start(journal) {
+                        Ok(journal) => match GlobalLibraryWriter::start(&writable) {
+                            Ok(writer) => {
+                                vocabulary::install(
+                                    &vocabulary_slot,
+                                    writer.profile_tag_vocabulary_client(),
+                                );
+                                persistence.writable = Some(writable);
+                                persistence.journal = Some(journal);
+                                persistence.writer = Some(writer);
+                            }
+                            Err(error) => {
+                                persistence.unavailable = Some(session_from_start_error(error))
+                            }
+                        },
                         Err(error) => {
-                            persistence.unavailable = Some(session_from_start_error(error))
+                            persistence.unavailable = Some(SessionError::Persistence(format!(
+                                "operation journal owner unavailable: {error}"
+                            )))
                         }
                     },
                     Err(error) => persistence.unavailable = Some(error),
@@ -991,23 +1000,43 @@ impl Persistence {
     }
 
     fn status_error(&self) -> Option<SessionError> {
-        self.unavailable.clone().or_else(|| {
-            self.writer
-                .as_ref()
-                .and_then(|writer| match writer.status() {
-                    GlobalLibraryWriterStatus::Unavailable { reason } => {
-                        Some(SessionError::Persistence(reason.to_string()))
-                    }
-                    GlobalLibraryWriterStatus::Closed => Some(SessionError::Persistence(
-                        String::from("global library writer closed"),
-                    )),
-                    _ => None,
-                })
-        })
+        self.unavailable
+            .clone()
+            .or_else(|| {
+                self.journal
+                    .as_ref()
+                    .and_then(|journal| match journal.status() {
+                        OperationJournalOwnerStatus::Unavailable { reason } => {
+                            Some(SessionError::Persistence(format!(
+                                "operation journal owner unavailable: {reason}"
+                            )))
+                        }
+                        OperationJournalOwnerStatus::Closed => Some(SessionError::Persistence(
+                            String::from("operation journal owner closed"),
+                        )),
+                        _ => None,
+                    })
+            })
+            .or_else(|| {
+                self.writer
+                    .as_ref()
+                    .and_then(|writer| match writer.status() {
+                        GlobalLibraryWriterStatus::Unavailable { reason } => {
+                            Some(SessionError::Persistence(reason.to_string()))
+                        }
+                        GlobalLibraryWriterStatus::Closed => Some(SessionError::Persistence(
+                            String::from("global library writer closed"),
+                        )),
+                        _ => None,
+                    })
+            })
     }
 
     fn available(&self) -> bool {
-        self.writer
+        self.journal.as_ref().is_some_and(|journal| {
+            matches!(journal.status(), OperationJournalOwnerStatus::Available)
+        }) && self
+            .writer
             .as_ref()
             .is_some_and(|writer| matches!(writer.status(), GlobalLibraryWriterStatus::Available))
     }
@@ -1027,10 +1056,12 @@ impl Persistence {
         self.load = None;
         self.pending_adds.clear();
         self.preference_unavailable = None;
-        // The journal owns a cloned profile guard and child lease. Release it after all ordinary
-        // writers and catalog/maintenance workers have stopped, but before the session's final
-        // profile guard is dropped.
-        self.journal.take();
+        // The journal worker owns a cloned profile guard and child lease. Stop it after all
+        // ordinary writers and catalog/maintenance workers have stopped, but before the session's
+        // final profile guard is dropped.
+        if let Some(mut journal) = self.journal.take() {
+            let _ = journal.shutdown();
+        }
         self.writable.take();
     }
 }
