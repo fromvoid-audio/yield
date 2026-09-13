@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -173,6 +173,29 @@ pub enum SourceLeaseError {
     ControlUnavailable,
 }
 
+/// A typed failure from an immutable source-publication fence.
+///
+/// A fence only carries a weak reference to the live source lease. It can therefore validate a
+/// queued result without keeping the physical-source writer alive after the source is closed.
+/// The owner identity and epoch captured by the fence are compared with both the retained lease
+/// and its durable row; creating or validating a fence does not grant database or filesystem
+/// authority.
+#[derive(Debug, Error)]
+pub enum SourcePublicationFenceError {
+    /// The source lease was dropped or replaced, so this result can no longer be published.
+    #[error("source publication fence lease is no longer alive")]
+    LeaseDropped,
+    /// The durable owner identity no longer matches the result's immutable fence.
+    #[error("source publication fence owner identity changed")]
+    OwnerChanged,
+    /// The durable source epoch no longer matches the result's immutable fence.
+    #[error("source publication fence epoch changed")]
+    EpochChanged,
+    /// The retained source ownership proof failed while validating the fence.
+    #[error(transparent)]
+    Lease(#[from] SourceLeaseError),
+}
+
 struct LeaseRow {
     lease_schema_version: i64,
     media_root_identity: String,
@@ -217,6 +240,43 @@ pub(crate) struct SourceLease {
     owner_identity: String,
     lease_epoch: i64,
     profile_guard: WritableProfileGuard,
+}
+
+/// Immutable proof that a source result belongs to one live owner and source epoch.
+///
+/// The fence is deliberately weak: retaining it cannot keep a physical-source lease or its
+/// SQLite control connection alive. Call [`Self::validate`] immediately before publishing a
+/// source-scoped result. Validation performs read-only checks through the retained control
+/// connection and never renews a lease or reopens a database pathname.
+pub struct SourcePublicationFence {
+    owner_identity: String,
+    lease_epoch: i64,
+    source_lease: Weak<SourceLease>,
+}
+
+impl std::fmt::Debug for SourcePublicationFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SourcePublicationFence")
+            .field("owner_identity", &self.owner_identity)
+            .field("lease_epoch", &self.lease_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SourcePublicationFence {
+    /// Validate the immutable owner/epoch against the retained lease and durable source state.
+    ///
+    /// This check is read-only and does not renew the lease. A successful result means the fence
+    /// was still current at the end of the validation call; callers must perform it at their
+    /// publication boundary and retain the existing lifecycle/revision checks as well.
+    pub fn validate(&self) -> Result<(), SourcePublicationFenceError> {
+        let source_lease = self
+            .source_lease
+            .upgrade()
+            .ok_or(SourcePublicationFenceError::LeaseDropped)?;
+        source_lease.validate_publication_fence(&self.owner_identity, self.lease_epoch)
+    }
 }
 
 impl SourceLeaseReservation {
@@ -400,6 +460,15 @@ impl SourceLeaseReservation {
 }
 
 impl SourceLease {
+    /// Mint a weak publication fence for this retained source lease.
+    pub(crate) fn publication_fence(self: &Arc<Self>) -> SourcePublicationFence {
+        SourcePublicationFence {
+            owner_identity: self.owner_identity.clone(),
+            lease_epoch: self.lease_epoch,
+            source_lease: Arc::downgrade(self),
+        }
+    }
+
     /// Return the durable epoch held by this source owner.
     pub(crate) fn epoch(&self) -> i64 {
         self.lease_epoch
@@ -687,6 +756,47 @@ impl SourceLease {
                 path: self.database_file_binding.path().to_path_buf(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_publication_fence(
+        &self,
+        expected_owner_identity: &str,
+        expected_epoch: i64,
+    ) -> Result<(), SourcePublicationFenceError> {
+        if self.owner_identity != expected_owner_identity {
+            return Err(SourcePublicationFenceError::OwnerChanged);
+        }
+        if self.lease_epoch != expected_epoch {
+            return Err(SourcePublicationFenceError::EpochChanged);
+        }
+
+        let control = self.control_connection.lock().map_err(|_| {
+            SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
+        })?;
+        self.validate_control_connection(&control)
+            .map_err(SourcePublicationFenceError::Lease)?;
+        let row = self
+            .read_current_row(&control)
+            .map_err(SourcePublicationFenceError::Lease)?;
+        if row.owner_identity != expected_owner_identity {
+            return Err(SourcePublicationFenceError::OwnerChanged);
+        }
+        if row.lease_epoch != expected_epoch {
+            return Err(SourcePublicationFenceError::EpochChanged);
+        }
+        self.validate_owned_row(&row, false)
+            .map_err(SourcePublicationFenceError::Lease)?;
+        let now = lease_now().map_err(SourcePublicationFenceError::Lease)?;
+        if row.expires_at <= now {
+            return Err(SourcePublicationFenceError::Lease(
+                SourceLeaseError::Expired {
+                    path: self.database_file_binding.path().to_path_buf(),
+                },
+            ));
+        }
+        self.validate_control_connection(&control)
+            .map_err(SourcePublicationFenceError::Lease)?;
         Ok(())
     }
 

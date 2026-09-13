@@ -35,7 +35,7 @@ pub(crate) use replay_authority::ValidatedReplayAuthority;
 pub mod schema;
 mod source_lease;
 pub(crate) mod sqlite_identity;
-pub use source_lease::SourceLeaseError;
+pub use source_lease::{SourceLeaseError, SourcePublicationFence, SourcePublicationFenceError};
 /// Durable per-source tag catalog and sample assignment helpers.
 pub mod tags;
 mod telemetry;
@@ -479,6 +479,28 @@ impl SourceDatabase {
                 ownership,
             ),
         )
+    }
+
+    /// Mint a weak source-publication fence from this profile-owned database.
+    ///
+    /// The fence captures the current physical-source owner and epoch after a read-only live
+    /// validation. It does not retain the lease or grant any database/filesystem authority; a
+    /// caller must validate it immediately before publishing a source-scoped result.
+    pub fn source_publication_fence(
+        &self,
+    ) -> Result<source_lease::SourcePublicationFence, SourceDbError> {
+        let profile_guard = self
+            .profile_guard
+            .as_ref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        self.validate_profile_owned_open(profile_guard)?;
+        let source_lease = self
+            .source_lease
+            .as_ref()
+            .ok_or(SourceDbError::SourceLease(
+                source_lease::SourceLeaseError::Required,
+            ))?;
+        Ok(source_lease.publication_fence())
     }
 
     /// Return the retained lease control connection's change count for ownership tests.

@@ -83,17 +83,32 @@ pub(crate) fn execute(
         sources,
     );
     match result {
-        Ok(outcome) => reservation.publish(CatalogEvent::RatingDecayProgress {
-            source_id,
-            lifecycle_generation,
-            root_identity: outcome.root_identity,
-            revision: outcome.revision,
-            request_id,
-            processed_count: outcome.processed_count,
-            updated_count: outcome.updated_count,
-            next_cursor: outcome.next_cursor,
-            receipt: outcome.receipt,
-        }),
+        Ok(outcome) => {
+            let source = sources
+                .get(&source_id)
+                .filter(|source| source.lifecycle_generation == lifecycle_generation);
+            let token = source.and_then(|source| source.attempt_token.as_ref());
+            let _ = super::publish_source_receipt(
+                &reservation.admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                token,
+                source,
+                |publication| CatalogEvent::RatingDecayProgress {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    root_identity: outcome.root_identity,
+                    revision: outcome.revision,
+                    request_id,
+                    processed_count: outcome.processed_count,
+                    updated_count: outcome.updated_count,
+                    next_cursor: outcome.next_cursor,
+                    receipt: outcome.receipt,
+                    publication,
+                },
+            );
+        }
         Err(error) => reservation.publish(CatalogEvent::RatingDecayFailed {
             source_id,
             lifecycle_generation,

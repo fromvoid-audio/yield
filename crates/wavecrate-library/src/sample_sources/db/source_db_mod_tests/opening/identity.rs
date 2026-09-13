@@ -200,6 +200,139 @@ fn source_database_identity_lease_releases_and_advances_epoch() {
 }
 
 #[test]
+fn source_database_identity_publication_fence_is_read_only_and_weak() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("profile-owned source database");
+    let changes_before = database
+        .source_lease_control_total_changes_for_tests()
+        .expect("physical source lease")
+        .expect("control change count");
+    let fence = database
+        .source_publication_fence()
+        .expect("publication fence");
+    fence.validate().expect("live publication fence");
+    let changes_after = database
+        .source_lease_control_total_changes_for_tests()
+        .expect("physical source lease")
+        .expect("control change count");
+    assert_eq!(changes_after, changes_before);
+
+    drop(database);
+    assert!(matches!(
+        fence.validate(),
+        Err(SourcePublicationFenceError::LeaseDropped)
+    ));
+}
+
+#[test]
+fn source_database_identity_publication_fence_rejects_owner_and_epoch_changes() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("profile-owned source database");
+    let fence = database
+        .source_publication_fence()
+        .expect("publication fence");
+    let (owner_identity, lease_epoch): (String, i64) = database
+        .connection
+        .query_row(
+            "SELECT owner_identity, lease_epoch FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("active source lease row");
+
+    let replacement_owner = Uuid::new_v4().to_string();
+    database
+        .connection
+        .execute(
+            "UPDATE source_lease SET owner_identity = ?1 WHERE singleton = 1",
+            [&replacement_owner],
+        )
+        .expect("replace durable owner identity");
+    assert!(matches!(
+        fence.validate(),
+        Err(SourcePublicationFenceError::OwnerChanged)
+    ));
+    database
+        .connection
+        .execute(
+            "UPDATE source_lease SET owner_identity = ?1 WHERE singleton = 1",
+            [&owner_identity],
+        )
+        .expect("restore durable owner identity");
+
+    database
+        .connection
+        .execute(
+            "UPDATE source_lease SET lease_epoch = ?1 WHERE singleton = 1",
+            [lease_epoch + 1],
+        )
+        .expect("replace durable lease epoch");
+    assert!(matches!(
+        fence.validate(),
+        Err(SourcePublicationFenceError::EpochChanged)
+    ));
+    database
+        .connection
+        .execute(
+            "UPDATE source_lease SET lease_epoch = ?1 WHERE singleton = 1",
+            [lease_epoch],
+        )
+        .expect("restore durable lease epoch");
+    fence.validate().expect("restored publication fence");
+}
+
+#[test]
+fn source_database_identity_publication_fence_is_invalidated_by_catalog_handoff() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let replacement_root = tempdir().expect("replacement source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "publication-fence-catalog-handoff",
+    )
+    .expect("profile-owned catalog database");
+    let old_fence = database
+        .source_publication_fence()
+        .expect("old publication fence");
+    let database = database
+        .retarget_catalog_root(replacement_root.path(), &profile_guard)
+        .expect("catalog root handoff");
+
+    assert!(matches!(
+        old_fence.validate(),
+        Err(SourcePublicationFenceError::LeaseDropped)
+    ));
+    let new_fence = database
+        .source_publication_fence()
+        .expect("new publication fence");
+    new_fence.validate().expect("new live publication fence");
+}
+
+#[test]
 fn source_database_identity_catalog_handoff_advances_epoch_and_preserves_data() {
     let app_root = tempdir().expect("app root");
     let source_root = tempdir().expect("source root");

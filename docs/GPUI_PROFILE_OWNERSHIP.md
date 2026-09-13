@@ -284,6 +284,32 @@ including production admission, journal, source identity/lease and session/catal
 checks. This completes OPT-1336's ownership foundation; OPT-1349 publication
 fencing and OPT-1337 coordinator execution remain separate unfinished work.
 
+## Source result publication
+
+`SourceDatabase::source_publication_fence` captures the owner UUID and epoch in
+a weak fence. Keeping a result cannot keep its source lock alive. Validation
+uses the retained control connection, checks persisted ownership and live
+identities, and never renews or reopens by pathname. Dropping or handing off the
+owner invalidates earlier fences.
+
+Catalog projection publication checks the fence outside the admission mutex,
+then rechecks lifecycle admission under that mutex before sending. Durable
+curation and rating-decay receipts are still delivered for accounting when they
+are no longer current, with `CatalogPublicationStatus::NonProjectable`. Browser
+consumers drain these outcomes without updating projections or continuing work
+from stale revisions/cursors.
+
+This catalog-send boundary does not complete OPT-1349: scanner/readiness result
+propagation, post-queue projection acceptance, and stable source-unavailable
+diagnostics still need their own integration and validation.
+
+The initial publication slice passed three library fence tests, the 92-test
+catalog suite before final regression refinement, two corrected live-admission
+publication tests, and all 396 UI tests (one existing ignored). The receipt
+regression uses an actual committed curation outcome and verifies it remains
+unchanged when delivered as non-projectable. GPUI compilation, formatting and
+diff checks passed. Windows storage validation is pending for this slice.
+
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
 operation admission, checkpointing, and recovery execution remain requirements

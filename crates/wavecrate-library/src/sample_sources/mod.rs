@@ -32,7 +32,8 @@ pub use db::{
     SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate, SourceDatabase,
     SourceDatabaseConnectionRole, SourceDbError, SourceDisplayLabelEntry, SourceDisplayLabelResult,
     SourceFileWrite, SourceIndexClassification, SourceIndexCommitResult, SourceIndexDiagnostic,
-    SourceIndexEntry, SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag,
+    SourceIndexEntry, SourceIndexSnapshot, SourceLeaseError, SourceManifestEntry,
+    SourcePlaybackType, SourcePublicationFence, SourcePublicationFenceError, SourceTag,
     SourceTagFilterResult, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
     SourceTagWrite, SourceWriteCommand, WavEntry,
 };

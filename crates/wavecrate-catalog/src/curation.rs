@@ -635,12 +635,27 @@ pub(crate) fn execute(
         source.curation_lineage = None;
     }
     match result {
-        Ok(receipt) => reservation.publish(CatalogEvent::CurationCommitted {
-            source_id,
-            lifecycle_generation,
-            request_id,
-            receipt,
-        }),
+        Ok(receipt) => {
+            let source = sources
+                .get(&source_id)
+                .filter(|source| source.lifecycle_generation == lifecycle_generation);
+            let token = source.and_then(|source| source.attempt_token.as_ref());
+            let _ = super::publish_source_receipt(
+                &reservation.admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                token,
+                source,
+                |publication| CatalogEvent::CurationCommitted {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    request_id,
+                    receipt,
+                    publication,
+                },
+            );
+        }
         Err(error) => reservation.publish(CatalogEvent::CurationFailed {
             source_id,
             lifecycle_generation,
@@ -795,12 +810,25 @@ fn publish_operation_outcome(
             last_success_revision: success_revision,
         });
     }
-    reservation.publish(CatalogEvent::CurationOperationCompleted {
-        source_id,
+    let source = sources
+        .get(&source_id)
+        .filter(|source| source.lifecycle_generation == lifecycle_generation);
+    let token = source.and_then(|source| source.attempt_token.as_ref());
+    let _ = super::publish_source_receipt(
+        &reservation.admission,
+        reservation,
+        &source_id,
         lifecycle_generation,
-        request_id,
-        outcome,
-    });
+        token,
+        source,
+        |publication| CatalogEvent::CurationOperationCompleted {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            request_id,
+            outcome,
+            publication,
+        },
+    );
 }
 
 pub(crate) fn execute_inner(

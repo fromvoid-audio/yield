@@ -33,7 +33,9 @@ pub use wavecrate_library::sample_sources::{
     SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor,
     SourceTagPageEntry,
 };
-use wavecrate_library::sample_sources::{SourceDatabase, SourceDbError, SourceId};
+use wavecrate_library::sample_sources::{
+    SourceDatabase, SourceDbError, SourceId, SourcePublicationFence,
+};
 use wavecrate_scan::sample_sources::scanner::{
     ScanError, ScanWritePhase, ScanWriter,
     audit_manifest_for_catalog_with_budget_and_progress_and_writer,
@@ -969,6 +971,19 @@ pub enum CatalogOperation {
     Remove,
 }
 
+/// Describes whether a successful source result can update the current projection.
+///
+/// Durable curation receipts are still delivered when the source lease becomes stale after a
+/// commit, so consumers can account for work that already happened. Such an event is explicitly
+/// [`Self::NonProjectable`] and must not be applied as current source projection data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogPublicationStatus {
+    /// The source lease and immutable publication fence were current at publication time.
+    Current,
+    /// The durable result remains available for terminal accounting but cannot update projection.
+    NonProjectable,
+}
+
 /// Worker output carrying source identity, lifecycle generation, and revision fences.
 #[derive(Debug)]
 pub enum CatalogEvent {
@@ -1131,6 +1146,8 @@ pub enum CatalogEvent {
         request_id: u64,
         /// Opaque library receipt for the exact committed revision and root.
         receipt: SourceCurationCommitReceipt,
+        /// Whether the receipt can update the current source projection.
+        publication: CatalogPublicationStatus,
     },
     /// A durable curation batch reached a terminal failure without mutating the source.
     CurationFailed {
@@ -1169,6 +1186,8 @@ pub enum CatalogEvent {
         next_cursor: Option<BrowserMetadataCursor>,
         /// Durable metadata patch when this page committed updates.
         receipt: Option<SourceCurationCommitReceipt>,
+        /// Whether this page can update the current source projection.
+        publication: CatalogPublicationStatus,
     },
     /// One bounded rating-decay page failed after admission.
     RatingDecayFailed {
@@ -1193,6 +1212,8 @@ pub enum CatalogEvent {
         request_id: u64,
         /// Committed prefix and optional failed batch detail.
         outcome: SourceCurationOperationOutcome,
+        /// Whether committed receipts can update the current source projection.
+        publication: CatalogPublicationStatus,
     },
     /// One source was removed from the active worker projection.
     Removed {
@@ -1220,6 +1241,7 @@ struct RegisteredSource {
     root: PathBuf,
     lifecycle_generation: u64,
     database: SourceDatabase,
+    publication_fence: SourcePublicationFence,
     known_root_identity: Option<RootIdentity>,
     snapshot: Option<CatalogSnapshot>,
     attempt_token: Option<Arc<AtomicBool>>,
@@ -2083,6 +2105,62 @@ fn publish_if_current(
     true
 }
 
+pub(crate) fn publish_source_if_current(
+    admission: &Arc<Mutex<AdmissionState>>,
+    reservation: &mut EventReservation<'_>,
+    source_id: &SourceId,
+    lifecycle_generation: u64,
+    token: Option<&Arc<AtomicBool>>,
+    source: &RegisteredSource,
+    event: CatalogEvent,
+) -> bool {
+    if !publication_is_current(admission, source_id, lifecycle_generation, token) {
+        return false;
+    }
+    // The fence validation intentionally happens outside the admission mutex: it may borrow the
+    // retained lease control connection. Recheck lifecycle admission immediately before sending
+    // so a source switch or cancellation cannot turn the validated result into current output.
+    if source.publication_fence.validate().is_err() {
+        return false;
+    }
+    let state = admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !publication_is_current_state(&state, source_id, lifecycle_generation, token) {
+        return false;
+    }
+    reservation.publish(event);
+    true
+}
+
+pub(crate) fn publish_source_receipt(
+    admission: &Arc<Mutex<AdmissionState>>,
+    reservation: &mut EventReservation<'_>,
+    source_id: &SourceId,
+    lifecycle_generation: u64,
+    token: Option<&Arc<AtomicBool>>,
+    source: Option<&RegisteredSource>,
+    event: impl FnOnce(CatalogPublicationStatus) -> CatalogEvent,
+) -> bool {
+    let mut publication = CatalogPublicationStatus::NonProjectable;
+    if let Some(source) = source.filter(|source| {
+        source.lifecycle_generation == lifecycle_generation
+            && publication_is_current(admission, source_id, lifecycle_generation, token)
+    }) {
+        if source.publication_fence.validate().is_ok() {
+            publication = CatalogPublicationStatus::Current;
+        }
+    }
+    let state = admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !publication_is_current_state(&state, source_id, lifecycle_generation, token) {
+        publication = CatalogPublicationStatus::NonProjectable;
+    }
+    reservation.publish(event(publication));
+    true
+}
+
 fn publish_removal_if_current(
     admission: &Arc<Mutex<AdmissionState>>,
     reservation: &mut EventReservation<'_>,
@@ -2749,12 +2827,13 @@ fn request_tag_page(
     );
     match result {
         Ok(patch) => {
-            let _ = publish_if_current(
+            let _ = publish_source_if_current(
                 admission,
                 reservation,
                 &source_id,
                 lifecycle_generation,
                 Some(&token),
+                source,
                 CatalogEvent::TagPageReady {
                     source_id: source_id.clone(),
                     lifecycle_generation,
@@ -2839,12 +2918,13 @@ fn request_tag_filter(
     );
     match result {
         Ok(patch) => {
-            let _ = publish_if_current(
+            let _ = publish_source_if_current(
                 admission,
                 reservation,
                 &source_id,
                 lifecycle_generation,
                 Some(&token),
+                source,
                 CatalogEvent::TagFilterReady {
                     source_id: source_id.clone(),
                     lifecycle_generation,
@@ -2929,12 +3009,13 @@ fn request_display_labels(
     );
     match result {
         Ok(patch) => {
-            let _ = publish_if_current(
+            let _ = publish_source_if_current(
                 admission,
                 reservation,
                 &source_id,
                 lifecycle_generation,
                 Some(&token),
+                source,
                 CatalogEvent::DisplayLabelsReady {
                     source_id: source_id.clone(),
                     lifecycle_generation,
@@ -3090,6 +3171,20 @@ fn register_source(
         );
         return;
     }
+    let publication_fence = match database.source_publication_fence() {
+        Ok(fence) => fence,
+        Err(error) => {
+            emit_failure(
+                reservation,
+                admission,
+                Some(source_id),
+                Some(lifecycle_generation),
+                CatalogOperation::Register,
+                catalog_error_from_db(error),
+            );
+            return;
+        }
+    };
     if let Err(error) = root::revalidate_registration_root(
         &source_id,
         &canonical_root,
@@ -3113,6 +3208,7 @@ fn register_source(
         root: canonical_root,
         lifecycle_generation,
         database,
+        publication_fence,
         known_root_identity: Some(expected_root.identity().clone()),
         snapshot: None,
         attempt_token: None,
@@ -3203,29 +3299,35 @@ fn register_source(
         }
         return;
     }
-    let _ = publish_if_current(
-        admission,
-        reservation,
-        &source_id,
-        lifecycle_generation,
-        None,
-        CatalogEvent::Registered {
-            source_id: source_id.clone(),
-            lifecycle_generation,
-        },
-    );
-    if let Some(snapshot) = sources
-        .get(&source_id)
-        .and_then(|source| source.snapshot.clone())
-    {
-        let _ = publish_if_current(
+    if let Some(source) = sources.get(&source_id) {
+        let _ = publish_source_if_current(
             admission,
             reservation,
             &source_id,
             lifecycle_generation,
             None,
-            CatalogEvent::SnapshotReady { snapshot },
+            source,
+            CatalogEvent::Registered {
+                source_id: source_id.clone(),
+                lifecycle_generation,
+            },
         );
+    }
+    if let Some(snapshot) = sources
+        .get(&source_id)
+        .and_then(|source| source.snapshot.clone())
+    {
+        if let Some(source) = sources.get(&source_id) {
+            let _ = publish_source_if_current(
+                admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                None,
+                source,
+                CatalogEvent::SnapshotReady { snapshot },
+            );
+        }
     }
 }
 
@@ -3299,12 +3401,13 @@ fn request_audit(
         Ok(snapshot) => {
             source.known_root_identity = Some(snapshot.root_identity.clone());
             source.snapshot = Some(snapshot.clone());
-            let published = publish_if_current(
+            let published = publish_source_if_current(
                 admission,
                 reservation,
                 &source_id,
                 lifecycle_generation,
                 Some(&token),
+                source,
                 CatalogEvent::AuditCommitted { snapshot },
             );
             if published {
@@ -3424,12 +3527,13 @@ fn request_wav_metadata(
                 snapshot.wav_metadata.remove(path);
             }
             snapshot.wav_metadata.extend(patch.metadata.clone());
-            let _ = publish_if_current(
+            let _ = publish_source_if_current(
                 admission,
                 reservation,
                 &source_id,
                 lifecycle_generation,
                 Some(&token),
+                source,
                 CatalogEvent::WavMetadataReady {
                     source_id: source_id.clone(),
                     lifecycle_generation,
@@ -3562,12 +3666,13 @@ fn read_snapshot(
             }
             source.known_root_identity = Some(snapshot.root_identity.clone());
             source.snapshot = Some(snapshot.clone());
-            let _ = publish_if_current(
+            let _ = publish_source_if_current(
                 admission,
                 reservation,
                 &source_id,
                 lifecycle_generation,
                 None,
+                source,
                 CatalogEvent::SnapshotReady { snapshot },
             );
         }
@@ -6272,6 +6377,9 @@ mod tests {
             catalog_profile_child(&source_id),
         )
         .expect("profile catalog database");
+        let publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence");
         let root_identity = source_root_identity(fixture.root.path()).expect("root identity");
         let token = Arc::new(AtomicBool::new(true));
         let admission = Arc::new(Mutex::new(AdmissionState::new()));
@@ -6288,6 +6396,7 @@ mod tests {
             root: fixture.root.path().to_path_buf(),
             lifecycle_generation: 1,
             database,
+            publication_fence,
             known_root_identity: Some(root_identity.clone()),
             snapshot: Some(CatalogSnapshot {
                 source_id: source_id.clone(),
@@ -6319,6 +6428,204 @@ mod tests {
             ),
             Err(CatalogError::Canceled)
         ));
+    }
+
+    #[test]
+    fn source_publication_fence_discards_stale_catalog_success() {
+        let fixture = Fixture::new("catalog-publication-fence");
+        let source_id = SourceId::from_string("source-publication-fence");
+        let replacement_root = tempfile::tempdir().expect("replacement source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("profile catalog database");
+        let stale_publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence");
+        let database = database
+            .retarget_catalog_root(replacement_root.path(), &fixture.guard)
+            .expect("catalog handoff");
+        let publication_fence = database
+            .source_publication_fence()
+            .expect("fresh publication fence");
+        let root_identity = source_root_identity(replacement_root.path()).expect("root identity");
+        let token = Arc::new(AtomicBool::new(false));
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        admission.lock().expect("admission lock").sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: Some(Arc::clone(&token)),
+                last_curation_request_id: None,
+            },
+        );
+        let mut source = RegisteredSource {
+            root: replacement_root.path().to_path_buf(),
+            lifecycle_generation: 1,
+            database,
+            publication_fence,
+            known_root_identity: Some(root_identity.clone()),
+            snapshot: None,
+            attempt_token: Some(Arc::clone(&token)),
+            curation_lineage: None,
+            watcher: None,
+            watcher_schedule: WatcherSchedule::new(false),
+        };
+        assert!(source.publication_fence.validate().is_ok());
+
+        let hub = EventHub::new();
+        let mut reservation = EventReservation {
+            hub: &hub,
+            admission: &admission,
+            remaining: 2,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_read_payload_bytes: 0,
+        };
+        assert!(publish_source_if_current(
+            &admission,
+            &mut reservation,
+            &source_id,
+            1,
+            Some(&token),
+            &source,
+            CatalogEvent::Registered {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            },
+        ));
+        source.publication_fence = stale_publication_fence;
+        assert!(source.publication_fence.validate().is_err());
+        assert!(!publish_source_if_current(
+            &admission,
+            &mut reservation,
+            &source_id,
+            1,
+            Some(&token),
+            &source,
+            CatalogEvent::Registered {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            },
+        ));
+        let (event, _, _, _) = hub.try_recv().expect("fresh fence publication");
+        assert!(matches!(
+            event,
+            CatalogEvent::Registered {
+                source_id: event_source,
+                lifecycle_generation: 1,
+            } if event_source == source_id
+        ));
+        assert!(matches!(hub.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn source_publication_receipt_delivers_stale_operation_outcome_as_non_projectable() {
+        let fixture = Fixture::new("catalog-publication-receipt");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-publication-receipt");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let path = RootRelativePath::try_from_path(PathBuf::from("one.wav"))
+            .expect("relative curation path");
+        let outcome = {
+            service
+                .submit(curation_operation(
+                    &source_id,
+                    1,
+                    &snapshot.root_identity,
+                    901,
+                    SourceCurationOperationFence::ExactRevision(snapshot.committed_revision),
+                    vec![vec![SourceCurationUpdate::SetRating {
+                        path,
+                        rating: wavecrate_library::sample_sources::Rating::KEEP_1,
+                    }]],
+                ))
+                .expect("curation operation admission");
+            receive_curation_operation(&service, 901)
+        };
+        assert!(outcome.is_success());
+        assert_eq!(outcome.committed_batches().len(), 1);
+        service.shutdown();
+
+        let replacement_root = tempfile::tempdir().expect("replacement source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source_id),
+        )
+        .expect("reopen profile catalog database");
+        let stale_publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence");
+        let database = database
+            .retarget_catalog_root(replacement_root.path(), &fixture.guard)
+            .expect("catalog handoff");
+        let root_identity = source_root_identity(replacement_root.path()).expect("root identity");
+        let token = Arc::new(AtomicBool::new(false));
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        admission.lock().expect("admission lock").sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: Some(Arc::clone(&token)),
+                last_curation_request_id: None,
+            },
+        );
+        let source = RegisteredSource {
+            root: replacement_root.path().to_path_buf(),
+            lifecycle_generation: 1,
+            database,
+            publication_fence: stale_publication_fence,
+            known_root_identity: Some(root_identity),
+            snapshot: None,
+            attempt_token: Some(Arc::clone(&token)),
+            curation_lineage: None,
+            watcher: None,
+            watcher_schedule: WatcherSchedule::new(false),
+        };
+        assert!(source.publication_fence.validate().is_err());
+
+        let hub = EventHub::new();
+        let mut reservation = EventReservation {
+            hub: &hub,
+            admission: &admission,
+            remaining: 1,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_read_payload_bytes: 0,
+        };
+        assert!(publish_source_receipt(
+            &admission,
+            &mut reservation,
+            &source_id,
+            1,
+            Some(&token),
+            Some(&source),
+            |publication| CatalogEvent::CurationOperationCompleted {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                request_id: 901,
+                outcome: outcome.clone(),
+                publication,
+            },
+        ));
+        let (event, _, _, _) = hub.try_recv().expect("stale receipt publication");
+        assert!(matches!(
+            event,
+            CatalogEvent::CurationOperationCompleted {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                request_id: 901,
+                outcome: event_outcome,
+                publication: CatalogPublicationStatus::NonProjectable,
+            } if event_source == source_id && event_outcome == outcome
+        ));
+        assert!(matches!(hub.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]

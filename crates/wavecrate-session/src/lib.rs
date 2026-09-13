@@ -32,8 +32,8 @@ mod vocabulary;
 
 pub use catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogDisplayLabelsRequestError, CatalogError,
-    CatalogEvent, CatalogOperation, CatalogRatingDecayRequestError, CatalogStatus,
-    CatalogSubmitError, CatalogTagFilterRequestError, CatalogTagPageQuery,
+    CatalogEvent, CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
+    CatalogStatus, CatalogSubmitError, CatalogTagFilterRequestError, CatalogTagPageQuery,
     CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
@@ -3693,6 +3693,7 @@ mod tests {
                 lifecycle_generation: 1,
                 request_id: 9001,
                 receipt,
+                ..
             } => {
                 assert_eq!(committed_source, source_id);
                 assert_eq!(receipt.files().len(), 1);

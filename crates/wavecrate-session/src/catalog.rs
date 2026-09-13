@@ -7,18 +7,18 @@ use wavecrate_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
 pub use wavecrate_catalog::{
     CatalogCommand, CatalogCurationRequestError, CatalogDisplayLabelsRequestError, CatalogError,
-    CatalogEvent, CatalogOperation, CatalogRatingDecayRequestError, CatalogTagFilterRequestError,
-    CatalogTagPageQuery, CatalogTagPageRequestError, CatalogWavMetadataRequestError,
-    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
-    MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES,
-    MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
-    MAX_WAV_METADATA_REQUEST_PATHS, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
-    SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,
-    SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
-    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt,
-    SourceCurationOperationFailure, SourceCurationOperationFence, SourceCurationOperationOutcome,
-    SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    CatalogEvent, CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
+    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
+    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
+    MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
+    SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
+    SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
+    SourceCurationOperationOutcome, SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.

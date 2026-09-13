@@ -21,7 +21,7 @@ use wavecrate_library::sample_sources::{
     reconciliation::{RootIdentity, RootRelativePath},
 };
 use wavecrate_session::{
-    MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
+    CatalogPublicationStatus, MAX_CURATION_OPERATION_BATCHES, MAX_CURATION_OPERATION_PATH_BYTES,
     MAX_CURATION_OPERATION_RECEIPT_BYTES, MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES,
     SourceCurationCommitReceipt, SourceCurationOperationFence, SourceCurationOperationOutcome,
 };
@@ -119,6 +119,8 @@ struct CurationLineage {
     confirmed: BTreeMap<PathBuf, AudioFileCuration>,
     pending: Vec<PendingCurationOperation>,
     failed: Option<String>,
+    /// A committed receipt was drained after its source fence became stale.
+    invalidated: Option<String>,
     message: Option<String>,
 }
 
@@ -203,6 +205,8 @@ pub(super) struct CurationOutcomeApplication {
     pub(super) metadata_changed: bool,
     pub(super) tags_may_change: bool,
     pub(super) failed: bool,
+    /// Whether the receipt may update the active browser projection.
+    pub(super) projectable: bool,
 }
 
 impl CurationState {
@@ -240,6 +244,7 @@ impl CurationState {
                 confirmed,
                 pending: Vec::new(),
                 failed: None,
+                invalidated: None,
                 message: None,
             },
         );
@@ -283,6 +288,7 @@ impl CurationState {
                 && lineage.directory_generation == directory_generation
                 && lineage.revision == revision
                 && lineage.failed.is_none()
+                && lineage.invalidated.is_none()
         })
     }
 
@@ -292,6 +298,11 @@ impl CurationState {
         if let Some(error) = lineage.failed.as_ref() {
             return Some(format!(
                 "Curation failed: {error}; refresh the catalog before editing"
+            ));
+        }
+        if let Some(reason) = lineage.invalidated.as_ref() {
+            return Some(format!(
+                "Curation committed but cannot update this source: {reason}; refresh the catalog before editing"
             ));
         }
         if !lineage.pending.is_empty() {
@@ -346,6 +357,11 @@ impl CurationState {
         if let Some(error) = lineage.failed.as_ref() {
             return CurationPlan::Rejected(format!(
                 "Curation lineage failed ({error}); refresh the catalog before editing"
+            ));
+        }
+        if let Some(reason) = lineage.invalidated.as_ref() {
+            return CurationPlan::Rejected(format!(
+                "Curation lineage is unavailable ({reason}); refresh the catalog before editing"
             ));
         }
         if target_paths.is_empty() {
@@ -484,6 +500,11 @@ impl CurationState {
         if let Some(error) = lineage.failed.as_ref() {
             return CurationPlan::Rejected(format!(
                 "Curation lineage failed ({error}); refresh the catalog before editing"
+            ));
+        }
+        if let Some(reason) = lineage.invalidated.as_ref() {
+            return CurationPlan::Rejected(format!(
+                "Curation lineage is unavailable ({reason}); refresh the catalog before editing"
             ));
         }
         if target_paths.is_empty() {
@@ -797,7 +818,10 @@ impl CurationState {
         let Some(lineage) = self.lineages.get_mut(key) else {
             return false;
         };
-        if lineage.failed.is_some() || plan.root_identity != lineage.root_identity {
+        if lineage.failed.is_some()
+            || lineage.invalidated.is_some()
+            || plan.root_identity != lineage.root_identity
+        {
             return false;
         }
         if plan.request_id != next_request_id {
@@ -824,6 +848,24 @@ impl CurationState {
         request_id: u64,
         outcome: CurationOutcome,
     ) -> Option<CurationOutcomeApplication> {
+        self.apply_outcome_with_projection(key, request_id, outcome, true)
+    }
+
+    fn apply_outcome_with_projection(
+        &mut self,
+        key: CurationLifecycleKey,
+        request_id: u64,
+        outcome: CurationOutcome,
+        projectable: bool,
+    ) -> Option<CurationOutcomeApplication> {
+        if !projectable
+            || self
+                .lineages
+                .get(&key)
+                .is_some_and(|lineage| lineage.invalidated.is_some())
+        {
+            return self.discard_non_projectable_outcome(key, request_id);
+        }
         let Some(lineage) = self.lineages.get_mut(&key) else {
             self.retired_pending.remove(&(key, request_id));
             return None;
@@ -963,6 +1005,47 @@ impl CurationState {
             metadata_changed,
             tags_may_change: operation_tags_may_change,
             failed: failed.is_some(),
+            projectable: true,
+        })
+    }
+
+    fn discard_non_projectable_outcome(
+        &mut self,
+        key: CurationLifecycleKey,
+        request_id: u64,
+    ) -> Option<CurationOutcomeApplication> {
+        let Some(lineage) = self.lineages.get_mut(&key) else {
+            self.retired_pending.remove(&(key, request_id));
+            return None;
+        };
+        let Some(operation_index) = lineage
+            .pending
+            .iter()
+            .position(|operation| operation.request_id == request_id)
+        else {
+            self.retired_pending.remove(&(key, request_id));
+            return None;
+        };
+        let revision = lineage.revision;
+        lineage.pending.remove(operation_index);
+        for operation in &mut lineage.pending {
+            operation.active_overlay = false;
+        }
+        lineage.invalidated = Some(String::from(
+            "the source publication fence became stale after the durable commit",
+        ));
+        lineage.message = None;
+        Some(CurationOutcomeApplication {
+            root_identity: lineage.root_identity.clone(),
+            directory_generation: lineage.directory_generation,
+            prior_revision: revision,
+            revision,
+            visible: BTreeMap::new(),
+            playback_types: BTreeMap::new(),
+            metadata_changed: false,
+            tags_may_change: false,
+            failed: false,
+            projectable: false,
         })
     }
 
@@ -2234,6 +2317,7 @@ impl Browser {
             lifecycle_generation,
             request_id,
             outcome,
+            publication,
         } = event
         else {
             return false;
@@ -2251,10 +2335,19 @@ impl Browser {
             lifecycle_generation: *lifecycle_generation,
         };
         let outcome = CurationOutcome::from_catalog(outcome);
-        let Some(application) =
+        let projectable = *publication == CatalogPublicationStatus::Current
+            || outcome.committed_batches.is_empty();
+        let Some(application) = (if projectable {
             self.curation_state
                 .apply_outcome(key.clone(), *request_id, outcome)
-        else {
+        } else {
+            self.curation_state.apply_outcome_with_projection(
+                key.clone(),
+                *request_id,
+                outcome,
+                false,
+            )
+        }) else {
             // The projection may have been superseded, but the terminal event was still drained.
             return true;
         };
@@ -2268,6 +2361,17 @@ impl Browser {
         self.curation_state
             .prune_completed_except(active_key.as_ref());
         let active = curation_key_is_active(active_key.as_ref(), &key);
+        if !application.projectable {
+            if active {
+                self.invalidate_source_publication(
+                    cx,
+                    source_id,
+                    *lifecycle_generation,
+                    "Curation committed, but the source changed; refresh the catalog",
+                );
+            }
+            return true;
+        }
         if active {
             let tag_filter_revision_changed = !application.failed
                 && self.catalog_metadata.context().is_some_and(|context| {
@@ -3107,6 +3211,55 @@ mod tests {
         assert!(application.playback_types.is_empty());
         assert_eq!(application.revision, 10);
         assert!(!state.has_pending_outcomes());
+    }
+
+    #[test]
+    fn non_projectable_committed_outcome_drains_without_advancing_projection() {
+        let path = PathBuf::from("kick.wav");
+        let mut state = install(&[entry("kick.wav", 0, false, 0)]);
+        let plan = ready_plan(
+            &state,
+            CurationAction::AdjustRating { delta: 1 },
+            std::slice::from_ref(&path),
+        );
+        let request_id = plan.request_id;
+        state.accept_operation(&key(), plan);
+
+        let application = state
+            .apply_outcome_with_projection(
+                key(),
+                request_id,
+                CurationOutcome {
+                    initial_revision: Some(10),
+                    final_revision: Some(11),
+                    committed_batches: vec![receipt(11, "kick.wav", curation(1, false, 0))],
+                    failure: None,
+                },
+                false,
+            )
+            .expect("non-projectable outcome is still consumed");
+        assert!(!application.projectable);
+        assert!(!application.metadata_changed);
+        assert_eq!(application.revision, 10);
+        assert!(!state.has_pending_outcomes());
+        assert_eq!(
+            state.lineages[&key()].confirmed[&path],
+            curation(0, false, 0)
+        );
+        assert!(matches!(
+            state.plan_action(
+                &key(),
+                CurationAction::AdjustRating { delta: 1 },
+                std::slice::from_ref(&path),
+            ),
+            CurationPlan::Rejected(message) if message.contains("refresh the catalog")
+        ));
+        assert!(
+            state
+                .status_for(&key())
+                .expect("non-projectable status")
+                .contains("committed but cannot update")
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@ use wavecrate_library::sample_sources::{
     BrowserMetadataCursor, SourceId, reconciliation::RootIdentity,
 };
 use wavecrate_session::{
-    CatalogCommand, CatalogError, CatalogEvent, CatalogOperation, CatalogSubmitError,
-    MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS,
+    CatalogCommand, CatalogError, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
+    CatalogSubmitError, MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS,
 };
 
 use super::{Browser, catalog, catalog_metadata::CatalogMetadataContext};
@@ -58,6 +58,7 @@ pub(super) struct RatingDecayState {
     processed_count: usize,
     updated_count: usize,
     status: Option<String>,
+    invalidated: bool,
 }
 
 impl RatingDecayState {
@@ -80,6 +81,7 @@ impl RatingDecayState {
         rating_decay_weeks: u16,
     ) -> bool {
         if self.active()
+            || self.invalidated
             || !(MIN_RATING_DECAY_WEEKS..=MAX_RATING_DECAY_WEEKS).contains(&rating_decay_weeks)
         {
             return false;
@@ -125,6 +127,7 @@ impl RatingDecayState {
 
     fn note_audit_committed(&mut self) {
         self.audit_generation = self.audit_generation.wrapping_add(1);
+        self.invalidated = false;
     }
 
     fn cancel(&mut self) {
@@ -133,6 +136,14 @@ impl RatingDecayState {
         self.processed_count = 0;
         self.updated_count = 0;
         self.status = None;
+        self.invalidated = false;
+    }
+
+    fn invalidate_for_source_publication(&mut self, status: &str) {
+        self.pending = None;
+        self.refresh = None;
+        self.status = Some(status.to_string());
+        self.invalidated = true;
     }
 
     fn cancel_for_preference_change(&mut self) {
@@ -225,6 +236,13 @@ impl Browser {
 /// Cancel a run whose source lifecycle is being replaced or removed.
 pub(super) fn cancel_for_source_change(browser: &mut Browser) {
     browser.rating_decay.cancel();
+}
+
+/// Stop maintenance after a durable result loses its source publication fence.
+pub(super) fn invalidate_for_source_publication(browser: &mut Browser, status: &str) {
+    browser
+        .rating_decay
+        .invalidate_for_source_publication(status);
 }
 
 /// Cancel a run while preferences are transitioning through an optimistic patch.
@@ -371,6 +389,7 @@ pub(super) fn apply_catalog_event(
             updated_count,
             next_cursor,
             receipt,
+            publication,
         } => apply_progress(
             browser,
             cx,
@@ -383,6 +402,7 @@ pub(super) fn apply_catalog_event(
             *updated_count,
             next_cursor,
             receipt.as_ref(),
+            *publication,
         ),
         CatalogEvent::RatingDecayFailed {
             source_id,
@@ -421,6 +441,7 @@ fn apply_progress(
     updated_count: usize,
     next_cursor: &Option<BrowserMetadataCursor>,
     receipt: Option<&wavecrate_session::SourceCurationCommitReceipt>,
+    publication: CatalogPublicationStatus,
 ) -> bool {
     let Some(request) = browser.rating_decay.pending.as_ref().cloned() else {
         return true;
@@ -429,6 +450,26 @@ fn apply_progress(
         .rating_decay
         .page_event_matches(source_id, lifecycle_generation, request_id)
     {
+        return true;
+    }
+    if publication == CatalogPublicationStatus::NonProjectable {
+        browser.rating_decay.processed_count = browser
+            .rating_decay
+            .processed_count
+            .saturating_add(processed_count);
+        browser.rating_decay.updated_count = browser
+            .rating_decay
+            .updated_count
+            .saturating_add(updated_count);
+        browser.rating_decay.invalidate_for_source_publication(
+            "Rating decay committed, but the source changed; refresh the catalog",
+        );
+        browser.invalidate_source_publication(
+            cx,
+            source_id,
+            lifecycle_generation,
+            "Rating decay committed, but the source changed; refresh the catalog",
+        );
         return true;
     }
     let expected_next_revision = request.expected_revision.checked_add(1);
@@ -705,6 +746,18 @@ mod tests {
             assert!(state.pending.is_none());
             assert_eq!(state.refresh.is_some(), updated_count > 0);
         }
+    }
+
+    #[test]
+    fn non_projectable_page_stops_continuations_until_a_new_audit() {
+        let mut state = RatingDecayState::default();
+        let context = context(7, 2);
+        assert!(state.begin(&context, 3, 4, 1234));
+        state.invalidate_for_source_publication("source changed");
+        assert!(!state.active());
+        assert!(!state.should_start(&context, 3, 4));
+        state.note_audit_committed();
+        assert!(state.should_start(&context, 3, 4));
     }
 
     #[test]

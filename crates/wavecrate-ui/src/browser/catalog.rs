@@ -11,8 +11,8 @@ use wavecrate_library::sample_sources::{
     BrowserFileMetadata, SourceId, SourcePlaybackType, reconciliation::RootIdentity,
 };
 use wavecrate_session::{
-    CatalogCommand, CatalogEvent, CatalogOperation, CatalogStatus, CatalogSubmitError,
-    VerifiedSourceRoot,
+    CatalogCommand, CatalogEvent, CatalogOperation, CatalogPublicationStatus, CatalogStatus,
+    CatalogSubmitError, VerifiedSourceRoot,
 };
 
 use super::source_registry::SourceRegistryGlobal;
@@ -572,7 +572,15 @@ impl Browser {
             // switched to another source. Consume them before the active projection fence so a
             // later receipt cannot be mistaken for a new source's metadata.
             let consumed = self.apply_curation_event(&event, cx);
-            if consumed {
+            if consumed
+                && matches!(
+                    &event,
+                    CatalogEvent::CurationOperationCompleted {
+                        publication: CatalogPublicationStatus::Current,
+                        ..
+                    }
+                )
+            {
                 let _ = self.maybe_start_rating_decay(cx);
             }
             return consumed;
@@ -649,6 +657,20 @@ impl Browser {
             }
             CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
                 self.apply_catalog_metadata_event(&event)
+            }
+            CatalogEvent::CurationCommitted {
+                source_id,
+                lifecycle_generation,
+                publication: CatalogPublicationStatus::NonProjectable,
+                ..
+            } => {
+                self.invalidate_source_publication(
+                    cx,
+                    source_id,
+                    *lifecycle_generation,
+                    "Curation committed, but the source changed; refresh the catalog",
+                );
+                true
             }
             CatalogEvent::CurationCommitted { .. }
             | CatalogEvent::CurationFailed { .. }
@@ -895,6 +917,36 @@ impl Browser {
         if audit_ready {
             let _ = self.maybe_start_rating_decay(cx);
         }
+    }
+
+    /// Retire source-scoped projections after a durable result loses its publication fence.
+    pub(super) fn invalidate_source_publication(
+        &mut self,
+        cx: &mut Context<Browser>,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+        status: &str,
+    ) {
+        if !self.catalog_activation.as_ref().is_some_and(|activation| {
+            activation.source_id == *source_id
+                && activation.lifecycle_generation == lifecycle_generation
+        }) {
+            return;
+        }
+        super::source_recovery::cancel_for_source_change(self);
+        super::rating_decay::invalidate_for_source_publication(self, status);
+        super::tag_chips::cancel_for_source_change(self);
+        super::tag_completion::cancel_for_source_change(self, cx);
+        super::tag_filter::cancel_for_source_change(self);
+        self.display_labels.cancel_for_source_change();
+        self.catalog_pending_command = None;
+        self.cancel_catalog_projection();
+        self.reset_catalog_metadata();
+        if let Some(activation) = self.catalog_activation.as_mut() {
+            activation.audit_finished = false;
+            activation.audit_error = Some(status.to_string());
+        }
+        self.scan_status = status.to_string();
     }
 }
 
