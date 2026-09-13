@@ -6,7 +6,8 @@
 //! types. V3 currently describes a newly durable intent, V4 a pre-publication cancellation
 //! request, V5 the first typed copy command and retry observations, and V6 the tagged command
 //! envelope. V7 adds a typed in-place WAV edit observation, V8 adds bounded namespace mutation
-//! observations, and V9 adds whole-file render observations.
+//! observations, V9 adds whole-file render observations, and V10 adds bounded configured-trash
+//! and retained-folder removal observations.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,6 +33,8 @@ pub const SCHEMA_V7: u32 = 7;
 pub const SCHEMA_V8: u32 = 8;
 /// The whole-file render command envelope schema.
 pub const SCHEMA_V9: u32 = 9;
+/// The configured-trash and retained-folder removal command envelope schema.
+pub const SCHEMA_V10: u32 = 10;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.

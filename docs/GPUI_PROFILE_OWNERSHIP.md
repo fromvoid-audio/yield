@@ -841,3 +841,37 @@ The lane also passed 12 legacy-reader, 90 catalog, 60 session (one helper
 ignored), 16 core edit-settings and five media-adapter tests. This accepts the
 V9 storage milestone; native Windows UI and filesystem execution remain outside
 this validation scope.
+
+## V10 removal observations (OPT-1337)
+
+V10 distinguishes configured Trash from StageRetainedFolder. Trash accepts a
+file or folder source plus an opaque configured-root binding, observed root
+identity and required Filesystem participant. Its destination policy is fixed
+NoReplace. StageRetainedFolder accepts only a non-root directory and requests
+source-local owned recovery storage, also with fixed NoReplace semantics that
+preserve an occupied recovery target. Both validate the full participant
+inventory, source/database identity and captured source revision. Known exact
+self-trash and source entries already inside the fenced trash-root namespace
+are rejected; other physical containment requires later live validation.
+
+These initial requests carry no actual destination leaf, staging locator or
+metadata snapshot. The universal OperationId is their planned recovery
+correlation key. Before any physical move, a later Prepared checkpoint must
+bind the chosen locators and durable restore material. Verified output identity
+is recorded afterward. Existing configured-trash code does not already provide
+that durable restore record, and this milestone does not execute that code or
+create recovery material. Protected-source, folder-lock and user-confirmation
+admission guards remain required above this storage boundary. Existing retained
+Restore/Purge resolution is a separate remaining command family.
+
+V10 retains all prior command families while V6 through V9 reject Removal in
+JSON and directly constructed records. V6 now uses an exhaustive variant match
+so later command additions require an explicit compatibility decision. Local
+validation passed 185 serialized journal tests (one helper ignored), including
+removal, codec, retry/cancellation/restart and owner coverage. Library checks
+with and without default features, GPUI compilation, formatting and diff checks
+passed. Independent review identified the missing explicit fixed collision
+policy for retained-folder staging; the policy is now exposed and documented,
+and its focused regression passed. No other findings were reported. This adds
+no filesystem executor. Windows storage acceptance is pending. The V1 default
+and SQLite schema remain unchanged.

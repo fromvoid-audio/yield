@@ -32,9 +32,10 @@ use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
-    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
 };
 use super::namespace_commands::NamespaceCommandArgs;
+use super::removal_commands::{RemovalCommandArgs, StageRetainedFolderIntentArgs, TrashIntentArgs};
 use super::render_commands::{
     RenderCommandArgs, WaveformDuplicateDoubleIntentArgs, WaveformNormalizeIntentArgs,
 };
@@ -1235,6 +1236,166 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
+    /// Persist one V10 configured-removal command and return its compatibility receipt.
+    ///
+    /// V10 carries only the initial configured-trash and source-local retained-folder request.
+    /// It performs no filesystem work, recovery staging, metadata capture, or permanent deletion.
+    pub fn persist_command_intent_v10(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v10_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V10 configured-removal command with its exact write-stage outcome.
+    pub fn persist_command_intent_v10_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v10 removal intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v10 removal command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v10 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v10_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        self.insert_intent_with_outcome(&record)
+    }
+
+    /// Persist one typed V10 removal command.
+    pub fn persist_removal_command_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: RemovalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v10(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::Removal(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
+    /// Persist one typed configured-trash request.
+    pub fn persist_trash_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: TrashIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_removal_command_intent(
+            operation_id,
+            intent,
+            universal_intent,
+            RemovalCommandArgs::Trash(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
+    /// Persist one typed source-local retained-folder request.
+    pub fn persist_stage_retained_folder_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: StageRetainedFolderIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_removal_command_intent(
+            operation_id,
+            intent,
+            universal_intent,
+            RemovalCommandArgs::StageRetainedFolder(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     /// Persist one typed V9 whole-file render command and return its compatibility receipt.
     pub fn persist_render_command_intent(
         &self,
@@ -1538,7 +1699,7 @@ impl OperationJournalStore {
 
         if matches!(
             current.record.schema_version,
-            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9
+            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -1560,7 +1721,7 @@ impl OperationJournalStore {
         }
         if !matches!(
             current.record.schema_version,
-            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9
+            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -1593,6 +1754,10 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V10 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
@@ -1602,6 +1767,7 @@ impl OperationJournalStore {
                 SCHEMA_V7 => "V7 IntentDurable/None or RetryPending",
                 SCHEMA_V8 => "V8 IntentDurable/None or RetryPending",
                 SCHEMA_V9 => "V9 IntentDurable/None or RetryPending",
+                SCHEMA_V10 => "V10 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -1737,7 +1903,7 @@ impl OperationJournalStore {
         }
         if matches!(
             current.record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -1757,7 +1923,7 @@ impl OperationJournalStore {
         }
         if !matches!(
             current.record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -1771,7 +1937,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6/V7/V8/V9 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7/V8/V9/V10 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -2926,13 +3092,14 @@ mod tests {
         NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
         NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
         ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
-        RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RenderCommandArgs, RetryErrorClass,
-        RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
-        StoredRelativePath, StoredSourceFence, UniversalCommandArgs, UniversalCommandKind,
-        UniversalIntent, WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange,
-        WaveformEditIntentArgs, WaveformEditOperationArgs, WaveformEditSettingsArgs,
-        WaveformFileRevisionObservation, WaveformNormalizeIntentArgs, WaveformOutputSpec,
-        WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+        RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RemovalCommandArgs,
+        RenderCommandArgs, RetryErrorClass, RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6,
+        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, StoredRelativePath, StoredSourceFence,
+        TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
+        WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
+        WaveformNormalizeIntentArgs, WaveformOutputSpec, WaveformRenderOutputSpec,
+        WaveformSampleFormat, WaveformSourceSpec,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -3404,6 +3571,56 @@ mod tests {
         )
     }
 
+    fn v10_trash_inputs() -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        TrashIntentArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, intent, copy_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        let participants = copy_universal.participants().clone();
+        let source_participant = copy_args.source().participant_id();
+        let filesystem_participant = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem descriptor")
+            .id();
+        let source_id = SourceId::from_string("source-a");
+        let source = NamespaceEntryEndpoint::new(
+            source_participant,
+            source_id,
+            StoredRelativePath::new("folder/item.wav").expect("trash source path"),
+            NamespaceEntryExpectation::RegularFile(
+                NamespaceFileExpectation::new(7, "file-identity", 10, Some(11))
+                    .expect("trash file expectation"),
+            ),
+        )
+        .expect("trash source endpoint");
+        let command_args = TrashIntentArgs::new(
+            source,
+            ExternalRootBindingId::new(),
+            filesystem_participant,
+            "trash-root",
+        )
+        .expect("trash arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Trash,
+            "operation.status.trash",
+            participants,
+        )
+        .expect("trash universal intent");
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+        )
+    }
+
     fn external_universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
         let mut value: serde_json::Value = serde_json::from_slice(
             &encode(&universal_intent_record(operation_id)).expect("v3 bytes"),
@@ -3540,6 +3757,102 @@ mod tests {
         assert_eq!(
             restarted.universal_command_args(),
             Some(&UniversalCommandArgs::Render(command_args))
+        );
+        assert_eq!(restarted.retry_observation(), Some(&retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+    }
+
+    #[test]
+    fn v10_removal_insert_retry_cancel_and_restart_preserve_typed_observation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+            v10_trash_inputs();
+        let inserted = store
+            .persist_command_intent_v10_with_outcome(
+                operation_id,
+                intent,
+                universal_intent,
+                UniversalCommandArgs::Removal(RemovalCommandArgs::Trash(command_args.clone())),
+                capacity_plan,
+                50,
+            )
+            .receipt()
+            .expect("persist V10 removal command");
+        assert_eq!(inserted.sequence(), 1);
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("trash-retry-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientContention,
+            "trash_busy",
+            None,
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist V10 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+        assert_eq!(
+            store
+                .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+                .expect("replay V10 retry"),
+            retry_receipt
+        );
+
+        let stale = RetryObservation::new(
+            2,
+            54,
+            55,
+            RetryLeaseId::new("trash-retry-2").expect("next retry lease"),
+            56,
+            RetryErrorClass::TransientAvailability,
+            "trash_unavailable",
+            None,
+        )
+        .expect("next retry observation");
+        assert!(matches!(
+            store.record_retry_pending(operation_id, inserted.sequence(), stale),
+            Err(OperationJournalStoreError::StaleSequence { .. })
+        ));
+
+        let cancellation = CancellationRequestObservation::new(57).expect("cancel observation");
+        let cancel_receipt = store
+            .request_cancel_before_publish(
+                operation_id,
+                retry_receipt.sequence(),
+                cancellation.clone(),
+            )
+            .expect("persist V10 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 3);
+        let persisted = store
+            .get(operation_id)
+            .expect("get V10 removal command")
+            .expect("V10 removal row");
+        assert_eq!(persisted.schema_version, SCHEMA_V10);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::Removal(RemovalCommandArgs::Trash(
+                command_args.clone(),
+            )))
+        );
+        assert_eq!(persisted.retry_observation(), Some(&retry));
+        assert_eq!(persisted.cancellation_request(), Some(&cancellation));
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V10 removal command")
+            .expect("restarted V10 removal row");
+        assert_eq!(restarted.schema_version, SCHEMA_V10);
+        assert_eq!(
+            restarted.universal_command_args(),
+            Some(&UniversalCommandArgs::Removal(RemovalCommandArgs::Trash(
+                command_args
+            )))
         );
         assert_eq!(restarted.retry_observation(), Some(&retry));
         assert_eq!(restarted.cancellation_request(), Some(&cancellation));

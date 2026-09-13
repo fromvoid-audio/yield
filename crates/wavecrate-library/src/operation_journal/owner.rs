@@ -985,13 +985,13 @@ mod tests {
         NamespaceRenameIntentArgs, NamespaceTarget, OperationActor, OperationDisposition,
         OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
         ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
-        RecoveryCursor, RecoveryRowOutcome, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6,
-        SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, StoredRelativePath, StoredSourceFence,
-        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
-        WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
-        WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
-        WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
-        decode,
+        RecoveryCursor, RecoveryRowOutcome, RemovalCommandArgs, RetryErrorClass, RetryLeaseId,
+        SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, StoredRelativePath,
+        StoredSourceFence, TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind,
+        UniversalIntent, WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange,
+        WaveformEditIntentArgs, WaveformEditOperationArgs, WaveformEditSettingsArgs,
+        WaveformFileRevisionObservation, WaveformOutputSpec, WaveformRenderOutputSpec,
+        WaveformSampleFormat, WaveformSourceSpec, decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1386,6 +1386,56 @@ mod tests {
         (record, command_args)
     }
 
+    fn v10_trash_record(operation_id: OperationId) -> (StoredOperationRecord, TrashIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let source_participant = copy_args.source().participant_id();
+        let filesystem_participant = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let source = NamespaceEntryEndpoint::new(
+            source_participant,
+            SourceId::from_string("owner-source"),
+            StoredRelativePath::new("folder/item.wav").expect("trash source path"),
+            NamespaceEntryExpectation::RegularFile(
+                NamespaceFileExpectation::new(7, "owner-file", 10, Some(11))
+                    .expect("trash file expectation"),
+            ),
+        )
+        .expect("trash source endpoint");
+        let trash_args = TrashIntentArgs::new(
+            source,
+            ExternalRootBindingId::new(),
+            filesystem_participant,
+            "owner-trash-root",
+        )
+        .expect("trash arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Trash,
+            "operation.status.owner-trash",
+            participants,
+        )
+        .expect("trash universal intent");
+        let record = StoredOperationRecord::new_v10_command(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            UniversalCommandArgs::Removal(RemovalCommandArgs::Trash(trash_args.clone())),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, trash_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1562,6 +1612,48 @@ mod tests {
             Some(&UniversalCommandArgs::Render(
                 super::super::render_commands::RenderCommandArgs::DuplicateDouble(render_args)
             ))
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v10_removal_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v10-removal");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, removal_args) = v10_trash_record(operation_id);
+        let mut request = client.persist_intent(record).expect("removal admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("removal result")
+            .expect("removal worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("removal acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+        let mut lookup = client.get(operation_id).expect("removal lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("removal lookup result")
+            .expect("removal lookup worker result")
+            .expect("persisted removal");
+        assert_eq!(persisted.schema_version, SCHEMA_V10);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::Removal(RemovalCommandArgs::Trash(
+                removal_args,
+            )))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("removal universal intent")
+                .command_kind(),
+            UniversalCommandKind::Trash
         );
         assert!(owner.shutdown());
     }

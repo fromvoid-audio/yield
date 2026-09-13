@@ -1478,6 +1478,8 @@ pub enum UniversalCommandArgs {
     Namespace(NamespaceCommandArgs),
     /// Observe one whole-file render command without executing it.
     Render(super::render_commands::RenderCommandArgs),
+    /// Observe one configured-trash or retained-folder removal request.
+    Removal(super::removal_commands::RemovalCommandArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1490,6 +1492,7 @@ impl UniversalCommandArgs {
             Self::WaveformEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
             Self::Namespace(args) => args.command_kind(),
             Self::Render(args) => args.command_kind(),
+            Self::Removal(args) => args.command_kind(),
         }
     }
 
@@ -1517,6 +1520,9 @@ impl UniversalCommandArgs {
             Self::Render(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Render),
+            Self::Removal(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::Removal),
         }
     }
 }
@@ -1542,6 +1548,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A bounded whole-file render command argument failed validation.
     #[error("invalid render command arguments: {0}")]
     Render(#[source] super::render_commands::RenderCommandValidationError),
+    /// A bounded configured-trash or retained-folder removal argument failed validation.
+    #[error("invalid removal command arguments: {0}")]
+    Removal(#[source] super::removal_commands::RemovalCommandValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.

@@ -1061,13 +1061,13 @@ fn validate_namespace_rename_value(value: &Value) -> Result<(), &'static str> {
     let object = strict_object(value, &["source", "destination"])?;
     let source = required_field(object, "source")?;
     let destination = required_field(object, "destination")?;
-    validate_namespace_entry_endpoint_value(source)?;
+    validate_persisted_namespace_entry_endpoint_value(source)?;
     validate_namespace_target_value(destination)
 }
 
 fn validate_namespace_move_value(value: &Value) -> Result<(), &'static str> {
     let object = strict_object(value, &["source", "destination_parent"])?;
-    validate_namespace_entry_endpoint_value(required_field(object, "source")?)?;
+    validate_persisted_namespace_entry_endpoint_value(required_field(object, "source")?)?;
     validate_namespace_directory_endpoint_value(required_field(object, "destination_parent")?)
 }
 
@@ -1077,7 +1077,9 @@ fn validate_namespace_create_folder_value(value: &Value) -> Result<(), &'static 
     validate_namespace_leaf_value(required_field(object, "leaf")?)
 }
 
-fn validate_namespace_entry_endpoint_value(value: &Value) -> Result<(), &'static str> {
+pub(crate) fn validate_persisted_namespace_entry_endpoint_value(
+    value: &Value,
+) -> Result<(), &'static str> {
     let object = strict_object(
         value,
         &[
