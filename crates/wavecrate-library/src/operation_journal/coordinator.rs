@@ -11,6 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::namespace_commands::{NamespaceCommandArgs, NamespaceCommandValidationError};
 use super::participants::{
     ParticipantId, ParticipantKind, ParticipantRequirement, ParticipantSet,
     ParticipantValidationError,
@@ -1473,6 +1474,8 @@ pub enum UniversalCommandArgs {
     DuplicateSame(CopyIntentArgs),
     /// Apply one bounded in-place WAV edit to a source-database file.
     WaveformEdit(WaveformEditIntentArgs),
+    /// Rename, move, or create one bounded namespace entry.
+    Namespace(NamespaceCommandArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1483,6 +1486,7 @@ impl UniversalCommandArgs {
             Self::Import(_) => super::model::UniversalCommandKind::Import,
             Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
             Self::WaveformEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
+            Self::Namespace(args) => args.command_kind(),
         }
     }
 
@@ -1504,6 +1508,9 @@ impl UniversalCommandArgs {
             Self::WaveformEdit(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::WaveformEdit),
+            Self::Namespace(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::Namespace),
         }
     }
 }
@@ -1523,6 +1530,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A bounded in-place waveform edit argument failed validation.
     #[error("invalid WaveformEdit command arguments: {0}")]
     WaveformEdit(#[source] WaveformEditValidationError),
+    /// A bounded namespace mutation argument failed validation.
+    #[error("invalid namespace command arguments: {0}")]
+    Namespace(#[source] NamespaceCommandValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.

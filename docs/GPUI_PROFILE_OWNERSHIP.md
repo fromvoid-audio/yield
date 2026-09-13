@@ -755,3 +755,42 @@ precision and exact-duration limits. It also passed 130 journal tests (one helpe
 ignored), 12 legacy reader tests, 90 catalog tests and 60 session tests (one helper
 ignored). This accepts the V7 storage and pure-adapter milestone; it does not
 establish native UI or filesystem-publication acceptance.
+
+## V8 namespace command observations (OPT-1337)
+
+The next envelope adds Rename, Move and Create Folder in a separate namespace
+command module. Existing entries carry file/directory expectations, physical
+identity, source revision and optional signed modification time; files also carry
+length. Destination parents use explicit Root or Child locators and observed
+directory identities. A root parent must match its source fence. Parent-plus-leaf
+bounds are checked together, including the retained leaf of a move.
+
+Rename stays within the same source participant and parent. File moves may cross
+sources; folder moves require the same observed root and database. Physical-root
+equality is also used to reject known same-target and descendant hazards across
+source-ID aliases. Known source-directory/destination-parent identity equality
+is rejected even when their relative locator spellings differ. These observation
+checks do not replace live capability, alias and containment validation.
+
+All namespace commands have fixed no-replace semantics. Source roots cannot be
+renamed or moved, and no-op requests are rejected. Full participant inventories
+are validated on the standalone command paths as well as the record boundary.
+Folder manifests are not created or embedded before IntentDurable; any later
+inventory belongs to prepared evidence. V8 retains all V7 command variants, while
+V6 and V7 reject namespace arguments. Retry/cancellation remain intent-only.
+
+Independent review identified a missing same-database folder-move guard. The
+repair and isolated same-root/different-database regression were verified, with
+no remaining findings. Local validation passed nine namespace tests, 38 codec
+tests, targeted V8 store/owner tests, production no-default library and GPUI
+checks, formatting and diff checks. The final serialized journal suite passed
+157 tests (one helper ignored).
+
+The initial serialized suite exposed an existing subprocess-test protocol flaw:
+with inherited `RUST_TEST_THREADS=1`, libtest appended the helper's `READY` message
+to its inline test-name prefix, so the parent ignored it and timed out. A raw
+stdout probe confirmed this occurred after the helper persisted its record. The
+helper now starts its protocol message on a new line and explicitly uses one
+child test thread. All three abrupt-restart tests and the full serialized suite
+pass without changing their timeout, strict parsing, abrupt-kill or reopen checks.
+Windows V8 storage acceptance is pending.

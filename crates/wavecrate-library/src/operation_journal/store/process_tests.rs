@@ -81,6 +81,8 @@ fn spawn_journal_owner_helper(fixture: &ProcessFixture, mode: HelperMode) -> Jou
         .arg("operation_journal::store::process_tests::journal_owner_process_helper")
         .arg("--ignored")
         .arg("--nocapture")
+        // Exercise libtest's inline test-name prefix regardless of the parent thread setting.
+        .arg("--test-threads=1")
         .env(CONFIG_HOME_ENV, fixture._base.path())
         .env(CONFIG_PROFILE_ENV, &fixture.profile_name)
         .env(
@@ -465,7 +467,9 @@ fn journal_owner_process_helper() {
             .insert_intent(&intent_record(operation_id))
             .expect("journal helper intent insert");
     }
-    println!("READY {operation_id}");
+    // Libtest may already have printed a test-name prefix without a newline.
+    // Keep the handshake on its own line so the parent can parse it strictly.
+    println!("\nREADY {operation_id}");
     io::stdout()
         .flush()
         .expect("flush journal helper handshake");

@@ -32,8 +32,9 @@ use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
-    SCHEMA_V6, SCHEMA_V7,
+    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
 };
+use super::namespace_commands::NamespaceCommandArgs;
 use super::validation::{RecordConsistency, classify_record};
 
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
@@ -1029,6 +1030,149 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
+    /// Persist one V8 command envelope and return its compatibility receipt.
+    ///
+    /// V8 carries the bounded namespace mutation commands while preserving the earlier Copy,
+    /// Import, DuplicateSame, and WaveformEdit observations. This remains a persistence
+    /// acknowledgement only; it does not authorize filesystem work or reserve capacity.
+    pub fn persist_command_intent_v8(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v8_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V8 command envelope with its exact write-stage outcome.
+    pub fn persist_command_intent_v8_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v8 command intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v8 command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v8 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v8_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        self.insert_intent_with_outcome(&record)
+    }
+
+    /// Persist one typed V8 namespace command and return its compatibility receipt.
+    pub fn persist_namespace_command_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: NamespaceCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_namespace_command_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one typed V8 namespace command with its exact write-stage outcome.
+    pub fn persist_namespace_command_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: NamespaceCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        self.persist_command_intent_v8_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::Namespace(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     /// Persist one typed V7 in-place WAV edit and return its compatibility receipt.
     ///
     /// The edit arguments are bounded observations only. They do not retain a source lease,
@@ -1208,7 +1352,7 @@ impl OperationJournalStore {
 
         if matches!(
             current.record.schema_version,
-            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
+            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -1230,7 +1374,7 @@ impl OperationJournalStore {
         }
         if !matches!(
             current.record.schema_version,
-            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
+            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -1255,6 +1399,10 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V8 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
@@ -1262,6 +1410,7 @@ impl OperationJournalStore {
                 SCHEMA_V5 => "V5 IntentDurable/None or RetryPending",
                 SCHEMA_V6 => "V6 IntentDurable/None or RetryPending",
                 SCHEMA_V7 => "V7 IntentDurable/None or RetryPending",
+                SCHEMA_V8 => "V8 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -1397,7 +1546,7 @@ impl OperationJournalStore {
         }
         if matches!(
             current.record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -1417,7 +1566,7 @@ impl OperationJournalStore {
         }
         if !matches!(
             current.record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -1431,7 +1580,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6/V7 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7/V8 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -2580,10 +2729,14 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation, ImportIntentArgs,
-        ParticipantCheckpoint, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
-        ParticipantSet, RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass,
-        RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7, StoredRelativePath,
+        CreateFolderIntentArgs, ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation,
+        ImportIntentArgs, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
+        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
+        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
+        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
+        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
+        RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass, RetryLeaseId,
+        RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, StoredRelativePath,
         StoredSourceFence, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
         WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
         WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformOutputSpec,
@@ -2907,6 +3060,93 @@ mod tests {
             intent,
             universal_intent,
             edit_args,
+            capacity_plan,
+        )
+    }
+
+    fn v8_namespace_inputs(
+        variant: &str,
+    ) -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        NamespaceCommandArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, intent, copy_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        let participants = copy_universal.participants().clone();
+        let source_participant = copy_args.source().participant_id();
+        let source_id = SourceId::from_string("source-a");
+        let source = NamespaceEntryEndpoint::new(
+            source_participant,
+            source_id.clone(),
+            StoredRelativePath::new("in.wav").expect("namespace source path"),
+            NamespaceEntryExpectation::RegularFile(
+                NamespaceFileExpectation::new(7, "file-identity", 10, Some(-2))
+                    .expect("namespace file expectation"),
+            ),
+        )
+        .expect("namespace source endpoint");
+        let root_parent = || {
+            NamespaceDirectoryEndpoint::new(
+                source_participant,
+                source_id.clone(),
+                NamespaceDirectoryLocator::Root,
+                NamespaceDirectoryExpectation::new(7, "root-a", Some(-1))
+                    .expect("namespace root expectation"),
+            )
+            .expect("namespace root parent")
+        };
+        let command_args = match variant {
+            "Rename" => NamespaceCommandArgs::Rename(
+                NamespaceRenameIntentArgs::new(
+                    source,
+                    NamespaceTarget::new(
+                        root_parent(),
+                        NamespaceLeafName::new("out.wav").expect("rename leaf"),
+                    )
+                    .expect("rename target"),
+                )
+                .expect("rename args"),
+            ),
+            "Move" => NamespaceCommandArgs::Move(
+                NamespaceMoveIntentArgs::new(
+                    source,
+                    NamespaceDirectoryEndpoint::new(
+                        source_participant,
+                        source_id.clone(),
+                        NamespaceDirectoryLocator::child(
+                            StoredRelativePath::new("archive").expect("archive path"),
+                        )
+                        .expect("archive locator"),
+                        NamespaceDirectoryExpectation::new(7, "archive", None)
+                            .expect("archive expectation"),
+                    )
+                    .expect("archive parent"),
+                )
+                .expect("move args"),
+            ),
+            "CreateFolder" => NamespaceCommandArgs::CreateFolder(
+                CreateFolderIntentArgs::new(
+                    root_parent(),
+                    NamespaceLeafName::new("new-folder").expect("folder leaf"),
+                )
+                .expect("create-folder args"),
+            ),
+            other => panic!("unsupported namespace test command {other}"),
+        };
+        let universal_intent = UniversalIntent::new(
+            None,
+            command_args.command_kind(),
+            "operation.status.namespace",
+            participants,
+        )
+        .expect("namespace universal intent");
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
             capacity_plan,
         )
     }
@@ -3901,6 +4141,154 @@ mod tests {
         );
         assert_eq!(restarted.retry_observation(), Some(&next_retry));
         assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+    }
+
+    #[test]
+    fn v8_namespace_retry_cancel_preserve_args_and_replay_after_restart() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, namespace_args, capacity_plan) =
+            v8_namespace_inputs("Rename");
+        let inserted = store
+            .persist_namespace_command_intent_with_outcome(
+                operation_id,
+                intent,
+                universal_intent,
+                namespace_args.clone(),
+                capacity_plan,
+                50,
+            )
+            .receipt()
+            .expect("persist V8 namespace command");
+        assert_eq!(inserted.sequence(), 1);
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("namespace-retry-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientContention,
+            "namespace_busy",
+            Some(String::from("same-parent check busy")),
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist V8 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+
+        let retry_replay = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("replay V8 retry");
+        assert_eq!(retry_replay, retry_receipt);
+        assert_eq!(journal_sequence(&store, operation_id), 2);
+
+        let changed_retry = RetryObservation::new(
+            2,
+            54,
+            55,
+            RetryLeaseId::new("namespace-retry-2").expect("next retry lease"),
+            56,
+            RetryErrorClass::TransientAvailability,
+            "namespace_unavailable",
+            None,
+        )
+        .expect("next retry observation");
+        assert!(matches!(
+            store.record_retry_pending(operation_id, inserted.sequence(), changed_retry),
+            Err(OperationJournalStoreError::StaleSequence {
+                operation_id: actual,
+                expected: 1,
+                actual: 2
+            }) if actual == operation_id
+        ));
+        assert_eq!(journal_sequence(&store, operation_id), 2);
+
+        let cancellation = CancellationRequestObservation::new(57).expect("cancel observation");
+        let cancel_receipt = store
+            .request_cancel_before_publish(operation_id, retry_receipt.sequence(), cancellation)
+            .expect("persist V8 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 3);
+
+        let canceled = store
+            .get(operation_id)
+            .expect("get V8 namespace command")
+            .expect("V8 namespace row");
+        assert_eq!(canceled.schema_version, SCHEMA_V8);
+        assert_eq!(
+            canceled.universal_command_args(),
+            Some(&UniversalCommandArgs::Namespace(namespace_args.clone()))
+        );
+        assert_eq!(canceled.retry_observation(), Some(&retry));
+        assert_eq!(canceled.cancellation_request(), Some(&cancellation));
+
+        let replay = store
+            .request_cancel_before_publish(
+                operation_id,
+                inserted.sequence(),
+                CancellationRequestObservation::new(57).expect("same cancellation"),
+            )
+            .expect("replay V8 cancellation");
+        assert_eq!(replay, cancel_receipt);
+        assert_eq!(journal_sequence(&store, operation_id), 3);
+
+        let differing_cancellation =
+            CancellationRequestObservation::new(58).expect("different cancel observation");
+        assert!(matches!(
+            store.request_cancel_before_publish(
+                operation_id,
+                inserted.sequence(),
+                differing_cancellation,
+            ),
+            Err(OperationJournalStoreError::CancellationConflict { operation_id: actual })
+                if actual == operation_id
+        ));
+        assert_eq!(journal_sequence(&store, operation_id), 3);
+
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V8 namespace command")
+            .expect("restarted V8 namespace row");
+        assert_eq!(restarted.schema_version, SCHEMA_V8);
+        assert_eq!(
+            restarted.universal_command_args(),
+            Some(&UniversalCommandArgs::Namespace(namespace_args))
+        );
+        assert_eq!(restarted.retry_observation(), Some(&retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+    }
+
+    #[test]
+    fn v8_namespace_move_and_create_folder_are_persisted_as_distinct_commands() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        for (index, variant) in ["Move", "CreateFolder"].into_iter().enumerate() {
+            let (operation_id, intent, universal_intent, namespace_args, capacity_plan) =
+                v8_namespace_inputs(variant);
+            let receipt = store
+                .persist_namespace_command_intent(
+                    operation_id,
+                    intent,
+                    universal_intent,
+                    namespace_args.clone(),
+                    capacity_plan,
+                    60 + index as i64,
+                )
+                .expect("persist namespace command");
+            assert_eq!(receipt.sequence(), (index + 1) as i64);
+            let persisted = store
+                .get(operation_id)
+                .expect("get namespace command")
+                .expect("namespace command row");
+            assert_eq!(persisted.schema_version, SCHEMA_V8);
+            assert_eq!(
+                persisted.universal_command_args(),
+                Some(&UniversalCommandArgs::Namespace(namespace_args))
+            );
+        }
     }
 
     #[test]

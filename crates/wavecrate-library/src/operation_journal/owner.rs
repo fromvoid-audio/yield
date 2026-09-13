@@ -979,14 +979,17 @@ mod tests {
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation, ImportIntentArgs,
-        MAX_DIAGNOSTIC_CODE_BYTES, OperationActor, OperationDisposition, OperationIntent,
-        OperationKind, ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor,
-        ParticipantKind, ParticipantRequirement, ParticipantSet, RecoveryCursor,
-        RecoveryRowOutcome, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-        StoredRelativePath, StoredSourceFence, UniversalCommandArgs, UniversalCommandKind,
-        UniversalIntent, WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
-        WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformOutputSpec,
-        WaveformSampleFormat, WaveformSourceSpec, decode,
+        MAX_DIAGNOSTIC_CODE_BYTES, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
+        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
+        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
+        NamespaceRenameIntentArgs, NamespaceTarget, OperationActor, OperationDisposition,
+        OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
+        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
+        RecoveryCursor, RecoveryRowOutcome, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6,
+        SCHEMA_V7, SCHEMA_V8, StoredRelativePath, StoredSourceFence, UniversalCommandArgs,
+        UniversalCommandKind, UniversalIntent, WaveformEditFrameRange, WaveformEditIntentArgs,
+        WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
+        WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec, decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1272,6 +1275,65 @@ mod tests {
         (record, edit_args)
     }
 
+    fn v8_namespace_record(
+        operation_id: OperationId,
+    ) -> (StoredOperationRecord, NamespaceCommandArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let source_participant = copy_args.source().participant_id();
+        let source_id = SourceId::from_string("owner-source");
+        let source = NamespaceEntryEndpoint::new(
+            source_participant,
+            source_id.clone(),
+            StoredRelativePath::new("in.wav").expect("namespace source path"),
+            NamespaceEntryExpectation::RegularFile(
+                NamespaceFileExpectation::new(7, "owner-file", 10, Some(-2))
+                    .expect("namespace file expectation"),
+            ),
+        )
+        .expect("namespace source");
+        let parent = NamespaceDirectoryEndpoint::new(
+            source_participant,
+            source_id,
+            NamespaceDirectoryLocator::Root,
+            NamespaceDirectoryExpectation::new(7, "owner-root", Some(-1))
+                .expect("namespace root expectation"),
+        )
+        .expect("namespace parent");
+        let command_args = NamespaceCommandArgs::Rename(
+            NamespaceRenameIntentArgs::new(
+                source,
+                NamespaceTarget::new(
+                    parent,
+                    NamespaceLeafName::new("out.wav").expect("namespace leaf"),
+                )
+                .expect("namespace target"),
+            )
+            .expect("namespace rename"),
+        );
+        let universal_intent = UniversalIntent::new(
+            None,
+            command_args.command_kind(),
+            "operation.status.owner-namespace",
+            participants,
+        )
+        .expect("namespace universal intent");
+        let record = StoredOperationRecord::new_v8_command(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            UniversalCommandArgs::Namespace(command_args.clone()),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, command_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1371,6 +1433,49 @@ mod tests {
                 .expect("edit universal intent")
                 .command_kind(),
             UniversalCommandKind::DestructiveEdit
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v8_namespace_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v8-namespace");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, namespace_args) = v8_namespace_record(operation_id);
+        let mut request = client.persist_intent(record).expect("namespace admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("namespace result")
+            .expect("namespace worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("namespace acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+
+        let mut lookup = client
+            .get(operation_id)
+            .expect("namespace lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("namespace lookup result")
+            .expect("namespace lookup worker result")
+            .expect("persisted namespace");
+        assert_eq!(persisted.schema_version, SCHEMA_V8);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::Namespace(namespace_args))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("namespace universal intent")
+                .command_kind(),
+            UniversalCommandKind::Rename
         );
         assert!(owner.shutdown());
     }
