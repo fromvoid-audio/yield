@@ -308,7 +308,10 @@ catalog suite before final regression refinement, two corrected live-admission
 publication tests, and all 396 UI tests (one existing ignored). The receipt
 regression uses an actual committed curation outcome and verifies it remains
 unchanged when delivered as non-projectable. GPUI compilation, formatting and
-diff checks passed. Windows storage validation is pending for this slice.
+diff checks passed. Windows storage validation passed on `c383a2ade` in
+[`34749559530`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34749559530),
+including production admission, source identity/publication fence tests and
+catalog/session checks. Queued delivery and readiness claim fencing remain open.
 
 OPT-1337 owns universal journal integration. The session now opens that journal
 before the global writer and closes it before final profile release, but durable
