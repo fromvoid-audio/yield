@@ -873,5 +873,14 @@ with and without default features, GPUI compilation, formatting and diff checks
 passed. Independent review identified the missing explicit fixed collision
 policy for retained-folder staging; the policy is now exposed and documented,
 and its focused regression passed. No other findings were reported. This adds
-no filesystem executor. Windows storage acceptance is pending. The V1 default
-and SQLite schema remain unchanged.
+no filesystem executor. The V1 default and SQLite schema remain unchanged.
+
+Windows storage validation
+[34775353882](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34775353882)
+passed at exact commit `e6b292c5403ec8e5cfe32e1e9d90a0e1b4ff2164`. Logs confirm
+173 journal tests (one helper ignored), including all six removal tests and V10
+codec, prior-version rejection, owner persistence, retry/cancellation and restart
+coverage. The lane also passed 12 legacy-reader, 90 catalog, 60 session (one
+helper ignored), 16 core edit-settings and five media-adapter tests. This accepts
+the V10 storage milestone; native Windows UI and filesystem execution remain
+outside this validation scope.
