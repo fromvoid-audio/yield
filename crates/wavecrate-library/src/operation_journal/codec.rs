@@ -12,6 +12,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::coordinator::{
+    CopyIntentArgs, RetryObservation, validate_persisted_copy_intent_value,
+    validate_persisted_retry_observation_value,
+};
 use super::evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalRecoveryObservation, AbsentFinalTransactionOwnedProof,
     FilesystemPublishedWaveformRestore, FilesystemStagedWaveformRestore, FinalNamespaceClaim,
@@ -21,7 +25,7 @@ use super::evidence::{
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
-    OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, UniversalIntent,
+    OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, UniversalIntent,
 };
 use super::participants::MAX_PARTICIPANTS;
 use crate::durable_capacity::DurableCapacityPlan;
@@ -65,6 +69,10 @@ pub struct StoredOperationRecord {
     pub replacement_qualification: Option<ReplacementQualificationAssessment>,
     /// Optional V4 pre-publication cancellation request observation.
     cancellation_request: Option<CancellationRequestObservation>,
+    /// Optional V5 typed coordinator command arguments.
+    command_args: Option<CopyIntentArgs>,
+    /// Optional V5 durable retry/status observation.
+    retry_observation: Option<RetryObservation>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
     /// Stored update timestamp in Unix milliseconds.
@@ -72,6 +80,38 @@ pub struct StoredOperationRecord {
 }
 
 impl StoredOperationRecord {
+    pub(crate) fn new_v5_copy(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: CopyIntentArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_V5,
+            operation_id,
+            intent,
+            universal_intent: Some(universal_intent),
+            phase: OperationPhase::IntentDurable,
+            disposition: OperationDisposition::None,
+            payload: Value::Object(Map::new()),
+            capacity_plan: Some(capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: None,
+            command_args: Some(command_args),
+            retry_observation: None,
+            created_unix_ms: timestamp_unix_ms,
+            updated_unix_ms: timestamp_unix_ms,
+        }
+    }
+
     /// Borrow stored publication evidence without exposing a construction path for it.
     pub fn published(&self) -> Option<&FilesystemPublishedWaveformRestore> {
         self.published.as_ref()
@@ -82,15 +122,37 @@ impl StoredOperationRecord {
         self.cancellation_request.as_ref()
     }
 
+    /// Borrow the persisted V5 typed copy arguments, when present.
+    pub fn command_args(&self) -> Option<&CopyIntentArgs> {
+        self.command_args.as_ref()
+    }
+
+    /// Borrow the persisted V5 retry/status observation, when present.
+    pub fn retry_observation(&self) -> Option<&RetryObservation> {
+        self.retry_observation.as_ref()
+    }
+
     pub(crate) fn with_cancellation_request(
         &self,
         observation: CancellationRequestObservation,
     ) -> Self {
         let mut record = self.clone();
-        record.schema_version = SCHEMA_V4;
+        if record.schema_version != SCHEMA_V5 {
+            record.schema_version = SCHEMA_V4;
+        }
         record.disposition = OperationDisposition::CancelRequestedBeforePublish;
         record.updated_unix_ms = observation.requested_unix_ms();
         record.cancellation_request = Some(observation);
+        record
+    }
+
+    pub(crate) fn with_retry_pending(&self, observation: RetryObservation) -> Self {
+        let mut record = self.clone();
+        record.schema_version = SCHEMA_V5;
+        record.disposition = OperationDisposition::RetryPending;
+        record.updated_unix_ms = observation.requested_unix_ms();
+        record.retry_observation = Some(observation);
+        record.cancellation_request = None;
         record
     }
 }
@@ -168,6 +230,20 @@ pub enum EncodeError {
         /// Bounded validation diagnostic.
         reason: String,
     },
+    /// A prior schema would silently discard typed coordinator fields.
+    #[error("schema-v{version} cannot encode V5 coordinator fields: {kind}")]
+    CoordinatorFieldsInPriorSchema {
+        /// Prior schema identifier that cannot carry the fields.
+        version: u32,
+        /// Coordinator field that would be discarded.
+        kind: &'static str,
+    },
+    /// A V5 typed coordinator record violates its bounded state or argument contract.
+    #[error("invalid schema-v5 coordinator record: {reason}")]
+    InvalidV5Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
     /// Serialized output exceeded the bounded record size.
     #[error("encoded operation journal record exceeds {maximum} bytes: {actual} bytes")]
     Oversize {
@@ -225,6 +301,8 @@ impl From<PersistedOperationRecordV1> for StoredOperationRecord {
             published: record.published,
             replacement_qualification: record.replacement_qualification,
             cancellation_request: None,
+            command_args: None,
+            retry_observation: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -242,6 +320,18 @@ fn persisted_v1_from_record(
     if record.cancellation_request.is_some() {
         return Err(EncodeError::CancellationRequestInLegacy {
             version: record.schema_version,
+        });
+    }
+    if record.command_args.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "typed command arguments",
+        });
+    }
+    if record.retry_observation.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "retry observation",
         });
     }
     if record.absent_final_recovery_observation.is_some() {
@@ -378,6 +468,8 @@ impl From<PersistedOperationRecordV2> for StoredOperationRecord {
             published: record.published,
             replacement_qualification: record.replacement_qualification,
             cancellation_request: None,
+            command_args: None,
+            retry_observation: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -395,6 +487,18 @@ fn persisted_v2_from_record(
     if record.cancellation_request.is_some() {
         return Err(EncodeError::CancellationRequestInLegacy {
             version: record.schema_version,
+        });
+    }
+    if record.command_args.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "typed command arguments",
+        });
+    }
+    if record.retry_observation.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "retry observation",
         });
     }
     Ok(PersistedOperationRecordV2Ref {
@@ -484,6 +588,8 @@ impl From<PersistedOperationRecordV3> for StoredOperationRecord {
             published: None,
             replacement_qualification: None,
             cancellation_request: None,
+            command_args: None,
+            retry_observation: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -524,6 +630,18 @@ fn persisted_v3_from_record(
         if present {
             return Err(EncodeError::LegacyEvidenceInV3 { kind });
         }
+    }
+    if record.command_args.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "typed command arguments",
+        });
+    }
+    if record.retry_observation.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "retry observation",
+        });
     }
     if record.phase != OperationPhase::IntentDurable {
         return Err(EncodeError::InvalidV3Record {
@@ -613,6 +731,8 @@ impl From<PersistedOperationRecordV4> for StoredOperationRecord {
             published: None,
             replacement_qualification: None,
             cancellation_request: Some(record.cancellation_request),
+            command_args: None,
+            retry_observation: None,
             created_unix_ms: record.created_unix_ms,
             updated_unix_ms: record.updated_unix_ms,
         }
@@ -622,6 +742,18 @@ impl From<PersistedOperationRecordV4> for StoredOperationRecord {
 fn persisted_v4_from_record(
     record: &StoredOperationRecord,
 ) -> Result<PersistedOperationRecordV4Ref<'_>, EncodeError> {
+    if record.command_args.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "typed command arguments",
+        });
+    }
+    if record.retry_observation.is_some() {
+        return Err(EncodeError::CoordinatorFieldsInPriorSchema {
+            version: record.schema_version,
+            kind: "retry observation",
+        });
+    }
     validate_v4_cancel_shape(record).map_err(|reason| EncodeError::InvalidV4Record { reason })?;
     Ok(PersistedOperationRecordV4Ref {
         schema_version: record.schema_version,
@@ -658,6 +790,98 @@ struct PersistedOperationRecordV4Ref<'a> {
     payload: &'a Value,
     capacity_plan: &'a DurableCapacityPlan,
     cancellation_request: &'a CancellationRequestObservation,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperationRecordV5 {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    command_args: CopyIntentArgs,
+    capacity_plan: DurableCapacityPlan,
+    #[serde(default)]
+    retry_observation: Option<RetryObservation>,
+    #[serde(default)]
+    cancellation_request: Option<CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl From<PersistedOperationRecordV5> for StoredOperationRecord {
+    fn from(record: PersistedOperationRecordV5) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            operation_id: OperationId::from_uuid(record.operation_id),
+            intent: record.intent,
+            universal_intent: Some(record.universal_intent),
+            phase: record.phase,
+            disposition: record.disposition,
+            payload: Value::Object(Map::new()),
+            capacity_plan: Some(record.capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: record.cancellation_request,
+            command_args: Some(record.command_args),
+            retry_observation: record.retry_observation,
+            created_unix_ms: record.created_unix_ms,
+            updated_unix_ms: record.updated_unix_ms,
+        }
+    }
+}
+
+fn persisted_v5_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedOperationRecordV5Ref<'_>, EncodeError> {
+    validate_v5_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV5Record { reason })?;
+    Ok(PersistedOperationRecordV5Ref {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("V5 universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        command_args: record
+            .command_args
+            .as_ref()
+            .expect("V5 command arguments checked above"),
+        capacity_plan: record
+            .capacity_plan
+            .as_ref()
+            .expect("V5 capacity plan checked above"),
+        retry_observation: record.retry_observation.as_ref(),
+        cancellation_request: record.cancellation_request.as_ref(),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    })
+}
+
+#[derive(Serialize)]
+struct PersistedOperationRecordV5Ref<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    command_args: &'a CopyIntentArgs,
+    capacity_plan: &'a DurableCapacityPlan,
+    retry_observation: Option<&'a RetryObservation>,
+    cancellation_request: Option<&'a CancellationRequestObservation>,
     created_unix_ms: i64,
     updated_unix_ms: i64,
 }
@@ -714,6 +938,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v4_cancel_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V5 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v5_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedOperationRecordV5>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v5_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -838,8 +1071,9 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
 /// Encode one stored record using its persisted schema and a capped writer.
 ///
 /// Encoding preserves the exact V1/V2 field and enum representation and emits the explicit V3
-/// universal-intent envelope. The V3 branch accepts only the initial durable-intent shape; later
-/// transition and publication-policy validation belongs to the owner boundary.
+/// universal-intent envelope. The V3 branch accepts only the initial durable-intent shape, while
+/// V4 and V5 encode their explicitly bounded pre-publication observations; later transition and
+/// publication-policy validation belongs to the owner boundary.
 pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
     let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
     let result = match record.schema_version {
@@ -857,6 +1091,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V4 => {
             let persisted = persisted_v4_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V5 => {
+            let persisted = persisted_v5_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -1575,6 +1813,57 @@ fn validate_persisted_v4_object_boundaries(value: &Value) -> Result<(), &'static
     Ok(())
 }
 
+fn validate_persisted_v5_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "command_args",
+            "capacity_plan",
+            "retry_observation",
+            "cancellation_request",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "command_args",
+        "capacity_plan",
+        "retry_observation",
+        "cancellation_request",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
+    validate_persisted_copy_intent_value(required_field(object, "command_args")?)?;
+    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
+    if let Some(retry) = object.get("retry_observation") {
+        if !retry.is_null() {
+            validate_persisted_retry_observation_value(retry)?;
+        }
+    }
+    if let Some(cancellation) = object.get("cancellation_request") {
+        if !cancellation.is_null() {
+            validate_persisted_cancellation_request_value(cancellation)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Result<(), String> {
     if record.schema_version != SCHEMA_V3 {
         return Err(String::from("schema-v3 validation received another schema"));
@@ -1594,6 +1883,14 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
         return Err(String::from(
             "schema-v3 cannot contain a cancellation request",
         ));
+    }
+    if record.command_args.is_some() {
+        return Err(String::from(
+            "schema-v3 cannot contain typed coordinator arguments",
+        ));
+    }
+    if record.retry_observation.is_some() {
+        return Err(String::from("schema-v3 cannot contain a retry observation"));
     }
     validate_universal_intent_envelope_shape(record)
 }
@@ -1691,6 +1988,14 @@ pub(crate) fn validate_v4_cancel_shape(record: &StoredOperationRecord) -> Result
             "schema-v4 cancellation records require a user intent",
         ));
     }
+    if record.command_args.is_some() {
+        return Err(String::from(
+            "schema-v4 cannot contain typed coordinator arguments",
+        ));
+    }
+    if record.retry_observation.is_some() {
+        return Err(String::from("schema-v4 cannot contain a retry observation"));
+    }
     let observation = record
         .cancellation_request
         .ok_or_else(|| String::from("schema-v4 cancellation record requires an observation"))?;
@@ -1702,6 +2007,105 @@ pub(crate) fn validate_v4_cancel_shape(record: &StoredOperationRecord) -> Result
     }
 
     validate_universal_intent_envelope_shape(record)
+}
+
+pub(crate) fn validate_v5_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    if record.schema_version != SCHEMA_V5 {
+        return Err(String::from("schema-v5 validation received another schema"));
+    }
+    if record.phase != OperationPhase::IntentDurable {
+        return Err(format!(
+            "schema-v5 coordinator only supports IntentDurable, found {:?}",
+            record.phase
+        ));
+    }
+    if record.intent.actor != OperationActor::User
+        || record.intent.kind != super::model::OperationKind::FileMutation
+    {
+        return Err(String::from(
+            "schema-v5 coordinator records require a user file-mutation intent",
+        ));
+    }
+    if !record.payload.as_object().is_some_and(Map::is_empty) {
+        return Err(String::from(
+            "schema-v5 coordinator records cannot carry opaque payload",
+        ));
+    }
+    let universal = record
+        .universal_intent
+        .as_ref()
+        .ok_or_else(|| String::from("schema-v5 record requires a universal intent"))?;
+    if universal.command_kind() != super::model::UniversalCommandKind::Copy {
+        return Err(String::from(
+            "schema-v5 coordinator currently supports only the Copy command",
+        ));
+    }
+    let command_args = record
+        .command_args
+        .as_ref()
+        .ok_or_else(|| String::from("schema-v5 record requires typed copy arguments"))?;
+    command_args
+        .validate_against_participants(universal.participants())
+        .map_err(|error| error.to_string())?;
+    validate_universal_intent_envelope_shape(record)?;
+
+    match record.disposition {
+        OperationDisposition::None => {
+            if record.retry_observation.is_some() || record.cancellation_request.is_some() {
+                return Err(String::from(
+                    "schema-v5 None records cannot carry retry or cancellation observations",
+                ));
+            }
+        }
+        OperationDisposition::RetryPending => {
+            if record.cancellation_request.is_some() {
+                return Err(String::from(
+                    "schema-v5 retry records cannot carry a cancellation request",
+                ));
+            }
+            let retry = record.retry_observation.as_ref().ok_or_else(|| {
+                String::from("schema-v5 RetryPending requires a retry observation")
+            })?;
+            retry.validate().map_err(|error| error.to_string())?;
+            if retry.requested_unix_ms() < record.created_unix_ms {
+                return Err(String::from(
+                    "schema-v5 retry request timestamp precedes creation",
+                ));
+            }
+            if retry.requested_unix_ms() != record.updated_unix_ms {
+                return Err(String::from(
+                    "schema-v5 retry request timestamp must equal the updated timestamp",
+                ));
+            }
+        }
+        OperationDisposition::CancelRequestedBeforePublish => {
+            let cancellation = record.cancellation_request.ok_or_else(|| {
+                String::from("schema-v5 cancellation requires a cancellation observation")
+            })?;
+            cancellation.validate().map_err(|error| error.to_string())?;
+            if cancellation.requested_unix_ms() != record.updated_unix_ms {
+                return Err(String::from(
+                    "schema-v5 cancellation request timestamp must equal the updated timestamp",
+                ));
+            }
+            if let Some(retry) = record.retry_observation.as_ref() {
+                retry.validate().map_err(|error| error.to_string())?;
+                if retry.requested_unix_ms() < record.created_unix_ms
+                    || retry.requested_unix_ms() > cancellation.requested_unix_ms()
+                {
+                    return Err(String::from(
+                        "schema-v5 retry request timestamp is outside the creation-to-cancellation interval",
+                    ));
+                }
+            }
+        }
+        disposition => {
+            return Err(format!(
+                "schema-v5 coordinator does not support disposition {disposition:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &'static str> {
@@ -1879,6 +2283,98 @@ mod tests {
         fixture
     }
 
+    fn v5_copy_fixture() -> Value {
+        serde_json::json!({
+            "schema_version": 5,
+            "operation_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "intent": {
+                "actor": "User",
+                "kind": "FileMutation",
+                "label": "copy fixture"
+            },
+            "universal_intent": {
+                "parent_operation_id": null,
+                "command_kind": "Copy",
+                "user_status_key": "operation.status.copy",
+                "participants": {
+                    "descriptors": [
+                        {
+                            "id": "fedcba98-7654-3210-fedc-ba9876543210",
+                            "kind": "SourceDatabase",
+                            "requirement": "Required",
+                            "source_fence": {
+                                "source_id": "source-a",
+                                "root_identity": "root-a",
+                                "database_identity": "database-a",
+                                "lifecycle_generation": 1,
+                                "source_revision": 7,
+                                "lease_epoch": 1
+                            },
+                            "artifact_key": null
+                        },
+                        {
+                            "id": "89abcdef-0123-4567-89ab-cdef01234567",
+                            "kind": "Filesystem",
+                            "requirement": "Required",
+                            "source_fence": null,
+                            "artifact_key": null
+                        }
+                    ],
+                    "checkpoints": [
+                        {
+                            "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                            "state": "Pending",
+                            "committed_revision": null,
+                            "diagnostic_code": null
+                        },
+                        {
+                            "participant_id": "89abcdef-0123-4567-89ab-cdef01234567",
+                            "state": "Pending",
+                            "committed_revision": null,
+                            "diagnostic_code": null
+                        }
+                    ]
+                }
+            },
+            "phase": "IntentDurable",
+            "disposition": "None",
+            "command_args": {
+                "source": {
+                    "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                    "source_id": "source-a",
+                    "relative_path": "in.wav"
+                },
+                "destination": {
+                    "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                    "source_id": "source-a",
+                    "relative_path": "out.wav"
+                },
+                "expected_source": {
+                    "source_revision": 7,
+                    "file_identity": "file-identity",
+                    "file_size": 10,
+                    "modified_ns": 11
+                },
+                "collision_policy": "NoReplace",
+                "inherited_metadata_reference": "metadata/entry"
+            },
+            "capacity_plan": {
+                "volumes": [{
+                    "identity": {"device": 1},
+                    "allocation_unit": 1,
+                    "allocation_class": "DestinationStaging",
+                    "logical_bytes": 1,
+                    "allocated_bytes": 1,
+                    "protected_free_bytes": 268435456
+                }]
+            },
+            "retry_observation": null,
+            "cancellation_request": null,
+            "created_unix_ms": 50,
+            "updated_unix_ms": 50
+        })
+    }
+
     #[test]
     fn pinned_v1_fixture_decodes_and_round_trips_by_value() {
         let record = decode(V1_FIXTURE).expect("v1 fixture decodes");
@@ -1949,6 +2445,92 @@ mod tests {
             value(&encode(&record).expect("v4 fixture encodes")),
             fixture
         );
+    }
+
+    #[test]
+    fn pinned_v5_copy_fixture_decodes_and_round_trips_by_value() {
+        let fixture = v5_copy_fixture();
+        let bytes = serde_json::to_vec(&fixture).expect("v5 fixture encodes");
+        let record = decode(&bytes).expect("v5 copy fixture decodes");
+        assert_eq!(record.schema_version, SCHEMA_V5);
+        assert_eq!(record.phase, OperationPhase::IntentDurable);
+        assert_eq!(record.disposition, OperationDisposition::None);
+        assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+        let args = record.command_args().expect("typed copy arguments");
+        assert_eq!(args.source().relative_path().as_str(), "in.wav");
+        assert_eq!(args.expected_source().source_revision(), 7);
+        assert_eq!(args.expected_source().file_identity(), "file-identity");
+        assert!(record.retry_observation().is_none());
+        assert_eq!(
+            value(&encode(&record).expect("v5 fixture encodes")),
+            fixture
+        );
+    }
+
+    #[test]
+    fn v5_copy_shape_is_strict_and_rejects_inconsistent_retry_chronology() {
+        let mut unknown = v5_copy_fixture();
+        unknown["unexpected"] = Value::Bool(true);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unknown).expect("unknown field encodes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut opaque_payload = v5_copy_fixture();
+        opaque_payload["payload"] = serde_json::json!({"future": true});
+        assert!(matches!(
+            decode(&serde_json::to_vec(&opaque_payload).expect("payload encodes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut invalid_path = v5_copy_fixture();
+        invalid_path["command_args"]["source"]["relative_path"] = Value::from("../in.wav");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_path).expect("invalid path encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("relative path")
+        ));
+
+        let mut retry_after_cancel = v5_copy_fixture();
+        retry_after_cancel["disposition"] = Value::from("CancelRequestedBeforePublish");
+        retry_after_cancel["cancellation_request"] = serde_json::json!({
+            "requested_unix_ms": 60
+        });
+        retry_after_cancel["retry_observation"] = serde_json::json!({
+            "attempt": 1,
+            "requested_unix_ms": 70,
+            "next_retry_unix_ms": 71,
+            "lease_id": "lease-1",
+            "lease_expiry_unix_ms": 72,
+            "error_class": "TransientContention",
+            "diagnostic_code": "busy",
+            "redacted_context": null
+        });
+        retry_after_cancel["updated_unix_ms"] = Value::from(60_i64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&retry_after_cancel).expect("retry fixture encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("creation-to-cancellation")
+        ));
+
+        let mut retry_before_creation = v5_copy_fixture();
+        retry_before_creation["disposition"] = Value::from("CancelRequestedBeforePublish");
+        retry_before_creation["cancellation_request"] = serde_json::json!({
+            "requested_unix_ms": 60
+        });
+        retry_before_creation["retry_observation"] = serde_json::json!({
+            "attempt": 1,
+            "requested_unix_ms": 40,
+            "next_retry_unix_ms": 41,
+            "lease_id": "lease-1",
+            "lease_expiry_unix_ms": 42,
+            "error_class": "TransientContention",
+            "diagnostic_code": "busy",
+            "redacted_context": null
+        });
+        retry_before_creation["updated_unix_ms"] = Value::from(60_i64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&retry_before_creation).expect("retry fixture encodes")),
+            Err(DecodeError::Malformed { reason }) if reason.contains("creation-to-cancellation")
+        ));
     }
 
     #[test]
@@ -2027,6 +2609,65 @@ mod tests {
         assert!(matches!(
             classify_record(&record),
             RecordConsistency::Invalid(reason) if reason.contains("cancellation request")
+        ));
+    }
+
+    #[test]
+    fn classification_rejects_foreign_v5_fields_under_v3_and_v4() {
+        let fixture = v5_copy_fixture();
+        let mut record = decode(&serde_json::to_vec(&fixture).expect("v5 fixture encodes"))
+            .expect("v5 fixture decodes");
+
+        record.schema_version = SCHEMA_V3;
+        record.disposition = OperationDisposition::None;
+        record.updated_unix_ms = record.created_unix_ms;
+        assert!(matches!(
+            classify_record(&record),
+            RecordConsistency::Invalid(reason) if reason.contains("typed coordinator")
+        ));
+        assert!(matches!(
+            encode(&record),
+            Err(EncodeError::CoordinatorFieldsInPriorSchema {
+                version: SCHEMA_V3,
+                ..
+            })
+        ));
+
+        record.schema_version = SCHEMA_V4;
+        record.disposition = OperationDisposition::CancelRequestedBeforePublish;
+        record.cancellation_request = Some(
+            CancellationRequestObservation::new(record.created_unix_ms)
+                .expect("cancellation timestamp"),
+        );
+        assert!(matches!(
+            classify_record(&record),
+            RecordConsistency::Invalid(reason) if reason.contains("typed coordinator")
+        ));
+        assert!(matches!(
+            encode(&record),
+            Err(EncodeError::CoordinatorFieldsInPriorSchema {
+                version: SCHEMA_V4,
+                ..
+            })
+        ));
+
+        record.command_args = None;
+        record.retry_observation = Some(
+            serde_json::from_value(serde_json::json!({
+                "attempt": 1,
+                "requested_unix_ms": 50,
+                "next_retry_unix_ms": 51,
+                "lease_id": "lease-1",
+                "lease_expiry_unix_ms": 52,
+                "error_class": "TransientContention",
+                "diagnostic_code": "busy",
+                "redacted_context": null
+            }))
+            .expect("retry observation"),
+        );
+        assert!(matches!(
+            classify_record(&record),
+            RecordConsistency::Invalid(reason) if reason.contains("retry observation")
         ));
     }
 

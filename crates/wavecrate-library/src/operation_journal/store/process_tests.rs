@@ -13,7 +13,8 @@ use crate::app_dirs::{
     ConfigBaseGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
 use crate::operation_journal::{
-    CancellationRequestObservation, OperationId, SCHEMA_V4, StoredOperationRecord, decode,
+    CancellationRequestObservation, OperationDisposition, OperationId, SCHEMA_V4, SCHEMA_V5,
+    StoredOperationRecord, decode,
 };
 use crate::test_runtime::TestRuntimeGuard;
 
@@ -22,6 +23,14 @@ const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
 const PROFILE_NAME: &str = "operation-journal-restart";
 const OPERATION_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 const CANCEL_HELPER_ENV: &str = "WAVECRATE_JOURNAL_HELPER_CANCEL";
+const RETRY_HELPER_ENV: &str = "WAVECRATE_JOURNAL_HELPER_RETRY";
+
+#[derive(Clone, Copy)]
+enum HelperMode {
+    Intent,
+    Cancellation,
+    Retry,
+}
 
 struct ProcessFixture {
     profile_name: String,
@@ -65,10 +74,7 @@ impl Drop for JournalOwnerProcess {
     }
 }
 
-fn spawn_journal_owner_helper(
-    fixture: &ProcessFixture,
-    cancel_requested: bool,
-) -> JournalOwnerProcess {
+fn spawn_journal_owner_helper(fixture: &ProcessFixture, mode: HelperMode) -> JournalOwnerProcess {
     let mut command = Command::new(std::env::current_exe().expect("current test executable"));
     command
         .arg("--exact")
@@ -77,7 +83,22 @@ fn spawn_journal_owner_helper(
         .arg("--nocapture")
         .env(CONFIG_HOME_ENV, fixture._base.path())
         .env(CONFIG_PROFILE_ENV, &fixture.profile_name)
-        .env(CANCEL_HELPER_ENV, if cancel_requested { "1" } else { "0" })
+        .env(
+            CANCEL_HELPER_ENV,
+            if matches!(mode, HelperMode::Cancellation) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            RETRY_HELPER_ENV,
+            if matches!(mode, HelperMode::Retry) {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -211,10 +232,104 @@ fn universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
         .expect("decode universal intent fixture")
 }
 
+fn v5_copy_record(operation_id: OperationId) -> StoredOperationRecord {
+    let value = serde_json::json!({
+        "schema_version": 5,
+        "operation_id": operation_id.as_uuid(),
+        "intent": {
+            "actor": "User",
+            "kind": "FileMutation",
+            "label": "restart-v5-copy"
+        },
+        "universal_intent": {
+            "parent_operation_id": null,
+            "command_kind": "Copy",
+            "user_status_key": "operation.status.restart-v5",
+            "participants": {
+                "descriptors": [
+                    {
+                        "id": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "kind": "SourceDatabase",
+                        "requirement": "Required",
+                        "source_fence": {
+                            "source_id": "source-a",
+                            "root_identity": "root-a",
+                            "database_identity": "database-a",
+                            "lifecycle_generation": 1,
+                            "source_revision": 7,
+                            "lease_epoch": 1
+                        },
+                        "artifact_key": null
+                    },
+                    {
+                        "id": "89abcdef-0123-4567-89ab-cdef01234567",
+                        "kind": "Filesystem",
+                        "requirement": "Required",
+                        "source_fence": null,
+                        "artifact_key": null
+                    }
+                ],
+                "checkpoints": [
+                    {
+                        "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                        "state": "Pending",
+                        "committed_revision": null,
+                        "diagnostic_code": null
+                    },
+                    {
+                        "participant_id": "89abcdef-0123-4567-89ab-cdef01234567",
+                        "state": "Pending",
+                        "committed_revision": null,
+                        "diagnostic_code": null
+                    }
+                ]
+            }
+        },
+        "phase": "IntentDurable",
+        "disposition": "None",
+        "command_args": {
+            "source": {
+                "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                "source_id": "source-a",
+                "relative_path": "in.wav"
+            },
+            "destination": {
+                "participant_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                "source_id": "source-a",
+                "relative_path": "out.wav"
+            },
+            "expected_source": {
+                "source_revision": 7,
+                "file_identity": "file-identity",
+                "file_size": 10,
+                "modified_ns": 11
+            },
+            "collision_policy": "NoReplace",
+            "inherited_metadata_reference": "metadata/entry"
+        },
+        "capacity_plan": {
+            "volumes": [{
+                "identity": {"device": 1},
+                "allocation_unit": 1,
+                "allocation_class": "DestinationStaging",
+                "logical_bytes": 1,
+                "allocated_bytes": 1,
+                "protected_free_bytes": 268435456
+            }]
+        },
+        "retry_observation": null,
+        "cancellation_request": null,
+        "created_unix_ms": 1,
+        "updated_unix_ms": 1
+    });
+    decode(&serde_json::to_vec(&value).expect("serialize v5 copy fixture"))
+        .expect("decode v5 copy fixture")
+}
+
 #[test]
 fn abrupt_owner_restart_retains_acknowledged_intent() {
     let fixture = ProcessFixture::new();
-    let mut helper = spawn_journal_owner_helper(&fixture, false);
+    let mut helper = spawn_journal_owner_helper(&fixture, HelperMode::Intent);
     let operation_id = wait_for_ready(&mut helper);
     assert_eq!(
         operation_id,
@@ -237,7 +352,7 @@ fn abrupt_owner_restart_retains_acknowledged_intent() {
 #[test]
 fn abrupt_owner_restart_retains_acknowledged_cancellation_request() {
     let fixture = ProcessFixture::new();
-    let mut helper = spawn_journal_owner_helper(&fixture, true);
+    let mut helper = spawn_journal_owner_helper(&fixture, HelperMode::Cancellation);
     let operation_id = wait_for_ready(&mut helper);
     terminate_abruptly(&mut helper);
 
@@ -262,12 +377,80 @@ fn abrupt_owner_restart_retains_acknowledged_cancellation_request() {
 }
 
 #[test]
+fn abrupt_owner_restart_retains_acknowledged_retry_observation() {
+    let fixture = ProcessFixture::new();
+    let mut helper = spawn_journal_owner_helper(&fixture, HelperMode::Retry);
+    let operation_id = wait_for_ready(&mut helper);
+    terminate_abruptly(&mut helper);
+
+    let owner = WritableProfileGuard::acquire_current().expect("reacquire after abrupt exit");
+    let store = OperationJournalStore::open(&owner).expect("reopen journal after abrupt exit");
+    let persisted = store
+        .get(operation_id)
+        .expect("read acknowledged retry observation")
+        .expect("retry observation row");
+    assert_eq!(persisted.schema_version, SCHEMA_V5);
+    assert_eq!(persisted.disposition, OperationDisposition::RetryPending);
+    assert_eq!(
+        persisted
+            .command_args()
+            .expect("typed copy arguments")
+            .source()
+            .relative_path()
+            .as_str(),
+        "in.wav"
+    );
+    let retry = persisted.retry_observation().expect("retry observation");
+    assert_eq!(retry.attempt(), 1);
+    assert_eq!(retry.requested_unix_ms(), 2);
+    assert_eq!(retry.next_retry_unix_ms(), 3);
+    assert_eq!(retry.lease_id().as_str(), "restart-retry-lease");
+    assert_eq!(retry.lease_expiry_unix_ms(), 4);
+    assert_eq!(retry.diagnostic_code(), "writer_busy");
+}
+
+#[test]
 #[ignore = "spawned by abrupt_owner_restart_retains_acknowledged_intent"]
 fn journal_owner_process_helper() {
     let owner = WritableProfileGuard::acquire_current().expect("journal helper profile owner");
     let store = OperationJournalStore::open(&owner).expect("journal helper store");
     let operation_id = OperationId::parse(OPERATION_ID).expect("fixed operation ID");
-    if std::env::var_os(CANCEL_HELPER_ENV).is_some_and(|value| value == "1") {
+    if std::env::var_os(RETRY_HELPER_ENV).is_some_and(|value| value == "1") {
+        let record = v5_copy_record(operation_id);
+        let inserted = store
+            .persist_copy_intent(
+                operation_id,
+                record.intent.clone(),
+                record
+                    .universal_intent
+                    .clone()
+                    .expect("journal helper universal intent"),
+                record
+                    .command_args()
+                    .cloned()
+                    .expect("journal helper copy arguments"),
+                record
+                    .capacity_plan
+                    .clone()
+                    .expect("journal helper capacity plan"),
+                1,
+            )
+            .expect("journal helper v5 intent insert");
+        let observation = serde_json::from_value(serde_json::json!({
+            "attempt": 1,
+            "requested_unix_ms": 2,
+            "next_retry_unix_ms": 3,
+            "lease_id": "restart-retry-lease",
+            "lease_expiry_unix_ms": 4,
+            "error_class": "TransientContention",
+            "diagnostic_code": "writer_busy",
+            "redacted_context": null
+        }))
+        .expect("journal helper retry observation");
+        store
+            .record_retry_pending(operation_id, inserted.sequence(), observation)
+            .expect("journal helper retry observation");
+    } else if std::env::var_os(CANCEL_HELPER_ENV).is_some_and(|value| value == "1") {
         let record = universal_intent_record(operation_id);
         let inserted = store
             .insert_intent(&record)

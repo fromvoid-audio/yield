@@ -3,7 +3,8 @@
 //! The active values include legacy operation identity/phase data and the initial V3 universal
 //! intent shape. They perform no filesystem I/O and grant no ownership or mutation authority.
 //! Later journal evidence and codecs can depend on these values without importing renderer or UI
-//! types. V3 currently describes only a newly durable intent; later transitions remain unsupported.
+//! types. V3 currently describes a newly durable intent, V4 a pre-publication cancellation
+//! request, and V5 the first typed coordinator command and retry observations.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +20,8 @@ pub const SCHEMA_V2: u32 = 2;
 pub const SCHEMA_V3: u32 = 3;
 /// The durable pre-publication cancellation-request schema.
 pub const SCHEMA_V4: u32 = 4;
+/// The typed coordinator copy-intent and retry-observation schema.
+pub const SCHEMA_V5: u32 = 5;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.

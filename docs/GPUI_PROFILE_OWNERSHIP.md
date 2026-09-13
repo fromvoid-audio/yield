@@ -494,3 +494,38 @@ passed at exact commit `c800405dbc3f9263d4cc58ed31d2cdf7a4c032e5`, including
 88 journal tests and the abrupt cancellation restart regression, 90 catalog tests
 and 60 session tests. This storage run is not native Windows UI acceptance. Full
 coordinator admission, phase transitions and recovery execution remain incomplete.
+
+### Typed coordinator envelope
+
+The journal supports a strict V5 envelope for typed command arguments
+and retry observations. Its initial Copy contract covers one regular file between
+registered sources, including within-source copies. Source and destination
+references must resolve to stored participant fences; relative locators remain
+non-authoritative hints. Existing V1–V4 formats are retained without inferred
+command arguments or automatic conversion of legacy recovery evidence.
+
+Typed persistence and retry updates do not establish runtime queue admission or
+protected-capacity enforcement. Those require live owners and the dependent
+capacity integration; persisted plans and retry lease observations are not
+execution capabilities. The session retains its nonempty-journal startup gate.
+
+The source-local file journal remains a compatibility participant. Its existing
+Move/Copy rows can lack the source, content and capacity observations required by
+the new envelope. Compatibility import must retain such evidence for explicit
+reconciliation instead of manufacturing a valid new command from stored paths.
+
+Copy intent persistence constructs the stored envelope from validated inputs. Retry
+updates use the expected observation sequence, increment the attempt count exactly
+once and retain immutable command data. An identical persisted retry is a
+read-only replay; stale or conflicting updates leave the row unchanged.
+Cancellation retains the command and prior retry observation, rejects impossible
+retry chronology and prevents further retry updates.
+
+Local validation passed: 107 journal tests (one helper ignored), three restart
+tests (one helper ignored), 61 session tests (one helper ignored), the production
+library check without default features, GPUI compilation, formatting and diff
+checks. Review identified and repaired V3/V4 foreign-field classification and
+retained retry chronology gaps; dedicated regressions cover both. Windows storage
+validation is pending. Other command families, later phase transitions, runtime
+admission and compatibility import remain open under OPT-1337 and its dependent
+tickets.
