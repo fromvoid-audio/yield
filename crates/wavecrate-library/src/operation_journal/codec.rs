@@ -28,12 +28,13 @@ use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, UniversalIntent,
+    SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
 use super::removal_commands::validate_persisted_removal_command_args_value;
 use super::render_commands::validate_persisted_render_command_args_value;
+use super::retained_resolution_commands::validate_persisted_retained_resolution_command_args_value;
 use crate::durable_capacity::DurableCapacityPlan;
 
 /// One complete stored operation record.
@@ -79,7 +80,7 @@ pub struct StoredOperationRecord {
     command_args: Option<CopyIntentArgs>,
     /// Optional V5 durable retry/status observation.
     retry_observation: Option<RetryObservation>,
-    /// Optional V6/V7/V8/V9/V10 tagged command arguments.
+    /// Optional V6/V7/V8/V9/V10/V11 tagged command arguments.
     universal_command_args: Option<UniversalCommandArgs>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
@@ -304,6 +305,39 @@ impl StoredOperationRecord {
         }
     }
 
+    pub(crate) fn new_v11_command(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_V11,
+            operation_id,
+            intent,
+            universal_intent: Some(universal_intent),
+            phase: OperationPhase::IntentDurable,
+            disposition: OperationDisposition::None,
+            payload: Value::Object(Map::new()),
+            capacity_plan: Some(capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: None,
+            command_args: None,
+            retry_observation: None,
+            universal_command_args: Some(command_args),
+            created_unix_ms: timestamp_unix_ms,
+            updated_unix_ms: timestamp_unix_ms,
+        }
+    }
+
     /// Borrow stored publication evidence without exposing a construction path for it.
     pub fn published(&self) -> Option<&FilesystemPublishedWaveformRestore> {
         self.published.as_ref()
@@ -336,7 +370,7 @@ impl StoredOperationRecord {
         let mut record = self.clone();
         if !matches!(
             record.schema_version,
-            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10 | SCHEMA_V11
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -350,7 +384,7 @@ impl StoredOperationRecord {
         let mut record = self.clone();
         if !matches!(
             record.schema_version,
-            SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10
+            SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10 | SCHEMA_V11
         ) {
             record.schema_version = SCHEMA_V5;
         }
@@ -476,6 +510,12 @@ pub enum EncodeError {
     /// A V10 removal-command record violates its bounded state or argument contract.
     #[error("invalid schema-v10 removal command record: {reason}")]
     InvalidV10Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// A V11 retained-resolution record violates its bounded state or argument contract.
+    #[error("invalid schema-v11 retained resolution record: {reason}")]
+    InvalidV11Record {
         /// Bounded validation diagnostic.
         reason: String,
     },
@@ -1615,6 +1655,99 @@ struct PersistedOperationRecordV10Ref<'a> {
     updated_unix_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedOperationRecordV11 {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: UniversalCommandArgs,
+    capacity_plan: DurableCapacityPlan,
+    #[serde(default)]
+    retry_observation: Option<RetryObservation>,
+    #[serde(default)]
+    cancellation_request: Option<CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl From<PersistedOperationRecordV11> for StoredOperationRecord {
+    fn from(record: PersistedOperationRecordV11) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            operation_id: OperationId::from_uuid(record.operation_id),
+            intent: record.intent,
+            universal_intent: Some(record.universal_intent),
+            phase: record.phase,
+            disposition: record.disposition,
+            payload: Value::Object(Map::new()),
+            capacity_plan: Some(record.capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: record.cancellation_request,
+            command_args: None,
+            retry_observation: record.retry_observation,
+            universal_command_args: Some(record.universal_command_args),
+            created_unix_ms: record.created_unix_ms,
+            updated_unix_ms: record.updated_unix_ms,
+        }
+    }
+}
+
+fn persisted_v11_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedOperationRecordV11Ref<'_>, EncodeError> {
+    validate_v11_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV11Record { reason })?;
+    Ok(PersistedOperationRecordV11Ref {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("V11 universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        universal_command_args: record
+            .universal_command_args
+            .as_ref()
+            .expect("V11 command arguments checked above"),
+        capacity_plan: record
+            .capacity_plan
+            .as_ref()
+            .expect("V11 capacity plan checked above"),
+        retry_observation: record.retry_observation.as_ref(),
+        cancellation_request: record.cancellation_request.as_ref(),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    })
+}
+
+#[derive(Serialize)]
+struct PersistedOperationRecordV11Ref<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: &'a UniversalCommandArgs,
+    capacity_plan: &'a DurableCapacityPlan,
+    retry_observation: Option<&'a RetryObservation>,
+    cancellation_request: Option<&'a CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -1721,6 +1854,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v10_coordinator_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V11 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v11_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedOperationRecordV11>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v11_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -1889,6 +2031,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V10 => {
             let persisted = persisted_v10_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V11 => {
+            let persisted = persisted_v11_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -2482,6 +2628,13 @@ fn validate_persisted_v3_object_boundaries(value: &Value) -> Result<(), &'static
 }
 
 fn validate_persisted_universal_intent_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_universal_intent_value_with_retained_resolution(value, false)
+}
+
+fn validate_persisted_universal_intent_value_with_retained_resolution(
+    value: &Value,
+    allow_retained_resolution: bool,
+) -> Result<(), &'static str> {
     let object = strict_object(
         value,
         &[
@@ -2495,8 +2648,11 @@ fn validate_persisted_universal_intent_value(value: &Value) -> Result<(), &'stat
     if !parent.is_null() && !parent.is_string() {
         return Err("schema-v3 parent operation ID must be a UUID string or null");
     }
-    if !required_field(object, "command_kind")?.is_string() {
-        return Err("schema-v3 command kind must be a string");
+    let command_kind = required_field(object, "command_kind")?
+        .as_str()
+        .ok_or("schema-v3 command kind must be a string")?;
+    if !allow_retained_resolution && matches!(command_kind, "RestoreRetained" | "PurgeRetained") {
+        return Err("persisted universal intent contains schema-v11 retained resolution command");
     }
     let status = required_field(object, "user_status_key")?
         .as_str()
@@ -2973,6 +3129,81 @@ fn validate_persisted_v10_universal_command_args_value(value: &Value) -> Result<
     )
 }
 
+fn validate_persisted_v11_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "universal_command_args",
+            "capacity_plan",
+            "retry_observation",
+            "cancellation_request",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "universal_command_args",
+        "capacity_plan",
+        "retry_observation",
+        "cancellation_request",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_persisted_v11_universal_intent_value(required_field(object, "universal_intent")?)?;
+    validate_persisted_v11_universal_command_args_value(required_field(
+        object,
+        "universal_command_args",
+    )?)?;
+    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
+    if let Some(retry) = object.get("retry_observation") {
+        if !retry.is_null() {
+            validate_persisted_retry_observation_value(retry)?;
+        }
+    }
+    if let Some(cancellation) = object.get("cancellation_request") {
+        if !cancellation.is_null() {
+            validate_persisted_cancellation_request_value(cancellation)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_v11_universal_intent_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_universal_intent_value_with_retained_resolution(value, true)
+}
+
+fn validate_persisted_v11_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(
+        value,
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+            "Removal",
+            "RetainedResolution",
+        ],
+        "schema-v11",
+    )
+}
+
 fn validate_persisted_tagged_command_args_value(
     value: &Value,
     allowed_variants: &[&str],
@@ -3002,6 +3233,9 @@ fn validate_persisted_tagged_command_args_value(
             "Removal" if schema_name == "schema-v9" => {
                 Err("schema-v9 command arguments cannot carry schema-v10 removal arguments")
             }
+            "RetainedResolution" => {
+                Err("command arguments carry schema-v11 retained resolution arguments")
+            }
             "Namespace" => Err("command arguments carry schema-v8 namespace arguments"),
             "Render" => Err("command arguments carry schema-v9 render arguments"),
             "Removal" => Err("command arguments carry schema-v10 removal arguments"),
@@ -3015,6 +3249,9 @@ fn validate_persisted_tagged_command_args_value(
         "Namespace" => validate_persisted_namespace_command_args_value(arguments),
         "Render" => validate_persisted_render_command_args_value(arguments),
         "Removal" => validate_persisted_removal_command_args_value(arguments),
+        "RetainedResolution" => {
+            validate_persisted_retained_resolution_command_args_value(arguments)
+        }
         _ => Err("persisted command arguments contain an unknown variant"),
     }
 }
@@ -3052,14 +3289,21 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
             "schema-v3 cannot contain V6 tagged command arguments",
         ));
     }
-    if record
-        .universal_intent
-        .as_ref()
-        .is_some_and(|intent| intent.command_kind() == super::model::UniversalCommandKind::Import)
-    {
-        return Err(String::from(
-            "schema-v3 cannot encode the V6 Import command",
-        ));
+    if let Some(intent) = record.universal_intent.as_ref() {
+        match intent.command_kind() {
+            super::model::UniversalCommandKind::Import => {
+                return Err(String::from(
+                    "schema-v3 cannot encode the V6 Import command",
+                ));
+            }
+            super::model::UniversalCommandKind::RestoreRetained
+            | super::model::UniversalCommandKind::PurgeRetained => {
+                return Err(String::from(
+                    "schema-v3 cannot encode schema-v11 retained resolution commands",
+                ));
+            }
+            _ => {}
+        }
     }
     validate_universal_intent_envelope_shape(record)
 }
@@ -3170,14 +3414,21 @@ pub(crate) fn validate_v4_cancel_shape(record: &StoredOperationRecord) -> Result
             "schema-v4 cannot contain V6 tagged command arguments",
         ));
     }
-    if record
-        .universal_intent
-        .as_ref()
-        .is_some_and(|intent| intent.command_kind() == super::model::UniversalCommandKind::Import)
-    {
-        return Err(String::from(
-            "schema-v4 cannot encode the V6 Import command",
-        ));
+    if let Some(intent) = record.universal_intent.as_ref() {
+        match intent.command_kind() {
+            super::model::UniversalCommandKind::Import => {
+                return Err(String::from(
+                    "schema-v4 cannot encode the V6 Import command",
+                ));
+            }
+            super::model::UniversalCommandKind::RestoreRetained
+            | super::model::UniversalCommandKind::PurgeRetained => {
+                return Err(String::from(
+                    "schema-v4 cannot encode schema-v11 retained resolution commands",
+                ));
+            }
+            _ => {}
+        }
     }
     let observation = record
         .cancellation_request
@@ -3355,6 +3606,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
                 "schema-v6 cannot carry schema-v10 removal arguments",
             ));
         }
+        UniversalCommandArgs::RetainedResolution(_) => {
+            return Err(String::from(
+                "schema-v6 cannot carry schema-v11 retained resolution arguments",
+            ));
+        }
     }
     if universal.command_kind() != command_args.command_kind() {
         return Err(String::from(
@@ -3482,6 +3738,24 @@ pub(crate) fn validate_v10_coordinator_shape(record: &StoredOperationRecord) -> 
     )
 }
 
+pub(crate) fn validate_v11_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V11,
+        "schema-v11",
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+            "Removal",
+            "RetainedResolution",
+        ],
+    )
+}
+
 fn validate_tagged_coordinator_shape(
     record: &StoredOperationRecord,
     expected_schema: u32,
@@ -3530,6 +3804,7 @@ fn validate_tagged_coordinator_shape(
         UniversalCommandArgs::Namespace(_) => "Namespace",
         UniversalCommandArgs::Render(_) => "Render",
         UniversalCommandArgs::Removal(_) => "Removal",
+        UniversalCommandArgs::RetainedResolution(_) => "RetainedResolution",
     };
     if !allowed_variants.contains(&variant) {
         return Err(match variant {
@@ -3538,6 +3813,9 @@ fn validate_tagged_coordinator_shape(
             }
             "Render" => format!("{schema_name} cannot carry schema-v9 render arguments"),
             "Removal" => format!("{schema_name} cannot carry schema-v10 removal arguments"),
+            "RetainedResolution" => {
+                format!("{schema_name} cannot carry schema-v11 retained resolution arguments")
+            }
             _ => format!("{schema_name} cannot carry {variant} arguments"),
         });
     }
@@ -4159,6 +4437,56 @@ mod tests {
         fixture
     }
 
+    fn v11_retained_fixture(variant: &str) -> Value {
+        let mut fixture = v6_command_fixture("Copy");
+        let source_participant =
+            fixture["universal_intent"]["participants"]["descriptors"][0]["id"].clone();
+        let staged = serde_json::json!({
+            "participant_id": source_participant,
+            "source_id": "source-a",
+            "relative_path": ".wavecrate_delete_staging/folder/retained",
+            "expectation": {
+                "Directory": {
+                    "source_revision": 7,
+                    "filesystem_identity": "staged-directory",
+                    "modified_unix_ns": null
+                }
+            }
+        });
+        fixture["schema_version"] = Value::from(SCHEMA_V11);
+        fixture["universal_intent"]["command_kind"] = Value::from(match variant {
+            "Restore" => "RestoreRetained",
+            "Purge" => "PurgeRetained",
+            other => panic!("unknown V11 retained variant {other}"),
+        });
+        let observation = serde_json::json!({
+            "original_relative": "folder/retained",
+            "staged": staged,
+            "staged_relative": "folder/retained",
+            "retained_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "stage": "Deleted",
+            "recovery_root_kind": "LegacyDeleteStaging",
+            "selected_entry_fingerprint": [1, 2, 3, 4, 5, 6, 7, 8,
+                9, 10, 11, 12, 13, 14, 15, 16,
+                17, 18, 19, 20, 21, 22, 23, 24,
+                25, 26, 27, 28, 29, 30, 31, 32]
+        });
+        fixture["universal_command_args"] = match variant {
+            "Restore" => serde_json::json!({
+                "RetainedResolution": {
+                    "Restore": {"observation": observation}
+                }
+            }),
+            "Purge" => serde_json::json!({
+                "RetainedResolution": {
+                    "Purge": {"observation": observation, "decision": "UserConfirmed"}
+                }
+            }),
+            _ => unreachable!(),
+        };
+        fixture
+    }
+
     #[test]
     fn pinned_v1_fixture_decodes_and_round_trips_by_value() {
         let record = decode(V1_FIXTURE).expect("v1 fixture decodes");
@@ -4567,6 +4895,144 @@ mod tests {
         assert!(matches!(
             decode(&serde_json::to_vec(&self_trash).expect("self-trash bytes")),
             Err(DecodeError::Malformed { reason }) if reason.contains("configured trash root")
+        ));
+    }
+
+    #[test]
+    fn v11_retained_resolution_restore_and_purge_round_trip() {
+        for variant in ["Restore", "Purge"] {
+            let fixture = v11_retained_fixture(variant);
+            let record = decode(&serde_json::to_vec(&fixture).expect("V11 retained bytes"))
+                .expect("V11 retained fixture decodes");
+            assert_eq!(record.schema_version, SCHEMA_V11);
+            assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+            assert!(matches!(
+                record.universal_command_args(),
+                Some(UniversalCommandArgs::RetainedResolution(_))
+            ));
+            assert_eq!(
+                value(&encode(&record).expect("V11 retained encodes")),
+                fixture
+            );
+        }
+    }
+
+    #[test]
+    fn v11_preserves_all_prior_command_families() {
+        let mut fixtures = Vec::new();
+        for variant in ["Copy", "Import", "DuplicateSame"] {
+            let mut fixture = v6_command_fixture(variant);
+            fixture["schema_version"] = Value::from(SCHEMA_V11);
+            fixtures.push(fixture);
+        }
+        let mut waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        waveform["schema_version"] = Value::from(SCHEMA_V11);
+        fixtures.push(waveform);
+        let mut namespace = v8_namespace_fixture("Rename");
+        namespace["schema_version"] = Value::from(SCHEMA_V11);
+        fixtures.push(namespace);
+        for variant in ["Normalize", "DuplicateDouble"] {
+            let mut render = v9_render_fixture(variant);
+            render["schema_version"] = Value::from(SCHEMA_V11);
+            fixtures.push(render);
+        }
+        let mut removal = v10_trash_fixture();
+        removal["schema_version"] = Value::from(SCHEMA_V11);
+        fixtures.push(removal);
+
+        for fixture in fixtures {
+            let record = decode(&serde_json::to_vec(&fixture).expect("V11 prior bytes"))
+                .expect("V11 prior command decodes");
+            assert_eq!(record.schema_version, SCHEMA_V11);
+            assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+            assert_eq!(value(&encode(&record).expect("V11 prior encodes")), fixture);
+        }
+    }
+
+    #[test]
+    fn v11_retained_raw_boundary_rejects_malformed_observations_and_old_versions() {
+        let fixture = v11_retained_fixture("Restore");
+        let mut unknown = fixture.clone();
+        unknown["universal_command_args"]["RetainedResolution"]["Restore"]["observation"]["unknown"] =
+            Value::Null;
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unknown).expect("unknown V11 field bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut bad_stage_path = fixture.clone();
+        bad_stage_path["universal_command_args"]["RetainedResolution"]["Restore"]["observation"]
+            ["staged"]["relative_path"] = Value::from("folder/retained");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&bad_stage_path).expect("bad staged path bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut bad_alias = fixture.clone();
+        bad_alias["universal_command_args"]["RetainedResolution"]["Restore"]["observation"]["original_relative"] =
+            Value::from(".WAVECRATE_DELETE_STAGING/recreated");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&bad_alias).expect("bad alias bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut bad_revision = fixture.clone();
+        bad_revision["universal_command_args"]["RetainedResolution"]["Restore"]["observation"]["staged"]
+            ["expectation"]["Directory"]["source_revision"] = Value::from(8_u64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&bad_revision).expect("bad revision bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        for version in [SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10] {
+            let mut older = fixture.clone();
+            older["schema_version"] = Value::from(version);
+            assert!(matches!(
+                decode(&serde_json::to_vec(&older).expect("old V11 bytes")),
+                Err(DecodeError::Malformed { .. })
+            ));
+
+            let mut direct = decode(&serde_json::to_vec(&fixture).expect("V11 direct bytes"))
+                .expect("V11 direct record");
+            direct.schema_version = version;
+            assert!(matches!(
+                classify_record(&direct),
+                RecordConsistency::Invalid(reason)
+                    if reason.contains("schema-v11 retained resolution")
+                        || reason.contains("schema-v10 removal")
+            ));
+            assert!(encode(&direct).is_err());
+        }
+    }
+
+    #[test]
+    fn v3_and_v4_reject_retained_resolution_command_kinds_from_raw_and_direct_records() {
+        let mut v3 = serde_json::from_slice::<Value>(V3_FIXTURE).expect("V3 fixture value");
+        v3["universal_intent"]["command_kind"] = Value::from("RestoreRetained");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&v3).expect("V3 retained bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let v3_record = StoredOperationRecord::from(
+            serde_json::from_value::<PersistedOperationRecordV3>(v3).expect("V3 direct record"),
+        );
+        assert!(matches!(
+            classify_record(&v3_record),
+            RecordConsistency::Invalid(reason) if reason.contains("retained resolution")
+        ));
+
+        let mut v4 = serde_json::to_value(v4_cancel_fixture()).expect("V4 fixture value");
+        v4["universal_intent"]["command_kind"] = Value::from("PurgeRetained");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&v4).expect("V4 retained bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let v4_record = StoredOperationRecord::from(
+            serde_json::from_value::<PersistedOperationRecordV4>(v4).expect("V4 direct record"),
+        );
+        assert!(matches!(
+            classify_record(&v4_record),
+            RecordConsistency::Invalid(reason) if reason.contains("retained resolution")
         ));
     }
 

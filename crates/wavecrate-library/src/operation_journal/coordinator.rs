@@ -1480,6 +1480,8 @@ pub enum UniversalCommandArgs {
     Render(super::render_commands::RenderCommandArgs),
     /// Observe one configured-trash or retained-folder removal request.
     Removal(super::removal_commands::RemovalCommandArgs),
+    /// Observe one existing retained-folder restore or purge request.
+    RetainedResolution(super::retained_resolution_commands::RetainedResolutionCommandArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1493,6 +1495,7 @@ impl UniversalCommandArgs {
             Self::Namespace(args) => args.command_kind(),
             Self::Render(args) => args.command_kind(),
             Self::Removal(args) => args.command_kind(),
+            Self::RetainedResolution(args) => args.command_kind(),
         }
     }
 
@@ -1523,6 +1526,9 @@ impl UniversalCommandArgs {
             Self::Removal(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Removal),
+            Self::RetainedResolution(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::RetainedResolution),
         }
     }
 }
@@ -1551,6 +1557,11 @@ pub enum UniversalCommandArgsValidationError {
     /// A bounded configured-trash or retained-folder removal argument failed validation.
     #[error("invalid removal command arguments: {0}")]
     Removal(#[source] super::removal_commands::RemovalCommandValidationError),
+    /// A retained-folder restore or purge argument failed validation.
+    #[error("invalid retained resolution command arguments: {0}")]
+    RetainedResolution(
+        #[source] super::retained_resolution_commands::RetainedResolutionValidationError,
+    ),
 }
 
 /// Stable class for an error that may schedule a later retry.

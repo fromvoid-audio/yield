@@ -884,3 +884,42 @@ coverage. The lane also passed 12 legacy-reader, 90 catalog, 60 session (one
 helper ignored), 16 core edit-settings and five media-adapter tests. This accepts
 the V10 storage milestone; native Windows UI and filesystem execution remain
 outside this validation scope.
+
+## V11 retained-folder resolution observations (OPT-1337)
+
+V11 adds distinct RestoreRetained and PurgeRetained commands for an existing
+legacy retained-folder record. The original location is only a bounded relative
+path: the deleted directory may be absent or independently recreated. The staged
+directory supplies the observed physical identity, source revision and fenced
+SourceDatabase participant. Its source-relative path must match
+`.wavecrate_delete_staging/<staged_relative>`, with composed path bounds checked.
+Original paths in the reserved recovery namespace, including ASCII case aliases,
+are rejected. These lexical checks do not replace live capability-bound
+containment and identity checks.
+
+The observation retains the legacy UUID, Deleted stage and a fixed BLAKE3 digest
+of the exact selected-entry JSON bytes, including restore metadata. Legacy redo
+reuses IDs; the digest detects changed bytes but is not a unique generation token.
+The pure helper bounds each hashing call to 64 KiB and stores only the 32-byte
+digest. It neither isolates nor parses the entry. A future capture adapter must
+derive the fields and digest from the same complete entry; oversized input must
+remain retained rather than be truncated. Large entries require a separate
+bounded streaming capture path. Serialized admission and fresh source revision,
+record and staged-directory identity checks are still required before execution.
+
+Restore has a fixed PreserveConflictsKeepBoth policy. The later Prepared record
+must bind the actual merge plan, conflict destinations and restore stamp before
+any effect. Purge records an explicit UserConfirmed decision, not a live deletion
+capability or protected-source override. RestorePendingDb belongs to recovery of
+an existing action and cannot start a new restore or purge request.
+
+This milestone remains initial-intent storage with retry and pre-publication
+cancellation observations. It does not execute restores or purges, capture legacy
+metadata, reserve live capacity or enable runtime admission. V11 preserves prior
+command families; V3 through V10 reject the new kinds and arguments in raw JSON
+and directly constructed records. Local validation passed 199 serialized journal
+tests (one helper ignored), including eight retained-observation tests, 50 codec,
+49 store and 15 owner tests. Library checks with and without default features,
+GPUI compilation, formatting and diff checks passed. Independent review found no
+meaningful correctness issues. Windows storage acceptance is pending. The V1
+default and SQLite schema remain unchanged.

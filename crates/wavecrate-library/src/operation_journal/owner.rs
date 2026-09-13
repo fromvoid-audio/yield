@@ -986,12 +986,12 @@ mod tests {
         OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
         ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
         RecoveryCursor, RecoveryRowOutcome, RemovalCommandArgs, RetryErrorClass, RetryLeaseId,
-        SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, StoredRelativePath,
-        StoredSourceFence, TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind,
-        UniversalIntent, WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange,
-        WaveformEditIntentArgs, WaveformEditOperationArgs, WaveformEditSettingsArgs,
-        WaveformFileRevisionObservation, WaveformOutputSpec, WaveformRenderOutputSpec,
-        WaveformSampleFormat, WaveformSourceSpec, decode,
+        SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+        StoredRelativePath, StoredSourceFence, TrashIntentArgs, UniversalCommandArgs,
+        UniversalCommandKind, UniversalIntent, WaveformDuplicateDoubleIntentArgs,
+        WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
+        WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformOutputSpec,
+        WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec, decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1436,6 +1436,48 @@ mod tests {
         (record, trash_args)
     }
 
+    fn v11_retained_restore_record(operation_id: OperationId) -> StoredOperationRecord {
+        let (v10_record, _) = v10_trash_record(operation_id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encode(&v10_record).expect("encode V10 owner fixture"))
+                .expect("parse V10 owner fixture");
+        let source_participant =
+            value["universal_intent"]["participants"]["descriptors"][0]["id"].clone();
+        value["schema_version"] = serde_json::Value::from(SCHEMA_V11);
+        value["universal_intent"]["command_kind"] = serde_json::Value::from("RestoreRetained");
+        value["universal_command_args"] = serde_json::json!({
+            "RetainedResolution": {
+                "Restore": {
+                    "observation": {
+                        "original_relative": "folder/item",
+                        "staged": {
+                            "participant_id": source_participant,
+                            "source_id": "owner-source",
+                            "relative_path": ".wavecrate_delete_staging/folder/item",
+                            "expectation": {
+                                "Directory": {
+                                    "source_revision": 7,
+                                    "filesystem_identity": "owner-staged-directory",
+                                    "modified_unix_ns": null
+                                }
+                            }
+                        },
+                        "staged_relative": "folder/item",
+                        "retained_id": "01234567-89ab-cdef-0123-456789abcdef",
+                        "stage": "Deleted",
+                        "recovery_root_kind": "LegacyDeleteStaging",
+                        "selected_entry_fingerprint": [1, 2, 3, 4, 5, 6, 7, 8,
+                            9, 10, 11, 12, 13, 14, 15, 16,
+                            17, 18, 19, 20, 21, 22, 23, 24,
+                            25, 26, 27, 28, 29, 30, 31, 32]
+                    }
+                }
+            }
+        });
+        decode(&serde_json::to_vec(&value).expect("serialize V11 owner fixture"))
+            .expect("decode V11 owner fixture")
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1654,6 +1696,50 @@ mod tests {
                 .expect("removal universal intent")
                 .command_kind(),
             UniversalCommandKind::Trash
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v11_retained_resolution_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v11-retained-resolution");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let record = v11_retained_restore_record(operation_id);
+        let mut request = client
+            .persist_intent(record)
+            .expect("retained resolution admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retained resolution result")
+            .expect("retained resolution worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("retained resolution acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+        let mut lookup = client
+            .get(operation_id)
+            .expect("retained resolution lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retained resolution lookup result")
+            .expect("retained resolution lookup worker result")
+            .expect("persisted retained resolution");
+        assert_eq!(persisted.schema_version, SCHEMA_V11);
+        assert!(matches!(
+            persisted.universal_command_args(),
+            Some(UniversalCommandArgs::RetainedResolution(_))
+        ));
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("retained resolution universal intent")
+                .command_kind(),
+            UniversalCommandKind::RestoreRetained
         );
         assert!(owner.shutdown());
     }

@@ -6,8 +6,8 @@
 //! types. V3 currently describes a newly durable intent, V4 a pre-publication cancellation
 //! request, V5 the first typed copy command and retry observations, and V6 the tagged command
 //! envelope. V7 adds a typed in-place WAV edit observation, V8 adds bounded namespace mutation
-//! observations, V9 adds whole-file render observations, and V10 adds bounded configured-trash
-//! and retained-folder removal observations.
+//! observations, V9 adds whole-file render observations, V10 adds bounded configured-trash and
+//! retained-folder removal observations, and V11 adds retained-folder resolution observations.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,6 +35,8 @@ pub const SCHEMA_V8: u32 = 8;
 pub const SCHEMA_V9: u32 = 9;
 /// The configured-trash and retained-folder removal command envelope schema.
 pub const SCHEMA_V10: u32 = 10;
+/// The retained-folder restore and purge command envelope schema.
+pub const SCHEMA_V11: u32 = 11;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
@@ -146,6 +148,10 @@ pub enum UniversalCommandKind {
     Trash,
     /// Delete an item through an explicit delete workflow.
     Delete,
+    /// Restore one existing retained folder through an explicit resolution workflow.
+    RestoreRetained,
+    /// Purge one existing retained folder through an explicit resolution workflow.
+    PurgeRetained,
     /// Apply an explicitly destructive audio edit.
     DestructiveEdit,
     /// Undo a prior user transaction.
