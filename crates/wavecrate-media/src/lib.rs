@@ -13,6 +13,7 @@ use wavecrate_core::AudioFile;
 use wavecrate_library::sample_sources::is_recognized_audio;
 
 mod detail;
+mod edit_intent;
 mod edit_preparation;
 mod edited_wav;
 mod padded_crop;
@@ -27,6 +28,9 @@ pub use detail::{
     MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
     WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
     WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
+};
+pub use edit_intent::{
+    WaveformEditIntentAdapterError, waveform_edit_intent, waveform_edit_request,
 };
 pub use edit_preparation::{
     MAX_WAV_EDIT_DECODED_BYTES, WavEditOperation, WavEditPreparationRequest, prepare_wav_edit,

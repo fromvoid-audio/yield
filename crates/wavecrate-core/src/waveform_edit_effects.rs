@@ -36,6 +36,32 @@ impl WaveformEditFade {
         })
     }
 
+    /// Construct exact finite fade parameters without normalization or clamping.
+    ///
+    /// This constructor is intended for replaying a previously validated representation. The
+    /// values must already satisfy the native domains: `length`, `curve`, and `outer_gain` must
+    /// be in `0.0..=1.0`, and `mute` must be finite and nonnegative. IEEE-754 bits, including
+    /// signed zero, are retained exactly.
+    pub fn from_exact(length: f32, curve: f32, mute: f32, outer_gain: f32) -> Option<Self> {
+        if !length.is_finite()
+            || !curve.is_finite()
+            || !mute.is_finite()
+            || !outer_gain.is_finite()
+            || !(0.0..=1.0).contains(&length)
+            || !(0.0..=1.0).contains(&curve)
+            || mute < 0.0
+            || !(0.0..=1.0).contains(&outer_gain)
+        {
+            return None;
+        }
+        Some(Self {
+            length,
+            curve,
+            mute,
+            outer_gain,
+        })
+    }
+
     /// Return the fraction of the selected span used by the inner fade.
     pub const fn length(self) -> f32 {
         self.length
@@ -98,6 +124,30 @@ impl WaveformEditSettings {
     ) -> Option<Self> {
         gain.is_finite().then_some(Self {
             gain: gain.clamp(0.0, 4.0),
+            fade_in,
+            fade_out,
+        })
+    }
+
+    /// Construct exact finite edit settings without normalization or clamping.
+    ///
+    /// Gain must already be in the native `0.0..=4.0` range. Any supplied fades must satisfy
+    /// [`WaveformEditFade::from_exact`]. IEEE-754 bits, including signed zero, are retained
+    /// exactly.
+    pub fn from_exact(
+        gain: f32,
+        fade_in: Option<WaveformEditFade>,
+        fade_out: Option<WaveformEditFade>,
+    ) -> Option<Self> {
+        if !gain.is_finite()
+            || !(0.0..=4.0).contains(&gain)
+            || fade_in.is_some_and(|fade| !fade.is_exact_valid())
+            || fade_out.is_some_and(|fade| !fade.is_exact_valid())
+        {
+            return None;
+        }
+        Some(Self {
+            gain,
             fade_in,
             fade_out,
         })
@@ -304,6 +354,19 @@ impl WaveformEditSettings {
     }
 }
 
+impl WaveformEditFade {
+    fn is_exact_valid(self) -> bool {
+        self.length.is_finite()
+            && (0.0..=1.0).contains(&self.length)
+            && self.curve.is_finite()
+            && (0.0..=1.0).contains(&self.curve)
+            && self.mute.is_finite()
+            && self.mute >= 0.0
+            && self.outer_gain.is_finite()
+            && (0.0..=1.0).contains(&self.outer_gain)
+    }
+}
+
 fn visual_fade_curve(ratio: f64, curve: f32) -> f32 {
     let t = ratio.clamp(0.0, 1.0) as f32;
     let t2 = t * t;
@@ -498,6 +561,20 @@ mod tests {
             None
         );
         assert_eq!(WaveformEditFade::new(0.0, 0.0, 0.0, f32::NAN), None);
+    }
+
+    #[test]
+    fn exact_edit_parameters_retain_signed_zero_without_clamping() {
+        let fade = WaveformEditFade::from_exact(-0.0, 0.25, -0.0, 0.75)
+            .expect("signed zero is a valid exact fade value");
+        assert_eq!(fade.length().to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(fade.mute().to_bits(), (-0.0_f32).to_bits());
+        let settings = WaveformEditSettings::from_exact(-0.0, Some(fade), None)
+            .expect("signed zero is a valid exact gain value");
+        assert_eq!(settings.gain().to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(settings.fade_in().expect("fade").outer_gain(), 0.75);
+        assert!(WaveformEditFade::from_exact(-0.1, 0.0, 0.0, 1.0).is_none());
+        assert!(WaveformEditSettings::from_exact(4.1, None, None).is_none());
     }
 
     #[test]

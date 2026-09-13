@@ -25,12 +25,14 @@ use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
-use super::coordinator::{CopyIntentArgs, RetryObservation, UniversalCommandArgs};
+use super::coordinator::{
+    CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
+};
 use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
-    SCHEMA_V6,
+    SCHEMA_V6, SCHEMA_V7,
 };
 use super::validation::{RecordConsistency, classify_record};
 
@@ -926,7 +928,209 @@ impl OperationJournalStore {
         self.persist_record_with_encoded_outcome(&record, &encoded)
     }
 
-    /// Persist a user cancellation request against a current V3, V5, or V6 universal intent.
+    /// Persist an existing tagged command in the V7 envelope and return its compatibility receipt.
+    ///
+    /// This explicit V7 entry point preserves V6 command observations while allowing a later
+    /// caller to select the V7 envelope. It does not change the older V6 adapter or grant any
+    /// execution authority.
+    pub fn persist_command_intent_v7(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v7_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist an existing tagged command in the V7 envelope with its exact write-stage outcome.
+    pub fn persist_command_intent_v7_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v7 command intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v7 command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v7 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v7_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        self.insert_intent_with_outcome(&record)
+    }
+
+    /// Persist one typed V7 in-place WAV edit and return its compatibility receipt.
+    ///
+    /// The edit arguments are bounded observations only. They do not retain a source lease,
+    /// authorize replacement, reserve capacity, or perform filesystem work. An `Err` may be
+    /// returned after COMMIT; callers that need the write-stage distinction should use
+    /// [`Self::persist_waveform_edit_intent_with_outcome`].
+    pub fn persist_waveform_edit_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        edit_args: WaveformEditIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_waveform_edit_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            edit_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one typed V7 in-place WAV edit and expose its exact write-stage outcome.
+    pub fn persist_waveform_edit_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        edit_args: WaveformEditIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v7 waveform edit intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != super::model::UniversalCommandKind::DestructiveEdit {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v7 waveform edit requires the DestructiveEdit command kind",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v7 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) = edit_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v7_waveform_edit(
+            operation_id,
+            intent,
+            universal_intent,
+            edit_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        self.insert_intent_with_outcome(&record)
+    }
+
+    /// Persist a user cancellation request against a current V3, V5, V6, or V7 universal intent.
     ///
     /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
     /// already stored for this operation is a read-only idempotent replay and returns the current
@@ -1004,7 +1208,7 @@ impl OperationJournalStore {
 
         if matches!(
             current.record.schema_version,
-            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6
+            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -1026,7 +1230,7 @@ impl OperationJournalStore {
         }
         if !matches!(
             current.record.schema_version,
-            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6
+            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -1047,12 +1251,17 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V7 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
             let expected = match current.record.schema_version {
                 SCHEMA_V5 => "V5 IntentDurable/None or RetryPending",
                 SCHEMA_V6 => "V6 IntentDurable/None or RetryPending",
+                SCHEMA_V7 => "V7 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -1110,7 +1319,7 @@ impl OperationJournalStore {
         })
     }
 
-    /// Persist the next typed V5 or V6 retry observation using a sequence compare-and-swap.
+    /// Persist the next typed V5, V6, or V7 retry observation using a sequence compare-and-swap.
     ///
     /// An identical observation already stored for the operation is a read-only idempotent
     /// replay, even when the caller still holds an older sequence. A changed observation must
@@ -1186,8 +1395,10 @@ impl OperationJournalStore {
         if current.record.disposition == OperationDisposition::CancelRequestedBeforePublish {
             return Err(OperationJournalStoreError::RetryObservationConflict { operation_id });
         }
-        if matches!(current.record.schema_version, SCHEMA_V5 | SCHEMA_V6)
-            && current.record.disposition == OperationDisposition::RetryPending
+        if matches!(
+            current.record.schema_version,
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
+        ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
             return Ok(RetryTransition::Replay(JournalRetryReceipt {
@@ -1204,7 +1415,10 @@ impl OperationJournalStore {
                 actual: current.sequence,
             });
         }
-        if !matches!(current.record.schema_version, SCHEMA_V5 | SCHEMA_V6) {
+        if !matches!(
+            current.record.schema_version,
+            SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
+        ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
             });
@@ -1217,7 +1431,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -2366,11 +2580,14 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExternalRootBindingId, ImportFileExpectation, ImportIntentArgs, ParticipantCheckpoint,
-        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
-        RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass, RetryLeaseId,
-        RetryObservation, SCHEMA_V1, SCHEMA_V6, StoredRelativePath, StoredSourceFence,
-        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation, ImportIntentArgs,
+        ParticipantCheckpoint, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
+        ParticipantSet, RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass,
+        RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7, StoredRelativePath,
+        StoredSourceFence, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
+        WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformOutputSpec,
+        WaveformSampleFormat, WaveformSourceSpec,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -2637,6 +2854,59 @@ mod tests {
             intent,
             universal_intent,
             command_args,
+            capacity_plan,
+        )
+    }
+
+    fn v7_waveform_edit_inputs() -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        WaveformEditIntentArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, intent, copy_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        let participants = copy_universal.participants().clone();
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::DestructiveEdit,
+            "operation.status.waveform-edit",
+            participants,
+        )
+        .expect("waveform edit universal intent");
+        let revision = WaveformFileRevisionObservation::new(
+            "file-identity",
+            "change-marker",
+            1024,
+            Some(12_000_000_000),
+        )
+        .expect("waveform file revision");
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
+            .expect("waveform source spec");
+        let range = WaveformEditFrameRange::new(2, 8).expect("waveform edit range");
+        let operation = WaveformEditOperationArgs::GainAndFades(
+            WaveformEditSettingsArgs::new(
+                FiniteF32Bits::new(-0.0).expect("signed zero gain"),
+                None,
+                None,
+            )
+            .expect("waveform edit settings"),
+        );
+        let edit_args = WaveformEditIntentArgs::new(
+            copy_args.source().clone(),
+            revision,
+            source_spec,
+            10,
+            range,
+            operation,
+            WaveformOutputSpec::float32(2, 48_000),
+        )
+        .expect("waveform edit arguments");
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            edit_args,
             capacity_plan,
         )
     }
@@ -3477,6 +3747,160 @@ mod tests {
             restarted.disposition,
             OperationDisposition::CancelRequestedBeforePublish
         );
+    }
+
+    #[test]
+    fn v7_waveform_edit_retry_cancel_preserve_exact_args_and_cas() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, edit_args, capacity_plan) =
+            v7_waveform_edit_inputs();
+        let inserted = store
+            .persist_waveform_edit_intent(
+                operation_id,
+                intent,
+                universal_intent,
+                edit_args.clone(),
+                capacity_plan,
+                50,
+            )
+            .expect("persist V7 waveform edit");
+        assert_eq!(inserted.sequence(), 1);
+
+        let persisted = store
+            .get(operation_id)
+            .expect("get V7 waveform edit")
+            .expect("V7 waveform edit row");
+        assert_eq!(persisted.schema_version, SCHEMA_V7);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::WaveformEdit(edit_args.clone()))
+        );
+
+        let first_retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("v7-retry-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientContention,
+            "writer_busy",
+            Some(String::from("V7 source is busy")),
+        )
+        .expect("first retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), first_retry.clone())
+            .expect("persist V7 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+
+        let (second_id, second_intent, second_universal, second_edit, second_capacity) =
+            v7_waveform_edit_inputs();
+        let second_inserted = store
+            .persist_waveform_edit_intent(
+                second_id,
+                second_intent,
+                second_universal,
+                second_edit,
+                second_capacity,
+                60,
+            )
+            .expect("persist second V7 waveform edit");
+        assert_eq!(second_inserted.sequence(), 3);
+
+        let next_retry = RetryObservation::new(
+            2,
+            54,
+            55,
+            RetryLeaseId::new("v7-retry-2").expect("next retry lease"),
+            56,
+            RetryErrorClass::TransientAvailability,
+            "source_unavailable",
+            None,
+        )
+        .expect("next retry observation");
+        assert!(matches!(
+            store.record_retry_pending(operation_id, inserted.sequence(), next_retry.clone()),
+            Err(OperationJournalStoreError::StaleSequence {
+                operation_id: actual,
+                expected: 1,
+                actual: 2
+            }) if actual == operation_id
+        ));
+        assert_eq!(journal_sequence(&store, operation_id), 2);
+
+        let next_retry_receipt = store
+            .record_retry_pending(operation_id, retry_receipt.sequence(), next_retry.clone())
+            .expect("persist second V7 retry");
+        assert_eq!(next_retry_receipt.sequence(), 4);
+        let cancellation = CancellationRequestObservation::new(57).expect("cancel observation");
+        assert!(matches!(
+            store.request_cancel_before_publish(
+                operation_id,
+                retry_receipt.sequence(),
+                cancellation
+            ),
+            Err(OperationJournalStoreError::StaleSequence {
+                operation_id: actual,
+                expected: 2,
+                actual: 4
+            }) if actual == operation_id
+        ));
+        let cancel_receipt = store
+            .request_cancel_before_publish(
+                operation_id,
+                next_retry_receipt.sequence(),
+                cancellation,
+            )
+            .expect("persist V7 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 5);
+
+        let canceled = store
+            .get(operation_id)
+            .expect("get canceled V7 waveform edit")
+            .expect("canceled V7 waveform edit row");
+        assert_eq!(canceled.schema_version, SCHEMA_V7);
+        assert_eq!(
+            canceled.universal_command_args(),
+            Some(&UniversalCommandArgs::WaveformEdit(edit_args.clone()))
+        );
+        assert_eq!(canceled.retry_observation(), Some(&next_retry));
+        assert_eq!(canceled.cancellation_request(), Some(&cancellation));
+        assert_eq!(
+            journal_sequence(&store, operation_id),
+            cancel_receipt.sequence()
+        );
+
+        let replay = store
+            .request_cancel_before_publish(
+                operation_id,
+                inserted.sequence(),
+                CancellationRequestObservation::new(57).expect("same cancellation"),
+            )
+            .expect("replay V7 cancellation");
+        assert_eq!(replay, cancel_receipt);
+        assert_eq!(journal_sequence(&store, operation_id), 5);
+
+        let differing = CancellationRequestObservation::new(58).expect("different cancellation");
+        assert!(matches!(
+            store.request_cancel_before_publish(operation_id, inserted.sequence(), differing),
+            Err(OperationJournalStoreError::CancellationConflict { operation_id: actual })
+                if actual == operation_id
+        ));
+        assert_eq!(journal_sequence(&store, operation_id), 5);
+
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V7 waveform edit")
+            .expect("restarted V7 waveform edit row");
+        assert_eq!(restarted.schema_version, SCHEMA_V7);
+        assert_eq!(
+            restarted.universal_command_args(),
+            Some(&UniversalCommandArgs::WaveformEdit(edit_args))
+        );
+        assert_eq!(restarted.retry_observation(), Some(&next_retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 
 use super::codec::{
     StoredOperationRecord, validate_v3_initial_shape, validate_v4_cancel_shape,
-    validate_v5_coordinator_shape, validate_v6_coordinator_shape,
+    validate_v5_coordinator_shape, validate_v6_coordinator_shape, validate_v7_coordinator_shape,
 };
 use super::evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalCapabilityScope, AbsentFinalObservation,
@@ -23,7 +23,7 @@ use super::evidence::{
 };
 use super::model::{
     OperationDisposition, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
-    SCHEMA_V6,
+    SCHEMA_V6, SCHEMA_V7,
 };
 use crate::durable_capacity::{
     DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, round_up_allocation,
@@ -61,7 +61,7 @@ enum RecordValidation {
 fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidation, String> {
     if !matches!(
         record.schema_version,
-        SCHEMA_V1 | SCHEMA_V2 | SCHEMA_V3 | SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6
+        SCHEMA_V1 | SCHEMA_V2 | SCHEMA_V3 | SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6 | SCHEMA_V7
     ) {
         return Err(format!(
             "unsupported operation journal schema version: {}",
@@ -86,6 +86,11 @@ fn validate_record_inner(record: &StoredOperationRecord) -> Result<RecordValidat
     }
     if record.schema_version == SCHEMA_V6 {
         validate_v6_coordinator_shape(record)?;
+        validate_capacity_plan_option(record.capacity_plan.as_ref())?;
+        return Ok(RecordValidation::Consistent);
+    }
+    if record.schema_version == SCHEMA_V7 {
+        validate_v7_coordinator_shape(record)?;
         validate_capacity_plan_option(record.capacity_plan.as_ref())?;
         return Ok(RecordValidation::Consistent);
     }

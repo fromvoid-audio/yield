@@ -83,6 +83,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p wavecrate-session -p wavecrate-catalog --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test durable waveform edit adapters
+        if: inputs.scope == 'storage'
+        shell: pwsh
+        run: |
+          cargo test --locked -p wavecrate-core --lib waveform_edit_effects
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p wavecrate-media --lib edit_intent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test audio, core, media and native platform
         if: inputs.scope != 'storage'
         run: cargo test --locked -p reson -p wavecrate-core -p wavecrate-media -p wavecrate-platform --lib

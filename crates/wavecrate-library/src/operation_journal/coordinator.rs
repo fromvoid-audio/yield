@@ -781,6 +781,683 @@ pub enum ImportIntentValidationError {
     Participants(#[from] ParticipantValidationError),
 }
 
+/// Maximum byte length of a stored waveform file identity observation.
+pub const MAX_WAVEFORM_FILE_IDENTITY_BYTES: usize = 256;
+/// Maximum byte length of a stored waveform change-marker observation.
+pub const MAX_WAVEFORM_CHANGE_MARKER_BYTES: usize = 256;
+/// Maximum number of source frames representable by the journal edit envelope.
+pub const MAX_WAVEFORM_EDIT_FRAMES: u64 = u32::MAX as u64;
+
+/// Exact finite IEEE-754 single-precision value stored as its bit pattern.
+///
+/// Persisting the bits rather than a decimal float keeps journal replay equality exact, including
+/// signed zero. The value is still an observation and carries no audio or execution authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct FiniteF32Bits(u32);
+
+impl FiniteF32Bits {
+    /// Construct an exact finite value, retaining its IEEE-754 bit pattern.
+    pub fn new(value: f32) -> Result<Self, WaveformEditValidationError> {
+        if value.is_finite() {
+            Ok(Self(value.to_bits()))
+        } else {
+            Err(WaveformEditValidationError::NonFiniteFloat)
+        }
+    }
+
+    /// Wrap a bit pattern after checking that it represents a finite value.
+    pub fn from_bits(bits: u32) -> Result<Self, WaveformEditValidationError> {
+        Self::new(f32::from_bits(bits))
+    }
+
+    /// Return the exact stored IEEE-754 bit pattern.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Return the represented finite value.
+    pub fn value(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+
+    fn in_range(self, minimum: f32, maximum: f32) -> bool {
+        let value = self.value();
+        value.is_finite() && (minimum..=maximum).contains(&value)
+    }
+}
+
+/// Stored WAV source sample representation used by an edit observation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WaveformSampleFormat {
+    /// Integer PCM samples.
+    Integer,
+    /// IEEE-754 single-precision samples.
+    Float,
+}
+
+/// Bounded source WAV specification captured with an edit request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformSourceSpec {
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    sample_format: WaveformSampleFormat,
+}
+
+impl WaveformSourceSpec {
+    /// Construct a source specification supported by the bounded WAV span reader.
+    pub fn new(
+        channels: u16,
+        sample_rate: u32,
+        bits_per_sample: u16,
+        sample_format: WaveformSampleFormat,
+    ) -> Result<Self, WaveformEditValidationError> {
+        let spec = Self {
+            channels,
+            sample_rate,
+            bits_per_sample,
+            sample_format,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Validate a source specification recovered from an untrusted record.
+    pub fn validate(self) -> Result<(), WaveformEditValidationError> {
+        if self.channels == 0 || self.sample_rate == 0 {
+            return Err(WaveformEditValidationError::InvalidSourceSpec);
+        }
+        let supported = match self.sample_format {
+            WaveformSampleFormat::Integer => matches!(self.bits_per_sample, 8 | 16 | 24 | 32),
+            WaveformSampleFormat::Float => self.bits_per_sample == 32,
+        };
+        if !supported {
+            Err(WaveformEditValidationError::InvalidSourceSpec)
+        } else {
+            let bytes_per_sample = u64::from(self.bits_per_sample / 8);
+            let block_align = u64::from(self.channels).checked_mul(bytes_per_sample);
+            let byte_rate =
+                block_align.and_then(|align| u64::from(self.sample_rate).checked_mul(align));
+            if block_align.is_some_and(|align| align > u64::from(u16::MAX))
+                || byte_rate.is_some_and(|rate| rate > u64::from(u32::MAX))
+            {
+                Err(WaveformEditValidationError::InvalidSourceSpec)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Return the source channel count.
+    pub const fn channels(self) -> u16 {
+        self.channels
+    }
+
+    /// Return the source sample rate.
+    pub const fn sample_rate(self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Return the source bit depth.
+    pub const fn bits_per_sample(self) -> u16 {
+        self.bits_per_sample
+    }
+
+    /// Return the source sample representation.
+    pub const fn sample_format(self) -> WaveformSampleFormat {
+        self.sample_format
+    }
+}
+
+/// Output encoding supported by the durable edit observation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WaveformOutputEncoding {
+    /// Native edited-WAV output: IEEE-754 single-precision samples.
+    Float32,
+}
+
+/// Bounded output specification for an edit request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformOutputSpec {
+    encoding: WaveformOutputEncoding,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl WaveformOutputSpec {
+    /// Construct the explicit Float32 output retained by the media edit writer.
+    pub const fn float32(channels: u16, sample_rate: u32) -> Self {
+        Self {
+            encoding: WaveformOutputEncoding::Float32,
+            channels,
+            sample_rate,
+        }
+    }
+
+    /// Validate output shape and its equality to the source's channel/rate contract.
+    pub fn validate_against_source(
+        self,
+        source: WaveformSourceSpec,
+    ) -> Result<(), WaveformEditValidationError> {
+        source.validate()?;
+        if self.encoding != WaveformOutputEncoding::Float32
+            || self.channels == 0
+            || self.sample_rate == 0
+            || self.channels != source.channels
+            || self.sample_rate != source.sample_rate
+        {
+            return Err(WaveformEditValidationError::InvalidOutputSpec);
+        }
+        let block_align = u64::from(self.channels).checked_mul(4);
+        let byte_rate =
+            block_align.and_then(|align| u64::from(self.sample_rate).checked_mul(align));
+        if block_align.is_none_or(|align| align == 0 || align > u64::from(u16::MAX))
+            || byte_rate.is_none_or(|rate| rate > u64::from(u32::MAX))
+        {
+            return Err(WaveformEditValidationError::InvalidOutputSpec);
+        }
+        Ok(())
+    }
+
+    /// Return the output encoding.
+    pub const fn encoding(self) -> WaveformOutputEncoding {
+        self.encoding
+    }
+
+    /// Return the output channel count.
+    pub const fn channels(self) -> u16 {
+        self.channels
+    }
+
+    /// Return the output sample rate.
+    pub const fn sample_rate(self) -> u32 {
+        self.sample_rate
+    }
+}
+
+/// Strong file revision observation carried by a durable WAV edit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformFileRevisionObservation {
+    filesystem_identity: String,
+    change_marker: String,
+    byte_len: u64,
+    modified_unix_ns: Option<i64>,
+}
+
+impl WaveformFileRevisionObservation {
+    /// Construct a bounded file revision observation without opening the file.
+    pub fn new(
+        filesystem_identity: impl Into<String>,
+        change_marker: impl Into<String>,
+        byte_len: u64,
+        modified_unix_ns: Option<i64>,
+    ) -> Result<Self, WaveformEditValidationError> {
+        let revision = Self {
+            filesystem_identity: filesystem_identity.into(),
+            change_marker: change_marker.into(),
+            byte_len,
+            modified_unix_ns,
+        };
+        revision.validate()?;
+        Ok(revision)
+    }
+
+    /// Validate a revision recovered from an untrusted record.
+    pub fn validate(&self) -> Result<(), WaveformEditValidationError> {
+        validate_bounded_text(&self.filesystem_identity, MAX_WAVEFORM_FILE_IDENTITY_BYTES)
+            .map_err(|_| WaveformEditValidationError::InvalidFileRevision)?;
+        validate_bounded_text(&self.change_marker, MAX_WAVEFORM_CHANGE_MARKER_BYTES)
+            .map_err(|_| WaveformEditValidationError::InvalidFileRevision)?;
+        Ok(())
+    }
+
+    /// Return the stable filesystem object identity observation.
+    pub fn filesystem_identity(&self) -> &str {
+        &self.filesystem_identity
+    }
+
+    /// Return the source change-marker observation.
+    pub fn change_marker(&self) -> &str {
+        &self.change_marker
+    }
+
+    /// Return the observed byte length.
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    /// Return the checked signed Unix nanosecond timestamp, when available.
+    pub const fn modified_unix_ns(&self) -> Option<i64> {
+        self.modified_unix_ns
+    }
+}
+
+/// Exact half-open source frame range retained by a WAV edit observation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformEditFrameRange {
+    start_frame: u64,
+    end_frame: u64,
+}
+
+impl WaveformEditFrameRange {
+    /// Construct a non-empty bounded frame range.
+    pub const fn new(
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Self, WaveformEditValidationError> {
+        if start_frame < end_frame {
+            Ok(Self {
+                start_frame,
+                end_frame,
+            })
+        } else {
+            Err(WaveformEditValidationError::InvalidFrameRange)
+        }
+    }
+
+    /// Return the first included source frame.
+    pub const fn start_frame(self) -> u64 {
+        self.start_frame
+    }
+
+    /// Return the exclusive source frame bound.
+    pub const fn end_frame(self) -> u64 {
+        self.end_frame
+    }
+
+    /// Return the checked number of frames in this range.
+    pub fn len(self) -> Result<u64, WaveformEditValidationError> {
+        self.end_frame
+            .checked_sub(self.start_frame)
+            .ok_or(WaveformEditValidationError::InvalidFrameRange)
+    }
+}
+
+/// Exact fade parameters retained by a durable WAV edit.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformEditFadeArgs {
+    length: FiniteF32Bits,
+    curve: FiniteF32Bits,
+    mute: FiniteF32Bits,
+    outer_gain: FiniteF32Bits,
+}
+
+impl WaveformEditFadeArgs {
+    /// Construct exact fade parameters without clamping or changing signed zero.
+    pub fn new(
+        length: FiniteF32Bits,
+        curve: FiniteF32Bits,
+        mute: FiniteF32Bits,
+        outer_gain: FiniteF32Bits,
+    ) -> Result<Self, WaveformEditValidationError> {
+        let fade = Self {
+            length,
+            curve,
+            mute,
+            outer_gain,
+        };
+        fade.validate()?;
+        Ok(fade)
+    }
+
+    /// Validate exact fade parameters recovered from an untrusted record.
+    pub fn validate(self) -> Result<(), WaveformEditValidationError> {
+        if !self.length.in_range(0.0, 1.0)
+            || !self.curve.in_range(0.0, 1.0)
+            || self.mute.value() < 0.0
+            || !self.mute.value().is_finite()
+            || !self.outer_gain.in_range(0.0, 1.0)
+        {
+            return Err(WaveformEditValidationError::InvalidFade);
+        }
+        Ok(())
+    }
+
+    /// Return the normalized fade length.
+    pub const fn length(self) -> FiniteF32Bits {
+        self.length
+    }
+
+    /// Return the fade curve.
+    pub const fn curve(self) -> FiniteF32Bits {
+        self.curve
+    }
+
+    /// Return the mute amount.
+    pub const fn mute(self) -> FiniteF32Bits {
+        self.mute
+    }
+
+    /// Return the outer gain.
+    pub const fn outer_gain(self) -> FiniteF32Bits {
+        self.outer_gain
+    }
+}
+
+/// Exact gain and fade parameters retained by a durable WAV edit.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformEditSettingsArgs {
+    gain: FiniteF32Bits,
+    fade_in: Option<WaveformEditFadeArgs>,
+    fade_out: Option<WaveformEditFadeArgs>,
+}
+
+impl WaveformEditSettingsArgs {
+    /// Construct exact settings without clamping or changing signed zero.
+    pub fn new(
+        gain: FiniteF32Bits,
+        fade_in: Option<WaveformEditFadeArgs>,
+        fade_out: Option<WaveformEditFadeArgs>,
+    ) -> Result<Self, WaveformEditValidationError> {
+        let settings = Self {
+            gain,
+            fade_in,
+            fade_out,
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// Validate settings recovered from an untrusted record.
+    pub fn validate(self) -> Result<(), WaveformEditValidationError> {
+        if !self.gain.in_range(0.0, 4.0) {
+            return Err(WaveformEditValidationError::InvalidGain);
+        }
+        if let Some(fade) = self.fade_in {
+            fade.validate()?;
+        }
+        if let Some(fade) = self.fade_out {
+            fade.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Return the exact gain value.
+    pub const fn gain(self) -> FiniteF32Bits {
+        self.gain
+    }
+
+    /// Return exact fade-in settings, when present.
+    pub const fn fade_in(self) -> Option<WaveformEditFadeArgs> {
+        self.fade_in
+    }
+
+    /// Return exact fade-out settings, when present.
+    pub const fn fade_out(self) -> Option<WaveformEditFadeArgs> {
+        self.fade_out
+    }
+}
+
+/// One of the seven bounded waveform edit operations supported by the media editor.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub enum WaveformEditOperationArgs {
+    /// Apply exact gain and optional fades to the selected range.
+    GainAndFades(WaveformEditSettingsArgs),
+    /// Reverse the selected range.
+    Reverse,
+    /// Mute the selected range.
+    Mute,
+    /// Remove the selected range.
+    Trim,
+    /// Retain only the selected range.
+    Crop,
+    /// Cyclically slide the whole source by exact signed frames.
+    Slide {
+        /// Signed cyclic frame offset.
+        frame_offset: i64,
+    },
+    /// Retain/pad signed bounds around the whole source.
+    CropWithSilence {
+        /// Inclusive signed source-relative start bound.
+        start_frame: i64,
+        /// Exclusive signed source-relative end bound.
+        end_frame: i64,
+    },
+}
+
+impl WaveformEditOperationArgs {
+    fn output_frames(
+        self,
+        total_frames: u64,
+        range: WaveformEditFrameRange,
+    ) -> Result<u64, WaveformEditValidationError> {
+        let range_len = range.len()?;
+        if range.start_frame >= range.end_frame
+            || range.end_frame > total_frames
+            || total_frames == 0
+        {
+            return Err(WaveformEditValidationError::InvalidFrameRange);
+        }
+        match self {
+            Self::GainAndFades(settings) => {
+                settings.validate()?;
+                Ok(total_frames)
+            }
+            Self::Reverse | Self::Mute => Ok(total_frames),
+            Self::Slide { .. } => {
+                if matches!(self, Self::Slide { .. })
+                    && (range.start_frame != 0 || range.end_frame != total_frames)
+                {
+                    return Err(WaveformEditValidationError::WholeSourceRequired);
+                }
+                Ok(total_frames)
+            }
+            Self::Trim => {
+                if range_len == total_frames {
+                    return Err(WaveformEditValidationError::EmptyOutput);
+                }
+                total_frames
+                    .checked_sub(range_len)
+                    .ok_or(WaveformEditValidationError::InvalidFrameRange)
+            }
+            Self::Crop => Ok(range_len),
+            Self::CropWithSilence {
+                start_frame,
+                end_frame,
+            } => {
+                if range.start_frame != 0 || range.end_frame != total_frames {
+                    return Err(WaveformEditValidationError::WholeSourceRequired);
+                }
+                let output = i128::from(end_frame) - i128::from(start_frame);
+                if output <= 0 || output > i128::from(MAX_WAVEFORM_EDIT_FRAMES) {
+                    return Err(WaveformEditValidationError::InvalidSignedFrameBounds);
+                }
+                u64::try_from(output)
+                    .map_err(|_| WaveformEditValidationError::InvalidSignedFrameBounds)
+            }
+        }
+    }
+}
+
+/// Complete storage-neutral typed intent for one in-place WAV edit.
+///
+/// The source endpoint, revision, operation, and output are observations captured before a
+/// later owner performs its own live source and filesystem checks. This value contains no path,
+/// open handle, source lease, capacity reservation, or permission to replace a file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaveformEditIntentArgs {
+    source: CopyEndpoint,
+    source_file_revision: WaveformFileRevisionObservation,
+    source_spec: WaveformSourceSpec,
+    total_frames: u64,
+    range: WaveformEditFrameRange,
+    operation: WaveformEditOperationArgs,
+    output: WaveformOutputSpec,
+}
+
+impl WaveformEditIntentArgs {
+    /// Construct a bounded edit observation without acquiring any live capability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source: CopyEndpoint,
+        source_file_revision: WaveformFileRevisionObservation,
+        source_spec: WaveformSourceSpec,
+        total_frames: u64,
+        range: WaveformEditFrameRange,
+        operation: WaveformEditOperationArgs,
+        output: WaveformOutputSpec,
+    ) -> Result<Self, WaveformEditValidationError> {
+        let args = Self {
+            source,
+            source_file_revision,
+            source_spec,
+            total_frames,
+            range,
+            operation,
+            output,
+        };
+        args.validate_shape()?;
+        Ok(args)
+    }
+
+    /// Validate source roles and the required filesystem participant.
+    pub fn validate_against_participants(
+        &self,
+        participants: &ParticipantSet,
+    ) -> Result<(), WaveformEditValidationError> {
+        self.validate_shape()?;
+        participants.validate_for_new_intent()?;
+        CopyIntentArgs::validate_endpoint(participants, CopyEndpointRole::Source, &self.source)
+            .map_err(WaveformEditValidationError::SourceParticipant)?;
+        if !participants.descriptors().iter().any(|descriptor| {
+            descriptor.kind() == ParticipantKind::Filesystem
+                && descriptor.requirement() == ParticipantRequirement::Required
+        }) {
+            return Err(WaveformEditValidationError::RequiredFilesystemParticipantMissing);
+        }
+        Ok(())
+    }
+
+    /// Return the source database endpoint observation.
+    pub fn source(&self) -> &CopyEndpoint {
+        &self.source
+    }
+
+    /// Return the strong file revision observation.
+    pub fn source_file_revision(&self) -> &WaveformFileRevisionObservation {
+        &self.source_file_revision
+    }
+
+    /// Return the source WAV specification.
+    pub const fn source_spec(&self) -> WaveformSourceSpec {
+        self.source_spec
+    }
+
+    /// Return the captured source frame count.
+    pub const fn total_frames(&self) -> u64 {
+        self.total_frames
+    }
+
+    /// Return the exact selected source frame range.
+    pub const fn range(&self) -> WaveformEditFrameRange {
+        self.range
+    }
+
+    /// Return the typed edit operation.
+    pub const fn operation(&self) -> WaveformEditOperationArgs {
+        self.operation
+    }
+
+    /// Return the explicit Float32 output specification.
+    pub const fn output(&self) -> WaveformOutputSpec {
+        self.output
+    }
+
+    fn validate_shape(&self) -> Result<(), WaveformEditValidationError> {
+        self.source
+            .relative_path()
+            .validate()
+            .map_err(WaveformEditValidationError::InvalidPath)?;
+        validate_source_id(self.source.source_id())
+            .map_err(WaveformEditValidationError::InvalidSourceIdentity)?;
+        self.source_file_revision.validate()?;
+        self.source_spec.validate()?;
+        if self.total_frames == 0 || self.total_frames > MAX_WAVEFORM_EDIT_FRAMES {
+            return Err(WaveformEditValidationError::InvalidFrameCount);
+        }
+        let output_frames = self
+            .operation
+            .output_frames(self.total_frames, self.range)?;
+        self.output.validate_against_source(self.source_spec)?;
+        let samples = output_frames
+            .checked_mul(u64::from(self.output.channels()))
+            .ok_or(WaveformEditValidationError::OutputArithmeticOverflow)?;
+        let output_bytes = samples
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(60))
+            .ok_or(WaveformEditValidationError::OutputArithmeticOverflow)?;
+        if output_bytes > u64::from(u32::MAX) {
+            return Err(WaveformEditValidationError::OutputArithmeticOverflow);
+        }
+        Ok(())
+    }
+}
+
+/// Failure while constructing or validating a typed waveform edit observation.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum WaveformEditValidationError {
+    /// A source endpoint path is not portable.
+    #[error("invalid waveform edit source path: {0}")]
+    InvalidPath(#[from] StoredRelativePathError),
+    /// A source identity is outside its bounded contract.
+    #[error("waveform edit source identity is invalid")]
+    InvalidSourceIdentity(CopyIntentValidationError),
+    /// The strong file revision is malformed or outside its bound.
+    #[error("waveform edit file revision is invalid")]
+    InvalidFileRevision,
+    /// The source WAV specification is unsupported or malformed.
+    #[error("waveform edit source specification is invalid")]
+    InvalidSourceSpec,
+    /// The output is not explicit Float32 matching the source rate/channels.
+    #[error("waveform edit output specification is invalid")]
+    InvalidOutputSpec,
+    /// The captured source frame count is outside its bound.
+    #[error("waveform edit frame count is invalid")]
+    InvalidFrameCount,
+    /// The selected frame range is empty or outside the source.
+    #[error("waveform edit frame range is invalid")]
+    InvalidFrameRange,
+    /// The operation requires a whole-source range.
+    #[error("waveform edit operation requires the whole source range")]
+    WholeSourceRequired,
+    /// The operation would leave no output frames.
+    #[error("waveform edit would leave no output frames")]
+    EmptyOutput,
+    /// Signed padded-crop bounds do not describe a representable output.
+    #[error("waveform edit signed frame bounds are invalid")]
+    InvalidSignedFrameBounds,
+    /// Output sample or byte arithmetic exceeded its checked bounds.
+    #[error("waveform edit output arithmetic overflowed its bound")]
+    OutputArithmeticOverflow,
+    /// Gain settings contain a value outside the exact domain.
+    #[error("waveform edit gain is invalid")]
+    InvalidGain,
+    /// Fade settings contain a value outside the exact domain.
+    #[error("waveform edit fade is invalid")]
+    InvalidFade,
+    /// A stored float was NaN or infinite.
+    #[error("waveform edit float is not finite")]
+    NonFiniteFloat,
+    /// The source participant could not be resolved to a required fenced database.
+    #[error("invalid waveform edit source participant: {0}")]
+    SourceParticipant(#[source] CopyIntentValidationError),
+    /// A required filesystem participant was absent.
+    #[error("waveform edit requires a required Filesystem participant")]
+    RequiredFilesystemParticipantMissing,
+    /// Participant shape validation failed.
+    #[error("invalid waveform edit participants: {0}")]
+    Participants(#[from] ParticipantValidationError),
+}
+
 /// Typed V6 command arguments for the supported regular-file coordinator commands.
 ///
 /// These are bounded observations. They contain no open roots, source leases, capacity
@@ -794,6 +1471,8 @@ pub enum UniversalCommandArgs {
     Import(ImportIntentArgs),
     /// Duplicate one source-database file into another leaf in the same parent directory.
     DuplicateSame(CopyIntentArgs),
+    /// Apply one bounded in-place WAV edit to a source-database file.
+    WaveformEdit(WaveformEditIntentArgs),
 }
 
 impl UniversalCommandArgs {
@@ -803,6 +1482,7 @@ impl UniversalCommandArgs {
             Self::Copy(_) => super::model::UniversalCommandKind::Copy,
             Self::Import(_) => super::model::UniversalCommandKind::Import,
             Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
+            Self::WaveformEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
         }
     }
 
@@ -821,6 +1501,9 @@ impl UniversalCommandArgs {
             Self::DuplicateSame(args) => args
                 .validate_as_duplicate_same_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::DuplicateSame),
+            Self::WaveformEdit(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::WaveformEdit),
         }
     }
 }
@@ -837,6 +1520,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A same-source DuplicateSame argument failed validation.
     #[error("invalid DuplicateSame command arguments: {0}")]
     DuplicateSame(#[source] CopyIntentValidationError),
+    /// A bounded in-place waveform edit argument failed validation.
+    #[error("invalid WaveformEdit command arguments: {0}")]
+    WaveformEdit(#[source] WaveformEditValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.
@@ -1112,8 +1798,228 @@ pub(crate) fn validate_persisted_universal_command_args_value(
     match variant.as_str() {
         "Copy" | "DuplicateSame" => validate_persisted_copy_intent_value(arguments),
         "Import" => validate_persisted_import_intent_value(arguments),
+        "WaveformEdit" => validate_persisted_waveform_edit_value(arguments),
         _ => Err("persisted command arguments contain an unknown variant"),
     }
+}
+
+/// Validate the strict V7 waveform-edit command-arguments JSON boundary before typed
+/// deserialization. Keeping this boundary borrowed avoids cloning untrusted payloads merely to
+/// validate them; the outer record-size and depth checks remain the codec's responsibility.
+pub(crate) fn validate_persisted_waveform_edit_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "source",
+            "source_file_revision",
+            "source_spec",
+            "total_frames",
+            "range",
+            "operation",
+            "output",
+        ],
+    )?;
+    for field in [
+        "source",
+        "source_file_revision",
+        "source_spec",
+        "total_frames",
+        "range",
+        "operation",
+        "output",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_copy_endpoint_value(required_field(object, "source")?)?;
+
+    let revision = strict_object(
+        required_field(object, "source_file_revision")?,
+        &[
+            "filesystem_identity",
+            "change_marker",
+            "byte_len",
+            "modified_unix_ns",
+        ],
+    )?;
+    for field in [
+        "filesystem_identity",
+        "change_marker",
+        "byte_len",
+        "modified_unix_ns",
+    ] {
+        required_field(revision, field)?;
+    }
+    for (field, maximum) in [
+        ("filesystem_identity", MAX_WAVEFORM_FILE_IDENTITY_BYTES),
+        ("change_marker", MAX_WAVEFORM_CHANGE_MARKER_BYTES),
+    ] {
+        let text = required_field(revision, field)?
+            .as_str()
+            .ok_or("waveform edit file revision identity must be a string")?;
+        if validate_bounded_text(text, maximum).is_err() {
+            return Err("waveform edit file revision identity is outside its bound");
+        }
+    }
+    required_field(revision, "byte_len")?
+        .as_u64()
+        .ok_or("waveform edit file byte length must be an unsigned integer")?;
+    let modified = required_field(revision, "modified_unix_ns")?;
+    if !modified.is_null() && modified.as_i64().is_none() {
+        return Err("waveform edit modified timestamp must be a signed integer or null");
+    }
+
+    let source_spec = strict_object(
+        required_field(object, "source_spec")?,
+        &[
+            "channels",
+            "sample_rate",
+            "bits_per_sample",
+            "sample_format",
+        ],
+    )?;
+    for field in [
+        "channels",
+        "sample_rate",
+        "bits_per_sample",
+        "sample_format",
+    ] {
+        required_field(source_spec, field)?;
+    }
+    let channels = required_field(source_spec, "channels")?
+        .as_u64()
+        .ok_or("waveform edit source channels must be an unsigned integer")?;
+    let sample_rate = required_field(source_spec, "sample_rate")?
+        .as_u64()
+        .ok_or("waveform edit source rate must be an unsigned integer")?;
+    let bits = required_field(source_spec, "bits_per_sample")?
+        .as_u64()
+        .ok_or("waveform edit source bit depth must be an unsigned integer")?;
+    let format = required_field(source_spec, "sample_format")?
+        .as_str()
+        .ok_or("waveform edit source format must be a string")?;
+    if channels == 0
+        || channels > u64::from(u16::MAX)
+        || sample_rate == 0
+        || sample_rate > u64::from(u32::MAX)
+        || bits > u64::from(u16::MAX)
+        || !matches!(format, "Integer" | "Float")
+    {
+        return Err("waveform edit source specification is invalid");
+    }
+    if (format == "Integer" && !matches!(bits, 8 | 16 | 24 | 32))
+        || (format == "Float" && bits != 32)
+    {
+        return Err("waveform edit source specification is unsupported");
+    }
+
+    let total_frames = required_field(object, "total_frames")?
+        .as_u64()
+        .ok_or("waveform edit total frames must be an unsigned integer")?;
+    if total_frames == 0 || total_frames > MAX_WAVEFORM_EDIT_FRAMES {
+        return Err("waveform edit total frames are outside their bound");
+    }
+    let range = strict_object(
+        required_field(object, "range")?,
+        &["start_frame", "end_frame"],
+    )?;
+    for field in ["start_frame", "end_frame"] {
+        required_field(range, field)?
+            .as_u64()
+            .ok_or("waveform edit frame range must use unsigned integers")?;
+    }
+    let start = required_field(range, "start_frame")?.as_u64().unwrap_or(0);
+    let end = required_field(range, "end_frame")?.as_u64().unwrap_or(0);
+    if start >= end || end > total_frames {
+        return Err("waveform edit frame range is invalid");
+    }
+    validate_persisted_waveform_operation_value(required_field(object, "operation")?)?;
+
+    let output = strict_object(
+        required_field(object, "output")?,
+        &["encoding", "channels", "sample_rate"],
+    )?;
+    for field in ["encoding", "channels", "sample_rate"] {
+        required_field(output, field)?;
+    }
+    if required_field(output, "encoding")?.as_str() != Some("Float32")
+        || required_field(output, "channels")?.as_u64() != Some(channels)
+        || required_field(output, "sample_rate")?.as_u64() != Some(sample_rate)
+    {
+        return Err("waveform edit output specification does not match source");
+    }
+    Ok(())
+}
+
+fn validate_persisted_waveform_operation_value(value: &Value) -> Result<(), &'static str> {
+    if let Some(variant) = value.as_str() {
+        return if matches!(variant, "Reverse" | "Mute" | "Trim" | "Crop") {
+            Ok(())
+        } else {
+            Err("waveform edit operation unit variant is unsupported")
+        };
+    }
+    let object = value
+        .as_object()
+        .ok_or("waveform edit operation must be a tagged value")?;
+    if object.len() != 1 {
+        return Err("waveform edit operation must contain exactly one variant");
+    }
+    let (variant, arguments) = object
+        .iter()
+        .next()
+        .ok_or("waveform edit operation must contain exactly one variant")?;
+    match variant.as_str() {
+        "GainAndFades" => validate_persisted_waveform_settings_value(arguments),
+        "Slide" => {
+            let object = strict_object(arguments, &["frame_offset"])?;
+            required_field(object, "frame_offset")?
+                .as_i64()
+                .ok_or("waveform edit slide offset must be a signed integer")?;
+            Ok(())
+        }
+        "CropWithSilence" => {
+            let object = strict_object(arguments, &["start_frame", "end_frame"])?;
+            let start = required_field(object, "start_frame")?
+                .as_i64()
+                .ok_or("waveform edit padded crop start must be a signed integer")?;
+            let end = required_field(object, "end_frame")?
+                .as_i64()
+                .ok_or("waveform edit padded crop end must be a signed integer")?;
+            if end <= start {
+                return Err("waveform edit padded crop bounds are invalid");
+            }
+            Ok(())
+        }
+        _ => Err("waveform edit operation contains an unknown variant"),
+    }
+}
+
+fn validate_persisted_waveform_settings_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(value, &["gain", "fade_in", "fade_out"])?;
+    for field in ["gain", "fade_in", "fade_out"] {
+        required_field(object, field)?;
+    }
+    validate_persisted_finite_f32_bits(required_field(object, "gain")?)?;
+    for field in ["fade_in", "fade_out"] {
+        let fade = required_field(object, field)?;
+        if !fade.is_null() {
+            let fade = strict_object(fade, &["length", "curve", "mute", "outer_gain"])?;
+            for field in ["length", "curve", "mute", "outer_gain"] {
+                validate_persisted_finite_f32_bits(required_field(fade, field)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_finite_f32_bits(value: &Value) -> Result<(), &'static str> {
+    let bits = value
+        .as_u64()
+        .ok_or("waveform edit float must be an unsigned bit pattern")?;
+    if bits > u64::from(u32::MAX) || !f32::from_bits(bits as u32).is_finite() {
+        return Err("waveform edit float is not a finite f32 bit pattern");
+    }
+    Ok(())
 }
 
 fn validate_persisted_import_intent_value(value: &Value) -> Result<(), &'static str> {

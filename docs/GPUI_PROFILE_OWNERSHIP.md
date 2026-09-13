@@ -699,3 +699,40 @@ These are stored command observations, not runtime admission or permission to
 read or write a file. The SQLite schema and legacy default record version remain
 unchanged. Duplicate Double, rendering/edit recipes, later execution checkpoints,
 live capacity ownership and startup replay remain separate implementation work.
+
+## V7 exact WAV edit observations (OPT-1337)
+
+The next explicit journal envelope adds the seven operations already supported by
+WAV edit preparation: gain/fades, reverse, mute, trim, crop, whole-file slide and
+signed crop with silence padding. It retains the source participant and relative
+locator, strong file identity and change marker, optional exact modification time,
+source format/frame count, exact selection, operation parameters and float32 output
+layout. It does not persist the absolute media path or display normalization gains.
+
+Edit parameters use validated IEEE-754 bit patterns so replay preserves signed
+zero and does not depend on decimal float formatting. Existing interactive core
+constructors retain their normalization behavior; additive exact constructors
+reject out-of-domain or nonfinite parameters without clamping. Source and output
+WAV layout arithmetic is checked separately. Reverse and mute preserve the whole
+file; trim and crop change its length. Empty decoded selections are invalid.
+
+The media adapters perform no filesystem I/O. Reconstructing a preparation request
+compares the caller's context against the stored revision, format and frame count.
+This equality is an observation check, not proof of current ownership. The existing
+renderer still checks the live source before decoding, before output and after
+finalization. A successful prepared output remains unpublished.
+
+This milestone remains at initial durable intent with retry/cancellation
+observations. Replacement qualification, history backups, later execution
+checkpoints, live capacity ownership and recovery execution remain future work.
+V7 also preserves Copy, Import and Duplicate Same, while the existing V6 entry
+points still emit V6 and reject edit arguments. Later-state authority is unchanged.
+
+Local validation passed 142 journal tests (one helper ignored), including 11 owner
+tests; four media adapter tests; 16 core edit-settings tests; and 19 existing WAV
+edit preparation tests. The adapter timestamp regression includes both exact i64
+limits and rejection beyond them, rather than saturating. Production no-default
+library and GPUI checks, formatting and diff checks passed. Independent review
+found no meaningful issues after the range/layout repairs. Windows validation is
+pending; its storage lane now includes the core edit-settings and media adapter
+tests.

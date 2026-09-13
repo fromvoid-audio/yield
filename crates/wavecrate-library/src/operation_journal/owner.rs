@@ -978,12 +978,15 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExternalRootBindingId, ImportFileExpectation, ImportIntentArgs, MAX_DIAGNOSTIC_CODE_BYTES,
-        OperationActor, OperationDisposition, OperationIntent, OperationKind,
-        ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor, ParticipantKind,
-        ParticipantRequirement, ParticipantSet, RecoveryCursor, RecoveryRowOutcome,
-        RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, StoredRelativePath, StoredSourceFence,
-        UniversalCommandArgs, UniversalCommandKind, UniversalIntent, decode,
+        ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation, ImportIntentArgs,
+        MAX_DIAGNOSTIC_CODE_BYTES, OperationActor, OperationDisposition, OperationIntent,
+        OperationKind, ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor,
+        ParticipantKind, ParticipantRequirement, ParticipantSet, RecoveryCursor,
+        RecoveryRowOutcome, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+        StoredRelativePath, StoredSourceFence, UniversalCommandArgs, UniversalCommandKind,
+        UniversalIntent, WaveformEditFrameRange, WaveformEditIntentArgs, WaveformEditOperationArgs,
+        WaveformEditSettingsArgs, WaveformFileRevisionObservation, WaveformOutputSpec,
+        WaveformSampleFormat, WaveformSourceSpec, decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1216,6 +1219,59 @@ mod tests {
         (record, import_args)
     }
 
+    fn v7_waveform_edit_record(
+        operation_id: OperationId,
+    ) -> (StoredOperationRecord, WaveformEditIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::DestructiveEdit,
+            "operation.status.owner-waveform-edit",
+            participants,
+        )
+        .expect("waveform edit universal intent");
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
+            .expect("waveform source spec");
+        let edit_args = WaveformEditIntentArgs::new(
+            copy_args.source().clone(),
+            WaveformFileRevisionObservation::new(
+                "owner-file-identity",
+                "owner-change-marker",
+                1024,
+                Some(12_000_000_000),
+            )
+            .expect("waveform file revision"),
+            source_spec,
+            10,
+            WaveformEditFrameRange::new(2, 8).expect("waveform edit range"),
+            WaveformEditOperationArgs::GainAndFades(
+                WaveformEditSettingsArgs::new(
+                    FiniteF32Bits::new(-0.0).expect("signed zero gain"),
+                    None,
+                    None,
+                )
+                .expect("waveform edit settings"),
+            ),
+            WaveformOutputSpec::float32(2, 48_000),
+        )
+        .expect("waveform edit arguments");
+        let record = StoredOperationRecord::new_v7_waveform_edit(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            edit_args.clone(),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, edit_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1274,6 +1330,47 @@ mod tests {
                 .expect("import universal intent")
                 .command_kind(),
             UniversalCommandKind::Import
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v7_waveform_edit_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v7-waveform-edit");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, edit_args) = v7_waveform_edit_record(operation_id);
+        let mut request = client.persist_intent(record).expect("edit admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("edit result")
+            .expect("edit worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("edit acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+
+        let mut lookup = client.get(operation_id).expect("edit lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("edit lookup result")
+            .expect("edit lookup worker result")
+            .expect("persisted edit");
+        assert_eq!(persisted.schema_version, SCHEMA_V7);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::WaveformEdit(edit_args))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("edit universal intent")
+                .command_kind(),
+            UniversalCommandKind::DestructiveEdit
         );
         assert!(owner.shutdown());
     }

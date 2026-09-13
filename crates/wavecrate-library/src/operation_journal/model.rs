@@ -5,7 +5,7 @@
 //! Later journal evidence and codecs can depend on these values without importing renderer or UI
 //! types. V3 currently describes a newly durable intent, V4 a pre-publication cancellation
 //! request, V5 the first typed copy command and retry observations, and V6 the tagged command
-//! envelope.
+//! envelope. V7 adds a typed in-place WAV edit observation.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -25,6 +25,8 @@ pub const SCHEMA_V4: u32 = 4;
 pub const SCHEMA_V5: u32 = 5;
 /// The universal coordinator command envelope schema.
 pub const SCHEMA_V6: u32 = 6;
+/// The typed in-place WAV edit command envelope schema.
+pub const SCHEMA_V7: u32 = 7;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.

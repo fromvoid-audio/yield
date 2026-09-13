@@ -19,13 +19,17 @@ pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode}
 
 pub use coordinator::{
     CopyCollisionPolicy, CopyEndpoint, CopyEndpointRole, CopyIntentArgs, CopyIntentValidationError,
-    CopySourceExpectation, ExternalRootBindingId, ImportFileExpectation, ImportIntentArgs,
-    ImportIntentValidationError, MAX_COPY_CONTENT_IDENTITY_BYTES,
+    CopySourceExpectation, ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation,
+    ImportIntentArgs, ImportIntentValidationError, MAX_COPY_CONTENT_IDENTITY_BYTES,
     MAX_COPY_METADATA_REFERENCE_BYTES, MAX_IMPORT_ROOT_IDENTITY_BYTES, MAX_RETRY_CONTEXT_BYTES,
     MAX_RETRY_LEASE_ID_BYTES, MAX_STORED_RELATIVE_PATH_BYTES, MAX_STORED_RELATIVE_PATH_COMPONENTS,
+    MAX_WAVEFORM_CHANGE_MARKER_BYTES, MAX_WAVEFORM_EDIT_FRAMES, MAX_WAVEFORM_FILE_IDENTITY_BYTES,
     RetryErrorClass, RetryLeaseId, RetryObservation, RetryObservationValidationError,
     StoredRelativePath, StoredRelativePathError, UniversalCommandArgs,
-    UniversalCommandArgsValidationError,
+    UniversalCommandArgsValidationError, WaveformEditFadeArgs, WaveformEditFrameRange,
+    WaveformEditIntentArgs, WaveformEditOperationArgs, WaveformEditSettingsArgs,
+    WaveformEditValidationError, WaveformFileRevisionObservation, WaveformOutputEncoding,
+    WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
 };
 
 pub use evidence::{
@@ -44,8 +48,8 @@ pub use model::{
     CURRENT_SCHEMA_VERSION, CancellationRequestObservation, CancellationRequestValidationError,
     MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationActor,
     OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
-    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, UniversalCommandKind, UniversalIntent,
-    UniversalIntentTextViolation, UniversalIntentValidationError,
+    SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, UniversalCommandKind,
+    UniversalIntent, UniversalIntentTextViolation, UniversalIntentValidationError,
 };
 
 pub use owner::{
