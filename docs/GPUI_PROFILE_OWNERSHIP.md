@@ -665,3 +665,30 @@ storage request does not acknowledge an operation as `Accepted`, reserve disk
 capacity, or authorize a filesystem participant. The existing nonempty recovery
 gate remains closed, and the session must stop maintenance, catalog and global
 writers before stopping the journal owner and releasing profile ownership.
+
+## V6 regular-file command envelopes (OPT-1337)
+
+The explicit V6 wire format carries tagged Copy, external Import and Duplicate
+Same arguments. V1–V5 retain their existing wire shapes and reject foreign V6
+fields. Import binds an observed external root UUID, physical root identity,
+relative locator and file expectation to a required filesystem participant and
+a fenced destination source participant. It does not invent a source catalog
+revision for an external file. Duplicate Same requires one source participant,
+one source identity, the same parent directory and a distinct destination leaf.
+All three commands retain no-replace collision semantics.
+
+V6 supports the existing initial durable intent, retry and pre-publication
+cancellation observations. Sequence-checked transitions preserve the typed
+arguments and schema across exact replay and restart; changed stale requests
+leave both the row and sequence unchanged. The generic bounded journal owner
+can persist and recover an Import envelope. Unknown variants, role mismatches,
+invalid nested identities and foreign fields fail closed.
+
+Local validation passed 135 journal tests (one helper ignored), including ten
+owner tests, plus production library compilation without default features, GPUI
+compilation, formatting and diff checks. Windows validation is pending.
+
+These are stored command observations, not runtime admission or permission to
+read or write a file. The SQLite schema and legacy default record version remain
+unchanged. Duplicate Double, rendering/edit recipes, later execution checkpoints,
+live capacity ownership and startup replay remain separate implementation work.

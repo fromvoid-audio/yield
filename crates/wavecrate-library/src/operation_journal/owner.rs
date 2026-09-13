@@ -978,11 +978,12 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        MAX_DIAGNOSTIC_CODE_BYTES, OperationActor, OperationDisposition, OperationIntent,
-        OperationKind, ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor,
-        ParticipantKind, ParticipantRequirement, ParticipantSet, RecoveryCursor,
-        RecoveryRowOutcome, RetryErrorClass, RetryLeaseId, SCHEMA_V5, StoredRelativePath,
-        StoredSourceFence, UniversalCommandKind, UniversalIntent, decode,
+        ExternalRootBindingId, ImportFileExpectation, ImportIntentArgs, MAX_DIAGNOSTIC_CODE_BYTES,
+        OperationActor, OperationDisposition, OperationIntent, OperationKind,
+        ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor, ParticipantKind,
+        ParticipantRequirement, ParticipantSet, RecoveryCursor, RecoveryRowOutcome,
+        RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, StoredRelativePath, StoredSourceFence,
+        UniversalCommandArgs, UniversalCommandKind, UniversalIntent, decode,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -1171,6 +1172,50 @@ mod tests {
         )
     }
 
+    fn v6_import_record(operation_id: OperationId) -> (StoredOperationRecord, ImportIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let filesystem_participant_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Import,
+            "operation.status.owner-import",
+            participants,
+        )
+        .expect("import universal intent");
+        let import_args = ImportIntentArgs::new(
+            ExternalRootBindingId::new(),
+            filesystem_participant_id,
+            "owner-external-root",
+            StoredRelativePath::new("sample.wav").expect("external path"),
+            ImportFileExpectation::new("owner-external-file", 10, 11)
+                .expect("external file expectation"),
+            copy_args.destination().clone(),
+            CopyCollisionPolicy::NoReplace,
+            Some(String::from("metadata/owner-import")),
+        )
+        .expect("import arguments");
+        let record = StoredOperationRecord::new_v6_command(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            UniversalCommandArgs::Import(import_args.clone()),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, import_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1193,6 +1238,42 @@ mod tests {
                 .expect("lookup worker result")
                 .map(|record| record.operation_id),
             Some(operation_id)
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v6_import_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v6-import");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, import_args) = v6_import_record(operation_id);
+        let mut request = client.persist_intent(record).expect("import admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("import result")
+            .expect("import worker result");
+        let receipt = outcome.receipt().expect("import acknowledgement");
+        assert_eq!(receipt.operation_id(), operation_id);
+
+        let mut lookup = client.get(operation_id).expect("import lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("import lookup result")
+            .expect("import lookup worker result")
+            .expect("persisted import");
+        assert_eq!(persisted.schema_version, SCHEMA_V6);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::Import(import_args))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("import universal intent")
+                .command_kind(),
+            UniversalCommandKind::Import
         );
         assert!(owner.shutdown());
     }

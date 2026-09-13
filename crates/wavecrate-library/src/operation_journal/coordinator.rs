@@ -1,13 +1,15 @@
 //! Strict, storage-neutral coordinator command observations.
 //!
-//! The first coordinator command contract is deliberately small: a regular-file copy between
-//! source-database participants. These values contain source identities, revisions, and bounded
-//! relative locators only. They are observations for a later owner; they do not contain a live
-//! source lease, filesystem capability, capacity reservation, or permission to execute a copy.
+//! The coordinator command observations are deliberately small: regular-file copies and
+//! same-source duplicates between source-database participants, plus one external regular-file
+//! import. These values contain source identities, revisions, and bounded relative locators only.
+//! They are observations for a later owner; they do not contain a live source lease, filesystem
+//! capability, capacity reservation, or permission to execute a command.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::participants::{
     ParticipantId, ParticipantKind, ParticipantRequirement, ParticipantSet,
@@ -23,6 +25,8 @@ pub const MAX_STORED_RELATIVE_PATH_COMPONENTS: usize = 64;
 pub const MAX_COPY_CONTENT_IDENTITY_BYTES: usize = 256;
 /// Maximum byte length of a metadata reference inherited by a copy.
 pub const MAX_COPY_METADATA_REFERENCE_BYTES: usize = 1024;
+/// Maximum byte length of an observed external root identity.
+pub const MAX_IMPORT_ROOT_IDENTITY_BYTES: usize = 256;
 /// Maximum byte length of an opaque durable retry lease identifier.
 pub const MAX_RETRY_LEASE_ID_BYTES: usize = 128;
 /// Maximum byte length of redaction-safe retry context.
@@ -301,9 +305,8 @@ impl CopyIntentArgs {
         self.validate_shape()?;
         participants.validate_for_new_intent()?;
 
-        let source =
-            self.validate_endpoint(participants, CopyEndpointRole::Source, &self.source)?;
-        self.validate_endpoint(
+        let source = Self::validate_endpoint(participants, CopyEndpointRole::Source, &self.source)?;
+        Self::validate_endpoint(
             participants,
             CopyEndpointRole::Destination,
             &self.destination,
@@ -327,6 +330,35 @@ impl CopyIntentArgs {
                 && descriptor.requirement() == ParticipantRequirement::Required
         }) {
             return Err(CopyIntentValidationError::RequiredFilesystemParticipantMissing);
+        }
+        Ok(())
+    }
+
+    /// Validate this copy as a same-source duplicate operation.
+    ///
+    /// DuplicateSame is intentionally narrower than a general copy: both endpoints must resolve
+    /// through the same required source participant and source identity, and their locators must
+    /// share a parent while naming different destination leaves.
+    pub fn validate_as_duplicate_same_against_participants(
+        &self,
+        participants: &ParticipantSet,
+    ) -> Result<(), CopyIntentValidationError> {
+        self.validate_against_participants(participants)?;
+        if self.source.participant_id != self.destination.participant_id {
+            return Err(CopyIntentValidationError::DuplicateSourceParticipantMismatch);
+        }
+        if self.source.source_id != self.destination.source_id {
+            return Err(CopyIntentValidationError::DuplicateSourceIdentityMismatch);
+        }
+        if relative_parent(self.source.relative_path.as_str())
+            != relative_parent(self.destination.relative_path.as_str())
+        {
+            return Err(CopyIntentValidationError::DuplicateParentDirectoryMismatch);
+        }
+        if relative_leaf(self.source.relative_path.as_str())
+            == relative_leaf(self.destination.relative_path.as_str())
+        {
+            return Err(CopyIntentValidationError::DuplicateDestinationLeafMismatch);
         }
         Ok(())
     }
@@ -376,7 +408,6 @@ impl CopyIntentArgs {
     }
 
     fn validate_endpoint<'a>(
-        &self,
         participants: &'a ParticipantSet,
         role: CopyEndpointRole,
         endpoint: &CopyEndpoint,
@@ -429,6 +460,18 @@ pub enum CopyIntentValidationError {
     /// The source and destination identify the same source-relative entry.
     #[error("copy source and destination endpoints are identical")]
     IdenticalEndpoints,
+    /// DuplicateSame endpoints resolved through different participant identities.
+    #[error("same-source duplicate endpoints must use the same source participant")]
+    DuplicateSourceParticipantMismatch,
+    /// DuplicateSame endpoints carried different source identity observations.
+    #[error("same-source duplicate endpoints must use the same source identity")]
+    DuplicateSourceIdentityMismatch,
+    /// DuplicateSame endpoints did not share a parent directory.
+    #[error("same-source duplicate endpoints must share a parent directory")]
+    DuplicateParentDirectoryMismatch,
+    /// DuplicateSame endpoints did not name distinct leaves.
+    #[error("same-source duplicate endpoints must name distinct destination leaves")]
+    DuplicateDestinationLeafMismatch,
     /// An endpoint participant was not in the participant set.
     #[error("copy {role} participant {participant_id} is missing")]
     ParticipantMissing {
@@ -472,6 +515,328 @@ pub enum CopyIntentValidationError {
     /// Participant shape validation failed.
     #[error("invalid copy participants: {0}")]
     Participants(#[from] ParticipantValidationError),
+}
+
+fn relative_parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn relative_leaf(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, leaf)| leaf)
+}
+
+/// Opaque identity for the external root binding observed by an Import command.
+///
+/// The UUID identifies a later owner lookup. It is not a path, an open descriptor, or an
+/// authorization to read from the external root.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ExternalRootBindingId(Uuid);
+
+impl ExternalRootBindingId {
+    /// Generate a new opaque external-root binding identity.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Wrap an existing UUID without interpreting it as live authority.
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Return the UUID used by the persisted representation.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for ExternalRootBindingId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Expected regular-file facts observed at an external root for an Import command.
+///
+/// Unlike [`CopySourceExpectation`], this observation has no source catalog revision because an
+/// external root is not represented by a source database participant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportFileExpectation {
+    file_identity: String,
+    file_size: u64,
+    modified_ns: i64,
+}
+
+impl ImportFileExpectation {
+    /// Construct bounded external regular-file facts.
+    pub fn new(
+        file_identity: impl Into<String>,
+        file_size: u64,
+        modified_ns: i64,
+    ) -> Result<Self, ImportIntentValidationError> {
+        let expectation = Self {
+            file_identity: file_identity.into(),
+            file_size,
+            modified_ns,
+        };
+        expectation.validate()?;
+        Ok(expectation)
+    }
+
+    /// Validate facts recovered from an untrusted V6 record.
+    pub fn validate(&self) -> Result<(), ImportIntentValidationError> {
+        validate_bounded_text(&self.file_identity, MAX_COPY_CONTENT_IDENTITY_BYTES)
+            .map_err(|_| ImportIntentValidationError::InvalidFileIdentity)?;
+        if self.modified_ns < 0 {
+            return Err(ImportIntentValidationError::NegativeModifiedTimestamp);
+        }
+        Ok(())
+    }
+
+    /// Return the opaque observed regular-file identity.
+    pub fn file_identity(&self) -> &str {
+        &self.file_identity
+    }
+
+    /// Return the observed regular-file length.
+    pub const fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Return the observed modification timestamp in epoch nanoseconds.
+    pub const fn modified_ns(&self) -> i64 {
+        self.modified_ns
+    }
+}
+
+/// Typed bounded arguments for importing one external regular file into a source database.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportIntentArgs {
+    external_root_binding_id: ExternalRootBindingId,
+    filesystem_participant_id: ParticipantId,
+    root_identity: String,
+    relative_path: StoredRelativePath,
+    expected_file: ImportFileExpectation,
+    destination: CopyEndpoint,
+    collision_policy: CopyCollisionPolicy,
+    inherited_metadata_reference: Option<String>,
+}
+
+impl ImportIntentArgs {
+    /// Construct Import observations without opening or retaining the external root.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        external_root_binding_id: ExternalRootBindingId,
+        filesystem_participant_id: ParticipantId,
+        root_identity: impl Into<String>,
+        relative_path: StoredRelativePath,
+        expected_file: ImportFileExpectation,
+        destination: CopyEndpoint,
+        collision_policy: CopyCollisionPolicy,
+        inherited_metadata_reference: Option<String>,
+    ) -> Result<Self, ImportIntentValidationError> {
+        let args = Self {
+            external_root_binding_id,
+            filesystem_participant_id,
+            root_identity: root_identity.into(),
+            relative_path,
+            expected_file,
+            destination,
+            collision_policy,
+            inherited_metadata_reference,
+        };
+        args.validate_shape()?;
+        Ok(args)
+    }
+
+    /// Validate the external and destination endpoint roles against stored participants.
+    pub fn validate_against_participants(
+        &self,
+        participants: &ParticipantSet,
+    ) -> Result<(), ImportIntentValidationError> {
+        self.validate_shape()?;
+        participants.validate_for_new_operation()?;
+        let filesystem = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.id() == self.filesystem_participant_id)
+            .ok_or(ImportIntentValidationError::FilesystemParticipantMissing)?;
+        if filesystem.kind() != ParticipantKind::Filesystem {
+            return Err(
+                ImportIntentValidationError::FilesystemParticipantWrongKind {
+                    actual: filesystem.kind(),
+                },
+            );
+        }
+        if filesystem.requirement() != ParticipantRequirement::Required {
+            return Err(ImportIntentValidationError::FilesystemParticipantNotRequired);
+        }
+        CopyIntentArgs::validate_endpoint(
+            participants,
+            CopyEndpointRole::Destination,
+            &self.destination,
+        )
+        .map_err(ImportIntentValidationError::Destination)?;
+        Ok(())
+    }
+
+    /// Return the opaque external-root binding identity.
+    pub const fn external_root_binding_id(&self) -> ExternalRootBindingId {
+        self.external_root_binding_id
+    }
+
+    /// Return the required Filesystem participant identity.
+    pub const fn filesystem_participant_id(&self) -> ParticipantId {
+        self.filesystem_participant_id
+    }
+
+    /// Return the observed external-root physical identity.
+    pub fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    /// Return the external-root relative input locator.
+    pub fn relative_path(&self) -> &StoredRelativePath {
+        &self.relative_path
+    }
+
+    /// Return the expected external regular-file facts.
+    pub fn expected_file(&self) -> &ImportFileExpectation {
+        &self.expected_file
+    }
+
+    /// Return the destination source-database endpoint.
+    pub fn destination(&self) -> &CopyEndpoint {
+        &self.destination
+    }
+
+    /// Return the explicit no-replace policy.
+    pub const fn collision_policy(&self) -> CopyCollisionPolicy {
+        self.collision_policy
+    }
+
+    /// Return the bounded inherited metadata reference, when supplied.
+    pub fn inherited_metadata_reference(&self) -> Option<&str> {
+        self.inherited_metadata_reference.as_deref()
+    }
+
+    fn validate_shape(&self) -> Result<(), ImportIntentValidationError> {
+        validate_bounded_text(&self.root_identity, MAX_IMPORT_ROOT_IDENTITY_BYTES)
+            .map_err(|_| ImportIntentValidationError::InvalidRootIdentity)?;
+        self.relative_path
+            .validate()
+            .map_err(ImportIntentValidationError::InvalidPath)?;
+        self.expected_file.validate()?;
+        self.destination
+            .relative_path()
+            .validate()
+            .map_err(ImportIntentValidationError::InvalidPath)?;
+        validate_source_id(self.destination.source_id())
+            .map_err(ImportIntentValidationError::Destination)?;
+        if let Some(reference) = &self.inherited_metadata_reference {
+            validate_bounded_text(reference, MAX_COPY_METADATA_REFERENCE_BYTES)
+                .map_err(|_| ImportIntentValidationError::InvalidMetadataReference)?;
+        }
+        Ok(())
+    }
+}
+
+/// Errors returned while constructing or validating Import observations.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum ImportIntentValidationError {
+    /// The observed external root identity is empty, oversized, or control text.
+    #[error("import external root identity is invalid")]
+    InvalidRootIdentity,
+    /// The external input locator is not portable.
+    #[error("invalid import relative path: {0}")]
+    InvalidPath(#[from] StoredRelativePathError),
+    /// The expected regular-file identity is empty, oversized, or control text.
+    #[error("import expected file identity is invalid")]
+    InvalidFileIdentity,
+    /// The expected regular-file modification timestamp is negative.
+    #[error("import expected modification timestamp must be non-negative")]
+    NegativeModifiedTimestamp,
+    /// The metadata reference is outside its bounded text contract.
+    #[error("import inherited metadata reference is invalid")]
+    InvalidMetadataReference,
+    /// The required Filesystem participant was not found.
+    #[error("import Filesystem participant is missing")]
+    FilesystemParticipantMissing,
+    /// The participant named for external input had another kind.
+    #[error("import Filesystem participant has kind {actual:?}")]
+    FilesystemParticipantWrongKind {
+        /// Actual participant descriptor kind.
+        actual: ParticipantKind,
+    },
+    /// The Filesystem participant was optional rather than required.
+    #[error("import Filesystem participant is not required")]
+    FilesystemParticipantNotRequired,
+    /// The destination endpoint failed source-database role validation.
+    #[error("invalid import destination: {0}")]
+    Destination(#[from] CopyIntentValidationError),
+    /// Participant shape or cross-reference validation failed.
+    #[error("invalid import participants: {0}")]
+    Participants(#[from] ParticipantValidationError),
+}
+
+/// Typed V6 command arguments for the supported regular-file coordinator commands.
+///
+/// These are bounded observations. They contain no open roots, source leases, capacity
+/// reservations, filesystem descriptors, or execution authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub enum UniversalCommandArgs {
+    /// Copy between two source-database endpoints.
+    Copy(CopyIntentArgs),
+    /// Import one external regular file into a source-database endpoint.
+    Import(ImportIntentArgs),
+    /// Duplicate one source-database file into another leaf in the same parent directory.
+    DuplicateSame(CopyIntentArgs),
+}
+
+impl UniversalCommandArgs {
+    /// Return the universal command kind represented by these arguments.
+    pub const fn command_kind(&self) -> super::model::UniversalCommandKind {
+        match self {
+            Self::Copy(_) => super::model::UniversalCommandKind::Copy,
+            Self::Import(_) => super::model::UniversalCommandKind::Import,
+            Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
+        }
+    }
+
+    /// Validate command-specific roles, identities, and bounded locators.
+    pub fn validate_against_participants(
+        &self,
+        participants: &ParticipantSet,
+    ) -> Result<(), UniversalCommandArgsValidationError> {
+        match self {
+            Self::Copy(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::Copy),
+            Self::Import(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::Import),
+            Self::DuplicateSame(args) => args
+                .validate_as_duplicate_same_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::DuplicateSame),
+        }
+    }
+}
+
+/// Failure while validating a tagged V6 command argument envelope.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum UniversalCommandArgsValidationError {
+    /// A source-to-source Copy argument failed validation.
+    #[error("invalid Copy command arguments: {0}")]
+    Copy(#[source] CopyIntentValidationError),
+    /// An external Import argument failed validation.
+    #[error("invalid Import command arguments: {0}")]
+    Import(#[source] ImportIntentValidationError),
+    /// A same-source DuplicateSame argument failed validation.
+    #[error("invalid DuplicateSame command arguments: {0}")]
+    DuplicateSame(#[source] CopyIntentValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.
@@ -730,6 +1095,110 @@ pub(crate) fn validate_persisted_copy_intent_value(value: &Value) -> Result<(), 
     Ok(())
 }
 
+/// Validate the explicit V6 tagged command-arguments JSON boundary before typed deserialization.
+pub(crate) fn validate_persisted_universal_command_args_value(
+    value: &Value,
+) -> Result<(), &'static str> {
+    let object = value
+        .as_object()
+        .ok_or("persisted command arguments must be a tagged object")?;
+    if object.len() != 1 {
+        return Err("persisted command arguments must contain exactly one variant");
+    }
+    let (variant, arguments) = object
+        .iter()
+        .next()
+        .ok_or("persisted command arguments must contain exactly one variant")?;
+    match variant.as_str() {
+        "Copy" | "DuplicateSame" => validate_persisted_copy_intent_value(arguments),
+        "Import" => validate_persisted_import_intent_value(arguments),
+        _ => Err("persisted command arguments contain an unknown variant"),
+    }
+}
+
+fn validate_persisted_import_intent_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "external_root_binding_id",
+            "filesystem_participant_id",
+            "root_identity",
+            "relative_path",
+            "expected_file",
+            "destination",
+            "collision_policy",
+            "inherited_metadata_reference",
+        ],
+    )?;
+    for field in [
+        "external_root_binding_id",
+        "filesystem_participant_id",
+        "root_identity",
+        "relative_path",
+        "expected_file",
+        "destination",
+        "collision_policy",
+        "inherited_metadata_reference",
+    ] {
+        required_field(object, field)?;
+    }
+    for field in ["external_root_binding_id", "filesystem_participant_id"] {
+        if required_field(object, field)?
+            .as_str()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .is_none()
+        {
+            return Err("import participant and root binding IDs must be UUID strings");
+        }
+    }
+    let root_identity = required_field(object, "root_identity")?
+        .as_str()
+        .ok_or("import root identity must be a string")?;
+    if validate_bounded_text(root_identity, MAX_IMPORT_ROOT_IDENTITY_BYTES).is_err() {
+        return Err("import root identity is outside its bound");
+    }
+    let relative_path = required_field(object, "relative_path")?
+        .as_str()
+        .ok_or("import relative path must be a string")?;
+    if StoredRelativePath::new(relative_path).is_err() {
+        return Err("import relative path is invalid");
+    }
+    let expected = strict_object(
+        required_field(object, "expected_file")?,
+        &["file_identity", "file_size", "modified_ns"],
+    )?;
+    for field in ["file_identity", "file_size", "modified_ns"] {
+        required_field(expected, field)?;
+    }
+    let file_identity = required_field(expected, "file_identity")?
+        .as_str()
+        .ok_or("import expected file identity must be a string")?;
+    if validate_bounded_text(file_identity, MAX_COPY_CONTENT_IDENTITY_BYTES).is_err() {
+        return Err("import expected file identity is outside its bound");
+    }
+    let modified_ns = required_field(expected, "modified_ns")?
+        .as_i64()
+        .ok_or("import expected modification timestamp must be a signed 64-bit integer")?;
+    if modified_ns < 0 {
+        return Err("import expected modification timestamp must be non-negative");
+    }
+    validate_persisted_copy_endpoint_value(required_field(object, "destination")?)?;
+    if required_field(object, "collision_policy")?.as_str() != Some("NoReplace") {
+        return Err("import collision policy is unsupported");
+    }
+    if let Some(reference) = object.get("inherited_metadata_reference") {
+        if !reference.is_null() {
+            let reference = reference
+                .as_str()
+                .ok_or("import inherited metadata reference must be a string or null")?;
+            if validate_bounded_text(reference, MAX_COPY_METADATA_REFERENCE_BYTES).is_err() {
+                return Err("import inherited metadata reference is outside its bound");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_persisted_copy_endpoint_value(value: &Value) -> Result<(), &'static str> {
     let object = strict_object(value, &["participant_id", "source_id", "relative_path"])?;
     let participant_id = required_field(object, "participant_id")?;
@@ -861,6 +1330,7 @@ mod tests {
         ParticipantCheckpoint, ParticipantDescriptor, ParticipantId, ParticipantKind,
         ParticipantRequirement, StoredSourceFence,
     };
+    use uuid::Uuid;
 
     fn participant_set() -> ParticipantSet {
         let source = SourceId::from_string("source-a");
@@ -1065,5 +1535,148 @@ mod tests {
         )
         .expect("ordered retry");
         assert_eq!(observation.attempt(), 1);
+    }
+
+    #[test]
+    fn import_args_require_external_filesystem_and_fenced_destination() {
+        let participants = participant_set();
+        let source_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::SourceDatabase)
+            .expect("source participant")
+            .id();
+        let filesystem_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let destination = CopyEndpoint::new(
+            source_id,
+            SourceId::from_string("source-a"),
+            StoredRelativePath::new("imports/sample.wav").expect("destination path"),
+        )
+        .expect("destination endpoint");
+        let args = ImportIntentArgs::new(
+            ExternalRootBindingId::from_uuid(Uuid::from_u128(1)),
+            filesystem_id,
+            "external-root-identity",
+            StoredRelativePath::new("sample.wav").expect("external path"),
+            ImportFileExpectation::new("external-file-identity", 12, 34).expect("file expectation"),
+            destination,
+            CopyCollisionPolicy::NoReplace,
+            Some(String::from("metadata/entry")),
+        )
+        .expect("import args");
+        args.validate_against_participants(&participants)
+            .expect("import roles validate");
+
+        let wrong_filesystem = ImportIntentArgs::new(
+            args.external_root_binding_id(),
+            source_id,
+            String::from(args.root_identity()),
+            args.relative_path().clone(),
+            args.expected_file().clone(),
+            args.destination().clone(),
+            args.collision_policy(),
+            args.inherited_metadata_reference().map(String::from),
+        )
+        .expect("wrong filesystem shape");
+        assert!(matches!(
+            wrong_filesystem.validate_against_participants(&participants),
+            Err(
+                ImportIntentValidationError::FilesystemParticipantWrongKind {
+                    actual: ParticipantKind::SourceDatabase
+                }
+            )
+        ));
+
+        let invalid_root = ImportIntentArgs::new(
+            args.external_root_binding_id(),
+            filesystem_id,
+            "",
+            args.relative_path().clone(),
+            args.expected_file().clone(),
+            args.destination().clone(),
+            args.collision_policy(),
+            None,
+        );
+        assert_eq!(
+            invalid_root,
+            Err(ImportIntentValidationError::InvalidRootIdentity)
+        );
+    }
+
+    #[test]
+    fn duplicate_same_requires_one_source_parent_and_distinct_leaf() {
+        let participants = participant_set();
+        let source_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::SourceDatabase)
+            .expect("source participant")
+            .id();
+        let source_identity = SourceId::from_string("source-a");
+        let source = CopyEndpoint::new(
+            source_id,
+            source_identity.clone(),
+            StoredRelativePath::new("folder/original.wav").expect("source path"),
+        )
+        .expect("source endpoint");
+        let destination = CopyEndpoint::new(
+            source_id,
+            source_identity.clone(),
+            StoredRelativePath::new("folder/copy.wav").expect("destination path"),
+        )
+        .expect("destination endpoint");
+        let args = CopyIntentArgs::new(
+            source,
+            destination,
+            CopySourceExpectation::new(7, "file-identity", 12, 34).expect("expectation"),
+            CopyCollisionPolicy::NoReplace,
+            Some(String::from("metadata/entry")),
+        )
+        .expect("duplicate args");
+        args.validate_as_duplicate_same_against_participants(&participants)
+            .expect("same-source duplicate validates");
+
+        let different_parent = CopyIntentArgs::new(
+            args.source().clone(),
+            CopyEndpoint::new(
+                source_id,
+                source_identity.clone(),
+                StoredRelativePath::new("other/copy.wav").expect("other destination"),
+            )
+            .expect("other destination endpoint"),
+            args.expected_source().clone(),
+            CopyCollisionPolicy::NoReplace,
+            args.inherited_metadata_reference().map(String::from),
+        )
+        .expect("different parent shape");
+        assert_eq!(
+            different_parent.validate_as_duplicate_same_against_participants(&participants),
+            Err(CopyIntentValidationError::DuplicateParentDirectoryMismatch)
+        );
+
+        let different_source = CopyIntentArgs::new(
+            args.source().clone(),
+            CopyEndpoint::new(
+                source_id,
+                SourceId::from_string("source-b"),
+                StoredRelativePath::new("folder/copy.wav").expect("different source"),
+            )
+            .expect("different source endpoint"),
+            args.expected_source().clone(),
+            CopyCollisionPolicy::NoReplace,
+            None,
+        )
+        .expect("different source shape");
+        assert!(matches!(
+            different_source.validate_as_duplicate_same_against_participants(&participants),
+            Err(CopyIntentValidationError::ParticipantSourceMismatch {
+                role: CopyEndpointRole::Destination
+            })
+        ));
     }
 }

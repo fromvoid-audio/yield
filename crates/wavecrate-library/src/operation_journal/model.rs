@@ -4,7 +4,8 @@
 //! intent shape. They perform no filesystem I/O and grant no ownership or mutation authority.
 //! Later journal evidence and codecs can depend on these values without importing renderer or UI
 //! types. V3 currently describes a newly durable intent, V4 a pre-publication cancellation
-//! request, and V5 the first typed coordinator command and retry observations.
+//! request, V5 the first typed copy command and retry observations, and V6 the tagged command
+//! envelope.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,6 +23,8 @@ pub const SCHEMA_V3: u32 = 3;
 pub const SCHEMA_V4: u32 = 4;
 /// The typed coordinator copy-intent and retry-observation schema.
 pub const SCHEMA_V5: u32 = 5;
+/// The universal coordinator command envelope schema.
+pub const SCHEMA_V6: u32 = 6;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.
@@ -115,6 +118,8 @@ pub enum UniversalCommandKind {
     Extract,
     /// Copy an existing file into a destination.
     Copy,
+    /// Import one external regular file into a source database.
+    Import,
     /// Create a new file.
     CreateFile,
     /// Create a new folder.

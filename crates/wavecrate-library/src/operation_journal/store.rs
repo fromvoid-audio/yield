@@ -25,11 +25,12 @@ use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
-use super::coordinator::{CopyIntentArgs, RetryObservation};
+use super::coordinator::{CopyIntentArgs, RetryObservation, UniversalCommandArgs};
 use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
+    SCHEMA_V6,
 };
 use super::validation::{RecordConsistency, classify_record};
 
@@ -197,7 +198,7 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the pre-publication cancellation API.
     #[error(
-        "operation journal cancellation requires a V3 universal intent, found schema v{schema_version}"
+        "operation journal cancellation requires a V3, V5, or V6 universal intent, found schema v{schema_version}"
     )]
     UnsupportedCancellationSchema {
         /// Schema version of the retained row.
@@ -229,13 +230,13 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the retry API.
     #[error(
-        "operation journal retry observation requires a V5 coordinator record, found schema v{schema_version}"
+        "operation journal retry observation requires a V5 or V6 coordinator record, found schema v{schema_version}"
     )]
     UnsupportedRetrySchema {
         /// Schema version of the retained row.
         schema_version: u32,
     },
-    /// The retained row is not eligible for a V5 retry observation.
+    /// The retained row is not eligible for a V5 or V6 retry observation.
     #[error("operation journal retry state is not eligible: {reason}")]
     UnsupportedRetryState {
         /// Bounded state diagnostic.
@@ -396,7 +397,7 @@ impl JournalCancelRequestReceipt {
         self.sequence
     }
 
-    /// Return the encoded V4 record length.
+    /// Return the encoded V4, V5, or V6 record length.
     pub fn encoded_bytes(self) -> usize {
         self.encoded_bytes
     }
@@ -425,7 +426,7 @@ impl JournalRetryReceipt {
         self.sequence
     }
 
-    /// Return the encoded V5 record length.
+    /// Return the encoded V5 or V6 record length.
     pub fn encoded_bytes(self) -> usize {
         self.encoded_bytes
     }
@@ -780,15 +781,160 @@ impl OperationJournalStore {
         self.persist_record_with_encoded_outcome(&record, &encoded)
     }
 
-    /// Persist a user cancellation request against a current V3 or V5 universal intent.
+    /// Persist one V6 typed coordinator command and return its compatibility receipt.
+    ///
+    /// The command arguments and participant observations are stored as bounded, authority-free
+    /// data. An `Err` may be returned after COMMIT, so callers that need to distinguish an
+    /// unacknowledged commit must use [`Self::persist_command_intent_with_outcome`].
+    pub fn persist_command_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V6 typed coordinator command and expose the exact write-stage outcome.
+    ///
+    /// This is a storage acknowledgement only. It does not admit execution, reserve capacity,
+    /// retain a filesystem root, or grant a live source capability. The returned receipt is
+    /// exposed only after commit, full post-commit namespace validation, and exact readback.
+    pub fn persist_command_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::User || intent.kind != OperationKind::FileMutation {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v6 command intent requires a user file-mutation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v6 command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v6 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v6_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        match classify_record(&record) {
+            RecordConsistency::Consistent => {}
+            RecordConsistency::LegacyMissingPublicationEvidence => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    OperationJournalStoreError::InconsistentRecord {
+                        reason: String::from(
+                            "schema-v6 command intent has legacy publication evidence",
+                        ),
+                    },
+                    None,
+                    0,
+                    None,
+                );
+            }
+            RecordConsistency::Invalid(reason) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    OperationJournalStoreError::InconsistentRecord { reason },
+                    None,
+                    0,
+                    None,
+                );
+            }
+        }
+        let encoded = match encode(&record) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    error.into(),
+                    None,
+                    0,
+                    None,
+                );
+            }
+        };
+        self.persist_record_with_encoded_outcome(&record, &encoded)
+    }
+
+    /// Persist a user cancellation request against a current V3, V5, or V6 universal intent.
     ///
     /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
     /// already stored for this operation is a read-only idempotent replay and returns the current
     /// receipt without allocating another sequence. All other stale, legacy, malformed, or
-    /// unsupported rows remain unchanged. A V3 row becomes V4 and a V5 row remains V5 so its
-    /// typed command and retry observations are preserved. The resulting record is intentionally
-    /// non-terminal; it grants no cleanup, capacity-release, filesystem, or recovery execution
-    /// authority.
+    /// unsupported rows remain unchanged. A V3 row becomes V4 while V5 and V6 rows retain their
+    /// schema so typed command and retry observations are preserved. The resulting record is
+    /// intentionally non-terminal; it grants no cleanup, capacity-release, filesystem, or
+    /// recovery execution authority.
     pub fn request_cancel_before_publish(
         &self,
         operation_id: OperationId,
@@ -856,8 +1002,10 @@ impl OperationJournalStore {
             return Err(OperationJournalStoreError::OperationNotFound { operation_id });
         };
 
-        if matches!(current.record.schema_version, SCHEMA_V4 | SCHEMA_V5)
-            && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
+        if matches!(
+            current.record.schema_version,
+            SCHEMA_V4 | SCHEMA_V5 | SCHEMA_V6
+        ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
                 return Ok(CancelTransition::Replay(JournalCancelRequestReceipt {
@@ -876,7 +1024,10 @@ impl OperationJournalStore {
                 actual: current.sequence,
             });
         }
-        if !matches!(current.record.schema_version, SCHEMA_V3 | SCHEMA_V5) {
+        if !matches!(
+            current.record.schema_version,
+            SCHEMA_V3 | SCHEMA_V5 | SCHEMA_V6
+        ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
             });
@@ -892,11 +1043,16 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V6 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
             let expected = match current.record.schema_version {
                 SCHEMA_V5 => "V5 IntentDurable/None or RetryPending",
+                SCHEMA_V6 => "V6 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -954,7 +1110,7 @@ impl OperationJournalStore {
         })
     }
 
-    /// Persist the next typed V5 retry observation using a sequence compare-and-swap.
+    /// Persist the next typed V5 or V6 retry observation using a sequence compare-and-swap.
     ///
     /// An identical observation already stored for the operation is a read-only idempotent
     /// replay, even when the caller still holds an older sequence. A changed observation must
@@ -1030,7 +1186,7 @@ impl OperationJournalStore {
         if current.record.disposition == OperationDisposition::CancelRequestedBeforePublish {
             return Err(OperationJournalStoreError::RetryObservationConflict { operation_id });
         }
-        if current.record.schema_version == SCHEMA_V5
+        if matches!(current.record.schema_version, SCHEMA_V5 | SCHEMA_V6)
             && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -1048,7 +1204,7 @@ impl OperationJournalStore {
                 actual: current.sequence,
             });
         }
-        if current.record.schema_version != SCHEMA_V5 {
+        if !matches!(current.record.schema_version, SCHEMA_V5 | SCHEMA_V6) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
             });
@@ -1061,7 +1217,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -2210,10 +2366,11 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ParticipantCheckpoint, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
-        ParticipantSet, RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass,
-        RetryLeaseId, RetryObservation, SCHEMA_V1, StoredRelativePath, StoredSourceFence,
-        UniversalCommandKind, UniversalIntent,
+        ExternalRootBindingId, ImportFileExpectation, ImportIntentArgs, ParticipantCheckpoint,
+        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
+        RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RetryErrorClass, RetryLeaseId,
+        RetryObservation, SCHEMA_V1, SCHEMA_V6, StoredRelativePath, StoredSourceFence,
+        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
     };
     use crate::sample_sources::SourceId;
     use crate::test_runtime::TestRuntimeGuard;
@@ -2421,6 +2578,60 @@ mod tests {
             kind: OperationKind::FileMutation,
             label: String::from("copy store test"),
         };
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+        )
+    }
+
+    fn v6_command_inputs(
+        variant: UniversalCommandKind,
+    ) -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        UniversalCommandArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, intent, source_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        let participants = source_universal.participants().clone();
+        let source_participant_id = copy_args.source().participant_id();
+        let filesystem_participant_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem descriptor")
+            .id();
+        let command_args = match variant {
+            UniversalCommandKind::Copy => UniversalCommandArgs::Copy(copy_args),
+            UniversalCommandKind::Duplicate => UniversalCommandArgs::DuplicateSame(copy_args),
+            UniversalCommandKind::Import => UniversalCommandArgs::Import(
+                ImportIntentArgs::new(
+                    ExternalRootBindingId::new(),
+                    filesystem_participant_id,
+                    "external-root-identity",
+                    StoredRelativePath::new("sample.wav").expect("external path"),
+                    ImportFileExpectation::new("external-file-identity", 12, 34)
+                        .expect("external file"),
+                    CopyEndpoint::new(
+                        source_participant_id,
+                        SourceId::from_string("source-a"),
+                        StoredRelativePath::new("out.wav").expect("destination path"),
+                    )
+                    .expect("destination endpoint"),
+                    CopyCollisionPolicy::NoReplace,
+                    Some(String::from("metadata/entry")),
+                )
+                .expect("import arguments"),
+            ),
+            other => panic!("unsupported V6 test command {other:?}"),
+        };
+        let universal_intent =
+            UniversalIntent::new(None, variant, "operation.status.v6", participants)
+                .expect("V6 universal intent");
         (
             operation_id,
             intent,
@@ -3092,6 +3303,180 @@ mod tests {
                 if actual == operation_id
         ));
         assert_eq!(journal_sequence(&store, operation_id), 5);
+    }
+
+    #[test]
+    fn v6_commands_round_trip_through_store_and_retry_cancel_cas() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+
+        let mut inserted = Vec::new();
+        for command in [
+            UniversalCommandKind::Copy,
+            UniversalCommandKind::Duplicate,
+            UniversalCommandKind::Import,
+        ] {
+            let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+                v6_command_inputs(command);
+            let receipt = store
+                .persist_command_intent(
+                    operation_id,
+                    intent,
+                    universal_intent,
+                    command_args.clone(),
+                    capacity_plan,
+                    50,
+                )
+                .expect("persist V6 command");
+            let persisted = store
+                .get(operation_id)
+                .expect("get V6 command")
+                .expect("V6 command row");
+            assert_eq!(persisted.schema_version, SCHEMA_V6);
+            assert_eq!(persisted.universal_command_args(), Some(&command_args));
+            assert_eq!(persisted.disposition, OperationDisposition::None);
+            inserted.push((operation_id, receipt, command_args));
+        }
+
+        let (operation_id, initial, command_args) =
+            inserted.pop().expect("import command is available for CAS");
+        assert_eq!(initial.sequence(), 3);
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("retry-lease-v6").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientContention,
+            "writer_busy",
+            Some(String::from("source database is busy")),
+        )
+        .expect("retry observation");
+        let expected_retry = retry.clone();
+        let retry_receipt = store
+            .record_retry_pending(operation_id, initial.sequence(), retry)
+            .expect("persist V6 retry");
+        assert_eq!(retry_receipt.sequence(), 4);
+
+        let replay = store
+            .record_retry_pending(
+                operation_id,
+                initial.sequence(),
+                RetryObservation::new(
+                    1,
+                    51,
+                    52,
+                    RetryLeaseId::new("retry-lease-v6").expect("retry lease"),
+                    53,
+                    RetryErrorClass::TransientContention,
+                    "writer_busy",
+                    Some(String::from("source database is busy")),
+                )
+                .expect("same retry observation"),
+            )
+            .expect("retry replay");
+        assert_eq!(replay, retry_receipt);
+
+        let stale_retry = RetryObservation::new(
+            2,
+            54,
+            55,
+            RetryLeaseId::new("retry-lease-v6-next").expect("next retry lease"),
+            56,
+            RetryErrorClass::TransientAvailability,
+            "source_unavailable",
+            None,
+        )
+        .expect("next retry observation");
+        assert!(matches!(
+            store.record_retry_pending(operation_id, initial.sequence(), stale_retry),
+            Err(OperationJournalStoreError::StaleSequence {
+                operation_id: actual,
+                expected: 3,
+                actual: 4
+            }) if actual == operation_id
+        ));
+        let after_stale_retry = store
+            .get(operation_id)
+            .expect("get V6 row after stale retry")
+            .expect("V6 row after stale retry");
+        assert_eq!(
+            journal_sequence(&store, operation_id),
+            retry_receipt.sequence()
+        );
+        assert_eq!(after_stale_retry.retry_observation(), Some(&expected_retry));
+        assert_eq!(after_stale_retry.cancellation_request(), None);
+
+        let cancellation = CancellationRequestObservation::new(56).expect("cancel timestamp");
+        assert!(matches!(
+            store.request_cancel_before_publish(
+                operation_id,
+                initial.sequence(),
+                CancellationRequestObservation::new(55).expect("stale cancellation")
+            ),
+            Err(OperationJournalStoreError::StaleSequence {
+                operation_id: actual,
+                expected: 3,
+                actual: 4
+            }) if actual == operation_id
+        ));
+        let after_stale_cancellation = store
+            .get(operation_id)
+            .expect("get V6 row after stale cancellation")
+            .expect("V6 row after stale cancellation");
+        assert_eq!(
+            journal_sequence(&store, operation_id),
+            retry_receipt.sequence()
+        );
+        assert_eq!(
+            after_stale_cancellation.retry_observation(),
+            Some(&expected_retry)
+        );
+        assert_eq!(after_stale_cancellation.cancellation_request(), None);
+        let cancel_receipt = store
+            .request_cancel_before_publish(operation_id, retry_receipt.sequence(), cancellation)
+            .expect("persist V6 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 5);
+        let canceled = store
+            .get(operation_id)
+            .expect("get V6 cancellation")
+            .expect("canceled V6 row");
+        assert_eq!(canceled.schema_version, SCHEMA_V6);
+        assert_eq!(canceled.universal_command_args(), Some(&command_args));
+        assert_eq!(
+            canceled.retry_observation().map(RetryObservation::attempt),
+            Some(1)
+        );
+        assert_eq!(
+            canceled
+                .cancellation_request()
+                .expect("cancellation observation")
+                .requested_unix_ms(),
+            56
+        );
+
+        let cancel_replay = store
+            .request_cancel_before_publish(
+                operation_id,
+                initial.sequence(),
+                CancellationRequestObservation::new(56).expect("same cancellation"),
+            )
+            .expect("cancellation replay");
+        assert_eq!(cancel_replay, cancel_receipt);
+        assert_eq!(journal_sequence(&store, operation_id), 5);
+
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V6 command")
+            .expect("restarted V6 row");
+        assert_eq!(restarted.schema_version, SCHEMA_V6);
+        assert_eq!(restarted.universal_command_args(), Some(&command_args));
+        assert_eq!(
+            restarted.disposition,
+            OperationDisposition::CancelRequestedBeforePublish
+        );
     }
 
     #[test]
