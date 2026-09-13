@@ -268,9 +268,9 @@ before commit. External databases cannot use this catalog-only transition.
 Ordinary opens still reject a different root. Catalog audits check root identity
 before maintenance so accidental replacement reports a stale-root outcome.
 
-Full asynchronous scanner, watcher and catalog publication fencing remains
-OPT-1349 work. A database transaction fence alone does not reject every late
-result already queued outside the database.
+The ownership foundation alone did not fence asynchronous publication. The
+OPT-1349 extensions below carry source identity through catalog delivery, browser
+projection and readiness publication, including results queued outside the database.
 
 The lease and handoff milestone passed 33 source identity tests, seven production
 admission tests, all 91 catalog tests and 61 session tests (one subprocess helper
@@ -282,7 +282,7 @@ transaction. Windows storage validation passed on `c6dc01b11` in
 [`34723711255`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34723711255),
 including production admission, journal, source identity/lease and session/catalog
 checks. This completes OPT-1336's ownership foundation; OPT-1349 publication
-fencing and OPT-1337 coordinator execution remain separate unfinished work.
+fencing is recorded below; OPT-1337 coordinator execution remains unfinished.
 
 ## Source result publication
 
@@ -299,9 +299,9 @@ are no longer current, with `CatalogPublicationStatus::NonProjectable`. Browser
 consumers drain these outcomes without updating projections or continuing work
 from stale revisions/cursors.
 
-This catalog-send boundary does not complete OPT-1349: scanner/readiness result
-propagation, post-queue projection acceptance, and stable source-unavailable
-diagnostics still need their own integration and validation.
+The initial catalog-send boundary left post-queue projection and readiness
+publication uncovered. Subsequent extensions below address those boundaries;
+stable source diagnostics remain the current OPT-1349 acceptance work.
 
 The initial publication slice passed three library fence tests, the 92-test
 catalog suite before final regression refinement, two corrected live-admission
@@ -311,7 +311,8 @@ unchanged when delivered as non-projectable. GPUI compilation, formatting and
 diff checks passed. Windows storage validation passed on `c383a2ade` in
 [`34749559530`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34749559530),
 including production admission, source identity/publication fence tests and
-catalog/session checks. Queued delivery and readiness claim fencing remain open.
+catalog/session checks. Queued delivery and readiness claim fencing were added
+in the following extensions.
 
 The queued-delivery extension carries the same fence through
 catalog/session delivery and asynchronous browser projection. Its UI boundary
@@ -319,8 +320,8 @@ reads a separate in-memory publication-generation token; that token owns no
 source lease, SQLite connection, or filesystem lock. Background projection still
 performs full validation before and after building the projection. Retired
 terminal receipts remain available for accounting, while stale projections are
-discarded. This extension does not establish readiness claim or independent
-artifact publication fencing.
+discarded. Readiness claim and independent artifact publication use the explicit
+origin contracts described below.
 
 Local validation of the extension passed three library fence tests,
 94 catalog tests, 61 session tests (one existing ignored), and 396 UI tests
@@ -383,8 +384,11 @@ Local validation passed two new origin regressions, the three claim regressions,
 and the full library suite (667 passed, three existing ignored). Production
 no-default compilation, seven profile-admission tests, the readiness process
 fixture (one passed, one helper ignored), GPUI compilation, formatting and diff
-checks passed. Windows acceptance remains pending. Stable source diagnostics and
-remaining integration acceptance still keep OPT-1349 open; no readiness executor
+checks passed. Windows storage acceptance passed on exact `fb278b708` in
+[`34752810963`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34752810963).
+Logs confirm both new origin regressions passed within the 57-test readiness
+selection. Stable source diagnostics and final data-preservation acceptance
+still keep OPT-1349 open; no readiness executor
 has been ported from the excluded reference application in this work.
 
 ## Journal coordination
