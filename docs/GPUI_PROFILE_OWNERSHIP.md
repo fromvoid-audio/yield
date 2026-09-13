@@ -614,4 +614,25 @@ tests (one helper ignored), GPUI compilation, formatting and diff checks passed.
 Fault coverage includes confirmed/unconfirmed rollback, commit errors with and
 without a persisted row, post-commit acknowledgement failure, duplicate rows,
 actual pre-commit namespace replacement and the V5 Copy adapter. Windows storage
-validation is pending. Runtime queue/capacity admission remains unimplemented.
+validation [34762689278](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34762689278)
+passed at exact commit `6b1344049c18c4f28638b17b839bfddf159ce09a`. Logs confirm
+107 journal tests (one helper ignored), including the conservative commit outcome,
+unconfirmed rollback, duplicate and V5 Copy outcome regressions. The namespace
+replacement tests are Unix-only and were covered locally. The full storage run
+also passed; this does not establish native Windows UI acceptance. Runtime
+queue/capacity admission remains unimplemented.
+
+### Bounded journal storage owner (in progress)
+
+The next OPT-1337 implementation moves the already-open, recovery-checked journal
+from session persistence into one storage worker. The boundary must bound both
+queued payloads and outstanding results, serialize all journal operations, and
+drain submitted writes before releasing the journal child lease. Client and
+result handles must not extend the profile lease after the worker has stopped.
+Dropping a result abandons observation, not the submitted write.
+
+This storage queue is distinct from universal operation admission. Submitting a
+storage request does not acknowledge an operation as `Accepted`, reserve disk
+capacity, or authorize a filesystem participant. The existing nonempty recovery
+gate remains closed, and the session must stop maintenance, catalog and global
+writers before stopping the journal owner and releasing profile ownership.
