@@ -174,6 +174,13 @@ fn system_time_to_signed_unix_nanos(
         Ok(duration) => (false, duration),
         Err(error) => (true, error.duration()),
     };
+    signed_duration_to_unix_nanos(negative, duration)
+}
+
+fn signed_duration_to_unix_nanos(
+    negative: bool,
+    duration: std::time::Duration,
+) -> Result<i64, WaveformEditIntentAdapterError> {
     let nanos = u128::from(duration.as_secs())
         .checked_mul(1_000_000_000)
         .and_then(|value| value.checked_add(u128::from(duration.subsec_nanos())))
@@ -498,48 +505,51 @@ mod tests {
     }
 
     #[test]
-    fn signed_timestamp_conversion_preserves_epoch_edges() {
+    fn signed_timestamp_conversion_preserves_representable_platform_times() {
+        assert_eq!(system_time_to_signed_unix_nanos(UNIX_EPOCH), Ok(0));
+        // Windows SystemTime uses 100 ns ticks; use a representable interval here.
+        let tick = Duration::from_nanos(100);
         assert_eq!(
-            system_time_to_signed_unix_nanos(UNIX_EPOCH).expect("epoch"),
-            0
+            system_time_to_signed_unix_nanos(UNIX_EPOCH.checked_sub(tick).expect("pre-epoch")),
+            Ok(-100)
         );
         assert_eq!(
-            system_time_to_signed_unix_nanos(
-                UNIX_EPOCH
-                    .checked_sub(Duration::from_nanos(1))
-                    .expect("pre-epoch")
-            )
-            .expect("pre-epoch nanos"),
-            -1
+            system_time_to_signed_unix_nanos(UNIX_EPOCH.checked_add(tick).expect("post-epoch")),
+            Ok(100)
         );
-        let positive_limit = Duration::from_nanos(i64::MAX as u64);
-        let negative_limit = Duration::from_nanos(i64::MAX as u64 + 1);
-        assert_eq!(
-            system_time_to_signed_unix_nanos(
-                UNIX_EPOCH
-                    .checked_add(positive_limit)
-                    .expect("positive limit")
-            ),
-            Ok(i64::MAX)
-        );
-        assert_eq!(
-            system_time_to_signed_unix_nanos(
-                UNIX_EPOCH
-                    .checked_sub(negative_limit)
-                    .expect("negative limit")
-            ),
-            Ok(i64::MIN)
-        );
+        let outside_limit = Duration::from_nanos(i64::MAX as u64 + 100);
         for time in [
-            UNIX_EPOCH
-                .checked_add(negative_limit)
-                .expect("above positive limit"),
-            UNIX_EPOCH
-                .checked_sub(Duration::from_nanos(i64::MAX as u64 + 2))
-                .expect("below negative limit"),
+            UNIX_EPOCH.checked_add(outside_limit).expect("above limit"),
+            UNIX_EPOCH.checked_sub(outside_limit).expect("below limit"),
         ] {
             assert_eq!(
                 system_time_to_signed_unix_nanos(time),
+                Err(WaveformEditIntentAdapterError::TimestampOutOfRange)
+            );
+        }
+    }
+
+    #[test]
+    fn signed_duration_conversion_preserves_exact_limits_without_saturation() {
+        assert_eq!(
+            signed_duration_to_unix_nanos(true, Duration::from_nanos(1)),
+            Ok(-1)
+        );
+        assert_eq!(
+            signed_duration_to_unix_nanos(false, Duration::from_nanos(1)),
+            Ok(1)
+        );
+        assert_eq!(
+            signed_duration_to_unix_nanos(false, Duration::from_nanos(i64::MAX as u64)),
+            Ok(i64::MAX)
+        );
+        assert_eq!(
+            signed_duration_to_unix_nanos(true, Duration::from_nanos(i64::MAX as u64 + 1)),
+            Ok(i64::MIN)
+        );
+        for (negative, nanos) in [(false, i64::MAX as u64 + 1), (true, i64::MAX as u64 + 2)] {
+            assert_eq!(
+                signed_duration_to_unix_nanos(negative, Duration::from_nanos(nanos)),
                 Err(WaveformEditIntentAdapterError::TimestampOutOfRange)
             );
         }

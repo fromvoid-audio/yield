@@ -736,3 +736,13 @@ library and GPUI checks, formatting and diff checks passed. Independent review
 found no meaningful issues after the range/layout repairs. Windows validation is
 pending; its storage lane now includes the core edit-settings and media adapter
 tests.
+
+The first V7 Windows run
+[34768644704](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34768644704)
+passed 130 journal tests (one helper ignored), the legacy reader, lifecycle checks
+and all 16 core edit-settings tests. Its adapter timestamp fixture failed because
+it assumed `SystemTime` could represent one nanosecond on Windows. Rust documents
+[100 ns Windows intervals](https://doc.rust-lang.org/std/time/struct.SystemTime.html).
+The repair uses representable platform times and tests exact nanosecond limits in
+the shared checked-duration arithmetic separately. All five adapter tests pass
+locally after this repair; a new exact-commit Windows run is required.
