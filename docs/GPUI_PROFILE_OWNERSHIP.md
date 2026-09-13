@@ -793,4 +793,11 @@ stdout probe confirmed this occurred after the helper persisted its record. The
 helper now starts its protocol message on a new line and explicitly uses one
 child test thread. All three abrupt-restart tests and the full serialized suite
 pass without changing their timeout, strict parsing, abrupt-kill or reopen checks.
-Windows V8 storage acceptance is pending.
+Windows storage validation
+[34771230509](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34771230509)
+passed at exact commit `10bfc6bb4ca25f4d9a12dc4f8902e0ca2ca7ae71`. Logs confirm
+145 journal tests (one helper ignored), including all nine namespace tests, V8
+codec/store/owner coverage and all three abrupt-restart regressions. The lane
+also passed 12 legacy-reader, 90 catalog, 60 session (one helper ignored), 16 core
+edit-settings and five media-adapter tests. This accepts the V8 storage milestone;
+native Windows UI and filesystem execution remain outside this validation scope.
