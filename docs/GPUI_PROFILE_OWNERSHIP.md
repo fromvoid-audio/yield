@@ -652,8 +652,13 @@ release, invalid decoded inputs, the shutdown race, and a successful V5 Copy
 intent/retry/cancellation/recovery round trip. The broader journal suite passed
 128 tests (one helper ignored) before the final two regression replacements;
 61 session tests (one helper ignored), production library compilation without
-default features and GPUI compilation also passed. Windows storage validation is
-pending for this owner implementation.
+default features and GPUI compilation also passed. Windows storage validation
+[34764655033](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34764655033)
+passed at exact commit `96ff3439acaa681dd6528989d21b235b31068c4e`. Its logs confirm
+all nine owner regressions within 116 journal tests (one helper ignored), including
+the shutdown race and successful V5 retry/cancel round trip. The full storage run
+also passed, including 90 catalog and 60 session tests. This is storage-scope
+acceptance, not native Windows UI acceptance.
 
 This storage queue is distinct from universal operation admission. Submitting a
 storage request does not acknowledge an operation as `Accepted`, reserve disk
