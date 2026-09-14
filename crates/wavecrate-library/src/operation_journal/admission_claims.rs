@@ -1,6 +1,7 @@
 //! Bounded observations for capacity admission and later settlement.
 //!
-//! These values bind an immutable [`DurableCapacityPlan`] to the claim rows an owner observed.
+//! These values bind an immutable [`super::full_capacity::FullCapacityPlan`] to the claim rows an
+//! owner observed.
 //! They do not reserve capacity, prove that bytes were allocated, or authorize a journal
 //! transition.  A future V16 owner must add its private admission authority before using these
 //! observations in a state transition.
@@ -9,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::durable_capacity::{CapacityAllocationClass, DurableCapacityPlan, VolumeIdentity};
+use super::full_capacity::{
+    FullCapacityAllocationClass, FullCapacityPlan, FullCapacityValidationError,
+};
+use crate::durable_capacity::VolumeIdentity;
 
 /// Maximum number of capacity claims or settlement rows in one bounded observation.
 pub const MAX_ADMISSION_CLAIMS: usize = 256;
@@ -69,7 +73,7 @@ impl std::fmt::Display for AdmissionClaimId {
 pub struct AdmissionClaim {
     claim_id: AdmissionClaimId,
     volume: VolumeIdentity,
-    allocation_class: CapacityAllocationClass,
+    allocation_class: FullCapacityAllocationClass,
     allocated_bytes: u64,
 }
 
@@ -78,7 +82,7 @@ impl AdmissionClaim {
     pub fn new(
         claim_id: AdmissionClaimId,
         volume: VolumeIdentity,
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
         allocated_bytes: u64,
     ) -> Result<Self, AdmissionClaimValidationError> {
         claim_id.validate()?;
@@ -104,7 +108,7 @@ impl AdmissionClaim {
     }
 
     /// Return the closed allocation class.
-    pub const fn allocation_class(&self) -> CapacityAllocationClass {
+    pub const fn allocation_class(&self) -> FullCapacityAllocationClass {
         self.allocation_class
     }
 
@@ -157,15 +161,14 @@ impl AdmissionClaimInventory {
     /// does not reserve or release capacity.
     pub fn validate_against(
         &self,
-        plan: &DurableCapacityPlan,
+        plan: &FullCapacityPlan,
     ) -> Result<(), AdmissionClaimValidationError> {
         validate_claim_rows(&self.claims)?;
         validate_plan_rows(plan)?;
 
         for claim in &self.claims {
-            if !plan.volumes.iter().any(|expected| {
-                expected.identity == *claim.volume()
-                    && expected.allocation_class == claim.allocation_class()
+            if !plan.allocations().iter().any(|expected| {
+                expected.volume() == claim.volume() && expected.class() == claim.allocation_class()
             }) {
                 return Err(AdmissionClaimValidationError::UnknownAllocation {
                     claim_id: claim.claim_id(),
@@ -175,11 +178,11 @@ impl AdmissionClaimInventory {
             }
         }
 
-        for expected in &plan.volumes {
+        for expected in plan.allocations() {
             let mut observed = 0_u64;
             for claim in &self.claims {
-                if claim.volume() == &expected.identity
-                    && claim.allocation_class() == expected.allocation_class
+                if claim.volume() == expected.volume()
+                    && claim.allocation_class() == expected.class()
                 {
                     observed = observed
                         .checked_add(claim.allocated_bytes())
@@ -188,24 +191,24 @@ impl AdmissionClaimInventory {
             }
             if observed == 0 {
                 return Err(AdmissionClaimValidationError::MissingAllocation {
-                    volume: expected.identity.clone(),
-                    allocation_class: expected.allocation_class,
-                    expected_bytes: expected.allocated_bytes,
+                    volume: expected.volume().clone(),
+                    allocation_class: expected.class(),
+                    expected_bytes: expected.allocated_bytes(),
                 });
             }
-            if observed < expected.allocated_bytes {
+            if observed < expected.allocated_bytes() {
                 return Err(AdmissionClaimValidationError::UnderAllocated {
-                    volume: expected.identity.clone(),
-                    allocation_class: expected.allocation_class,
-                    expected_bytes: expected.allocated_bytes,
+                    volume: expected.volume().clone(),
+                    allocation_class: expected.class(),
+                    expected_bytes: expected.allocated_bytes(),
                     observed_bytes: observed,
                 });
             }
-            if observed > expected.allocated_bytes {
+            if observed > expected.allocated_bytes() {
                 return Err(AdmissionClaimValidationError::OverAllocated {
-                    volume: expected.identity.clone(),
-                    allocation_class: expected.allocation_class,
-                    expected_bytes: expected.allocated_bytes,
+                    volume: expected.volume().clone(),
+                    allocation_class: expected.class(),
+                    expected_bytes: expected.allocated_bytes(),
                     observed_bytes: observed,
                 });
             }
@@ -319,6 +322,49 @@ impl AdmissionClaimSettlementInventory {
         Ok(())
     }
 
+    /// Classify whether these exact settlement observations satisfy a prepublication
+    /// cancellation's allocation policy.
+    ///
+    /// This first validates one settlement row for every admitted claim.  It is an observation
+    /// predicate only: it does not prove filesystem absence, database reclamation, or release
+    /// authority.  A `Held` row always makes the predicate false.
+    pub fn satisfies_prepublication_cancellation(
+        &self,
+        claims: &AdmissionClaimInventory,
+    ) -> Result<bool, AdmissionClaimValidationError> {
+        self.validate_against(claims)?;
+        for claim in claims.claims() {
+            let settlement = self
+                .settlements
+                .iter()
+                .find(|settlement| settlement.claim_id() == claim.claim_id())
+                .expect("validated settlement coverage");
+            let acceptable = match claim.allocation_class() {
+                FullCapacityAllocationClass::DestinationStaging
+                | FullCapacityAllocationClass::OperationRecoveryPayload => {
+                    settlement.outcome() == AdmissionClaimSettlementOutcome::Released
+                }
+                FullCapacityAllocationClass::JournalRecord
+                | FullCapacityAllocationClass::ExistingDestination
+                | FullCapacityAllocationClass::ExistingRecoveryPayload => {
+                    settlement.outcome() == AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                }
+                FullCapacityAllocationClass::SourceDatabaseCommit
+                | FullCapacityAllocationClass::SourceWalShm
+                | FullCapacityAllocationClass::GlobalDatabaseCommit
+                | FullCapacityAllocationClass::GlobalWalShm => matches!(
+                    settlement.outcome(),
+                    AdmissionClaimSettlementOutcome::Released
+                        | AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                ),
+            };
+            if !acceptable {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Return whether every retained settlement observation is `Released`.
     ///
     /// This is a classification predicate over observations, not a release proof.  Callers must
@@ -370,33 +416,34 @@ fn validate_claim_rows(claims: &[AdmissionClaim]) -> Result<(), AdmissionClaimVa
     Ok(())
 }
 
-fn validate_plan_rows(plan: &DurableCapacityPlan) -> Result<(), AdmissionClaimValidationError> {
-    if plan.volumes.is_empty() {
+fn validate_plan_rows(plan: &FullCapacityPlan) -> Result<(), AdmissionClaimValidationError> {
+    if plan.allocations().is_empty() {
         return Err(AdmissionClaimValidationError::EmptyCapacityPlan);
     }
-    if plan.volumes.len() > MAX_ADMISSION_CLAIMS {
+    if plan.allocations().len() > MAX_ADMISSION_CLAIMS {
         return Err(AdmissionClaimValidationError::TooManyExpectedRows {
-            actual: plan.volumes.len(),
+            actual: plan.allocations().len(),
             maximum: MAX_ADMISSION_CLAIMS,
         });
     }
-    for (index, expected) in plan.volumes.iter().enumerate() {
-        if expected.allocated_bytes == 0 {
+    for (index, expected) in plan.allocations().iter().enumerate() {
+        if expected.allocated_bytes() == 0 {
             return Err(AdmissionClaimValidationError::ZeroExpectedBytes {
-                volume: expected.identity.clone(),
-                allocation_class: expected.allocation_class,
+                volume: expected.volume().clone(),
+                allocation_class: expected.class(),
             });
         }
-        if plan.volumes[..index].iter().any(|prior| {
-            prior.identity == expected.identity
-                && prior.allocation_class == expected.allocation_class
-        }) {
+        if plan.allocations()[..index]
+            .iter()
+            .any(|prior| prior.volume() == expected.volume() && prior.class() == expected.class())
+        {
             return Err(AdmissionClaimValidationError::DuplicateExpectedAllocation {
-                volume: expected.identity.clone(),
-                allocation_class: expected.allocation_class,
+                volume: expected.volume().clone(),
+                allocation_class: expected.class(),
             });
         }
     }
+    plan.validate()?;
     Ok(())
 }
 
@@ -446,7 +493,7 @@ pub enum AdmissionClaimValidationError {
         /// Repeated volume identity.
         volume: VolumeIdentity,
         /// Repeated allocation class.
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
     },
     /// Zero-sized expected rows are rejected explicitly by this contract.
     #[error(
@@ -456,7 +503,7 @@ pub enum AdmissionClaimValidationError {
         /// Zero-sized expected volume.
         volume: VolumeIdentity,
         /// Zero-sized expected class.
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
     },
     /// A claim named a `(volume, allocation class)` absent from the plan.
     #[error(
@@ -468,7 +515,7 @@ pub enum AdmissionClaimValidationError {
         /// Unknown volume identity.
         volume: VolumeIdentity,
         /// Unknown allocation class.
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
     },
     /// No positive claim covered an expected plan row.
     #[error(
@@ -478,7 +525,7 @@ pub enum AdmissionClaimValidationError {
         /// Missing expected volume identity.
         volume: VolumeIdentity,
         /// Missing expected class.
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
         /// Expected positive bytes.
         expected_bytes: u64,
     },
@@ -490,7 +537,7 @@ pub enum AdmissionClaimValidationError {
         /// Under-covered volume identity.
         volume: VolumeIdentity,
         /// Under-covered allocation class.
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
         /// Expected bytes.
         expected_bytes: u64,
         /// Observed bytes.
@@ -504,7 +551,7 @@ pub enum AdmissionClaimValidationError {
         /// Over-covered volume identity.
         volume: VolumeIdentity,
         /// Over-covered allocation class.
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
         /// Expected bytes.
         expected_bytes: u64,
         /// Observed bytes.
@@ -550,6 +597,9 @@ pub enum AdmissionClaimValidationError {
         /// Claim identity without a settlement.
         claim_id: AdmissionClaimId,
     },
+    /// A full-capacity plan failed validation before claim coverage could be checked.
+    #[error("invalid full capacity plan: {0}")]
+    FullCapacity(#[from] FullCapacityValidationError),
 }
 
 fn validate_settlement_rows(
@@ -581,7 +631,10 @@ fn validate_settlement_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_capacity::{DurableVolumeCapacity, PROTECTED_FREE_SPACE_FLOOR};
+    use crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR;
+    use crate::operation_journal::full_capacity::{
+        FULL_CAPACITY_PLAN_VERSION, FullCapacityAllocation,
+    };
 
     fn claim_id(value: u128) -> AdmissionClaimId {
         AdmissionClaimId::from_uuid(Uuid::from_u128(value)).expect("claim id")
@@ -589,34 +642,43 @@ mod tests {
 
     fn plan_row(
         device: u64,
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
         allocated_bytes: u64,
-    ) -> DurableVolumeCapacity {
-        DurableVolumeCapacity {
-            identity: VolumeIdentity { device },
-            allocation_unit: 1,
+    ) -> FullCapacityAllocation {
+        FullCapacityAllocation::new(
+            VolumeIdentity { device },
+            1,
             allocation_class,
-            logical_bytes: allocated_bytes,
             allocated_bytes,
-            protected_free_bytes: PROTECTED_FREE_SPACE_FLOOR,
-        }
+            allocated_bytes,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("plan row")
     }
 
-    fn plan(rows: &[(u64, CapacityAllocationClass, u64)]) -> DurableCapacityPlan {
-        DurableCapacityPlan {
-            volumes: rows
-                .iter()
+    fn plan(rows: &[(u64, FullCapacityAllocationClass, u64)]) -> FullCapacityPlan {
+        FullCapacityPlan::new(
+            rows.iter()
                 .map(|(device, allocation_class, bytes)| {
                     plan_row(*device, *allocation_class, *bytes)
                 })
                 .collect(),
-        }
+        )
+        .expect("capacity plan")
+    }
+
+    fn unchecked_plan(allocations: Vec<FullCapacityAllocation>) -> FullCapacityPlan {
+        serde_json::from_value(serde_json::json!({
+            "version": FULL_CAPACITY_PLAN_VERSION,
+            "allocations": allocations,
+        }))
+        .expect("unchecked test plan shape")
     }
 
     fn claim(
         id: u128,
         device: u64,
-        allocation_class: CapacityAllocationClass,
+        allocation_class: FullCapacityAllocationClass,
         allocated_bytes: u64,
     ) -> AdmissionClaim {
         AdmissionClaim::new(
@@ -650,15 +712,15 @@ mod tests {
             AdmissionClaim::new(
                 claim_id(1),
                 VolumeIdentity { device: 1 },
-                CapacityAllocationClass::DestinationStaging,
+                FullCapacityAllocationClass::DestinationStaging,
                 0,
             ),
             Err(AdmissionClaimValidationError::ZeroClaimBytes { .. })
         ));
         assert!(matches!(
             AdmissionClaimInventory::new(vec![
-                claim(1, 1, CapacityAllocationClass::DestinationStaging, 1),
-                claim(1, 1, CapacityAllocationClass::DestinationStaging, 1),
+                claim(1, 1, FullCapacityAllocationClass::DestinationStaging, 1),
+                claim(1, 1, FullCapacityAllocationClass::DestinationStaging, 1),
             ]),
             Err(AdmissionClaimValidationError::DuplicateClaimId { .. })
         ));
@@ -667,39 +729,55 @@ mod tests {
     #[test]
     fn exact_aggregate_coverage_accepts_split_claims_and_rejects_plan_ambiguity() {
         let capacity_plan = plan(&[
-            (1, CapacityAllocationClass::DestinationStaging, 10),
-            (1, CapacityAllocationClass::JournalRecord, 5),
-            (2, CapacityAllocationClass::ExistingRecoveryPayload, 3),
+            (1, FullCapacityAllocationClass::DestinationStaging, 10),
+            (1, FullCapacityAllocationClass::JournalRecord, 5),
+            (2, FullCapacityAllocationClass::ExistingRecoveryPayload, 3),
         ]);
         let inventory = AdmissionClaimInventory::new(vec![
-            claim(1, 1, CapacityAllocationClass::DestinationStaging, 4),
-            claim(2, 1, CapacityAllocationClass::DestinationStaging, 6),
-            claim(3, 1, CapacityAllocationClass::JournalRecord, 5),
-            claim(4, 2, CapacityAllocationClass::ExistingRecoveryPayload, 3),
+            claim(1, 1, FullCapacityAllocationClass::DestinationStaging, 4),
+            claim(2, 1, FullCapacityAllocationClass::DestinationStaging, 6),
+            claim(3, 1, FullCapacityAllocationClass::JournalRecord, 5),
+            claim(
+                4,
+                2,
+                FullCapacityAllocationClass::ExistingRecoveryPayload,
+                3,
+            ),
         ])
         .expect("claims");
         inventory
             .validate_against(&capacity_plan)
             .expect("exact coverage");
 
-        let duplicate_plan = plan(&[
-            (1, CapacityAllocationClass::DestinationStaging, 4),
-            (1, CapacityAllocationClass::DestinationStaging, 6),
+        let duplicate_plan = unchecked_plan(vec![
+            plan_row(1, FullCapacityAllocationClass::DestinationStaging, 4),
+            plan_row(1, FullCapacityAllocationClass::DestinationStaging, 6),
         ]);
         assert!(matches!(
             inventory.validate_against(&duplicate_plan),
             Err(AdmissionClaimValidationError::DuplicateExpectedAllocation { .. })
         ));
-        let zero_plan = plan(&[(1, CapacityAllocationClass::DestinationStaging, 0)]);
+        let zero_plan: FullCapacityPlan = serde_json::from_value(serde_json::json!({
+            "version": FULL_CAPACITY_PLAN_VERSION,
+            "allocations": [{
+                "volume": {"device": 1},
+                "allocation_unit": 1,
+                "class": "DestinationStaging",
+                "logical_bytes": 0,
+                "allocated_bytes": 0,
+                "protected_free_bytes": PROTECTED_FREE_SPACE_FLOOR,
+            }]
+        }))
+        .expect("zero test plan shape");
         assert_eq!(
             inventory.validate_against(&zero_plan),
             Err(AdmissionClaimValidationError::ZeroExpectedBytes {
                 volume: VolumeIdentity { device: 1 },
-                allocation_class: CapacityAllocationClass::DestinationStaging,
+                allocation_class: FullCapacityAllocationClass::DestinationStaging,
             })
         );
         assert_eq!(
-            inventory.validate_against(&DurableCapacityPlan::default()),
+            inventory.validate_against(&unchecked_plan(Vec::new())),
             Err(AdmissionClaimValidationError::EmptyCapacityPlan)
         );
     }
@@ -707,20 +785,20 @@ mod tests {
     #[test]
     fn coverage_reports_missing_under_over_unknown_and_overflow() {
         let two_rows = plan(&[
-            (1, CapacityAllocationClass::DestinationStaging, 10),
-            (1, CapacityAllocationClass::JournalRecord, 4),
+            (1, FullCapacityAllocationClass::DestinationStaging, 10),
+            (1, FullCapacityAllocationClass::JournalRecord, 4),
         ]);
         let missing = AdmissionClaimInventory::new(vec![claim(
             1,
             1,
-            CapacityAllocationClass::DestinationStaging,
+            FullCapacityAllocationClass::DestinationStaging,
             10,
         )])
         .expect("missing inventory");
         assert!(matches!(
             missing.validate_against(&two_rows),
             Err(AdmissionClaimValidationError::MissingAllocation {
-                allocation_class: CapacityAllocationClass::JournalRecord,
+                allocation_class: FullCapacityAllocationClass::JournalRecord,
                 ..
             })
         ));
@@ -728,14 +806,14 @@ mod tests {
         let under = AdmissionClaimInventory::new(vec![claim(
             1,
             1,
-            CapacityAllocationClass::DestinationStaging,
+            FullCapacityAllocationClass::DestinationStaging,
             9,
         )])
         .expect("under inventory");
         assert!(matches!(
             under.validate_against(&plan(&[(
                 1,
-                CapacityAllocationClass::DestinationStaging,
+                FullCapacityAllocationClass::DestinationStaging,
                 10
             )])),
             Err(AdmissionClaimValidationError::UnderAllocated {
@@ -748,14 +826,14 @@ mod tests {
         let over = AdmissionClaimInventory::new(vec![claim(
             1,
             1,
-            CapacityAllocationClass::DestinationStaging,
+            FullCapacityAllocationClass::DestinationStaging,
             11,
         )])
         .expect("over inventory");
         assert!(matches!(
             over.validate_against(&plan(&[(
                 1,
-                CapacityAllocationClass::DestinationStaging,
+                FullCapacityAllocationClass::DestinationStaging,
                 10
             )])),
             Err(AdmissionClaimValidationError::OverAllocated {
@@ -768,29 +846,34 @@ mod tests {
         let unknown = AdmissionClaimInventory::new(vec![claim(
             1,
             1,
-            CapacityAllocationClass::JournalRecord,
+            FullCapacityAllocationClass::JournalRecord,
             1,
         )])
         .expect("unknown inventory");
         assert!(matches!(
             unknown.validate_against(&plan(&[(
                 1,
-                CapacityAllocationClass::DestinationStaging,
+                FullCapacityAllocationClass::DestinationStaging,
                 1
             )])),
             Err(AdmissionClaimValidationError::UnknownAllocation { .. })
         ));
 
         let overflow = AdmissionClaimInventory::new(vec![
-            claim(1, 1, CapacityAllocationClass::DestinationStaging, u64::MAX),
-            claim(2, 1, CapacityAllocationClass::DestinationStaging, 1),
+            claim(
+                1,
+                1,
+                FullCapacityAllocationClass::DestinationStaging,
+                u64::MAX,
+            ),
+            claim(2, 1, FullCapacityAllocationClass::DestinationStaging, 1),
         ])
         .expect("overflow inventory");
         assert_eq!(
             overflow.validate_against(&plan(&[(
                 1,
-                CapacityAllocationClass::DestinationStaging,
-                u64::MAX
+                FullCapacityAllocationClass::DestinationStaging,
+                1
             )])),
             Err(AdmissionClaimValidationError::ArithmeticOverflow)
         );
@@ -803,7 +886,7 @@ mod tests {
                 claim(
                     (index + 1) as u128,
                     1,
-                    CapacityAllocationClass::DestinationStaging,
+                    FullCapacityAllocationClass::DestinationStaging,
                     1,
                 )
             })
@@ -825,9 +908,9 @@ mod tests {
     #[test]
     fn settlement_inventory_requires_each_claim_and_exposes_only_observation_predicates() {
         let claims = AdmissionClaimInventory::new(vec![
-            claim(1, 1, CapacityAllocationClass::DestinationStaging, 1),
-            claim(2, 1, CapacityAllocationClass::JournalRecord, 2),
-            claim(3, 2, CapacityAllocationClass::ExistingDestination, 3),
+            claim(1, 1, FullCapacityAllocationClass::DestinationStaging, 1),
+            claim(2, 1, FullCapacityAllocationClass::JournalRecord, 2),
+            claim(3, 2, FullCapacityAllocationClass::ExistingDestination, 3),
         ])
         .expect("claims");
         let all_released = AdmissionClaimSettlementInventory::new(vec![
@@ -884,6 +967,121 @@ mod tests {
         assert!(matches!(
             unknown.validate_against(&claims),
             Err(AdmissionClaimValidationError::UnknownSettlementClaim { .. })
+        ));
+    }
+
+    #[test]
+    fn prepublication_settlement_policy_is_class_sensitive_and_exact() {
+        let classes = [
+            FullCapacityAllocationClass::DestinationStaging,
+            FullCapacityAllocationClass::OperationRecoveryPayload,
+            FullCapacityAllocationClass::JournalRecord,
+            FullCapacityAllocationClass::ExistingDestination,
+            FullCapacityAllocationClass::ExistingRecoveryPayload,
+            FullCapacityAllocationClass::SourceDatabaseCommit,
+            FullCapacityAllocationClass::SourceWalShm,
+            FullCapacityAllocationClass::GlobalDatabaseCommit,
+            FullCapacityAllocationClass::GlobalWalShm,
+        ];
+        let claims = AdmissionClaimInventory::new(
+            classes
+                .iter()
+                .enumerate()
+                .map(|(index, class)| claim((index + 1) as u128, 1, *class, 1))
+                .collect(),
+        )
+        .expect("class-complete claims");
+
+        let all_released = AdmissionClaimSettlementInventory::new(
+            classes
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    settlement(
+                        (index + 1) as u128,
+                        AdmissionClaimSettlementOutcome::Released,
+                    )
+                })
+                .collect(),
+        )
+        .expect("released settlements");
+        assert!(
+            !all_released
+                .satisfies_prepublication_cancellation(&claims)
+                .expect("exact released coverage")
+        );
+
+        let policy_valid = AdmissionClaimSettlementInventory::new(
+            classes
+                .iter()
+                .enumerate()
+                .map(|(index, class)| {
+                    let outcome = match class {
+                        FullCapacityAllocationClass::DestinationStaging
+                        | FullCapacityAllocationClass::OperationRecoveryPayload
+                        | FullCapacityAllocationClass::SourceDatabaseCommit
+                        | FullCapacityAllocationClass::SourceWalShm
+                        | FullCapacityAllocationClass::GlobalDatabaseCommit
+                        | FullCapacityAllocationClass::GlobalWalShm => {
+                            AdmissionClaimSettlementOutcome::Released
+                        }
+                        FullCapacityAllocationClass::JournalRecord
+                        | FullCapacityAllocationClass::ExistingDestination
+                        | FullCapacityAllocationClass::ExistingRecoveryPayload => {
+                            AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                        }
+                    };
+                    settlement((index + 1) as u128, outcome)
+                })
+                .collect(),
+        )
+        .expect("policy-valid settlements");
+        assert!(
+            policy_valid
+                .satisfies_prepublication_cancellation(&claims)
+                .expect("exact policy coverage")
+        );
+
+        let held = AdmissionClaimSettlementInventory::new(
+            classes
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    settlement(
+                        (index + 1) as u128,
+                        if index == 0 {
+                            AdmissionClaimSettlementOutcome::Held
+                        } else {
+                            AdmissionClaimSettlementOutcome::Released
+                        },
+                    )
+                })
+                .collect(),
+        )
+        .expect("held settlements");
+        assert!(
+            !held
+                .satisfies_prepublication_cancellation(&claims)
+                .expect("held is a valid observation")
+        );
+
+        let incomplete = AdmissionClaimSettlementInventory::new(
+            classes
+                .iter()
+                .take(classes.len() - 1)
+                .enumerate()
+                .map(|(index, _)| {
+                    settlement(
+                        (index + 1) as u128,
+                        AdmissionClaimSettlementOutcome::Released,
+                    )
+                })
+                .collect(),
+        )
+        .expect("incomplete shape");
+        assert!(matches!(
+            incomplete.satisfies_prepublication_cancellation(&claims),
+            Err(AdmissionClaimValidationError::SettlementCountMismatch { .. })
         ));
     }
 }

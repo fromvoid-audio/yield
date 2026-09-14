@@ -1235,3 +1235,31 @@ Windows storage run `34894858329` passed at exact status/claim-attachment source
 including the five claim tests, two full-status compatibility tests and sixteen
 progress tests. The remaining storage-lane checks passed too. This is storage
 acceptance, not native Windows UI/audio acceptance.
+
+Cancellation inventory source `8f76586a78b0803e12fcc83bab82b9762c1d3830` freezes
+the exact work-step snapshot, entered-action classification and admitted claims.
+Validation rejects a forged prerequisite-closed publication snapshot that differs
+from current progress, and permits a retained capture epoch after source lease
+reacquisition while rejecting a future epoch. Retained merge, destructive
+disposition and audited external effects cannot masquerade as clean staging.
+The narrow after-observed-effect audit overlay preserves its cancellation hold.
+Twenty progress tests and one cancellation module test passed, along with library
+and GPUI checks without default features, formatting and diff checks. Independent
+review accepted the repaired snapshot and epoch guards. Terminal cancellation
+outcomes remain unavailable pending scoped recovery and settlement guards.
+
+Windows storage run `34897433109` passed at that exact cancellation-inventory
+source: 271 journal tests passed with one ignored, including all twenty progress
+tests and the cancellation module test. The remaining storage-lane checks passed.
+This does not provide native Windows UI/audio acceptance.
+
+The full-progress capacity contract now has its own bounded version-one plan and
+allocation classes, including operation-created recovery payloads. Legacy plans
+convert by copying and validating their facts; no floor or recovery class is
+inferred. Validation covers row bounds, alignment, protected floors, per-volume
+allocation-unit consistency and aggregate overflow. Prepublication settlement
+requires released staging/new recovery claims, retained journal/existing-data
+charges, and no held claims. These remain observations, not live release proofs.
+Six capacity tests, six claim tests and twenty progress tests passed, together
+with library/GPUI checks without default features and formatting/diff checks.
+Primary review added the per-volume aggregate and unit-consistency checks.

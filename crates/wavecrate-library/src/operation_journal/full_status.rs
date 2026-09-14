@@ -2,8 +2,8 @@
 //!
 //! The legacy [`super::model::OperationDisposition`] remains the wire and status type for
 //! schemas V1 through V15.  This parallel type adds cancellation states that describe an
-//! observed effect without claiming ordinary application publication, leaving the legacy
-//! vocabulary or its codecs.
+//! observed effect without claiming ordinary application publication, preserving the legacy
+//! vocabulary and its codecs.
 
 use serde::{Deserialize, Serialize};
 

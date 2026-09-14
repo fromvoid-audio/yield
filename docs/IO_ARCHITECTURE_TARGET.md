@@ -680,6 +680,17 @@ not authorize a subsequent, unstarted trim. Private recovery authority binds the
 exact inventory and current execution epoch; stored observations alone do not
 authorize cleanup, compensation, reconciliation or claim settlement.
 
+Entered effects use one cancellation recovery strategy: forward reconciliation or
+compensation. Prepublication cleanup may accompany either strategy. Recovery
+receipts name the entered action and its affected source or coordinator role;
+they never mark unrelated ordinary work complete. Created parent directories do
+not become deletion obligations merely because an action was cancelled.
+
+Normal full-progress success also requires exact settlement coverage of the
+admitted claims, with no held claim. Finishing the work plan alone is insufficient;
+progress remains nonterminal until its capacity owner supplies settlement. A pure
+unadmitted progress model cannot report durable successful completion.
+
 `RejectedBeforeIntent` is outside this phase/disposition table: it is a non-durable
 coordinator result, not a journal phase or durable disposition. Pre-intent cancellation is
 also non-durable and returns no operation record. `RetryPending` requires `IntentDurable`, a

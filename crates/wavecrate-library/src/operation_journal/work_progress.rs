@@ -35,7 +35,6 @@ use super::work_plan::{
     MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnitApplicability,
     WorkUnitKey, WorkUnitRole,
 };
-use crate::durable_capacity::DurableCapacityPlan;
 use crate::sample_sources::SourceId;
 
 /// One bounded source revision observation attached to a progress completion.
@@ -756,7 +755,7 @@ impl WorkProgress {
         plan: &WorkPlan,
         args: &UniversalCommandArgs,
         participants: &ParticipantSet,
-        capacity_plan: &DurableCapacityPlan,
+        capacity_plan: &super::full_capacity::FullCapacityPlan,
         admission_claims: AdmissionClaimInventory,
     ) -> Result<Self, WorkProgressError> {
         admission_claims.validate_against(capacity_plan)?;
@@ -2149,10 +2148,7 @@ impl From<CancellationRequestValidationError> for WorkProgressError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_capacity::{
-        CapacityAllocationClass, DurableCapacityPlan, DurableVolumeCapacity,
-        PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
-    };
+    use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity};
     use crate::operation_journal::MAX_CANCELLATION_STEPS;
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, CancellationActionState,
@@ -2162,6 +2158,7 @@ mod tests {
         ExternalRawObservationLimits, ExternalRawObservationMetadata,
         ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
         ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
         NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
         NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
         NamespaceFileExpectation, NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget,
@@ -2358,17 +2355,19 @@ mod tests {
         (participants, args, plan)
     }
 
-    fn admission_capacity_plan() -> DurableCapacityPlan {
-        DurableCapacityPlan {
-            volumes: vec![DurableVolumeCapacity {
-                identity: VolumeIdentity { device: 1 },
-                allocation_unit: 1,
-                allocation_class: CapacityAllocationClass::DestinationStaging,
-                logical_bytes: 12,
-                allocated_bytes: 12,
-                protected_free_bytes: PROTECTED_FREE_SPACE_FLOOR,
-            }],
-        }
+    fn admission_capacity_plan() -> FullCapacityPlan {
+        FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 1 },
+                1,
+                FullCapacityAllocationClass::DestinationStaging,
+                12,
+                12,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("full capacity allocation"),
+        ])
+        .expect("full capacity plan")
     }
 
     fn admission_claims(allocated_bytes: u64) -> AdmissionClaimInventory {
@@ -2376,7 +2375,7 @@ mod tests {
             AdmissionClaim::new(
                 AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("claim id"),
                 VolumeIdentity { device: 1 },
-                CapacityAllocationClass::DestinationStaging,
+                FullCapacityAllocationClass::DestinationStaging,
                 allocated_bytes,
             )
             .expect("claim"),

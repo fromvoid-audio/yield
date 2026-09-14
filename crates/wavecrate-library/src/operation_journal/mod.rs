@@ -11,6 +11,7 @@ pub mod codec;
 pub mod coordinator;
 pub mod evidence;
 pub mod external_commands;
+pub mod full_capacity;
 pub mod full_status;
 pub mod history_commands;
 pub mod model;
@@ -111,6 +112,11 @@ pub use external_commands::{
     ExternalReconciliationValidationError, MAX_EXTERNAL_RECONCILIATION_EVENTS,
     MAX_EXTERNAL_RECONCILIATION_IDENTITY_BYTES, MAX_EXTERNAL_RECONCILIATION_METADATA_BYTES,
     MAX_EXTERNAL_RECONCILIATION_PATH_BYTES, MAX_EXTERNAL_RECONCILIATION_PATHS,
+};
+
+pub use full_capacity::{
+    FULL_CAPACITY_PLAN_VERSION, FullCapacityAllocation, FullCapacityAllocationClass,
+    FullCapacityPlan, FullCapacityValidationError, MAX_FULL_CAPACITY_ALLOCATIONS,
 };
 
 pub use full_status::FullProgressDisposition;
