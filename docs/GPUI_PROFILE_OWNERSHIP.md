@@ -1103,5 +1103,14 @@ including native-string, uncertainty, one-sided sequence, nullable-field,
 owner/store, retry/cancel and restart coverage. Library and GPUI checks without
 default features, formatting and diff checks passed. Primary review covered
 allocation bounds, participant bindings and codec compatibility, and repaired the
-provenance preallocation and nullable-key issues before acceptance. Windows storage
-validation is pending.
+provenance preallocation and nullable-key issues before acceptance.
+
+Windows storage validation
+[34881198244](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34881198244)
+passed at exact commit `692bc3aaf6bd7bfdca9b21d0a3cb3eba138ad5d9`, after gating
+Unix-only test imports found by the first Windows run. The lane passed 233 journal
+tests (one helper ignored), including V15 raw-evidence, nullable-field, owner and
+restart/retry/cancel coverage. It also passed 12 legacy-reader, 90 catalog,
+60 session (one helper ignored), 16 core edit-settings and five media-adapter
+tests. This accepts external-evidence storage; native Windows UI and filesystem
+execution remain outside this lane.
