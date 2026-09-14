@@ -1485,8 +1485,11 @@ mod tests {
     };
     use crate::sample_sources::reconciliation::{
         CaptureBoundary, RawObservation, RawObservationEnvelope, RawObservationLimits,
-        RawObservationMetadata, RawObservationProvenance, RawObservedPath, RawPathRole,
-        RootIdentity, WatcherGeneration,
+        RawObservationProvenance, RootIdentity, WatcherGeneration,
+    };
+    #[cfg(unix)]
+    use crate::sample_sources::reconciliation::{
+        RawObservationMetadata, RawObservedPath, RawPathRole,
     };
 
     fn participant_fixture() -> (ParticipantSet, ParticipantId, ParticipantId, SourceId) {
