@@ -1173,8 +1173,11 @@ Eight focused progress tests and the library and GPUI checks without default
 features passed, as did formatting and diff checks. Independent review verified
 the fenced coordinator and retry-epoch repairs; its final empty retry-window
 finding was repaired with an unchanged-state boundary regression. Windows storage
-validation is pending. Durable progress encoding, SQL CAS, owner integration,
-source-lease reacquisition, audit recovery and readiness-deficit scheduling remain
+run `34890767898` passed at exact source commit
+`71baad29317b96c2e9e41ad576c91406d3c151c9`: 251 journal tests passed with one ignored,
+including all eight progress tests. The remaining storage-lane checks passed too;
+this does not establish native Windows UI/audio acceptance. Durable progress
+encoding, SQL CAS, owner integration, audit recovery and readiness-deficit scheduling remain
 separate work; this core does not complete OPT-1337.
 
 The following source-reacquisition guard preserves the immutable plan while
