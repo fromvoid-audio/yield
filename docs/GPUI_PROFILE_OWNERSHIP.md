@@ -1229,3 +1229,9 @@ and V1–V15 codecs remain unchanged. The new effect routes are not enabled unti
 the cancellation inventory guards exist. Sixteen progress tests, two full-status
 compatibility tests, library and GPUI checks without default features, formatting
 and diff checks passed. Primary diff review found no material issue.
+
+Windows storage run `34894858329` passed at exact status/claim-attachment source
+`086b63ff58839794eb37f995c276e88d8c4612d4`: 266 journal tests passed with one ignored,
+including the five claim tests, two full-status compatibility tests and sixteen
+progress tests. The remaining storage-lane checks passed too. This is storage
+acceptance, not native Windows UI/audio acceptance.
