@@ -1277,3 +1277,8 @@ pure progress no longer reports success from work completion alone. Twenty-five
 focused progress tests passed, together with library/GPUI checks without default
 features, formatting and diff checks. Primary review repaired retention and
 monotonic advancement of held rows. No live capacity authority issuer was added.
+
+Windows storage run `34900358246` passed at exact settlement source `a9fcfc83b`:
+283 journal tests passed with one ignored, including all twenty-five progress
+tests. The remaining storage-lane checks passed; native Windows UI/audio
+acceptance remains separate.
