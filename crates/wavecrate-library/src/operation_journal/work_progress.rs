@@ -28,7 +28,8 @@ use super::participants::{
     ParticipantValidationError, StoredSourceFence,
 };
 use super::work_plan::{
-    WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
+    MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnitApplicability,
+    WorkUnitKey, WorkUnitRole,
 };
 use crate::sample_sources::SourceId;
 
@@ -351,23 +352,146 @@ pub enum ProgressAuditReason {
     WatcherContinuityUnproven,
 }
 
+/// Bounded target set for one audit overlay.
+///
+/// `Steps` must be sorted by the stable [`WorkUnitKey`] order, contain no duplicate, and contain
+/// at least one key.  The plan membership check is performed when the target is attached to a
+/// progress record; a target value by itself is only a bounded observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub enum AuditTarget {
+    /// Audit the complete operation while preserving every existing step observation.
+    WholeOperation,
+    /// Audit this exact sorted, unique subset of frozen work-unit keys.
+    Steps(Vec<WorkUnitKey>),
+}
+
+impl AuditTarget {
+    /// Construct and shape-check a step target without checking plan membership.
+    pub fn steps(keys: Vec<WorkUnitKey>) -> Result<Self, AuditTargetValidationError> {
+        let target = Self::Steps(keys);
+        target.validate_shape()?;
+        Ok(target)
+    }
+
+    fn validate_shape(&self) -> Result<(), AuditTargetValidationError> {
+        let Self::Steps(keys) = self else {
+            return Ok(());
+        };
+        if keys.is_empty() {
+            return Err(AuditTargetValidationError::Empty);
+        }
+        if keys.len() > MAX_WORK_PLAN_UNITS {
+            return Err(AuditTargetValidationError::TooMany {
+                actual: keys.len(),
+                maximum: MAX_WORK_PLAN_UNITS,
+            });
+        }
+        if keys.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(AuditTargetValidationError::NotSortedUnique);
+        }
+        Ok(())
+    }
+
+    fn validate_for_plan(&self, plan: &WorkPlan) -> Result<(), AuditTargetValidationError> {
+        self.validate_shape()?;
+        let Self::Steps(keys) = self else {
+            return Ok(());
+        };
+        for key in keys {
+            if !plan.units().iter().any(|unit| unit.key() == *key) {
+                return Err(AuditTargetValidationError::UnknownWorkUnit { key: *key });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Failure while validating a bounded audit target.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AuditTargetValidationError {
+    /// A step target contained no keys.
+    #[error("audit target must contain at least one work-unit key")]
+    Empty,
+    /// A step target exceeded the frozen-plan unit bound.
+    #[error("audit target contains {actual} keys, maximum is {maximum}")]
+    TooMany {
+        /// Number of supplied target keys.
+        actual: usize,
+        /// Maximum number of target keys.
+        maximum: usize,
+    },
+    /// A step target was not strictly sorted or contained a duplicate.
+    #[error("audit target keys must be sorted and unique")]
+    NotSortedUnique,
+    /// A step target named a key absent from the frozen plan.
+    #[error("audit target names unknown work unit {key:?}")]
+    UnknownWorkUnit {
+        /// Unknown key named by the target.
+        key: WorkUnitKey,
+    },
+}
+
 /// Bounded audit observation retained when progress must stop and preserve evidence.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgressAuditObservation {
     reason: ProgressAuditReason,
+    target: AuditTarget,
 }
 
 impl ProgressAuditObservation {
     /// Construct an audit observation without resolving the audit.
     pub const fn new(reason: ProgressAuditReason) -> Self {
-        Self { reason }
+        Self {
+            reason,
+            target: AuditTarget::WholeOperation,
+        }
+    }
+
+    /// Construct an audit observation for a bounded subset of frozen work units.
+    pub fn for_target(
+        reason: ProgressAuditReason,
+        target: AuditTarget,
+    ) -> Result<Self, AuditTargetValidationError> {
+        target.validate_shape()?;
+        Ok(Self { reason, target })
+    }
+
+    fn validate_for_plan(&self, plan: &WorkPlan) -> Result<(), AuditTargetValidationError> {
+        self.target.validate_for_plan(plan)
     }
 
     /// Return the closed audit reason.
-    pub const fn reason(self) -> ProgressAuditReason {
+    pub const fn reason(&self) -> ProgressAuditReason {
         self.reason
     }
+
+    /// Borrow the exact audit target.
+    pub fn target(&self) -> &AuditTarget {
+        &self.target
+    }
+}
+
+/// The progress disposition hidden beneath an active audit overlay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuditSuspendedHold {
+    /// No retry or cancellation disposition was active when the audit began.
+    None,
+    /// A retry observation remains pending beneath the audit.
+    RetryPending,
+    /// Cancellation was requested before publication beneath the audit.
+    CancelRequestedBeforePublish,
+    /// Cancellation was requested after publication beneath the audit.
+    CancelRequestedAfterPublish,
+}
+
+/// Current audit overlay with its exact generation and suspended disposition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveAudit {
+    generation: u64,
+    observation: ProgressAuditObservation,
+    suspended_hold: AuditSuspendedHold,
 }
 
 /// Immutable participant scope captured from the initial participant inventory.
@@ -501,6 +625,16 @@ struct VerifiedSourceReacquisition {
     new_fence: StoredSourceFence,
 }
 
+/// Private owner-issued authority for resolving one exact active audit overlay.
+#[allow(dead_code)]
+struct VerifiedAuditResolution {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    generation: u64,
+    observation: ProgressAuditObservation,
+}
+
 /// Internal typed gate for a pre-publication cancellation terminal transition.
 #[allow(dead_code)]
 struct PrePublishCancellationAuthority {
@@ -542,7 +676,8 @@ pub struct WorkProgress {
     retry_observation: Option<RetryObservation>,
     last_retry_observation: Option<RetryObservation>,
     execution_epoch: u64,
-    audit_observation: Option<ProgressAuditObservation>,
+    active_audit: Option<ActiveAudit>,
+    audit_generation: u64,
     cancellation_request: Option<CancellationRequestObservation>,
 }
 
@@ -594,7 +729,8 @@ impl WorkProgress {
             retry_observation: None,
             last_retry_observation: None,
             execution_epoch: 0,
-            audit_observation: None,
+            active_audit: None,
+            audit_generation: 0,
             cancellation_request: None,
         })
     }
@@ -645,8 +781,13 @@ impl WorkProgress {
     }
 
     /// Borrow the retained audit observation, when progress is audit-blocked.
-    pub const fn audit_observation(&self) -> Option<ProgressAuditObservation> {
-        self.audit_observation
+    pub fn audit_observation(&self) -> Option<&ProgressAuditObservation> {
+        self.active_audit.as_ref().map(|audit| &audit.observation)
+    }
+
+    /// Return the retained audit generation, including generations that were resolved.
+    pub const fn audit_generation(&self) -> u64 {
+        self.audit_generation
     }
 
     /// Borrow the retained cancellation request, when cancellation was requested.
@@ -837,8 +978,97 @@ impl WorkProgress {
         if self.disposition.is_terminal() {
             return Err(WorkProgressError::TerminalTransitionForbidden);
         }
-        self.audit_observation = Some(observation);
+        observation.validate_for_plan(&self.plan)?;
+        if let Some(active) = &self.active_audit {
+            if active.observation == observation {
+                return Ok(());
+            }
+            return Err(WorkProgressError::AuditReplayConflict);
+        }
+        if self.disposition == OperationDisposition::AuditRequired {
+            return Err(WorkProgressError::AuditStateMissing);
+        }
+        if self.phase.is_pre_publication() {
+            return Err(WorkProgressError::AuditPhaseInvalid);
+        }
+        let suspended_hold = match self.disposition {
+            OperationDisposition::None => AuditSuspendedHold::None,
+            OperationDisposition::RetryPending => AuditSuspendedHold::RetryPending,
+            OperationDisposition::CancelRequestedBeforePublish => {
+                AuditSuspendedHold::CancelRequestedBeforePublish
+            }
+            OperationDisposition::CancelRequestedAfterPublish => {
+                AuditSuspendedHold::CancelRequestedAfterPublish
+            }
+            disposition => {
+                return Err(WorkProgressError::AuditUnderlyingDispositionUnsupported {
+                    disposition,
+                });
+            }
+        };
+        let generation = self
+            .audit_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::AuditGenerationOverflow)?;
+        self.active_audit = Some(ActiveAudit {
+            generation,
+            observation,
+            suspended_hold,
+        });
+        self.audit_generation = generation;
         self.disposition = OperationDisposition::AuditRequired;
+        Ok(())
+    }
+
+    /// Resolve one active audit only through a private authority matching its exact hold.
+    #[allow(dead_code)]
+    fn resolve_audit(
+        &mut self,
+        authority: VerifiedAuditResolution,
+    ) -> Result<(), WorkProgressError> {
+        if self.disposition != OperationDisposition::AuditRequired {
+            return Err(WorkProgressError::AuditResolutionNotActive);
+        }
+        let Some(active) = &self.active_audit else {
+            return Err(WorkProgressError::AuditStateMissing);
+        };
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::AuditResolutionAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::AuditResolutionEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        if authority.generation != active.generation {
+            return Err(WorkProgressError::AuditResolutionGenerationMismatch {
+                expected: active.generation,
+                actual: authority.generation,
+            });
+        }
+        if authority.observation != active.observation {
+            return Err(WorkProgressError::AuditResolutionObservationMismatch);
+        }
+        let restored_disposition = match active.suspended_hold {
+            AuditSuspendedHold::None => OperationDisposition::None,
+            AuditSuspendedHold::RetryPending if self.retry_observation.is_some() => {
+                OperationDisposition::RetryPending
+            }
+            AuditSuspendedHold::CancelRequestedBeforePublish
+                if self.cancellation_request.is_some() =>
+            {
+                OperationDisposition::CancelRequestedBeforePublish
+            }
+            AuditSuspendedHold::CancelRequestedAfterPublish
+                if self.cancellation_request.is_some() =>
+            {
+                OperationDisposition::CancelRequestedAfterPublish
+            }
+            _ => return Err(WorkProgressError::AuditSuspendedHoldMissing),
+        };
+        self.active_audit = None;
+        self.disposition = restored_disposition;
         Ok(())
     }
 
@@ -851,16 +1081,24 @@ impl WorkProgress {
         if self.disposition.is_terminal() {
             return Err(WorkProgressError::TerminalTransitionForbidden);
         }
-        if self.disposition == OperationDisposition::AuditRequired {
-            return Err(WorkProgressError::ProgressSuspended {
-                disposition: self.disposition,
-            });
-        }
         if let Some(existing) = self.cancellation_request {
             if existing == observation {
                 return Ok(());
             }
             return Err(WorkProgressError::CancellationReplayConflict);
+        }
+        if self.disposition == OperationDisposition::AuditRequired {
+            if self.active_audit.is_none() {
+                return Err(WorkProgressError::AuditStateMissing);
+            }
+            if !self.phase.is_post_publication() {
+                return Err(WorkProgressError::CancellationPhaseInvalid);
+            }
+            self.cancellation_request = Some(observation);
+            if let Some(active) = &mut self.active_audit {
+                active.suspended_hold = AuditSuspendedHold::CancelRequestedAfterPublish;
+            }
+            return Ok(());
         }
         self.cancellation_request = Some(observation);
         self.disposition = if self.phase.is_pre_publication() {
@@ -1115,7 +1353,7 @@ impl WorkProgress {
             self.phase = candidate;
         }
         if self.all_required_complete()
-            && self.audit_observation.is_none()
+            && self.active_audit.is_none()
             && self.optional_artifacts_resolved()
         {
             self.phase = OperationPhase::Terminal;
@@ -1512,6 +1750,9 @@ pub enum WorkProgressError {
     /// A nested evidence observation was malformed.
     #[error("invalid work progress evidence: {0}")]
     Evidence(#[from] ProgressEvidenceError),
+    /// An audit target was malformed or absent from the frozen plan.
+    #[error("invalid work progress audit target: {0}")]
+    AuditTarget(#[from] AuditTargetValidationError),
     /// A retry observation failed its bounded validation.
     #[error("invalid work progress retry observation: {0}")]
     RetryObservation(#[source] RetryObservationValidationError),
@@ -1604,6 +1845,56 @@ pub enum WorkProgressError {
     /// The source-reacquisition epoch could not advance without wrapping.
     #[error("work progress source-reacquisition execution epoch overflowed")]
     SourceReacquisitionEpochOverflow,
+    /// A generic audit was requested before filesystem publication.
+    #[error("work progress audit is only valid after filesystem publication")]
+    AuditPhaseInvalid,
+    /// A new audit request changed the currently active reason or target.
+    #[error("work progress audit replay conflicts with the active observation")]
+    AuditReplayConflict,
+    /// The disposition beneath an audit cannot be restored by this overlay.
+    #[error("work progress audit cannot suspend disposition {disposition:?}")]
+    AuditUnderlyingDispositionUnsupported {
+        /// Disposition that would have been hidden by the audit.
+        disposition: OperationDisposition,
+    },
+    /// The retained audit generation could not advance without wrapping.
+    #[error("work progress audit generation overflowed")]
+    AuditGenerationOverflow,
+    /// The progress disposition says audit is active but has no retained overlay.
+    #[error("work progress audit overlay is missing")]
+    AuditStateMissing,
+    /// A private audit-resolution authority was used without an active audit.
+    #[error("work progress audit resolution is not active")]
+    AuditResolutionNotActive,
+    /// A private audit-resolution authority did not bind the operation or plan.
+    #[error("work progress audit-resolution authority does not match")]
+    AuditResolutionAuthorityMismatch,
+    /// A private audit-resolution authority carried another execution epoch.
+    #[error(
+        "work progress audit-resolution epoch {actual} does not match expected epoch {expected}"
+    )]
+    AuditResolutionEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the resolution authority.
+        actual: u64,
+    },
+    /// A private audit-resolution authority carried another retained generation.
+    #[error(
+        "work progress audit-resolution generation {actual} does not match expected generation {expected}"
+    )]
+    AuditResolutionGenerationMismatch {
+        /// Current active audit generation.
+        expected: u64,
+        /// Generation supplied by the resolution authority.
+        actual: u64,
+    },
+    /// A private audit-resolution authority carried another reason or target.
+    #[error("work progress audit-resolution observation does not match")]
+    AuditResolutionObservationMismatch,
+    /// The suspended retry or cancellation hold lacks its retained observation.
+    #[error("work progress audit suspended hold observation is missing")]
+    AuditSuspendedHoldMissing,
     /// A cancellation observation failed its bounded validation.
     #[error("invalid work progress cancellation observation: {0}")]
     CancellationObservation(#[source] CancellationRequestValidationError),
@@ -2142,12 +2433,41 @@ mod tests {
         }
     }
 
+    fn audit_resolution_authority(
+        progress: &WorkProgress,
+        generation: u64,
+        execution_epoch: u64,
+    ) -> VerifiedAuditResolution {
+        VerifiedAuditResolution {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch,
+            generation,
+            observation: progress
+                .audit_observation()
+                .expect("active audit observation")
+                .clone(),
+        }
+    }
+
     fn apply_role(progress: &mut WorkProgress, action: u8, role: WorkUnitRole) {
         let key = key_for(progress, action, role);
         let evidence = evidence_for(progress, key, 7);
         progress
             .apply_verified_completion(completion(progress, key, evidence))
             .expect("completion applies");
+    }
+
+    fn publish_prefix(progress: &mut WorkProgress) {
+        apply_role(progress, 0, WorkUnitRole::SourceRead);
+        for role in [
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+        ] {
+            apply_role(progress, 0, role);
+        }
     }
 
     fn complete_required(progress: &mut WorkProgress) {
@@ -2733,12 +3053,13 @@ mod tests {
         assert_eq!(delayed_retry.execution_epoch(), 1);
 
         let mut audit = copy_progress(false);
+        publish_prefix(&mut audit);
         audit
             .require_audit(ProgressAuditObservation::new(
                 ProgressAuditReason::UncertainEvidence,
             ))
             .expect("require audit");
-        let audit_key = key_for(&audit, 0, WorkUnitRole::SourceRead);
+        let audit_key = key_for(&audit, 0, WorkUnitRole::SourceAffect);
         assert!(matches!(
             audit.apply_verified_completion(completion(
                 &audit,
@@ -3044,17 +3365,18 @@ mod tests {
         assert_eq!(retry.retry_observation(), Some(&observation));
 
         let mut audit = copy_progress(false);
+        publish_prefix(&mut audit);
         let target = key_for(&audit, 0, WorkUnitRole::SourceRead).participant_id();
         let audit_observation = ProgressAuditObservation::new(ProgressAuditReason::RevisionGap);
         audit
-            .require_audit(audit_observation)
+            .require_audit(audit_observation.clone())
             .expect("require audit");
         audit
             .reacquire_source(source_reacquisition_authority(&audit, target, 7, 2, 0))
             .expect("reacquire while audit required");
         assert_eq!(audit.execution_epoch(), 1);
         assert_eq!(audit.disposition(), OperationDisposition::AuditRequired);
-        assert_eq!(audit.audit_observation(), Some(audit_observation));
+        assert_eq!(audit.audit_observation(), Some(&audit_observation));
 
         let mut cancelled = copy_progress(false);
         let target = key_for(&cancelled, 0, WorkUnitRole::SourceRead).participant_id();
@@ -3081,5 +3403,266 @@ mod tests {
             Err(WorkProgressError::TerminalTransitionForbidden)
         ));
         assert_eq!(terminal, before_terminal);
+    }
+
+    #[test]
+    fn audit_overlay_requires_publication_and_validates_bounded_targets() {
+        let mut prepublication = copy_progress(false);
+        let before_prepublication = prepublication.clone();
+        assert!(matches!(
+            prepublication.require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::UncertainEvidence
+            )),
+            Err(WorkProgressError::AuditPhaseInvalid)
+        ));
+        assert_eq!(prepublication, before_prepublication);
+
+        let mut progress = copy_progress(false);
+        publish_prefix(&mut progress);
+        let first_key = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        let second_key = key_for(&progress, u8::MAX, WorkUnitRole::GlobalLibrary);
+        let mut unsorted = vec![first_key, second_key];
+        unsorted.sort_unstable();
+        let targeted = ProgressAuditObservation::for_target(
+            ProgressAuditReason::LateCollision,
+            AuditTarget::steps(vec![first_key]).expect("single target"),
+        )
+        .expect("targeted audit");
+        progress
+            .require_audit(targeted.clone())
+            .expect("targeted audit request");
+        assert_eq!(progress.audit_generation(), 1);
+        assert_eq!(progress.audit_observation(), Some(&targeted));
+
+        let before_exact_replay = progress.clone();
+        progress
+            .require_audit(targeted.clone())
+            .expect("exact audit replay");
+        assert_eq!(progress, before_exact_replay);
+
+        let conflicting = ProgressAuditObservation::for_target(
+            ProgressAuditReason::LateCollision,
+            AuditTarget::steps(vec![second_key]).expect("different target"),
+        )
+        .expect("conflicting audit");
+        let before_conflict = progress.clone();
+        assert!(matches!(
+            progress.require_audit(conflicting),
+            Err(WorkProgressError::AuditReplayConflict)
+        ));
+        assert_eq!(progress, before_conflict);
+
+        let mut invalid = copy_progress(false);
+        publish_prefix(&mut invalid);
+        let empty = ProgressAuditObservation {
+            reason: ProgressAuditReason::UncertainEvidence,
+            target: AuditTarget::Steps(Vec::new()),
+        };
+        let before_invalid = invalid.clone();
+        assert!(matches!(
+            invalid.require_audit(empty),
+            Err(WorkProgressError::AuditTarget(
+                AuditTargetValidationError::Empty
+            ))
+        ));
+        assert_eq!(invalid, before_invalid);
+
+        let duplicate = ProgressAuditObservation {
+            reason: ProgressAuditReason::UncertainEvidence,
+            target: AuditTarget::Steps(vec![first_key, first_key]),
+        };
+        assert!(matches!(
+            invalid.require_audit(duplicate),
+            Err(WorkProgressError::AuditTarget(
+                AuditTargetValidationError::NotSortedUnique
+            ))
+        ));
+        assert_eq!(invalid, before_invalid);
+
+        let reversed = ProgressAuditObservation {
+            reason: ProgressAuditReason::UncertainEvidence,
+            target: AuditTarget::Steps(vec![unsorted[1], unsorted[0]]),
+        };
+        assert!(matches!(
+            invalid.require_audit(reversed),
+            Err(WorkProgressError::AuditTarget(
+                AuditTargetValidationError::NotSortedUnique
+            ))
+        ));
+        assert_eq!(invalid, before_invalid);
+
+        let oversized = ProgressAuditObservation {
+            reason: ProgressAuditReason::UncertainEvidence,
+            target: AuditTarget::Steps(vec![first_key; MAX_WORK_PLAN_UNITS + 1]),
+        };
+        assert!(matches!(
+            invalid.require_audit(oversized),
+            Err(WorkProgressError::AuditTarget(
+                AuditTargetValidationError::TooMany { .. }
+            ))
+        ));
+        assert_eq!(invalid, before_invalid);
+
+        let unknown_key = WorkUnitKey::new(
+            first_key.action_ordinal(),
+            u16::MAX,
+            first_key.participant_id(),
+            first_key.role(),
+        );
+        let unknown = ProgressAuditObservation::for_target(
+            ProgressAuditReason::UncertainEvidence,
+            AuditTarget::steps(vec![unknown_key]).expect("unknown target shape"),
+        )
+        .expect("unknown target observation");
+        assert!(matches!(
+            invalid.require_audit(unknown),
+            Err(WorkProgressError::AuditTarget(
+                AuditTargetValidationError::UnknownWorkUnit { key }
+            )) if key == unknown_key
+        ));
+        assert_eq!(invalid, before_invalid);
+    }
+
+    #[test]
+    fn audit_resolution_restores_holds_and_rejects_stale_or_changed_authority() {
+        let mut progress = copy_progress(false);
+        publish_prefix(&mut progress);
+        let first_key = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        let second_key = key_for(&progress, u8::MAX, WorkUnitRole::GlobalLibrary);
+        let observation = ProgressAuditObservation::for_target(
+            ProgressAuditReason::RevisionGap,
+            AuditTarget::steps(vec![first_key]).expect("target"),
+        )
+        .expect("audit observation");
+        progress
+            .require_audit(observation.clone())
+            .expect("require audit");
+        let steps_before = progress.steps.clone();
+
+        let mut wrong_authority = audit_resolution_authority(&progress, 1, 0);
+        wrong_authority.operation_id = OperationId::from_uuid(Uuid::from_u128(106));
+        assert!(matches!(
+            progress.resolve_audit(wrong_authority),
+            Err(WorkProgressError::AuditResolutionAuthorityMismatch)
+        ));
+        assert_eq!(progress.steps, steps_before);
+
+        let stale_resolution = audit_resolution_authority(&progress, 1, 0);
+        progress
+            .resolve_audit(audit_resolution_authority(&progress, 1, 0))
+            .expect("resolve audit");
+        assert_eq!(progress.disposition(), OperationDisposition::None);
+        assert!(progress.audit_observation().is_none());
+        assert_eq!(progress.audit_generation(), 1);
+        assert_eq!(progress.steps, steps_before);
+
+        progress
+            .require_audit(observation)
+            .expect("reopen same audit observation");
+        assert_eq!(progress.audit_generation(), 2);
+        assert!(matches!(
+            progress.resolve_audit(stale_resolution),
+            Err(WorkProgressError::AuditResolutionGenerationMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert_eq!(progress.disposition(), OperationDisposition::AuditRequired);
+
+        let mut retry = copy_progress(false);
+        publish_prefix(&mut retry);
+        let retry_observation = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("audit-hold-retry").expect("retry lease"),
+            10,
+            RetryErrorClass::TransientContention,
+            "busy",
+            None,
+        )
+        .expect("retry observation");
+        retry
+            .request_retry(retry_observation.clone())
+            .expect("request retry");
+        let retry_audit = ProgressAuditObservation::new(ProgressAuditReason::UncertainEvidence);
+        retry.require_audit(retry_audit).expect("audit over retry");
+        assert!(matches!(
+            retry.request_retry(retry_observation.clone()),
+            Err(WorkProgressError::ProgressSuspended {
+                disposition: OperationDisposition::AuditRequired
+            })
+        ));
+        retry
+            .resolve_audit(audit_resolution_authority(&retry, 1, 0))
+            .expect("resolve retry audit");
+        assert_eq!(retry.disposition(), OperationDisposition::RetryPending);
+        assert_eq!(retry.retry_observation(), Some(&retry_observation));
+        retry
+            .resume_retry(VerifiedRetryResume {
+                operation_id: retry.operation_id,
+                plan: retry.plan.clone(),
+                retry_observation,
+                now_unix_ms: 1,
+                expected_execution_epoch: 0,
+            })
+            .expect("resume restored retry separately");
+        assert_eq!(retry.disposition(), OperationDisposition::None);
+
+        let mut cancelled = copy_progress(false);
+        publish_prefix(&mut cancelled);
+        let cancellation = CancellationRequestObservation::new(88).expect("cancel request");
+        cancelled
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::LateCollision,
+            ))
+            .expect("audit before cancellation");
+        cancelled
+            .request_cancellation(cancellation)
+            .expect("record cancellation under audit");
+        assert_eq!(cancelled.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(cancelled.cancellation_request(), Some(cancellation));
+        cancelled
+            .request_cancellation(cancellation)
+            .expect("idempotent cancellation under audit");
+        assert!(matches!(
+            cancelled.request_cancellation(CancellationRequestObservation::new(89).unwrap()),
+            Err(WorkProgressError::CancellationReplayConflict)
+        ));
+        cancelled
+            .resolve_audit(audit_resolution_authority(&cancelled, 1, 0))
+            .expect("resolve cancellation audit");
+        assert_eq!(
+            cancelled.disposition(),
+            OperationDisposition::CancelRequestedAfterPublish
+        );
+
+        let _ = second_key;
+    }
+
+    #[test]
+    fn audit_resolution_epoch_is_bound_to_source_reacquisition() {
+        let mut progress = copy_progress(false);
+        publish_prefix(&mut progress);
+        progress
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("require audit");
+        let stale_resolution = audit_resolution_authority(&progress, 1, 0);
+        let target = key_for(&progress, 0, WorkUnitRole::SourceRead).participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(&progress, target, 7, 2, 0))
+            .expect("source reacquisition preserves audit");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(progress.disposition(), OperationDisposition::AuditRequired);
+        assert!(matches!(
+            progress.resolve_audit(stale_resolution),
+            Err(WorkProgressError::AuditResolutionEpochMismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert_eq!(progress.disposition(), OperationDisposition::AuditRequired);
     }
 }

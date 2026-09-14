@@ -159,8 +159,9 @@ pub use work_plan::{
     derive_work_plan, derive_work_plan_v1, validate_work_plan,
 };
 pub use work_progress::{
-    CoordinatorDeficit, CoordinatorReceiptKind, CoordinatorReceiptSummary, FilesystemReceiptKind,
-    FilesystemReceiptSummary, ParticipantScope, ProgressAuditObservation, ProgressAuditReason,
-    ProgressEvidenceError, ProgressStepStatus, SourceRevisionObservation, StoredStepEvidence,
-    WorkProgress, WorkProgressError, WorkProgressStep,
+    AuditTarget, AuditTargetValidationError, CoordinatorDeficit, CoordinatorReceiptKind,
+    CoordinatorReceiptSummary, FilesystemReceiptKind, FilesystemReceiptSummary, ParticipantScope,
+    ProgressAuditObservation, ProgressAuditReason, ProgressEvidenceError, ProgressStepStatus,
+    SourceRevisionObservation, StoredStepEvidence, WorkProgress, WorkProgressError,
+    WorkProgressStep,
 };

@@ -1189,3 +1189,14 @@ execution epoch and preserves retry, audit and cancellation holds. It cannot
 complete work or resume a retry, and no production authority issuer is present.
 Eleven focused progress tests, the library check without default features,
 formatting and diff checks passed. Primary diff review found no material issue.
+
+Audit recovery now uses one bounded generation-tracked overlay with a whole-operation
+or exact sorted work-unit target. A private resolution binds the operation, frozen
+plan, execution epoch, audit generation and observation. Exact requests replay;
+conflicts preserve the active audit. Resolution restores the prior retry or
+cancellation hold without completing work. Cancellation requested during an audit
+is retained beneath it. Generic prepublication audits are rejected unchanged;
+the raw ExternalFs source-audit requirement remains separate. Fourteen focused
+progress tests, library compilation without default features, formatting and diff
+checks passed. Primary diff review found no material issue. No production audit
+authority issuer or durable progress encoding is provided yet.
