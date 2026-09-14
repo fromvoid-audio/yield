@@ -959,5 +959,12 @@ tests (one helper ignored), including argument bounds, malformed records, prior
 version rejection, retry/cancellation/restart and generic owner persistence.
 Library checks with and without default features, GPUI compilation, formatting
 and diff checks passed. Primary review found no remaining issue in the new typed
-contract and version wiring. Windows storage acceptance is pending; the V1
-default and SQLite schema remain unchanged.
+contract and version wiring. The V1 default and SQLite schema remain unchanged.
+
+Windows storage validation
+[34778990457](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34778990457)
+passed at exact commit `c8a8b71b50994a645c58251a525d280982036147`. Logs confirm
+198 journal tests (one helper ignored), plus 12 legacy-reader, 90 catalog,
+60 session (one helper ignored), 16 core edit-settings and five media-adapter
+tests. This accepts the V12 storage milestone; native Windows UI and audio
+execution remain outside this validation scope.
