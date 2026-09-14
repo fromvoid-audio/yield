@@ -22,6 +22,7 @@ pub mod selection_output_commands;
 pub mod status;
 pub mod store;
 pub mod validation;
+pub mod work_plan;
 
 pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 
@@ -151,3 +152,8 @@ pub use store::{
     OperationJournalStore, OperationJournalStoreError,
 };
 pub use validation::{RecordConsistency, classify_record};
+pub use work_plan::{
+    MAX_WORK_PLAN_EDGES, MAX_WORK_PLAN_UNITS, WORK_PLAN_VERSION, WORK_PLAN_VERSION_V1, WorkPlan,
+    WorkPlanError, WorkPrerequisite, WorkUnit, WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
+    derive_work_plan, derive_work_plan_v1, validate_work_plan,
+};

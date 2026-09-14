@@ -1114,3 +1114,32 @@ restart/retry/cancel coverage. It also passed 12 legacy-reader, 90 catalog,
 60 session (one helper ignored), 16 core edit-settings and five media-adapter
 tests. This accepts external-evidence storage; native Windows UI and filesystem
 execution remain outside this lane.
+
+## Versioned full-progress work plan (OPT-1337)
+
+The V1 planner derives bounded work units and prerequisites from command arguments
+and a complete initial participant inventory. Keys distinguish actions, steps,
+participants and semantic roles. Source read and source affect obligations stay
+separate even when they use the same database. Validation compares a recovered
+plan against the frozen V1 derivation, including its exact units and edges.
+
+This contract uses one required, unfenced filesystem coordinator for the profile.
+That coordinator can cover multiple roots and devices; sharing its participant ID
+does not establish device equality. Regular-file moves use conservative staging.
+Qualified direct directory moves, retained-folder merges, history parent creation
+and recovery-material retention have distinct obligations. Complete global,
+Harvest, projection and readiness coverage is required for affected sources.
+
+The planner is pure: it neither admits an operation nor advances a journal record.
+Full-progress persistence, guarded transitions and legacy compatibility integration
+remain separate work.
+
+Local validation passed ten focused planner tests, library compilation without
+default features, GPUI compilation, formatting and diff checks. Independent review
+found and then verified repairs for same-source staged moves and direct
+relocation/removal semantics. Staged file moves require the full destination then
+origin-removal sequence even within one database. Direct relocations require
+origin absence; retained purge instead verifies the selected retained object's
+absence. Restore records precede retention relocation, while retained-payload
+verification follows it. No material findings remained on recheck. Windows storage
+validation is pending.
