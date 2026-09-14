@@ -1066,7 +1066,15 @@ the existing owner/store path for persistence, restart reads, retry, cancellatio
 and compare-and-swap updates. Local validation passed 235 serialized journal tests
 (one helper ignored), the library check without default features, GPUI compilation,
 formatting and diff checks. Focused independent review found no meaningful issues
-in restore policies, bindings, bounds or version compatibility. Windows acceptance
-is pending.
+in restore policies, bindings, bounds or version compatibility.
 Filesystem execution and live recovery-material retention remain outside this
 initial intent contract.
+
+Windows storage validation
+[34877410904](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34877410904)
+passed at exact commit `c96cda4711f0311f03bf2115a72f153630424719`. The lane passed
+223 journal tests (one helper ignored), including history codec, direction/absence,
+directory-only moves, generic owner and restart/retry/cancel coverage. It also
+passed 12 legacy-reader, 90 catalog, 60 session (one helper ignored), 16 core
+edit-settings and five media-adapter tests. This accepts the history storage
+milestone; native Windows UI and filesystem execution remain outside this lane.
