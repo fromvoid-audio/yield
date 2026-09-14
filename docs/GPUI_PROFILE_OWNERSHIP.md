@@ -1026,4 +1026,13 @@ tests (one helper ignored), including owner write/read, restart, retry/cancel,
 old-schema rejection, metadata capture and odd-padding coverage. The library
 check without default features, GPUI compilation, formatting and diff checks
 passed. Primary review checked the version gates, participant binding, output
-arithmetic and resolved metadata/fade semantics. Windows acceptance is pending.
+arithmetic and resolved metadata/fade semantics.
+
+Windows storage validation
+[34871875304](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34871875304)
+passed at exact commit `6381dd2e1cd32c6b3804a95659d7fb94c0dd3a97`. Logs confirm
+212 journal tests (one helper ignored), including V13 codec, generic owner,
+selection-output and compound restart coverage. The lane also passed 12 legacy
+reader, 90 catalog, 60 session (one helper ignored), 16 core edit-settings and
+five media-adapter tests. This accepts the V13 storage slice; native Windows UI
+and audio/filesystem execution remain outside this lane.
