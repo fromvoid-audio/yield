@@ -11,6 +11,9 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::external_commands::{
+    ExternalReconciliationIntentArgs, ExternalReconciliationValidationError,
+};
 use super::namespace_commands::{NamespaceCommandArgs, NamespaceCommandValidationError};
 use super::participants::{
     ParticipantId, ParticipantKind, ParticipantRequirement, ParticipantSet,
@@ -1488,6 +1491,8 @@ pub enum UniversalCommandArgs {
     SelectionOutput(super::selection_output_commands::SelectionOutputCommandArgs),
     /// Observe one bounded transaction-history Undo or Redo action list.
     History(super::history_commands::HistoryUndoRedoIntentArgs),
+    /// Observe one bounded external filesystem reconciliation batch.
+    ExternalReconciliation(ExternalReconciliationIntentArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1505,6 +1510,7 @@ impl UniversalCommandArgs {
             Self::SelectionNormalize(args) => args.command_kind(),
             Self::SelectionOutput(args) => args.command_kind(),
             Self::History(args) => args.command_kind(),
+            Self::ExternalReconciliation(args) => args.command_kind(),
         }
     }
 
@@ -1547,6 +1553,9 @@ impl UniversalCommandArgs {
             Self::History(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::History),
+            Self::ExternalReconciliation(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::ExternalReconciliation),
         }
     }
 }
@@ -1591,6 +1600,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A transaction-history Undo or Redo argument failed validation.
     #[error("invalid history Undo/Redo command arguments: {0}")]
     History(#[source] super::history_commands::HistoryValidationError),
+    /// An external filesystem reconciliation observation failed validation.
+    #[error("invalid external reconciliation command arguments: {0}")]
+    ExternalReconciliation(#[source] ExternalReconciliationValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.

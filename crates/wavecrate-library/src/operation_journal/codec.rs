@@ -24,13 +24,14 @@ use super::evidence::{
     PreparedAbsentFinalNoReplace, PreparedTargetContract, PreparedWaveformRestore,
     ReplacementQualificationAssessment,
 };
+use super::external_commands::validate_persisted_external_reconciliation_intent_value;
 use super::history_commands::validate_persisted_history_command_args_value;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, UniversalIntent,
+    SCHEMA_V14, SCHEMA_V15, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
@@ -84,7 +85,7 @@ pub struct StoredOperationRecord {
     command_args: Option<CopyIntentArgs>,
     /// Optional V5 durable retry/status observation.
     retry_observation: Option<RetryObservation>,
-    /// Optional V6-V14 tagged command arguments.
+    /// Optional V6-V15 tagged command arguments.
     universal_command_args: Option<UniversalCommandArgs>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
@@ -315,6 +316,25 @@ impl StoredOperationRecord {
         )
     }
 
+    pub(crate) fn new_v15_command(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self::new_tagged_command(
+            SCHEMA_V15,
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     fn new_tagged_command(
         schema_version: u32,
         operation_id: OperationId,
@@ -391,6 +411,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V12
                 | SCHEMA_V13
                 | SCHEMA_V14
+                | SCHEMA_V15
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -413,6 +434,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V12
                 | SCHEMA_V13
                 | SCHEMA_V14
+                | SCHEMA_V15
         ) {
             record.schema_version = SCHEMA_V5;
         }
@@ -562,6 +584,12 @@ pub enum EncodeError {
     /// A V14 transaction-history record violates its bounded state or argument contract.
     #[error("invalid schema-v14 transaction-history record: {reason}")]
     InvalidV14Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// A V15 external-reconciliation record violates its bounded state or argument contract.
+    #[error("invalid schema-v15 external reconciliation record: {reason}")]
+    InvalidV15Record {
         /// Bounded validation diagnostic.
         reason: String,
     },
@@ -1399,6 +1427,14 @@ fn persisted_v14_from_record(
     Ok(persisted_tagged_ref_from_record(record))
 }
 
+fn persisted_v15_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
+    validate_v15_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV15Record { reason })?;
+    Ok(persisted_tagged_ref_from_record(record))
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -1541,6 +1577,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v14_coordinator_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V15 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v15_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v15_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -1725,6 +1770,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V14 => {
             let persisted = persisted_v14_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V15 => {
+            let persisted = persisted_v15_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -2759,6 +2808,22 @@ fn validate_persisted_v14_universal_command_args_value(value: &Value) -> Result<
     )
 }
 
+fn validate_persisted_v15_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_object_boundaries(
+        value,
+        validate_persisted_v15_universal_intent_value,
+        validate_persisted_v15_universal_command_args_value,
+    )
+}
+
+fn validate_persisted_v15_universal_intent_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_universal_intent_value_with_retained_resolution(value, true)
+}
+
+fn validate_persisted_v15_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(value, &["ExternalReconciliation"], "schema-v15")
+}
+
 fn validate_persisted_tagged_command_args_value(
     value: &Value,
     allowed_variants: &[&str],
@@ -2795,6 +2860,9 @@ fn validate_persisted_tagged_command_args_value(
                 Err("command arguments carry schema-v12 selection Normalize arguments")
             }
             "History" => Err("command arguments carry schema-v14 transaction-history arguments"),
+            "ExternalReconciliation" => {
+                Err("command arguments carry schema-v15 external reconciliation arguments")
+            }
             "Namespace" => Err("command arguments carry schema-v8 namespace arguments"),
             "Render" => Err("command arguments carry schema-v9 render arguments"),
             "Removal" => Err("command arguments carry schema-v10 removal arguments"),
@@ -2814,6 +2882,9 @@ fn validate_persisted_tagged_command_args_value(
         "SelectionNormalize" => validate_persisted_selection_normalize_intent_args_value(arguments),
         "SelectionOutput" => validate_persisted_selection_output_command_args_value(arguments),
         "History" => validate_persisted_history_command_args_value(arguments),
+        "ExternalReconciliation" => {
+            validate_persisted_external_reconciliation_intent_value(arguments)
+        }
         _ => Err("persisted command arguments contain an unknown variant"),
     }
 }
@@ -3188,6 +3259,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
                 "schema-v6 cannot carry schema-v14 transaction-history arguments",
             ));
         }
+        UniversalCommandArgs::ExternalReconciliation(_) => {
+            return Err(String::from(
+                "schema-v6 cannot carry schema-v15 external reconciliation arguments",
+            ));
+        }
     }
     if universal.command_kind() != command_args.command_kind() {
         return Err(String::from(
@@ -3264,6 +3340,7 @@ pub(crate) fn validate_v7_coordinator_shape(record: &StoredOperationRecord) -> R
         SCHEMA_V7,
         "schema-v7",
         &["Copy", "Import", "DuplicateSame", "WaveformEdit"],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3280,6 +3357,7 @@ pub(crate) fn validate_v8_coordinator_shape(record: &StoredOperationRecord) -> R
             "WaveformEdit",
             "Namespace",
         ],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3297,6 +3375,7 @@ pub(crate) fn validate_v9_coordinator_shape(record: &StoredOperationRecord) -> R
             "Namespace",
             "Render",
         ],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3315,6 +3394,7 @@ pub(crate) fn validate_v10_coordinator_shape(record: &StoredOperationRecord) -> 
             "Render",
             "Removal",
         ],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3334,6 +3414,7 @@ pub(crate) fn validate_v11_coordinator_shape(record: &StoredOperationRecord) -> 
             "Removal",
             "RetainedResolution",
         ],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3354,6 +3435,7 @@ pub(crate) fn validate_v12_coordinator_shape(record: &StoredOperationRecord) -> 
             "RetainedResolution",
             "SelectionNormalize",
         ],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3375,6 +3457,7 @@ pub(crate) fn validate_v13_coordinator_shape(record: &StoredOperationRecord) -> 
             "SelectionNormalize",
             "SelectionOutput",
         ],
+        OperationActor::User,
         OperationKind::FileMutation,
     )
 }
@@ -3390,6 +3473,7 @@ pub(crate) fn validate_v14_coordinator_shape(record: &StoredOperationRecord) -> 
             SCHEMA_V14,
             "schema-v14",
             &["History"],
+            OperationActor::User,
             OperationKind::FileHistory,
         )
     } else {
@@ -3409,9 +3493,21 @@ pub(crate) fn validate_v14_coordinator_shape(record: &StoredOperationRecord) -> 
                 "SelectionNormalize",
                 "SelectionOutput",
             ],
+            OperationActor::User,
             OperationKind::FileMutation,
         )
     }
+}
+
+pub(crate) fn validate_v15_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V15,
+        "schema-v15",
+        &["ExternalReconciliation"],
+        OperationActor::ExternalFs,
+        OperationKind::ExternalReconciliation,
+    )
 }
 
 fn validate_tagged_coordinator_shape(
@@ -3419,6 +3515,7 @@ fn validate_tagged_coordinator_shape(
     expected_schema: u32,
     schema_name: &str,
     allowed_variants: &[&str],
+    expected_actor: OperationActor,
     expected_operation_kind: OperationKind,
 ) -> Result<(), String> {
     if record.schema_version != expected_schema {
@@ -3430,15 +3527,18 @@ fn validate_tagged_coordinator_shape(
             record.phase
         ));
     }
-    if record.intent.actor != OperationActor::User || record.intent.kind != expected_operation_kind
-    {
+    if record.intent.actor != expected_actor || record.intent.kind != expected_operation_kind {
+        let actor_label = match expected_actor {
+            OperationActor::User => "a user",
+            OperationActor::ExternalFs => "an external-fs",
+        };
         let operation_kind_label = match expected_operation_kind {
             OperationKind::FileMutation => "file-mutation",
             OperationKind::FileHistory => "file-history",
             OperationKind::ExternalReconciliation => "external-reconciliation",
         };
         return Err(format!(
-            "{schema_name} coordinator records require a user {operation_kind_label} intent"
+            "{schema_name} coordinator records require {actor_label} {operation_kind_label} intent"
         ));
     }
     if !record.payload.as_object().is_some_and(Map::is_empty) {
@@ -3471,6 +3571,7 @@ fn validate_tagged_coordinator_shape(
         UniversalCommandArgs::SelectionNormalize(_) => "SelectionNormalize",
         UniversalCommandArgs::SelectionOutput(_) => "SelectionOutput",
         UniversalCommandArgs::History(_) => "History",
+        UniversalCommandArgs::ExternalReconciliation(_) => "ExternalReconciliation",
     };
     if !allowed_variants.contains(&variant) {
         return Err(match variant {
@@ -3490,6 +3591,9 @@ fn validate_tagged_coordinator_shape(
             }
             "History" => {
                 format!("{schema_name} cannot carry schema-v14 transaction-history arguments")
+            }
+            "ExternalReconciliation" => {
+                format!("{schema_name} cannot carry schema-v15 external reconciliation arguments")
             }
             _ => format!("{schema_name} cannot carry {variant} arguments"),
         });
@@ -4389,6 +4493,69 @@ mod tests {
         fixture
     }
 
+    fn v15_external_reconciliation_fixture() -> Value {
+        let mut fixture = v6_command_fixture("Copy");
+        let source_participant =
+            fixture["universal_intent"]["participants"]["descriptors"][0]["id"].clone();
+        let filesystem_participant =
+            fixture["universal_intent"]["participants"]["descriptors"][1]["id"].clone();
+        fixture["schema_version"] = Value::from(SCHEMA_V15);
+        fixture["intent"]["actor"] = Value::from("ExternalFs");
+        fixture["intent"]["kind"] = Value::from("ExternalReconciliation");
+        fixture["universal_intent"]["command_kind"] = Value::from("ExternalReconciliation");
+        fixture["universal_command_args"] = serde_json::json!({
+            "ExternalReconciliation": {
+                "evidence_batch_id": "00000000-0000-0000-0000-000000000042",
+                "source_participant_id": source_participant,
+                "filesystem_participant_id": filesystem_participant,
+                "source_revision": 7,
+                "raw": {
+                    "provenance": {
+                        "source_id": "source-a",
+                        "root_identity": [1, 255],
+                        "backend_stream_identity": null,
+                        "watcher_generation": 9,
+                        "capture_boundary": {
+                            "captured_at": 44,
+                            "first_sequence": null,
+                            "last_sequence": 4
+                        }
+                    },
+                    "limits": {
+                        "max_events": 64,
+                        "max_native_path_bytes": 4096,
+                        "max_native_metadata_bytes": 4096
+                    },
+                    "native_accounting": {
+                        "event_count": 1,
+                        "path_bytes": 0,
+                        "metadata_bytes": 1
+                    },
+                    "durable_accounting": {
+                        "event_count": 1,
+                        "path_bytes": 0,
+                        "metadata_bytes": 61
+                    },
+                    "observations": [{
+                        "kind": "Overflow",
+                        "paths": [],
+                        "metadata": {
+                            "flags": 0,
+                            "rename_cookie": null,
+                            "event_id": null,
+                            "cursor": null,
+                            "detail": null,
+                            "source": null,
+                            "process_id": null
+                        },
+                        "uncertainty_bits": 32768
+                    }]
+                }
+            }
+        });
+        fixture
+    }
+
     fn v6_v12_codec_golden_fixtures() -> Vec<(String, Value)> {
         let mut fixtures = Vec::new();
         for variant in ["Copy", "Import", "DuplicateSame"] {
@@ -5258,6 +5425,70 @@ mod tests {
         assert!(matches!(
             encode(&direct),
             Err(EncodeError::InvalidV13Record { .. })
+        ));
+    }
+
+    #[test]
+    fn v15_external_reconciliation_round_trip_preserves_raw_batch_and_audit_boundary() {
+        let fixture = v15_external_reconciliation_fixture();
+        let record = decode(&serde_json::to_vec(&fixture).expect("V15 external bytes"))
+            .expect("V15 external fixture decodes");
+        assert_eq!(record.schema_version, SCHEMA_V15);
+        assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+        let Some(UniversalCommandArgs::ExternalReconciliation(args)) =
+            record.universal_command_args()
+        else {
+            panic!("V15 external arguments");
+        };
+        assert_eq!(args.evidence_batch_id().as_uuid().as_u128(), 0x42);
+        assert_eq!(args.raw().observations().len(), 1);
+        assert_eq!(args.raw().observations()[0].uncertainty_bits(), 1 << 15);
+        assert_eq!(
+            args.audit_requirement(),
+            super::super::external_commands::ExternalReconciliationAuditRequirement::SourceAuditRequired
+        );
+        assert_eq!(
+            value(&encode(&record).expect("V15 external encodes")),
+            fixture
+        );
+    }
+
+    #[test]
+    fn v15_external_reconciliation_rejects_unknown_fields_old_versions_and_wrong_actor() {
+        let fixture = v15_external_reconciliation_fixture();
+        let mut unknown = fixture.clone();
+        unknown["universal_command_args"]["ExternalReconciliation"]["raw"]["observations"][0]["unknown"] =
+            Value::Null;
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unknown).expect("unknown V15 bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut old_schema = fixture.clone();
+        old_schema["schema_version"] = Value::from(SCHEMA_V14);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&old_schema).expect("old V15 bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let record = decode(&serde_json::to_vec(&fixture).expect("V15 direct bytes"))
+            .expect("V15 direct record");
+        let mut direct = record.clone();
+        direct.schema_version = SCHEMA_V14;
+        assert!(matches!(
+            classify_record(&direct),
+            RecordConsistency::Invalid(_)
+        ));
+        assert!(matches!(
+            encode(&direct),
+            Err(EncodeError::InvalidV14Record { .. })
+        ));
+
+        let mut wrong_actor = fixture;
+        wrong_actor["intent"]["actor"] = Value::from("User");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&wrong_actor).expect("wrong V15 actor bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason.contains("schema-v15 coordinator records require an external-fs external-reconciliation intent")
         ));
     }
 

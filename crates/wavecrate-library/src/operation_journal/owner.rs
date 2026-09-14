@@ -977,22 +977,27 @@ mod tests {
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
     };
     use crate::operation_journal::{
-        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExternalRootBindingId, ExtractAndTrimIntentArgs, FiniteF32Bits, HistoryAction,
-        HistoryDirection, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
-        HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
-        HistoryWaveformRestore, ImportFileExpectation, ImportIntentArgs, MAX_DIAGNOSTIC_CODE_BYTES,
-        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
-        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
-        NamespaceFileExpectation, NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget,
-        OperationActor, OperationDisposition, OperationIntent, OperationKind,
-        ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor, ParticipantKind,
-        ParticipantRequirement, ParticipantSet, RawWavExtractionRecipe, RecoveryCursor,
-        RecoveryRowOutcome, RemovalCommandArgs, RetryErrorClass, RetryLeaseId, SCHEMA_V5,
-        SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-        SCHEMA_V14, SelectionExtractIntentArgs, SelectionNormalizeIntentArgs,
-        SelectionOutputCommandArgs, SelectionOutputRecipe, StoredRelativePath, StoredSourceFence,
-        TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation, EvidenceBatchId,
+        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
+        ExternalRawObservationLimits, ExternalRawObservationMetadata,
+        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
+        ExternalReconciliationIntentArgs, ExternalRootBindingId, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, HistoryAction, HistoryDirection, HistoryRecoveryBackupObservation,
+        HistoryRecoveryLeafObservation, HistoryRestoreTargetExpectation, HistoryScopeId,
+        HistoryUndoRedoIntentArgs, HistoryWaveformRestore, ImportFileExpectation, ImportIntentArgs,
+        MAX_DIAGNOSTIC_CODE_BYTES, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
+        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
+        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
+        NamespaceRenameIntentArgs, NamespaceTarget, OperationActor, OperationDisposition,
+        OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
+        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
+        RawWavExtractionRecipe, RecoveryCursor, RecoveryRowOutcome, RemovalCommandArgs,
+        RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+        SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
+        SelectionExtractIntentArgs, SelectionNormalizeIntentArgs, SelectionOutputCommandArgs,
+        SelectionOutputRecipe, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
+        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
         WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
         WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
         WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
@@ -1661,6 +1666,79 @@ mod tests {
         (record, command_args)
     }
 
+    fn v15_external_record(operation_id: OperationId) -> StoredOperationRecord {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let filesystem_participant_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let provenance = ExternalRawObservationProvenance::new(
+            SourceId::from_string("owner-source"),
+            Some(vec![1, 2]),
+            None,
+            4,
+            ExternalCaptureBoundary::new(50, None, None).expect("capture boundary"),
+        )
+        .expect("external provenance");
+        let observation = ExternalRawObservation::new(
+            ExternalRawEventKind::Error,
+            vec![
+                ExternalRawObservedPath::new(
+                    ExternalNativeString::unix_bytes(b"changed.wav".to_vec()).expect("native path"),
+                    ExternalRawPathRole::Subject,
+                    None,
+                )
+                .expect("path"),
+            ],
+            ExternalRawObservationMetadata::new().with_flags(1),
+            1 << 14,
+        )
+        .expect("external observation");
+        let raw = ExternalRawObservationEnvelope::new(
+            provenance,
+            ExternalRawObservationLimits::new(64, 4096, 4096).expect("raw limits"),
+            ExternalRawNativeAccounting::new(1, 12, 9),
+            vec![observation],
+        )
+        .expect("external envelope");
+        let args = ExternalReconciliationIntentArgs::new(
+            EvidenceBatchId::from_uuid(uuid::Uuid::from_u128(44)),
+            copy_args.source().participant_id(),
+            filesystem_participant_id,
+            7,
+            raw,
+        )
+        .expect("external command arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::ExternalReconciliation,
+            "operation.status.owner-external",
+            participants,
+        )
+        .expect("external universal intent");
+        let intent = OperationIntent {
+            actor: OperationActor::ExternalFs,
+            kind: OperationKind::ExternalReconciliation,
+            label: String::from("owner external"),
+        };
+        StoredOperationRecord::new_v15_command(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::ExternalReconciliation(args),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        )
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -2056,6 +2134,43 @@ mod tests {
             UniversalCommandKind::Undo
         );
         assert_eq!(persisted.intent.kind, OperationKind::FileHistory);
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v15_external_reconciliation_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v15-external");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let record = v15_external_record(operation_id);
+        let mut request = client.persist_intent(record).expect("external admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("external result")
+            .expect("external worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("external acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+        let mut lookup = client.get(operation_id).expect("external lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("external lookup result")
+            .expect("external lookup worker result")
+            .expect("persisted external");
+        assert_eq!(persisted.schema_version, SCHEMA_V15);
+        let Some(UniversalCommandArgs::ExternalReconciliation(args)) =
+            persisted.universal_command_args()
+        else {
+            panic!("V15 external arguments");
+        };
+        assert_eq!(args.evidence_batch_id().as_uuid().as_u128(), 44);
+        assert_eq!(args.raw().observations().len(), 1);
+        assert_eq!(persisted.intent.actor, OperationActor::ExternalFs);
+        assert_eq!(persisted.intent.kind, OperationKind::ExternalReconciliation);
         assert!(owner.shutdown());
     }
 

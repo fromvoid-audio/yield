@@ -1078,3 +1078,30 @@ directory-only moves, generic owner and restart/retry/cancel coverage. It also
 passed 12 legacy-reader, 90 catalog, 60 session (one helper ignored), 16 core
 edit-settings and five media-adapter tests. This accepts the history storage
 milestone; native Windows UI and filesystem execution remain outside this lane.
+
+## V15 external filesystem observations (OPT-1337)
+
+The external reconciliation intent uses the ExternalFs actor and a capture-time
+evidence batch identity distinct from its later operation ID. It retains ordered
+events and duplicate paths, opaque root/backend identities, watcher generation,
+capture sequence observations, uncertainty bits and optional backend metadata.
+Native strings use explicit Unix-byte or Windows-UTF-16 representations.
+
+Conversion is bounded by 64 events, 512 paths, 64 KiB of stored native path bytes
+and 32 KiB of metadata. Original native capture accounting is retained separately
+from durable encoding accounting. The source revision is bound to a required
+source-database participant; watcher generation is not a source lifecycle epoch.
+
+Recovered raw observations require a source audit until a later owner establishes
+continuity. No serialized proof, live lease, filesystem authority or watcher
+publication is created by this contract. The strict persisted codec requires
+explicit nullable fields, while borrowed conversion checks provenance identity
+sizes before cloning them. Earlier schema gates and diagnostics remain intact.
+
+Local validation passed 246 serialized journal tests (one helper ignored),
+including native-string, uncertainty, one-sided sequence, nullable-field,
+owner/store, retry/cancel and restart coverage. Library and GPUI checks without
+default features, formatting and diff checks passed. Primary review covered
+allocation bounds, participant bindings and codec compatibility, and repaired the
+provenance preallocation and nullable-key issues before acceptance. Windows storage
+validation is pending.

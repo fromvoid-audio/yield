@@ -28,13 +28,14 @@ use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, enco
 use super::coordinator::{
     CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
 };
+use super::external_commands::ExternalReconciliationIntentArgs;
 use super::history_commands::HistoryUndoRedoIntentArgs;
 use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14,
+    SCHEMA_V14, SCHEMA_V15,
 };
 use super::namespace_commands::NamespaceCommandArgs;
 use super::removal_commands::{RemovalCommandArgs, StageRetainedFolderIntentArgs, TrashIntentArgs};
@@ -214,7 +215,7 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the pre-publication cancellation API.
     #[error(
-        "operation journal cancellation requires a V3 or V5-V14 universal intent, found schema v{schema_version}"
+        "operation journal cancellation requires a V3 or V5-V15 universal intent, found schema v{schema_version}"
     )]
     UnsupportedCancellationSchema {
         /// Schema version of the retained row.
@@ -246,13 +247,13 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the retry API.
     #[error(
-        "operation journal retry observation requires a V5-V14 coordinator record, found schema v{schema_version}"
+        "operation journal retry observation requires a V5-V15 coordinator record, found schema v{schema_version}"
     )]
     UnsupportedRetrySchema {
         /// Schema version of the retained row.
         schema_version: u32,
     },
-    /// The retained row is not eligible for a V5-V14 retry observation.
+    /// The retained row is not eligible for a V5-V15 retry observation.
     #[error("operation journal retry state is not eligible: {reason}")]
     UnsupportedRetryState {
         /// Bounded state diagnostic.
@@ -1995,6 +1996,166 @@ impl OperationJournalStore {
         )
     }
 
+    /// Persist one V15 external filesystem reconciliation command.
+    pub fn persist_command_intent_v15(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v15_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V15 external filesystem reconciliation command with its exact write-stage
+    /// outcome.
+    pub fn persist_command_intent_v15_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        if intent.actor != OperationActor::ExternalFs
+            || intent.kind != OperationKind::ExternalReconciliation
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v15 command intent requires an external-fs external-reconciliation operation",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if !matches!(
+            command_args,
+            UniversalCommandArgs::ExternalReconciliation(_)
+        ) {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v15 command intent requires ExternalReconciliation arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v15 command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v15 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v15_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        self.insert_intent_with_outcome(&record)
+    }
+
+    /// Persist one typed V15 external filesystem reconciliation observation.
+    pub fn persist_external_reconciliation_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: ExternalReconciliationIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_external_reconciliation_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one typed V15 external filesystem reconciliation observation with its exact
+    /// write-stage outcome.
+    pub fn persist_external_reconciliation_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: ExternalReconciliationIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        self.persist_command_intent_v15_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::ExternalReconciliation(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     /// Persist one typed V13 raw WAV extraction command.
     pub fn persist_selection_extract_intent(
         &self,
@@ -2369,7 +2530,7 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
-    /// Persist a user cancellation request against a current V3 or V5-V14 universal intent.
+    /// Persist a user cancellation request against a current V3 or V5-V15 universal intent.
     ///
     /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
     /// already stored for this operation is a read-only idempotent replay and returns the current
@@ -2458,6 +2619,7 @@ impl OperationJournalStore {
                 | SCHEMA_V12
                 | SCHEMA_V13
                 | SCHEMA_V14
+                | SCHEMA_V15
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -2490,12 +2652,18 @@ impl OperationJournalStore {
                 | SCHEMA_V12
                 | SCHEMA_V13
                 | SCHEMA_V14
+                | SCHEMA_V15
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
             });
         }
-        if current.record.intent.actor != OperationActor::User {
+        let external_reconciliation = current.record.schema_version == SCHEMA_V15
+            && current.record.intent.kind == OperationKind::ExternalReconciliation;
+        if current.record.intent.actor != OperationActor::User
+            && !(external_reconciliation
+                && current.record.intent.actor == OperationActor::ExternalFs)
+        {
             return Err(OperationJournalStoreError::UnsupportedCancellationActor {
                 actor: current.record.intent.actor,
             });
@@ -2542,6 +2710,10 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V15 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
@@ -2556,6 +2728,7 @@ impl OperationJournalStore {
                 SCHEMA_V12 => "V12 IntentDurable/None or RetryPending",
                 SCHEMA_V13 => "V13 IntentDurable/None or RetryPending",
                 SCHEMA_V14 => "V14 IntentDurable/None or RetryPending",
+                SCHEMA_V15 => "V15 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -2613,7 +2786,7 @@ impl OperationJournalStore {
         })
     }
 
-    /// Persist the next typed V5-V14 retry observation using a sequence compare-and-swap.
+    /// Persist the next typed V5-V15 retry observation using a sequence compare-and-swap.
     ///
     /// An identical observation already stored for the operation is a read-only idempotent
     /// replay, even when the caller still holds an older sequence. A changed observation must
@@ -2701,6 +2874,7 @@ impl OperationJournalStore {
                 | SCHEMA_V12
                 | SCHEMA_V13
                 | SCHEMA_V14
+                | SCHEMA_V15
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -2730,6 +2904,7 @@ impl OperationJournalStore {
                 | SCHEMA_V12
                 | SCHEMA_V13
                 | SCHEMA_V14
+                | SCHEMA_V15
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -2743,7 +2918,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6/V7/V8/V9/V10/V11/V12/V13/V14 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7/V8/V9/V10/V11/V12/V13/V14/V15 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -3892,8 +4067,12 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        CreateFolderIntentArgs, ExternalRootBindingId, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        HistoryAction, HistoryDirection, HistoryRecoveryBackupObservation,
+        CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
+        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
+        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        ExternalRawObservationMetadata, ExternalRawObservationProvenance,
+        ExternalReconciliationIntentArgs, ExternalRootBindingId, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, HistoryAction, HistoryDirection, HistoryRecoveryBackupObservation,
         HistoryRecoveryLeafObservation, HistoryRestoreTargetExpectation, HistoryScopeId,
         HistoryUndoRedoIntentArgs, HistoryWaveformRestore, ImportFileExpectation, ImportIntentArgs,
         NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
@@ -3906,9 +4085,9 @@ mod tests {
         RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedRestoreIntentArgs,
         RetryErrorClass, RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7,
         SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
-        SelectionExtractIntentArgs, SelectionNormalizeIntentArgs, SelectionOutputCommandArgs,
-        SelectionOutputRecipe, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
-        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        SCHEMA_V15, SelectionExtractIntentArgs, SelectionNormalizeIntentArgs,
+        SelectionOutputCommandArgs, SelectionOutputRecipe, StoredRelativePath, StoredSourceFence,
+        TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
         WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
         WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
         WaveformNormalizeIntentArgs, WaveformOutputSpec, WaveformRenderOutputSpec,
@@ -4669,6 +4848,80 @@ mod tests {
         )
     }
 
+    fn v15_external_inputs() -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        ExternalReconciliationIntentArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, mut intent, copy_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        intent.actor = OperationActor::ExternalFs;
+        intent.kind = OperationKind::ExternalReconciliation;
+        let participants = copy_universal.participants().clone();
+        let source_participant_id = copy_args.source().participant_id();
+        let filesystem_participant_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem descriptor")
+            .id();
+        let provenance = ExternalRawObservationProvenance::new(
+            SourceId::from_string("source-a"),
+            Some(vec![1, 2, 3]),
+            Some(vec![4, 5]),
+            12,
+            ExternalCaptureBoundary::new(50, Some(10), None).expect("capture boundary"),
+        )
+        .expect("external provenance");
+        let marker = ExternalRawObservation::new(
+            ExternalRawEventKind::Overflow,
+            vec![
+                crate::operation_journal::ExternalRawObservedPath::new(
+                    ExternalNativeString::unix_bytes(b"changed.wav".to_vec()).expect("native path"),
+                    crate::operation_journal::ExternalRawPathRole::Subject,
+                    None,
+                )
+                .expect("path observation"),
+            ],
+            ExternalRawObservationMetadata::new()
+                .with_cursor(vec![9, 8])
+                .with_event_id(44),
+            1 << 15,
+        )
+        .expect("external marker");
+        let limits = ExternalRawObservationLimits::new(64, 4096, 4096).expect("raw limits");
+        let raw = ExternalRawObservationEnvelope::new(
+            provenance,
+            limits,
+            ExternalRawNativeAccounting::new(1, 11, 11),
+            vec![marker],
+        )
+        .expect("external raw envelope");
+        let command_args = ExternalReconciliationIntentArgs::new(
+            EvidenceBatchId::from_uuid(Uuid::from_u128(55)),
+            source_participant_id,
+            filesystem_participant_id,
+            7,
+            raw,
+        )
+        .expect("external command arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::ExternalReconciliation,
+            "operation.status.external-reconciliation",
+            participants,
+        )
+        .expect("external universal intent");
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+        )
+    }
+
     fn external_universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
         let mut value: serde_json::Value = serde_json::from_slice(
             &encode(&universal_intent_record(operation_id)).expect("v3 bytes"),
@@ -5293,6 +5546,95 @@ mod tests {
         assert_eq!(
             restarted.universal_command_args(),
             Some(&UniversalCommandArgs::History(command_args))
+        );
+        assert_eq!(restarted.retry_observation(), Some(&retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+    }
+
+    #[test]
+    fn v15_external_reconciliation_insert_retry_cancel_and_restart_preserve_raw_batch() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+            v15_external_inputs();
+        let inserted = store
+            .persist_external_reconciliation_intent_with_outcome(
+                operation_id,
+                intent,
+                universal_intent,
+                command_args.clone(),
+                capacity_plan,
+                50,
+            )
+            .receipt()
+            .expect("persist V15 external reconciliation command");
+        assert_eq!(inserted.sequence(), 1);
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("external-retry-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientAvailability,
+            "external_unavailable",
+            None,
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist V15 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+        assert_eq!(
+            store
+                .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+                .expect("replay V15 retry"),
+            retry_receipt
+        );
+
+        let cancellation = CancellationRequestObservation::new(57).expect("cancel observation");
+        let cancel_receipt = store
+            .request_cancel_before_publish(
+                operation_id,
+                retry_receipt.sequence(),
+                cancellation.clone(),
+            )
+            .expect("persist V15 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 3);
+        assert_eq!(
+            store
+                .request_cancel_before_publish(
+                    operation_id,
+                    inserted.sequence(),
+                    cancellation.clone(),
+                )
+                .expect("replay V15 cancellation"),
+            cancel_receipt
+        );
+        let persisted = store
+            .get(operation_id)
+            .expect("get V15 external command")
+            .expect("V15 external row");
+        assert_eq!(persisted.schema_version, SCHEMA_V15);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::ExternalReconciliation(
+                command_args.clone()
+            ))
+        );
+        assert_eq!(persisted.retry_observation(), Some(&retry));
+        assert_eq!(persisted.cancellation_request(), Some(&cancellation));
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V15 external command")
+            .expect("restarted V15 external row");
+        assert_eq!(restarted.schema_version, SCHEMA_V15);
+        assert_eq!(
+            restarted.universal_command_args(),
+            Some(&UniversalCommandArgs::ExternalReconciliation(command_args))
         );
         assert_eq!(restarted.retry_observation(), Some(&retry));
         assert_eq!(restarted.cancellation_request(), Some(&cancellation));
