@@ -217,9 +217,10 @@ impl AdmissionClaimInventory {
 /// Closed outcome observed for one admitted claim after owner settlement work.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AdmissionClaimSettlementOutcome {
-    /// The claim's allocation was released.
+    /// The operation's logical reservation or charge was closed by its owner.
+    /// This does not establish filesystem absence or database page reclamation.
     Released,
-    /// The claim's allocation was consumed by or transferred to the durable result.
+    /// The allocation remains accounted by the durable-result or existing-data owner.
     ConsumedOrTransferred,
     /// The claim remains held and cannot satisfy a release-safe terminal predicate.
     Held,

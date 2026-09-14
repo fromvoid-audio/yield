@@ -656,6 +656,22 @@ Preserved or uncertain effects and held claims remain nonterminal. Required sour
 global, Harvest, projection and readiness reconciliation must cover the actual
 cancelled action scope; it cannot run later actions from the original plan.
 
+An audit may suspend this after-observed-effect cancellation route even when the
+structural phase is still prepublication, but only when the frozen inventory
+proves the nonpublication effect. Resolving that audit restores the effect
+cancellation hold. This full-progress exception does not permit an ordinary
+prepublication audit or manufacture a publication checkpoint.
+
+Claim settlement is distinct from physical cleanup. `Released` closes the
+operation's logical reservation/charge; it does not prove filesystem absence or
+database page reclamation. Clean prepublication cancellation requires released
+destination-staging claims and separately verified staging absence. Journal-record
+and pre-existing destination/recovery allocations remain `ConsumedOrTransferred`.
+Database commit/WAL/SHM claims may be released if unused or transferred to their
+durable owner if written. `Held` is never terminal. Operation-created recovery
+material must be distinguished from pre-existing recovery data before any cleanup
+or release authority can be issued.
+
 The first cancellation freezes a non-executable recovery inventory. A verified
 late publication may refine an already-entered action, advance its recovery
 generation and select the after-publication route, but cannot introduce an action

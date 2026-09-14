@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::admission_claims::{AdmissionClaimInventory, AdmissionClaimValidationError};
+use super::cancellation_recovery::{
+    CancellationInventory, CancellationInventoryError, CancellationRoute,
+};
 use super::coordinator::{RetryObservation, RetryObservationValidationError, UniversalCommandArgs};
 use super::full_status::FullProgressDisposition;
 use super::model::{
@@ -486,6 +489,8 @@ enum AuditSuspendedHold {
     CancelRequestedBeforePublish,
     /// Cancellation was requested after publication beneath the audit.
     CancelRequestedAfterPublish,
+    /// Cancellation was requested after an observed non-publication effect beneath the audit.
+    CancelRequestedAfterObservedEffect,
 }
 
 /// Current audit overlay with its exact generation and suspended disposition.
@@ -533,7 +538,7 @@ impl ParticipantScope {
 }
 
 /// Per-key progress status derived from the frozen plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProgressStepStatus {
     /// The applicable work has not completed.
     Pending,
@@ -637,7 +642,7 @@ struct VerifiedAuditResolution {
     observation: ProgressAuditObservation,
 }
 
-/// Internal typed gate for a pre-publication cancellation terminal transition.
+/// Legacy placeholder for the not-yet-implemented pre-publication cancellation outcome.
 #[allow(dead_code)]
 struct PrePublishCancellationAuthority {
     operation_id: OperationId,
@@ -646,15 +651,15 @@ struct PrePublishCancellationAuthority {
     _capacity_release: VerifiedCapacityRelease,
 }
 
-/// Internal marker for capability-bound verified staging absence.
+/// Placeholder marker retained until the cancellation outcome gate is implemented.
 #[allow(dead_code)]
 struct VerifiedStagingAbsence;
 
-/// Internal marker for durable capacity-release evidence.
+/// Placeholder marker retained until the cancellation outcome gate is implemented.
 #[allow(dead_code)]
 struct VerifiedCapacityRelease;
 
-/// Internal typed gate for a post-publication cancellation terminal transition.
+/// Legacy placeholder for the not-yet-implemented post-publication cancellation outcome.
 #[allow(dead_code)]
 struct PostPublishCancellationAuthority {
     operation_id: OperationId,
@@ -662,7 +667,7 @@ struct PostPublishCancellationAuthority {
     _recovery: VerifiedPostPublishRecovery,
 }
 
-/// Internal marker for complete verified post-publication reconciliation or compensation.
+/// Placeholder marker retained until the cancellation outcome gate is implemented.
 #[allow(dead_code)]
 struct VerifiedPostPublishRecovery;
 
@@ -682,6 +687,7 @@ pub struct WorkProgress {
     audit_generation: u64,
     cancellation_request: Option<CancellationRequestObservation>,
     admission_claims: Option<AdmissionClaimInventory>,
+    cancellation_inventory: Option<CancellationInventory>,
 }
 
 #[allow(dead_code)]
@@ -736,6 +742,7 @@ impl WorkProgress {
             audit_generation: 0,
             cancellation_request: None,
             admission_claims: None,
+            cancellation_inventory: None,
         })
     }
 
@@ -823,6 +830,11 @@ impl WorkProgress {
         self.admission_claims.as_ref()
     }
 
+    /// Borrow the immutable cancellation inventory frozen by the first request, when present.
+    pub fn cancellation_inventory(&self) -> Option<&CancellationInventory> {
+        self.cancellation_inventory.as_ref()
+    }
+
     /// Record a bounded retry disposition without changing any step completion.
     pub(crate) fn request_retry(
         &mut self,
@@ -840,6 +852,7 @@ impl WorkProgress {
             FullProgressDisposition::AuditRequired
                 | FullProgressDisposition::CancelRequestedBeforePublish
                 | FullProgressDisposition::CancelRequestedAfterPublish
+                | FullProgressDisposition::CancelRequestedAfterObservedEffect
         ) {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
@@ -1016,7 +1029,15 @@ impl WorkProgress {
         if self.disposition == FullProgressDisposition::AuditRequired {
             return Err(WorkProgressError::AuditStateMissing);
         }
-        if self.phase.is_pre_publication() {
+        let observed_effect_cancellation = self.disposition
+            == FullProgressDisposition::CancelRequestedAfterObservedEffect
+            && self
+                .cancellation_inventory
+                .as_ref()
+                .is_some_and(|inventory| {
+                    inventory.route() == CancellationRoute::AfterObservedEffect
+                });
+        if self.phase.is_pre_publication() && !observed_effect_cancellation {
             return Err(WorkProgressError::AuditPhaseInvalid);
         }
         let suspended_hold = match self.disposition {
@@ -1027,6 +1048,9 @@ impl WorkProgress {
             }
             FullProgressDisposition::CancelRequestedAfterPublish => {
                 AuditSuspendedHold::CancelRequestedAfterPublish
+            }
+            FullProgressDisposition::CancelRequestedAfterObservedEffect => {
+                AuditSuspendedHold::CancelRequestedAfterObservedEffect
             }
             disposition => {
                 return Err(WorkProgressError::AuditUnderlyingDispositionUnsupported {
@@ -1093,6 +1117,11 @@ impl WorkProgress {
             {
                 FullProgressDisposition::CancelRequestedAfterPublish
             }
+            AuditSuspendedHold::CancelRequestedAfterObservedEffect
+                if self.cancellation_request.is_some() =>
+            {
+                FullProgressDisposition::CancelRequestedAfterObservedEffect
+            }
             _ => return Err(WorkProgressError::AuditSuspendedHoldMissing),
         };
         self.active_audit = None;
@@ -1111,31 +1140,69 @@ impl WorkProgress {
         }
         if let Some(existing) = self.cancellation_request {
             if existing == observation {
-                return Ok(());
+                return if self.cancellation_inventory.is_some() {
+                    Ok(())
+                } else {
+                    Err(WorkProgressError::CancellationInventoryMissing)
+                };
             }
             return Err(WorkProgressError::CancellationReplayConflict);
         }
+
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationAdmissionClaimsMissing)?;
+        let generation = self
+            .cancellation_inventory
+            .as_ref()
+            .map(CancellationInventory::generation)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(WorkProgressError::CancellationGenerationOverflow)?;
+        let inventory = CancellationInventory::capture(
+            self.operation_id,
+            &self.plan,
+            self.execution_epoch,
+            generation,
+            &self.steps,
+            admission_claims,
+        )?;
+        let route = inventory.route();
+        let requested_disposition = match route {
+            CancellationRoute::BeforePublish => {
+                FullProgressDisposition::CancelRequestedBeforePublish
+            }
+            CancellationRoute::AfterPublish => FullProgressDisposition::CancelRequestedAfterPublish,
+            CancellationRoute::AfterObservedEffect => {
+                FullProgressDisposition::CancelRequestedAfterObservedEffect
+            }
+        };
         if self.disposition == FullProgressDisposition::AuditRequired {
             if self.active_audit.is_none() {
                 return Err(WorkProgressError::AuditStateMissing);
             }
-            if !self.phase.is_post_publication() {
+            if route == CancellationRoute::BeforePublish {
                 return Err(WorkProgressError::CancellationPhaseInvalid);
             }
             self.cancellation_request = Some(observation);
+            self.cancellation_inventory = Some(inventory);
             if let Some(active) = &mut self.active_audit {
-                active.suspended_hold = AuditSuspendedHold::CancelRequestedAfterPublish;
+                active.suspended_hold = match requested_disposition {
+                    FullProgressDisposition::CancelRequestedAfterPublish => {
+                        AuditSuspendedHold::CancelRequestedAfterPublish
+                    }
+                    FullProgressDisposition::CancelRequestedAfterObservedEffect => {
+                        AuditSuspendedHold::CancelRequestedAfterObservedEffect
+                    }
+                    _ => return Err(WorkProgressError::CancellationPhaseInvalid),
+                };
             }
             return Ok(());
         }
         self.cancellation_request = Some(observation);
-        self.disposition = if self.phase.is_pre_publication() {
-            FullProgressDisposition::CancelRequestedBeforePublish
-        } else if self.phase.is_post_publication() {
-            FullProgressDisposition::CancelRequestedAfterPublish
-        } else {
-            return Err(WorkProgressError::CancellationPhaseInvalid);
-        };
+        self.cancellation_inventory = Some(inventory);
+        self.disposition = requested_disposition;
         Ok(())
     }
 
@@ -1267,38 +1334,24 @@ impl WorkProgress {
         Ok(ProgressApplyOutcome::Applied)
     }
 
-    /// Complete a pre-publication cancellation only with an internal cleanup/release gate.
+    /// Cancellation outcomes remain unavailable until cleanup, settlement, and safe-state
+    /// authorities are implemented.  The placeholder authority cannot advance progress.
     #[allow(dead_code)]
     fn finish_pre_publish_cancellation(
         &mut self,
-        authority: PrePublishCancellationAuthority,
+        _authority: PrePublishCancellationAuthority,
     ) -> Result<(), WorkProgressError> {
-        if self.disposition != FullProgressDisposition::CancelRequestedBeforePublish {
-            return Err(WorkProgressError::CancellationNotRequested);
-        }
-        if authority.operation_id != self.operation_id || authority.plan != self.plan {
-            return Err(WorkProgressError::CancellationAuthorityMismatch);
-        }
-        self.phase = OperationPhase::Terminal;
-        self.disposition = FullProgressDisposition::CancelledBeforePublish;
-        Ok(())
+        Err(WorkProgressError::CancellationOutcomeUnavailable)
     }
 
-    /// Complete a post-publication cancellation only with an internal recovery gate.
+    /// Cancellation outcomes remain unavailable until recovery and settlement authorities are
+    /// implemented.  The placeholder authority cannot advance progress.
     #[allow(dead_code)]
     fn finish_post_publish_cancellation(
         &mut self,
-        authority: PostPublishCancellationAuthority,
+        _authority: PostPublishCancellationAuthority,
     ) -> Result<(), WorkProgressError> {
-        if self.disposition != FullProgressDisposition::CancelRequestedAfterPublish {
-            return Err(WorkProgressError::CancellationNotRequested);
-        }
-        if authority.operation_id != self.operation_id || authority.plan != self.plan {
-            return Err(WorkProgressError::CancellationAuthorityMismatch);
-        }
-        self.phase = OperationPhase::Terminal;
-        self.disposition = FullProgressDisposition::CancelledAfterPublish;
-        Ok(())
+        Err(WorkProgressError::CancellationOutcomeUnavailable)
     }
 
     #[allow(dead_code)]
@@ -1372,6 +1425,7 @@ impl WorkProgress {
                 FullProgressDisposition::AuditRequired
                     | FullProgressDisposition::CancelRequestedBeforePublish
                     | FullProgressDisposition::CancelRequestedAfterPublish
+                    | FullProgressDisposition::CancelRequestedAfterObservedEffect
             )
         {
             return;
@@ -2053,6 +2107,22 @@ pub enum WorkProgressError {
     /// A second cancellation request changed the captured request.
     #[error("work progress cancellation replay conflicts")]
     CancellationReplayConflict,
+    /// Cancellation cannot become terminal until cleanup, settlement, and safe-state authorities
+    /// are available.
+    #[error("work progress cancellation outcome authority is not yet available")]
+    CancellationOutcomeUnavailable,
+    /// Cancellation requires an exact retained admission-claim observation.
+    #[error("work progress cancellation admission claims are missing")]
+    CancellationAdmissionClaimsMissing,
+    /// An existing cancellation request had no frozen inventory to replay.
+    #[error("work progress cancellation inventory is missing")]
+    CancellationInventoryMissing,
+    /// The cancellation generation could not advance without wrapping.
+    #[error("work progress cancellation generation overflowed")]
+    CancellationGenerationOverflow,
+    /// The bounded cancellation inventory was invalid or did not bind this progress.
+    #[error("invalid work progress cancellation inventory: {0}")]
+    CancellationInventory(#[from] CancellationInventoryError),
     /// Cancellation was requested from an unsupported phase.
     #[error("work progress cancellation phase is invalid")]
     CancellationPhaseInvalid,
@@ -2083,18 +2153,26 @@ mod tests {
         CapacityAllocationClass, DurableCapacityPlan, DurableVolumeCapacity,
         PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
     };
+    use crate::operation_journal::MAX_CANCELLATION_STEPS;
     use crate::operation_journal::{
-        AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, CopyCollisionPolicy,
-        CopyEndpoint, CopyIntentArgs, CopySourceExpectation, ExtractAndTrimIntentArgs,
-        FiniteF32Bits, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
-        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
-        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
-        NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
-        ParticipantCheckpointState, RawWavExtractionRecipe, RetryErrorClass, RetryLeaseId,
+        AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, CancellationActionState,
+        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation, EvidenceBatchId,
+        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
+        ExternalRawObservationLimits, ExternalRawObservationMetadata,
+        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
+        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
+        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
+        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
+        NamespaceFileExpectation, NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget,
+        ParticipantCheckpoint, ParticipantCheckpointState, RawWavExtractionRecipe,
+        RetainedDeleteId, RetainedFolderObservation, RetainedPurgeDecision,
+        RetainedPurgeIntentArgs, RetainedRecoveryRootKind, RetainedResolutionCommandArgs,
+        RetainedResolutionStage, RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId,
         SelectionExtractIntentArgs, SelectionOutputCommandArgs, SelectionOutputRecipe,
         StoredRelativePath, UniversalCommandArgs, WaveformEditFrameRange,
         WaveformFileRevisionObservation, WaveformOutputSpec, WaveformSampleFormat,
-        WaveformSourceSpec,
+        WaveformSourceSpec, fingerprint_selected_entry_json,
     };
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use uuid::Uuid;
@@ -2304,6 +2382,129 @@ mod tests {
             .expect("claim"),
         ])
         .expect("claim inventory")
+    }
+
+    fn copy_progress_with_admission_claims() -> WorkProgress {
+        let (participants, args, plan) = copy_plan_inputs();
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(205)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("copy progress with claim observation")
+    }
+
+    fn claimed_progress(
+        participants: ParticipantSet,
+        args: UniversalCommandArgs,
+        operation_value: u128,
+    ) -> WorkProgress {
+        let plan =
+            super::super::work_plan::derive_work_plan(&args, &participants).expect("work plan");
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(operation_value)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("progress with claim observation")
+    }
+
+    fn retained_folder_observation(
+        source: ParticipantId,
+        source_id: SourceId,
+        retained_value: u128,
+    ) -> RetainedFolderObservation {
+        let staged = NamespaceEntryEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new(".wavecrate_delete_staging/drums/kick").expect("staged path"),
+            NamespaceEntryExpectation::Directory(
+                NamespaceDirectoryExpectation::new(7, "staged-directory", None)
+                    .expect("staged expectation"),
+            ),
+        )
+        .expect("staged endpoint");
+        RetainedFolderObservation::new(
+            StoredRelativePath::new("drums/kick").expect("original path"),
+            staged,
+            StoredRelativePath::new("drums/kick").expect("staged relative"),
+            RetainedDeleteId::new(Uuid::from_u128(retained_value)).expect("retained ID"),
+            RetainedResolutionStage::Deleted,
+            RetainedRecoveryRootKind::LegacyDeleteStaging,
+            fingerprint_selected_entry_json(br#"{"id":"retained"}"#)
+                .expect("selected entry fingerprint"),
+        )
+        .expect("retained observation")
+    }
+
+    fn retained_resolution_args(
+        source: ParticipantId,
+        source_id: SourceId,
+        restore: bool,
+    ) -> UniversalCommandArgs {
+        let observation = retained_folder_observation(source, source_id, 206);
+        let command = if restore {
+            RetainedResolutionCommandArgs::Restore(
+                RetainedRestoreIntentArgs::new(observation).expect("restore arguments"),
+            )
+        } else {
+            RetainedResolutionCommandArgs::Purge(
+                RetainedPurgeIntentArgs::new(observation, RetainedPurgeDecision::UserConfirmed)
+                    .expect("purge arguments"),
+            )
+        };
+        UniversalCommandArgs::RetainedResolution(command)
+    }
+
+    fn external_reconciliation_args(
+        source: ParticipantId,
+        filesystem: ParticipantId,
+        source_id: SourceId,
+    ) -> UniversalCommandArgs {
+        let provenance = ExternalRawObservationProvenance::new(
+            source_id,
+            None,
+            None,
+            1,
+            ExternalCaptureBoundary::new(1, None, None).expect("capture boundary"),
+        )
+        .expect("provenance");
+        let path = ExternalRawObservedPath::new(
+            ExternalNativeString::unix_bytes(b"observed.wav".to_vec()).expect("path"),
+            ExternalRawPathRole::Subject,
+            None,
+        )
+        .expect("observed path");
+        let observation = ExternalRawObservation::new(
+            ExternalRawEventKind::Modify,
+            vec![path],
+            ExternalRawObservationMetadata::new(),
+            0,
+        )
+        .expect("raw observation");
+        let raw = ExternalRawObservationEnvelope::new(
+            provenance,
+            ExternalRawObservationLimits::new(64, 4096, 4096).expect("raw limits"),
+            ExternalRawNativeAccounting::new(1, 12, 4),
+            vec![observation],
+        )
+        .expect("raw envelope");
+        UniversalCommandArgs::ExternalReconciliation(
+            ExternalReconciliationIntentArgs::new(
+                EvidenceBatchId::from_uuid(Uuid::from_u128(207)),
+                source,
+                filesystem,
+                7,
+                raw,
+            )
+            .expect("external arguments"),
+        )
     }
 
     fn fenced_harvest_progress() -> WorkProgress {
@@ -2732,6 +2933,21 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_requires_admission_claims_without_changing_unadmitted_progress() {
+        let mut progress = copy_progress(false);
+        let before = progress.clone();
+        assert_eq!(
+            progress.request_cancellation(
+                CancellationRequestObservation::new(206).expect("cancel observation")
+            ),
+            Err(WorkProgressError::CancellationAdmissionClaimsMissing)
+        );
+        assert_eq!(progress, before);
+        assert!(progress.cancellation_inventory().is_none());
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
+    }
+
+    #[test]
     fn committed_source_evidence_records_a_monotonic_before_after_interval() {
         let mut progress = copy_progress(false);
         apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
@@ -2941,11 +3157,13 @@ mod tests {
             ));
         let plan =
             super::super::work_plan::derive_work_plan(&args, &participants).expect("compound plan");
-        let mut progress = WorkProgress::from_plan(
+        let mut progress = WorkProgress::from_plan_with_admission_observations(
             OperationId::from_uuid(Uuid::from_u128(103)),
             &plan,
             &args,
             &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
         )
         .expect("compound progress");
         for role in [
@@ -2966,6 +3184,310 @@ mod tests {
             ProgressStepStatus::Pending
         );
         assert_eq!(progress.disposition(), FullProgressDisposition::None);
+
+        progress
+            .request_cancellation(CancellationRequestObservation::new(205).expect("cancel"))
+            .expect("compound cancellation");
+        let inventory = progress
+            .cancellation_inventory()
+            .expect("compound cancellation inventory");
+        assert_eq!(inventory.route(), CancellationRoute::AfterPublish);
+        assert_eq!(
+            inventory.actions()[0].state(),
+            CancellationActionState::AppPublished
+        );
+        assert_eq!(
+            inventory.actions()[1].state(),
+            CancellationActionState::NotStarted
+        );
+    }
+
+    #[test]
+    fn cancellation_inventory_classifies_nonpublication_effects_and_audit_hold() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut purge = claimed_progress(
+            participants,
+            retained_resolution_args(source, source_id, false),
+            208,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::SelectedRetainedObjectDisposition,
+        ] {
+            apply_role(&mut purge, 0, role);
+        }
+        purge
+            .request_cancellation(CancellationRequestObservation::new(207).expect("cancel"))
+            .expect("purge cancellation");
+        let purge_inventory = purge
+            .cancellation_inventory()
+            .expect("purge cancellation inventory");
+        assert_eq!(
+            purge_inventory.actions()[0].state(),
+            CancellationActionState::DestructiveDispositionWithoutPublish
+        );
+        assert_eq!(
+            purge_inventory.route(),
+            CancellationRoute::AfterObservedEffect
+        );
+        assert!(purge.phase().is_pre_publication());
+
+        purge
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::UncertainEvidence,
+            ))
+            .expect("audit may cover the observed purge effect");
+        assert_eq!(purge.disposition(), FullProgressDisposition::AuditRequired);
+        purge
+            .resolve_audit(audit_resolution_authority(&purge, 1, 0))
+            .expect("resolve purge audit");
+        assert_eq!(
+            purge.disposition(),
+            FullProgressDisposition::CancelRequestedAfterObservedEffect
+        );
+
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut merge = claimed_progress(
+            participants,
+            retained_resolution_args(source, source_id, true),
+            209,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::RetainedMerge,
+        ] {
+            apply_role(&mut merge, 0, role);
+        }
+        merge
+            .request_cancellation(CancellationRequestObservation::new(208).expect("cancel"))
+            .expect("merge cancellation");
+        let merge_inventory = merge
+            .cancellation_inventory()
+            .expect("merge cancellation inventory");
+        assert_eq!(
+            merge_inventory.actions()[0].state(),
+            CancellationActionState::ApplicationMutationWithoutPublish
+        );
+        assert_eq!(
+            merge_inventory.route(),
+            CancellationRoute::AfterObservedEffect
+        );
+        assert_eq!(merge.phase(), OperationPhase::Prepared);
+
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut external = claimed_progress(
+            participants,
+            external_reconciliation_args(source, filesystem, source_id),
+            210,
+        );
+        apply_role(&mut external, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut external, 0, WorkUnitRole::ExternalAudit);
+        external
+            .request_cancellation(CancellationRequestObservation::new(209).expect("cancel"))
+            .expect("external cancellation");
+        let external_inventory = external
+            .cancellation_inventory()
+            .expect("external cancellation inventory");
+        assert_eq!(
+            external_inventory.actions()[0].state(),
+            CancellationActionState::ExternalEffectAudited {
+                source_reconciled: false
+            }
+        );
+        assert_eq!(
+            external_inventory.route(),
+            CancellationRoute::AfterObservedEffect
+        );
+        assert!(external.phase().is_pre_publication());
+
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut reconciled_external = claimed_progress(
+            participants,
+            external_reconciliation_args(source, filesystem, source_id),
+            211,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::ExternalAudit,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_role(&mut reconciled_external, 0, role);
+        }
+        reconciled_external
+            .request_cancellation(CancellationRequestObservation::new(210).expect("cancel"))
+            .expect("reconciled external cancellation");
+        assert_eq!(
+            reconciled_external
+                .cancellation_inventory()
+                .expect("reconciled external inventory")
+                .actions()[0]
+                .state(),
+            CancellationActionState::ExternalEffectAudited {
+                source_reconciled: true
+            }
+        );
+    }
+
+    #[test]
+    fn cancellation_replay_freezes_inventory_across_reacquisition() {
+        let mut progress = copy_progress_with_admission_claims();
+        let request = CancellationRequestObservation::new(211).expect("cancel observation");
+        progress
+            .request_cancellation(request)
+            .expect("cancellation request");
+        let frozen = progress
+            .cancellation_inventory()
+            .expect("frozen cancellation inventory")
+            .clone();
+        let target = key_for(&progress, 0, WorkUnitRole::SourceRead).participant_id();
+
+        progress
+            .reacquire_source(source_reacquisition_authority(&progress, target, 7, 2, 0))
+            .expect("source reacquisition");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(progress.cancellation_inventory(), Some(&frozen));
+        frozen
+            .validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                progress.steps(),
+                progress.execution_epoch(),
+                progress.admission_claims().expect("admission claims"),
+            )
+            .expect("capture epoch remains valid after reacquisition");
+        let mut future_epoch = serde_json::to_value(&frozen).expect("inventory JSON");
+        future_epoch["execution_epoch"] = serde_json::json!(2);
+        let future_epoch: CancellationInventory =
+            serde_json::from_value(future_epoch).expect("future epoch shape decodes");
+        assert!(matches!(
+            future_epoch.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                progress.steps(),
+                progress.execution_epoch(),
+                progress.admission_claims().expect("admission claims"),
+            ),
+            Err(CancellationInventoryError::ExecutionEpochFuture {
+                current: 1,
+                actual: 2
+            })
+        ));
+        progress
+            .request_cancellation(request)
+            .expect("exact cancellation replay");
+        assert_eq!(progress.cancellation_inventory(), Some(&frozen));
+
+        let before_conflict = progress.clone();
+        assert_eq!(
+            progress.request_cancellation(CancellationRequestObservation::new(212).unwrap()),
+            Err(WorkProgressError::CancellationReplayConflict)
+        );
+        assert_eq!(progress, before_conflict);
+    }
+
+    #[test]
+    fn cancellation_inventory_validates_prerequisites_and_bounded_keys() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(213).expect("cancel"))
+            .expect("cancellation request");
+        let inventory = progress
+            .cancellation_inventory()
+            .expect("cancellation inventory")
+            .clone();
+        let claims = progress.admission_claims().expect("admission claims");
+
+        let mut unknown_key = serde_json::to_value(&inventory).expect("inventory JSON");
+        unknown_key["steps"][0]["key"]["step_ordinal"] = serde_json::json!(999);
+        let unknown_key: CancellationInventory =
+            serde_json::from_value(unknown_key).expect("unknown key shape decodes");
+        assert!(matches!(
+            unknown_key.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                progress.steps(),
+                progress.execution_epoch(),
+                claims,
+            ),
+            Err(CancellationInventoryError::StepKeyMismatch { index: 0, .. })
+        ));
+
+        let mut oversized = serde_json::to_value(&inventory).expect("inventory JSON");
+        let first_step = oversized["steps"][0].clone();
+        let steps = oversized["steps"].as_array_mut().expect("step array");
+        for _ in 0..MAX_CANCELLATION_STEPS {
+            steps.push(first_step.clone());
+        }
+        let oversized: CancellationInventory =
+            serde_json::from_value(oversized).expect("oversized inventory decodes");
+        assert!(matches!(
+            oversized.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                progress.steps(),
+                progress.execution_epoch(),
+                claims,
+            ),
+            Err(CancellationInventoryError::TooManySteps { .. })
+        ));
+
+        let mut tampered_publish = serde_json::to_value(&inventory).expect("inventory JSON");
+        let publish_roles = [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+        ];
+        let steps = tampered_publish["steps"]
+            .as_array_mut()
+            .expect("step array");
+        for (index, unit) in progress.plan().units().iter().enumerate() {
+            if unit.key().action_ordinal() == 0 && publish_roles.contains(&unit.key().role()) {
+                steps[index]["status"] = serde_json::json!("Completed");
+            }
+        }
+        tampered_publish["actions"][0]["state"] = serde_json::json!("AppPublished");
+        tampered_publish["route"] = serde_json::json!("AfterPublish");
+        let tampered_publish: CancellationInventory =
+            serde_json::from_value(tampered_publish).expect("valid publish snapshot shape");
+        assert!(matches!(
+            tampered_publish.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                progress.steps(),
+                progress.execution_epoch(),
+                claims,
+            ),
+            Err(CancellationInventoryError::CurrentProgressMismatch { .. })
+        ));
+
+        let mut invalid_progress = copy_progress_with_admission_claims();
+        let dependent = key_for(&invalid_progress, 0, WorkUnitRole::Prepare);
+        let dependent_index = invalid_progress
+            .steps
+            .iter()
+            .position(|step| step.key() == dependent)
+            .expect("dependent step");
+        invalid_progress.steps[dependent_index].status = ProgressStepStatus::Completed;
+        let error = CancellationInventory::capture(
+            invalid_progress.operation_id,
+            &invalid_progress.plan,
+            invalid_progress.execution_epoch,
+            1,
+            &invalid_progress.steps,
+            invalid_progress
+                .admission_claims
+                .as_ref()
+                .expect("admission claims"),
+        )
+        .expect_err("incomplete prerequisite");
+        assert!(matches!(
+            error,
+            CancellationInventoryError::PrerequisiteIncomplete { .. }
+        ));
     }
 
     #[test]
@@ -3198,7 +3720,7 @@ mod tests {
             })
         ));
 
-        let mut cancelled = copy_progress(false);
+        let mut cancelled = copy_progress_with_admission_claims();
         let request = CancellationRequestObservation::new(42).expect("cancel request");
         cancelled
             .request_cancellation(request)
@@ -3210,29 +3732,21 @@ mod tests {
             cancelled.request_cancellation(CancellationRequestObservation::new(43).unwrap()),
             Err(WorkProgressError::CancellationReplayConflict)
         ));
-        let wrong_authority = PrePublishCancellationAuthority {
-            operation_id: OperationId::from_uuid(Uuid::from_u128(104)),
-            plan: cancelled.plan.clone(),
-            _staging_absence: VerifiedStagingAbsence,
-            _capacity_release: VerifiedCapacityRelease,
-        };
-        assert!(matches!(
-            cancelled.finish_pre_publish_cancellation(wrong_authority),
-            Err(WorkProgressError::CancellationAuthorityMismatch)
-        ));
         let authority = PrePublishCancellationAuthority {
             operation_id: cancelled.operation_id,
             plan: cancelled.plan.clone(),
             _staging_absence: VerifiedStagingAbsence,
             _capacity_release: VerifiedCapacityRelease,
         };
-        cancelled
-            .finish_pre_publish_cancellation(authority)
-            .expect("guarded cancellation terminal");
-        assert_eq!(cancelled.phase(), OperationPhase::Terminal);
+        let before_outcome = cancelled.clone();
+        assert_eq!(
+            cancelled.finish_pre_publish_cancellation(authority),
+            Err(WorkProgressError::CancellationOutcomeUnavailable)
+        );
+        assert_eq!(cancelled, before_outcome);
         assert_eq!(
             cancelled.disposition(),
-            FullProgressDisposition::CancelledBeforePublish
+            FullProgressDisposition::CancelRequestedBeforePublish
         );
     }
 
@@ -3505,7 +4019,7 @@ mod tests {
         assert_eq!(audit.disposition(), FullProgressDisposition::AuditRequired);
         assert_eq!(audit.audit_observation(), Some(&audit_observation));
 
-        let mut cancelled = copy_progress(false);
+        let mut cancelled = copy_progress_with_admission_claims();
         let target = key_for(&cancelled, 0, WorkUnitRole::SourceRead).participant_id();
         let cancellation = CancellationRequestObservation::new(77).expect("cancel request");
         cancelled
@@ -3739,7 +4253,7 @@ mod tests {
             .expect("resume restored retry separately");
         assert_eq!(retry.disposition(), FullProgressDisposition::None);
 
-        let mut cancelled = copy_progress(false);
+        let mut cancelled = copy_progress_with_admission_claims();
         publish_prefix(&mut cancelled);
         let cancellation = CancellationRequestObservation::new(88).expect("cancel request");
         cancelled

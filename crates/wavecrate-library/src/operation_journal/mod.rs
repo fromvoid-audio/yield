@@ -6,6 +6,7 @@
 //! retains those capabilities for the lifetime of its connection.
 
 pub mod admission_claims;
+pub mod cancellation_recovery;
 pub mod codec;
 pub mod coordinator;
 pub mod evidence;
@@ -33,6 +34,12 @@ pub use admission_claims::{
     AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
     AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
     AdmissionClaimValidationError, MAX_ADMISSION_CLAIMS,
+};
+
+pub use cancellation_recovery::{
+    CancellationActionSnapshot, CancellationActionState, CancellationInventory,
+    CancellationInventoryError, CancellationRoute, CancellationStepSnapshot,
+    MAX_CANCELLATION_ACTIONS, MAX_CANCELLATION_STEPS,
 };
 
 pub use coordinator::{
