@@ -1484,6 +1484,8 @@ pub enum UniversalCommandArgs {
     RetainedResolution(super::retained_resolution_commands::RetainedResolutionCommandArgs),
     /// Observe one selection-only Normalize request with a full-file Float32 output.
     SelectionNormalize(super::selection_normalize_commands::SelectionNormalizeIntentArgs),
+    /// Observe one source-owned selection extraction or ordered ExtractAndTrim request.
+    SelectionOutput(super::selection_output_commands::SelectionOutputCommandArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1499,6 +1501,7 @@ impl UniversalCommandArgs {
             Self::Removal(args) => args.command_kind(),
             Self::RetainedResolution(args) => args.command_kind(),
             Self::SelectionNormalize(args) => args.command_kind(),
+            Self::SelectionOutput(args) => args.command_kind(),
         }
     }
 
@@ -1535,6 +1538,9 @@ impl UniversalCommandArgs {
             Self::SelectionNormalize(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::SelectionNormalize),
+            Self::SelectionOutput(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::SelectionOutput),
         }
     }
 }
@@ -1573,6 +1579,9 @@ pub enum UniversalCommandArgsValidationError {
     SelectionNormalize(
         #[source] super::selection_normalize_commands::SelectionNormalizeValidationError,
     ),
+    /// A source-owned selection-output argument failed validation.
+    #[error("invalid selection output command arguments: {0}")]
+    SelectionOutput(#[source] super::selection_output_commands::SelectionOutputValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.

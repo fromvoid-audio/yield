@@ -978,23 +978,25 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExternalRootBindingId, FiniteF32Bits, ImportFileExpectation, ImportIntentArgs,
-        MAX_DIAGNOSTIC_CODE_BYTES, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
-        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
-        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
-        NamespaceRenameIntentArgs, NamespaceTarget, OperationActor, OperationDisposition,
-        OperationIntent, OperationKind, ParticipantCheckpoint, ParticipantCheckpointState,
-        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
-        RecoveryCursor, RecoveryRowOutcome, RemovalCommandArgs, RetryErrorClass, RetryLeaseId,
-        SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
-        SelectionNormalizeIntentArgs, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
+        ExternalRootBindingId, ExtractAndTrimIntentArgs, FiniteF32Bits, ImportFileExpectation,
+        ImportIntentArgs, MAX_DIAGNOSTIC_CODE_BYTES, NamespaceCommandArgs,
+        NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation, NamespaceDirectoryLocator,
+        NamespaceEntryEndpoint, NamespaceEntryExpectation, NamespaceFileExpectation,
+        NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget, OperationActor,
+        OperationDisposition, OperationIntent, OperationKind, ParticipantCheckpoint,
+        ParticipantCheckpointState, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
+        ParticipantSet, RawWavExtractionRecipe, RecoveryCursor, RecoveryRowOutcome,
+        RemovalCommandArgs, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+        SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+        SelectionExtractIntentArgs, SelectionNormalizeIntentArgs, SelectionOutputCommandArgs,
+        SelectionOutputRecipe, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
         UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
         WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
         WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
         WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
         decode,
     };
-    use crate::sample_sources::SourceId;
+    use crate::sample_sources::{SourceId, SourcePlaybackType};
     use crate::test_runtime::TestRuntimeGuard;
     use std::fs;
     use std::thread;
@@ -1525,6 +1527,67 @@ mod tests {
         (record, selection_args)
     }
 
+    fn v13_extract_and_trim_record(
+        operation_id: OperationId,
+    ) -> (StoredOperationRecord, ExtractAndTrimIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
+            .expect("selection output source spec");
+        let extraction = SelectionExtractIntentArgs::new(
+            copy_args.source().clone(),
+            7,
+            WaveformFileRevisionObservation::new(
+                "owner-selection-output-file",
+                "owner-selection-output-change",
+                1024,
+                Some(-12_000_000_000),
+            )
+            .expect("selection output file revision"),
+            source_spec,
+            10,
+            WaveformEditFrameRange::new(2, 8).expect("selection output range"),
+            SelectionOutputRecipe::RawWav(
+                RawWavExtractionRecipe::new(
+                    16,
+                    FiniteF32Bits::new(1.0).expect("selection output gain"),
+                    2,
+                )
+                .expect("selection output recipe"),
+            ),
+            SourcePlaybackType::OneShot,
+            copy_args.destination().clone(),
+            CopyCollisionPolicy::NoReplace,
+        )
+        .expect("selection output extraction");
+        let command_args =
+            ExtractAndTrimIntentArgs::new(extraction, WaveformOutputSpec::float32(2, 48_000))
+                .expect("ExtractAndTrim arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::DestructiveEdit,
+            "operation.status.owner-selection-output",
+            participants,
+        )
+        .expect("selection output universal intent");
+        let record = StoredOperationRecord::new_v13_command(
+            operation_id,
+            copy_record.intent,
+            universal_intent,
+            UniversalCommandArgs::SelectionOutput(SelectionOutputCommandArgs::ExtractAndTrim(
+                command_args.clone(),
+            )),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, command_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1829,6 +1892,52 @@ mod tests {
                 .universal_intent
                 .as_ref()
                 .expect("selection Normalize universal intent")
+                .command_kind(),
+            UniversalCommandKind::DestructiveEdit
+        );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v13_extract_and_trim_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v13-selection-output");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, command_args) = v13_extract_and_trim_record(operation_id);
+        let mut request = client
+            .persist_intent(record)
+            .expect("selection output admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("selection output result")
+            .expect("selection output worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("selection output acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+        let mut lookup = client
+            .get(operation_id)
+            .expect("selection output lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("selection output lookup result")
+            .expect("selection output lookup worker result")
+            .expect("persisted selection output");
+        assert_eq!(persisted.schema_version, SCHEMA_V13);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::SelectionOutput(
+                SelectionOutputCommandArgs::ExtractAndTrim(command_args)
+            ))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("selection output universal intent")
                 .command_kind(),
             UniversalCommandKind::DestructiveEdit
         );

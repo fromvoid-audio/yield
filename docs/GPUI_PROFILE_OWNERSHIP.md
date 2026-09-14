@@ -990,3 +990,40 @@ passed at exact commit `6c75d2fd8f04b62f2e111f9ea34ddcc67e9e45ab`, including bot
 frozen compatibility baselines and 200 journal tests (one helper ignored).
 The lane also passed the catalog, session, core edit-settings and media-adapter
 checks. This is storage acceptance, not native Windows UI or audio execution.
+
+## V13 source-owned WAV selection output (OPT-1337)
+
+V13 adds `SelectionOutput::Extract` and `SelectionOutput::ExtractAndTrim`.
+The source observation contains its source-database revision, strong file
+revision, WAV layout, total frames and exact half-open selection. The destination
+is a concrete source-relative endpoint with fixed NoReplace policy. Source and
+destination cannot identify the same entry under an observed physical root.
+
+The raw recipe preserves the source format, including the observed bounded
+`fmt ` chunk length and both format/data padding bytes. Checked arithmetic
+rejects RIFF, block-alignment and byte-rate overflow. Before staging, the owner
+must recapture the actual format bytes under the strong source revision; the
+stored length is not a live header proof. Gain bits and edge-fade frames are
+resolved observations. Validation bounds the fade by half the selection without
+recomputing a duration from current settings.
+
+The compound intent specifies extraction verification/publication before
+trimming the same range from the original. Its trim output is Float32 at the
+original channel count and rate, and cannot remove the whole source. This
+captures the intended order; later coordinator checkpoints must enforce it.
+Both variants use one operation ID and retain the existing Extract or
+DestructiveEdit command kind respectively.
+
+The intent also captures the output's one-shot/loop playback type. Extracted
+metadata follows the existing fixed Keep1Unlocked policy, so recovery need not
+consult a later loop setting. This records the metadata recipe without applying
+source or global metadata writes.
+
+This slice does not capture audio buffers, execute filesystem mutations, reserve
+capacity, or enable a GPUI action. Decoded-source output and external export/handoff
+remain separate command work. Local validation passed 224 serialized journal
+tests (one helper ignored), including owner write/read, restart, retry/cancel,
+old-schema rejection, metadata capture and odd-padding coverage. The library
+check without default features, GPUI compilation, formatting and diff checks
+passed. Primary review checked the version gates, participant binding, output
+arithmetic and resolved metadata/fade semantics. Windows acceptance is pending.

@@ -16,6 +16,7 @@ pub mod removal_commands;
 pub mod render_commands;
 pub mod retained_resolution_commands;
 pub mod selection_normalize_commands;
+pub mod selection_output_commands;
 pub mod status;
 pub mod store;
 pub mod validation;
@@ -52,6 +53,12 @@ pub use selection_normalize_commands::{
     SelectionNormalizeEdgeFadePolicy, SelectionNormalizeIntentArgs, SelectionNormalizePeakPolicy,
     SelectionNormalizeValidationError,
 };
+pub use selection_output_commands::{
+    ExtractAndTrimIntentArgs, MAX_RAW_WAV_FMT_CHUNK_BYTES, MIN_RAW_WAV_FMT_CHUNK_BYTES,
+    RawWavEdgeFadePolicy, RawWavExtractionRecipe, RawWavOutputArithmetic,
+    SelectionExtractIntentArgs, SelectionExtractMetadataPolicy, SelectionOutputCommandArgs,
+    SelectionOutputRecipe, SelectionOutputValidationError, SourcePlaybackType,
+};
 
 pub use evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalObservation, AbsentFinalRecoveryObservation,
@@ -70,7 +77,7 @@ pub use model::{
     MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationActor,
     OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
     SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
-    SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, UniversalCommandKind, UniversalIntent,
+    SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, UniversalCommandKind, UniversalIntent,
     UniversalIntentTextViolation, UniversalIntentValidationError,
 };
 

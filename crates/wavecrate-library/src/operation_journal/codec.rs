@@ -28,7 +28,7 @@ use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, UniversalIntent,
+    SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
@@ -36,6 +36,7 @@ use super::removal_commands::validate_persisted_removal_command_args_value;
 use super::render_commands::validate_persisted_render_command_args_value;
 use super::retained_resolution_commands::validate_persisted_retained_resolution_command_args_value;
 use super::selection_normalize_commands::validate_persisted_selection_normalize_intent_args_value;
+use super::selection_output_commands::validate_persisted_selection_output_command_args_value;
 use crate::durable_capacity::DurableCapacityPlan;
 
 /// One complete stored operation record.
@@ -81,7 +82,7 @@ pub struct StoredOperationRecord {
     command_args: Option<CopyIntentArgs>,
     /// Optional V5 durable retry/status observation.
     retry_observation: Option<RetryObservation>,
-    /// Optional V6-V12 tagged command arguments.
+    /// Optional V6-V13 tagged command arguments.
     universal_command_args: Option<UniversalCommandArgs>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
@@ -274,6 +275,25 @@ impl StoredOperationRecord {
         )
     }
 
+    pub(crate) fn new_v13_command(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self::new_tagged_command(
+            SCHEMA_V13,
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     fn new_tagged_command(
         schema_version: u32,
         operation_id: OperationId,
@@ -348,6 +368,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V10
                 | SCHEMA_V11
                 | SCHEMA_V12
+                | SCHEMA_V13
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -361,7 +382,14 @@ impl StoredOperationRecord {
         let mut record = self.clone();
         if !matches!(
             record.schema_version,
-            SCHEMA_V6 | SCHEMA_V7 | SCHEMA_V8 | SCHEMA_V9 | SCHEMA_V10 | SCHEMA_V11 | SCHEMA_V12
+            SCHEMA_V6
+                | SCHEMA_V7
+                | SCHEMA_V8
+                | SCHEMA_V9
+                | SCHEMA_V10
+                | SCHEMA_V11
+                | SCHEMA_V12
+                | SCHEMA_V13
         ) {
             record.schema_version = SCHEMA_V5;
         }
@@ -499,6 +527,12 @@ pub enum EncodeError {
     /// A V12 selection-Normalize record violates its bounded state or argument contract.
     #[error("invalid schema-v12 selection Normalize record: {reason}")]
     InvalidV12Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// A V13 selection-output record violates its bounded state or argument contract.
+    #[error("invalid schema-v13 selection output record: {reason}")]
+    InvalidV13Record {
         /// Bounded validation diagnostic.
         reason: String,
     },
@@ -1320,6 +1354,14 @@ fn persisted_v12_from_record(
     Ok(persisted_tagged_ref_from_record(record))
 }
 
+fn persisted_v13_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
+    validate_v13_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV13Record { reason })?;
+    Ok(persisted_tagged_ref_from_record(record))
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -1444,6 +1486,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v12_coordinator_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V13 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v13_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v13_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -1620,6 +1671,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V12 => {
             let persisted = persisted_v12_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V13 => {
+            let persisted = persisted_v13_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -2591,6 +2646,37 @@ fn validate_persisted_v12_universal_command_args_value(value: &Value) -> Result<
     )
 }
 
+fn validate_persisted_v13_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_object_boundaries(
+        value,
+        validate_persisted_v13_universal_intent_value,
+        validate_persisted_v13_universal_command_args_value,
+    )
+}
+
+fn validate_persisted_v13_universal_intent_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_universal_intent_value_with_retained_resolution(value, true)
+}
+
+fn validate_persisted_v13_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(
+        value,
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+            "Removal",
+            "RetainedResolution",
+            "SelectionNormalize",
+            "SelectionOutput",
+        ],
+        "schema-v13",
+    )
+}
+
 fn validate_persisted_tagged_command_args_value(
     value: &Value,
     allowed_variants: &[&str],
@@ -2643,6 +2729,7 @@ fn validate_persisted_tagged_command_args_value(
             validate_persisted_retained_resolution_command_args_value(arguments)
         }
         "SelectionNormalize" => validate_persisted_selection_normalize_intent_args_value(arguments),
+        "SelectionOutput" => validate_persisted_selection_output_command_args_value(arguments),
         _ => Err("persisted command arguments contain an unknown variant"),
     }
 }
@@ -3007,6 +3094,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
                 "schema-v6 cannot carry schema-v12 selection Normalize arguments",
             ));
         }
+        UniversalCommandArgs::SelectionOutput(_) => {
+            return Err(String::from(
+                "schema-v6 cannot carry schema-v13 selection output arguments",
+            ));
+        }
     }
     if universal.command_kind() != command_args.command_kind() {
         return Err(String::from(
@@ -3171,6 +3263,26 @@ pub(crate) fn validate_v12_coordinator_shape(record: &StoredOperationRecord) -> 
     )
 }
 
+pub(crate) fn validate_v13_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    validate_tagged_coordinator_shape(
+        record,
+        SCHEMA_V13,
+        "schema-v13",
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+            "Removal",
+            "RetainedResolution",
+            "SelectionNormalize",
+            "SelectionOutput",
+        ],
+    )
+}
+
 fn validate_tagged_coordinator_shape(
     record: &StoredOperationRecord,
     expected_schema: u32,
@@ -3221,6 +3333,7 @@ fn validate_tagged_coordinator_shape(
         UniversalCommandArgs::Removal(_) => "Removal",
         UniversalCommandArgs::RetainedResolution(_) => "RetainedResolution",
         UniversalCommandArgs::SelectionNormalize(_) => "SelectionNormalize",
+        UniversalCommandArgs::SelectionOutput(_) => "SelectionOutput",
     };
     if !allowed_variants.contains(&variant) {
         return Err(match variant {
@@ -3234,6 +3347,9 @@ fn validate_tagged_coordinator_shape(
             }
             "SelectionNormalize" => {
                 format!("{schema_name} cannot carry schema-v12 selection Normalize arguments")
+            }
+            "SelectionOutput" => {
+                format!("{schema_name} cannot carry schema-v13 selection output arguments")
             }
             _ => format!("{schema_name} cannot carry {variant} arguments"),
         });
@@ -3939,6 +4055,70 @@ mod tests {
                 }
             }
         });
+        fixture
+    }
+
+    fn v13_selection_output_fixture(compound: bool) -> Value {
+        let mut fixture = v6_command_fixture("Copy");
+        let source = fixture["universal_command_args"]["Copy"]["source"].clone();
+        let destination = fixture["universal_command_args"]["Copy"]["destination"].clone();
+        let extraction = serde_json::json!({
+            "source": source,
+            "source_revision": 7,
+            "source_file_revision": {
+                "filesystem_identity": "selection-file-identity",
+                "change_marker": "selection-change-marker",
+                "byte_len": 1024,
+                "modified_unix_ns": 12000000000_i64
+            },
+            "source_spec": {
+                "channels": 2,
+                "sample_rate": 48000,
+                "bits_per_sample": 16,
+                "sample_format": "Integer"
+            },
+            "total_frames": 10,
+            "range": {
+                "start_frame": 2,
+                "end_frame": 8
+            },
+            "recipe": {
+                "RawWav": {
+                    "fmt_chunk_bytes": 16,
+                    "gain": 1065353216_u32,
+                    "edge_fade_frames": 2
+                }
+            },
+            "playback_type": "OneShot",
+            "destination": destination,
+            "collision_policy": "NoReplace"
+        });
+        fixture["schema_version"] = Value::from(SCHEMA_V13);
+        fixture["universal_intent"]["command_kind"] = Value::from(if compound {
+            "DestructiveEdit"
+        } else {
+            "Extract"
+        });
+        fixture["universal_command_args"] = if compound {
+            serde_json::json!({
+                "SelectionOutput": {
+                    "ExtractAndTrim": {
+                        "extraction": extraction,
+                        "trim_output": {
+                            "encoding": "Float32",
+                            "channels": 2,
+                            "sample_rate": 48000
+                        }
+                    }
+                }
+            })
+        } else {
+            serde_json::json!({
+                "SelectionOutput": {
+                    "Extract": extraction
+                }
+            })
+        };
         fixture
     }
 
@@ -4674,6 +4854,73 @@ mod tests {
             value(&encode(&record).expect("V12 selection encodes")),
             fixture
         );
+    }
+
+    #[test]
+    fn v13_selection_output_round_trip_preserves_extract_and_compound_shapes() {
+        for compound in [false, true] {
+            let fixture = v13_selection_output_fixture(compound);
+            let record = decode(&serde_json::to_vec(&fixture).expect("V13 selection bytes"))
+                .expect("V13 selection fixture decodes");
+            assert_eq!(record.schema_version, SCHEMA_V13);
+            assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+            let Some(UniversalCommandArgs::SelectionOutput(args)) = record.universal_command_args()
+            else {
+                panic!("V13 selection output arguments");
+            };
+            assert_eq!(
+                args.command_kind(),
+                if compound {
+                    UniversalCommandKind::DestructiveEdit
+                } else {
+                    UniversalCommandKind::Extract
+                }
+            );
+            assert_eq!(
+                value(&encode(&record).expect("V13 selection encodes")),
+                fixture
+            );
+        }
+    }
+
+    #[test]
+    fn v13_selection_output_boundary_rejects_bad_fields_and_prior_schemas() {
+        let fixture = v13_selection_output_fixture(false);
+        let mut unknown = fixture.clone();
+        unknown["universal_command_args"]["SelectionOutput"]["Extract"]["recipe"]["RawWav"]["unexpected"] =
+            Value::Null;
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unknown).expect("unknown V13 selection bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut invalid_revision = fixture.clone();
+        invalid_revision["universal_command_args"]["SelectionOutput"]["Extract"]["source_revision"] =
+            Value::from(8_u64);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_revision).expect("invalid V13 revision bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut old_schema = fixture.clone();
+        old_schema["schema_version"] = Value::from(SCHEMA_V12);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&old_schema).expect("V13 command under V12 bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let record = decode(&serde_json::to_vec(&fixture).expect("V13 direct bytes"))
+            .expect("V13 direct record");
+        let mut direct = record;
+        direct.schema_version = SCHEMA_V12;
+        assert!(matches!(
+            classify_record(&direct),
+            RecordConsistency::Invalid(reason)
+                if reason.contains("schema-v12 cannot carry schema-v13 selection output")
+        ));
+        assert!(matches!(
+            encode(&direct),
+            Err(EncodeError::InvalidV12Record { .. })
+        ));
     }
 
     #[test]
