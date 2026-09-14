@@ -10,6 +10,7 @@ pub mod codec;
 pub mod coordinator;
 pub mod evidence;
 pub mod external_commands;
+pub mod full_status;
 pub mod history_commands;
 pub mod model;
 pub mod namespace_commands;
@@ -104,6 +105,8 @@ pub use external_commands::{
     MAX_EXTERNAL_RECONCILIATION_IDENTITY_BYTES, MAX_EXTERNAL_RECONCILIATION_METADATA_BYTES,
     MAX_EXTERNAL_RECONCILIATION_PATH_BYTES, MAX_EXTERNAL_RECONCILIATION_PATHS,
 };
+
+pub use full_status::FullProgressDisposition;
 
 pub use model::{
     CURRENT_SCHEMA_VERSION, CancellationRequestObservation, CancellationRequestValidationError,

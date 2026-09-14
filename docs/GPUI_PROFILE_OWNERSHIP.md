@@ -1219,3 +1219,13 @@ release proofs; future private admission/recovery authorities remain required.
 Five focused claim tests, the library check without default features, formatting
 and diff checks passed. Primary diff review found no material issue. The contract
 is not yet wired into durable progress or the live OPT-1338 capacity provider.
+
+WorkProgress can now retain validated immutable admission-claim observations through
+a crate-private constructor. Its ordinary pure constructor retains no claims; no
+record admission or live reservation is implied. Full progress uses its own
+`FullProgressDisposition`, including after-observed-effect cancellation values for
+effects that must not be called application publication. Legacy disposition types
+and V1–V15 codecs remain unchanged. The new effect routes are not enabled until
+the cancellation inventory guards exist. Sixteen progress tests, two full-status
+compatibility tests, library and GPUI checks without default features, formatting
+and diff checks passed. Primary diff review found no material issue.

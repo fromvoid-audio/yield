@@ -17,10 +17,11 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::admission_claims::{AdmissionClaimInventory, AdmissionClaimValidationError};
 use super::coordinator::{RetryObservation, RetryObservationValidationError, UniversalCommandArgs};
+use super::full_status::FullProgressDisposition;
 use super::model::{
-    CancellationRequestObservation, CancellationRequestValidationError, OperationDisposition,
-    OperationId, OperationPhase,
+    CancellationRequestObservation, CancellationRequestValidationError, OperationId, OperationPhase,
 };
 use super::participants::{
     MAX_SOURCE_IDENTITY_BYTES, ParticipantDescriptor, ParticipantId, ParticipantKind,
@@ -31,6 +32,7 @@ use super::work_plan::{
     MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnitApplicability,
     WorkUnitKey, WorkUnitRole,
 };
+use crate::durable_capacity::DurableCapacityPlan;
 use crate::sample_sources::SourceId;
 
 /// One bounded source revision observation attached to a progress completion.
@@ -672,13 +674,14 @@ pub struct WorkProgress {
     scopes: Vec<ParticipantScope>,
     steps: Vec<WorkProgressStep>,
     phase: OperationPhase,
-    disposition: OperationDisposition,
+    disposition: FullProgressDisposition,
     retry_observation: Option<RetryObservation>,
     last_retry_observation: Option<RetryObservation>,
     execution_epoch: u64,
     active_audit: Option<ActiveAudit>,
     audit_generation: u64,
     cancellation_request: Option<CancellationRequestObservation>,
+    admission_claims: Option<AdmissionClaimInventory>,
 }
 
 #[allow(dead_code)]
@@ -725,14 +728,34 @@ impl WorkProgress {
             scopes,
             steps,
             phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
+            disposition: FullProgressDisposition::None,
             retry_observation: None,
             last_retry_observation: None,
             execution_epoch: 0,
             active_audit: None,
             audit_generation: 0,
             cancellation_request: None,
+            admission_claims: None,
         })
+    }
+
+    /// Derive progress after checking and retaining an immutable capacity-claim observation.
+    ///
+    /// Claim validation occurs before this method constructs or clones any progress state.  The
+    /// retained inventory remains an observation only; it is not a reservation or admission
+    /// authority.
+    pub(crate) fn from_plan_with_admission_observations(
+        operation_id: OperationId,
+        plan: &WorkPlan,
+        args: &UniversalCommandArgs,
+        participants: &ParticipantSet,
+        capacity_plan: &DurableCapacityPlan,
+        admission_claims: AdmissionClaimInventory,
+    ) -> Result<Self, WorkProgressError> {
+        admission_claims.validate_against(capacity_plan)?;
+        let mut progress = Self::from_plan(operation_id, plan, args, participants)?;
+        progress.admission_claims = Some(admission_claims);
+        Ok(progress)
     }
 
     /// Return the operation identity bound to every completion.
@@ -751,7 +774,7 @@ impl WorkProgress {
     }
 
     /// Return the guarded durable disposition.
-    pub const fn disposition(&self) -> OperationDisposition {
+    pub const fn disposition(&self) -> FullProgressDisposition {
         self.disposition
     }
 
@@ -795,6 +818,11 @@ impl WorkProgress {
         self.cancellation_request
     }
 
+    /// Borrow the optional immutable capacity-claim observation retained with progress.
+    pub fn admission_claims(&self) -> Option<&AdmissionClaimInventory> {
+        self.admission_claims.as_ref()
+    }
+
     /// Record a bounded retry disposition without changing any step completion.
     pub(crate) fn request_retry(
         &mut self,
@@ -809,9 +837,9 @@ impl WorkProgress {
         }
         if matches!(
             self.disposition,
-            OperationDisposition::AuditRequired
-                | OperationDisposition::CancelRequestedBeforePublish
-                | OperationDisposition::CancelRequestedAfterPublish
+            FullProgressDisposition::AuditRequired
+                | FullProgressDisposition::CancelRequestedBeforePublish
+                | FullProgressDisposition::CancelRequestedAfterPublish
         ) {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
@@ -838,7 +866,7 @@ impl WorkProgress {
             }
         }
         self.last_retry_observation = Some(observation.clone());
-        self.disposition = OperationDisposition::RetryPending;
+        self.disposition = FullProgressDisposition::RetryPending;
         self.retry_observation = Some(observation);
         Ok(())
     }
@@ -846,7 +874,7 @@ impl WorkProgress {
     /// Resume a retry only after a private owner has reacquired its lease in the valid window.
     #[allow(dead_code)]
     fn resume_retry(&mut self, authority: VerifiedRetryResume) -> Result<(), WorkProgressError> {
-        if self.disposition != OperationDisposition::RetryPending {
+        if self.disposition != FullProgressDisposition::RetryPending {
             return Err(WorkProgressError::RetryResumeNotPending);
         }
         let Some(observation) = &self.retry_observation else {
@@ -878,7 +906,7 @@ impl WorkProgress {
             .checked_add(1)
             .ok_or(WorkProgressError::ExecutionEpochOverflow)?;
         self.retry_observation = None;
-        self.disposition = OperationDisposition::None;
+        self.disposition = FullProgressDisposition::None;
         Ok(())
     }
 
@@ -985,19 +1013,19 @@ impl WorkProgress {
             }
             return Err(WorkProgressError::AuditReplayConflict);
         }
-        if self.disposition == OperationDisposition::AuditRequired {
+        if self.disposition == FullProgressDisposition::AuditRequired {
             return Err(WorkProgressError::AuditStateMissing);
         }
         if self.phase.is_pre_publication() {
             return Err(WorkProgressError::AuditPhaseInvalid);
         }
         let suspended_hold = match self.disposition {
-            OperationDisposition::None => AuditSuspendedHold::None,
-            OperationDisposition::RetryPending => AuditSuspendedHold::RetryPending,
-            OperationDisposition::CancelRequestedBeforePublish => {
+            FullProgressDisposition::None => AuditSuspendedHold::None,
+            FullProgressDisposition::RetryPending => AuditSuspendedHold::RetryPending,
+            FullProgressDisposition::CancelRequestedBeforePublish => {
                 AuditSuspendedHold::CancelRequestedBeforePublish
             }
-            OperationDisposition::CancelRequestedAfterPublish => {
+            FullProgressDisposition::CancelRequestedAfterPublish => {
                 AuditSuspendedHold::CancelRequestedAfterPublish
             }
             disposition => {
@@ -1016,7 +1044,7 @@ impl WorkProgress {
             suspended_hold,
         });
         self.audit_generation = generation;
-        self.disposition = OperationDisposition::AuditRequired;
+        self.disposition = FullProgressDisposition::AuditRequired;
         Ok(())
     }
 
@@ -1026,7 +1054,7 @@ impl WorkProgress {
         &mut self,
         authority: VerifiedAuditResolution,
     ) -> Result<(), WorkProgressError> {
-        if self.disposition != OperationDisposition::AuditRequired {
+        if self.disposition != FullProgressDisposition::AuditRequired {
             return Err(WorkProgressError::AuditResolutionNotActive);
         }
         let Some(active) = &self.active_audit else {
@@ -1051,19 +1079,19 @@ impl WorkProgress {
             return Err(WorkProgressError::AuditResolutionObservationMismatch);
         }
         let restored_disposition = match active.suspended_hold {
-            AuditSuspendedHold::None => OperationDisposition::None,
+            AuditSuspendedHold::None => FullProgressDisposition::None,
             AuditSuspendedHold::RetryPending if self.retry_observation.is_some() => {
-                OperationDisposition::RetryPending
+                FullProgressDisposition::RetryPending
             }
             AuditSuspendedHold::CancelRequestedBeforePublish
                 if self.cancellation_request.is_some() =>
             {
-                OperationDisposition::CancelRequestedBeforePublish
+                FullProgressDisposition::CancelRequestedBeforePublish
             }
             AuditSuspendedHold::CancelRequestedAfterPublish
                 if self.cancellation_request.is_some() =>
             {
-                OperationDisposition::CancelRequestedAfterPublish
+                FullProgressDisposition::CancelRequestedAfterPublish
             }
             _ => return Err(WorkProgressError::AuditSuspendedHoldMissing),
         };
@@ -1087,7 +1115,7 @@ impl WorkProgress {
             }
             return Err(WorkProgressError::CancellationReplayConflict);
         }
-        if self.disposition == OperationDisposition::AuditRequired {
+        if self.disposition == FullProgressDisposition::AuditRequired {
             if self.active_audit.is_none() {
                 return Err(WorkProgressError::AuditStateMissing);
             }
@@ -1102,9 +1130,9 @@ impl WorkProgress {
         }
         self.cancellation_request = Some(observation);
         self.disposition = if self.phase.is_pre_publication() {
-            OperationDisposition::CancelRequestedBeforePublish
+            FullProgressDisposition::CancelRequestedBeforePublish
         } else if self.phase.is_post_publication() {
-            OperationDisposition::CancelRequestedAfterPublish
+            FullProgressDisposition::CancelRequestedAfterPublish
         } else {
             return Err(WorkProgressError::CancellationPhaseInvalid);
         };
@@ -1116,7 +1144,7 @@ impl WorkProgress {
         &mut self,
         key: WorkUnitKey,
     ) -> Result<(), WorkProgressError> {
-        if self.disposition != OperationDisposition::None {
+        if self.disposition != FullProgressDisposition::None {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
             });
@@ -1184,13 +1212,13 @@ impl WorkProgress {
                 key: completion.key,
             });
         }
-        if self.disposition == OperationDisposition::RetryPending {
+        if self.disposition == FullProgressDisposition::RetryPending {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
             });
         }
-        if self.disposition != OperationDisposition::None
-            && self.disposition != OperationDisposition::RetryPending
+        if self.disposition != FullProgressDisposition::None
+            && self.disposition != FullProgressDisposition::RetryPending
         {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
@@ -1231,8 +1259,8 @@ impl WorkProgress {
         )?;
         self.steps[index].status = ProgressStepStatus::Completed;
         self.steps[index].evidence = Some(completion.evidence);
-        if self.disposition == OperationDisposition::RetryPending {
-            self.disposition = OperationDisposition::None;
+        if self.disposition == FullProgressDisposition::RetryPending {
+            self.disposition = FullProgressDisposition::None;
             self.retry_observation = None;
         }
         self.refresh_derived_state();
@@ -1245,14 +1273,14 @@ impl WorkProgress {
         &mut self,
         authority: PrePublishCancellationAuthority,
     ) -> Result<(), WorkProgressError> {
-        if self.disposition != OperationDisposition::CancelRequestedBeforePublish {
+        if self.disposition != FullProgressDisposition::CancelRequestedBeforePublish {
             return Err(WorkProgressError::CancellationNotRequested);
         }
         if authority.operation_id != self.operation_id || authority.plan != self.plan {
             return Err(WorkProgressError::CancellationAuthorityMismatch);
         }
         self.phase = OperationPhase::Terminal;
-        self.disposition = OperationDisposition::CancelledBeforePublish;
+        self.disposition = FullProgressDisposition::CancelledBeforePublish;
         Ok(())
     }
 
@@ -1262,14 +1290,14 @@ impl WorkProgress {
         &mut self,
         authority: PostPublishCancellationAuthority,
     ) -> Result<(), WorkProgressError> {
-        if self.disposition != OperationDisposition::CancelRequestedAfterPublish {
+        if self.disposition != FullProgressDisposition::CancelRequestedAfterPublish {
             return Err(WorkProgressError::CancellationNotRequested);
         }
         if authority.operation_id != self.operation_id || authority.plan != self.plan {
             return Err(WorkProgressError::CancellationAuthorityMismatch);
         }
         self.phase = OperationPhase::Terminal;
-        self.disposition = OperationDisposition::CancelledAfterPublish;
+        self.disposition = FullProgressDisposition::CancelledAfterPublish;
         Ok(())
     }
 
@@ -1341,9 +1369,9 @@ impl WorkProgress {
         if self.disposition.is_terminal()
             || matches!(
                 self.disposition,
-                OperationDisposition::AuditRequired
-                    | OperationDisposition::CancelRequestedBeforePublish
-                    | OperationDisposition::CancelRequestedAfterPublish
+                FullProgressDisposition::AuditRequired
+                    | FullProgressDisposition::CancelRequestedBeforePublish
+                    | FullProgressDisposition::CancelRequestedAfterPublish
             )
         {
             return;
@@ -1358,9 +1386,9 @@ impl WorkProgress {
         {
             self.phase = OperationPhase::Terminal;
             self.disposition = if self.has_deferred_optional_artifact() {
-                OperationDisposition::SucceededWithDeferredArtifacts
+                FullProgressDisposition::SucceededWithDeferredArtifacts
             } else {
-                OperationDisposition::Succeeded
+                FullProgressDisposition::Succeeded
             };
         }
     }
@@ -1747,6 +1775,9 @@ pub enum WorkProgressError {
     /// The participant inventory was invalid.
     #[error("invalid work progress participants: {0}")]
     Participants(#[from] ParticipantValidationError),
+    /// The retained admission-claim observation did not exactly cover its capacity plan.
+    #[error("invalid work progress admission claims: {0}")]
+    AdmissionClaims(#[from] AdmissionClaimValidationError),
     /// A nested evidence observation was malformed.
     #[error("invalid work progress evidence: {0}")]
     Evidence(#[from] ProgressEvidenceError),
@@ -1855,7 +1886,7 @@ pub enum WorkProgressError {
     #[error("work progress audit cannot suspend disposition {disposition:?}")]
     AuditUnderlyingDispositionUnsupported {
         /// Disposition that would have been hidden by the audit.
-        disposition: OperationDisposition,
+        disposition: FullProgressDisposition,
     },
     /// The retained audit generation could not advance without wrapping.
     #[error("work progress audit generation overflowed")]
@@ -2008,7 +2039,7 @@ pub enum WorkProgressError {
     #[error("work progress is suspended by disposition {disposition:?}")]
     ProgressSuspended {
         /// Resumable disposition currently blocking progress.
-        disposition: OperationDisposition,
+        disposition: FullProgressDisposition,
     },
     /// A terminal disposition cannot be changed.
     #[error("work progress terminal transition is already durable")]
@@ -2048,9 +2079,14 @@ impl From<CancellationRequestValidationError> for WorkProgressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable_capacity::{
+        CapacityAllocationClass, DurableCapacityPlan, DurableVolumeCapacity,
+        PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
+    };
     use crate::operation_journal::{
-        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExtractAndTrimIntentArgs, FiniteF32Bits, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
+        AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, CopyCollisionPolicy,
+        CopyEndpoint, CopyIntentArgs, CopySourceExpectation, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
         NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
         NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
         NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
@@ -2234,6 +2270,40 @@ mod tests {
             &participants,
         )
         .expect("copy progress")
+    }
+
+    fn copy_plan_inputs() -> (ParticipantSet, UniversalCommandArgs, WorkPlan) {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let args = copy_args_at(source, source_id, "copy.wav");
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("copy work plan");
+        (participants, args, plan)
+    }
+
+    fn admission_capacity_plan() -> DurableCapacityPlan {
+        DurableCapacityPlan {
+            volumes: vec![DurableVolumeCapacity {
+                identity: VolumeIdentity { device: 1 },
+                allocation_unit: 1,
+                allocation_class: CapacityAllocationClass::DestinationStaging,
+                logical_bytes: 12,
+                allocated_bytes: 12,
+                protected_free_bytes: PROTECTED_FREE_SPACE_FLOOR,
+            }],
+        }
+    }
+
+    fn admission_claims(allocated_bytes: u64) -> AdmissionClaimInventory {
+        AdmissionClaimInventory::new(vec![
+            AdmissionClaim::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("claim id"),
+                VolumeIdentity { device: 1 },
+                CapacityAllocationClass::DestinationStaging,
+                allocated_bytes,
+            )
+            .expect("claim"),
+        ])
+        .expect("claim inventory")
     }
 
     fn fenced_harvest_progress() -> WorkProgress {
@@ -2608,6 +2678,60 @@ mod tests {
     }
 
     #[test]
+    fn admission_claim_observation_is_optional_and_read_only() {
+        let (participants, args, plan) = copy_plan_inputs();
+        let capacity_plan = admission_capacity_plan();
+        let claims = admission_claims(12);
+
+        let plain = WorkProgress::from_plan(
+            OperationId::from_uuid(Uuid::from_u128(202)),
+            &plan,
+            &args,
+            &participants,
+        )
+        .expect("ordinary progress");
+        assert!(plain.admission_claims().is_none());
+
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(203)),
+            &plan,
+            &args,
+            &participants,
+            &capacity_plan,
+            claims.clone(),
+        )
+        .expect("progress with claim observation");
+        let retained = progress.admission_claims().expect("retained claims");
+        assert_eq!(retained, &claims);
+        assert_eq!(retained.claims(), claims.claims());
+    }
+
+    #[test]
+    fn invalid_admission_claim_coverage_is_rejected_before_progress_creation() {
+        let (participants, args, plan) = copy_plan_inputs();
+        let capacity_plan = admission_capacity_plan();
+        let claims = admission_claims(11);
+
+        let error = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(204)),
+            &plan,
+            &args,
+            &participants,
+            &capacity_plan,
+            claims,
+        )
+        .expect_err("under-covered claims");
+        assert!(matches!(
+            error,
+            WorkProgressError::AdmissionClaims(AdmissionClaimValidationError::UnderAllocated {
+                expected_bytes: 12,
+                observed_bytes: 11,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn committed_source_evidence_records_a_monotonic_before_after_interval() {
         let mut progress = copy_progress(false);
         apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
@@ -2841,7 +2965,7 @@ mod tests {
                 .status(),
             ProgressStepStatus::Pending
         );
-        assert_eq!(progress.disposition(), OperationDisposition::None);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
     }
 
     #[test]
@@ -2849,7 +2973,7 @@ mod tests {
         let mut progress = copy_progress(true);
         complete_required(&mut progress);
         assert_eq!(progress.phase(), OperationPhase::ReadinessScheduled);
-        assert_eq!(progress.disposition(), OperationDisposition::None);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
         let artifact_key = progress
             .steps()
             .iter()
@@ -2862,13 +2986,16 @@ mod tests {
         assert_eq!(progress.phase(), OperationPhase::Terminal);
         assert_eq!(
             progress.disposition(),
-            OperationDisposition::SucceededWithDeferredArtifacts
+            FullProgressDisposition::SucceededWithDeferredArtifacts
         );
 
         let mut required_only = copy_progress(false);
         complete_required(&mut required_only);
         assert_eq!(required_only.phase(), OperationPhase::Terminal);
-        assert_eq!(required_only.disposition(), OperationDisposition::Succeeded);
+        assert_eq!(
+            required_only.disposition(),
+            FullProgressDisposition::Succeeded
+        );
     }
 
     #[test]
@@ -2916,7 +3043,7 @@ mod tests {
         assert!(matches!(
             retry.apply_verified_completion(delayed_completion),
             Err(WorkProgressError::ProgressSuspended {
-                disposition: OperationDisposition::RetryPending
+                disposition: FullProgressDisposition::RetryPending
             })
         ));
         delayed_completion = completion(&retry, key, evidence.clone());
@@ -2952,7 +3079,7 @@ mod tests {
                 .expect("retry completion"),
             ProgressApplyOutcome::Applied
         );
-        assert_eq!(retry.disposition(), OperationDisposition::None);
+        assert_eq!(retry.disposition(), FullProgressDisposition::None);
         assert!(retry.retry_observation().is_none());
         assert_eq!(
             retry
@@ -2974,7 +3101,7 @@ mod tests {
         retry
             .request_retry(observation.clone())
             .expect("exact retry replay");
-        assert_eq!(retry.disposition(), OperationDisposition::None);
+        assert_eq!(retry.disposition(), FullProgressDisposition::None);
         let same_attempt_different_retry = RetryObservation::new(
             1,
             0,
@@ -3067,7 +3194,7 @@ mod tests {
                 evidence_for(&audit, audit_key, 7),
             )),
             Err(WorkProgressError::ProgressSuspended {
-                disposition: OperationDisposition::AuditRequired
+                disposition: FullProgressDisposition::AuditRequired
             })
         ));
 
@@ -3105,7 +3232,7 @@ mod tests {
         assert_eq!(cancelled.phase(), OperationPhase::Terminal);
         assert_eq!(
             cancelled.disposition(),
-            OperationDisposition::CancelledBeforePublish
+            FullProgressDisposition::CancelledBeforePublish
         );
     }
 
@@ -3162,7 +3289,7 @@ mod tests {
         assert_eq!(progress.execution_epoch(), 1);
         assert_eq!(progress.plan, plan_before);
         assert_eq!(progress.steps, steps_before);
-        assert_eq!(progress.disposition(), OperationDisposition::None);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
         for key in [source_key, projection, readiness] {
             let fence = progress
                 .scope_for(key)
@@ -3361,7 +3488,7 @@ mod tests {
             .reacquire_source(source_reacquisition_authority(&retry, target, 7, 2, 0))
             .expect("reacquire while retry pending");
         assert_eq!(retry.execution_epoch(), 1);
-        assert_eq!(retry.disposition(), OperationDisposition::RetryPending);
+        assert_eq!(retry.disposition(), FullProgressDisposition::RetryPending);
         assert_eq!(retry.retry_observation(), Some(&observation));
 
         let mut audit = copy_progress(false);
@@ -3375,7 +3502,7 @@ mod tests {
             .reacquire_source(source_reacquisition_authority(&audit, target, 7, 2, 0))
             .expect("reacquire while audit required");
         assert_eq!(audit.execution_epoch(), 1);
-        assert_eq!(audit.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(audit.disposition(), FullProgressDisposition::AuditRequired);
         assert_eq!(audit.audit_observation(), Some(&audit_observation));
 
         let mut cancelled = copy_progress(false);
@@ -3390,7 +3517,7 @@ mod tests {
         assert_eq!(cancelled.execution_epoch(), 1);
         assert_eq!(
             cancelled.disposition(),
-            OperationDisposition::CancelRequestedBeforePublish
+            FullProgressDisposition::CancelRequestedBeforePublish
         );
         assert_eq!(cancelled.cancellation_request(), Some(cancellation));
 
@@ -3551,7 +3678,7 @@ mod tests {
         progress
             .resolve_audit(audit_resolution_authority(&progress, 1, 0))
             .expect("resolve audit");
-        assert_eq!(progress.disposition(), OperationDisposition::None);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
         assert!(progress.audit_observation().is_none());
         assert_eq!(progress.audit_generation(), 1);
         assert_eq!(progress.steps, steps_before);
@@ -3567,7 +3694,10 @@ mod tests {
                 actual: 1
             })
         ));
-        assert_eq!(progress.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::AuditRequired
+        );
 
         let mut retry = copy_progress(false);
         publish_prefix(&mut retry);
@@ -3590,13 +3720,13 @@ mod tests {
         assert!(matches!(
             retry.request_retry(retry_observation.clone()),
             Err(WorkProgressError::ProgressSuspended {
-                disposition: OperationDisposition::AuditRequired
+                disposition: FullProgressDisposition::AuditRequired
             })
         ));
         retry
             .resolve_audit(audit_resolution_authority(&retry, 1, 0))
             .expect("resolve retry audit");
-        assert_eq!(retry.disposition(), OperationDisposition::RetryPending);
+        assert_eq!(retry.disposition(), FullProgressDisposition::RetryPending);
         assert_eq!(retry.retry_observation(), Some(&retry_observation));
         retry
             .resume_retry(VerifiedRetryResume {
@@ -3607,7 +3737,7 @@ mod tests {
                 expected_execution_epoch: 0,
             })
             .expect("resume restored retry separately");
-        assert_eq!(retry.disposition(), OperationDisposition::None);
+        assert_eq!(retry.disposition(), FullProgressDisposition::None);
 
         let mut cancelled = copy_progress(false);
         publish_prefix(&mut cancelled);
@@ -3620,7 +3750,10 @@ mod tests {
         cancelled
             .request_cancellation(cancellation)
             .expect("record cancellation under audit");
-        assert_eq!(cancelled.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(
+            cancelled.disposition(),
+            FullProgressDisposition::AuditRequired
+        );
         assert_eq!(cancelled.cancellation_request(), Some(cancellation));
         cancelled
             .request_cancellation(cancellation)
@@ -3634,7 +3767,7 @@ mod tests {
             .expect("resolve cancellation audit");
         assert_eq!(
             cancelled.disposition(),
-            OperationDisposition::CancelRequestedAfterPublish
+            FullProgressDisposition::CancelRequestedAfterPublish
         );
 
         let _ = second_key;
@@ -3655,7 +3788,10 @@ mod tests {
             .reacquire_source(source_reacquisition_authority(&progress, target, 7, 2, 0))
             .expect("source reacquisition preserves audit");
         assert_eq!(progress.execution_epoch(), 1);
-        assert_eq!(progress.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::AuditRequired
+        );
         assert!(matches!(
             progress.resolve_audit(stale_resolution),
             Err(WorkProgressError::AuditResolutionEpochMismatch {
@@ -3663,6 +3799,9 @@ mod tests {
                 actual: 0
             })
         ));
-        assert_eq!(progress.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::AuditRequired
+        );
     }
 }

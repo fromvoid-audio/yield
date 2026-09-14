@@ -633,6 +633,37 @@ must name the guard and the participant checkpoint that proved it.
 | `ProjectionPublished`, `ReadinessScheduled` | None, `RetryPending`, `AuditRequired`, `CancelRequestedAfterPublish` | A projection gap remains `AuditRequired` until the authoritative revision is republished. Optional artifact deficits may remain deferred, but required participants must be complete. |
 | `Terminal` | None | `Succeeded` requires all required participants `Applied`/`NotApplicable` and no unresolved audit; a qualified no-replace claim with `ReopenedVerified` and `VisibilityVerified` may retain `PowerLossSynchronizationUnverified` as a persistent downgrade/evidence, and that downgrade alone does not prevent `Terminal` + `Succeeded`. Cross-source moves additionally require every ordered origin/destination checkpoint. `SucceededWithDeferredArtifacts` permits only optional rebuildable artifacts to be deferred. `CancelledBeforePublish` requires no publish, verified staged absence when staging existed, and durable capacity release. `CancelledAfterPublish` requires verified publish plus complete required reconciliation or a verified compensating outcome. `RolledBack` requires verified compensating work, including origin restoration when needed. `BlockedByUser`, `FailedPreservingData`, and `FailedDataLossRisk` require their explicit safe-state/escalation guards and preserve evidence. |
 
+#### Full-progress cancellation after an observed effect
+
+The V1–V15 phase/disposition wire contract remains unchanged. The full-progress
+record uses a separate disposition type and adds `CancelRequestedAfterObservedEffect`
+and `CancelledAfterObservedEffect`. These values are never projected into a legacy
+`CancelledAfterPublish` disposition.
+
+An application mutation may already be observable without a completed `Publish`
+checkpoint: retained-folder merge and selected-retained-object disposition are
+examples. An externally audited source change likewise does not imply that the
+application published a filesystem object. Such actions cannot be classified as
+untouched or as cleanable staging solely because `Publish` is absent.
+
+The full-progress cancellation inventory records the exact entered action set,
+observed effect kinds, generation and execution epoch. The after-observed-effect
+route requires a verified effect for an entered action. It retains the actually
+reached phase and does not manufacture `FilesystemPublished`. Its terminal outcome
+requires cancellation-scoped reconciliation or verified compensation for every
+entered effect, together with exact settlement of the admitted capacity claims.
+Preserved or uncertain effects and held claims remain nonterminal. Required source,
+global, Harvest, projection and readiness reconciliation must cover the actual
+cancelled action scope; it cannot run later actions from the original plan.
+
+The first cancellation freezes a non-executable recovery inventory. A verified
+late publication may refine an already-entered action, advance its recovery
+generation and select the after-publication route, but cannot introduce an action
+that was not entered. In particular, cancelling after extraction publication does
+not authorize a subsequent, unstarted trim. Private recovery authority binds the
+exact inventory and current execution epoch; stored observations alone do not
+authorize cleanup, compensation, reconciliation or claim settlement.
+
 `RejectedBeforeIntent` is outside this phase/disposition table: it is a non-durable
 coordinator result, not a journal phase or durable disposition. Pre-intent cancellation is
 also non-durable and returns no operation record. `RetryPending` requires `IntentDurable`, a
