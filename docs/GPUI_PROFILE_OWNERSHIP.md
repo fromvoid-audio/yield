@@ -1036,3 +1036,37 @@ selection-output and compound restart coverage. The lane also passed 12 legacy
 reader, 90 catalog, 60 session (one helper ignored), 16 core edit-settings and
 five media-adapter tests. This accepts the V13 storage slice; native Windows UI
 and audio/filesystem execution remain outside this lane.
+
+## V14 transaction-history observations (OPT-1337)
+
+V14 records bounded Undo and Redo requests as User/FileHistory operations. A new
+runtime-session history scope distinguishes the existing execution and transaction
+counters without treating those counters as durable operation IDs. Ordered action
+lists are limited to 32 actions, 128 total folder relocations and 256 KiB of path
+and identity text, within the journal's existing record and participant limits.
+
+Waveform restores bind the configured recovery-root identity, edit-directory UUID
+and identity, and strong revisions for the fixed before/after/extracted backup
+leaves. These are observations; future admission must retain the recovery material
+and reacquire the root. An existing original target requires expected-identity
+replacement, while an observed absent target requires NoReplace. Undo restores
+the original before removing an expected extracted target; Redo restores the
+original before recreating an observed absent extracted target. The selected
+backup and compensation material must be present in the observation.
+
+Folder history moves apply only to directories under a fenced source root. Their
+fixed plan ensures contained destination parents before a NoReplace relocation;
+it does not fabricate an existing-directory identity for a missing parent. The
+source database remains independently identified by its participant fence.
+Waveform restores without an extracted target must stand alone, matching the
+native history routing contract; other supported actions preserve captured order.
+
+The codec keeps V1–V13 gates and diagnostics unchanged. V14 history records use
+the existing owner/store path for persistence, restart reads, retry, cancellation
+and compare-and-swap updates. Local validation passed 235 serialized journal tests
+(one helper ignored), the library check without default features, GPUI compilation,
+formatting and diff checks. Focused independent review found no meaningful issues
+in restore policies, bindings, bounds or version compatibility. Windows acceptance
+is pending.
+Filesystem execution and live recovery-material retention remain outside this
+initial intent contract.

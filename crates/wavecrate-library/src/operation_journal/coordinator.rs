@@ -1486,6 +1486,8 @@ pub enum UniversalCommandArgs {
     SelectionNormalize(super::selection_normalize_commands::SelectionNormalizeIntentArgs),
     /// Observe one source-owned selection extraction or ordered ExtractAndTrim request.
     SelectionOutput(super::selection_output_commands::SelectionOutputCommandArgs),
+    /// Observe one bounded transaction-history Undo or Redo action list.
+    History(super::history_commands::HistoryUndoRedoIntentArgs),
 }
 
 impl UniversalCommandArgs {
@@ -1502,6 +1504,7 @@ impl UniversalCommandArgs {
             Self::RetainedResolution(args) => args.command_kind(),
             Self::SelectionNormalize(args) => args.command_kind(),
             Self::SelectionOutput(args) => args.command_kind(),
+            Self::History(args) => args.command_kind(),
         }
     }
 
@@ -1541,6 +1544,9 @@ impl UniversalCommandArgs {
             Self::SelectionOutput(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::SelectionOutput),
+            Self::History(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::History),
         }
     }
 }
@@ -1582,6 +1588,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A source-owned selection-output argument failed validation.
     #[error("invalid selection output command arguments: {0}")]
     SelectionOutput(#[source] super::selection_output_commands::SelectionOutputValidationError),
+    /// A transaction-history Undo or Redo argument failed validation.
+    #[error("invalid history Undo/Redo command arguments: {0}")]
+    History(#[source] super::history_commands::HistoryValidationError),
 }
 
 /// Stable class for an error that may schedule a later retry.

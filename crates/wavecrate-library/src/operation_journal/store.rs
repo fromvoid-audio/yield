@@ -28,11 +28,13 @@ use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, enco
 use super::coordinator::{
     CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
 };
+use super::history_commands::HistoryUndoRedoIntentArgs;
 use super::model::UniversalIntent;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+    SCHEMA_V14,
 };
 use super::namespace_commands::NamespaceCommandArgs;
 use super::removal_commands::{RemovalCommandArgs, StageRetainedFolderIntentArgs, TrashIntentArgs};
@@ -212,7 +214,7 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the pre-publication cancellation API.
     #[error(
-        "operation journal cancellation requires a V3 or V5-V13 universal intent, found schema v{schema_version}"
+        "operation journal cancellation requires a V3 or V5-V14 universal intent, found schema v{schema_version}"
     )]
     UnsupportedCancellationSchema {
         /// Schema version of the retained row.
@@ -244,13 +246,13 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the retry API.
     #[error(
-        "operation journal retry observation requires a V5-V13 coordinator record, found schema v{schema_version}"
+        "operation journal retry observation requires a V5-V14 coordinator record, found schema v{schema_version}"
     )]
     UnsupportedRetrySchema {
         /// Schema version of the retained row.
         schema_version: u32,
     },
-    /// The retained row is not eligible for a V5-V13 retry observation.
+    /// The retained row is not eligible for a V5-V14 retry observation.
     #[error("operation journal retry state is not eligible: {reason}")]
     UnsupportedRetryState {
         /// Bounded state diagnostic.
@@ -1808,6 +1810,191 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
+    /// Persist one V14 tagged command, retaining the old V6-V13 families and the new history
+    /// family under their respective operation kinds.
+    pub fn persist_command_intent_v14(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_command_intent_v14_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one V14 tagged command and expose its exact write-stage outcome.
+    pub fn persist_command_intent_v14_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        let expected_kind = if matches!(&command_args, UniversalCommandArgs::History(_)) {
+            OperationKind::FileHistory
+        } else {
+            OperationKind::FileMutation
+        };
+        if intent.actor != OperationActor::User || intent.kind != expected_kind {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v14 command intent operation kind does not match its command family",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if universal_intent.command_kind() != command_args.command_kind() {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from(
+                        "schema-v14 command kind does not match tagged command arguments",
+                    ),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if timestamp_unix_ms < 0 {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("schema-v14 timestamps must be non-negative"),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        if let Err(error) =
+            command_args.validate_against_participants(universal_intent.participants())
+        {
+            return failed_insert(
+                operation_id,
+                JournalInsertWriteStage::NoMutationAttempted,
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: error.to_string(),
+                },
+                None,
+                0,
+                None,
+            );
+        }
+        let record = StoredOperationRecord::new_v14_command(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        );
+        match classify_record(&record) {
+            RecordConsistency::Consistent => {}
+            RecordConsistency::LegacyMissingPublicationEvidence => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    OperationJournalStoreError::InconsistentRecord {
+                        reason: String::from(
+                            "schema-v14 command intent has legacy publication evidence",
+                        ),
+                    },
+                    None,
+                    0,
+                    None,
+                );
+            }
+            RecordConsistency::Invalid(reason) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    OperationJournalStoreError::InconsistentRecord { reason },
+                    None,
+                    0,
+                    None,
+                );
+            }
+        }
+        let encoded = match encode(&record) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::NoMutationAttempted,
+                    error.into(),
+                    None,
+                    0,
+                    None,
+                );
+            }
+        };
+        self.persist_record_with_encoded_outcome(&record, &encoded)
+    }
+
+    /// Persist one typed V14 transaction-history Undo or Redo observation.
+    pub fn persist_history_intent(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: HistoryUndoRedoIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Result<JournalInsertReceipt, OperationJournalStoreError> {
+        self.persist_history_intent_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+        .into_result()
+        .map_err(JournalInsertFailure::into_error)
+    }
+
+    /// Persist one typed V14 transaction-history observation with its exact write-stage outcome.
+    pub fn persist_history_intent_with_outcome(
+        &self,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: HistoryUndoRedoIntentArgs,
+        capacity_plan: crate::durable_capacity::DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> JournalInsertOutcome {
+        self.persist_command_intent_v14_with_outcome(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::History(command_args),
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     /// Persist one typed V13 raw WAV extraction command.
     pub fn persist_selection_extract_intent(
         &self,
@@ -2182,7 +2369,7 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
-    /// Persist a user cancellation request against a current V3 or V5-V13 universal intent.
+    /// Persist a user cancellation request against a current V3 or V5-V14 universal intent.
     ///
     /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
     /// already stored for this operation is a read-only idempotent replay and returns the current
@@ -2270,6 +2457,7 @@ impl OperationJournalStore {
                 | SCHEMA_V11
                 | SCHEMA_V12
                 | SCHEMA_V13
+                | SCHEMA_V14
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -2301,6 +2489,7 @@ impl OperationJournalStore {
                 | SCHEMA_V11
                 | SCHEMA_V12
                 | SCHEMA_V13
+                | SCHEMA_V14
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
@@ -2349,6 +2538,10 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V14 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
@@ -2362,6 +2555,7 @@ impl OperationJournalStore {
                 SCHEMA_V11 => "V11 IntentDurable/None or RetryPending",
                 SCHEMA_V12 => "V12 IntentDurable/None or RetryPending",
                 SCHEMA_V13 => "V13 IntentDurable/None or RetryPending",
+                SCHEMA_V14 => "V14 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -2419,7 +2613,7 @@ impl OperationJournalStore {
         })
     }
 
-    /// Persist the next typed V5-V13 retry observation using a sequence compare-and-swap.
+    /// Persist the next typed V5-V14 retry observation using a sequence compare-and-swap.
     ///
     /// An identical observation already stored for the operation is a read-only idempotent
     /// replay, even when the caller still holds an older sequence. A changed observation must
@@ -2506,6 +2700,7 @@ impl OperationJournalStore {
                 | SCHEMA_V11
                 | SCHEMA_V12
                 | SCHEMA_V13
+                | SCHEMA_V14
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -2534,6 +2729,7 @@ impl OperationJournalStore {
                 | SCHEMA_V11
                 | SCHEMA_V12
                 | SCHEMA_V13
+                | SCHEMA_V14
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -2547,7 +2743,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6/V7/V8/V9/V10/V11/V12/V13 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7/V8/V9/V10/V11/V12/V13/V14 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -3697,16 +3893,19 @@ mod tests {
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         CreateFolderIntentArgs, ExternalRootBindingId, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        ImportFileExpectation, ImportIntentArgs, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
-        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
-        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
-        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
-        ParticipantDescriptor, ParticipantKind, ParticipantRequirement, ParticipantSet,
-        RawWavExtractionRecipe, RecoveryCursor, RecoveryRowOutcome, RecoveryScanError,
-        RemovalCommandArgs, RenderCommandArgs, RetainedDeleteId, RetainedFolderObservation,
-        RetainedRecoveryRootKind, RetainedResolutionCommandArgs, RetainedResolutionStage,
-        RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId, RetryObservation, SCHEMA_V1,
-        SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+        HistoryAction, HistoryDirection, HistoryRecoveryBackupObservation,
+        HistoryRecoveryLeafObservation, HistoryRestoreTargetExpectation, HistoryScopeId,
+        HistoryUndoRedoIntentArgs, HistoryWaveformRestore, ImportFileExpectation, ImportIntentArgs,
+        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
+        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
+        NamespaceFileExpectation, NamespaceLeafName, NamespaceMoveIntentArgs,
+        NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint, ParticipantDescriptor,
+        ParticipantKind, ParticipantRequirement, ParticipantSet, RawWavExtractionRecipe,
+        RecoveryCursor, RecoveryRowOutcome, RecoveryScanError, RemovalCommandArgs,
+        RenderCommandArgs, RetainedDeleteId, RetainedFolderObservation, RetainedRecoveryRootKind,
+        RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedRestoreIntentArgs,
+        RetryErrorClass, RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7,
+        SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
         SelectionExtractIntentArgs, SelectionNormalizeIntentArgs, SelectionOutputCommandArgs,
         SelectionOutputRecipe, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
         UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
@@ -4388,6 +4587,88 @@ mod tests {
         )
     }
 
+    fn v14_history_inputs(
+        direction: HistoryDirection,
+    ) -> (
+        OperationId,
+        OperationIntent,
+        UniversalIntent,
+        HistoryUndoRedoIntentArgs,
+        DurableCapacityPlan,
+    ) {
+        let (operation_id, mut intent, copy_universal, copy_args, capacity_plan) = v5_copy_inputs();
+        intent.kind = OperationKind::FileHistory;
+        let participants = copy_universal.participants().clone();
+        let filesystem_participant_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem descriptor")
+            .id();
+        let revision = |identity: &str| {
+            WaveformFileRevisionObservation::new(identity, "change", 10, Some(11))
+                .expect("history revision")
+        };
+        let before =
+            HistoryRecoveryLeafObservation::new(revision("before")).expect("history before backup");
+        let after =
+            HistoryRecoveryLeafObservation::new(revision("after")).expect("history after backup");
+        let backups = match direction {
+            HistoryDirection::Undo => HistoryRecoveryBackupObservation::new(
+                filesystem_participant_id,
+                "recovery-root",
+                uuid::Uuid::from_u128(20),
+                "edit-directory",
+                Some(before),
+                None,
+                None,
+            )
+            .expect("history Undo backups"),
+            HistoryDirection::Redo => HistoryRecoveryBackupObservation::new(
+                filesystem_participant_id,
+                "recovery-root",
+                uuid::Uuid::from_u128(20),
+                "edit-directory",
+                None,
+                Some(after),
+                None,
+            )
+            .expect("history Redo backups"),
+        };
+        let restore = HistoryWaveformRestore::new(
+            copy_args.source().clone(),
+            7,
+            HistoryRestoreTargetExpectation::Existing(revision("target")),
+            Some(String::from("before-content")),
+            backups,
+            None,
+        )
+        .expect("history waveform restore");
+        let command_args = HistoryUndoRedoIntentArgs::new(
+            HistoryScopeId::from_uuid(uuid::Uuid::from_u128(30)),
+            4,
+            5,
+            Some(6),
+            direction,
+            vec![HistoryAction::WaveformRestore(restore)],
+        )
+        .expect("history arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            direction.command_kind(),
+            "operation.status.history",
+            participants,
+        )
+        .expect("history universal intent");
+        (
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+        )
+    }
+
     fn external_universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
         let mut value: serde_json::Value = serde_json::from_slice(
             &encode(&universal_intent_record(operation_id)).expect("v3 bytes"),
@@ -4917,6 +5198,101 @@ mod tests {
         assert_eq!(
             restarted.universal_command_args(),
             Some(&UniversalCommandArgs::SelectionOutput(command_args))
+        );
+        assert_eq!(restarted.retry_observation(), Some(&retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+    }
+
+    #[test]
+    fn v14_history_insert_retry_cancel_and_restart_preserve_ordered_args() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, capacity_plan) =
+            v14_history_inputs(HistoryDirection::Undo);
+        let inserted = store
+            .persist_history_intent_with_outcome(
+                operation_id,
+                intent,
+                universal_intent,
+                command_args.clone(),
+                capacity_plan,
+                50,
+            )
+            .receipt()
+            .expect("persist V14 history command");
+        assert_eq!(inserted.sequence(), 1);
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("history-retry-1").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientAvailability,
+            "history_unavailable",
+            None,
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist V14 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+        assert_eq!(
+            store
+                .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+                .expect("replay V14 retry"),
+            retry_receipt
+        );
+
+        let cancellation = CancellationRequestObservation::new(57).expect("cancel observation");
+        let cancel_receipt = store
+            .request_cancel_before_publish(
+                operation_id,
+                retry_receipt.sequence(),
+                cancellation.clone(),
+            )
+            .expect("persist V14 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 3);
+        assert_eq!(
+            store
+                .request_cancel_before_publish(
+                    operation_id,
+                    inserted.sequence(),
+                    cancellation.clone(),
+                )
+                .expect("replay V14 cancellation"),
+            cancel_receipt
+        );
+        let persisted = store
+            .get(operation_id)
+            .expect("get V14 history command")
+            .expect("V14 history row");
+        assert_eq!(persisted.schema_version, SCHEMA_V14);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::History(command_args.clone()))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("history universal intent")
+                .command_kind(),
+            UniversalCommandKind::Undo
+        );
+        assert_eq!(persisted.retry_observation(), Some(&retry));
+        assert_eq!(persisted.cancellation_request(), Some(&cancellation));
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("get restarted V14 history command")
+            .expect("restarted V14 history row");
+        assert_eq!(restarted.schema_version, SCHEMA_V14);
+        assert_eq!(
+            restarted.universal_command_args(),
+            Some(&UniversalCommandArgs::History(command_args))
         );
         assert_eq!(restarted.retry_observation(), Some(&retry));
         assert_eq!(restarted.cancellation_request(), Some(&cancellation));

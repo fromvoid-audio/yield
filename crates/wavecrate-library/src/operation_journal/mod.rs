@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod coordinator;
 pub mod evidence;
+pub mod history_commands;
 pub mod model;
 pub mod namespace_commands;
 pub mod owner;
@@ -72,13 +73,23 @@ pub use evidence::{
     ReplacementQualificationDecision, ReplacementQualificationRetryCondition, VolumeIdentity,
 };
 
+pub use history_commands::{
+    HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+    HistoryFolderRelocation, HistoryFolderRelocationPlan, HistoryRecoveryBackupObservation,
+    HistoryRecoveryLeaf, HistoryRecoveryLeafObservation, HistoryRecoveryRootRole,
+    HistoryRestoreTargetExpectation, HistoryRestoreTargetPolicy, HistoryScopeId,
+    HistoryUndoRedoIntentArgs, HistoryValidationError, HistoryWaveformRestore,
+    HistoryWaveformRestorePlan, MAX_HISTORY_ACTIONS, MAX_HISTORY_AGGREGATE_TEXT_BYTES,
+    MAX_HISTORY_RELOCATIONS,
+};
+
 pub use model::{
     CURRENT_SCHEMA_VERSION, CancellationRequestObservation, CancellationRequestValidationError,
     MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES, MAX_USER_STATUS_KEY_BYTES, OperationActor,
     OperationDisposition, OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V1,
     SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
-    SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, UniversalCommandKind, UniversalIntent,
-    UniversalIntentTextViolation, UniversalIntentValidationError,
+    SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, UniversalCommandKind,
+    UniversalIntent, UniversalIntentTextViolation, UniversalIntentValidationError,
 };
 
 pub use namespace_commands::{

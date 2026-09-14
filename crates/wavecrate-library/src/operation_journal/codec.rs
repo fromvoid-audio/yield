@@ -24,11 +24,13 @@ use super::evidence::{
     PreparedAbsentFinalNoReplace, PreparedTargetContract, PreparedWaveformRestore,
     ReplacementQualificationAssessment,
 };
+use super::history_commands::validate_persisted_history_command_args_value;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
-    OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, UniversalIntent,
+    OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
+    SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+    SCHEMA_V14, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
@@ -82,7 +84,7 @@ pub struct StoredOperationRecord {
     command_args: Option<CopyIntentArgs>,
     /// Optional V5 durable retry/status observation.
     retry_observation: Option<RetryObservation>,
-    /// Optional V6-V13 tagged command arguments.
+    /// Optional V6-V14 tagged command arguments.
     universal_command_args: Option<UniversalCommandArgs>,
     /// Stored creation timestamp in Unix milliseconds.
     pub created_unix_ms: i64,
@@ -294,6 +296,25 @@ impl StoredOperationRecord {
         )
     }
 
+    pub(crate) fn new_v14_command(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self::new_tagged_command(
+            SCHEMA_V14,
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
     fn new_tagged_command(
         schema_version: u32,
         operation_id: OperationId,
@@ -369,6 +390,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V11
                 | SCHEMA_V12
                 | SCHEMA_V13
+                | SCHEMA_V14
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -390,6 +412,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V11
                 | SCHEMA_V12
                 | SCHEMA_V13
+                | SCHEMA_V14
         ) {
             record.schema_version = SCHEMA_V5;
         }
@@ -533,6 +556,12 @@ pub enum EncodeError {
     /// A V13 selection-output record violates its bounded state or argument contract.
     #[error("invalid schema-v13 selection output record: {reason}")]
     InvalidV13Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// A V14 transaction-history record violates its bounded state or argument contract.
+    #[error("invalid schema-v14 transaction-history record: {reason}")]
+    InvalidV14Record {
         /// Bounded validation diagnostic.
         reason: String,
     },
@@ -1362,6 +1391,14 @@ fn persisted_v13_from_record(
     Ok(persisted_tagged_ref_from_record(record))
 }
 
+fn persisted_v14_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
+    validate_v14_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV14Record { reason })?;
+    Ok(persisted_tagged_ref_from_record(record))
+}
+
 /// Decode one bounded persisted operation record.
 ///
 /// The input is checked against [`MAX_RECORD_BYTES`] before JSON parsing. Unknown schema versions
@@ -1495,6 +1532,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v13_coordinator_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
+        SCHEMA_V14 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v14_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v14_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
         version => Err(DecodeError::UnsupportedVersion { version }),
@@ -1675,6 +1721,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V13 => {
             let persisted = persisted_v13_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V14 => {
+            let persisted = persisted_v14_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -2677,6 +2727,38 @@ fn validate_persisted_v13_universal_command_args_value(value: &Value) -> Result<
     )
 }
 
+fn validate_persisted_v14_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_object_boundaries(
+        value,
+        validate_persisted_v14_universal_intent_value,
+        validate_persisted_v14_universal_command_args_value,
+    )
+}
+
+fn validate_persisted_v14_universal_intent_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_universal_intent_value_with_retained_resolution(value, true)
+}
+
+fn validate_persisted_v14_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(
+        value,
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+            "Removal",
+            "RetainedResolution",
+            "SelectionNormalize",
+            "SelectionOutput",
+            "History",
+        ],
+        "schema-v14",
+    )
+}
+
 fn validate_persisted_tagged_command_args_value(
     value: &Value,
     allowed_variants: &[&str],
@@ -2712,6 +2794,7 @@ fn validate_persisted_tagged_command_args_value(
             "SelectionNormalize" => {
                 Err("command arguments carry schema-v12 selection Normalize arguments")
             }
+            "History" => Err("command arguments carry schema-v14 transaction-history arguments"),
             "Namespace" => Err("command arguments carry schema-v8 namespace arguments"),
             "Render" => Err("command arguments carry schema-v9 render arguments"),
             "Removal" => Err("command arguments carry schema-v10 removal arguments"),
@@ -2730,6 +2813,7 @@ fn validate_persisted_tagged_command_args_value(
         }
         "SelectionNormalize" => validate_persisted_selection_normalize_intent_args_value(arguments),
         "SelectionOutput" => validate_persisted_selection_output_command_args_value(arguments),
+        "History" => validate_persisted_history_command_args_value(arguments),
         _ => Err("persisted command arguments contain an unknown variant"),
     }
 }
@@ -3099,6 +3183,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
                 "schema-v6 cannot carry schema-v13 selection output arguments",
             ));
         }
+        UniversalCommandArgs::History(_) => {
+            return Err(String::from(
+                "schema-v6 cannot carry schema-v14 transaction-history arguments",
+            ));
+        }
     }
     if universal.command_kind() != command_args.command_kind() {
         return Err(String::from(
@@ -3175,6 +3264,7 @@ pub(crate) fn validate_v7_coordinator_shape(record: &StoredOperationRecord) -> R
         SCHEMA_V7,
         "schema-v7",
         &["Copy", "Import", "DuplicateSame", "WaveformEdit"],
+        OperationKind::FileMutation,
     )
 }
 
@@ -3190,6 +3280,7 @@ pub(crate) fn validate_v8_coordinator_shape(record: &StoredOperationRecord) -> R
             "WaveformEdit",
             "Namespace",
         ],
+        OperationKind::FileMutation,
     )
 }
 
@@ -3206,6 +3297,7 @@ pub(crate) fn validate_v9_coordinator_shape(record: &StoredOperationRecord) -> R
             "Namespace",
             "Render",
         ],
+        OperationKind::FileMutation,
     )
 }
 
@@ -3223,6 +3315,7 @@ pub(crate) fn validate_v10_coordinator_shape(record: &StoredOperationRecord) -> 
             "Render",
             "Removal",
         ],
+        OperationKind::FileMutation,
     )
 }
 
@@ -3241,6 +3334,7 @@ pub(crate) fn validate_v11_coordinator_shape(record: &StoredOperationRecord) -> 
             "Removal",
             "RetainedResolution",
         ],
+        OperationKind::FileMutation,
     )
 }
 
@@ -3260,6 +3354,7 @@ pub(crate) fn validate_v12_coordinator_shape(record: &StoredOperationRecord) -> 
             "RetainedResolution",
             "SelectionNormalize",
         ],
+        OperationKind::FileMutation,
     )
 }
 
@@ -3280,7 +3375,43 @@ pub(crate) fn validate_v13_coordinator_shape(record: &StoredOperationRecord) -> 
             "SelectionNormalize",
             "SelectionOutput",
         ],
+        OperationKind::FileMutation,
     )
+}
+
+pub(crate) fn validate_v14_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    let is_history = matches!(
+        record.universal_command_args.as_ref(),
+        Some(UniversalCommandArgs::History(_))
+    );
+    if is_history {
+        validate_tagged_coordinator_shape(
+            record,
+            SCHEMA_V14,
+            "schema-v14",
+            &["History"],
+            OperationKind::FileHistory,
+        )
+    } else {
+        validate_tagged_coordinator_shape(
+            record,
+            SCHEMA_V14,
+            "schema-v14",
+            &[
+                "Copy",
+                "Import",
+                "DuplicateSame",
+                "WaveformEdit",
+                "Namespace",
+                "Render",
+                "Removal",
+                "RetainedResolution",
+                "SelectionNormalize",
+                "SelectionOutput",
+            ],
+            OperationKind::FileMutation,
+        )
+    }
 }
 
 fn validate_tagged_coordinator_shape(
@@ -3288,6 +3419,7 @@ fn validate_tagged_coordinator_shape(
     expected_schema: u32,
     schema_name: &str,
     allowed_variants: &[&str],
+    expected_operation_kind: OperationKind,
 ) -> Result<(), String> {
     if record.schema_version != expected_schema {
         return Err(format!("{schema_name} validation received another schema"));
@@ -3298,11 +3430,15 @@ fn validate_tagged_coordinator_shape(
             record.phase
         ));
     }
-    if record.intent.actor != OperationActor::User
-        || record.intent.kind != super::model::OperationKind::FileMutation
+    if record.intent.actor != OperationActor::User || record.intent.kind != expected_operation_kind
     {
+        let operation_kind_label = match expected_operation_kind {
+            OperationKind::FileMutation => "file-mutation",
+            OperationKind::FileHistory => "file-history",
+            OperationKind::ExternalReconciliation => "external-reconciliation",
+        };
         return Err(format!(
-            "{schema_name} coordinator records require a user file-mutation intent"
+            "{schema_name} coordinator records require a user {operation_kind_label} intent"
         ));
     }
     if !record.payload.as_object().is_some_and(Map::is_empty) {
@@ -3334,6 +3470,7 @@ fn validate_tagged_coordinator_shape(
         UniversalCommandArgs::RetainedResolution(_) => "RetainedResolution",
         UniversalCommandArgs::SelectionNormalize(_) => "SelectionNormalize",
         UniversalCommandArgs::SelectionOutput(_) => "SelectionOutput",
+        UniversalCommandArgs::History(_) => "History",
     };
     if !allowed_variants.contains(&variant) {
         return Err(match variant {
@@ -3350,6 +3487,9 @@ fn validate_tagged_coordinator_shape(
             }
             "SelectionOutput" => {
                 format!("{schema_name} cannot carry schema-v13 selection output arguments")
+            }
+            "History" => {
+                format!("{schema_name} cannot carry schema-v14 transaction-history arguments")
             }
             _ => format!("{schema_name} cannot carry {variant} arguments"),
         });
@@ -4119,6 +4259,133 @@ mod tests {
                 }
             })
         };
+        fixture
+    }
+
+    fn v14_history_fixture(direction: &str) -> Value {
+        let mut fixture = v6_command_fixture("Copy");
+        let source_participant =
+            fixture["universal_intent"]["participants"]["descriptors"][0]["id"].clone();
+        let filesystem_participant =
+            fixture["universal_intent"]["participants"]["descriptors"][1]["id"].clone();
+        let source_id = Value::from("source-a");
+        let source = serde_json::json!({
+            "participant_id": source_participant,
+            "source_id": source_id,
+            "relative_path": "in.wav"
+        });
+        let extracted_target = serde_json::json!({
+            "participant_id": source_participant,
+            "source_id": "source-a",
+            "relative_path": "extracted.wav"
+        });
+        let revision = |identity: &str| {
+            serde_json::json!({
+                "filesystem_identity": identity,
+                "change_marker": "change",
+                "byte_len": 10,
+                "modified_unix_ns": 11
+            })
+        };
+        let leaf = |identity: &str| serde_json::json!({ "file_revision": revision(identity) });
+        let backups = if direction == "Undo" {
+            serde_json::json!({
+                "filesystem_participant_id": filesystem_participant,
+                "root_role": "ConfiguredRecoveryRoot",
+                "root_identity": "recovery-root",
+                "directory_id": "22222222-2222-2222-2222-222222222222",
+                "directory_identity": "edit-directory",
+                "before": leaf("before"),
+                "after": null,
+                "extracted": leaf("extracted-backup")
+            })
+        } else {
+            serde_json::json!({
+                "filesystem_participant_id": filesystem_participant,
+                "root_role": "ConfiguredRecoveryRoot",
+                "root_identity": "recovery-root",
+                "directory_id": "22222222-2222-2222-2222-222222222222",
+                "directory_identity": "edit-directory",
+                "before": null,
+                "after": leaf("after"),
+                "extracted": leaf("extracted-backup")
+            })
+        };
+        let extracted_file = if direction == "Undo" {
+            serde_json::json!({
+                "UndoRemoveExpected": {
+                    "target": extracted_target,
+                    "expected_current_revision": revision("current-extracted")
+                }
+            })
+        } else {
+            serde_json::json!({
+                "RedoRecreateAbsent": {
+                    "target": extracted_target,
+                    "absence": "ObservedAbsent"
+                }
+            })
+        };
+        let root = serde_json::json!({
+            "participant_id": source_participant,
+            "source_id": "source-a",
+            "locator": "Root",
+            "expectation": {
+                "source_revision": 7,
+                "filesystem_identity": "root-a",
+                "modified_unix_ns": null
+            }
+        });
+        let folder_source = serde_json::json!({
+            "participant_id": source_participant,
+            "source_id": "source-a",
+            "relative_path": "folder",
+            "expectation": {
+                "Directory": {
+                    "source_revision": 7,
+                    "filesystem_identity": "folder",
+                    "modified_unix_ns": null
+                }
+            }
+        });
+        let folder_destination = serde_json::json!({
+            "participant_id": source_participant,
+            "source_id": "source-a",
+            "relative_path": "archive/folder"
+        });
+        let folder_move = serde_json::json!({
+            "source_root": root,
+            "moves": [{
+                "source": folder_source,
+                "destination": folder_destination
+            }]
+        });
+        let restore = serde_json::json!({
+            "target": source,
+            "source_revision": 7,
+            "target_expectation": {
+                "Existing": revision("target")
+            },
+            "before_content_identity": "before-content",
+            "backups": backups,
+            "extracted_file": extracted_file
+        });
+        fixture["schema_version"] = Value::from(SCHEMA_V14);
+        fixture["intent"]["kind"] = Value::from("FileHistory");
+        fixture["universal_intent"]["command_kind"] = Value::from(direction);
+        fixture["universal_command_args"] = serde_json::json!({
+            "History": {
+                "scope": "11111111-1111-1111-1111-111111111111",
+                "execution_id": 4,
+                "transaction_id": 5,
+                "through_target": 6,
+                "direction": direction,
+                "actions": [
+                    {"FolderMove": folder_move},
+                    {"WaveformRestore": restore}
+                ]
+            }
+        });
         fixture
     }
 
@@ -4920,6 +5187,88 @@ mod tests {
         assert!(matches!(
             encode(&direct),
             Err(EncodeError::InvalidV12Record { .. })
+        ));
+    }
+
+    #[test]
+    fn v14_history_round_trip_preserves_order_and_direction_specific_extracted_steps() {
+        for direction in ["Undo", "Redo"] {
+            let fixture = v14_history_fixture(direction);
+            let record = decode(&serde_json::to_vec(&fixture).expect("V14 history bytes"))
+                .expect("V14 history fixture decodes");
+            assert_eq!(record.schema_version, SCHEMA_V14);
+            assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+            let Some(UniversalCommandArgs::History(args)) = record.universal_command_args() else {
+                panic!("V14 history arguments");
+            };
+            assert_eq!(format!("{:?}", args.direction()), direction);
+            assert_eq!(args.actions().len(), 2);
+            assert!(matches!(
+                args.actions()[0],
+                super::super::history_commands::HistoryAction::FolderMove(_)
+            ));
+            let super::super::history_commands::HistoryAction::WaveformRestore(restore) =
+                &args.actions()[1]
+            else {
+                panic!("V14 waveform restore action");
+            };
+            assert_eq!(
+                restore.backups().selected_restore_backup(args.direction()),
+                Some(match args.direction() {
+                    super::super::history_commands::HistoryDirection::Undo => {
+                        restore.backups().before().expect("before backup")
+                    }
+                    super::super::history_commands::HistoryDirection::Redo => {
+                        restore.backups().after().expect("after backup")
+                    }
+                })
+            );
+            assert_eq!(
+                value(&encode(&record).expect("V14 history encodes")),
+                fixture
+            );
+        }
+    }
+
+    #[test]
+    fn v14_history_boundary_rejects_unknown_fields_and_prior_versions() {
+        let fixture = v14_history_fixture("Undo");
+        let mut unknown = fixture.clone();
+        unknown["universal_command_args"]["History"]["actions"][1]["WaveformRestore"]["backups"]
+            ["unknown"] = Value::Null;
+        assert!(matches!(
+            decode(&serde_json::to_vec(&unknown).expect("unknown V14 history bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut old_schema = fixture.clone();
+        old_schema["schema_version"] = Value::from(SCHEMA_V13);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&old_schema).expect("history under V13 bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let record = decode(&serde_json::to_vec(&fixture).expect("V14 direct bytes"))
+            .expect("V14 direct record");
+        let mut direct = record;
+        direct.schema_version = SCHEMA_V13;
+        assert!(matches!(
+            classify_record(&direct),
+            RecordConsistency::Invalid(_)
+        ));
+        assert!(matches!(
+            encode(&direct),
+            Err(EncodeError::InvalidV13Record { .. })
+        ));
+    }
+
+    #[test]
+    fn prior_file_mutation_diagnostic_remains_stable_after_v14_kind_gating() {
+        let mut fixture = v13_selection_output_fixture(false);
+        fixture["intent"]["kind"] = Value::from("FileHistory");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&fixture).expect("wrong-kind V13 bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason.contains("schema-v13 coordinator records require a user file-mutation intent")
         ));
     }
 

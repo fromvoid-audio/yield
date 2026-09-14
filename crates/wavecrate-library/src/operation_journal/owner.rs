@@ -978,19 +978,21 @@ mod tests {
     };
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        ExternalRootBindingId, ExtractAndTrimIntentArgs, FiniteF32Bits, ImportFileExpectation,
-        ImportIntentArgs, MAX_DIAGNOSTIC_CODE_BYTES, NamespaceCommandArgs,
-        NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation, NamespaceDirectoryLocator,
-        NamespaceEntryEndpoint, NamespaceEntryExpectation, NamespaceFileExpectation,
-        NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget, OperationActor,
-        OperationDisposition, OperationIntent, OperationKind, ParticipantCheckpoint,
-        ParticipantCheckpointState, ParticipantDescriptor, ParticipantKind, ParticipantRequirement,
-        ParticipantSet, RawWavExtractionRecipe, RecoveryCursor, RecoveryRowOutcome,
-        RemovalCommandArgs, RetryErrorClass, RetryLeaseId, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-        SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-        SelectionExtractIntentArgs, SelectionNormalizeIntentArgs, SelectionOutputCommandArgs,
-        SelectionOutputRecipe, StoredRelativePath, StoredSourceFence, TrashIntentArgs,
-        UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
+        ExternalRootBindingId, ExtractAndTrimIntentArgs, FiniteF32Bits, HistoryAction,
+        HistoryDirection, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
+        HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
+        HistoryWaveformRestore, ImportFileExpectation, ImportIntentArgs, MAX_DIAGNOSTIC_CODE_BYTES,
+        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
+        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
+        NamespaceFileExpectation, NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget,
+        OperationActor, OperationDisposition, OperationIntent, OperationKind,
+        ParticipantCheckpoint, ParticipantCheckpointState, ParticipantDescriptor, ParticipantKind,
+        ParticipantRequirement, ParticipantSet, RawWavExtractionRecipe, RecoveryCursor,
+        RecoveryRowOutcome, RemovalCommandArgs, RetryErrorClass, RetryLeaseId, SCHEMA_V5,
+        SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+        SCHEMA_V14, SelectionExtractIntentArgs, SelectionNormalizeIntentArgs,
+        SelectionOutputCommandArgs, SelectionOutputRecipe, StoredRelativePath, StoredSourceFence,
+        TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
         WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
         WaveformEditOperationArgs, WaveformEditSettingsArgs, WaveformFileRevisionObservation,
         WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
@@ -1588,6 +1590,77 @@ mod tests {
         (record, command_args)
     }
 
+    fn v14_history_record(
+        operation_id: OperationId,
+    ) -> (StoredOperationRecord, HistoryUndoRedoIntentArgs) {
+        let (copy_record, copy_args) = v5_copy_record(operation_id);
+        let participants = copy_record
+            .universal_intent
+            .as_ref()
+            .expect("copy universal intent")
+            .participants()
+            .clone();
+        let filesystem_participant_id = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let revision = |identity: &str| {
+            WaveformFileRevisionObservation::new(identity, "owner-history-change", 10, Some(11))
+                .expect("history revision")
+        };
+        let backup = HistoryRecoveryBackupObservation::new(
+            filesystem_participant_id,
+            "owner-history-root",
+            uuid::Uuid::from_u128(20),
+            "owner-history-directory",
+            Some(HistoryRecoveryLeafObservation::new(revision("before")).expect("history backup")),
+            None,
+            None,
+        )
+        .expect("history backup observation");
+        let restore = HistoryWaveformRestore::new(
+            copy_args.source().clone(),
+            7,
+            HistoryRestoreTargetExpectation::Existing(revision("target")),
+            Some(String::from("owner-before-content")),
+            backup,
+            None,
+        )
+        .expect("history restore");
+        let command_args = HistoryUndoRedoIntentArgs::new(
+            HistoryScopeId::from_uuid(uuid::Uuid::from_u128(30)),
+            4,
+            5,
+            Some(6),
+            HistoryDirection::Undo,
+            vec![HistoryAction::WaveformRestore(restore)],
+        )
+        .expect("history arguments");
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Undo,
+            "operation.status.owner-history",
+            participants,
+        )
+        .expect("history universal intent");
+        let intent = OperationIntent {
+            actor: OperationActor::User,
+            kind: OperationKind::FileHistory,
+            label: String::from("owner history"),
+        };
+        let record = StoredOperationRecord::new_v14_command(
+            operation_id,
+            intent,
+            universal_intent,
+            UniversalCommandArgs::History(command_args.clone()),
+            copy_record.capacity_plan.expect("capacity plan"),
+            50,
+        );
+        (record, command_args)
+    }
+
     #[test]
     fn owner_persists_and_reads_through_cloneable_client() {
         let (_fixture, mut owner) = open_owner("journal-owner-basic");
@@ -1941,6 +2014,48 @@ mod tests {
                 .command_kind(),
             UniversalCommandKind::DestructiveEdit
         );
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn owner_persists_v14_history_through_generic_encoded_command() {
+        let (_fixture, mut owner) = open_owner("journal-owner-v14-history");
+        let client = owner.client();
+        let operation_id = OperationId::new();
+        let (record, command_args) = v14_history_record(operation_id);
+        let mut request = client.persist_intent(record).expect("history admission");
+        let outcome = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("history result")
+            .expect("history worker result");
+        assert_eq!(
+            outcome
+                .receipt()
+                .expect("history acknowledgement")
+                .operation_id(),
+            operation_id
+        );
+
+        let mut lookup = client.get(operation_id).expect("history lookup admission");
+        let persisted = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("history lookup result")
+            .expect("history lookup worker result")
+            .expect("persisted history");
+        assert_eq!(persisted.schema_version, SCHEMA_V14);
+        assert_eq!(
+            persisted.universal_command_args(),
+            Some(&UniversalCommandArgs::History(command_args))
+        );
+        assert_eq!(
+            persisted
+                .universal_intent
+                .as_ref()
+                .expect("history universal intent")
+                .command_kind(),
+            UniversalCommandKind::Undo
+        );
+        assert_eq!(persisted.intent.kind, OperationKind::FileHistory);
         assert!(owner.shutdown());
     }
 
