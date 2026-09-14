@@ -1201,6 +1201,13 @@ progress tests, library compilation without default features, formatting and dif
 checks passed. Primary diff review found no material issue. No production audit
 authority issuer or durable progress encoding is provided yet.
 
+Windows storage run `34893017246` passed at exact audit source
+`0c892ae42ba9a0d135fd3ab80b04794450a4a711`, including the preceding source-lease
+reacquisition change: 257 journal tests passed with one ignored and all fourteen
+progress tests passed. The other storage-lane checks also passed. The older
+reacquisition-only run was superseded; acceptance is based on this combined run.
+This is not native Windows UI/audio acceptance.
+
 The admission-claim observation contract is bounded to 256 positive, uniquely
 identified claims. It requires exact allocated-byte coverage for every captured
 volume/allocation-class pair, rejecting empty/zero, duplicate, unknown, missing,
