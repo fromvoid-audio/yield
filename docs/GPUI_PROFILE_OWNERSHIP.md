@@ -968,3 +968,18 @@ passed at exact commit `c8a8b71b50994a645c58251a525d280982036147`. Logs confirm
 60 session (one helper ignored), 16 core edit-settings and five media-adapter
 tests. This accepts the V12 storage milestone; native Windows UI and audio
 execution remain outside this validation scope.
+
+## Shared V6–V12 codec envelope (OPT-1337)
+
+The tagged command schemas share private owned and borrowed envelopes, initial
+record construction and strict raw-field validation. Version-specific command
+gates, diagnostics and encoder errors remain explicit. This changes neither
+the twelve serialized fields and their order nor the V1 default or SQLite schema.
+
+A frozen 53-case byte-length/BLAKE3 manifest from
+`c8a8b71b50994a645c58251a525d280982036147` checks every supported schema/family
+boundary. Negative baselines retain the V6 waveform diagnostic and required
+nullable retry/cancellation fields. Local validation passed 212 serialized
+journal tests (one helper ignored), library checks with and without default
+features, GPUI compilation, formatting and diff checks. Independent compatibility
+review found no meaningful issues. Windows validation for this refactor is pending.

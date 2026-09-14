@@ -131,29 +131,15 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
-        Self {
-            schema_version: SCHEMA_V6,
+        Self::new_tagged_command(
+            SCHEMA_V6,
             operation_id,
             intent,
-            universal_intent: Some(universal_intent),
-            phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: None,
-            command_args: None,
-            retry_observation: None,
-            universal_command_args: Some(command_args),
-            created_unix_ms: timestamp_unix_ms,
-            updated_unix_ms: timestamp_unix_ms,
-        }
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
     }
 
     pub(crate) fn new_v7_waveform_edit(
@@ -182,29 +168,15 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
-        Self {
-            schema_version: SCHEMA_V7,
+        Self::new_tagged_command(
+            SCHEMA_V7,
             operation_id,
             intent,
-            universal_intent: Some(universal_intent),
-            phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: None,
-            command_args: None,
-            retry_observation: None,
-            universal_command_args: Some(command_args),
-            created_unix_ms: timestamp_unix_ms,
-            updated_unix_ms: timestamp_unix_ms,
-        }
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
     }
 
     pub(crate) fn new_v8_command(
@@ -215,29 +187,15 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
-        Self {
-            schema_version: SCHEMA_V8,
+        Self::new_tagged_command(
+            SCHEMA_V8,
             operation_id,
             intent,
-            universal_intent: Some(universal_intent),
-            phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: None,
-            command_args: None,
-            retry_observation: None,
-            universal_command_args: Some(command_args),
-            created_unix_ms: timestamp_unix_ms,
-            updated_unix_ms: timestamp_unix_ms,
-        }
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
     }
 
     pub(crate) fn new_v9_command(
@@ -248,29 +206,15 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
-        Self {
-            schema_version: SCHEMA_V9,
+        Self::new_tagged_command(
+            SCHEMA_V9,
             operation_id,
             intent,
-            universal_intent: Some(universal_intent),
-            phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: None,
-            command_args: None,
-            retry_observation: None,
-            universal_command_args: Some(command_args),
-            created_unix_ms: timestamp_unix_ms,
-            updated_unix_ms: timestamp_unix_ms,
-        }
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
     }
 
     pub(crate) fn new_v10_command(
@@ -281,29 +225,15 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
-        Self {
-            schema_version: SCHEMA_V10,
+        Self::new_tagged_command(
+            SCHEMA_V10,
             operation_id,
             intent,
-            universal_intent: Some(universal_intent),
-            phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: None,
-            command_args: None,
-            retry_observation: None,
-            universal_command_args: Some(command_args),
-            created_unix_ms: timestamp_unix_ms,
-            updated_unix_ms: timestamp_unix_ms,
-        }
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
     }
 
     pub(crate) fn new_v11_command(
@@ -314,29 +244,15 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
-        Self {
-            schema_version: SCHEMA_V11,
+        Self::new_tagged_command(
+            SCHEMA_V11,
             operation_id,
             intent,
-            universal_intent: Some(universal_intent),
-            phase: OperationPhase::IntentDurable,
-            disposition: OperationDisposition::None,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: None,
-            command_args: None,
-            retry_observation: None,
-            universal_command_args: Some(command_args),
-            created_unix_ms: timestamp_unix_ms,
-            updated_unix_ms: timestamp_unix_ms,
-        }
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
     }
 
     pub(crate) fn new_v12_command(
@@ -347,8 +263,28 @@ impl StoredOperationRecord {
         capacity_plan: DurableCapacityPlan,
         timestamp_unix_ms: i64,
     ) -> Self {
+        Self::new_tagged_command(
+            SCHEMA_V12,
+            operation_id,
+            intent,
+            universal_intent,
+            command_args,
+            capacity_plan,
+            timestamp_unix_ms,
+        )
+    }
+
+    fn new_tagged_command(
+        schema_version: u32,
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        capacity_plan: DurableCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
         Self {
-            schema_version: SCHEMA_V12,
+            schema_version,
             operation_id,
             intent,
             universal_intent: Some(universal_intent),
@@ -1239,7 +1175,7 @@ struct PersistedOperationRecordV5Ref<'a> {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV6 {
+struct PersistedTaggedOperationRecord {
     schema_version: u32,
     operation_id: Uuid,
     intent: OperationIntent,
@@ -1256,8 +1192,8 @@ struct PersistedOperationRecordV6 {
     updated_unix_ms: i64,
 }
 
-impl From<PersistedOperationRecordV6> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV6) -> Self {
+impl From<PersistedTaggedOperationRecord> for StoredOperationRecord {
+    fn from(record: PersistedTaggedOperationRecord) -> Self {
         Self {
             schema_version: record.schema_version,
             operation_id: OperationId::from_uuid(record.operation_id),
@@ -1282,610 +1218,106 @@ impl From<PersistedOperationRecordV6> for StoredOperationRecord {
             updated_unix_ms: record.updated_unix_ms,
         }
     }
+}
+
+fn persisted_tagged_ref_from_record(
+    record: &StoredOperationRecord,
+) -> PersistedTaggedOperationRecordRef<'_> {
+    PersistedTaggedOperationRecordRef {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("tagged universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        universal_command_args: record
+            .universal_command_args
+            .as_ref()
+            .expect("tagged command arguments checked above"),
+        capacity_plan: record
+            .capacity_plan
+            .as_ref()
+            .expect("tagged capacity plan checked above"),
+        retry_observation: record.retry_observation.as_ref(),
+        cancellation_request: record.cancellation_request.as_ref(),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedTaggedOperationRecordRef<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: &'a UniversalCommandArgs,
+    capacity_plan: &'a DurableCapacityPlan,
+    retry_observation: Option<&'a RetryObservation>,
+    cancellation_request: Option<&'a CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
 }
 
 fn persisted_v6_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV6Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v6_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV6Record { reason })?;
-    Ok(PersistedOperationRecordV6Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V6 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V6 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V6 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV6Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV7 {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: OperationIntent,
-    universal_intent: UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: UniversalCommandArgs,
-    capacity_plan: DurableCapacityPlan,
-    #[serde(default)]
-    retry_observation: Option<RetryObservation>,
-    #[serde(default)]
-    cancellation_request: Option<CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-impl From<PersistedOperationRecordV7> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV7) -> Self {
-        Self {
-            schema_version: record.schema_version,
-            operation_id: OperationId::from_uuid(record.operation_id),
-            intent: record.intent,
-            universal_intent: Some(record.universal_intent),
-            phase: record.phase,
-            disposition: record.disposition,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(record.capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: record.cancellation_request,
-            command_args: None,
-            retry_observation: record.retry_observation,
-            universal_command_args: Some(record.universal_command_args),
-            created_unix_ms: record.created_unix_ms,
-            updated_unix_ms: record.updated_unix_ms,
-        }
-    }
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 fn persisted_v7_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV7Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v7_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV7Record { reason })?;
-    Ok(PersistedOperationRecordV7Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V7 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V7 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V7 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV7Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV8 {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: OperationIntent,
-    universal_intent: UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: UniversalCommandArgs,
-    capacity_plan: DurableCapacityPlan,
-    #[serde(default)]
-    retry_observation: Option<RetryObservation>,
-    #[serde(default)]
-    cancellation_request: Option<CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-impl From<PersistedOperationRecordV8> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV8) -> Self {
-        Self {
-            schema_version: record.schema_version,
-            operation_id: OperationId::from_uuid(record.operation_id),
-            intent: record.intent,
-            universal_intent: Some(record.universal_intent),
-            phase: record.phase,
-            disposition: record.disposition,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(record.capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: record.cancellation_request,
-            command_args: None,
-            retry_observation: record.retry_observation,
-            universal_command_args: Some(record.universal_command_args),
-            created_unix_ms: record.created_unix_ms,
-            updated_unix_ms: record.updated_unix_ms,
-        }
-    }
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 fn persisted_v8_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV8Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v8_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV8Record { reason })?;
-    Ok(PersistedOperationRecordV8Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V8 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V8 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V8 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV8Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV9 {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: OperationIntent,
-    universal_intent: UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: UniversalCommandArgs,
-    capacity_plan: DurableCapacityPlan,
-    #[serde(default)]
-    retry_observation: Option<RetryObservation>,
-    #[serde(default)]
-    cancellation_request: Option<CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-impl From<PersistedOperationRecordV9> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV9) -> Self {
-        Self {
-            schema_version: record.schema_version,
-            operation_id: OperationId::from_uuid(record.operation_id),
-            intent: record.intent,
-            universal_intent: Some(record.universal_intent),
-            phase: record.phase,
-            disposition: record.disposition,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(record.capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: record.cancellation_request,
-            command_args: None,
-            retry_observation: record.retry_observation,
-            universal_command_args: Some(record.universal_command_args),
-            created_unix_ms: record.created_unix_ms,
-            updated_unix_ms: record.updated_unix_ms,
-        }
-    }
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 fn persisted_v9_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV9Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v9_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV9Record { reason })?;
-    Ok(PersistedOperationRecordV9Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V9 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V9 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V9 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV9Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV10 {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: OperationIntent,
-    universal_intent: UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: UniversalCommandArgs,
-    capacity_plan: DurableCapacityPlan,
-    #[serde(default)]
-    retry_observation: Option<RetryObservation>,
-    #[serde(default)]
-    cancellation_request: Option<CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-impl From<PersistedOperationRecordV10> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV10) -> Self {
-        Self {
-            schema_version: record.schema_version,
-            operation_id: OperationId::from_uuid(record.operation_id),
-            intent: record.intent,
-            universal_intent: Some(record.universal_intent),
-            phase: record.phase,
-            disposition: record.disposition,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(record.capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: record.cancellation_request,
-            command_args: None,
-            retry_observation: record.retry_observation,
-            universal_command_args: Some(record.universal_command_args),
-            created_unix_ms: record.created_unix_ms,
-            updated_unix_ms: record.updated_unix_ms,
-        }
-    }
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 fn persisted_v10_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV10Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v10_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV10Record { reason })?;
-    Ok(PersistedOperationRecordV10Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V10 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V10 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V10 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV10Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV11 {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: OperationIntent,
-    universal_intent: UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: UniversalCommandArgs,
-    capacity_plan: DurableCapacityPlan,
-    #[serde(default)]
-    retry_observation: Option<RetryObservation>,
-    #[serde(default)]
-    cancellation_request: Option<CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-impl From<PersistedOperationRecordV11> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV11) -> Self {
-        Self {
-            schema_version: record.schema_version,
-            operation_id: OperationId::from_uuid(record.operation_id),
-            intent: record.intent,
-            universal_intent: Some(record.universal_intent),
-            phase: record.phase,
-            disposition: record.disposition,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(record.capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: record.cancellation_request,
-            command_args: None,
-            retry_observation: record.retry_observation,
-            universal_command_args: Some(record.universal_command_args),
-            created_unix_ms: record.created_unix_ms,
-            updated_unix_ms: record.updated_unix_ms,
-        }
-    }
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 fn persisted_v11_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV11Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v11_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV11Record { reason })?;
-    Ok(PersistedOperationRecordV11Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V11 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V11 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V11 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV11Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedOperationRecordV12 {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: OperationIntent,
-    universal_intent: UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: UniversalCommandArgs,
-    capacity_plan: DurableCapacityPlan,
-    #[serde(default)]
-    retry_observation: Option<RetryObservation>,
-    #[serde(default)]
-    cancellation_request: Option<CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
-}
-
-impl From<PersistedOperationRecordV12> for StoredOperationRecord {
-    fn from(record: PersistedOperationRecordV12) -> Self {
-        Self {
-            schema_version: record.schema_version,
-            operation_id: OperationId::from_uuid(record.operation_id),
-            intent: record.intent,
-            universal_intent: Some(record.universal_intent),
-            phase: record.phase,
-            disposition: record.disposition,
-            payload: Value::Object(Map::new()),
-            capacity_plan: Some(record.capacity_plan),
-            prepared: None,
-            staged: None,
-            absent_final_recovery_observation: None,
-            absent_final_transaction_owned_proof: None,
-            absent_final_adoption_evidence: None,
-            published: None,
-            replacement_qualification: None,
-            cancellation_request: record.cancellation_request,
-            command_args: None,
-            retry_observation: record.retry_observation,
-            universal_command_args: Some(record.universal_command_args),
-            created_unix_ms: record.created_unix_ms,
-            updated_unix_ms: record.updated_unix_ms,
-        }
-    }
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 fn persisted_v12_from_record(
     record: &StoredOperationRecord,
-) -> Result<PersistedOperationRecordV12Ref<'_>, EncodeError> {
+) -> Result<PersistedTaggedOperationRecordRef<'_>, EncodeError> {
     validate_v12_coordinator_shape(record)
         .map_err(|reason| EncodeError::InvalidV12Record { reason })?;
-    Ok(PersistedOperationRecordV12Ref {
-        schema_version: record.schema_version,
-        operation_id: record.operation_id.as_uuid(),
-        intent: &record.intent,
-        universal_intent: record
-            .universal_intent
-            .as_ref()
-            .expect("V12 universal intent checked above"),
-        phase: record.phase,
-        disposition: record.disposition,
-        universal_command_args: record
-            .universal_command_args
-            .as_ref()
-            .expect("V12 command arguments checked above"),
-        capacity_plan: record
-            .capacity_plan
-            .as_ref()
-            .expect("V12 capacity plan checked above"),
-        retry_observation: record.retry_observation.as_ref(),
-        cancellation_request: record.cancellation_request.as_ref(),
-        created_unix_ms: record.created_unix_ms,
-        updated_unix_ms: record.updated_unix_ms,
-    })
-}
-
-#[derive(Serialize)]
-struct PersistedOperationRecordV12Ref<'a> {
-    schema_version: u32,
-    operation_id: Uuid,
-    intent: &'a OperationIntent,
-    universal_intent: &'a UniversalIntent,
-    phase: OperationPhase,
-    disposition: OperationDisposition,
-    universal_command_args: &'a UniversalCommandArgs,
-    capacity_plan: &'a DurableCapacityPlan,
-    retry_observation: Option<&'a RetryObservation>,
-    cancellation_request: Option<&'a CancellationRequestObservation>,
-    created_unix_ms: i64,
-    updated_unix_ms: i64,
+    Ok(persisted_tagged_ref_from_record(record))
 }
 
 /// Decode one bounded persisted operation record.
@@ -1954,7 +1386,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V6 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v6_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV6>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v6_coordinator_shape(&record).map_err(malformed)?;
@@ -1963,7 +1395,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V7 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v7_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV7>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v7_coordinator_shape(&record).map_err(malformed)?;
@@ -1972,7 +1404,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V8 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v8_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV8>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v8_coordinator_shape(&record).map_err(malformed)?;
@@ -1981,7 +1413,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V9 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v9_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV9>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v9_coordinator_shape(&record).map_err(malformed)?;
@@ -1990,7 +1422,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V10 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v10_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV10>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v10_coordinator_shape(&record).map_err(malformed)?;
@@ -1999,7 +1431,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V11 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v11_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV11>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v11_coordinator_shape(&record).map_err(malformed)?;
@@ -2008,7 +1440,7 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
         SCHEMA_V12 => {
             validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
             validate_persisted_v12_object_boundaries(&value).map_err(malformed)?;
-            let record = serde_json::from_value::<PersistedOperationRecordV12>(value)
+            let record = serde_json::from_value::<PersistedTaggedOperationRecord>(value)
                 .map(Into::into)
                 .map_err(|error| malformed(error.to_string()))?;
             validate_v12_coordinator_shape(&record).map_err(malformed)?;
@@ -2967,168 +2399,82 @@ fn validate_persisted_v5_object_boundaries(value: &Value) -> Result<(), &'static
     Ok(())
 }
 
+fn validate_persisted_tagged_object_boundaries(
+    value: &Value,
+    validate_universal_intent: fn(&Value) -> Result<(), &'static str>,
+    validate_command_args: fn(&Value) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "universal_command_args",
+            "capacity_plan",
+            "retry_observation",
+            "cancellation_request",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "universal_command_args",
+        "capacity_plan",
+        "retry_observation",
+        "cancellation_request",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_universal_intent(required_field(object, "universal_intent")?)?;
+    validate_command_args(required_field(object, "universal_command_args")?)?;
+    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
+    if let Some(retry) = object.get("retry_observation") {
+        if !retry.is_null() {
+            validate_persisted_retry_observation_value(retry)?;
+        }
+    }
+    if let Some(cancellation) = object.get("cancellation_request") {
+        if !cancellation.is_null() {
+            validate_persisted_cancellation_request_value(cancellation)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_persisted_v6_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_universal_intent_value,
+        validate_persisted_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v7_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_universal_intent_value,
+        validate_persisted_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v8_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_v8_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_universal_intent_value,
+        validate_persisted_v8_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v8_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
     validate_persisted_tagged_command_args_value(
         value,
@@ -3144,59 +2490,12 @@ fn validate_persisted_v8_universal_command_args_value(value: &Value) -> Result<(
 }
 
 fn validate_persisted_v9_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_v9_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_universal_intent_value,
+        validate_persisted_v9_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v9_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
     validate_persisted_tagged_command_args_value(
         value,
@@ -3213,59 +2512,12 @@ fn validate_persisted_v9_universal_command_args_value(value: &Value) -> Result<(
 }
 
 fn validate_persisted_v10_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_v10_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_universal_intent_value,
+        validate_persisted_v10_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v10_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
     validate_persisted_tagged_command_args_value(
         value,
@@ -3283,59 +2535,12 @@ fn validate_persisted_v10_universal_command_args_value(value: &Value) -> Result<
 }
 
 fn validate_persisted_v11_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_v11_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_v11_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_v11_universal_intent_value,
+        validate_persisted_v11_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v11_universal_intent_value(value: &Value) -> Result<(), &'static str> {
     validate_persisted_universal_intent_value_with_retained_resolution(value, true)
 }
@@ -3358,59 +2563,12 @@ fn validate_persisted_v11_universal_command_args_value(value: &Value) -> Result<
 }
 
 fn validate_persisted_v12_object_boundaries(value: &Value) -> Result<(), &'static str> {
-    let object = strict_object(
+    validate_persisted_tagged_object_boundaries(
         value,
-        &[
-            "schema_version",
-            "operation_id",
-            "intent",
-            "universal_intent",
-            "phase",
-            "disposition",
-            "universal_command_args",
-            "capacity_plan",
-            "retry_observation",
-            "cancellation_request",
-            "created_unix_ms",
-            "updated_unix_ms",
-        ],
-    )?;
-    for field in [
-        "schema_version",
-        "operation_id",
-        "intent",
-        "universal_intent",
-        "phase",
-        "disposition",
-        "universal_command_args",
-        "capacity_plan",
-        "retry_observation",
-        "cancellation_request",
-        "created_unix_ms",
-        "updated_unix_ms",
-    ] {
-        required_field(object, field)?;
-    }
-    validate_persisted_intent_value(required_field(object, "intent")?)?;
-    validate_persisted_v12_universal_intent_value(required_field(object, "universal_intent")?)?;
-    validate_persisted_v12_universal_command_args_value(required_field(
-        object,
-        "universal_command_args",
-    )?)?;
-    validate_persisted_capacity_plan_v3_value(required_field(object, "capacity_plan")?)?;
-    if let Some(retry) = object.get("retry_observation") {
-        if !retry.is_null() {
-            validate_persisted_retry_observation_value(retry)?;
-        }
-    }
-    if let Some(cancellation) = object.get("cancellation_request") {
-        if !cancellation.is_null() {
-            validate_persisted_cancellation_request_value(cancellation)?;
-        }
-    }
-    Ok(())
+        validate_persisted_v12_universal_intent_value,
+        validate_persisted_v12_universal_command_args_value,
+    )
 }
-
 fn validate_persisted_v12_universal_intent_value(value: &Value) -> Result<(), &'static str> {
     validate_persisted_universal_intent_value_with_retained_resolution(value, true)
 }
@@ -4782,6 +3940,189 @@ mod tests {
             }
         });
         fixture
+    }
+
+    fn v6_v12_codec_golden_fixtures() -> Vec<(String, Value)> {
+        let mut fixtures = Vec::new();
+        for variant in ["Copy", "Import", "DuplicateSame"] {
+            fixtures.push((format!("v6-{variant}"), v6_command_fixture(variant)));
+        }
+        for variant in ["Copy", "Import", "DuplicateSame"] {
+            let mut fixture = v6_command_fixture(variant);
+            fixture["schema_version"] = Value::from(SCHEMA_V7);
+            fixtures.push((format!("v7-{variant}"), fixture));
+        }
+        let mut v7_waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        v7_waveform["schema_version"] = Value::from(SCHEMA_V7);
+        fixtures.push((String::from("v7-WaveformEdit-Reverse"), v7_waveform));
+
+        for variant in ["Copy", "Import", "DuplicateSame"] {
+            let mut fixture = v6_command_fixture(variant);
+            fixture["schema_version"] = Value::from(SCHEMA_V8);
+            fixtures.push((format!("v8-{variant}"), fixture));
+        }
+        let mut v8_waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        v8_waveform["schema_version"] = Value::from(SCHEMA_V8);
+        fixtures.push((String::from("v8-WaveformEdit-Reverse"), v8_waveform));
+        for variant in ["Rename", "Move", "CreateFolder"] {
+            fixtures.push((
+                format!("v8-Namespace-{variant}"),
+                v8_namespace_fixture(variant),
+            ));
+        }
+
+        for variant in ["Copy", "Import", "DuplicateSame"] {
+            let mut fixture = v6_command_fixture(variant);
+            fixture["schema_version"] = Value::from(SCHEMA_V9);
+            fixtures.push((format!("v9-{variant}"), fixture));
+        }
+        let mut v9_waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        v9_waveform["schema_version"] = Value::from(SCHEMA_V9);
+        fixtures.push((String::from("v9-WaveformEdit-Reverse"), v9_waveform));
+        let mut v9_namespace = v8_namespace_fixture("Rename");
+        v9_namespace["schema_version"] = Value::from(SCHEMA_V9);
+        fixtures.push((String::from("v9-Namespace-Rename"), v9_namespace));
+        for variant in ["Normalize", "DuplicateDouble"] {
+            fixtures.push((format!("v9-Render-{variant}"), v9_render_fixture(variant)));
+        }
+
+        for version in [SCHEMA_V10, SCHEMA_V11, SCHEMA_V12] {
+            for variant in ["Copy", "Import", "DuplicateSame"] {
+                let mut fixture = v6_command_fixture(variant);
+                fixture["schema_version"] = Value::from(version);
+                fixtures.push((format!("v{version}-{variant}"), fixture));
+            }
+            let mut waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+            waveform["schema_version"] = Value::from(version);
+            fixtures.push((format!("v{version}-WaveformEdit-Reverse"), waveform));
+            let mut namespace = v8_namespace_fixture("Rename");
+            namespace["schema_version"] = Value::from(version);
+            fixtures.push((format!("v{version}-Namespace-Rename"), namespace));
+            for variant in ["Normalize", "DuplicateDouble"] {
+                let mut render = v9_render_fixture(variant);
+                render["schema_version"] = Value::from(version);
+                fixtures.push((format!("v{version}-Render-{variant}"), render));
+            }
+            let mut removal = v10_trash_fixture();
+            removal["schema_version"] = Value::from(version);
+            fixtures.push((format!("v{version}-Removal-Trash"), removal));
+            if version >= SCHEMA_V11 {
+                for variant in ["Restore", "Purge"] {
+                    let mut retained = v11_retained_fixture(variant);
+                    retained["schema_version"] = Value::from(version);
+                    fixtures.push((format!("v{version}-RetainedResolution-{variant}"), retained));
+                }
+            }
+            if version >= SCHEMA_V12 {
+                fixtures.push((
+                    String::from("v12-SelectionNormalize"),
+                    v12_selection_normalize_fixture(),
+                ));
+            }
+        }
+
+        fixtures
+    }
+
+    const CODEC_V6_V12_WIRE_GOLDENS: &str = include_str!("codec_v6_v12_wire_goldens.txt");
+
+    #[test]
+    fn codec_v6_v12_wire_golden_baseline() {
+        let fixtures = v6_v12_codec_golden_fixtures();
+        let expected = CODEC_V6_V12_WIRE_GOLDENS
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let name = fields.next().expect("golden name");
+                let length = fields
+                    .next()
+                    .expect("golden length")
+                    .parse::<usize>()
+                    .expect("golden length is an integer");
+                let hash = fields.next().expect("golden hash");
+                assert!(fields.next().is_none(), "golden manifest has extra fields");
+                (name, length, hash)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fixtures.len(), expected.len());
+        for ((name, fixture), (expected_name, expected_len, expected_hash)) in
+            fixtures.iter().zip(expected)
+        {
+            assert_eq!(name, expected_name);
+            let input = serde_json::to_vec(fixture).expect("fixture bytes");
+            let record = decode(&input).expect("fixture decodes");
+            let encoded = encode(&record).expect("fixture encodes");
+            assert_eq!(encoded.len(), expected_len, "{name} encoded length");
+            assert_eq!(
+                blake3::hash(&encoded).to_hex().to_string(),
+                expected_hash,
+                "{name} encoded bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_v6_v12_negative_error_baseline() {
+        let mut waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        waveform["schema_version"] = Value::from(SCHEMA_V6);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&waveform).expect("waveform bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason == "schema-v6 cannot carry schema-v7 waveform edit arguments"
+        ));
+
+        let mut retained = v11_retained_fixture("Restore");
+        retained["schema_version"] = Value::from(SCHEMA_V10);
+        assert!(matches!(
+            decode(&serde_json::to_vec(&retained).expect("retained bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason == "persisted universal intent contains schema-v11 retained resolution command"
+        ));
+
+        let mut missing_retry = v9_render_fixture("Normalize");
+        missing_retry
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("retry_observation");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&missing_retry).expect("missing retry bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason == "persisted object is missing a required field"
+        ));
+
+        let mut invalid_retry = v9_render_fixture("Normalize");
+        invalid_retry["retry_observation"] = serde_json::json!({
+            "requested_unix_ms": 50,
+            "unexpected": true
+        });
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_retry).expect("invalid retry bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason == "persisted object contains an unknown field"
+        ));
+
+        let mut missing_cancel = v9_render_fixture("Normalize");
+        missing_cancel
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("cancellation_request");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&missing_cancel).expect("missing cancellation bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason == "persisted object is missing a required field"
+        ));
+
+        let mut invalid_cancel = v9_render_fixture("Normalize");
+        invalid_cancel["cancellation_request"] = serde_json::json!({
+            "requested_unix_ms": 50,
+            "unexpected": true
+        });
+        assert!(matches!(
+            decode(&serde_json::to_vec(&invalid_cancel).expect("invalid cancellation bytes")),
+            Err(DecodeError::Malformed { reason })
+                if reason == "persisted object contains an unknown field"
+        ));
     }
 
     #[test]
