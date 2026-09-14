@@ -1263,3 +1263,8 @@ charges, and no held claims. These remain observations, not live release proofs.
 Six capacity tests, six claim tests and twenty progress tests passed, together
 with library/GPUI checks without default features and formatting/diff checks.
 Primary review added the per-volume aggregate and unit-consistency checks.
+
+Windows storage run `34899074677` passed at exact capacity source `f79e85257`:
+278 journal tests passed with one ignored, including all six full-capacity tests.
+The remaining storage-lane checks passed. Native Windows UI/audio acceptance is
+separate.
