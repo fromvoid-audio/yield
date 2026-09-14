@@ -1142,4 +1142,8 @@ origin-removal sequence even within one database. Direct relocations require
 origin absence; retained purge instead verifies the selected retained object's
 absence. Restore records precede retention relocation, while retained-payload
 verification follows it. No material findings remained on recheck. Windows storage
-validation is pending.
+validation passed at exact source commit `499802ee3c57f60b2a96125ef98e2f8e64a67704`
+in run `34886224285`: 243 journal tests passed with one ignored, including all ten
+planner tests. The legacy reader, source ownership, catalog/session and waveform
+adapter checks also passed. This storage lane does not establish native Windows
+UI or audio acceptance.
