@@ -5,6 +5,7 @@
 //! authority. The separate store module adds the profile-owned SQLite persistence boundary and
 //! retains those capabilities for the lifetime of its connection.
 
+pub mod admission_claims;
 pub mod codec;
 pub mod coordinator;
 pub mod evidence;
@@ -26,6 +27,12 @@ pub mod work_plan;
 pub mod work_progress;
 
 pub use codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
+
+pub use admission_claims::{
+    AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
+    AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
+    AdmissionClaimValidationError, MAX_ADMISSION_CLAIMS,
+};
 
 pub use coordinator::{
     CopyCollisionPolicy, CopyEndpoint, CopyEndpointRole, CopyIntentArgs, CopyIntentValidationError,

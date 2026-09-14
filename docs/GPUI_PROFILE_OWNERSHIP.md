@@ -1200,3 +1200,15 @@ the raw ExternalFs source-audit requirement remains separate. Fourteen focused
 progress tests, library compilation without default features, formatting and diff
 checks passed. Primary diff review found no material issue. No production audit
 authority issuer or durable progress encoding is provided yet.
+
+The admission-claim observation contract is bounded to 256 positive, uniquely
+identified claims. It requires exact allocated-byte coverage for every captured
+volume/allocation-class pair, rejecting empty/zero, duplicate, unknown, missing,
+under/over and overflowing coverage. Ambiguous duplicate capacity-plan pairs are
+rejected by this new contract without changing legacy capacity-plan behavior.
+Settlement observations cover every claim exactly once as Released,
+ConsumedOrTransferred, or Held. Their classification predicates are not live
+release proofs; future private admission/recovery authorities remain required.
+Five focused claim tests, the library check without default features, formatting
+and diff checks passed. Primary diff review found no material issue. The contract
+is not yet wired into durable progress or the live OPT-1338 capacity provider.
