@@ -982,4 +982,11 @@ boundary. Negative baselines retain the V6 waveform diagnostic and required
 nullable retry/cancellation fields. Local validation passed 212 serialized
 journal tests (one helper ignored), library checks with and without default
 features, GPUI compilation, formatting and diff checks. Independent compatibility
-review found no meaningful issues. Windows validation for this refactor is pending.
+review found no meaningful issues.
+
+Windows storage validation
+[34866551245](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34866551245)
+passed at exact commit `6c75d2fd8f04b62f2e111f9ea34ddcc67e9e45ab`, including both
+frozen compatibility baselines and 200 journal tests (one helper ignored).
+The lane also passed the catalog, session, core edit-settings and media-adapter
+checks. This is storage acceptance, not native Windows UI or audio execution.
