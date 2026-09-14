@@ -1147,3 +1147,32 @@ in run `34886224285`: 243 journal tests passed with one ignored, including all t
 planner tests. The legacy reader, source ownership, catalog/session and waveform
 adapter checks also passed. This storage lane does not establish native Windows
 UI or audio acceptance.
+
+### Guarded work-progress core
+
+The pure work-progress model derives an exact state for every frozen-plan unit.
+Completion requires a private, non-serialized token bound to the operation, plan,
+participant scope, role and execution epoch. Stored receipt summaries remain
+observations and cannot construct that token. No production token issuer or
+filesystem executor is supplied by this layer.
+
+Prerequisites gate completion, including staged copy validation and compound
+extraction-before-trim. The global phase records a monotonic visibility frontier;
+one published action does not complete later actions. Source reconciliation also
+requires all required filesystem obligations. Success requires every required
+unit, no audit hold, and completion or explicit deferral of optional artifacts.
+
+Source commits retain before/after revisions. Fenced coordinator receipts carry
+source observations and must meet the latest accepted revision across participants
+for that source. Retry resume requires a private exact-lease/time/epoch gate and
+advances the execution epoch, rejecting callbacks from earlier attempts. Retry,
+audit and cancellation observations preserve pending work; cancellation terminals
+require private safety gates with no production issuer.
+
+Eight focused progress tests and the library and GPUI checks without default
+features passed, as did formatting and diff checks. Independent review verified
+the fenced coordinator and retry-epoch repairs; its final empty retry-window
+finding was repaired with an unchanged-state boundary regression. Windows storage
+validation is pending. Durable progress encoding, SQL CAS, owner integration,
+source-lease reacquisition, audit recovery and readiness-deficit scheduling remain
+separate work; this core does not complete OPT-1337.
