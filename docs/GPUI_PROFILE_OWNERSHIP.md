@@ -1176,3 +1176,13 @@ finding was repaired with an unchanged-state boundary regression. Windows storag
 validation is pending. Durable progress encoding, SQL CAS, owner integration,
 source-lease reacquisition, audit recovery and readiness-deficit scheduling remain
 separate work; this core does not complete OPT-1337.
+
+The following source-reacquisition guard preserves the immutable plan while
+rebinding the current scopes for every participant of one stable source. A private
+authority must match the current source-database scope and execution epoch, retain
+source/root/database/lifecycle identity, advance the lease epoch, and meet the
+greatest accepted source or coordinator revision. Reacquisition advances the
+execution epoch and preserves retry, audit and cancellation holds. It cannot
+complete work or resume a retry, and no production authority issuer is present.
+Eleven focused progress tests, the library check without default features,
+formatting and diff checks passed. Primary diff review found no material issue.

@@ -485,6 +485,22 @@ struct VerifiedRetryResume {
     expected_execution_epoch: u64,
 }
 
+/// Private owner-issued authority for reacquiring a source lease after a handoff.
+///
+/// The old scope is carried by value so a stale owner cannot cause the progress model to
+/// rewrite a scope that another owner already reacquired.  This authority is intentionally not
+/// constructible by production code in this module; the future source owner must issue it after
+/// checking the live lease and source database.
+#[allow(dead_code)]
+struct VerifiedSourceReacquisition {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    target_participant_id: ParticipantId,
+    old_scope: ParticipantScope,
+    new_fence: StoredSourceFence,
+}
+
 /// Internal typed gate for a pre-publication cancellation terminal transition.
 #[allow(dead_code)]
 struct PrePublishCancellationAuthority {
@@ -725,6 +741,94 @@ impl WorkProgress {
         Ok(())
     }
 
+    /// Rebind every scope for one stable source after a private owner reacquires its lease.
+    ///
+    /// Reacquisition only advances the owner epoch and observed scopes.  It never changes the
+    /// frozen command or plan, marks a step complete, clears a retry/audit/cancellation
+    /// disposition, or grants a live source capability.
+    #[allow(dead_code)]
+    fn reacquire_source(
+        &mut self,
+        authority: VerifiedSourceReacquisition,
+    ) -> Result<(), WorkProgressError> {
+        if self.disposition.is_terminal() {
+            return Err(WorkProgressError::TerminalTransitionForbidden);
+        }
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::SourceReacquisitionAuthorityMismatch);
+        }
+        let Some(current_scope) = self
+            .scopes
+            .iter()
+            .find(|scope| scope.participant_id == authority.target_participant_id)
+        else {
+            return Err(WorkProgressError::SourceReacquisitionTargetInvalid {
+                participant_id: authority.target_participant_id,
+            });
+        };
+        if current_scope.kind != ParticipantKind::SourceDatabase
+            || current_scope.source_fence.is_none()
+        {
+            return Err(WorkProgressError::SourceReacquisitionTargetInvalid {
+                participant_id: authority.target_participant_id,
+            });
+        }
+        if current_scope != &authority.old_scope {
+            return Err(WorkProgressError::SourceReacquisitionAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::SourceReacquisitionEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        authority.new_fence.validate()?;
+        let old_fence = current_scope
+            .source_fence
+            .as_ref()
+            .expect("source database scope checked above")
+            .clone();
+        if !same_stable_source_identity(&old_fence, &authority.new_fence) {
+            return Err(WorkProgressError::SourceReacquisitionIdentityMismatch);
+        }
+        let current_lease_epoch = self
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.source_fence.as_ref())
+            .filter(|fence| same_stable_source_identity(fence, &old_fence))
+            .map(StoredSourceFence::lease_epoch)
+            .max()
+            .unwrap_or(old_fence.lease_epoch());
+        if authority.new_fence.lease_epoch() <= current_lease_epoch {
+            return Err(WorkProgressError::SourceReacquisitionLeaseRegressed {
+                observed: authority.new_fence.lease_epoch(),
+                current: current_lease_epoch,
+            });
+        }
+        let minimum_revision = self.minimum_source_revision_for_stable_source(&old_fence);
+        if authority.new_fence.source_revision() < minimum_revision {
+            return Err(WorkProgressError::SourceReacquisitionRevisionRegressed {
+                observed: authority.new_fence.source_revision(),
+                minimum: minimum_revision,
+            });
+        }
+        let next_execution_epoch = self
+            .execution_epoch
+            .checked_add(1)
+            .ok_or(WorkProgressError::SourceReacquisitionEpochOverflow)?;
+        for scope in &mut self.scopes {
+            if scope
+                .source_fence
+                .as_ref()
+                .is_some_and(|fence| same_stable_source_identity(fence, &old_fence))
+            {
+                scope.source_fence = Some(authority.new_fence.clone());
+            }
+        }
+        self.execution_epoch = next_execution_epoch;
+        Ok(())
+    }
+
     /// Record a bounded audit disposition while preserving all current step observations.
     pub(crate) fn require_audit(
         &mut self,
@@ -957,6 +1061,42 @@ impl WorkProgress {
                 _ => None,
             })
             .max()
+    }
+
+    fn minimum_source_revision_for_stable_source(&self, fence: &StoredSourceFence) -> u64 {
+        let mut minimum = fence.source_revision();
+        for scope in &self.scopes {
+            if let Some(scope_fence) = scope.source_fence.as_ref() {
+                if same_stable_source_identity(scope_fence, fence) {
+                    minimum = minimum.max(scope_fence.source_revision());
+                }
+            }
+        }
+        for step in &self.steps {
+            let Some(scope_fence) = self
+                .scope_for(step.key)
+                .and_then(ParticipantScope::source_fence)
+            else {
+                continue;
+            };
+            if !same_stable_source_identity(scope_fence, fence) {
+                continue;
+            }
+            let observation = match step.evidence.as_ref() {
+                Some(StoredStepEvidence::SourceObserved { observation })
+                | Some(StoredStepEvidence::SourceCommitted {
+                    after: observation, ..
+                }) => Some(observation),
+                Some(StoredStepEvidence::Coordinator { receipt }) => receipt.source_observation(),
+                _ => None,
+            };
+            if let Some(observation) = observation {
+                if same_stable_source_identity_observation(observation, fence) {
+                    minimum = minimum.max(observation.revision());
+                }
+            }
+        }
+        minimum
     }
 
     fn refresh_derived_state(&mut self) {
@@ -1311,6 +1451,23 @@ fn validate_source_observation(
     Ok(())
 }
 
+fn same_stable_source_identity(left: &StoredSourceFence, right: &StoredSourceFence) -> bool {
+    left.source_id() == right.source_id()
+        && left.root_identity() == right.root_identity()
+        && left.database_identity() == right.database_identity()
+        && left.lifecycle_generation() == right.lifecycle_generation()
+}
+
+fn same_stable_source_identity_observation(
+    observation: &SourceRevisionObservation,
+    fence: &StoredSourceFence,
+) -> bool {
+    observation.source_id() == fence.source_id()
+        && observation.root_identity() == fence.root_identity()
+        && observation.database_identity() == fence.database_identity()
+        && observation.lifecycle_generation() == fence.lifecycle_generation()
+}
+
 fn validate_source_text(
     value: &str,
     field: ParticipantTextField,
@@ -1402,6 +1559,51 @@ pub enum WorkProgressError {
         /// Epoch supplied by the completion authority.
         actual: u64,
     },
+    /// A private source-reacquisition authority did not bind the operation, plan, or old scope.
+    #[error("work progress source-reacquisition authority does not match")]
+    SourceReacquisitionAuthorityMismatch,
+    /// The source-reacquisition target was not a currently fenced source database participant.
+    #[error(
+        "work progress source-reacquisition target is not a fenced source database: {participant_id}"
+    )]
+    SourceReacquisitionTargetInvalid {
+        /// Participant named by the private reacquisition authority.
+        participant_id: ParticipantId,
+    },
+    /// A private source-reacquisition authority carried another execution epoch.
+    #[error(
+        "work progress source-reacquisition epoch {actual} does not match expected epoch {expected}"
+    )]
+    SourceReacquisitionEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the reacquisition authority.
+        actual: u64,
+    },
+    /// A reacquired fence changed stable source identity or lifecycle.
+    #[error("work progress source-reacquisition stable source identity does not match")]
+    SourceReacquisitionIdentityMismatch,
+    /// A reacquired lease was not strictly newer than every scope for the source.
+    #[error(
+        "work progress source-reacquisition lease epoch {observed} is not newer than {current}"
+    )]
+    SourceReacquisitionLeaseRegressed {
+        /// Lease epoch carried by the new source fence.
+        observed: u64,
+        /// Greatest lease epoch already observed for the stable source.
+        current: u64,
+    },
+    /// A reacquired source revision fell behind accepted source or coordinator evidence.
+    #[error("work progress source-reacquisition revision {observed} regressed below {minimum}")]
+    SourceReacquisitionRevisionRegressed {
+        /// Revision carried by the new source fence.
+        observed: u64,
+        /// Greatest accepted revision for the stable source.
+        minimum: u64,
+    },
+    /// The source-reacquisition epoch could not advance without wrapping.
+    #[error("work progress source-reacquisition execution epoch overflowed")]
+    SourceReacquisitionEpochOverflow,
     /// A cancellation observation failed its bounded validation.
     #[error("invalid work progress cancellation observation: {0}")]
     CancellationObservation(#[source] CancellationRequestValidationError),
@@ -1743,6 +1945,48 @@ mod tests {
         .expect("copy progress")
     }
 
+    fn fenced_harvest_progress() -> WorkProgress {
+        let (base, source, _filesystem, source_id) = valid_topology(false);
+        let source_fence = base
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::SourceDatabase)
+            .and_then(ParticipantDescriptor::source_fence)
+            .expect("source fence")
+            .clone();
+        let descriptors = base
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                let fence = if descriptor.kind() == ParticipantKind::Harvest {
+                    Some(source_fence.clone())
+                } else {
+                    descriptor.source_fence().cloned()
+                };
+                ParticipantDescriptor::new(
+                    descriptor.id(),
+                    descriptor.kind(),
+                    descriptor.requirement(),
+                    fence,
+                    descriptor.artifact_key().map(str::to_owned),
+                )
+                .expect("fenced harvest descriptor")
+            })
+            .collect();
+        let participants = ParticipantSet::new(descriptors, base.checkpoints().to_vec())
+            .expect("fenced harvest participants");
+        let args = copy_args_at(source, source_id, "copy.wav");
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("fenced harvest work plan");
+        WorkProgress::from_plan(
+            OperationId::from_uuid(Uuid::from_u128(105)),
+            &plan,
+            &args,
+            &participants,
+        )
+        .expect("fenced harvest progress")
+    }
+
     fn key_for(progress: &WorkProgress, action: u8, role: WorkUnitRole) -> WorkUnitKey {
         progress
             .steps()
@@ -1826,6 +2070,75 @@ mod tests {
             scope: progress.scope_for(key).expect("completion scope").clone(),
             execution_epoch: progress.execution_epoch,
             evidence,
+        }
+    }
+
+    fn source_reacquisition_authority(
+        progress: &WorkProgress,
+        target_participant_id: ParticipantId,
+        revision: u64,
+        lease_epoch: u64,
+        execution_epoch: u64,
+    ) -> VerifiedSourceReacquisition {
+        let old_scope = progress
+            .scopes
+            .iter()
+            .find(|scope| scope.participant_id == target_participant_id)
+            .expect("source scope")
+            .clone();
+        let old_fence = old_scope.source_fence().expect("source fence");
+        let new_fence = StoredSourceFence::new(
+            old_fence.source_id().clone(),
+            old_fence.root_identity(),
+            old_fence.database_identity(),
+            old_fence.lifecycle_generation(),
+            revision,
+            lease_epoch,
+        )
+        .expect("new source fence");
+        VerifiedSourceReacquisition {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch,
+            target_participant_id,
+            old_scope,
+            new_fence,
+        }
+    }
+
+    fn source_reacquisition_authority_with_identity(
+        progress: &WorkProgress,
+        target_participant_id: ParticipantId,
+        source_id: SourceId,
+        root_identity: &str,
+        database_identity: &str,
+        lifecycle_generation: u64,
+        revision: u64,
+        lease_epoch: u64,
+        execution_epoch: u64,
+    ) -> VerifiedSourceReacquisition {
+        let old_scope = progress
+            .scopes
+            .iter()
+            .find(|scope| scope.participant_id == target_participant_id)
+            .expect("source scope")
+            .clone();
+        let new_fence = StoredSourceFence::new(
+            source_id,
+            root_identity,
+            database_identity,
+            lifecycle_generation,
+            revision,
+            lease_epoch,
+        )
+        .expect("new source fence");
+        VerifiedSourceReacquisition {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch,
+            target_participant_id,
+            old_scope,
+            new_fence,
         }
     }
 
@@ -2473,5 +2786,300 @@ mod tests {
             cancelled.disposition(),
             OperationDisposition::CancelledBeforePublish
         );
+    }
+
+    #[test]
+    fn source_reacquisition_advances_shared_fence_and_invalidates_old_epoch() {
+        let mut progress = copy_progress(false);
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let source_participant_id = source_key.participant_id();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        for role in [
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        let source_affect = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                source_affect,
+                StoredStepEvidence::SourceCommitted {
+                    before_revision: 7,
+                    after: source_observation(&progress, source_affect, 8),
+                },
+            ))
+            .expect("source commit establishes revision floor");
+        apply_role(&mut progress, u8::MAX, WorkUnitRole::GlobalLibrary);
+        apply_role(&mut progress, u8::MAX, WorkUnitRole::Harvest);
+        let projection = key_for(&progress, u8::MAX, WorkUnitRole::Projection);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                projection,
+                evidence_for(&progress, projection, 8),
+            ))
+            .expect("projection records source-bound revision");
+        let readiness = key_for(&progress, u8::MAX, WorkUnitRole::Readiness);
+        let stale_scope_completion =
+            completion(&progress, readiness, evidence_for(&progress, readiness, 8));
+        let plan_before = progress.plan.clone();
+        let steps_before = progress.steps.clone();
+
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant_id,
+                8,
+                2,
+                0,
+            ))
+            .expect("source owner reacquisition");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(progress.plan, plan_before);
+        assert_eq!(progress.steps, steps_before);
+        assert_eq!(progress.disposition(), OperationDisposition::None);
+        for key in [source_key, projection, readiness] {
+            let fence = progress
+                .scope_for(key)
+                .expect("shared source scope")
+                .source_fence()
+                .expect("shared source fence");
+            assert_eq!(fence.source_revision(), 8);
+            assert_eq!(fence.lease_epoch(), 2);
+        }
+        let harvest = key_for(&progress, u8::MAX, WorkUnitRole::Harvest);
+        assert!(
+            progress
+                .scope_for(harvest)
+                .expect("harvest scope")
+                .source_fence()
+                .is_none()
+        );
+
+        assert!(matches!(
+            progress.apply_verified_completion(stale_scope_completion),
+            Err(WorkProgressError::ParticipantScopeMismatch { key }) if key == readiness
+        ));
+        let mut stale_epoch =
+            completion(&progress, readiness, evidence_for(&progress, readiness, 8));
+        stale_epoch.execution_epoch = 0;
+        assert!(matches!(
+            progress.apply_verified_completion(stale_epoch),
+            Err(WorkProgressError::ExecutionEpochMismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                readiness,
+                evidence_for(&progress, readiness, 8),
+            ))
+            .expect("completion issued in reacquired epoch");
+    }
+
+    #[test]
+    fn source_reacquisition_updates_source_fenced_harvest_and_rejects_stale_guards() {
+        let mut fenced_harvest = fenced_harvest_progress();
+        let source_key = key_for(&fenced_harvest, 0, WorkUnitRole::SourceRead);
+        let source_participant_id = source_key.participant_id();
+        let harvest_key = key_for(&fenced_harvest, u8::MAX, WorkUnitRole::Harvest);
+        fenced_harvest
+            .reacquire_source(source_reacquisition_authority(
+                &fenced_harvest,
+                source_participant_id,
+                7,
+                2,
+                0,
+            ))
+            .expect("source owner reacquisition");
+        for key in [source_key, harvest_key] {
+            let fence = fenced_harvest
+                .scope_for(key)
+                .expect("shared source scope")
+                .source_fence()
+                .expect("fenced source scope");
+            assert_eq!(fence.source_revision(), 7);
+            assert_eq!(fence.lease_epoch(), 2);
+        }
+
+        let mut progress = copy_progress(false);
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let target = source_key.participant_id();
+        let before = progress.clone();
+        let source_id = progress
+            .scope_for(source_key)
+            .expect("source scope")
+            .source_fence()
+            .expect("source fence")
+            .source_id()
+            .clone();
+        for authority in [
+            source_reacquisition_authority_with_identity(
+                &progress,
+                target,
+                SourceId::from_string("other-source"),
+                "root-a",
+                "db-a",
+                1,
+                7,
+                2,
+                0,
+            ),
+            source_reacquisition_authority_with_identity(
+                &progress,
+                target,
+                source_id.clone(),
+                "different-root",
+                "db-a",
+                1,
+                7,
+                2,
+                0,
+            ),
+            source_reacquisition_authority_with_identity(
+                &progress,
+                target,
+                source_id.clone(),
+                "root-a",
+                "db-a",
+                2,
+                7,
+                2,
+                0,
+            ),
+        ] {
+            assert!(matches!(
+                progress.reacquire_source(authority),
+                Err(WorkProgressError::SourceReacquisitionIdentityMismatch)
+            ));
+            assert_eq!(progress, before);
+        }
+        assert!(matches!(
+            progress.reacquire_source(source_reacquisition_authority(&progress, target, 7, 1, 0,)),
+            Err(WorkProgressError::SourceReacquisitionLeaseRegressed {
+                observed: 1,
+                current: 1
+            })
+        ));
+        assert_eq!(progress, before);
+        assert!(matches!(
+            progress.reacquire_source(source_reacquisition_authority(&progress, target, 6, 2, 0,)),
+            Err(WorkProgressError::SourceReacquisitionRevisionRegressed {
+                observed: 6,
+                minimum: 7
+            })
+        ));
+        assert_eq!(progress, before);
+        assert!(matches!(
+            progress.reacquire_source(source_reacquisition_authority(&progress, target, 7, 2, 1,)),
+            Err(WorkProgressError::SourceReacquisitionEpochMismatch {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        assert_eq!(progress, before);
+
+        let old_scope = progress
+            .scope_for(source_key)
+            .expect("source scope")
+            .clone();
+        let first_authority = source_reacquisition_authority(&progress, target, 7, 2, 0);
+        progress
+            .reacquire_source(first_authority)
+            .expect("first source reacquisition");
+        let after_first = progress.clone();
+        let old_fence = old_scope.source_fence().expect("old source fence").clone();
+        let stale_authority = VerifiedSourceReacquisition {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: 1,
+            target_participant_id: target,
+            old_scope,
+            new_fence: StoredSourceFence::new(
+                old_fence.source_id().clone(),
+                old_fence.root_identity(),
+                old_fence.database_identity(),
+                old_fence.lifecycle_generation(),
+                7,
+                3,
+            )
+            .expect("stale authority fence"),
+        };
+        assert!(matches!(
+            progress.reacquire_source(stale_authority),
+            Err(WorkProgressError::SourceReacquisitionAuthorityMismatch)
+        ));
+        assert_eq!(progress, after_first);
+    }
+
+    #[test]
+    fn source_reacquisition_preserves_retry_audit_and_cancellation_dispositions() {
+        let observation = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("reacquire-retry").expect("retry lease"),
+            10,
+            RetryErrorClass::TransientContention,
+            "busy",
+            None,
+        )
+        .expect("retry observation");
+        let mut retry = copy_progress(false);
+        let target = key_for(&retry, 0, WorkUnitRole::SourceRead).participant_id();
+        retry
+            .request_retry(observation.clone())
+            .expect("request retry");
+        retry
+            .reacquire_source(source_reacquisition_authority(&retry, target, 7, 2, 0))
+            .expect("reacquire while retry pending");
+        assert_eq!(retry.execution_epoch(), 1);
+        assert_eq!(retry.disposition(), OperationDisposition::RetryPending);
+        assert_eq!(retry.retry_observation(), Some(&observation));
+
+        let mut audit = copy_progress(false);
+        let target = key_for(&audit, 0, WorkUnitRole::SourceRead).participant_id();
+        let audit_observation = ProgressAuditObservation::new(ProgressAuditReason::RevisionGap);
+        audit
+            .require_audit(audit_observation)
+            .expect("require audit");
+        audit
+            .reacquire_source(source_reacquisition_authority(&audit, target, 7, 2, 0))
+            .expect("reacquire while audit required");
+        assert_eq!(audit.execution_epoch(), 1);
+        assert_eq!(audit.disposition(), OperationDisposition::AuditRequired);
+        assert_eq!(audit.audit_observation(), Some(audit_observation));
+
+        let mut cancelled = copy_progress(false);
+        let target = key_for(&cancelled, 0, WorkUnitRole::SourceRead).participant_id();
+        let cancellation = CancellationRequestObservation::new(77).expect("cancel request");
+        cancelled
+            .request_cancellation(cancellation)
+            .expect("request cancellation");
+        cancelled
+            .reacquire_source(source_reacquisition_authority(&cancelled, target, 7, 2, 0))
+            .expect("reacquire while cancellation requested");
+        assert_eq!(cancelled.execution_epoch(), 1);
+        assert_eq!(
+            cancelled.disposition(),
+            OperationDisposition::CancelRequestedBeforePublish
+        );
+        assert_eq!(cancelled.cancellation_request(), Some(cancellation));
+
+        let mut terminal = copy_progress(false);
+        complete_required(&mut terminal);
+        let target = key_for(&terminal, 0, WorkUnitRole::SourceRead).participant_id();
+        let before_terminal = terminal.clone();
+        assert!(matches!(
+            terminal.reacquire_source(source_reacquisition_authority(&terminal, target, 7, 2, 0)),
+            Err(WorkProgressError::TerminalTransitionForbidden)
+        ));
+        assert_eq!(terminal, before_terminal);
     }
 }
