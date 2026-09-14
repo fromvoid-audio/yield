@@ -1268,3 +1268,12 @@ Windows storage run `34899074677` passed at exact capacity source `f79e85257`:
 278 journal tests passed with one ignored, including all six full-capacity tests.
 The remaining storage-lane checks passed. Native Windows UI/audio acceptance is
 separate.
+
+Normal full-progress success now requires a private epoch-bound settlement
+authority after all required work and optional-artifact decisions resolve. Exact
+claim coverage is retained; held rows stay nonterminal and may later settle,
+while settled outcomes cannot change. Exact replay is idempotent. Unadmitted
+pure progress no longer reports success from work completion alone. Twenty-five
+focused progress tests passed, together with library/GPUI checks without default
+features, formatting and diff checks. Primary review repaired retention and
+monotonic advancement of held rows. No live capacity authority issuer was added.

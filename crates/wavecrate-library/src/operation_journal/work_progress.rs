@@ -17,7 +17,10 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::admission_claims::{AdmissionClaimInventory, AdmissionClaimValidationError};
+use super::admission_claims::{
+    AdmissionClaimInventory, AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
+    AdmissionClaimValidationError,
+};
 use super::cancellation_recovery::{
     CancellationInventory, CancellationInventoryError, CancellationRoute,
 };
@@ -605,6 +608,20 @@ pub(crate) struct VerifiedStepCompletion {
     evidence: StoredStepEvidence,
 }
 
+/// Crate-private owner-issued authority for settling all retained admission claims.
+///
+/// The authority is deliberately non-serialized and has no production constructor here.  A
+/// future owner must bind the operation, frozen plan, current execution epoch, exact admitted
+/// claim observation, and the candidate settlement observation before handing it to progress.
+#[allow(dead_code)]
+pub(crate) struct VerifiedClaimSettlement {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    admission_claims: AdmissionClaimInventory,
+    settlement: AdmissionClaimSettlementInventory,
+}
+
 /// Private owner-issued authority for resuming work after a durable retry observation.
 #[allow(dead_code)]
 struct VerifiedRetryResume {
@@ -686,6 +703,7 @@ pub struct WorkProgress {
     audit_generation: u64,
     cancellation_request: Option<CancellationRequestObservation>,
     admission_claims: Option<AdmissionClaimInventory>,
+    claim_settlement: Option<AdmissionClaimSettlementInventory>,
     cancellation_inventory: Option<CancellationInventory>,
 }
 
@@ -741,6 +759,7 @@ impl WorkProgress {
             audit_generation: 0,
             cancellation_request: None,
             admission_claims: None,
+            claim_settlement: None,
             cancellation_inventory: None,
         })
     }
@@ -827,6 +846,11 @@ impl WorkProgress {
     /// Borrow the optional immutable capacity-claim observation retained with progress.
     pub fn admission_claims(&self) -> Option<&AdmissionClaimInventory> {
         self.admission_claims.as_ref()
+    }
+
+    /// Borrow the optional immutable settlement observation retained by the success guard.
+    pub fn claim_settlement(&self) -> Option<&AdmissionClaimSettlementInventory> {
+        self.claim_settlement.as_ref()
     }
 
     /// Borrow the immutable cancellation inventory frozen by the first request, when present.
@@ -1333,6 +1357,86 @@ impl WorkProgress {
         Ok(ProgressApplyOutcome::Applied)
     }
 
+    /// Apply a private owner-issued settlement for every admitted claim.
+    ///
+    /// Normal success is withheld until all required work and optional artifact decisions are
+    /// resolved and the exact admitted inventory has a non-held settlement outcome for every
+    /// claim.  A valid inventory containing `Held` rows is retained as a nonterminal observation
+    /// so a later owner authority can settle those rows.  This method has no live release or
+    /// capacity authority.  Replaying the exact observation is idempotent, while a settled row
+    /// cannot be rewritten.
+    #[allow(dead_code)]
+    pub(crate) fn apply_verified_claim_settlement(
+        &mut self,
+        authority: VerifiedClaimSettlement,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::ClaimSettlementAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::ClaimSettlementEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        authority
+            .admission_claims
+            .validate()
+            .map_err(WorkProgressError::ClaimSettlement)?;
+        let Some(admission_claims) = self.admission_claims.as_ref() else {
+            return Err(WorkProgressError::ClaimSettlementAdmissionClaimsMissing);
+        };
+        if admission_claims != &authority.admission_claims {
+            return Err(WorkProgressError::ClaimSettlementClaimsMismatch);
+        }
+        authority
+            .settlement
+            .validate_against(&authority.admission_claims)
+            .map_err(WorkProgressError::ClaimSettlement)?;
+        if let Some(existing) = &self.claim_settlement {
+            if existing == &authority.settlement {
+                return Ok(ProgressApplyOutcome::Replay);
+            }
+            for settled in existing.settlements() {
+                if settled.outcome() == AdmissionClaimSettlementOutcome::Held {
+                    continue;
+                }
+                let candidate = authority
+                    .settlement
+                    .settlements()
+                    .iter()
+                    .find(|candidate| candidate.claim_id() == settled.claim_id())
+                    .expect("validated settlement coverage");
+                if candidate.outcome() != settled.outcome() {
+                    return Err(WorkProgressError::ClaimSettlementReplayConflict);
+                }
+            }
+        }
+        if self.disposition.is_terminal() {
+            return Err(WorkProgressError::TerminalTransitionForbidden);
+        }
+        if self.disposition != FullProgressDisposition::None {
+            return Err(WorkProgressError::ProgressSuspended {
+                disposition: self.disposition,
+            });
+        }
+        if !self.all_required_complete() || !self.optional_artifacts_resolved() {
+            return Err(WorkProgressError::ClaimSettlementProgressIncomplete);
+        }
+
+        let all_settled_without_held = authority.settlement.all_settled_without_held();
+        self.claim_settlement = Some(authority.settlement);
+        if all_settled_without_held {
+            self.phase = OperationPhase::Terminal;
+            self.disposition = if self.has_deferred_optional_artifact() {
+                FullProgressDisposition::SucceededWithDeferredArtifacts
+            } else {
+                FullProgressDisposition::Succeeded
+            };
+        }
+        Ok(ProgressApplyOutcome::Applied)
+    }
+
     /// Cancellation outcomes remain unavailable until cleanup, settlement, and safe-state
     /// authorities are implemented.  The placeholder authority cannot advance progress.
     #[allow(dead_code)]
@@ -1433,17 +1537,9 @@ impl WorkProgress {
         if phase_rank(candidate) > phase_rank(self.phase) {
             self.phase = candidate;
         }
-        if self.all_required_complete()
-            && self.active_audit.is_none()
-            && self.optional_artifacts_resolved()
-        {
-            self.phase = OperationPhase::Terminal;
-            self.disposition = if self.has_deferred_optional_artifact() {
-                FullProgressDisposition::SucceededWithDeferredArtifacts
-            } else {
-                FullProgressDisposition::Succeeded
-            };
-        }
+        // A terminal success also needs a private claim-settlement authority.  Keeping this
+        // derived refresh nonterminal prevents an unadmitted or unsettled observation from being
+        // mistaken for durable success.
     }
 
     fn derived_phase(&self) -> OperationPhase {
@@ -1831,6 +1927,9 @@ pub enum WorkProgressError {
     /// The retained admission-claim observation did not exactly cover its capacity plan.
     #[error("invalid work progress admission claims: {0}")]
     AdmissionClaims(#[from] AdmissionClaimValidationError),
+    /// A candidate claim-settlement observation failed bounded exact coverage validation.
+    #[error("invalid work progress claim settlement: {0}")]
+    ClaimSettlement(#[source] AdmissionClaimValidationError),
     /// A nested evidence observation was malformed.
     #[error("invalid work progress evidence: {0}")]
     Evidence(#[from] ProgressEvidenceError),
@@ -1882,6 +1981,16 @@ pub enum WorkProgressError {
         /// Current execution epoch required by progress.
         expected: u64,
         /// Epoch supplied by the completion authority.
+        actual: u64,
+    },
+    /// A private claim-settlement authority carried another execution epoch.
+    #[error(
+        "work progress claim-settlement epoch {actual} does not match expected epoch {expected}"
+    )]
+    ClaimSettlementEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the settlement authority.
         actual: u64,
     },
     /// A private source-reacquisition authority did not bind the operation, plan, or old scope.
@@ -2097,6 +2206,21 @@ pub enum WorkProgressError {
     /// A terminal disposition cannot be changed.
     #[error("work progress terminal transition is already durable")]
     TerminalTransitionForbidden,
+    /// A claim-settlement authority did not bind this operation or frozen plan.
+    #[error("work progress claim-settlement authority does not match")]
+    ClaimSettlementAuthorityMismatch,
+    /// No admission-claim observation was retained for settlement.
+    #[error("work progress claim-settlement admission claims are missing")]
+    ClaimSettlementAdmissionClaimsMissing,
+    /// A claim-settlement authority carried a different retained admission inventory.
+    #[error("work progress claim-settlement admission claims do not match")]
+    ClaimSettlementClaimsMismatch,
+    /// Required work or an optional artifact decision is still pending.
+    #[error("work progress claim settlement requires all work and artifacts to be resolved")]
+    ClaimSettlementProgressIncomplete,
+    /// A replay attempted to change an already-retained settlement observation.
+    #[error("work progress claim-settlement replay conflicts with the retained observation")]
+    ClaimSettlementReplayConflict,
     /// The selected key was not an optional rebuildable artifact still pending.
     #[error("work progress artifact deferral is forbidden for {key:?}")]
     ArtifactDeferralForbidden {
@@ -2151,14 +2275,15 @@ mod tests {
     use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity};
     use crate::operation_journal::MAX_CANCELLATION_STEPS;
     use crate::operation_journal::{
-        AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, CancellationActionState,
-        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation, EvidenceBatchId,
-        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
-        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
-        ExternalRawObservationLimits, ExternalRawObservationMetadata,
-        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
-        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+        AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
+        AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
+        CancellationActionState, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
+        CopySourceExpectation, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
+        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
+        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
+        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
         NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
         NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
         NamespaceFileExpectation, NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget,
@@ -2383,6 +2508,50 @@ mod tests {
         .expect("claim inventory")
     }
 
+    fn two_claim_capacity_plan() -> FullCapacityPlan {
+        FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 1 },
+                1,
+                FullCapacityAllocationClass::DestinationStaging,
+                12,
+                12,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("destination allocation"),
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 2 },
+                1,
+                FullCapacityAllocationClass::OperationRecoveryPayload,
+                8,
+                8,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("recovery allocation"),
+        ])
+        .expect("two-row capacity plan")
+    }
+
+    fn two_admission_claims() -> AdmissionClaimInventory {
+        AdmissionClaimInventory::new(vec![
+            AdmissionClaim::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("first claim id"),
+                VolumeIdentity { device: 1 },
+                FullCapacityAllocationClass::DestinationStaging,
+                12,
+            )
+            .expect("first claim"),
+            AdmissionClaim::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(202)).expect("second claim id"),
+                VolumeIdentity { device: 2 },
+                FullCapacityAllocationClass::OperationRecoveryPayload,
+                8,
+            )
+            .expect("second claim"),
+        ])
+        .expect("two claim inventory")
+    }
+
     fn copy_progress_with_admission_claims() -> WorkProgress {
         let (participants, args, plan) = copy_plan_inputs();
         WorkProgress::from_plan_with_admission_observations(
@@ -2394,6 +2563,69 @@ mod tests {
             admission_claims(12),
         )
         .expect("copy progress with claim observation")
+    }
+
+    fn copy_progress_with_admission_claims_and_optional() -> WorkProgress {
+        let (participants, source, _filesystem, source_id) = valid_topology(true);
+        let args = copy_args_at(source, source_id, "copy.wav");
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("copy work plan");
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(206)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("copy progress with optional claim observation")
+    }
+
+    fn copy_progress_with_two_admission_claims() -> WorkProgress {
+        let (participants, args, plan) = copy_plan_inputs();
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(208)),
+            &plan,
+            &args,
+            &participants,
+            &two_claim_capacity_plan(),
+            two_admission_claims(),
+        )
+        .expect("copy progress with two claim observations")
+    }
+
+    fn settlement_inventory(
+        progress: &WorkProgress,
+        outcome: AdmissionClaimSettlementOutcome,
+    ) -> AdmissionClaimSettlementInventory {
+        let claims = progress.admission_claims().expect("admission claims");
+        AdmissionClaimSettlementInventory::new(
+            claims
+                .claims()
+                .iter()
+                .map(|claim| {
+                    AdmissionClaimSettlement::new(claim.claim_id(), outcome).expect("settlement")
+                })
+                .collect(),
+        )
+        .expect("settlement inventory")
+    }
+
+    fn settlement_authority(
+        progress: &WorkProgress,
+        settlement: AdmissionClaimSettlementInventory,
+    ) -> VerifiedClaimSettlement {
+        VerifiedClaimSettlement {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch,
+            admission_claims: progress
+                .admission_claims
+                .as_ref()
+                .expect("admission claims")
+                .clone(),
+            settlement,
+        }
     }
 
     fn claimed_progress(
@@ -3504,19 +3736,352 @@ mod tests {
         progress
             .defer_optional_artifact(artifact_key)
             .expect("defer optional artifact");
-        assert_eq!(progress.phase(), OperationPhase::Terminal);
-        assert_eq!(
-            progress.disposition(),
-            FullProgressDisposition::SucceededWithDeferredArtifacts
-        );
+        assert_eq!(progress.phase(), OperationPhase::ReadinessScheduled);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
 
-        let mut required_only = copy_progress(false);
+        let mut required_only = copy_progress_with_admission_claims();
         complete_required(&mut required_only);
+        let settlement =
+            settlement_inventory(&required_only, AdmissionClaimSettlementOutcome::Released);
+        required_only
+            .apply_verified_claim_settlement(settlement_authority(&required_only, settlement))
+            .expect("claim settlement applies");
         assert_eq!(required_only.phase(), OperationPhase::Terminal);
         assert_eq!(
             required_only.disposition(),
             FullProgressDisposition::Succeeded
         );
+
+        let mut optional = copy_progress_with_admission_claims_and_optional();
+        complete_required(&mut optional);
+        let before_settlement = optional.clone();
+        let settlement = settlement_inventory(&optional, AdmissionClaimSettlementOutcome::Released);
+        assert_eq!(
+            optional.apply_verified_claim_settlement(settlement_authority(&optional, settlement)),
+            Err(WorkProgressError::ClaimSettlementProgressIncomplete)
+        );
+        assert_eq!(optional, before_settlement);
+        let optional_artifact = optional
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        optional
+            .defer_optional_artifact(optional_artifact)
+            .expect("defer optional artifact");
+        let settlement = settlement_inventory(&optional, AdmissionClaimSettlementOutcome::Released);
+        optional
+            .apply_verified_claim_settlement(settlement_authority(&optional, settlement))
+            .expect("deferred claim settlement applies");
+        assert_eq!(optional.phase(), OperationPhase::Terminal);
+        assert_eq!(
+            optional.disposition(),
+            FullProgressDisposition::SucceededWithDeferredArtifacts
+        );
+    }
+
+    #[test]
+    fn claim_settlement_requires_admission_and_resolved_work() {
+        let mut unadmitted = copy_progress(false);
+        complete_required(&mut unadmitted);
+        assert_eq!(unadmitted.phase(), OperationPhase::ReadinessScheduled);
+        let candidate = AdmissionClaimSettlementInventory::new(vec![
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("claim id"),
+                AdmissionClaimSettlementOutcome::Released,
+            )
+            .expect("settlement"),
+        ])
+        .expect("candidate settlement");
+        let authority = VerifiedClaimSettlement {
+            operation_id: unadmitted.operation_id,
+            plan: unadmitted.plan.clone(),
+            execution_epoch: unadmitted.execution_epoch,
+            admission_claims: admission_claims(12),
+            settlement: candidate,
+        };
+        let before = unadmitted.clone();
+        assert_eq!(
+            unadmitted.apply_verified_claim_settlement(authority),
+            Err(WorkProgressError::ClaimSettlementAdmissionClaimsMissing)
+        );
+        assert_eq!(unadmitted, before);
+
+        let mut incomplete = copy_progress_with_admission_claims();
+        let before = incomplete.clone();
+        let settlement =
+            settlement_inventory(&incomplete, AdmissionClaimSettlementOutcome::Released);
+        assert_eq!(
+            incomplete
+                .apply_verified_claim_settlement(settlement_authority(&incomplete, settlement)),
+            Err(WorkProgressError::ClaimSettlementProgressIncomplete)
+        );
+        assert_eq!(incomplete, before);
+    }
+
+    #[test]
+    fn claim_settlement_requires_exact_nonheld_coverage_before_mutation() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        complete_required(&mut progress);
+
+        let partial = AdmissionClaimSettlementInventory::new(vec![
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("claim id"),
+                AdmissionClaimSettlementOutcome::Released,
+            )
+            .expect("partial settlement"),
+        ])
+        .expect("partial settlement shape");
+        let before = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, partial)),
+            Err(WorkProgressError::ClaimSettlement(
+                AdmissionClaimValidationError::SettlementCountMismatch { .. }
+            ))
+        ));
+        assert_eq!(progress, before);
+
+        let unknown = AdmissionClaimSettlementInventory::new(vec![
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("claim id"),
+                AdmissionClaimSettlementOutcome::Released,
+            )
+            .expect("known settlement"),
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(299)).expect("unknown claim id"),
+                AdmissionClaimSettlementOutcome::Released,
+            )
+            .expect("unknown settlement"),
+        ])
+        .expect("unknown settlement shape");
+        let before = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, unknown)),
+            Err(WorkProgressError::ClaimSettlement(
+                AdmissionClaimValidationError::UnknownSettlementClaim { .. }
+            ))
+        ));
+        assert_eq!(progress, before);
+
+        let held = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+        let before = progress.clone();
+        assert_eq!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, held)),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_ne!(progress, before);
+        assert_eq!(progress.phase(), OperationPhase::ReadinessScheduled);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
+        let retained = progress
+            .claim_settlement()
+            .expect("held settlement retained");
+        assert!(!retained.all_settled_without_held());
+        let released = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        progress
+            .apply_verified_claim_settlement(settlement_authority(&progress, released))
+            .expect("held claim settles later");
+        assert_eq!(progress.disposition(), FullProgressDisposition::Succeeded);
+    }
+
+    #[test]
+    fn claim_settlement_allows_only_held_rows_to_advance() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        complete_required(&mut progress);
+        let first = AdmissionClaimSettlementInventory::new(vec![
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("first claim id"),
+                AdmissionClaimSettlementOutcome::Released,
+            )
+            .expect("released first claim"),
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(202)).expect("second claim id"),
+                AdmissionClaimSettlementOutcome::Held,
+            )
+            .expect("held second claim"),
+        ])
+        .expect("partial settlement");
+        progress
+            .apply_verified_claim_settlement(settlement_authority(&progress, first))
+            .expect("retain partial settlement");
+        assert_eq!(progress.phase(), OperationPhase::ReadinessScheduled);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
+
+        let rewrite_settled = AdmissionClaimSettlementInventory::new(vec![
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("first claim id"),
+                AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+            )
+            .expect("rewritten first claim"),
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(202)).expect("second claim id"),
+                AdmissionClaimSettlementOutcome::Held,
+            )
+            .expect("held second claim"),
+        ])
+        .expect("rewrite settlement");
+        let before_rewrite = progress.clone();
+        assert_eq!(
+            progress
+                .apply_verified_claim_settlement(settlement_authority(&progress, rewrite_settled,)),
+            Err(WorkProgressError::ClaimSettlementReplayConflict)
+        );
+        assert_eq!(progress, before_rewrite);
+
+        let completed = AdmissionClaimSettlementInventory::new(vec![
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("first claim id"),
+                AdmissionClaimSettlementOutcome::Released,
+            )
+            .expect("released first claim"),
+            AdmissionClaimSettlement::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(202)).expect("second claim id"),
+                AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+            )
+            .expect("consumed second claim"),
+        ])
+        .expect("completed settlement");
+        progress
+            .apply_verified_claim_settlement(settlement_authority(&progress, completed))
+            .expect("settle previously held claim");
+        assert_eq!(progress.disposition(), FullProgressDisposition::Succeeded);
+    }
+
+    #[test]
+    fn claim_settlement_rejects_stale_authority_and_suspended_dispositions() {
+        let mut progress = copy_progress_with_admission_claims();
+        complete_required(&mut progress);
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+
+        let mut stale_operation = settlement_authority(&progress, settlement.clone());
+        stale_operation.operation_id = OperationId::from_uuid(Uuid::from_u128(999));
+        let before = progress.clone();
+        assert_eq!(
+            progress.apply_verified_claim_settlement(stale_operation),
+            Err(WorkProgressError::ClaimSettlementAuthorityMismatch)
+        );
+        assert_eq!(progress, before);
+
+        let mut stale_plan = settlement_authority(&progress, settlement.clone());
+        stale_plan.plan = copy_progress_with_admission_claims_and_optional()
+            .plan
+            .clone();
+        assert_eq!(
+            progress.apply_verified_claim_settlement(stale_plan),
+            Err(WorkProgressError::ClaimSettlementAuthorityMismatch)
+        );
+        assert_eq!(progress, before);
+
+        let mut stale_epoch = settlement_authority(&progress, settlement.clone());
+        stale_epoch.execution_epoch = 1;
+        assert_eq!(
+            progress.apply_verified_claim_settlement(stale_epoch),
+            Err(WorkProgressError::ClaimSettlementEpochMismatch {
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(progress, before);
+
+        let mut stale_claims = settlement_authority(&progress, settlement.clone());
+        stale_claims.admission_claims = admission_claims(11);
+        assert_eq!(
+            progress.apply_verified_claim_settlement(stale_claims),
+            Err(WorkProgressError::ClaimSettlementClaimsMismatch)
+        );
+        assert_eq!(progress, before);
+
+        let retry_observation = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("settlement-retry").expect("retry lease"),
+            10,
+            RetryErrorClass::TransientContention,
+            "busy",
+            None,
+        )
+        .expect("retry observation");
+        progress
+            .request_retry(retry_observation)
+            .expect("request retry");
+        let before_retry = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, settlement)),
+            Err(WorkProgressError::ProgressSuspended {
+                disposition: FullProgressDisposition::RetryPending
+            })
+        ));
+        assert_eq!(progress, before_retry);
+
+        let mut audit = copy_progress_with_admission_claims();
+        complete_required(&mut audit);
+        audit
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("require audit");
+        let settlement = settlement_inventory(&audit, AdmissionClaimSettlementOutcome::Released);
+        let before_audit = audit.clone();
+        assert!(matches!(
+            audit.apply_verified_claim_settlement(settlement_authority(&audit, settlement)),
+            Err(WorkProgressError::ProgressSuspended {
+                disposition: FullProgressDisposition::AuditRequired
+            })
+        ));
+        assert_eq!(audit, before_audit);
+
+        let mut cancelled = copy_progress_with_admission_claims();
+        complete_required(&mut cancelled);
+        cancelled
+            .request_cancellation(CancellationRequestObservation::new(301).expect("cancel"))
+            .expect("request cancellation");
+        let settlement =
+            settlement_inventory(&cancelled, AdmissionClaimSettlementOutcome::Released);
+        let before_cancel = cancelled.clone();
+        assert!(matches!(
+            cancelled.apply_verified_claim_settlement(settlement_authority(&cancelled, settlement)),
+            Err(WorkProgressError::ProgressSuspended {
+                disposition: FullProgressDisposition::CancelRequestedAfterPublish
+            })
+        ));
+        assert_eq!(cancelled, before_cancel);
+    }
+
+    #[test]
+    fn claim_settlement_replay_is_stable_and_settled_rows_are_immutable() {
+        let mut progress = copy_progress_with_admission_claims();
+        complete_required(&mut progress);
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        progress
+            .apply_verified_claim_settlement(settlement_authority(&progress, settlement.clone()))
+            .expect("first settlement");
+        assert_eq!(progress.disposition(), FullProgressDisposition::Succeeded);
+        assert_eq!(progress.claim_settlement(), Some(&settlement));
+
+        let after_success = progress.clone();
+        assert_eq!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, settlement)),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+        assert_eq!(progress, after_success);
+
+        let swapped = settlement_inventory(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        assert_eq!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, swapped)),
+            Err(WorkProgressError::ClaimSettlementReplayConflict)
+        );
+        assert_eq!(progress, after_success);
+
+        let held = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+        assert_eq!(
+            progress.apply_verified_claim_settlement(settlement_authority(&progress, held)),
+            Err(WorkProgressError::ClaimSettlementReplayConflict)
+        );
+        assert_eq!(progress, after_success);
     }
 
     #[test]
@@ -4034,8 +4599,12 @@ mod tests {
         );
         assert_eq!(cancelled.cancellation_request(), Some(cancellation));
 
-        let mut terminal = copy_progress(false);
+        let mut terminal = copy_progress_with_admission_claims();
         complete_required(&mut terminal);
+        let settlement = settlement_inventory(&terminal, AdmissionClaimSettlementOutcome::Released);
+        terminal
+            .apply_verified_claim_settlement(settlement_authority(&terminal, settlement))
+            .expect("settle terminal progress");
         let target = key_for(&terminal, 0, WorkUnitRole::SourceRead).participant_id();
         let before_terminal = terminal.clone();
         assert!(matches!(

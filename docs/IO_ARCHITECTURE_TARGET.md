@@ -691,6 +691,15 @@ admitted claims, with no held claim. Finishing the work plan alone is insufficie
 progress remains nonterminal until its capacity owner supplies settlement. A pure
 unadmitted progress model cannot report durable successful completion.
 
+Full-progress readiness completion requires a source-scoped scheduling receipt:
+the exact target-set digest and count, source generation, readiness revision,
+contract version, and durable wake observation. A generic coordinator receipt or
+an optional-artifact label cannot substitute for this receipt. Only its explicit
+same-source optional-artifact subset may be deferred; unlisted artifacts remain
+pending until completed or deferred through a later generation-checked receipt.
+Stored readiness targets remain in their source database rather than being
+embedded as unbounded paths or payloads in the journal.
+
 `RejectedBeforeIntent` is outside this phase/disposition table: it is a non-durable
 coordinator result, not a journal phase or durable disposition. Pre-intent cancellation is
 also non-durable and returns no operation record. `RetryPending` requires `IntentDurable`, a
