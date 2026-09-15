@@ -1282,3 +1282,18 @@ Windows storage run `34900358246` passed at exact settlement source `a9fcfc83b`:
 283 journal tests passed with one ignored, including all twenty-five progress
 tests. The remaining storage-lane checks passed; native Windows UI/audio
 acceptance remains separate.
+
+Prepublication cancellation now has a guarded terminal path over bounded cleanup
+and settlement observations. It covers only entered actions from the frozen
+inventory, distinguishes creation from preservation of an existing input, and
+requires applicable staging/recovery absence even when a checkpoint is pending.
+Known preserved material and uncertain or missing observations remain nonterminal.
+Staging/recovery claims cannot be released before those absence checks pass;
+settled outcomes cannot be rewritten. Recovery generations reject stale changes
+while accepting an exact replay of the original result after acknowledgement loss.
+The private authority binds the operation, plan, current epoch and exact inventory.
+Thirty focused progress tests, library/GPUI checks without default features,
+formatting and diff checks passed. Independent review found no material issue.
+This adds no live cleanup issuer or filesystem execution. After-publication and
+observed-effect outcomes, full progress persistence and the remaining OPT-1337
+integration are still open.

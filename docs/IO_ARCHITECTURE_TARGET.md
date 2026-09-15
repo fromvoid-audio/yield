@@ -686,6 +686,13 @@ receipts name the entered action and its affected source or coordinator role;
 they never mark unrelated ordinary work complete. Created parent directories do
 not become deletion obligations merely because an action was cancelled.
 
+Prepublication cleanup derives absence obligations from applicable work, including
+staging or operation-created recovery material whose checkpoint is still pending.
+It verifies that no final claim occurred and that the action's expected input
+state is preserved. A creation with no original object records that distinction.
+For retained-object operations, the input is the selected retained payload, not
+an old source pathname that may legitimately be absent.
+
 Normal full-progress success also requires exact settlement coverage of the
 admitted claims, with no held claim. Finishing the work plan alone is insufficient;
 progress remains nonterminal until its capacity owner supplies settlement. A pure

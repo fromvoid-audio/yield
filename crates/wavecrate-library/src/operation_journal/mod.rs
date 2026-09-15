@@ -184,7 +184,9 @@ pub use work_plan::{
 pub use work_progress::{
     AuditTarget, AuditTargetValidationError, CoordinatorDeficit, CoordinatorReceiptKind,
     CoordinatorReceiptSummary, FilesystemReceiptKind, FilesystemReceiptSummary, ParticipantScope,
-    ProgressAuditObservation, ProgressAuditReason, ProgressEvidenceError, ProgressStepStatus,
-    SourceRevisionObservation, StoredStepEvidence, WorkProgress, WorkProgressError,
-    WorkProgressStep,
+    PrePublishAbsenceObservation, PrePublishActionCleanup, PrePublishCancellationObservation,
+    PrePublishCleanupObservation, PrePublishCleanupValidationError,
+    PrePublishFinalClaimObservation, PrePublishOriginalStateObservation, ProgressAuditObservation,
+    ProgressAuditReason, ProgressEvidenceError, ProgressStepStatus, SourceRevisionObservation,
+    StoredStepEvidence, WorkProgress, WorkProgressError, WorkProgressStep,
 };

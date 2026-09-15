@@ -18,17 +18,20 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::admission_claims::{
-    AdmissionClaimInventory, AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
-    AdmissionClaimValidationError,
+    AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlementInventory,
+    AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
 use super::cancellation_recovery::{
-    CancellationInventory, CancellationInventoryError, CancellationRoute,
+    CancellationActionState, CancellationInventory, CancellationInventoryError, CancellationRoute,
+    MAX_CANCELLATION_ACTIONS,
 };
 use super::coordinator::{RetryObservation, RetryObservationValidationError, UniversalCommandArgs};
+use super::full_capacity::FullCapacityAllocationClass;
 use super::full_status::FullProgressDisposition;
 use super::model::{
     CancellationRequestObservation, CancellationRequestValidationError, OperationId, OperationPhase,
 };
+use super::namespace_commands::NamespaceCommandArgs;
 use super::participants::{
     MAX_SOURCE_IDENTITY_BYTES, ParticipantDescriptor, ParticipantId, ParticipantKind,
     ParticipantRequirement, ParticipantSet, ParticipantTextField, ParticipantTextViolation,
@@ -561,6 +564,195 @@ pub struct WorkProgressStep {
     evidence: Option<StoredStepEvidence>,
 }
 
+/// Bounded observation of the final-claim state during prepublication cleanup.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PrePublishFinalClaimObservation {
+    /// The owner established that no application publication claim was ever entered.
+    NoFinalClaim,
+    /// The owner could not establish whether a final application claim remains.
+    Uncertain,
+}
+
+/// Bounded observation of the action's qualified input/origin state during cleanup.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PrePublishOriginalStateObservation {
+    /// The action's qualified input/origin state remains preserved.
+    ///
+    /// For retained restore and purge actions, this refers to the selected retained payload.  It
+    /// does not assert that the original source-relative pathname exists.
+    Preserved,
+    /// The action was a creation and therefore has no original object.
+    NoOriginalObject,
+    /// The owner could not establish the required input/origin state.
+    Uncertain,
+}
+
+/// Bounded observation that one cleanup namespace is absent.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PrePublishAbsenceObservation {
+    /// The selected cleanup namespace is absent.
+    Absent,
+    /// The selected cleanup namespace is known to remain present and retained.
+    Preserved,
+    /// The owner could not establish absence.
+    Uncertain,
+}
+
+/// Per-action cleanup observations retained by a prepublication cancellation outcome.
+///
+/// Missing fields and `Uncertain` values describe incomplete observations.  They are retained for
+/// later owner work but cannot by themselves authorize a terminal cancellation.  Parent and
+/// restore-record preparation are intentionally not deletion obligations in this shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrePublishActionCleanup {
+    action_ordinal: u8,
+    final_claim: Option<PrePublishFinalClaimObservation>,
+    original_state: Option<PrePublishOriginalStateObservation>,
+    staging_absence: Option<PrePublishAbsenceObservation>,
+    operation_recovery_payload_absence: Option<PrePublishAbsenceObservation>,
+}
+
+impl PrePublishActionCleanup {
+    /// Construct one bounded per-action cleanup observation.
+    pub fn new(
+        action_ordinal: u8,
+        final_claim: Option<PrePublishFinalClaimObservation>,
+        original_state: Option<PrePublishOriginalStateObservation>,
+        staging_absence: Option<PrePublishAbsenceObservation>,
+        operation_recovery_payload_absence: Option<PrePublishAbsenceObservation>,
+    ) -> Self {
+        Self {
+            action_ordinal,
+            final_claim,
+            original_state,
+            staging_absence,
+            operation_recovery_payload_absence,
+        }
+    }
+
+    /// Return the action ordinal covered by this observation.
+    pub const fn action_ordinal(&self) -> u8 {
+        self.action_ordinal
+    }
+
+    /// Return the optional final-claim observation.
+    pub const fn final_claim(&self) -> Option<PrePublishFinalClaimObservation> {
+        self.final_claim
+    }
+
+    /// Return the optional qualified input/origin observation.
+    pub const fn original_state(&self) -> Option<PrePublishOriginalStateObservation> {
+        self.original_state
+    }
+
+    /// Return the optional staging-namespace absence observation.
+    pub const fn staging_absence(&self) -> Option<PrePublishAbsenceObservation> {
+        self.staging_absence
+    }
+
+    /// Return the optional operation-recovery-payload absence observation.
+    pub const fn operation_recovery_payload_absence(&self) -> Option<PrePublishAbsenceObservation> {
+        self.operation_recovery_payload_absence
+    }
+}
+
+/// Bounded ordered cleanup observations for a prepublication cancellation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrePublishCleanupObservation {
+    actions: Vec<PrePublishActionCleanup>,
+}
+
+impl PrePublishCleanupObservation {
+    /// Construct ordered cleanup observations after checking their local bounded shape.
+    pub fn new(
+        actions: Vec<PrePublishActionCleanup>,
+    ) -> Result<Self, PrePublishCleanupValidationError> {
+        let observation = Self { actions };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    /// Validate the bounded ordered action list without interpreting owner authority.
+    pub fn validate(&self) -> Result<(), PrePublishCleanupValidationError> {
+        if self.actions.len() > MAX_CANCELLATION_ACTIONS {
+            return Err(PrePublishCleanupValidationError::TooManyActions {
+                actual: self.actions.len(),
+                maximum: MAX_CANCELLATION_ACTIONS,
+            });
+        }
+        for (index, action) in self.actions.iter().enumerate() {
+            if index > 0 && self.actions[index - 1].action_ordinal >= action.action_ordinal {
+                return Err(PrePublishCleanupValidationError::ActionsNotSortedOrUnique {
+                    index,
+                    action_ordinal: action.action_ordinal,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrow cleanup observations in increasing action order.
+    pub fn actions(&self) -> &[PrePublishActionCleanup] {
+        &self.actions
+    }
+}
+
+/// Stored prepublication cancellation observations, including cleanup and claim settlement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrePublishCancellationObservation {
+    cleanup: PrePublishCleanupObservation,
+    settlement: AdmissionClaimSettlementInventory,
+}
+
+/// Failure while validating the bounded local shape of prepublication cleanup observations.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PrePublishCleanupValidationError {
+    /// The ordered action observations exceed the cancellation bound.
+    #[error("prepublication cleanup has {actual} actions, maximum is {maximum}")]
+    TooManyActions {
+        /// Number of action rows supplied.
+        actual: usize,
+        /// Maximum number of action rows permitted.
+        maximum: usize,
+    },
+    /// The action rows were not strictly sorted by ordinal or contained a duplicate.
+    #[error(
+        "prepublication cleanup action list is not sorted or unique at index {index}: {action_ordinal}"
+    )]
+    ActionsNotSortedOrUnique {
+        /// Position of the offending row.
+        index: usize,
+        /// Offending action ordinal.
+        action_ordinal: u8,
+    },
+}
+
+impl PrePublishCancellationObservation {
+    /// Construct one stored prepublication cancellation observation.
+    pub fn new(
+        cleanup: PrePublishCleanupObservation,
+        settlement: AdmissionClaimSettlementInventory,
+    ) -> Self {
+        Self {
+            cleanup,
+            settlement,
+        }
+    }
+
+    /// Borrow the bounded cleanup observations.
+    pub fn cleanup(&self) -> &PrePublishCleanupObservation {
+        &self.cleanup
+    }
+
+    /// Borrow the bounded claim settlement observations.
+    pub fn settlement(&self) -> &AdmissionClaimSettlementInventory {
+        &self.settlement
+    }
+}
+
 impl WorkProgressStep {
     /// Return the exact immutable work-unit key.
     pub const fn key(&self) -> WorkUnitKey {
@@ -658,22 +850,36 @@ struct VerifiedAuditResolution {
     observation: ProgressAuditObservation,
 }
 
-/// Legacy placeholder for the not-yet-implemented pre-publication cancellation outcome.
+/// Private owner-issued authority for a bounded prepublication cleanup observation.
+///
+/// This authority is deliberately non-serialized and has no production constructor.  A future
+/// owner must bind the operation, frozen plan, current execution epoch, frozen cancellation
+/// inventory, and current recovery-observation generation before handing it to progress.
 #[allow(dead_code)]
-struct PrePublishCancellationAuthority {
+#[derive(Clone)]
+struct VerifiedPrePublishCancellation {
     operation_id: OperationId,
     plan: WorkPlan,
-    _staging_absence: VerifiedStagingAbsence,
-    _capacity_release: VerifiedCapacityRelease,
+    execution_epoch: u64,
+    cancellation_inventory: CancellationInventory,
+    expected_recovery_generation: u64,
+    cleanup: PrePublishCleanupObservation,
+    settlement: AdmissionClaimSettlementInventory,
 }
 
-/// Placeholder marker retained until the cancellation outcome gate is implemented.
-#[allow(dead_code)]
-struct VerifiedStagingAbsence;
+/// Origin state required by one prepublication cleanup action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrePublishOriginPolicy {
+    OriginalStatePreserved,
+    NoOriginalObject,
+}
 
-/// Placeholder marker retained until the cancellation outcome gate is implemented.
-#[allow(dead_code)]
-struct VerifiedCapacityRelease;
+/// Immutable action policy derived from the command and frozen plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrePublishActionPolicy {
+    action_ordinal: u8,
+    origin: PrePublishOriginPolicy,
+}
 
 /// Legacy placeholder for the not-yet-implemented post-publication cancellation outcome.
 #[allow(dead_code)]
@@ -705,6 +911,9 @@ pub struct WorkProgress {
     admission_claims: Option<AdmissionClaimInventory>,
     claim_settlement: Option<AdmissionClaimSettlementInventory>,
     cancellation_inventory: Option<CancellationInventory>,
+    origin_policies: Vec<PrePublishActionPolicy>,
+    recovery_generation: u64,
+    pre_publish_cancellation: Option<PrePublishCancellationObservation>,
 }
 
 #[allow(dead_code)]
@@ -761,6 +970,9 @@ impl WorkProgress {
             admission_claims: None,
             claim_settlement: None,
             cancellation_inventory: None,
+            origin_policies: derive_origin_policies(args, plan),
+            recovery_generation: 0,
+            pre_publish_cancellation: None,
         })
     }
 
@@ -856,6 +1068,16 @@ impl WorkProgress {
     /// Borrow the immutable cancellation inventory frozen by the first request, when present.
     pub fn cancellation_inventory(&self) -> Option<&CancellationInventory> {
         self.cancellation_inventory.as_ref()
+    }
+
+    /// Return the bounded recovery-observation generation.
+    pub const fn recovery_generation(&self) -> u64 {
+        self.recovery_generation
+    }
+
+    /// Borrow the retained prepublication cancellation observation, when present.
+    pub fn pre_publish_cancellation(&self) -> Option<&PrePublishCancellationObservation> {
+        self.pre_publish_cancellation.as_ref()
     }
 
     /// Record a bounded retry disposition without changing any step completion.
@@ -1437,14 +1659,367 @@ impl WorkProgress {
         Ok(ProgressApplyOutcome::Applied)
     }
 
-    /// Cancellation outcomes remain unavailable until cleanup, settlement, and safe-state
-    /// authorities are implemented.  The placeholder authority cannot advance progress.
+    /// Retain a private-owner prepublication cleanup observation and derive a safe terminal result
+    /// only after every entered action and admitted claim is covered.
     #[allow(dead_code)]
     fn finish_pre_publish_cancellation(
         &mut self,
-        _authority: PrePublishCancellationAuthority,
+        authority: VerifiedPrePublishCancellation,
     ) -> Result<(), WorkProgressError> {
-        Err(WorkProgressError::CancellationOutcomeUnavailable)
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::PrePublishCancellationAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::PrePublishCancellationEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        let generation_is_current =
+            authority.expected_recovery_generation == self.recovery_generation;
+        let generation_is_replay = authority
+            .expected_recovery_generation
+            .checked_add(1)
+            .is_some_and(|generation| generation == self.recovery_generation);
+        let Some(admission_claims) = self.admission_claims.as_ref() else {
+            return Err(WorkProgressError::PrePublishCancellationAdmissionClaimsMissing);
+        };
+        let Some(current_inventory) = self.cancellation_inventory.as_ref() else {
+            return Err(WorkProgressError::CancellationInventoryMissing);
+        };
+        authority.cancellation_inventory.validate_against(
+            self.operation_id,
+            &self.plan,
+            &self.steps,
+            self.execution_epoch,
+            admission_claims,
+        )?;
+        if &authority.cancellation_inventory != current_inventory {
+            return Err(WorkProgressError::PrePublishCancellationInventoryMismatch);
+        }
+        if authority.cancellation_inventory.route() != CancellationRoute::BeforePublish {
+            return Err(WorkProgressError::PrePublishCancellationRouteInvalid {
+                route: authority.cancellation_inventory.route(),
+            });
+        }
+        if self.active_audit.is_some() || self.disposition == FullProgressDisposition::AuditRequired
+        {
+            return Err(WorkProgressError::PrePublishCancellationAuditActive);
+        }
+        if self.disposition != FullProgressDisposition::CancelRequestedBeforePublish
+            && self.disposition != FullProgressDisposition::CancelledBeforePublish
+        {
+            return Err(WorkProgressError::PrePublishCancellationStateInvalid);
+        }
+
+        authority
+            .cleanup
+            .validate()
+            .map_err(WorkProgressError::PrePublishCleanup)?;
+        let cleanup_complete = self.validate_pre_publish_cleanup(
+            &authority.cancellation_inventory,
+            &authority.cleanup,
+            admission_claims,
+        )?;
+        self.validate_pre_publish_settlement(
+            &authority.cancellation_inventory,
+            admission_claims,
+            &authority.cleanup,
+            &authority.settlement,
+        )?;
+
+        if let Some(existing) = &self.pre_publish_cancellation {
+            if existing.cleanup() == &authority.cleanup
+                && existing.settlement() == &authority.settlement
+            {
+                if generation_is_current || generation_is_replay {
+                    return Ok(());
+                }
+            }
+            if !generation_is_current {
+                return Err(
+                    WorkProgressError::PrePublishCancellationRecoveryGenerationMismatch {
+                        expected: self.recovery_generation,
+                        actual: authority.expected_recovery_generation,
+                    },
+                );
+            }
+            validate_pre_publish_settlement_transition(
+                existing.settlement(),
+                &authority.settlement,
+            )?;
+            if self.disposition == FullProgressDisposition::CancelledBeforePublish {
+                return Err(WorkProgressError::TerminalTransitionForbidden);
+            }
+        } else if !generation_is_current {
+            return Err(
+                WorkProgressError::PrePublishCancellationRecoveryGenerationMismatch {
+                    expected: self.recovery_generation,
+                    actual: authority.expected_recovery_generation,
+                },
+            );
+        } else if self.disposition == FullProgressDisposition::CancelledBeforePublish {
+            return Err(WorkProgressError::PrePublishCancellationStateInvalid);
+        }
+
+        let next_recovery_generation = self
+            .recovery_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::PrePublishCancellationRecoveryGenerationOverflow)?;
+        let settled = authority
+            .settlement
+            .satisfies_prepublication_cancellation(admission_claims)
+            .map_err(WorkProgressError::PrePublishCancellationSettlement)?;
+        self.pre_publish_cancellation = Some(PrePublishCancellationObservation::new(
+            authority.cleanup,
+            authority.settlement,
+        ));
+        self.recovery_generation = next_recovery_generation;
+        if cleanup_complete && settled {
+            self.phase = OperationPhase::Terminal;
+            self.disposition = FullProgressDisposition::CancelledBeforePublish;
+        }
+        Ok(())
+    }
+
+    fn validate_pre_publish_cleanup(
+        &self,
+        inventory: &CancellationInventory,
+        cleanup: &PrePublishCleanupObservation,
+        admission_claims: &AdmissionClaimInventory,
+    ) -> Result<bool, WorkProgressError> {
+        let has_operation_recovery_claim = admission_claims.claims().iter().any(|claim| {
+            claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
+        });
+        for row in cleanup.actions() {
+            let Some(action) = inventory
+                .actions()
+                .iter()
+                .find(|action| action.action_ordinal() == row.action_ordinal())
+            else {
+                return Err(WorkProgressError::PrePublishCleanupActionSetMismatch {
+                    action_ordinal: row.action_ordinal(),
+                });
+            };
+            if action.state() != CancellationActionState::CleanablePrePublish {
+                return Err(WorkProgressError::PrePublishCleanupActionSetMismatch {
+                    action_ordinal: row.action_ordinal(),
+                });
+            }
+        }
+
+        let mut complete = true;
+        for action in inventory.actions() {
+            let Some(row) = cleanup
+                .actions()
+                .iter()
+                .find(|row| row.action_ordinal() == action.action_ordinal())
+            else {
+                if action.state() == CancellationActionState::CleanablePrePublish {
+                    complete = false;
+                }
+                continue;
+            };
+            if action.state() != CancellationActionState::CleanablePrePublish {
+                return Err(WorkProgressError::PrePublishCleanupActionSetMismatch {
+                    action_ordinal: action.action_ordinal(),
+                });
+            }
+            let Some(policy) = self
+                .origin_policies
+                .iter()
+                .find(|policy| policy.action_ordinal == action.action_ordinal())
+            else {
+                return Err(WorkProgressError::PrePublishCleanupActionSetMismatch {
+                    action_ordinal: action.action_ordinal(),
+                });
+            };
+
+            match row.final_claim() {
+                Some(PrePublishFinalClaimObservation::NoFinalClaim) => {}
+                Some(PrePublishFinalClaimObservation::Uncertain) | None => complete = false,
+            }
+            match (policy.origin, row.original_state()) {
+                (
+                    PrePublishOriginPolicy::OriginalStatePreserved,
+                    Some(PrePublishOriginalStateObservation::Preserved),
+                )
+                | (
+                    PrePublishOriginPolicy::NoOriginalObject,
+                    Some(PrePublishOriginalStateObservation::NoOriginalObject),
+                ) => {}
+                (_, Some(PrePublishOriginalStateObservation::Uncertain)) | (_, None) => {
+                    complete = false
+                }
+                (
+                    PrePublishOriginPolicy::OriginalStatePreserved,
+                    Some(PrePublishOriginalStateObservation::NoOriginalObject),
+                )
+                | (
+                    PrePublishOriginPolicy::NoOriginalObject,
+                    Some(PrePublishOriginalStateObservation::Preserved),
+                ) => {
+                    return Err(WorkProgressError::PrePublishCleanupOriginalStateMismatch {
+                        action_ordinal: action.action_ordinal(),
+                    });
+                }
+            }
+
+            let staging_required =
+                action_has_required_role(&self.plan, action.action_ordinal(), WorkUnitRole::Stage);
+            match (staging_required, row.staging_absence()) {
+                (true, Some(PrePublishAbsenceObservation::Absent)) => {}
+                (
+                    true,
+                    Some(
+                        PrePublishAbsenceObservation::Preserved
+                        | PrePublishAbsenceObservation::Uncertain,
+                    ),
+                )
+                | (true, None) => complete = false,
+                (false, None) => {}
+                (false, Some(_)) => {
+                    return Err(WorkProgressError::PrePublishCleanupStagingUnexpected {
+                        action_ordinal: action.action_ordinal(),
+                    });
+                }
+            }
+
+            let recovery_required = has_operation_recovery_claim
+                || action_has_required_role(
+                    &self.plan,
+                    action.action_ordinal(),
+                    WorkUnitRole::RecoveryMaterialRetained,
+                );
+            match (recovery_required, row.operation_recovery_payload_absence()) {
+                (true, Some(PrePublishAbsenceObservation::Absent)) => {}
+                (
+                    true,
+                    Some(
+                        PrePublishAbsenceObservation::Preserved
+                        | PrePublishAbsenceObservation::Uncertain,
+                    ),
+                )
+                | (true, None) => complete = false,
+                (false, None) => {}
+                (false, Some(_)) => {
+                    return Err(WorkProgressError::PrePublishCleanupRecoveryUnexpected {
+                        action_ordinal: action.action_ordinal(),
+                    });
+                }
+            }
+        }
+        Ok(complete)
+    }
+
+    fn validate_pre_publish_settlement(
+        &self,
+        inventory: &CancellationInventory,
+        admission_claims: &AdmissionClaimInventory,
+        cleanup: &PrePublishCleanupObservation,
+        settlement: &AdmissionClaimSettlementInventory,
+    ) -> Result<(), WorkProgressError> {
+        settlement
+            .validate_against(admission_claims)
+            .map_err(WorkProgressError::PrePublishCancellationSettlement)?;
+        for claim in admission_claims.claims() {
+            let observed = settlement
+                .settlements()
+                .iter()
+                .find(|row| row.claim_id() == claim.claim_id())
+                .expect("validated settlement coverage");
+            if observed.outcome() == AdmissionClaimSettlementOutcome::Held {
+                continue;
+            }
+            let compatible = match claim.allocation_class() {
+                FullCapacityAllocationClass::DestinationStaging
+                | FullCapacityAllocationClass::OperationRecoveryPayload => {
+                    observed.outcome() == AdmissionClaimSettlementOutcome::Released
+                }
+                FullCapacityAllocationClass::JournalRecord
+                | FullCapacityAllocationClass::ExistingDestination
+                | FullCapacityAllocationClass::ExistingRecoveryPayload => {
+                    observed.outcome() == AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                }
+                FullCapacityAllocationClass::SourceDatabaseCommit
+                | FullCapacityAllocationClass::SourceWalShm
+                | FullCapacityAllocationClass::GlobalDatabaseCommit
+                | FullCapacityAllocationClass::GlobalWalShm => matches!(
+                    observed.outcome(),
+                    AdmissionClaimSettlementOutcome::Released
+                        | AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                ),
+            };
+            if !compatible {
+                return Err(
+                    WorkProgressError::PrePublishCancellationSettlementClassMismatch {
+                        claim_id: claim.claim_id(),
+                        allocation_class: claim.allocation_class(),
+                        outcome: observed.outcome(),
+                    },
+                );
+            }
+            if observed.outcome() == AdmissionClaimSettlementOutcome::Released {
+                let absence_role = match claim.allocation_class() {
+                    FullCapacityAllocationClass::DestinationStaging => Some(WorkUnitRole::Stage),
+                    FullCapacityAllocationClass::OperationRecoveryPayload => {
+                        Some(WorkUnitRole::RecoveryMaterialRetained)
+                    }
+                    _ => None,
+                };
+                if let Some(role) = absence_role {
+                    let ready = self.pre_publish_absence_ready(inventory, cleanup, role);
+                    if !ready {
+                        return Err(
+                            WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
+                                allocation_class: claim.allocation_class(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn pre_publish_absence_ready(
+        &self,
+        inventory: &CancellationInventory,
+        cleanup: &PrePublishCleanupObservation,
+        role: WorkUnitRole,
+    ) -> bool {
+        let has_operation_recovery_claim = self.admission_claims.as_ref().is_some_and(|claims| {
+            claims.claims().iter().any(|claim| {
+                claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
+            })
+        });
+        inventory.actions().iter().all(|action| {
+            if action.state() != CancellationActionState::CleanablePrePublish {
+                return true;
+            }
+            let required =
+                if role == WorkUnitRole::RecoveryMaterialRetained && has_operation_recovery_claim {
+                    true
+                } else {
+                    action_has_required_role(&self.plan, action.action_ordinal(), role)
+                };
+            if !required {
+                return true;
+            }
+            let Some(row) = cleanup
+                .actions()
+                .iter()
+                .find(|row| row.action_ordinal() == action.action_ordinal())
+            else {
+                return false;
+            };
+            let observation = if role == WorkUnitRole::Stage {
+                row.staging_absence()
+            } else {
+                row.operation_recovery_payload_absence()
+            };
+            observation == Some(PrePublishAbsenceObservation::Absent)
+        })
     }
 
     /// Cancellation outcomes remain unavailable until recovery and settlement authorities are
@@ -1664,6 +2239,63 @@ impl WorkProgress {
                 && step.status == ProgressStepStatus::Deferred
         })
     }
+}
+
+fn derive_origin_policies(
+    args: &UniversalCommandArgs,
+    plan: &WorkPlan,
+) -> Vec<PrePublishActionPolicy> {
+    let create_folder = matches!(
+        args,
+        UniversalCommandArgs::Namespace(NamespaceCommandArgs::CreateFolder(_))
+    );
+    let mut policies = Vec::new();
+    let mut previous = None;
+    for unit in plan.units() {
+        let action_ordinal = unit.key().action_ordinal();
+        if previous == Some(action_ordinal) {
+            continue;
+        }
+        policies.push(PrePublishActionPolicy {
+            action_ordinal,
+            origin: if create_folder && action_ordinal == 0 {
+                PrePublishOriginPolicy::NoOriginalObject
+            } else {
+                PrePublishOriginPolicy::OriginalStatePreserved
+            },
+        });
+        previous = Some(action_ordinal);
+    }
+    policies
+}
+
+fn action_has_required_role(plan: &WorkPlan, action_ordinal: u8, role: WorkUnitRole) -> bool {
+    plan.units().iter().any(|unit| {
+        unit.key().action_ordinal() == action_ordinal
+            && unit.key().role() == role
+            && unit.applicability() == WorkUnitApplicability::Required
+    })
+}
+
+fn validate_pre_publish_settlement_transition(
+    existing: &AdmissionClaimSettlementInventory,
+    candidate: &AdmissionClaimSettlementInventory,
+) -> Result<(), WorkProgressError> {
+    for settled in existing.settlements() {
+        let observed = candidate
+            .settlements()
+            .iter()
+            .find(|row| row.claim_id() == settled.claim_id())
+            .expect("validated settlement coverage");
+        let allowed = match settled.outcome() {
+            AdmissionClaimSettlementOutcome::Held => true,
+            outcome => observed.outcome() == outcome,
+        };
+        if !allowed {
+            return Err(WorkProgressError::PrePublishCancellationSettlementReplayConflict);
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1933,6 +2565,9 @@ pub enum WorkProgressError {
     /// A nested evidence observation was malformed.
     #[error("invalid work progress evidence: {0}")]
     Evidence(#[from] ProgressEvidenceError),
+    /// A prepublication cleanup observation failed its bounded local shape validation.
+    #[error("invalid work progress prepublication cleanup: {0}")]
+    PrePublishCleanup(#[source] PrePublishCleanupValidationError),
     /// An audit target was malformed or absent from the frozen plan.
     #[error("invalid work progress audit target: {0}")]
     AuditTarget(#[from] AuditTargetValidationError),
@@ -2255,6 +2890,106 @@ pub enum WorkProgressError {
     /// The private cancellation gate did not bind this operation and plan.
     #[error("work progress cancellation authority does not match")]
     CancellationAuthorityMismatch,
+    /// A private prepublication cancellation authority did not bind this operation or plan.
+    #[error("work progress prepublication cancellation authority does not match")]
+    PrePublishCancellationAuthorityMismatch,
+    /// A private prepublication cancellation authority carried another execution epoch.
+    #[error(
+        "work progress prepublication cancellation epoch {actual} does not match expected epoch {expected}"
+    )]
+    PrePublishCancellationEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the cleanup authority.
+        actual: u64,
+    },
+    /// A private prepublication cancellation authority carried another cleanup generation.
+    #[error(
+        "work progress prepublication cancellation generation {actual} does not match expected generation {expected}"
+    )]
+    PrePublishCancellationRecoveryGenerationMismatch {
+        /// Current cleanup-observation generation.
+        expected: u64,
+        /// Generation supplied by the cleanup authority.
+        actual: u64,
+    },
+    /// The cleanup-observation generation could not advance without wrapping.
+    #[error("work progress prepublication cancellation generation overflowed")]
+    PrePublishCancellationRecoveryGenerationOverflow,
+    /// No admission-claim observation was retained for prepublication cancellation.
+    #[error("work progress prepublication cancellation admission claims are missing")]
+    PrePublishCancellationAdmissionClaimsMissing,
+    /// The cleanup authority carried a different frozen cancellation inventory.
+    #[error("work progress prepublication cancellation inventory does not match")]
+    PrePublishCancellationInventoryMismatch,
+    /// The cleanup authority carried a route other than before-publication.
+    #[error("work progress prepublication cancellation route is invalid: {route:?}")]
+    PrePublishCancellationRouteInvalid {
+        /// Route captured by the cancellation inventory.
+        route: CancellationRoute,
+    },
+    /// Progress is not in a before-publication cancellation state.
+    #[error("work progress prepublication cancellation state is invalid")]
+    PrePublishCancellationStateInvalid,
+    /// An audit overlay is active and must be resolved by its own authority first.
+    #[error("work progress prepublication cancellation cannot finish while audit is active")]
+    PrePublishCancellationAuditActive,
+    /// A prepublication settlement observation failed exact claim coverage validation.
+    #[error("invalid work progress prepublication cancellation settlement: {0}")]
+    PrePublishCancellationSettlement(#[source] AdmissionClaimValidationError),
+    /// A closed claim outcome does not match its allocation class policy.
+    #[error(
+        "work progress prepublication settlement outcome {outcome:?} is incompatible with claim {claim_id} class {allocation_class:?}"
+    )]
+    PrePublishCancellationSettlementClassMismatch {
+        /// Claim carrying the incompatible outcome.
+        claim_id: AdmissionClaimId,
+        /// Class whose policy rejected the outcome.
+        allocation_class: super::full_capacity::FullCapacityAllocationClass,
+        /// Outcome observed for the claim.
+        outcome: AdmissionClaimSettlementOutcome,
+    },
+    /// A released staging or recovery claim lacks a matching observed absence.
+    #[error(
+        "work progress prepublication settlement class {allocation_class:?} requires cleanup absence"
+    )]
+    PrePublishCancellationSettlementCleanupIncomplete {
+        /// Class whose release is unsafe while cleanup is incomplete.
+        allocation_class: super::full_capacity::FullCapacityAllocationClass,
+    },
+    /// A changed settlement attempted to rewrite an already settled claim.
+    #[error("work progress prepublication settlement replay conflicts with a settled claim")]
+    PrePublishCancellationSettlementReplayConflict,
+    /// A cleanup row named an action that was not entered in the frozen prepublication inventory.
+    #[error("work progress prepublication cleanup action {action_ordinal} is not cleanable")]
+    PrePublishCleanupActionSetMismatch {
+        /// Action named by the invalid cleanup row.
+        action_ordinal: u8,
+    },
+    /// A cleanup row carried the wrong origin-state variant for its immutable action policy.
+    #[error(
+        "work progress prepublication cleanup origin state is invalid for action {action_ordinal}"
+    )]
+    PrePublishCleanupOriginalStateMismatch {
+        /// Action whose immutable origin policy was violated.
+        action_ordinal: u8,
+    },
+    /// A cleanup row supplied a staging absence for an action without staging work.
+    #[error(
+        "work progress prepublication cleanup staging absence is unexpected for action {action_ordinal}"
+    )]
+    PrePublishCleanupStagingUnexpected {
+        /// Action carrying an unexpected staging field.
+        action_ordinal: u8,
+    },
+    /// A cleanup row supplied a recovery-payload absence for an action without recovery work.
+    #[error(
+        "work progress prepublication cleanup recovery absence is unexpected for action {action_ordinal}"
+    )]
+    PrePublishCleanupRecoveryUnexpected {
+        /// Action carrying an unexpected recovery field.
+        action_ordinal: u8,
+    },
 }
 
 impl From<RetryObservationValidationError> for WorkProgressError {
@@ -2278,9 +3013,9 @@ mod tests {
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
         CancellationActionState, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
-        CopySourceExpectation, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
-        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
-        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary,
+        ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
+        ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
         ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
         ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
         FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
@@ -2611,6 +3346,25 @@ mod tests {
         .expect("settlement inventory")
     }
 
+    fn settlement_inventory_with_outcomes(
+        progress: &WorkProgress,
+        outcomes: &[AdmissionClaimSettlementOutcome],
+    ) -> AdmissionClaimSettlementInventory {
+        let claims = progress.admission_claims().expect("admission claims");
+        assert_eq!(claims.claims().len(), outcomes.len());
+        AdmissionClaimSettlementInventory::new(
+            claims
+                .claims()
+                .iter()
+                .zip(outcomes)
+                .map(|(claim, outcome)| {
+                    AdmissionClaimSettlement::new(claim.claim_id(), *outcome).expect("settlement")
+                })
+                .collect(),
+        )
+        .expect("settlement inventory")
+    }
+
     fn settlement_authority(
         progress: &WorkProgress,
         settlement: AdmissionClaimSettlementInventory,
@@ -2624,6 +3378,26 @@ mod tests {
                 .as_ref()
                 .expect("admission claims")
                 .clone(),
+            settlement,
+        }
+    }
+
+    fn pre_publish_cleanup_authority(
+        progress: &WorkProgress,
+        cleanup: PrePublishCleanupObservation,
+        settlement: AdmissionClaimSettlementInventory,
+    ) -> VerifiedPrePublishCancellation {
+        VerifiedPrePublishCancellation {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch,
+            cancellation_inventory: progress
+                .cancellation_inventory
+                .as_ref()
+                .expect("cancellation inventory")
+                .clone(),
+            expected_recovery_generation: progress.recovery_generation,
+            cleanup,
             settlement,
         }
     }
@@ -4296,21 +5070,426 @@ mod tests {
             cancelled.request_cancellation(CancellationRequestObservation::new(43).unwrap()),
             Err(WorkProgressError::CancellationReplayConflict)
         ));
-        let authority = PrePublishCancellationAuthority {
-            operation_id: cancelled.operation_id,
-            plan: cancelled.plan.clone(),
-            _staging_absence: VerifiedStagingAbsence,
-            _capacity_release: VerifiedCapacityRelease,
-        };
-        let before_outcome = cancelled.clone();
-        assert_eq!(
-            cancelled.finish_pre_publish_cancellation(authority),
-            Err(WorkProgressError::CancellationOutcomeUnavailable)
-        );
-        assert_eq!(cancelled, before_outcome);
+        let cleanup = PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup");
+        let settlement =
+            settlement_inventory(&cancelled, AdmissionClaimSettlementOutcome::Released);
+        let authority = pre_publish_cleanup_authority(&cancelled, cleanup, settlement);
+        let replay = authority.clone();
+        cancelled
+            .finish_pre_publish_cancellation(authority)
+            .expect("empty prepublication cancellation can finish");
+        assert_eq!(cancelled.phase(), OperationPhase::Terminal);
         assert_eq!(
             cancelled.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+        let after_outcome = cancelled.clone();
+        cancelled
+            .finish_pre_publish_cancellation(replay)
+            .expect("original authority replay");
+        assert_eq!(cancelled, after_outcome);
+        assert_eq!(
+            cancelled.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+    }
+
+    #[test]
+    fn prepublish_cleanup_retains_uncertainty_and_requires_staging_absence_for_release() {
+        let mut progress = copy_progress_with_admission_claims();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::Prepare);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(401).expect("cancel"))
+            .expect("prepublication cancellation");
+
+        let partial_cleanup =
+            PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+                0,
+                Some(PrePublishFinalClaimObservation::NoFinalClaim),
+                Some(PrePublishOriginalStateObservation::Preserved),
+                Some(PrePublishAbsenceObservation::Preserved),
+                None,
+            )])
+            .expect("partial cleanup");
+        let partial_authority = pre_publish_cleanup_authority(
+            &progress,
+            partial_cleanup,
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        let original_authority = partial_authority.clone();
+        progress
+            .finish_pre_publish_cancellation(partial_authority)
+            .expect("retain partial cleanup");
+        assert_eq!(progress.recovery_generation(), 1);
+        assert_eq!(
+            progress.disposition(),
             FullProgressDisposition::CancelRequestedBeforePublish
+        );
+
+        let after_partial = progress.clone();
+        progress
+            .finish_pre_publish_cancellation(original_authority)
+            .expect("replay original authority after acknowledgement loss");
+        assert_eq!(progress, after_partial);
+
+        let release_before_absence = pre_publish_cleanup_authority(
+            &progress,
+            progress
+                .pre_publish_cancellation()
+                .expect("partial observation")
+                .cleanup()
+                .clone(),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+        );
+        let before_rejected_release = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(release_before_absence),
+            Err(
+                WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
+                    allocation_class: FullCapacityAllocationClass::DestinationStaging,
+                }
+            )
+        );
+        assert_eq!(progress, before_rejected_release);
+
+        let complete_cleanup =
+            PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+                0,
+                Some(PrePublishFinalClaimObservation::NoFinalClaim),
+                Some(PrePublishOriginalStateObservation::Preserved),
+                Some(PrePublishAbsenceObservation::Absent),
+                None,
+            )])
+            .expect("complete cleanup");
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                complete_cleanup,
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("finish prepublication cancellation");
+        assert_eq!(progress.phase(), OperationPhase::Terminal);
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+        let terminal = progress.clone();
+        let terminal_authority = pre_publish_cleanup_authority(
+            &progress,
+            progress
+                .pre_publish_cancellation()
+                .expect("terminal observation")
+                .cleanup()
+                .clone(),
+            progress
+                .pre_publish_cancellation()
+                .expect("terminal observation")
+                .settlement()
+                .clone(),
+        );
+        progress
+            .finish_pre_publish_cancellation(terminal_authority)
+            .expect("terminal replay");
+        assert_eq!(progress, terminal);
+    }
+
+    #[test]
+    fn prepublish_cleanup_requires_recovery_absence_for_recovery_claims_and_allows_held_rows() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::Prepare);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(402).expect("cancel"))
+            .expect("prepublication cancellation");
+
+        let held_cleanup = PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+            0,
+            Some(PrePublishFinalClaimObservation::NoFinalClaim),
+            Some(PrePublishOriginalStateObservation::Preserved),
+            Some(PrePublishAbsenceObservation::Absent),
+            Some(PrePublishAbsenceObservation::Preserved),
+        )])
+        .expect("held cleanup");
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                held_cleanup,
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("retain held recovery observation");
+        let before_release = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                progress
+                    .pre_publish_cancellation()
+                    .expect("held observation")
+                    .cleanup()
+                    .clone(),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            )),
+            Err(
+                WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
+                    allocation_class: FullCapacityAllocationClass::OperationRecoveryPayload,
+                }
+            )
+        );
+        assert_eq!(progress, before_release);
+
+        let complete_cleanup =
+            PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+                0,
+                Some(PrePublishFinalClaimObservation::NoFinalClaim),
+                Some(PrePublishOriginalStateObservation::Preserved),
+                Some(PrePublishAbsenceObservation::Absent),
+                Some(PrePublishAbsenceObservation::Absent),
+            )])
+            .expect("complete cleanup");
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                complete_cleanup,
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("release staging and recovery claims");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+    }
+
+    #[test]
+    fn prepublish_cleanup_enforces_create_folder_origin_policy() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let parent = NamespaceDirectoryEndpoint::new(
+            source,
+            source_id.clone(),
+            NamespaceDirectoryLocator::Root,
+            NamespaceDirectoryExpectation::new(7, "root-a", Some(1)).expect("root"),
+        )
+        .expect("parent");
+        let args = UniversalCommandArgs::Namespace(NamespaceCommandArgs::CreateFolder(
+            CreateFolderIntentArgs::new(parent, NamespaceLeafName::new("created").expect("leaf"))
+                .expect("create folder"),
+        ));
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("create-folder plan");
+        let mut progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(403)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("create-folder progress");
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::Prepare);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(403).expect("cancel"))
+            .expect("prepublication cancellation");
+
+        let wrong_origin = PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+            0,
+            Some(PrePublishFinalClaimObservation::NoFinalClaim),
+            Some(PrePublishOriginalStateObservation::Preserved),
+            None,
+            None,
+        )])
+        .expect("wrong-origin cleanup");
+        let before = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                wrong_origin,
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            )),
+            Err(WorkProgressError::PrePublishCleanupOriginalStateMismatch { action_ordinal: 0 })
+        );
+        assert_eq!(progress, before);
+
+        let valid_cleanup = PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+            0,
+            Some(PrePublishFinalClaimObservation::NoFinalClaim),
+            Some(PrePublishOriginalStateObservation::NoOriginalObject),
+            None,
+            None,
+        )])
+        .expect("valid create-folder cleanup");
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                valid_cleanup,
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("create-folder cancellation");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+    }
+
+    #[test]
+    fn prepublish_cleanup_rejects_stale_bindings_and_non_prepublication_routes() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(404).expect("cancel"))
+            .expect("prepublication cancellation");
+        let cleanup = PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup");
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+
+        let mut wrong_operation =
+            pre_publish_cleanup_authority(&progress, cleanup.clone(), settlement.clone());
+        wrong_operation.operation_id = OperationId::from_uuid(Uuid::from_u128(405));
+        let before = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(wrong_operation),
+            Err(WorkProgressError::PrePublishCancellationAuthorityMismatch)
+        );
+        assert_eq!(progress, before);
+
+        let mut wrong_epoch =
+            pre_publish_cleanup_authority(&progress, cleanup.clone(), settlement.clone());
+        wrong_epoch.execution_epoch = 1;
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(wrong_epoch),
+            Err(WorkProgressError::PrePublishCancellationEpochMismatch {
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(progress, before);
+
+        let mut wrong_generation =
+            pre_publish_cleanup_authority(&progress, cleanup.clone(), settlement.clone());
+        wrong_generation.expected_recovery_generation = 1;
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(wrong_generation),
+            Err(
+                WorkProgressError::PrePublishCancellationRecoveryGenerationMismatch {
+                    expected: 0,
+                    actual: 1,
+                }
+            )
+        );
+        assert_eq!(progress, before);
+
+        let bad_row = PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+            1, None, None, None, None,
+        )])
+        .expect("bounded unknown action row");
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                bad_row,
+                settlement.clone(),
+            )),
+            Err(WorkProgressError::PrePublishCleanupActionSetMismatch { action_ordinal: 1 })
+        ));
+        assert_eq!(progress, before);
+
+        let mut published = copy_progress_with_admission_claims();
+        publish_prefix(&mut published);
+        published
+            .request_cancellation(CancellationRequestObservation::new(406).expect("cancel"))
+            .expect("postpublication cancellation");
+        let published_before = published.clone();
+        let published_inventory = published
+            .cancellation_inventory
+            .as_ref()
+            .expect("published inventory")
+            .clone();
+        assert_eq!(
+            published.finish_pre_publish_cancellation(VerifiedPrePublishCancellation {
+                operation_id: published.operation_id,
+                plan: published.plan.clone(),
+                execution_epoch: published.execution_epoch,
+                cancellation_inventory: published_inventory,
+                expected_recovery_generation: 0,
+                cleanup: PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                settlement: settlement_inventory(
+                    &published,
+                    AdmissionClaimSettlementOutcome::Held,
+                ),
+            }),
+            Err(WorkProgressError::PrePublishCancellationRouteInvalid {
+                route: CancellationRoute::AfterPublish,
+            })
+        );
+        assert_eq!(published, published_before);
+    }
+
+    #[test]
+    fn prepublish_cleanup_preserves_settled_rows_while_held_rows_progress() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::Prepare);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(407).expect("cancel"))
+            .expect("prepublication cancellation");
+        let cleanup = PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+            0,
+            Some(PrePublishFinalClaimObservation::NoFinalClaim),
+            Some(PrePublishOriginalStateObservation::Preserved),
+            Some(PrePublishAbsenceObservation::Absent),
+            Some(PrePublishAbsenceObservation::Absent),
+        )])
+        .expect("complete cleanup");
+        let partial_settlement = settlement_inventory_with_outcomes(
+            &progress,
+            &[
+                AdmissionClaimSettlementOutcome::Released,
+                AdmissionClaimSettlementOutcome::Held,
+            ],
+        );
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                cleanup.clone(),
+                partial_settlement,
+            ))
+            .expect("retain partial settlement");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelRequestedBeforePublish
+        );
+
+        let settled_rewrite = settlement_inventory_with_outcomes(
+            &progress,
+            &[
+                AdmissionClaimSettlementOutcome::Held,
+                AdmissionClaimSettlementOutcome::Held,
+            ],
+        );
+        let before_rewrite = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                cleanup.clone(),
+                settled_rewrite,
+            )),
+            Err(WorkProgressError::PrePublishCancellationSettlementReplayConflict)
+        );
+        assert_eq!(progress, before_rewrite);
+
+        let complete_settlement = settlement_inventory_with_outcomes(
+            &progress,
+            &[
+                AdmissionClaimSettlementOutcome::Released,
+                AdmissionClaimSettlementOutcome::Released,
+            ],
+        );
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                cleanup,
+                complete_settlement,
+            ))
+            .expect("held claim becomes released");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
         );
     }
 
