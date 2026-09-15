@@ -693,6 +693,12 @@ state is preserved. A creation with no original object records that distinction.
 For retained-object operations, the input is the selected retained payload, not
 an old source pathname that may legitimately be absent.
 
+If cancellation falls between a completed source read and an eligible but still
+uncheckpointed first non-read obligation, the action remains a nonterminal
+boundary even when no cleanup row is entered. A future owner must establish
+whether that obligation was entered and reach a quiescent cleanup observation;
+this progress layer does not execute future work or infer that boundary away.
+
 Normal full-progress success also requires exact settlement coverage of the
 admitted claims, with no held claim. Finishing the work plan alone is insufficient;
 progress remains nonterminal until its capacity owner supplies settlement. A pure

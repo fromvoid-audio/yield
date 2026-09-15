@@ -1297,3 +1297,14 @@ formatting and diff checks passed. Independent review found no material issue.
 This adds no live cleanup issuer or filesystem execution. After-publication and
 observed-effect outcomes, full progress persistence and the remaining OPT-1337
 integration are still open.
+
+The initial prepublication commit `8fa6f00b5` passed Windows storage run
+`34991443605`, but final primary review found an eligible first-effect gap:
+`SourceRead` may be complete while the first effect is pending/in flight and the
+completion-only inventory still says `NotStarted`. The repair computes that
+boundary once from the frozen prerequisites, keeps cancellation nonterminal and
+blocks staging/recovery release. It never introduces cleanup for an unstarted
+action. Explicit entered/quiescent owner authority is still needed to resolve
+this boundary. Thirty-one progress tests, related cancellation/claim tests,
+library/GPUI checks without default features, formatting and diff checks passed.
+Independent review accepted the repair with no remaining material findings.

@@ -34,7 +34,10 @@ pub enum CancellationRoute {
 /// Derived state of one action at cancellation request time.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CancellationActionState {
-    /// Only source reads or non-effect obligations have completed.
+    /// No preparation or effect completion is recorded for the action.
+    ///
+    /// This does not prove that an eligible first effect is not already in flight between
+    /// checkpoints; the guarded progress layer must retain that boundary as nonterminal.
     NotStarted,
     /// Preparation, staging, or recovery material work has begun without an observed effect.
     CleanablePrePublish,

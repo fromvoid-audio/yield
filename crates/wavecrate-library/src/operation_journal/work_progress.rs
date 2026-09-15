@@ -15,6 +15,7 @@
 //! or lease identity.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 use super::admission_claims::{
@@ -1716,16 +1717,20 @@ impl WorkProgress {
             .cleanup
             .validate()
             .map_err(WorkProgressError::PrePublishCleanup)?;
+        let uncheckpointed_first_effect_boundary =
+            self.has_uncheckpointed_first_effect_boundary(&authority.cancellation_inventory);
         let cleanup_complete = self.validate_pre_publish_cleanup(
             &authority.cancellation_inventory,
             &authority.cleanup,
             admission_claims,
+            uncheckpointed_first_effect_boundary,
         )?;
         self.validate_pre_publish_settlement(
             &authority.cancellation_inventory,
             admission_claims,
             &authority.cleanup,
             &authority.settlement,
+            uncheckpointed_first_effect_boundary,
         )?;
 
         if let Some(existing) = &self.pre_publish_cancellation {
@@ -1787,6 +1792,7 @@ impl WorkProgress {
         inventory: &CancellationInventory,
         cleanup: &PrePublishCleanupObservation,
         admission_claims: &AdmissionClaimInventory,
+        uncheckpointed_first_effect_boundary: bool,
     ) -> Result<bool, WorkProgressError> {
         let has_operation_recovery_claim = admission_claims.claims().iter().any(|claim| {
             claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
@@ -1909,7 +1915,51 @@ impl WorkProgress {
                 }
             }
         }
+        // A source read can be the last durable checkpoint before the first filesystem owner
+        // enters its work.  The inventory still classifies that action as `NotStarted`, but a
+        // pending non-read unit whose prerequisites are all closed is an ambiguous cancellation
+        // boundary: cleanup must not claim that the operation-created namespace is absent until a
+        // future owner establishes whether that first effect was entered.  Keep this boundary
+        // nonterminal without adding a cleanup row for the still-unentered action.
+        if uncheckpointed_first_effect_boundary {
+            complete = false;
+        }
         Ok(complete)
+    }
+
+    fn has_uncheckpointed_first_effect_boundary(&self, inventory: &CancellationInventory) -> bool {
+        let mut blocked_dependents = BTreeSet::new();
+        for edge in self.plan.prerequisites() {
+            let prerequisite_ready = inventory
+                .steps()
+                .binary_search_by_key(&edge.prerequisite(), |step| step.key())
+                .ok()
+                .is_some_and(|index| {
+                    matches!(
+                        inventory.steps()[index].status(),
+                        ProgressStepStatus::Completed | ProgressStepStatus::NotApplicable
+                    )
+                });
+            if !prerequisite_ready {
+                blocked_dependents.insert(edge.dependent());
+            }
+        }
+        inventory.actions().iter().any(|action| {
+            action.state() == CancellationActionState::NotStarted
+                && self.plan.units().iter().enumerate().any(|(index, unit)| {
+                    if unit.key().action_ordinal() != action.action_ordinal()
+                        || unit.applicability() != WorkUnitApplicability::Required
+                        || unit.key().role() == WorkUnitRole::SourceRead
+                    {
+                        return false;
+                    }
+                    let Some(snapshot) = inventory.steps().get(index) else {
+                        return false;
+                    };
+                    snapshot.status() == ProgressStepStatus::Pending
+                        && !blocked_dependents.contains(&unit.key())
+                })
+        })
     }
 
     fn validate_pre_publish_settlement(
@@ -1918,6 +1968,7 @@ impl WorkProgress {
         admission_claims: &AdmissionClaimInventory,
         cleanup: &PrePublishCleanupObservation,
         settlement: &AdmissionClaimSettlementInventory,
+        uncheckpointed_first_effect_boundary: bool,
     ) -> Result<(), WorkProgressError> {
         settlement
             .validate_against(admission_claims)
@@ -1968,7 +2019,12 @@ impl WorkProgress {
                     _ => None,
                 };
                 if let Some(role) = absence_role {
-                    let ready = self.pre_publish_absence_ready(inventory, cleanup, role);
+                    let ready = self.pre_publish_absence_ready(
+                        inventory,
+                        cleanup,
+                        role,
+                        uncheckpointed_first_effect_boundary,
+                    );
                     if !ready {
                         return Err(
                             WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
@@ -1987,7 +2043,11 @@ impl WorkProgress {
         inventory: &CancellationInventory,
         cleanup: &PrePublishCleanupObservation,
         role: WorkUnitRole,
+        uncheckpointed_first_effect_boundary: bool,
     ) -> bool {
+        if uncheckpointed_first_effect_boundary {
+            return false;
+        }
         let has_operation_recovery_claim = self.admission_claims.as_ref().is_some_and(|claims| {
             claims.claims().iter().any(|claim| {
                 claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
@@ -5192,6 +5252,66 @@ mod tests {
             .finish_pre_publish_cancellation(terminal_authority)
             .expect("terminal replay");
         assert_eq!(progress, terminal);
+    }
+
+    #[test]
+    fn prepublish_cleanup_holds_uncheckpointed_first_effect_boundary() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(408).expect("cancel"))
+            .expect("prepublication cancellation");
+
+        let cleanup = PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup");
+        let held = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                cleanup.clone(),
+                held,
+            ))
+            .expect("retain uncheckpointed boundary");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelRequestedBeforePublish
+        );
+        assert_eq!(progress.recovery_generation(), 1);
+
+        let before_staging_release = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                cleanup.clone(),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            )),
+            Err(
+                WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
+                    allocation_class: FullCapacityAllocationClass::DestinationStaging,
+                }
+            )
+        );
+        assert_eq!(progress, before_staging_release);
+
+        let before_recovery_release = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                cleanup,
+                settlement_inventory_with_outcomes(
+                    &progress,
+                    &[
+                        AdmissionClaimSettlementOutcome::Held,
+                        AdmissionClaimSettlementOutcome::Released,
+                    ],
+                ),
+            )),
+            Err(
+                WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
+                    allocation_class: FullCapacityAllocationClass::OperationRecoveryPayload,
+                }
+            )
+        );
+        assert_eq!(progress, before_recovery_release);
     }
 
     #[test]
