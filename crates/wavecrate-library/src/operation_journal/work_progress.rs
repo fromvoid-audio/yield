@@ -15,7 +15,7 @@
 //! or lease identity.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::admission_claims::{
@@ -599,6 +599,141 @@ pub enum PrePublishAbsenceObservation {
     Uncertain,
 }
 
+/// Maximum number of unstarted-action quiescence rows retained for one cancellation.
+pub const MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS: usize = MAX_CANCELLATION_ACTIONS;
+/// Maximum number of eligible pending work-unit keys retained by one quiescence observation.
+pub const MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS: usize = MAX_WORK_PLAN_UNITS;
+
+/// Result of an owner barrier for an action that remained `NotStarted` in the frozen inventory.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PrePublishUnstartedQuiescenceResult {
+    /// A verified barrier established that the eligible work was never entered.
+    QuiescedWithoutEntry,
+    /// The owner could not establish the no-entry boundary.
+    Uncertain,
+}
+
+/// One bounded quiescence observation for a frozen `NotStarted` action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrePublishUnstartedQuiescenceAction {
+    action_ordinal: u8,
+    eligible_pending_keys: Vec<WorkUnitKey>,
+    result: PrePublishUnstartedQuiescenceResult,
+    staging_absence: Option<PrePublishAbsenceObservation>,
+    operation_recovery_payload_absence: Option<PrePublishAbsenceObservation>,
+}
+
+impl PrePublishUnstartedQuiescenceAction {
+    /// Construct one bounded per-action quiescence observation.
+    pub fn new(
+        action_ordinal: u8,
+        eligible_pending_keys: Vec<WorkUnitKey>,
+        result: PrePublishUnstartedQuiescenceResult,
+        staging_absence: Option<PrePublishAbsenceObservation>,
+        operation_recovery_payload_absence: Option<PrePublishAbsenceObservation>,
+    ) -> Self {
+        Self {
+            action_ordinal,
+            eligible_pending_keys,
+            result,
+            staging_absence,
+            operation_recovery_payload_absence,
+        }
+    }
+
+    /// Return the frozen action ordinal covered by this observation.
+    pub const fn action_ordinal(&self) -> u8 {
+        self.action_ordinal
+    }
+
+    /// Borrow the exact sorted eligible pending keys required for this boundary.
+    pub fn eligible_pending_keys(&self) -> &[WorkUnitKey] {
+        &self.eligible_pending_keys
+    }
+
+    /// Return the owner barrier result.
+    pub const fn result(&self) -> PrePublishUnstartedQuiescenceResult {
+        self.result
+    }
+
+    /// Return the optional staging absence observation.
+    pub const fn staging_absence(&self) -> Option<PrePublishAbsenceObservation> {
+        self.staging_absence
+    }
+
+    /// Return the optional operation-recovery-payload absence observation.
+    pub const fn operation_recovery_payload_absence(&self) -> Option<PrePublishAbsenceObservation> {
+        self.operation_recovery_payload_absence
+    }
+}
+
+/// Bounded ordered quiescence observations for unstarted prepublication actions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrePublishUnstartedQuiescenceObservation {
+    actions: Vec<PrePublishUnstartedQuiescenceAction>,
+}
+
+impl PrePublishUnstartedQuiescenceObservation {
+    /// Construct ordered quiescence observations after checking their local bounded shape.
+    pub fn new(
+        actions: Vec<PrePublishUnstartedQuiescenceAction>,
+    ) -> Result<Self, PrePublishUnstartedQuiescenceValidationError> {
+        let observation = Self { actions };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    /// Validate bounded action and key ordering without interpreting owner authority.
+    pub fn validate(&self) -> Result<(), PrePublishUnstartedQuiescenceValidationError> {
+        if self.actions.len() > MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS {
+            return Err(
+                PrePublishUnstartedQuiescenceValidationError::TooManyActions {
+                    actual: self.actions.len(),
+                    maximum: MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS,
+                },
+            );
+        }
+        let mut key_count = 0usize;
+        for action in &self.actions {
+            key_count = key_count.saturating_add(action.eligible_pending_keys.len());
+            if key_count > MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS {
+                return Err(PrePublishUnstartedQuiescenceValidationError::TooManyKeys {
+                    actual: key_count,
+                    maximum: MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS,
+                });
+            }
+        }
+        for (index, action) in self.actions.iter().enumerate() {
+            if index > 0 && self.actions[index - 1].action_ordinal >= action.action_ordinal {
+                return Err(
+                    PrePublishUnstartedQuiescenceValidationError::ActionsNotSortedOrUnique {
+                        index,
+                        action_ordinal: action.action_ordinal,
+                    },
+                );
+            }
+            for (key_index, key) in action.eligible_pending_keys.iter().enumerate() {
+                if key_index > 0 && action.eligible_pending_keys[key_index - 1] >= *key {
+                    return Err(
+                        PrePublishUnstartedQuiescenceValidationError::KeysNotSortedOrUnique {
+                            action_ordinal: action.action_ordinal,
+                            index: key_index,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrow quiescence observations in increasing action order.
+    pub fn actions(&self) -> &[PrePublishUnstartedQuiescenceAction] {
+        &self.actions
+    }
+}
+
 /// Per-action cleanup observations retained by a prepublication cancellation outcome.
 ///
 /// Missing fields and `Uncertain` values describe incomplete observations.  They are retained for
@@ -705,6 +840,7 @@ impl PrePublishCleanupObservation {
 #[serde(deny_unknown_fields)]
 pub struct PrePublishCancellationObservation {
     cleanup: PrePublishCleanupObservation,
+    unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
     settlement: AdmissionClaimSettlementInventory,
 }
 
@@ -731,14 +867,70 @@ pub enum PrePublishCleanupValidationError {
     },
 }
 
+/// Failure while validating the bounded local shape of unstarted-action quiescence observations.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PrePublishUnstartedQuiescenceValidationError {
+    /// The ordered action observations exceed the cancellation bound.
+    #[error("prepublication unstarted quiescence has {actual} actions, maximum is {maximum}")]
+    TooManyActions {
+        /// Number of action rows supplied.
+        actual: usize,
+        /// Maximum number of action rows permitted.
+        maximum: usize,
+    },
+    /// The aggregate key rows exceed the frozen-plan bound.
+    #[error("prepublication unstarted quiescence has {actual} keys, maximum is {maximum}")]
+    TooManyKeys {
+        /// Number of keys supplied across all action rows.
+        actual: usize,
+        /// Maximum number of keys permitted.
+        maximum: usize,
+    },
+    /// The action rows were not strictly sorted by ordinal or contained a duplicate.
+    #[error(
+        "prepublication unstarted quiescence action list is not sorted or unique at index {index}: {action_ordinal}"
+    )]
+    ActionsNotSortedOrUnique {
+        /// Position of the offending row.
+        index: usize,
+        /// Offending action ordinal.
+        action_ordinal: u8,
+    },
+    /// A row's eligible pending keys were not strictly sorted or contained a duplicate.
+    #[error(
+        "prepublication unstarted quiescence keys for action {action_ordinal} are not sorted or unique at index {index}"
+    )]
+    KeysNotSortedOrUnique {
+        /// Action whose key list was invalid.
+        action_ordinal: u8,
+        /// Position of the offending key.
+        index: usize,
+    },
+}
+
 impl PrePublishCancellationObservation {
     /// Construct one stored prepublication cancellation observation.
     pub fn new(
         cleanup: PrePublishCleanupObservation,
         settlement: AdmissionClaimSettlementInventory,
     ) -> Self {
+        Self::with_unstarted_quiescence(
+            cleanup,
+            PrePublishUnstartedQuiescenceObservation::new(Vec::new())
+                .expect("empty quiescence observation is valid"),
+            settlement,
+        )
+    }
+
+    /// Construct one stored observation with an owner-supplied unstarted-action barrier result.
+    pub fn with_unstarted_quiescence(
+        cleanup: PrePublishCleanupObservation,
+        unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
+        settlement: AdmissionClaimSettlementInventory,
+    ) -> Self {
         Self {
             cleanup,
+            unstarted_quiescence,
             settlement,
         }
     }
@@ -746,6 +938,11 @@ impl PrePublishCancellationObservation {
     /// Borrow the bounded cleanup observations.
     pub fn cleanup(&self) -> &PrePublishCleanupObservation {
         &self.cleanup
+    }
+
+    /// Borrow the bounded unstarted-action quiescence observations.
+    pub fn unstarted_quiescence(&self) -> &PrePublishUnstartedQuiescenceObservation {
+        &self.unstarted_quiescence
     }
 
     /// Borrow the bounded claim settlement observations.
@@ -855,7 +1052,9 @@ struct VerifiedAuditResolution {
 ///
 /// This authority is deliberately non-serialized and has no production constructor.  A future
 /// owner must bind the operation, frozen plan, current execution epoch, frozen cancellation
-/// inventory, and current recovery-observation generation before handing it to progress.
+/// inventory, current recovery-observation generation, and any unstarted-action quiescence
+/// observation before handing it to progress.  `QuiescedWithoutEntry` remains a typed owner
+/// observation; this module does not issue the barrier or inspect the filesystem.
 #[allow(dead_code)]
 #[derive(Clone)]
 struct VerifiedPrePublishCancellation {
@@ -865,6 +1064,7 @@ struct VerifiedPrePublishCancellation {
     cancellation_inventory: CancellationInventory,
     expected_recovery_generation: u64,
     cleanup: PrePublishCleanupObservation,
+    unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
     settlement: AdmissionClaimSettlementInventory,
 }
 
@@ -1717,24 +1917,35 @@ impl WorkProgress {
             .cleanup
             .validate()
             .map_err(WorkProgressError::PrePublishCleanup)?;
-        let uncheckpointed_first_effect_boundary =
-            self.has_uncheckpointed_first_effect_boundary(&authority.cancellation_inventory);
+        authority
+            .unstarted_quiescence
+            .validate()
+            .map_err(WorkProgressError::PrePublishUnstartedQuiescence)?;
+        let uncheckpointed_first_effect_keys =
+            self.uncheckpointed_first_effect_keys(&authority.cancellation_inventory);
+        let unstarted_quiescence_complete = self.validate_pre_publish_unstarted_quiescence(
+            &authority.cancellation_inventory,
+            &authority.unstarted_quiescence,
+            &uncheckpointed_first_effect_keys,
+            admission_claims,
+        )?;
         let cleanup_complete = self.validate_pre_publish_cleanup(
             &authority.cancellation_inventory,
             &authority.cleanup,
             admission_claims,
-            uncheckpointed_first_effect_boundary,
+            unstarted_quiescence_complete,
         )?;
         self.validate_pre_publish_settlement(
             &authority.cancellation_inventory,
             admission_claims,
             &authority.cleanup,
             &authority.settlement,
-            uncheckpointed_first_effect_boundary,
+            unstarted_quiescence_complete,
         )?;
 
         if let Some(existing) = &self.pre_publish_cancellation {
             if existing.cleanup() == &authority.cleanup
+                && existing.unstarted_quiescence() == &authority.unstarted_quiescence
                 && existing.settlement() == &authority.settlement
             {
                 if generation_is_current || generation_is_replay {
@@ -1749,6 +1960,10 @@ impl WorkProgress {
                     },
                 );
             }
+            validate_pre_publish_unstarted_quiescence_transition(
+                existing.unstarted_quiescence(),
+                &authority.unstarted_quiescence,
+            )?;
             validate_pre_publish_settlement_transition(
                 existing.settlement(),
                 &authority.settlement,
@@ -1775,10 +1990,13 @@ impl WorkProgress {
             .settlement
             .satisfies_prepublication_cancellation(admission_claims)
             .map_err(WorkProgressError::PrePublishCancellationSettlement)?;
-        self.pre_publish_cancellation = Some(PrePublishCancellationObservation::new(
-            authority.cleanup,
-            authority.settlement,
-        ));
+        self.pre_publish_cancellation = Some(
+            PrePublishCancellationObservation::with_unstarted_quiescence(
+                authority.cleanup,
+                authority.unstarted_quiescence,
+                authority.settlement,
+            ),
+        );
         self.recovery_generation = next_recovery_generation;
         if cleanup_complete && settled {
             self.phase = OperationPhase::Terminal;
@@ -1792,7 +2010,7 @@ impl WorkProgress {
         inventory: &CancellationInventory,
         cleanup: &PrePublishCleanupObservation,
         admission_claims: &AdmissionClaimInventory,
-        uncheckpointed_first_effect_boundary: bool,
+        unstarted_quiescence_complete: bool,
     ) -> Result<bool, WorkProgressError> {
         let has_operation_recovery_claim = admission_claims.claims().iter().any(|claim| {
             claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
@@ -1921,13 +2139,16 @@ impl WorkProgress {
         // boundary: cleanup must not claim that the operation-created namespace is absent until a
         // future owner establishes whether that first effect was entered.  Keep this boundary
         // nonterminal without adding a cleanup row for the still-unentered action.
-        if uncheckpointed_first_effect_boundary {
+        if !unstarted_quiescence_complete {
             complete = false;
         }
         Ok(complete)
     }
 
-    fn has_uncheckpointed_first_effect_boundary(&self, inventory: &CancellationInventory) -> bool {
+    fn uncheckpointed_first_effect_keys(
+        &self,
+        inventory: &CancellationInventory,
+    ) -> BTreeSet<WorkUnitKey> {
         let mut blocked_dependents = BTreeSet::new();
         for edge in self.plan.prerequisites() {
             let prerequisite_ready = inventory
@@ -1944,22 +2165,156 @@ impl WorkProgress {
                 blocked_dependents.insert(edge.dependent());
             }
         }
-        inventory.actions().iter().any(|action| {
-            action.state() == CancellationActionState::NotStarted
-                && self.plan.units().iter().enumerate().any(|(index, unit)| {
-                    if unit.key().action_ordinal() != action.action_ordinal()
-                        || unit.applicability() != WorkUnitApplicability::Required
-                        || unit.key().role() == WorkUnitRole::SourceRead
-                    {
-                        return false;
-                    }
-                    let Some(snapshot) = inventory.steps().get(index) else {
-                        return false;
-                    };
-                    snapshot.status() == ProgressStepStatus::Pending
-                        && !blocked_dependents.contains(&unit.key())
-                })
-        })
+        let mut eligible = BTreeSet::new();
+        for action in inventory.actions() {
+            if action.state() != CancellationActionState::NotStarted {
+                continue;
+            }
+            for (index, unit) in self.plan.units().iter().enumerate() {
+                if unit.key().action_ordinal() != action.action_ordinal()
+                    || unit.applicability() != WorkUnitApplicability::Required
+                    || unit.key().role() == WorkUnitRole::SourceRead
+                {
+                    continue;
+                }
+                let Some(snapshot) = inventory.steps().get(index) else {
+                    continue;
+                };
+                if snapshot.status() == ProgressStepStatus::Pending
+                    && !blocked_dependents.contains(&unit.key())
+                {
+                    eligible.insert(unit.key());
+                }
+            }
+        }
+        eligible
+    }
+
+    fn validate_pre_publish_unstarted_quiescence(
+        &self,
+        inventory: &CancellationInventory,
+        quiescence: &PrePublishUnstartedQuiescenceObservation,
+        eligible_keys: &BTreeSet<WorkUnitKey>,
+        admission_claims: &AdmissionClaimInventory,
+    ) -> Result<bool, WorkProgressError> {
+        let mut expected_by_action = BTreeMap::<u8, Vec<WorkUnitKey>>::new();
+        for key in eligible_keys {
+            expected_by_action
+                .entry(key.action_ordinal())
+                .or_default()
+                .push(*key);
+        }
+        let has_destination_staging_claim = admission_claims.claims().iter().any(|claim| {
+            claim.allocation_class() == FullCapacityAllocationClass::DestinationStaging
+        });
+        let has_operation_recovery_claim = admission_claims.claims().iter().any(|claim| {
+            claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
+        });
+
+        for row in quiescence.actions() {
+            let Some(action) = inventory
+                .actions()
+                .iter()
+                .find(|action| action.action_ordinal() == row.action_ordinal())
+            else {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceActionSetMismatch {
+                        action_ordinal: row.action_ordinal(),
+                    },
+                );
+            };
+            if action.state() != CancellationActionState::NotStarted {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceActionSetMismatch {
+                        action_ordinal: row.action_ordinal(),
+                    },
+                );
+            }
+            let Some(expected_keys) = expected_by_action.get(&row.action_ordinal()) else {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceActionSetMismatch {
+                        action_ordinal: row.action_ordinal(),
+                    },
+                );
+            };
+            if row.eligible_pending_keys() != expected_keys.as_slice() {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceKeySetMismatch {
+                        action_ordinal: row.action_ordinal(),
+                    },
+                );
+            }
+
+            let staging_required = has_destination_staging_claim
+                || action_has_required_role(&self.plan, row.action_ordinal(), WorkUnitRole::Stage);
+            if !staging_required && row.staging_absence().is_some() {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceStagingUnexpected {
+                        action_ordinal: row.action_ordinal(),
+                    },
+                );
+            }
+            let recovery_required = has_operation_recovery_claim
+                || action_has_required_role(
+                    &self.plan,
+                    row.action_ordinal(),
+                    WorkUnitRole::RecoveryMaterialRetained,
+                );
+            if !recovery_required && row.operation_recovery_payload_absence().is_some() {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceRecoveryUnexpected {
+                        action_ordinal: row.action_ordinal(),
+                    },
+                );
+            }
+        }
+
+        let mut complete = true;
+        for (action_ordinal, expected_keys) in &expected_by_action {
+            let Some(_action) = inventory
+                .actions()
+                .iter()
+                .find(|action| action.action_ordinal() == *action_ordinal)
+            else {
+                return Err(
+                    WorkProgressError::PrePublishUnstartedQuiescenceActionSetMismatch {
+                        action_ordinal: *action_ordinal,
+                    },
+                );
+            };
+            let Some(row) = quiescence
+                .actions()
+                .iter()
+                .find(|row| row.action_ordinal() == *action_ordinal)
+            else {
+                complete = false;
+                continue;
+            };
+            debug_assert_eq!(row.eligible_pending_keys(), expected_keys.as_slice());
+            if row.result() != PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry {
+                complete = false;
+            }
+            let staging_required = has_destination_staging_claim
+                || action_has_required_role(&self.plan, *action_ordinal, WorkUnitRole::Stage);
+            if staging_required
+                && row.staging_absence() != Some(PrePublishAbsenceObservation::Absent)
+            {
+                complete = false;
+            }
+            let recovery_required = has_operation_recovery_claim
+                || action_has_required_role(
+                    &self.plan,
+                    *action_ordinal,
+                    WorkUnitRole::RecoveryMaterialRetained,
+                );
+            if recovery_required
+                && row.operation_recovery_payload_absence()
+                    != Some(PrePublishAbsenceObservation::Absent)
+            {
+                complete = false;
+            }
+        }
+        Ok(complete)
     }
 
     fn validate_pre_publish_settlement(
@@ -1968,7 +2323,7 @@ impl WorkProgress {
         admission_claims: &AdmissionClaimInventory,
         cleanup: &PrePublishCleanupObservation,
         settlement: &AdmissionClaimSettlementInventory,
-        uncheckpointed_first_effect_boundary: bool,
+        unstarted_quiescence_complete: bool,
     ) -> Result<(), WorkProgressError> {
         settlement
             .validate_against(admission_claims)
@@ -2023,7 +2378,7 @@ impl WorkProgress {
                         inventory,
                         cleanup,
                         role,
-                        uncheckpointed_first_effect_boundary,
+                        unstarted_quiescence_complete,
                     );
                     if !ready {
                         return Err(
@@ -2043,9 +2398,9 @@ impl WorkProgress {
         inventory: &CancellationInventory,
         cleanup: &PrePublishCleanupObservation,
         role: WorkUnitRole,
-        uncheckpointed_first_effect_boundary: bool,
+        unstarted_quiescence_complete: bool,
     ) -> bool {
-        if uncheckpointed_first_effect_boundary {
+        if !unstarted_quiescence_complete {
             return false;
         }
         let has_operation_recovery_claim = self.admission_claims.as_ref().is_some_and(|claims| {
@@ -2353,6 +2708,42 @@ fn validate_pre_publish_settlement_transition(
         };
         if !allowed {
             return Err(WorkProgressError::PrePublishCancellationSettlementReplayConflict);
+        }
+    }
+    Ok(())
+}
+
+fn validate_pre_publish_unstarted_quiescence_transition(
+    existing: &PrePublishUnstartedQuiescenceObservation,
+    candidate: &PrePublishUnstartedQuiescenceObservation,
+) -> Result<(), WorkProgressError> {
+    for existing_row in existing.actions() {
+        let Some(candidate_row) = candidate
+            .actions()
+            .iter()
+            .find(|row| row.action_ordinal() == existing_row.action_ordinal())
+        else {
+            if existing_row.result() == PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry
+                || existing_row.staging_absence() == Some(PrePublishAbsenceObservation::Absent)
+                || existing_row.operation_recovery_payload_absence()
+                    == Some(PrePublishAbsenceObservation::Absent)
+            {
+                return Err(WorkProgressError::PrePublishCancellationQuiescenceReplayConflict);
+            }
+            continue;
+        };
+        let quiescence_regressed = existing_row.result()
+            == PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry
+            && candidate_row.result() != PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry;
+        let staging_regressed = existing_row.staging_absence()
+            == Some(PrePublishAbsenceObservation::Absent)
+            && candidate_row.staging_absence() != Some(PrePublishAbsenceObservation::Absent);
+        let recovery_regressed = existing_row.operation_recovery_payload_absence()
+            == Some(PrePublishAbsenceObservation::Absent)
+            && candidate_row.operation_recovery_payload_absence()
+                != Some(PrePublishAbsenceObservation::Absent);
+        if quiescence_regressed || staging_regressed || recovery_regressed {
+            return Err(WorkProgressError::PrePublishCancellationQuiescenceReplayConflict);
         }
     }
     Ok(())
@@ -2997,6 +3388,9 @@ pub enum WorkProgressError {
     /// A prepublication settlement observation failed exact claim coverage validation.
     #[error("invalid work progress prepublication cancellation settlement: {0}")]
     PrePublishCancellationSettlement(#[source] AdmissionClaimValidationError),
+    /// A bounded unstarted-action quiescence observation failed local shape validation.
+    #[error("invalid work progress prepublication unstarted quiescence: {0}")]
+    PrePublishUnstartedQuiescence(#[source] PrePublishUnstartedQuiescenceValidationError),
     /// A closed claim outcome does not match its allocation class policy.
     #[error(
         "work progress prepublication settlement outcome {outcome:?} is incompatible with claim {claim_id} class {allocation_class:?}"
@@ -3050,6 +3444,43 @@ pub enum WorkProgressError {
         /// Action carrying an unexpected recovery field.
         action_ordinal: u8,
     },
+    /// A quiescence row named an action that is unknown or not still `NotStarted`.
+    #[error(
+        "work progress prepublication unstarted quiescence action {action_ordinal} is not eligible"
+    )]
+    PrePublishUnstartedQuiescenceActionSetMismatch {
+        /// Action named by the invalid quiescence row.
+        action_ordinal: u8,
+    },
+    /// A quiescence row did not carry the exact pending key set for its action.
+    #[error(
+        "work progress prepublication unstarted quiescence keys do not match action {action_ordinal}"
+    )]
+    PrePublishUnstartedQuiescenceKeySetMismatch {
+        /// Action whose key set was invalid.
+        action_ordinal: u8,
+    },
+    /// A quiescence row supplied staging absence for an action without staging work.
+    #[error(
+        "work progress prepublication unstarted quiescence staging absence is unexpected for action {action_ordinal}"
+    )]
+    PrePublishUnstartedQuiescenceStagingUnexpected {
+        /// Action carrying an unexpected staging field.
+        action_ordinal: u8,
+    },
+    /// A quiescence row supplied recovery absence without a recovery obligation.
+    #[error(
+        "work progress prepublication unstarted quiescence recovery absence is unexpected for action {action_ordinal}"
+    )]
+    PrePublishUnstartedQuiescenceRecoveryUnexpected {
+        /// Action carrying an unexpected recovery field.
+        action_ordinal: u8,
+    },
+    /// A later observation attempted to regress decisive quiescence or absence evidence.
+    #[error(
+        "work progress prepublication unstarted quiescence replay conflicts with a decisive observation"
+    )]
+    PrePublishCancellationQuiescenceReplayConflict,
 }
 
 impl From<RetryObservationValidationError> for WorkProgressError {
@@ -3447,6 +3878,21 @@ mod tests {
         cleanup: PrePublishCleanupObservation,
         settlement: AdmissionClaimSettlementInventory,
     ) -> VerifiedPrePublishCancellation {
+        pre_publish_cleanup_authority_with_quiescence(
+            progress,
+            PrePublishUnstartedQuiescenceObservation::new(Vec::new())
+                .expect("empty quiescence observation"),
+            cleanup,
+            settlement,
+        )
+    }
+
+    fn pre_publish_cleanup_authority_with_quiescence(
+        progress: &WorkProgress,
+        unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
+        cleanup: PrePublishCleanupObservation,
+        settlement: AdmissionClaimSettlementInventory,
+    ) -> VerifiedPrePublishCancellation {
         VerifiedPrePublishCancellation {
             operation_id: progress.operation_id,
             plan: progress.plan.clone(),
@@ -3458,8 +3904,38 @@ mod tests {
                 .clone(),
             expected_recovery_generation: progress.recovery_generation,
             cleanup,
+            unstarted_quiescence,
             settlement,
         }
+    }
+
+    fn unstarted_quiescence_for_action(
+        progress: &WorkProgress,
+        action_ordinal: u8,
+        result: PrePublishUnstartedQuiescenceResult,
+        staging_absence: Option<PrePublishAbsenceObservation>,
+        operation_recovery_payload_absence: Option<PrePublishAbsenceObservation>,
+    ) -> PrePublishUnstartedQuiescenceObservation {
+        let inventory = progress
+            .cancellation_inventory
+            .as_ref()
+            .expect("cancellation inventory");
+        let keys: Vec<_> = progress
+            .uncheckpointed_first_effect_keys(inventory)
+            .into_iter()
+            .filter(|key| key.action_ordinal() == action_ordinal)
+            .collect();
+        assert!(!keys.is_empty(), "expected an eligible unstarted boundary");
+        PrePublishUnstartedQuiescenceObservation::new(vec![
+            PrePublishUnstartedQuiescenceAction::new(
+                action_ordinal,
+                keys,
+                result,
+                staging_absence,
+                operation_recovery_payload_absence,
+            ),
+        ])
+        .expect("quiescence observation")
     }
 
     fn claimed_progress(
@@ -5315,6 +5791,380 @@ mod tests {
     }
 
     #[test]
+    fn prepublish_unstarted_quiescence_requires_decisive_barrier_and_is_replay_stable() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(409).expect("cancel"))
+            .expect("prepublication cancellation");
+
+        let uncertain = unstarted_quiescence_for_action(
+            &progress,
+            0,
+            PrePublishUnstartedQuiescenceResult::Uncertain,
+            Some(PrePublishAbsenceObservation::Preserved),
+            Some(PrePublishAbsenceObservation::Preserved),
+        );
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority_with_quiescence(
+                &progress,
+                uncertain,
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("retain uncertain boundary");
+        assert_eq!(progress.recovery_generation(), 1);
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelRequestedBeforePublish
+        );
+
+        let decisive = unstarted_quiescence_for_action(
+            &progress,
+            0,
+            PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry,
+            Some(PrePublishAbsenceObservation::Absent),
+            Some(PrePublishAbsenceObservation::Absent),
+        );
+        let decisive_authority = pre_publish_cleanup_authority_with_quiescence(
+            &progress,
+            decisive,
+            PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        let decisive_replay = decisive_authority.clone();
+        progress
+            .finish_pre_publish_cancellation(decisive_authority)
+            .expect("retain decisive boundary");
+        assert_eq!(progress.recovery_generation(), 2);
+        let after_decisive = progress.clone();
+        progress
+            .finish_pre_publish_cancellation(decisive_replay)
+            .expect("acknowledgement-loss replay");
+        assert_eq!(progress, after_decisive);
+
+        let regressed = unstarted_quiescence_for_action(
+            &progress,
+            0,
+            PrePublishUnstartedQuiescenceResult::Uncertain,
+            Some(PrePublishAbsenceObservation::Preserved),
+            Some(PrePublishAbsenceObservation::Preserved),
+        );
+        let before_regression = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(
+                pre_publish_cleanup_authority_with_quiescence(
+                    &progress,
+                    regressed,
+                    PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                    settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+                )
+            ),
+            Err(WorkProgressError::PrePublishCancellationQuiescenceReplayConflict)
+        );
+        assert_eq!(progress, before_regression);
+
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority_with_quiescence(
+                &progress,
+                unstarted_quiescence_for_action(
+                    &progress,
+                    0,
+                    PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry,
+                    Some(PrePublishAbsenceObservation::Absent),
+                    Some(PrePublishAbsenceObservation::Absent),
+                ),
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("decisive absence and settled claims finish cancellation");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+    }
+
+    #[test]
+    fn prepublish_unstarted_quiescence_rejects_wrong_rows_and_bounds() {
+        let mut progress = copy_progress_with_admission_claims();
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let wrong_action_key = WorkUnitKey::new(
+            1,
+            source_key.step_ordinal(),
+            source_key.participant_id(),
+            source_key.role(),
+        );
+
+        let duplicate_rows = PrePublishUnstartedQuiescenceAction::new(
+            0,
+            Vec::new(),
+            PrePublishUnstartedQuiescenceResult::Uncertain,
+            None,
+            None,
+        );
+        assert!(matches!(
+            PrePublishUnstartedQuiescenceObservation::new(vec![
+                duplicate_rows.clone(),
+                duplicate_rows.clone(),
+            ]),
+            Err(PrePublishUnstartedQuiescenceValidationError::ActionsNotSortedOrUnique { .. })
+        ));
+        assert!(matches!(
+            PrePublishUnstartedQuiescenceObservation::new(vec![
+                duplicate_rows;
+                MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS
+                    + 1
+            ]),
+            Err(PrePublishUnstartedQuiescenceValidationError::TooManyActions { .. })
+        ));
+        assert!(matches!(
+            PrePublishUnstartedQuiescenceObservation::new(vec![
+                PrePublishUnstartedQuiescenceAction::new(
+                    0,
+                    vec![source_key; MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS + 1],
+                    PrePublishUnstartedQuiescenceResult::Uncertain,
+                    None,
+                    None,
+                ),
+            ]),
+            Err(PrePublishUnstartedQuiescenceValidationError::TooManyKeys { .. })
+        ));
+        assert!(matches!(
+            PrePublishUnstartedQuiescenceObservation::new(vec![
+                PrePublishUnstartedQuiescenceAction::new(
+                    0,
+                    vec![source_key, source_key],
+                    PrePublishUnstartedQuiescenceResult::Uncertain,
+                    None,
+                    None,
+                ),
+            ]),
+            Err(PrePublishUnstartedQuiescenceValidationError::KeysNotSortedOrUnique { .. })
+        ));
+
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(410).expect("cancel"))
+            .expect("prepublication cancellation");
+        let unknown_action = PrePublishUnstartedQuiescenceObservation::new(vec![
+            PrePublishUnstartedQuiescenceAction::new(
+                99,
+                vec![wrong_action_key],
+                PrePublishUnstartedQuiescenceResult::Uncertain,
+                None,
+                None,
+            ),
+        ])
+        .expect("bounded unknown action");
+        let held = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+        let before = progress.clone();
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(
+                pre_publish_cleanup_authority_with_quiescence(
+                    &progress,
+                    unknown_action,
+                    PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                    held.clone(),
+                )
+            ),
+            Err(
+                WorkProgressError::PrePublishUnstartedQuiescenceActionSetMismatch {
+                    action_ordinal: 99
+                }
+            )
+        ));
+        assert_eq!(progress, before);
+
+        let wrong_keys = PrePublishUnstartedQuiescenceObservation::new(vec![
+            PrePublishUnstartedQuiescenceAction::new(
+                0,
+                vec![wrong_action_key],
+                PrePublishUnstartedQuiescenceResult::Uncertain,
+                None,
+                None,
+            ),
+        ])
+        .expect("bounded cross-action key");
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(
+                pre_publish_cleanup_authority_with_quiescence(
+                    &progress,
+                    wrong_keys,
+                    PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                    held.clone(),
+                )
+            ),
+            Err(
+                WorkProgressError::PrePublishUnstartedQuiescenceKeySetMismatch {
+                    action_ordinal: 0
+                }
+            )
+        ));
+        assert_eq!(progress, before);
+
+        let unexpected_recovery = unstarted_quiescence_for_action(
+            &progress,
+            0,
+            PrePublishUnstartedQuiescenceResult::Uncertain,
+            None,
+            Some(PrePublishAbsenceObservation::Absent),
+        );
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(
+                pre_publish_cleanup_authority_with_quiescence(
+                    &progress,
+                    unexpected_recovery,
+                    PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                    held.clone(),
+                )
+            ),
+            Err(
+                WorkProgressError::PrePublishUnstartedQuiescenceRecoveryUnexpected {
+                    action_ordinal: 0
+                }
+            )
+        ));
+        assert_eq!(progress, before);
+
+        let mut cleanable = copy_progress_with_admission_claims();
+        apply_role(&mut cleanable, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut cleanable, 0, WorkUnitRole::Prepare);
+        cleanable
+            .request_cancellation(CancellationRequestObservation::new(412).expect("cancel"))
+            .expect("prepublication cancellation");
+        let non_not_started = PrePublishUnstartedQuiescenceObservation::new(vec![
+            PrePublishUnstartedQuiescenceAction::new(
+                0,
+                Vec::new(),
+                PrePublishUnstartedQuiescenceResult::Uncertain,
+                None,
+                None,
+            ),
+        ])
+        .expect("bounded cleanable action row");
+        assert!(matches!(
+            cleanable.finish_pre_publish_cancellation(
+                pre_publish_cleanup_authority_with_quiescence(
+                    &cleanable,
+                    non_not_started,
+                    PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                    settlement_inventory(&cleanable, AdmissionClaimSettlementOutcome::Held),
+                )
+            ),
+            Err(
+                WorkProgressError::PrePublishUnstartedQuiescenceActionSetMismatch {
+                    action_ordinal: 0
+                }
+            )
+        ));
+
+        let not_started_cleanup =
+            PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+                0,
+                Some(PrePublishFinalClaimObservation::NoFinalClaim),
+                Some(PrePublishOriginalStateObservation::Preserved),
+                None,
+                None,
+            )])
+            .expect("bounded not-started cleanup row");
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                not_started_cleanup,
+                held,
+            )),
+            Err(WorkProgressError::PrePublishCleanupActionSetMismatch { action_ordinal: 0 })
+        ));
+        assert_eq!(progress, before);
+    }
+
+    #[test]
+    fn prepublish_unstarted_quiescence_requires_current_epoch_after_reacquisition() {
+        let mut progress = copy_progress_with_two_admission_claims();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(411).expect("cancel"))
+            .expect("prepublication cancellation");
+        let retained_quiescence = unstarted_quiescence_for_action(
+            &progress,
+            0,
+            PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry,
+            Some(PrePublishAbsenceObservation::Absent),
+            Some(PrePublishAbsenceObservation::Absent),
+        );
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority_with_quiescence(
+                &progress,
+                retained_quiescence.clone(),
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("retain current epoch proof");
+        let stale_authority = pre_publish_cleanup_authority_with_quiescence(
+            &progress,
+            retained_quiescence,
+            PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        let target = key_for(&progress, 0, WorkUnitRole::SourceRead).participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(&progress, target, 7, 2, 0))
+            .expect("source reacquisition");
+        let after_reacquisition = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(stale_authority),
+            Err(WorkProgressError::PrePublishCancellationEpochMismatch {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(progress, after_reacquisition);
+        assert_eq!(progress.recovery_generation(), 1);
+        assert_eq!(
+            progress
+                .pre_publish_cancellation()
+                .expect("retained quiescence")
+                .unstarted_quiescence()
+                .actions()
+                .len(),
+            1
+        );
+
+        let current_quiescence = unstarted_quiescence_for_action(
+            &progress,
+            0,
+            PrePublishUnstartedQuiescenceResult::QuiescedWithoutEntry,
+            Some(PrePublishAbsenceObservation::Absent),
+            Some(PrePublishAbsenceObservation::Absent),
+        );
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority_with_quiescence(
+                &progress,
+                current_quiescence.clone(),
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("current epoch retained proof");
+        assert_eq!(progress.recovery_generation(), 1);
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelRequestedBeforePublish
+        );
+        progress
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority_with_quiescence(
+                &progress,
+                current_quiescence,
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("current epoch release");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledBeforePublish
+        );
+    }
+
+    #[test]
     fn prepublish_cleanup_requires_recovery_absence_for_recovery_claims_and_allows_held_rows() {
         let mut progress = copy_progress_with_two_admission_claims();
         apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
@@ -5528,6 +6378,8 @@ mod tests {
                 cancellation_inventory: published_inventory,
                 expected_recovery_generation: 0,
                 cleanup: PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                unstarted_quiescence: PrePublishUnstartedQuiescenceObservation::new(Vec::new())
+                    .expect("quiescence"),
                 settlement: settlement_inventory(
                     &published,
                     AdmissionClaimSettlementOutcome::Held,

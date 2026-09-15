@@ -183,10 +183,14 @@ pub use work_plan::{
 };
 pub use work_progress::{
     AuditTarget, AuditTargetValidationError, CoordinatorDeficit, CoordinatorReceiptKind,
-    CoordinatorReceiptSummary, FilesystemReceiptKind, FilesystemReceiptSummary, ParticipantScope,
-    PrePublishAbsenceObservation, PrePublishActionCleanup, PrePublishCancellationObservation,
-    PrePublishCleanupObservation, PrePublishCleanupValidationError,
-    PrePublishFinalClaimObservation, PrePublishOriginalStateObservation, ProgressAuditObservation,
-    ProgressAuditReason, ProgressEvidenceError, ProgressStepStatus, SourceRevisionObservation,
-    StoredStepEvidence, WorkProgress, WorkProgressError, WorkProgressStep,
+    CoordinatorReceiptSummary, FilesystemReceiptKind, FilesystemReceiptSummary,
+    MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS, MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS,
+    ParticipantScope, PrePublishAbsenceObservation, PrePublishActionCleanup,
+    PrePublishCancellationObservation, PrePublishCleanupObservation,
+    PrePublishCleanupValidationError, PrePublishFinalClaimObservation,
+    PrePublishOriginalStateObservation, PrePublishUnstartedQuiescenceAction,
+    PrePublishUnstartedQuiescenceObservation, PrePublishUnstartedQuiescenceResult,
+    PrePublishUnstartedQuiescenceValidationError, ProgressAuditObservation, ProgressAuditReason,
+    ProgressEvidenceError, ProgressStepStatus, SourceRevisionObservation, StoredStepEvidence,
+    WorkProgress, WorkProgressError, WorkProgressStep,
 };

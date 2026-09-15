@@ -1308,3 +1308,25 @@ action. Explicit entered/quiescent owner authority is still needed to resolve
 this boundary. Thirty-one progress tests, related cancellation/claim tests,
 library/GPUI checks without default features, formatting and diff checks passed.
 Independent review accepted the repair with no remaining material findings.
+
+Windows storage run `34993593461` passed at exact repair source `4a81a779c`:
+289 journal tests passed with one ignored, and the remaining storage-lane checks
+passed. This does not provide native Windows UI/audio acceptance.
+
+The pending-first-effect boundary now accepts a bounded, private-authority-bound
+quiescence observation. Each supplied unstarted action must identify its exact
+eligible pending work keys. A verified barrier must establish that none was
+entered, together with applicable staging and recovery absence; missing or
+uncertain observations retain the hold. These rows never become cleanup work for
+future actions. Decisive observations cannot regress, exact acknowledgement-loss
+replay is harmless, and source reacquisition requires current-epoch authority
+even when an earlier observation remains retained. Claim release and terminal
+cancellation share the same completeness guard.
+
+Thirty-four focused progress tests passed, including retained-observation
+reacquisition, malformed coverage, bounds, and replay regressions. Library and
+GPUI checks without default features, formatting, and diff checks passed.
+Independent production-path review found no actionable issue. This remains a
+guarded observation model: no live barrier issuer, filesystem execution, or full
+durable progress codec was added. Effects that actually entered still require
+their own exact recovery observations; OPT-1337 remains in progress.
