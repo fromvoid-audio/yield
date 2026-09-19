@@ -22,6 +22,11 @@ use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlementInventory,
     AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
+use super::cancellation_cleanup::{
+    CancellationResourceCleanupManifest, CancellationResourceCleanupManifestError,
+    CancellationResourceCleanupObservationRecord,
+    CancellationResourceCleanupObservationRecordError, CancellationResourceCleanupOutcome,
+};
 use super::cancellation_dispatch::{
     CancellationDispatchManifest, CancellationDispatchManifestError, CancellationDispatchOutcome,
     CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
@@ -1435,6 +1440,38 @@ impl WorkProgress {
         context: &CompletionContext,
         evidence: &StoredStepEvidence,
     ) -> Result<(), WorkProgressError> {
+        let current_scope = self.validate_historical_context_for_unit(key, context)?;
+        evidence.validate()?;
+        if let (Some(current_fence), Some(historical_fence)) =
+            (current_scope.source_fence(), context.scope.source_fence())
+        {
+            if historical_fence.lease_epoch() < current_fence.lease_epoch() {
+                if let Some(observation) = source_observation_for_evidence(evidence) {
+                    if observation.revision() > current_fence.source_revision() {
+                        return Err(
+                            WorkProgressError::CompletionHistoryRevisionBeyondCurrentFence {
+                                key,
+                                observed: observation.revision(),
+                                current_revision: current_fence.source_revision(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        validate_evidence_for_role(key.role(), &context.scope, evidence, None)
+    }
+
+    /// Validate the historical epoch and participant scope retained for one unit.
+    ///
+    /// Resource-cleanup observations intentionally retain context without synthesizing step
+    /// evidence.  This prefix is shared with normal completion-history validation so source
+    /// reacquisition and stable-identity rules remain identical across both observation paths.
+    fn validate_historical_context_for_unit(
+        &self,
+        key: WorkUnitKey,
+        context: &CompletionContext,
+    ) -> Result<&ParticipantScope, WorkProgressError> {
         let current_scope =
             self.scope_for(key)
                 .ok_or(WorkProgressError::ParticipantScopeMissing {
@@ -1458,25 +1495,7 @@ impl WorkProgress {
         if let Some(fence) = context.scope.source_fence() {
             fence.validate()?;
         }
-        evidence.validate()?;
-        if let (Some(current_fence), Some(historical_fence)) =
-            (current_scope.source_fence(), context.scope.source_fence())
-        {
-            if historical_fence.lease_epoch() < current_fence.lease_epoch() {
-                if let Some(observation) = source_observation_for_evidence(evidence) {
-                    if observation.revision() > current_fence.source_revision() {
-                        return Err(
-                            WorkProgressError::CompletionHistoryRevisionBeyondCurrentFence {
-                                key,
-                                observed: observation.revision(),
-                                current_revision: current_fence.source_revision(),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        validate_evidence_for_role(key.role(), &context.scope, evidence, None)
+        Ok(current_scope)
     }
 
     /// Find one exact keyed step.
@@ -1681,6 +1700,79 @@ impl WorkProgress {
                 self.execution_epoch,
             )
             .map_err(WorkProgressError::CancellationCleanupManifest)
+    }
+
+    /// Derive the exact applicable staging and retained-recovery resource manifest from one
+    /// explicitly supplied cleanup lineage.
+    ///
+    /// The returned value is observational only.  It does not complete normal progress, prove
+    /// adoption or absence, discharge operation-wide claims, or authorize cleanup or release.
+    pub fn cancellation_resource_cleanup_manifest(
+        &self,
+        expected_cleanup_manifest: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<CancellationResourceCleanupManifest, WorkProgressError> {
+        self.validate_cancellation_cleanup_manifest(
+            expected_cleanup_manifest,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        CancellationResourceCleanupManifest::derive(expected_cleanup_manifest).map_err(|error| {
+            WorkProgressError::CancellationResourceCleanupManifest(
+                CancellationResourceCleanupManifestError::from(error),
+            )
+        })
+    }
+
+    /// Validate one candidate resource-cleanup manifest against explicit cleanup lineage.
+    pub fn validate_cancellation_resource_cleanup_manifest(
+        &self,
+        candidate: &CancellationResourceCleanupManifest,
+        expected_cleanup_manifest: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let expected = self.cancellation_resource_cleanup_manifest(
+            expected_cleanup_manifest,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&expected)
+            .map_err(WorkProgressError::CancellationResourceCleanupManifest)
+    }
+
+    /// Validate one immutable cancellation-local resource-cleanup observation record.
+    ///
+    /// The expected cleanup manifest, recovery inventory, and dispatch outcome are explicit so
+    /// a candidate cannot silently substitute retained state.  Preserved and absent rows retain
+    /// historical participant context only; they do not synthesize completion evidence or affect
+    /// source-revision floors.
+    pub fn validate_cancellation_resource_cleanup_observation_record(
+        &self,
+        candidate: &CancellationResourceCleanupObservationRecord,
+        expected_cleanup_manifest: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let manifest = self.cancellation_resource_cleanup_manifest(
+            expected_cleanup_manifest,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&manifest, self.execution_epoch)
+            .map_err(WorkProgressError::CancellationResourceCleanupObservation)?;
+        for row in candidate.rows() {
+            let context = match row.outcome() {
+                CancellationResourceCleanupOutcome::Pending => continue,
+                CancellationResourceCleanupOutcome::Preserved { context, .. }
+                | CancellationResourceCleanupOutcome::Absent { context, .. } => context,
+            };
+            self.validate_historical_context_for_unit(row.key(), context)?;
+        }
+        Ok(())
     }
 
     /// Derive the exact pending source-closure manifest from one validated after-effect inventory.
@@ -4410,6 +4502,15 @@ pub enum WorkProgressError {
     /// A cancellation-local cleanup-obligation manifest failed exact derivation or validation.
     #[error("invalid work progress cancellation cleanup manifest: {0}")]
     CancellationCleanupManifest(#[source] CancellationCleanupManifestError),
+    /// A cancellation-local resource-cleanup manifest failed exact derivation or validation.
+    #[error("invalid work progress cancellation resource-cleanup manifest: {0}")]
+    CancellationResourceCleanupManifest(#[source] CancellationResourceCleanupManifestError),
+    /// A cancellation-local resource-cleanup observation failed exact binding or context
+    /// validation.
+    #[error("invalid work progress cancellation resource-cleanup observation: {0}")]
+    CancellationResourceCleanupObservation(
+        #[source] CancellationResourceCleanupObservationRecordError,
+    ),
     /// A cancellation-local source-closure manifest failed exact derivation or validation.
     #[error("invalid work progress cancellation source-closure manifest: {0}")]
     CancellationSourceClosureManifest(#[source] SourceClosureManifestError),
@@ -5103,6 +5204,10 @@ mod tests {
         CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
         CancellationDispatchOutcomeRow, CancellationEffectBundle, CancellationEffectFactKind,
         CancellationEffectOutcome, CancellationEffectRecipe, CancellationEffectRecoveryInventory,
+        CancellationResourceCleanupManifest, CancellationResourceCleanupManifestValidationError,
+        CancellationResourceCleanupObservationRecord,
+        CancellationResourceCleanupObservationRecordError,
+        CancellationResourceCleanupObservationRow, CancellationResourceCleanupOutcome,
         CancellationSourceClosureObservationRecord,
         CancellationSourceClosureObservationRecordError, CancellationSourceClosureObservationRow,
         CancellationSourceClosureOutcome, CoordinatorClosureManifest,
@@ -5705,6 +5810,37 @@ mod tests {
             .cancellation_cleanup_manifest(&recovery, &dispatch)
             .expect("cleanup manifest");
         (dispatch, recovery, manifest)
+    }
+
+    fn resource_cleanup_manifest_for(
+        progress: &mut WorkProgress,
+        request_value: i64,
+    ) -> (
+        CancellationDispatchOutcomeRecord,
+        CancellationEffectRecoveryInventory,
+        CancellationCleanupManifest,
+        CancellationResourceCleanupManifest,
+    ) {
+        let (dispatch, recovery, cleanup) = cleanup_manifest_for(progress, request_value);
+        let resource = progress
+            .cancellation_resource_cleanup_manifest(&cleanup, &recovery, &dispatch)
+            .expect("resource cleanup manifest");
+        (dispatch, recovery, cleanup, resource)
+    }
+
+    fn pending_resource_cleanup_rows(
+        manifest: &CancellationResourceCleanupManifest,
+    ) -> Vec<CancellationResourceCleanupObservationRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationResourceCleanupObservationRow::new(
+                    *key,
+                    CancellationResourceCleanupOutcome::Pending,
+                )
+            })
+            .collect()
     }
 
     fn dispatch_outcome_for_authority(
@@ -9705,6 +9841,428 @@ mod tests {
                 CancellationCleanupManifestError::RecoveryInventoryMismatch
             ))
         );
+    }
+
+    #[test]
+    fn cancellation_resource_cleanup_manifest_covers_required_resources_only() {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1520,
+        );
+        let (dispatch, recovery, cleanup, resource) =
+            resource_cleanup_manifest_for(&mut progress, 1520);
+        assert!(!resource.keys().is_empty());
+        assert!(resource.keys().iter().all(|key| {
+            matches!(
+                key.role(),
+                WorkUnitRole::Stage | WorkUnitRole::RecoveryMaterialRetained
+            )
+        }));
+        assert!(
+            resource
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::RecoveryMaterialRetained)
+        );
+        assert!(
+            resource
+                .cleanup_manifest()
+                .operation_recovery_payload_claim_ids()
+                .iter()
+                .all(|claim| cleanup
+                    .operation_recovery_payload_claim_ids()
+                    .contains(claim))
+        );
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress.cancellation_inventory().cloned();
+        let pending = CancellationResourceCleanupObservationRecord::new(
+            resource.clone(),
+            progress.execution_epoch(),
+            1,
+            pending_resource_cleanup_rows(&resource),
+        )
+        .expect("pending resource cleanup record");
+        progress
+            .validate_cancellation_resource_cleanup_observation_record(
+                &pending, &cleanup, &recovery, &dispatch,
+            )
+            .expect("pending resource cleanup validation");
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), inventory_before.as_ref());
+
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let parent = NamespaceDirectoryEndpoint::new(
+            source,
+            source_id.clone(),
+            NamespaceDirectoryLocator::Root,
+            NamespaceDirectoryExpectation::new(7, "root-a", Some(1)).expect("root"),
+        )
+        .expect("parent");
+        let args = UniversalCommandArgs::Namespace(NamespaceCommandArgs::CreateFolder(
+            CreateFolderIntentArgs::new(parent, NamespaceLeafName::new("created").expect("leaf"))
+                .expect("create-folder arguments"),
+        ));
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("create-folder plan");
+        let mut create_folder = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(1521)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("create-folder progress");
+        create_folder
+            .request_cancellation(CancellationRequestObservation::new(1521).expect("cancel"))
+            .expect("create-folder cancellation");
+        let create_dispatch = all_never_dispatch_record(&create_folder);
+        let create_recovery = create_folder
+            .cancellation_effect_recovery_inventory(&create_dispatch)
+            .expect("create-folder recovery");
+        let create_cleanup = create_folder
+            .cancellation_cleanup_manifest(&create_recovery, &create_dispatch)
+            .expect("create-folder cleanup");
+        let create_resource = create_folder
+            .cancellation_resource_cleanup_manifest(
+                &create_cleanup,
+                &create_recovery,
+                &create_dispatch,
+            )
+            .expect("create-folder resource cleanup");
+        assert!(create_resource.keys().is_empty());
+        let create_record = CancellationResourceCleanupObservationRecord::new(
+            create_resource.clone(),
+            create_folder.execution_epoch(),
+            1,
+            Vec::new(),
+        )
+        .expect("empty create-folder resource record");
+        create_folder
+            .validate_cancellation_resource_cleanup_observation_record(
+                &create_record,
+                &create_cleanup,
+                &create_recovery,
+                &create_dispatch,
+            )
+            .expect("empty create-folder resource validation");
+        assert!(matches!(
+            CancellationResourceCleanupManifest::new(
+                create_cleanup,
+                vec![key_for(&create_folder, 0, WorkUnitRole::CopyValidated)],
+            ),
+            Err(CancellationResourceCleanupManifestValidationError::UnexpectedRole)
+        ));
+    }
+
+    #[test]
+    fn cancellation_resource_cleanup_observations_preserve_context_after_reacquisition() {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1522,
+        );
+        let (dispatch, recovery, cleanup, resource) =
+            resource_cleanup_manifest_for(&mut progress, 1522);
+        let rows = resource
+            .keys()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let context = CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(*key).expect("resource scope").clone(),
+                );
+                let outcome = if index % 2 == 0 {
+                    CancellationResourceCleanupOutcome::Preserved {
+                        owner_revision: u64::MAX - index as u64,
+                        context,
+                    }
+                } else {
+                    CancellationResourceCleanupOutcome::Absent {
+                        owner_revision: u64::MAX - index as u64,
+                        context,
+                    }
+                };
+                CancellationResourceCleanupObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let record = CancellationResourceCleanupObservationRecord::new(
+            resource.clone(),
+            progress.execution_epoch(),
+            1,
+            rows,
+        )
+        .expect("resource observation record");
+        progress
+            .validate_cancellation_resource_cleanup_observation_record(
+                &record, &cleanup, &recovery, &dispatch,
+            )
+            .expect("resource observation validation");
+
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress.cancellation_inventory().cloned();
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let source_participant = source_key.participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant,
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        progress
+            .validate_cancellation_resource_cleanup_observation_record(
+                &record, &cleanup, &recovery, &dispatch,
+            )
+            .expect("historical resource context remains valid");
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), inventory_before.as_ref());
+
+        let key = resource.keys()[0];
+        let mut wrong_context =
+            CompletionContext::new(0, progress.scope_for(key).expect("resource scope").clone());
+        wrong_context.scope.source_fence = progress
+            .scope_for(source_key)
+            .and_then(ParticipantScope::source_fence)
+            .cloned();
+        let wrong_rows = resource
+            .keys()
+            .iter()
+            .map(|candidate| {
+                let context = if *candidate == key {
+                    wrong_context.clone()
+                } else {
+                    CompletionContext::new(
+                        0,
+                        progress
+                            .scope_for(*candidate)
+                            .expect("resource scope")
+                            .clone(),
+                    )
+                };
+                CancellationResourceCleanupObservationRow::new(
+                    *candidate,
+                    CancellationResourceCleanupOutcome::Preserved {
+                        owner_revision: 1,
+                        context,
+                    },
+                )
+            })
+            .collect();
+        let wrong = CancellationResourceCleanupObservationRecord::new(resource, 0, 1, wrong_rows)
+            .expect("wrong-fence record shape");
+        assert_eq!(
+            progress.validate_cancellation_resource_cleanup_observation_record(
+                &wrong, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CompletionContextScopeMismatch { key })
+        );
+    }
+
+    #[test]
+    fn cancellation_resource_cleanup_observation_rejects_bad_coverage_and_headers() {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1523,
+        );
+        let (dispatch, recovery, cleanup, resource) =
+            resource_cleanup_manifest_for(&mut progress, 1523);
+        let rows = pending_resource_cleanup_rows(&resource);
+        let zero_generation = CancellationResourceCleanupObservationRecord::new(
+            resource.clone(),
+            progress.execution_epoch(),
+            0,
+            rows.clone(),
+        );
+        assert_eq!(
+            zero_generation,
+            Err(CancellationResourceCleanupObservationRecordError::ObservationGenerationZero)
+        );
+        if let Some(key) = resource.keys().first() {
+            let invalid = CancellationResourceCleanupObservationRecord::new(
+                resource.clone(),
+                progress.execution_epoch(),
+                1,
+                resource
+                    .keys()
+                    .iter()
+                    .map(|candidate| {
+                        CancellationResourceCleanupObservationRow::new(
+                            *candidate,
+                            if candidate == key {
+                                CancellationResourceCleanupOutcome::Absent {
+                                    owner_revision: 0,
+                                    context: CompletionContext::new(
+                                        progress.execution_epoch(),
+                                        progress
+                                            .scope_for(*candidate)
+                                            .expect("resource scope")
+                                            .clone(),
+                                    ),
+                                }
+                            } else {
+                                CancellationResourceCleanupOutcome::Pending
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                invalid,
+                Err(
+                    CancellationResourceCleanupObservationRecordError::OwnerRevisionZero {
+                        key: *key
+                    }
+                )
+            );
+        }
+        let future = CancellationResourceCleanupObservationRecord::new(
+            resource.clone(),
+            progress.execution_epoch() + 1,
+            1,
+            rows.clone(),
+        )
+        .expect("future header shape");
+        assert_eq!(
+            progress.validate_cancellation_resource_cleanup_observation_record(
+                &future, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CancellationResourceCleanupObservation(
+                CancellationResourceCleanupObservationRecordError::ObservationEpochFuture {
+                    actual: 1,
+                    current: 0,
+                }
+            ))
+        );
+
+        let missing = CancellationResourceCleanupObservationRecord::new(
+            resource.clone(),
+            progress.execution_epoch(),
+            1,
+            rows.iter().skip(1).cloned().collect(),
+        )
+        .expect("missing row shape");
+        assert!(matches!(
+            progress.validate_cancellation_resource_cleanup_observation_record(
+                &missing, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CancellationResourceCleanupObservation(
+                CancellationResourceCleanupObservationRecordError::RowCountMismatch { .. }
+            ))
+        ));
+
+        let extra_key =
+            WorkUnitKey::new(u8::MAX, u16::MAX, participant_id(999), WorkUnitRole::Stage);
+        let mut extra_rows = rows.clone();
+        extra_rows.push(CancellationResourceCleanupObservationRow::new(
+            extra_key,
+            CancellationResourceCleanupOutcome::Pending,
+        ));
+        let extra = CancellationResourceCleanupObservationRecord::new(
+            resource.clone(),
+            progress.execution_epoch(),
+            1,
+            extra_rows,
+        )
+        .expect("extra row shape");
+        assert!(matches!(
+            progress.validate_cancellation_resource_cleanup_observation_record(
+                &extra, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CancellationResourceCleanupObservation(
+                CancellationResourceCleanupObservationRecordError::RowCountMismatch { .. }
+            ))
+        ));
+
+        let mut reordered_rows = rows.clone();
+        reordered_rows.reverse();
+        assert!(matches!(
+            CancellationResourceCleanupObservationRecord::new(
+                resource.clone(),
+                progress.execution_epoch(),
+                1,
+                reordered_rows,
+            ),
+            Err(CancellationResourceCleanupObservationRecordError::RowsNotSortedOrUnique { .. })
+        ));
+
+        if let Some(key) = resource.keys().first() {
+            let future_context = CancellationResourceCleanupObservationRecord::new(
+                resource.clone(),
+                progress.execution_epoch(),
+                1,
+                resource
+                    .keys()
+                    .iter()
+                    .map(|candidate| {
+                        CancellationResourceCleanupObservationRow::new(
+                            *candidate,
+                            if candidate == key {
+                                CancellationResourceCleanupOutcome::Preserved {
+                                    owner_revision: 1,
+                                    context: CompletionContext::new(
+                                        progress.execution_epoch() + 1,
+                                        progress
+                                            .scope_for(*candidate)
+                                            .expect("resource scope")
+                                            .clone(),
+                                    ),
+                                }
+                            } else {
+                                CancellationResourceCleanupOutcome::Pending
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                future_context,
+                Err(
+                    CancellationResourceCleanupObservationRecordError::
+                        ContextEpochAfterObservation {
+                            key: *key,
+                            context_epoch: 1,
+                            observation_epoch: 0,
+                        },
+                )
+            );
+        }
+
+        let other = {
+            let (participants, source, _filesystem, source_id) = valid_topology(false);
+            let mut other = claimed_progress(
+                participants,
+                copy_args_at(source, source_id, "other-resource.wav"),
+                1524,
+            );
+            resource_cleanup_manifest_for(&mut other, 1524).3
+        };
+        let wrong_lineage = CancellationResourceCleanupObservationRecord::new(
+            other,
+            progress.execution_epoch(),
+            1,
+            rows,
+        )
+        .expect("wrong-lineage record shape");
+        assert!(matches!(
+            progress.validate_cancellation_resource_cleanup_observation_record(
+                &wrong_lineage,
+                &cleanup,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CancellationResourceCleanupObservation(
+                CancellationResourceCleanupObservationRecordError::ManifestMismatch
+            ))
+        ));
     }
 
     #[test]
