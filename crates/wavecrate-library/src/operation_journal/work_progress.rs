@@ -28,8 +28,9 @@ use super::cancellation_dispatch::{
     derive_cancellation_dispatch_manifest as derive_dispatch_manifest,
 };
 use super::cancellation_effects::{
-    CancellationEffectInventory, CancellationEffectInventoryError,
-    CancellationEffectRecoveryInventory,
+    CancellationCleanupManifest, CancellationCleanupManifestError, CancellationEffectInventory,
+    CancellationEffectInventoryError, CancellationEffectRecoveryInventory,
+    derive_cancellation_cleanup_manifest,
     derive_cancellation_effect_inventory as derive_effect_inventory,
     derive_cancellation_effect_recovery_inventory as derive_effect_recovery_inventory,
 };
@@ -1618,6 +1619,68 @@ impl WorkProgress {
                 self.execution_epoch,
             )
             .map_err(WorkProgressError::CancellationEffectInventory)
+    }
+
+    /// Derive the exact canonical cleanup-obligation manifest from explicit recovery lineage.
+    ///
+    /// Every non-global frozen plan segment is retained when it matches one of the strict V1
+    /// cancellation recipes, including preparation-only and pending segments with no effect
+    /// bundle.  The result is observational only: it does not prove no entry, absence, adoption,
+    /// release, or terminal completion.
+    pub fn cancellation_cleanup_manifest(
+        &self,
+        recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<CancellationCleanupManifest, WorkProgressError> {
+        self.validate_cancellation_effect_recovery_inventory(
+            recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationAdmissionClaimsMissing)?;
+        derive_cancellation_cleanup_manifest(
+            self.operation_id,
+            &self.plan,
+            recovery_inventory,
+            expected_dispatch_outcome,
+            &self.steps,
+            admission_claims,
+            self.execution_epoch,
+        )
+        .map_err(WorkProgressError::CancellationCleanupManifest)
+    }
+
+    /// Validate one cleanup-obligation candidate against explicit recovery and dispatch lineage.
+    ///
+    /// The expected values are explicit so an observational candidate cannot silently substitute
+    /// a retained accepted state.  This check never mutates progress or grants cleanup authority.
+    pub fn validate_cancellation_cleanup_manifest(
+        &self,
+        candidate: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        self.validate_cancellation_effect_recovery_inventory(
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationAdmissionClaimsMissing)?;
+        candidate
+            .validate_against(
+                self.operation_id,
+                &self.plan,
+                expected_recovery_inventory,
+                expected_dispatch_outcome,
+                &self.steps,
+                admission_claims,
+                self.execution_epoch,
+            )
+            .map_err(WorkProgressError::CancellationCleanupManifest)
     }
 
     /// Derive the exact pending source-closure manifest from one validated after-effect inventory.
@@ -4344,6 +4407,9 @@ pub enum WorkProgressError {
     /// validation.
     #[error("invalid work progress cancellation effect recovery inventory: {0}")]
     CancellationEffectInventory(#[source] CancellationEffectInventoryError),
+    /// A cancellation-local cleanup-obligation manifest failed exact derivation or validation.
+    #[error("invalid work progress cancellation cleanup manifest: {0}")]
+    CancellationCleanupManifest(#[source] CancellationCleanupManifestError),
     /// A cancellation-local source-closure manifest failed exact derivation or validation.
     #[error("invalid work progress cancellation source-closure manifest: {0}")]
     CancellationSourceClosureManifest(#[source] SourceClosureManifestError),
@@ -5027,7 +5093,8 @@ mod tests {
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
-        AdmissionClaimValidationError, CancellationActionState,
+        AdmissionClaimValidationError, CancellationActionState, CancellationCleanupManifest,
+        CancellationCleanupManifestValidationError, CancellationCleanupSegment,
         CancellationCoordinatorClosureObservationRecord,
         CancellationCoordinatorClosureObservationRecordError,
         CancellationCoordinatorClosureObservationRow, CancellationCoordinatorClosureOutcome,
@@ -5615,6 +5682,29 @@ mod tests {
             rows,
         )
         .expect("all-never dispatch record")
+    }
+
+    fn cleanup_manifest_for(
+        progress: &mut WorkProgress,
+        request_value: i64,
+    ) -> (
+        CancellationDispatchOutcomeRecord,
+        CancellationEffectRecoveryInventory,
+        CancellationCleanupManifest,
+    ) {
+        progress
+            .request_cancellation(
+                CancellationRequestObservation::new(request_value).expect("cancel"),
+            )
+            .expect("cleanup cancellation");
+        let dispatch = all_never_dispatch_record(progress);
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("cleanup recovery inventory");
+        let manifest = progress
+            .cancellation_cleanup_manifest(&recovery, &dispatch)
+            .expect("cleanup manifest");
+        (dispatch, recovery, manifest)
     }
 
     fn dispatch_outcome_for_authority(
@@ -7624,6 +7714,24 @@ mod tests {
                 .status(),
             ProgressStepStatus::Pending
         );
+        let cleanup = progress
+            .cancellation_cleanup_manifest(&recovery, &record)
+            .expect("cleanup manifest retains future trim");
+        assert_eq!(cleanup.segments().len(), 2);
+        assert_eq!(
+            cleanup.segments()[0].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert_eq!(
+            cleanup.segments()[1].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert!(
+            cleanup.segments()[1]
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::Publish)
+        );
     }
 
     #[test]
@@ -7683,6 +7791,17 @@ mod tests {
             recovery.bundles()[1].outcome(),
             CancellationEffectOutcome::QualifiedRelocationCompleted
         );
+        let cleanup = progress
+            .cancellation_cleanup_manifest(&recovery, &record)
+            .expect("mixed history cleanup manifest");
+        assert_eq!(cleanup.segments().len(), 2);
+        assert!(cleanup.segments().iter().all(|segment| {
+            segment.recipe() == CancellationEffectRecipe::QualifiedRelocation
+                && segment
+                    .keys()
+                    .iter()
+                    .any(|key| key.role() == WorkUnitRole::SourceAffect)
+        }));
     }
 
     #[test]
@@ -7738,6 +7857,9 @@ mod tests {
         let before_reacquisition = progress
             .cancellation_effect_recovery_inventory(&record)
             .expect("pre-reacquisition recovery effects");
+        let before_cleanup = progress
+            .cancellation_cleanup_manifest(&before_reacquisition, &record)
+            .expect("pre-reacquisition cleanup manifest");
         let source_participant =
             key_for_step(&progress, 0, 0, WorkUnitRole::SourceRead).participant_id();
         progress
@@ -7752,8 +7874,12 @@ mod tests {
         let after_reacquisition = progress
             .cancellation_effect_recovery_inventory(&record)
             .expect("post-reacquisition recovery effects");
+        let after_cleanup = progress
+            .cancellation_cleanup_manifest(&after_reacquisition, &record)
+            .expect("post-reacquisition cleanup manifest");
 
         assert_eq!(before_reacquisition, after_reacquisition);
+        assert_eq!(before_cleanup, after_cleanup);
         assert_eq!(progress.steps(), steps_before_reacquisition.as_slice());
         assert_eq!(progress.cancellation_inventory(), Some(&frozen_inventory));
         let extracted = &after_reacquisition.bundles()[1];
@@ -9302,6 +9428,283 @@ mod tests {
             }
         );
         assert_eq!(preparation_recovery.frozen_inventory(), &frozen_inventory);
+        let preparation_cleanup = progress
+            .cancellation_cleanup_manifest(&preparation_recovery, &observed)
+            .expect("preparation cleanup manifest");
+        assert_eq!(preparation_cleanup.segments().len(), 1);
+        assert_eq!(
+            preparation_cleanup.segments()[0].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert!(preparation_recovery.bundles().is_empty());
+    }
+
+    #[test]
+    fn cancellation_cleanup_manifest_retains_all_recipe_segments_and_claims() {
+        let mut staged_publish = copy_progress_with_admission_claims();
+        let (_, _, staged_publish_manifest) = cleanup_manifest_for(&mut staged_publish, 1500);
+        assert_eq!(
+            staged_publish_manifest.segments()[0].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert!(
+            staged_publish_manifest.segments()[0]
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::Stage)
+        );
+        assert!(
+            staged_publish_manifest.segments()[0]
+                .applicable_staging_key()
+                .is_some()
+        );
+
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut staged_move = claimed_progress(
+            participants.clone(),
+            namespace_file_move_args(source, source_id.clone()),
+            1501,
+        );
+        let (_, _, staged_move_manifest) = cleanup_manifest_for(&mut staged_move, 1501);
+        assert_eq!(
+            staged_move_manifest.segments()[0].recipe(),
+            CancellationEffectRecipe::StagedMove
+        );
+        assert!(
+            staged_move_manifest.segments()[0]
+                .applicable_origin_source_reconcile_key()
+                .is_some()
+        );
+
+        let mut qualified = claimed_progress(
+            participants.clone(),
+            history_folder_args(source, source_id.clone()),
+            1502,
+        );
+        let (_, _, qualified_manifest) = cleanup_manifest_for(&mut qualified, 1502);
+        assert_eq!(qualified_manifest.segments().len(), 2);
+        assert!(
+            qualified_manifest
+                .segments()
+                .iter()
+                .all(|segment| segment.recipe() == CancellationEffectRecipe::QualifiedRelocation)
+        );
+        assert!(qualified_manifest.segments().iter().all(|segment| {
+            segment
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::Stage)
+                && segment.applicable_staging_key().is_none()
+        }));
+
+        let mut retained_merge = claimed_progress(
+            participants.clone(),
+            retained_resolution_args(source, source_id.clone(), true),
+            1503,
+        );
+        let (_, _, retained_merge_manifest) = cleanup_manifest_for(&mut retained_merge, 1503);
+        assert_eq!(
+            retained_merge_manifest.segments()[0].recipe(),
+            CancellationEffectRecipe::RetainedMerge
+        );
+
+        let mut retained_disposition = claimed_progress(
+            participants.clone(),
+            retained_resolution_args(source, source_id.clone(), false),
+            1504,
+        );
+        let (_, _, retained_disposition_manifest) =
+            cleanup_manifest_for(&mut retained_disposition, 1504);
+        assert_eq!(
+            retained_disposition_manifest.segments()[0].recipe(),
+            CancellationEffectRecipe::RetainedDisposition
+        );
+        assert!(
+            retained_disposition_manifest.segments()[0]
+                .applicable_selected_retained_object_disposition_key()
+                .is_some()
+        );
+
+        let filesystem = participant_id(2);
+        let mut external_audit = claimed_progress(
+            participants.clone(),
+            external_reconciliation_args(source, filesystem, source_id.clone()),
+            1505,
+        );
+        let (_, _, external_audit_manifest) = cleanup_manifest_for(&mut external_audit, 1505);
+        assert_eq!(
+            external_audit_manifest.segments()[0].recipe(),
+            CancellationEffectRecipe::ExternalAudit
+        );
+
+        let mut history_restore = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1506,
+        );
+        let (_, _, history_restore_manifest) = cleanup_manifest_for(&mut history_restore, 1506);
+        assert_eq!(history_restore_manifest.segments().len(), 2);
+        assert_eq!(
+            history_restore_manifest.segments()[0].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert_eq!(
+            history_restore_manifest.segments()[1].recipe(),
+            CancellationEffectRecipe::HistoryUndoExtractedRemoval
+        );
+
+        let mut claimed_recovery = copy_progress_with_two_admission_claims();
+        let (_, _, claimed_recovery_manifest) = cleanup_manifest_for(&mut claimed_recovery, 1507);
+        assert_eq!(
+            claimed_recovery_manifest.operation_recovery_payload_claim_ids(),
+            &[AdmissionClaimId::from_uuid(Uuid::from_u128(202)).expect("recovery claim")]
+        );
+        assert!(
+            !claimed_recovery_manifest
+                .segments()
+                .iter()
+                .flat_map(CancellationCleanupSegment::keys)
+                .any(|key| key.role() == WorkUnitRole::RecoveryMaterialRetained)
+        );
+    }
+
+    #[test]
+    fn cancellation_cleanup_manifest_keeps_pending_segments_and_rejects_malformed_candidates() {
+        let mut progress = copy_progress_with_admission_claims();
+        let (dispatch, recovery, valid) = cleanup_manifest_for(&mut progress, 1508);
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress.cancellation_inventory().cloned();
+        assert!(
+            valid
+                .segments()
+                .iter()
+                .all(|segment| segment.keys().iter().all(|key| {
+                    progress
+                        .cancellation_inventory()
+                        .expect("inventory")
+                        .steps()
+                        .iter()
+                        .any(|snapshot| snapshot.key() == *key)
+                }))
+        );
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), inventory_before.as_ref());
+
+        let missing = CancellationCleanupManifest::new(
+            valid.recovery_inventory().clone(),
+            dispatch.clone(),
+            Vec::new(),
+            valid.operation_recovery_payload_claim_ids().to_vec(),
+        )
+        .expect("missing candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_cleanup_manifest(&missing, &recovery, &dispatch),
+            Err(WorkProgressError::CancellationCleanupManifest(
+                CancellationCleanupManifestError::CandidateMismatch
+            ))
+        );
+
+        let different_dispatch = recovery_dispatch_record(&progress, 2, &[]);
+        assert!(matches!(
+            progress
+                .validate_cancellation_cleanup_manifest(&valid, &recovery, &different_dispatch,),
+            Err(WorkProgressError::CancellationEffectInventory(
+                CancellationEffectInventoryError::DispatchOutcomeMismatch
+            ))
+        ));
+
+        let original = valid.segments()[0].clone();
+        let wrong_recipe = CancellationCleanupSegment::new(
+            original.action_ordinal(),
+            original.step_segment(),
+            CancellationEffectRecipe::ExternalAudit,
+            original.keys().to_vec(),
+            original.applicable_keys().to_vec(),
+        )
+        .expect("wrong recipe candidate shape");
+        let altered = CancellationCleanupManifest::new(
+            valid.recovery_inventory().clone(),
+            dispatch.clone(),
+            vec![wrong_recipe],
+            valid.operation_recovery_payload_claim_ids().to_vec(),
+        )
+        .expect("altered candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_cleanup_manifest(&altered, &recovery, &dispatch),
+            Err(WorkProgressError::CancellationCleanupManifest(
+                CancellationCleanupManifestError::CandidateMismatch
+            ))
+        );
+
+        let extra_key = WorkUnitKey::new(
+            1,
+            original.keys()[0].step_ordinal(),
+            original.keys()[0].participant_id(),
+            original.keys()[0].role(),
+        );
+        let extra_segment = CancellationCleanupSegment::new(
+            1,
+            0,
+            original.recipe(),
+            vec![extra_key],
+            vec![extra_key],
+        )
+        .expect("extra segment candidate shape");
+        let extra = CancellationCleanupManifest::new(
+            valid.recovery_inventory().clone(),
+            dispatch.clone(),
+            vec![original.clone(), extra_segment],
+            valid.operation_recovery_payload_claim_ids().to_vec(),
+        )
+        .expect("extra segment candidate");
+        assert_eq!(
+            progress.validate_cancellation_cleanup_manifest(&extra, &recovery, &dispatch),
+            Err(WorkProgressError::CancellationCleanupManifest(
+                CancellationCleanupManifestError::CandidateMismatch
+            ))
+        );
+        assert!(matches!(
+            CancellationCleanupManifest::new(
+                valid.recovery_inventory().clone(),
+                dispatch.clone(),
+                vec![original.clone(), original.clone()],
+                valid.operation_recovery_payload_claim_ids().to_vec(),
+            ),
+            Err(CancellationCleanupManifestValidationError::SegmentsNotSortedOrUnique { .. })
+        ));
+
+        let mut reversed_keys = original.keys().to_vec();
+        reversed_keys.reverse();
+        assert!(matches!(
+            CancellationCleanupSegment::new(
+                original.action_ordinal(),
+                original.step_segment(),
+                original.recipe(),
+                reversed_keys,
+                original.applicable_keys().to_vec(),
+            ),
+            Err(CancellationCleanupManifestValidationError::KeysNotSortedOrUnique { .. })
+        ));
+
+        let (other_participants, other_source, _other_filesystem, other_source_id) =
+            valid_topology(false);
+        let mut other_progress = claimed_progress(
+            other_participants,
+            copy_args_at(other_source, other_source_id, "other.wav"),
+            1510,
+        );
+        let (_other_dispatch, other_recovery, other_manifest) =
+            cleanup_manifest_for(&mut other_progress, 1509);
+        assert_eq!(
+            other_recovery.frozen_inventory().operation_id(),
+            other_progress.operation_id()
+        );
+        assert_eq!(
+            progress.validate_cancellation_cleanup_manifest(&other_manifest, &recovery, &dispatch,),
+            Err(WorkProgressError::CancellationCleanupManifest(
+                CancellationCleanupManifestError::RecoveryInventoryMismatch
+            ))
+        );
     }
 
     #[test]

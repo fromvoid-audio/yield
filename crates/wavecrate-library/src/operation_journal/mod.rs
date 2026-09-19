@@ -54,10 +54,13 @@ pub use cancellation_dispatch::{
 };
 
 pub use cancellation_effects::{
+    CancellationCleanupManifest, CancellationCleanupManifestError,
+    CancellationCleanupManifestValidationError, CancellationCleanupSegment,
     CancellationEffectBundle, CancellationEffectFact, CancellationEffectFactKind,
     CancellationEffectInventory, CancellationEffectInventoryError,
     CancellationEffectInventoryValidationError, CancellationEffectOutcome,
     CancellationEffectRecipe, CancellationEffectRecoveryInventory, CancellationEffectSourceClosure,
+    MAX_CANCELLATION_CLEANUP_KEYS, MAX_CANCELLATION_CLEANUP_SEGMENTS,
     MAX_CANCELLATION_EFFECT_BUNDLES, MAX_CANCELLATION_EFFECT_ROWS,
 };
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-use super::admission_claims::AdmissionClaimInventory;
+use super::admission_claims::{AdmissionClaimId, AdmissionClaimInventory, MAX_ADMISSION_CLAIMS};
 use super::cancellation_dispatch::{
     CancellationDispatchManifestError, CancellationDispatchOutcome,
     CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
@@ -20,6 +20,7 @@ use super::cancellation_dispatch::{
 use super::cancellation_recovery::{
     CancellationInventory, CancellationInventoryError, MAX_CANCELLATION_ACTIONS,
 };
+use super::full_capacity::FullCapacityAllocationClass;
 use super::model::OperationId;
 use super::work_plan::{
     GLOBAL_ACTION_ORDINAL, STEP_HISTORY_STRIDE, WORK_PLAN_VERSION_V1, WorkPlan, WorkPrerequisite,
@@ -300,6 +301,459 @@ pub struct CancellationEffectRecoveryInventory {
     frozen_inventory: CancellationInventory,
     dispatch_outcome: CancellationDispatchOutcomeRecord,
     bundles: Vec<CancellationEffectBundle>,
+}
+
+/// Maximum number of local cancellation-cleanup segments retained for one frozen plan.
+pub const MAX_CANCELLATION_CLEANUP_SEGMENTS: usize = MAX_CANCELLATION_EFFECT_ROWS;
+/// Maximum number of local work-unit keys retained by one cleanup manifest.
+pub const MAX_CANCELLATION_CLEANUP_KEYS: usize = MAX_CANCELLATION_EFFECT_ROWS;
+
+/// One exact non-global recipe segment retained for cancellation cleanup accounting.
+///
+/// The complete `keys` list includes preparation, source-closure, and not-applicable roles.  The
+/// `applicable_keys` list is derived from the planner's `Required` applicability and is only a
+/// convenience view; neither list proves that a cleanup action was never entered, adopted, or
+/// completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationCleanupSegment {
+    action_ordinal: u8,
+    step_segment: u16,
+    recipe: CancellationEffectRecipe,
+    keys: Vec<WorkUnitKey>,
+    applicable_keys: Vec<WorkUnitKey>,
+}
+
+impl CancellationCleanupSegment {
+    /// Construct one observational segment candidate without granting cleanup authority.
+    pub fn new(
+        action_ordinal: u8,
+        step_segment: u16,
+        recipe: CancellationEffectRecipe,
+        keys: Vec<WorkUnitKey>,
+        applicable_keys: Vec<WorkUnitKey>,
+    ) -> Result<Self, CancellationCleanupManifestValidationError> {
+        let segment = Self {
+            action_ordinal,
+            step_segment,
+            recipe,
+            keys,
+            applicable_keys,
+        };
+        segment.validate()?;
+        Ok(segment)
+    }
+
+    /// Validate local key ordering and segment binding without consulting progress authority.
+    pub fn validate(&self) -> Result<(), CancellationCleanupManifestValidationError> {
+        if self.keys.is_empty() {
+            return Err(CancellationCleanupManifestValidationError::EmptySegment {
+                action_ordinal: self.action_ordinal,
+                step_segment: self.step_segment,
+            });
+        }
+        if self.keys.len() > MAX_CANCELLATION_CLEANUP_KEYS {
+            return Err(CancellationCleanupManifestValidationError::TooManyKeys {
+                action_ordinal: self.action_ordinal,
+                step_segment: self.step_segment,
+                actual: self.keys.len(),
+                maximum: MAX_CANCELLATION_CLEANUP_KEYS,
+            });
+        }
+        validate_segment_keys(self.action_ordinal, self.step_segment, &self.keys, false)?;
+        validate_segment_keys(
+            self.action_ordinal,
+            self.step_segment,
+            &self.applicable_keys,
+            true,
+        )?;
+        for key in &self.applicable_keys {
+            if !self.keys.contains(key) {
+                return Err(
+                    CancellationCleanupManifestValidationError::ApplicableKeyMissing {
+                        action_ordinal: self.action_ordinal,
+                        step_segment: self.step_segment,
+                        key: *key,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the containing action ordinal.
+    pub const fn action_ordinal(&self) -> u8 {
+        self.action_ordinal
+    }
+
+    /// Return the V1 history segment within the action.
+    pub const fn step_segment(&self) -> u16 {
+        self.step_segment
+    }
+
+    /// Return the exact recognized local recipe.
+    pub const fn recipe(&self) -> CancellationEffectRecipe {
+        self.recipe
+    }
+
+    /// Borrow all local work-unit keys, including preparation, source closure, and N/A roles.
+    pub fn keys(&self) -> &[WorkUnitKey] {
+        &self.keys
+    }
+
+    /// Borrow the planner-derived required keys for this segment.
+    pub fn applicable_keys(&self) -> &[WorkUnitKey] {
+        &self.applicable_keys
+    }
+
+    /// Return the required key for one role, when the planner marked that role applicable.
+    pub fn applicable_key(&self, role: WorkUnitRole) -> Option<WorkUnitKey> {
+        self.applicable_keys
+            .iter()
+            .copied()
+            .find(|key| key.role() == role)
+    }
+
+    /// Return the applicable staging key, when present.
+    pub fn applicable_staging_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::Stage)
+    }
+
+    /// Return the applicable recovery-material key, when present.
+    pub fn applicable_recovery_material_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::RecoveryMaterialRetained)
+    }
+
+    /// Return the applicable restore-record key, when present.
+    pub fn applicable_restore_record_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::RestoreRecordPrepared)
+    }
+
+    /// Return the applicable origin-removal marker key, when present.
+    pub fn applicable_origin_removal_start_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::OriginRemovalStart)
+    }
+
+    /// Return the applicable origin-absence key, when present.
+    pub fn applicable_origin_absence_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::OriginAbsence)
+    }
+
+    /// Return the applicable origin-reconciliation key, when present.
+    pub fn applicable_origin_source_reconcile_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::OriginSourceReconcile)
+    }
+
+    /// Return the applicable selected-retained-object disposition key, when present.
+    pub fn applicable_selected_retained_object_disposition_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::SelectedRetainedObjectDisposition)
+    }
+
+    /// Return the applicable retained-object absence key, when present.
+    pub fn applicable_retained_object_absence_key(&self) -> Option<WorkUnitKey> {
+        self.applicable_key(WorkUnitRole::RetainedObjectAbsence)
+    }
+}
+
+/// Bounded canonical cleanup obligations for one cancellation recovery observation.
+///
+/// This manifest retains the complete recovery lineage and separately lists operation-wide
+/// recovery-payload claim identities.  It is observational only: membership, pending status, or
+/// a missing local role never proves no entry, absence, adoption, release, or terminal completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationCleanupManifest {
+    recovery_inventory: CancellationEffectRecoveryInventory,
+    segments: Vec<CancellationCleanupSegment>,
+    operation_recovery_payload_claim_ids: Vec<AdmissionClaimId>,
+}
+
+impl CancellationCleanupManifest {
+    /// Construct one bounded cleanup-obligation candidate without granting cleanup authority.
+    pub fn new(
+        recovery_inventory: CancellationEffectRecoveryInventory,
+        dispatch_outcome: CancellationDispatchOutcomeRecord,
+        segments: Vec<CancellationCleanupSegment>,
+        operation_recovery_payload_claim_ids: Vec<AdmissionClaimId>,
+    ) -> Result<Self, CancellationCleanupManifestValidationError> {
+        if recovery_inventory.dispatch_outcome() != &dispatch_outcome {
+            return Err(CancellationCleanupManifestValidationError::DispatchOutcomeMismatch);
+        }
+        let manifest = Self {
+            recovery_inventory,
+            segments,
+            operation_recovery_payload_claim_ids,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate bounded segment and operation-claim ordering without consulting live authority.
+    pub fn validate(&self) -> Result<(), CancellationCleanupManifestValidationError> {
+        if self.segments.len() > MAX_CANCELLATION_CLEANUP_SEGMENTS {
+            return Err(
+                CancellationCleanupManifestValidationError::TooManySegments {
+                    actual: self.segments.len(),
+                    maximum: MAX_CANCELLATION_CLEANUP_SEGMENTS,
+                },
+            );
+        }
+        let mut key_count = 0usize;
+        for (index, segment) in self.segments.iter().enumerate() {
+            segment.validate()?;
+            key_count = key_count.saturating_add(segment.keys.len());
+            if key_count > MAX_CANCELLATION_CLEANUP_KEYS {
+                return Err(
+                    CancellationCleanupManifestValidationError::TooManyTotalKeys {
+                        actual: key_count,
+                        maximum: MAX_CANCELLATION_CLEANUP_KEYS,
+                    },
+                );
+            }
+            if index > 0 {
+                let previous = &self.segments[index - 1];
+                if (previous.action_ordinal, previous.step_segment)
+                    >= (segment.action_ordinal, segment.step_segment)
+                {
+                    return Err(
+                        CancellationCleanupManifestValidationError::SegmentsNotSortedOrUnique {
+                            index,
+                        },
+                    );
+                }
+            }
+        }
+        if self.operation_recovery_payload_claim_ids.len() > MAX_ADMISSION_CLAIMS {
+            return Err(
+                CancellationCleanupManifestValidationError::TooManyOperationRecoveryClaims {
+                    actual: self.operation_recovery_payload_claim_ids.len(),
+                    maximum: MAX_ADMISSION_CLAIMS,
+                },
+            );
+        }
+        for (index, claim_id) in self.operation_recovery_payload_claim_ids.iter().enumerate() {
+            claim_id.validate().map_err(|_| {
+                CancellationCleanupManifestValidationError::InvalidOperationRecoveryClaim { index }
+            })?;
+            if index > 0 && self.operation_recovery_payload_claim_ids[index - 1] >= *claim_id {
+                return Err(
+                    CancellationCleanupManifestValidationError::OperationRecoveryClaimsNotSortedOrUnique {
+                        index,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate this candidate against the exact frozen recovery lineage and canonical plan view.
+    pub fn validate_against(
+        &self,
+        operation_id: OperationId,
+        plan: &WorkPlan,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+        current_steps: &[WorkProgressStep],
+        admission_claims: &AdmissionClaimInventory,
+        execution_epoch: u64,
+    ) -> Result<(), CancellationCleanupManifestError> {
+        self.validate()?;
+        expected_recovery_inventory.validate_against(
+            operation_id,
+            plan,
+            expected_recovery_inventory.frozen_inventory(),
+            expected_dispatch_outcome,
+            current_steps,
+            admission_claims,
+            execution_epoch,
+        )?;
+        if self.recovery_inventory != *expected_recovery_inventory {
+            return Err(CancellationCleanupManifestError::RecoveryInventoryMismatch);
+        }
+        let expected = derive_cancellation_cleanup_manifest(
+            operation_id,
+            plan,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+            current_steps,
+            admission_claims,
+            execution_epoch,
+        )?;
+        if self != &expected {
+            return Err(CancellationCleanupManifestError::CandidateMismatch);
+        }
+        Ok(())
+    }
+
+    /// Borrow the complete validated recovery inventory lineage.
+    pub fn recovery_inventory(&self) -> &CancellationEffectRecoveryInventory {
+        &self.recovery_inventory
+    }
+
+    /// Borrow the exact dispatch outcome lineage.
+    pub fn dispatch_outcome(&self) -> &CancellationDispatchOutcomeRecord {
+        self.recovery_inventory.dispatch_outcome()
+    }
+
+    /// Borrow canonical local cleanup segments in action and history-segment order.
+    pub fn segments(&self) -> &[CancellationCleanupSegment] {
+        &self.segments
+    }
+
+    /// Borrow operation-wide recovery-payload claim identities without segment mapping.
+    pub fn operation_recovery_payload_claim_ids(&self) -> &[AdmissionClaimId] {
+        &self.operation_recovery_payload_claim_ids
+    }
+}
+
+/// Failure while validating one cleanup segment or manifest shape.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CancellationCleanupManifestValidationError {
+    /// The explicit dispatch record differed from the recovery inventory lineage.
+    #[error("cancellation cleanup dispatch outcome does not match recovery inventory")]
+    DispatchOutcomeMismatch,
+    /// A segment did not retain any local work-unit keys.
+    #[error("cancellation cleanup segment {action_ordinal}/{step_segment} is empty")]
+    EmptySegment {
+        /// Containing action ordinal.
+        action_ordinal: u8,
+        /// V1 segment ordinal.
+        step_segment: u16,
+    },
+    /// A segment retained more local keys than the frozen-plan bound.
+    #[error(
+        "cancellation cleanup segment {action_ordinal}/{step_segment} has {actual} keys, maximum is {maximum}"
+    )]
+    TooManyKeys {
+        /// Containing action ordinal.
+        action_ordinal: u8,
+        /// V1 segment ordinal.
+        step_segment: u16,
+        /// Supplied key count.
+        actual: usize,
+        /// Maximum accepted key count.
+        maximum: usize,
+    },
+    /// Segment keys were not strictly sorted and unique.
+    #[error(
+        "cancellation cleanup {kind} keys are not sorted and unique for segment {action_ordinal}/{step_segment} at index {index}"
+    )]
+    KeysNotSortedOrUnique {
+        /// Containing action ordinal.
+        action_ordinal: u8,
+        /// V1 segment ordinal.
+        step_segment: u16,
+        /// Index at which ordering failed.
+        index: usize,
+        /// Whether the applicable subset was being checked.
+        kind: &'static str,
+    },
+    /// A segment key did not belong to the declared action and history segment.
+    #[error(
+        "cancellation cleanup key {key:?} does not belong to segment {action_ordinal}/{step_segment}"
+    )]
+    KeySegmentMismatch {
+        /// Containing action ordinal.
+        action_ordinal: u8,
+        /// V1 segment ordinal.
+        step_segment: u16,
+        /// Misbound local key.
+        key: WorkUnitKey,
+    },
+    /// An applicable key was absent from the complete local key set.
+    #[error(
+        "cancellation cleanup applicable key {key:?} is absent from segment {action_ordinal}/{step_segment}"
+    )]
+    ApplicableKeyMissing {
+        /// Containing action ordinal.
+        action_ordinal: u8,
+        /// V1 segment ordinal.
+        step_segment: u16,
+        /// Missing complete key.
+        key: WorkUnitKey,
+    },
+    /// The segment count exceeded the frozen-plan bound.
+    #[error("cancellation cleanup manifest has {actual} segments, maximum is {maximum}")]
+    TooManySegments {
+        /// Supplied segment count.
+        actual: usize,
+        /// Maximum accepted segment count.
+        maximum: usize,
+    },
+    /// The manifest retained too many aggregate local keys.
+    #[error("cancellation cleanup manifest has {actual} keys, maximum is {maximum}")]
+    TooManyTotalKeys {
+        /// Aggregate key count.
+        actual: usize,
+        /// Maximum accepted key count.
+        maximum: usize,
+    },
+    /// Segments were not strictly sorted and unique.
+    #[error("cancellation cleanup segments are not sorted and unique at index {index}")]
+    SegmentsNotSortedOrUnique {
+        /// Index at which ordering failed.
+        index: usize,
+    },
+    /// The manifest retained too many operation-wide recovery claims.
+    #[error(
+        "cancellation cleanup manifest has {actual} operation-recovery claims, maximum is {maximum}"
+    )]
+    TooManyOperationRecoveryClaims {
+        /// Supplied claim count.
+        actual: usize,
+        /// Maximum accepted claim count.
+        maximum: usize,
+    },
+    /// An operation-recovery claim identity was invalid.
+    #[error("cancellation cleanup operation-recovery claim at index {index} is invalid")]
+    InvalidOperationRecoveryClaim {
+        /// Invalid claim index.
+        index: usize,
+    },
+    /// Operation-recovery claim identities were not strictly sorted and unique.
+    #[error(
+        "cancellation cleanup operation-recovery claims are not sorted and unique at index {index}"
+    )]
+    OperationRecoveryClaimsNotSortedOrUnique {
+        /// Index at which ordering failed.
+        index: usize,
+    },
+}
+
+/// Failure while deriving or binding a canonical cleanup-obligation manifest.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum CancellationCleanupManifestError {
+    /// The bound recovery inventory failed exact validation.
+    #[error("invalid cancellation cleanup recovery inventory: {0}")]
+    RecoveryInventory(#[source] CancellationEffectInventoryError),
+    /// The bound recovery inventory did not retain the explicit dispatch record.
+    #[error("cancellation cleanup dispatch outcome does not match recovery inventory")]
+    DispatchOutcomeMismatch,
+    /// The plan was not the supported frozen V1 plan.
+    #[error("unsupported cancellation cleanup plan version {actual}")]
+    UnsupportedPlanVersion {
+        /// Plan version found in the supplied plan.
+        actual: u16,
+    },
+    /// A local segment or manifest shape was invalid.
+    #[error("invalid cancellation cleanup manifest shape: {0}")]
+    Shape(#[source] CancellationCleanupManifestValidationError),
+    /// The candidate retained another recovery inventory.
+    #[error("cancellation cleanup recovery inventory does not match")]
+    RecoveryInventoryMismatch,
+    /// The candidate rows did not match the canonical plan derivation.
+    #[error("cancellation cleanup manifest candidate does not match the frozen derivation")]
+    CandidateMismatch,
+}
+
+impl From<CancellationEffectInventoryError> for CancellationCleanupManifestError {
+    fn from(error: CancellationEffectInventoryError) -> Self {
+        Self::RecoveryInventory(error)
+    }
+}
+
+impl From<CancellationCleanupManifestValidationError> for CancellationCleanupManifestError {
+    fn from(error: CancellationCleanupManifestValidationError) -> Self {
+        Self::Shape(error)
+    }
 }
 
 /// Failure while validating local effect-inventory shape.
@@ -641,6 +1095,38 @@ fn validate_bundles(
     Ok(())
 }
 
+fn validate_segment_keys(
+    action_ordinal: u8,
+    step_segment: u16,
+    keys: &[WorkUnitKey],
+    applicable: bool,
+) -> Result<(), CancellationCleanupManifestValidationError> {
+    for (index, key) in keys.iter().enumerate() {
+        if key.action_ordinal() != action_ordinal
+            || key.step_ordinal() / STEP_HISTORY_STRIDE != step_segment
+        {
+            return Err(
+                CancellationCleanupManifestValidationError::KeySegmentMismatch {
+                    action_ordinal,
+                    step_segment,
+                    key: *key,
+                },
+            );
+        }
+        if index > 0 && keys[index - 1] >= *key {
+            return Err(
+                CancellationCleanupManifestValidationError::KeysNotSortedOrUnique {
+                    action_ordinal,
+                    step_segment,
+                    index,
+                    kind: if applicable { "applicable" } else { "local" },
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Derive an exact effect inventory after validating the frozen cancellation source.
 pub(crate) fn derive_cancellation_effect_inventory(
     operation_id: OperationId,
@@ -714,7 +1200,14 @@ fn derive_recovery_bundles(
     inventory: &CancellationInventory,
     dispatch_outcome: &CancellationDispatchOutcomeRecord,
 ) -> Result<Vec<CancellationEffectBundle>, CancellationEffectInventoryError> {
-    let late_completed = dispatch_outcome
+    let late_completed = late_completed_keys(dispatch_outcome);
+    derive_bundles(plan, inventory, &late_completed)
+}
+
+fn late_completed_keys(
+    dispatch_outcome: &CancellationDispatchOutcomeRecord,
+) -> BTreeSet<WorkUnitKey> {
+    dispatch_outcome
         .rows()
         .iter()
         .filter_map(|row| {
@@ -724,8 +1217,94 @@ fn derive_recovery_bundles(
             )
             .then_some(row.key())
         })
-        .collect::<BTreeSet<_>>();
-    derive_bundles(plan, inventory, &late_completed)
+        .collect()
+}
+
+/// Derive the exact cleanup-obligation manifest from an explicitly validated recovery lineage.
+pub(crate) fn derive_cancellation_cleanup_manifest(
+    operation_id: OperationId,
+    plan: &WorkPlan,
+    recovery_inventory: &CancellationEffectRecoveryInventory,
+    expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    current_steps: &[WorkProgressStep],
+    admission_claims: &AdmissionClaimInventory,
+    execution_epoch: u64,
+) -> Result<CancellationCleanupManifest, CancellationCleanupManifestError> {
+    if plan.plan_version() != WORK_PLAN_VERSION_V1 {
+        return Err(CancellationCleanupManifestError::UnsupportedPlanVersion {
+            actual: plan.plan_version(),
+        });
+    }
+    if recovery_inventory.dispatch_outcome() != expected_dispatch_outcome {
+        return Err(CancellationCleanupManifestError::DispatchOutcomeMismatch);
+    }
+    recovery_inventory
+        .validate_against(
+            operation_id,
+            plan,
+            recovery_inventory.frozen_inventory(),
+            expected_dispatch_outcome,
+            current_steps,
+            admission_claims,
+            execution_epoch,
+        )
+        .map_err(CancellationCleanupManifestError::RecoveryInventory)?;
+
+    let late_completed = late_completed_keys(expected_dispatch_outcome);
+    let mut segments = Vec::new();
+    let groups = grouped_units(plan, recovery_inventory.frozen_inventory(), &late_completed);
+    for ((action_ordinal, step_segment), units) in groups {
+        if action_ordinal == GLOBAL_ACTION_ORDINAL {
+            continue;
+        }
+        let by_role =
+            local_role_map(&units).ok_or(CancellationCleanupManifestError::RecoveryInventory(
+                CancellationEffectInventoryError::UnsupportedPattern {
+                    action_ordinal,
+                    step_segment,
+                },
+            ))?;
+        let recipe = classify_recipe(plan, &units, &by_role, action_ordinal, step_segment)
+            .map_err(CancellationCleanupManifestError::RecoveryInventory)?;
+        let mut keys = units.iter().map(|unit| unit.key).collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut applicable_keys = units
+            .iter()
+            .filter(|unit| unit.applicability == WorkUnitApplicability::Required)
+            .map(|unit| unit.key)
+            .collect::<Vec<_>>();
+        applicable_keys.sort_unstable();
+        segments.push(
+            CancellationCleanupSegment::new(
+                action_ordinal,
+                step_segment,
+                recipe,
+                keys,
+                applicable_keys,
+            )
+            .map_err(CancellationCleanupManifestError::Shape)?,
+        );
+    }
+    segments.sort_by_key(|segment| (segment.action_ordinal, segment.step_segment));
+
+    let mut operation_recovery_payload_claim_ids = recovery_inventory
+        .frozen_inventory()
+        .admission_claims()
+        .claims()
+        .iter()
+        .filter(|claim| {
+            claim.allocation_class() == FullCapacityAllocationClass::OperationRecoveryPayload
+        })
+        .map(|claim| claim.claim_id())
+        .collect::<Vec<_>>();
+    operation_recovery_payload_claim_ids.sort_unstable();
+    CancellationCleanupManifest::new(
+        recovery_inventory.clone(),
+        expected_dispatch_outcome.clone(),
+        segments,
+        operation_recovery_payload_claim_ids,
+    )
+    .map_err(CancellationCleanupManifestError::Shape)
 }
 
 fn derive_bundles(
