@@ -40,7 +40,7 @@ pub const MAX_WORK_PLAN_UNITS: usize = 2048;
 /// Maximum number of prerequisite edges in one plan.
 pub const MAX_WORK_PLAN_EDGES: usize = 8192;
 
-const GLOBAL_ACTION_ORDINAL: u8 = u8::MAX;
+pub(crate) const GLOBAL_ACTION_ORDINAL: u8 = u8::MAX;
 const STEP_SOURCE_READ: u16 = 10;
 const STEP_RECOVERY_MATERIAL: u16 = 15;
 const STEP_PREPARE: u16 = 20;
@@ -60,7 +60,7 @@ const STEP_ORIGIN_ABSENCE: u16 = 90;
 const STEP_ORIGIN_RECONCILE: u16 = 100;
 const STEP_EXTERNAL_AUDIT: u16 = 110;
 const STEP_RETAINED_MERGE: u16 = 35;
-const STEP_HISTORY_STRIDE: u16 = 256;
+pub(crate) const STEP_HISTORY_STRIDE: u16 = 256;
 const STEP_GLOBAL_LIBRARY: u16 = 10;
 const STEP_HARVEST: u16 = 20;
 const STEP_PROJECTION: u16 = 30;

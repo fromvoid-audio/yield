@@ -6,6 +6,7 @@
 //! retains those capabilities for the lifetime of its connection.
 
 pub mod admission_claims;
+pub mod cancellation_effects;
 pub mod cancellation_recovery;
 pub mod codec;
 pub mod coordinator;
@@ -41,6 +42,14 @@ pub use cancellation_recovery::{
     CancellationActionSnapshot, CancellationActionState, CancellationInventory,
     CancellationInventoryError, CancellationRoute, CancellationStepSnapshot,
     MAX_CANCELLATION_ACTIONS, MAX_CANCELLATION_STEPS,
+};
+
+pub use cancellation_effects::{
+    CancellationEffectBundle, CancellationEffectFact, CancellationEffectFactKind,
+    CancellationEffectInventory, CancellationEffectInventoryError,
+    CancellationEffectInventoryValidationError, CancellationEffectOutcome,
+    CancellationEffectRecipe, CancellationEffectSourceClosure, MAX_CANCELLATION_EFFECT_BUNDLES,
+    MAX_CANCELLATION_EFFECT_ROWS,
 };
 
 pub use coordinator::{

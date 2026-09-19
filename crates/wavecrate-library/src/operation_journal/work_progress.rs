@@ -22,6 +22,10 @@ use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlementInventory,
     AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
+use super::cancellation_effects::{
+    CancellationEffectInventory, CancellationEffectInventoryError,
+    derive_cancellation_effect_inventory as derive_effect_inventory,
+};
 use super::cancellation_recovery::{
     CancellationActionState, CancellationInventory, CancellationInventoryError, CancellationRoute,
     MAX_CANCELLATION_ACTIONS,
@@ -1269,6 +1273,32 @@ impl WorkProgress {
     /// Borrow the immutable cancellation inventory frozen by the first request, when present.
     pub fn cancellation_inventory(&self) -> Option<&CancellationInventory> {
         self.cancellation_inventory.as_ref()
+    }
+
+    /// Derive the bounded effect inventory from the exact frozen cancellation source.
+    ///
+    /// The derivation validates the retained inventory against this operation's current plan,
+    /// steps, claims, and execution epoch before it produces any effect rows.  It is an
+    /// observation only: it does not grant recovery, filesystem, source, or terminal authority.
+    pub fn cancellation_effect_inventory(
+        &self,
+    ) -> Result<CancellationEffectInventory, CancellationEffectInventoryError> {
+        let inventory = self
+            .cancellation_inventory
+            .as_ref()
+            .ok_or(CancellationEffectInventoryError::CancellationInventoryMissing)?;
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(CancellationEffectInventoryError::AdmissionClaimsMissing)?;
+        derive_effect_inventory(
+            self.operation_id,
+            &self.plan,
+            inventory,
+            &self.steps,
+            admission_claims,
+            self.execution_epoch,
+        )
     }
 
     /// Return the bounded recovery-observation generation.
@@ -3503,24 +3533,29 @@ mod tests {
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
-        CancellationActionState, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
+        CancellationActionState, CancellationEffectFactKind, CancellationEffectOutcome,
+        CancellationEffectRecipe, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
         CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary,
         ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
         ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
         ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
         ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
         FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
-        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
-        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
-        NamespaceFileExpectation, NamespaceLeafName, NamespaceRenameIntentArgs, NamespaceTarget,
-        ParticipantCheckpoint, ParticipantCheckpointState, RawWavExtractionRecipe,
-        RetainedDeleteId, RetainedFolderObservation, RetainedPurgeDecision,
-        RetainedPurgeIntentArgs, RetainedRecoveryRootKind, RetainedResolutionCommandArgs,
-        RetainedResolutionStage, RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId,
-        SelectionExtractIntentArgs, SelectionOutputCommandArgs, SelectionOutputRecipe,
-        StoredRelativePath, UniversalCommandArgs, WaveformEditFrameRange,
-        WaveformFileRevisionObservation, WaveformOutputSpec, WaveformSampleFormat,
-        WaveformSourceSpec, fingerprint_selected_entry_json,
+        HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+        HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
+        HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
+        HistoryWaveformRestore, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
+        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
+        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
+        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
+        ParticipantCheckpointState, RawWavExtractionRecipe, RetainedDeleteId,
+        RetainedFolderObservation, RetainedPurgeDecision, RetainedPurgeIntentArgs,
+        RetainedRecoveryRootKind, RetainedResolutionCommandArgs, RetainedResolutionStage,
+        RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId, SelectionExtractIntentArgs,
+        SelectionOutputCommandArgs, SelectionOutputRecipe, StoredRelativePath,
+        UniversalCommandArgs, WaveformEditFrameRange, WaveformFileRevisionObservation,
+        WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+        fingerprint_selected_entry_json,
     };
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use uuid::Uuid;
@@ -3678,6 +3713,147 @@ mod tests {
         UniversalCommandArgs::Namespace(NamespaceCommandArgs::Rename(
             NamespaceRenameIntentArgs::new(source_entry, destination).expect("rename arguments"),
         ))
+    }
+
+    fn namespace_file_move_args(
+        source: ParticipantId,
+        source_id: SourceId,
+    ) -> UniversalCommandArgs {
+        let destination_parent = NamespaceDirectoryEndpoint::new(
+            source,
+            source_id.clone(),
+            NamespaceDirectoryLocator::child(
+                StoredRelativePath::new("archive").expect("archive path"),
+            )
+            .expect("archive locator"),
+            NamespaceDirectoryExpectation::new(7, "archive", Some(1)).expect("archive"),
+        )
+        .expect("destination parent");
+        let source_entry = NamespaceEntryEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("source.wav").expect("source path"),
+            NamespaceEntryExpectation::RegularFile(
+                NamespaceFileExpectation::new(7, "file-a", 12, Some(2)).expect("file"),
+            ),
+        )
+        .expect("source entry");
+        UniversalCommandArgs::Namespace(NamespaceCommandArgs::Move(
+            NamespaceMoveIntentArgs::new(source_entry, destination_parent)
+                .expect("file move arguments"),
+        ))
+    }
+
+    fn history_folder_args(source: ParticipantId, source_id: SourceId) -> UniversalCommandArgs {
+        let root = NamespaceDirectoryEndpoint::new(
+            source,
+            source_id.clone(),
+            NamespaceDirectoryLocator::Root,
+            NamespaceDirectoryExpectation::new(7, "root-a", None).expect("root"),
+        )
+        .expect("history root");
+        let relocation = |source_path: &str, source_identity: &str, destination_path: &str| {
+            let source_entry = NamespaceEntryEndpoint::new(
+                source,
+                source_id.clone(),
+                StoredRelativePath::new(source_path).expect("source path"),
+                NamespaceEntryExpectation::Directory(
+                    NamespaceDirectoryExpectation::new(7, source_identity, None)
+                        .expect("source directory"),
+                ),
+            )
+            .expect("source entry");
+            let destination = CopyEndpoint::new(
+                source,
+                source_id.clone(),
+                StoredRelativePath::new(destination_path).expect("destination path"),
+            )
+            .expect("destination");
+            HistoryFolderRelocation::new(source_entry, destination).expect("relocation")
+        };
+        let action = HistoryAction::FolderMove(
+            HistoryFolderMove::new(
+                root,
+                vec![
+                    relocation("folder/a", "folder-a", "archive/a"),
+                    relocation("folder/b", "folder-b", "archive/b"),
+                ],
+            )
+            .expect("folder move"),
+        );
+        UniversalCommandArgs::History(
+            HistoryUndoRedoIntentArgs::new(
+                HistoryScopeId::from_uuid(Uuid::from_u128(310)),
+                4,
+                5,
+                Some(6),
+                HistoryDirection::Undo,
+                vec![action],
+            )
+            .expect("history arguments"),
+        )
+    }
+
+    fn history_restore_with_extracted_args(
+        source: ParticipantId,
+        filesystem: ParticipantId,
+        source_id: SourceId,
+    ) -> UniversalCommandArgs {
+        let revision = |identity: &str| {
+            WaveformFileRevisionObservation::new(identity, "change", 10, Some(11))
+                .expect("history revision")
+        };
+        let target = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("target path"),
+        )
+        .expect("target");
+        let extracted_target = CopyEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("extracted.wav").expect("extracted path"),
+        )
+        .expect("extracted target");
+        let before =
+            HistoryRecoveryLeafObservation::new(revision("before")).expect("before backup");
+        let extracted_backup = HistoryRecoveryLeafObservation::new(revision("extracted-backup"))
+            .expect("extracted backup");
+        let backups = HistoryRecoveryBackupObservation::new(
+            filesystem,
+            "recovery-root",
+            Uuid::from_u128(311),
+            "edit-directory",
+            Some(before),
+            None,
+            Some(extracted_backup),
+        )
+        .expect("history backups");
+        let extracted = HistoryExtractedFileObservation::undo_remove_expected(
+            extracted_target,
+            revision("current"),
+        )
+        .expect("extracted removal");
+        let restore = HistoryWaveformRestore::new(
+            target,
+            7,
+            HistoryRestoreTargetExpectation::Existing(revision("target")),
+            Some(String::from("before-content")),
+            backups,
+            Some(extracted),
+        )
+        .expect("history restore");
+        UniversalCommandArgs::History(
+            HistoryUndoRedoIntentArgs::new(
+                HistoryScopeId::from_uuid(Uuid::from_u128(312)),
+                4,
+                5,
+                Some(6),
+                HistoryDirection::Undo,
+                vec![HistoryAction::WaveformRestore(restore)],
+            )
+            .expect("history arguments"),
+        )
     }
 
     fn copy_progress(with_optional_artifact: bool) -> WorkProgress {
@@ -4099,6 +4275,25 @@ mod tests {
             .expect("work-plan role")
     }
 
+    fn key_for_step(
+        progress: &WorkProgress,
+        action: u8,
+        step_segment: u16,
+        role: WorkUnitRole,
+    ) -> WorkUnitKey {
+        progress
+            .steps()
+            .iter()
+            .find(|step| {
+                step.key().action_ordinal() == action
+                    && step.key().step_ordinal() / super::super::work_plan::STEP_HISTORY_STRIDE
+                        == step_segment
+                    && step.key().role() == role
+            })
+            .map(WorkProgressStep::key)
+            .expect("work-plan segment role")
+    }
+
     fn source_observation(
         progress: &WorkProgress,
         key: WorkUnitKey,
@@ -4268,6 +4463,14 @@ mod tests {
         progress
             .apply_verified_completion(completion(progress, key, evidence))
             .expect("completion applies");
+    }
+
+    fn apply_step(progress: &mut WorkProgress, action: u8, step_segment: u16, role: WorkUnitRole) {
+        let key = key_for_step(progress, action, step_segment, role);
+        let evidence = evidence_for(progress, key, 7);
+        progress
+            .apply_verified_completion(completion(progress, key, evidence))
+            .expect("segmented completion applies");
     }
 
     fn publish_prefix(progress: &mut WorkProgress) {
@@ -4740,6 +4943,250 @@ mod tests {
         assert_eq!(
             inventory.actions()[1].state(),
             CancellationActionState::NotStarted
+        );
+        let effects = progress
+            .cancellation_effect_inventory()
+            .expect("compound cancellation effects");
+        assert_eq!(effects.bundles().len(), 1);
+        let publication = &effects.bundles()[0];
+        assert_eq!(publication.action_ordinal(), 0);
+        assert_eq!(publication.step_segment(), 0);
+        assert_eq!(
+            publication.recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert_eq!(publication.outcome(), CancellationEffectOutcome::Published);
+        assert_eq!(publication.facts().len(), 1);
+        assert_eq!(
+            publication.facts()[0].kind(),
+            CancellationEffectFactKind::Publish
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_inventory_keeps_history_relocations_distinct() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 313);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(313).expect("cancel"))
+            .expect("history cancellation");
+
+        let effects = progress
+            .cancellation_effect_inventory()
+            .expect("history cancellation effects");
+        assert_eq!(effects.bundles().len(), 2);
+        for (segment, bundle) in effects.bundles().iter().enumerate() {
+            assert_eq!(bundle.action_ordinal(), 0);
+            assert_eq!(bundle.step_segment(), segment as u16);
+            assert_eq!(
+                bundle.recipe(),
+                CancellationEffectRecipe::QualifiedRelocation
+            );
+            assert_eq!(
+                bundle.outcome(),
+                CancellationEffectOutcome::QualifiedRelocationCompleted
+            );
+            assert_eq!(
+                bundle
+                    .facts()
+                    .iter()
+                    .map(|fact| fact.kind())
+                    .collect::<Vec<_>>(),
+                vec![
+                    CancellationEffectFactKind::QualifiedRelocation,
+                    CancellationEffectFactKind::OriginAbsence,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_effect_inventory_records_standalone_history_extract_removal() {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            314,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::RecoveryMaterialRetained,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::OriginRemovalStart,
+            WorkUnitRole::OriginAbsence,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(314).expect("cancel"))
+            .expect("history extract cancellation");
+
+        let effects = progress
+            .cancellation_effect_inventory()
+            .expect("history extract effects");
+        assert_eq!(effects.bundles().len(), 2);
+        assert_eq!(
+            effects.bundles()[0].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert_eq!(effects.bundles()[0].step_segment(), 0);
+        let extracted = &effects.bundles()[1];
+        assert_eq!(
+            extracted.recipe(),
+            CancellationEffectRecipe::HistoryUndoExtractedRemoval
+        );
+        assert_eq!(extracted.step_segment(), 1);
+        assert_eq!(
+            extracted.outcome(),
+            CancellationEffectOutcome::RemovalConfirmed
+        );
+        assert_eq!(
+            extracted
+                .facts()
+                .iter()
+                .map(|fact| fact.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                CancellationEffectFactKind::OriginRemovalStart,
+                CancellationEffectFactKind::OriginAbsence,
+            ]
+        );
+        assert!(
+            !extracted
+                .facts()
+                .iter()
+                .any(|fact| fact.kind() == CancellationEffectFactKind::Publish)
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_inventory_retains_merge_and_publication_facts() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            retained_resolution_args(source, source_id, true),
+            315,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::RetainedMerge,
+            WorkUnitRole::Publish,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(315).expect("cancel"))
+            .expect("retained merge cancellation");
+
+        let effects = progress
+            .cancellation_effect_inventory()
+            .expect("retained merge effects");
+        assert_eq!(effects.bundles().len(), 1);
+        let merge = &effects.bundles()[0];
+        assert_eq!(merge.recipe(), CancellationEffectRecipe::RetainedMerge);
+        assert_eq!(
+            merge.outcome(),
+            CancellationEffectOutcome::RetainedMergeCompleted
+        );
+        assert_eq!(
+            merge
+                .facts()
+                .iter()
+                .map(|fact| fact.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                CancellationEffectFactKind::RetainedMerge,
+                CancellationEffectFactKind::Publish,
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_inventory_keeps_staged_move_unresolved_without_origin_absence() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            namespace_file_move_args(source, source_id),
+            316,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::DestinationSourceReconcile,
+            WorkUnitRole::OriginRemovalStart,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(316).expect("cancel"))
+            .expect("staged move cancellation");
+
+        let effects = progress
+            .cancellation_effect_inventory()
+            .expect("staged move effects");
+        assert_eq!(effects.bundles().len(), 1);
+        let move_effect = &effects.bundles()[0];
+        assert_eq!(move_effect.recipe(), CancellationEffectRecipe::StagedMove);
+        assert_eq!(
+            move_effect.outcome(),
+            CancellationEffectOutcome::RemovalUnresolved
+        );
+        assert!(
+            move_effect
+                .facts()
+                .iter()
+                .any(|fact| fact.kind() == CancellationEffectFactKind::Publish)
+        );
+        assert!(
+            move_effect
+                .facts()
+                .iter()
+                .any(|fact| fact.kind() == CancellationEffectFactKind::OriginRemovalStart)
+        );
+        assert!(
+            !move_effect
+                .facts()
+                .iter()
+                .any(|fact| fact.kind() == CancellationEffectFactKind::OriginAbsence)
+        );
+        assert_eq!(
+            progress
+                .step_for(key_for(&progress, 0, WorkUnitRole::OriginAbsence))
+                .expect("origin absence")
+                .status(),
+            ProgressStepStatus::Pending
         );
     }
 
@@ -6254,11 +6701,30 @@ mod tests {
             admission_claims(12),
         )
         .expect("create-folder progress");
+        for role in [WorkUnitRole::Stage, WorkUnitRole::CopyValidated] {
+            assert_eq!(
+                progress
+                    .plan
+                    .units()
+                    .iter()
+                    .find(|unit| unit.key() == key_for(&progress, 0, role))
+                    .expect("create-folder applicability")
+                    .applicability(),
+                WorkUnitApplicability::NotApplicable
+            );
+        }
         apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
         apply_role(&mut progress, 0, WorkUnitRole::Prepare);
         progress
             .request_cancellation(CancellationRequestObservation::new(403).expect("cancel"))
             .expect("prepublication cancellation");
+        assert!(
+            progress
+                .cancellation_effect_inventory()
+                .expect("create-folder effects")
+                .bundles()
+                .is_empty()
+        );
 
         let wrong_origin = PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
             0,

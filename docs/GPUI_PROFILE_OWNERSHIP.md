@@ -1330,3 +1330,16 @@ Independent production-path review found no actionable issue. This remains a
 guarded observation model: no live barrier issuer, filesystem execution, or full
 durable progress codec was added. Effects that actually entered still require
 their own exact recovery observations; OPT-1337 remains in progress.
+
+The cancellation-effect inventory now derives bounded observational bundles from
+the frozen V1 cancellation snapshot and exact action/segment work-plan groups.
+Public progress coverage exercises `StagedPublish` without future trim work,
+`StagedMove` with unresolved origin absence, two distinct `QualifiedRelocation`
+segments in one history action, `RetainedMerge` with its publication fact, and
+standalone `HistoryUndoExtractedRemoval`; CreateFolder accepts its not-applicable
+staging and copy-validation roles. Five cancellation-effect tests and thirty-eight
+public progress tests passed, together with library and GPUI checks without default
+features, formatting and diff checks. This remains observational: no recovery
+issuer, filesystem execution, durable progress persistence, or native Windows
+UI/audio acceptance was added. After-effect recovery, cancellation-local
+reconciliation, owner integration and the remaining OPT-1337 work remain open.
