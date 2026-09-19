@@ -20,11 +20,13 @@ use thiserror::Error;
 use crate::operation_journal::CancellationDispatchOutcomeRow;
 
 use super::{
-    CancellationDispatchOutcome, CancellationDispatchOutcomeRecord,
-    CancellationDispatchOutcomeRecordError, CancellationRequestObservation, CompletionContext,
-    FullProgressDisposition, OperationId, OperationPhase, ParticipantScope, ProgressApplyOutcome,
-    ProgressStepStatus, StoredStepEvidence, WorkPlan, WorkProgress, WorkProgressError,
-    WorkUnitApplicability, WorkUnitKey,
+    CancellationCoordinatorClosureObservationRecord, CancellationDispatchOutcome,
+    CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
+    CancellationNamespaceCleanupObservationRecord, CancellationRequestObservation,
+    CancellationResourceCleanupObservationRecord, CancellationSourceClosureObservationRecord,
+    CompletionContext, FullProgressDisposition, OperationId, OperationPhase, ParticipantScope,
+    ProgressApplyOutcome, ProgressStepStatus, StoredStepEvidence, WorkPlan, WorkProgress,
+    WorkProgressError, WorkUnitApplicability, WorkUnitKey,
 };
 
 static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -107,6 +109,12 @@ pub(super) enum DispatchOwnerError {
     /// A sealed barrier no longer matches the owner's retained sealed outcome.
     #[error("dispatch barrier state does not match the owner's sealed outcome")]
     BarrierStateMismatch,
+    /// A sealed barrier no longer matches the owner's frozen cancellation inventory.
+    #[error("dispatch barrier cancellation inventory does not match the owner's current inventory")]
+    BarrierInventoryMismatch,
+    /// The owner's accepted after-effect state does not retain the barrier's sealed dispatch.
+    #[error("dispatch barrier does not match the owner's accepted after-effect dispatch")]
+    AfterEffectDispatchMismatch,
     /// An entered or reserved permit remains outstanding at the cancellation barrier.
     #[error("dispatch owner has {count} outstanding permit(s)")]
     OutstandingPermits { count: usize },
@@ -266,6 +274,14 @@ impl VerifiedCancellationBarrier {
             .is_none_or(|record| record != &self.dispatch_outcome)
         {
             return Err(DispatchOwnerError::BarrierStateMismatch);
+        }
+        if owner
+            .progress
+            .cancellation_inventory
+            .as_ref()
+            .is_none_or(|inventory| inventory != &self.cancellation_inventory)
+        {
+            return Err(DispatchOwnerError::BarrierInventoryMismatch);
         }
         Ok(())
     }
@@ -778,6 +794,76 @@ impl LiveDispatchOwner {
         self.sealed_dispatch_outcome = Some(dispatch_outcome.clone());
         self.lifecycle = DispatchOwnerLifecycle::Sealed;
         Ok(self.barrier(dispatch_outcome))
+    }
+
+    /// Accept the existing private after-effect reconciliation guard using this owner's sealed
+    /// dispatch barrier.  Recovery and receipt lineage are derived from the owner progress so a
+    /// caller cannot substitute an unrelated inventory or authority snapshot.
+    pub(super) fn accept_after_effect_reconciliation(
+        &mut self,
+        barrier: &VerifiedCancellationBarrier,
+        expected_recovery_generation: u64,
+        source_closure_observation: CancellationSourceClosureObservationRecord,
+        coordinator_closure_observation: CancellationCoordinatorClosureObservationRecord,
+    ) -> Result<(), DispatchOwnerError> {
+        barrier.validate_for_owner(self)?;
+        let recovery_inventory = self
+            .progress
+            .cancellation_effect_recovery_inventory(barrier.dispatch_outcome())?;
+        let authority = super::VerifiedAfterEffectReconciliation {
+            operation_id: self.progress.operation_id,
+            plan: self.progress.plan.clone(),
+            execution_epoch: self.progress.execution_epoch,
+            cancellation_inventory: barrier.cancellation_inventory().clone(),
+            expected_recovery_generation,
+            recovery_inventory,
+            source_closure_observation,
+            coordinator_closure_observation,
+        };
+        self.progress
+            .accept_after_effect_reconciliation(authority)
+            .map_err(DispatchOwnerError::Progress)
+    }
+
+    /// Accept existing nonterminal cleanup observations against this owner's sealed dispatch and
+    /// current accepted after-effect state.  The owner supplies the exact after-effect snapshot;
+    /// callers provide only the bounded resource and namespace observations and expected global
+    /// generation.
+    pub(super) fn accept_cancellation_cleanup_observations(
+        &mut self,
+        barrier: &VerifiedCancellationBarrier,
+        expected_recovery_generation: u64,
+        resource_cleanup_observation: CancellationResourceCleanupObservationRecord,
+        namespace_cleanup_observation: CancellationNamespaceCleanupObservationRecord,
+    ) -> Result<(), DispatchOwnerError> {
+        barrier.validate_for_owner(self)?;
+        let after_effect_reconciliation =
+            self.progress.after_effect_reconciliation.as_ref().ok_or(
+                DispatchOwnerError::Progress(
+                    WorkProgressError::CancellationCleanupAfterEffectMissing,
+                ),
+            )?;
+        if after_effect_reconciliation.execution_epoch() != self.progress.execution_epoch
+            || after_effect_reconciliation
+                .recovery_inventory()
+                .dispatch_outcome()
+                != barrier.dispatch_outcome()
+        {
+            return Err(DispatchOwnerError::AfterEffectDispatchMismatch);
+        }
+        let authority = super::VerifiedCancellationCleanupObservations {
+            operation_id: self.progress.operation_id,
+            plan: self.progress.plan.clone(),
+            execution_epoch: self.progress.execution_epoch,
+            cancellation_inventory: barrier.cancellation_inventory().clone(),
+            expected_recovery_generation,
+            after_effect_reconciliation: after_effect_reconciliation.clone(),
+            resource_cleanup_observation,
+            namespace_cleanup_observation,
+        };
+        self.progress
+            .accept_cancellation_cleanup_observations(authority)
+            .map_err(DispatchOwnerError::Progress)
     }
 
     /// Report one ledger state for focused owner tests without exposing mutable progress.

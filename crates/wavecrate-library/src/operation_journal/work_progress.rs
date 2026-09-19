@@ -7460,6 +7460,66 @@ mod tests {
         }
     }
 
+    fn owner_publish_prefix(owner: &mut dispatch_owner::LiveDispatchOwner) {
+        let source = key_for(owner.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = owner.issue(source).expect("owner source reservation");
+        let entered = owner.enter(reserved).expect("owner source entry");
+        owner
+            .complete(entered, evidence_for(owner.progress(), source, 7))
+            .expect("owner source completion");
+        for role in [
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+        ] {
+            let key = key_for(owner.progress(), 0, role);
+            let reserved = owner.issue(key).expect("owner work reservation");
+            let entered = owner.enter(reserved).expect("owner work entry");
+            owner
+                .complete(entered, evidence_for(owner.progress(), key, 7))
+                .expect("owner work completion");
+        }
+    }
+
+    fn owner_pending_cleanup_observation_records(
+        owner: &dispatch_owner::LiveDispatchOwner,
+        recovery: &CancellationEffectRecoveryInventory,
+        dispatch: &CancellationDispatchOutcomeRecord,
+        observation_generation: u64,
+    ) -> (
+        CancellationResourceCleanupObservationRecord,
+        CancellationNamespaceCleanupObservationRecord,
+    ) {
+        let cleanup = owner
+            .progress()
+            .cancellation_cleanup_manifest(recovery, dispatch)
+            .expect("owner cleanup manifest");
+        let resource_manifest = owner
+            .progress()
+            .cancellation_resource_cleanup_manifest(&cleanup, recovery, dispatch)
+            .expect("owner resource manifest");
+        let namespace_manifest = owner
+            .progress()
+            .cancellation_namespace_cleanup_manifest(&cleanup, recovery, dispatch)
+            .expect("owner namespace manifest");
+        let resource = CancellationResourceCleanupObservationRecord::new(
+            resource_manifest.clone(),
+            owner.progress().execution_epoch(),
+            observation_generation,
+            pending_resource_cleanup_rows(&resource_manifest),
+        )
+        .expect("owner resource observations");
+        let namespace = CancellationNamespaceCleanupObservationRecord::new(
+            namespace_manifest.clone(),
+            owner.progress().execution_epoch(),
+            observation_generation,
+            pending_namespace_cleanup_rows(&namespace_manifest),
+        )
+        .expect("owner namespace observations");
+        (resource, namespace)
+    }
+
     fn complete_required(progress: &mut WorkProgress) {
         loop {
             let next = progress.steps().iter().find_map(|step| {
@@ -18095,5 +18155,286 @@ mod tests {
             generation_overflow.lifecycle(),
             dispatch_owner::DispatchOwnerLifecycle::CancelDraining
         );
+    }
+
+    #[test]
+    fn live_dispatch_owner_barrier_accepts_nonterminal_after_effect_and_cleanup() {
+        let mut before_publish =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("before-publish owner");
+        let before_steps = before_publish.progress().steps().to_vec();
+        before_publish
+            .request_cancellation(CancellationRequestObservation::new(17030).expect("cancel"))
+            .expect("before-publish cancellation");
+        assert_eq!(
+            before_publish
+                .progress()
+                .cancellation_inventory()
+                .expect("cancellation inventory")
+                .route(),
+            CancellationRoute::BeforePublish
+        );
+        let before_barrier = before_publish.seal().expect("before-publish barrier");
+        let (before_recovery, before_source, before_coordinator) = empty_after_effect_inputs(
+            before_publish.progress(),
+            before_barrier.dispatch_outcome().clone(),
+        );
+        before_publish
+            .accept_after_effect_reconciliation(
+                &before_barrier,
+                before_publish.progress().recovery_generation(),
+                before_source.clone(),
+                before_coordinator.clone(),
+            )
+            .expect("before-publish after-effect acceptance");
+        assert_eq!(before_publish.progress().recovery_generation(), 1);
+        assert_eq!(before_publish.progress().steps(), before_steps.as_slice());
+        let (before_resource, before_namespace) = owner_pending_cleanup_observation_records(
+            &before_publish,
+            &before_recovery,
+            before_barrier.dispatch_outcome(),
+            1,
+        );
+        before_publish
+            .accept_cancellation_cleanup_observations(
+                &before_barrier,
+                before_publish.progress().recovery_generation(),
+                before_resource.clone(),
+                before_namespace.clone(),
+            )
+            .expect("before-publish cleanup acceptance");
+        assert_eq!(before_publish.progress().recovery_generation(), 2);
+        assert_eq!(
+            before_publish.progress().disposition(),
+            FullProgressDisposition::CancelRequestedBeforePublish
+        );
+        let before_replay_generation = before_publish.progress().recovery_generation();
+        before_publish
+            .accept_cancellation_cleanup_observations(
+                &before_barrier,
+                before_replay_generation,
+                before_resource,
+                before_namespace,
+            )
+            .expect("before-publish cleanup replay");
+        assert_eq!(
+            before_publish.progress().recovery_generation(),
+            before_replay_generation
+        );
+        assert_eq!(
+            before_publish.lifecycle(),
+            dispatch_owner::DispatchOwnerLifecycle::Sealed
+        );
+        assert!(matches!(
+            before_publish.issue(key_for(before_publish.progress(), 0, WorkUnitRole::Prepare)),
+            Err(dispatch_owner::DispatchOwnerError::IssuanceClosed)
+        ));
+
+        let mut after_publish =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("after-publish owner");
+        owner_publish_prefix(&mut after_publish);
+        let after_steps = after_publish.progress().steps().to_vec();
+        let after_claims = after_publish.progress().admission_claims().cloned();
+        after_publish
+            .request_cancellation(CancellationRequestObservation::new(17031).expect("cancel"))
+            .expect("after-publish cancellation");
+        assert_eq!(
+            after_publish
+                .progress()
+                .cancellation_inventory()
+                .expect("cancellation inventory")
+                .route(),
+            CancellationRoute::AfterPublish
+        );
+        let after_barrier = after_publish.seal().expect("after-publish barrier");
+        let (after_recovery, after_source, after_coordinator) = empty_after_effect_inputs(
+            after_publish.progress(),
+            after_barrier.dispatch_outcome().clone(),
+        );
+        after_publish
+            .accept_after_effect_reconciliation(
+                &after_barrier,
+                after_publish.progress().recovery_generation(),
+                after_source.clone(),
+                after_coordinator.clone(),
+            )
+            .expect("after-publish after-effect acceptance");
+        assert_eq!(after_publish.progress().recovery_generation(), 1);
+        assert_eq!(after_publish.progress().steps(), after_steps.as_slice());
+        assert_eq!(
+            after_publish.progress().admission_claims(),
+            after_claims.as_ref()
+        );
+        let after_replay_generation = after_publish.progress().recovery_generation();
+        after_publish
+            .accept_after_effect_reconciliation(
+                &after_barrier,
+                after_replay_generation,
+                after_source,
+                after_coordinator,
+            )
+            .expect("after-publish after-effect replay");
+        assert_eq!(
+            after_publish.progress().recovery_generation(),
+            after_replay_generation
+        );
+        let (after_resource, after_namespace) = owner_pending_cleanup_observation_records(
+            &after_publish,
+            &after_recovery,
+            after_barrier.dispatch_outcome(),
+            1,
+        );
+        after_publish
+            .accept_cancellation_cleanup_observations(
+                &after_barrier,
+                after_publish.progress().recovery_generation(),
+                after_resource.clone(),
+                after_namespace.clone(),
+            )
+            .expect("after-publish cleanup acceptance");
+        let cleanup_replay_generation = after_publish.progress().recovery_generation();
+        after_publish
+            .accept_cancellation_cleanup_observations(
+                &after_barrier,
+                cleanup_replay_generation,
+                after_resource,
+                after_namespace,
+            )
+            .expect("after-publish cleanup replay");
+        assert_eq!(
+            after_publish.progress().recovery_generation(),
+            cleanup_replay_generation
+        );
+        assert_eq!(after_publish.progress().steps(), after_steps.as_slice());
+        assert_eq!(
+            after_publish.progress().admission_claims(),
+            after_claims.as_ref()
+        );
+        assert_eq!(
+            after_publish.lifecycle(),
+            dispatch_owner::DispatchOwnerLifecycle::Sealed
+        );
+        assert!(matches!(
+            after_publish.issue(key_for(
+                after_publish.progress(),
+                0,
+                WorkUnitRole::SourceRead
+            )),
+            Err(dispatch_owner::DispatchOwnerError::IssuanceClosed)
+        ));
+    }
+
+    #[test]
+    fn live_dispatch_owner_guard_wrappers_reject_foreign_and_stale_inputs_atomically() {
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("owner");
+        owner
+            .request_cancellation(CancellationRequestObservation::new(17032).expect("cancel"))
+            .expect("owner cancellation");
+        let barrier = owner.seal().expect("owner barrier");
+        let (recovery, source, coordinator) =
+            empty_after_effect_inputs(owner.progress(), barrier.dispatch_outcome().clone());
+        let before_cleanup = owner.progress().clone();
+        let (resource, namespace) = owner_pending_cleanup_observation_records(
+            &owner,
+            &recovery,
+            barrier.dispatch_outcome(),
+            1,
+        );
+        assert_eq!(
+            owner.accept_cancellation_cleanup_observations(
+                &barrier,
+                owner.progress().recovery_generation(),
+                resource.clone(),
+                namespace.clone(),
+            ),
+            Err(dispatch_owner::DispatchOwnerError::Progress(
+                WorkProgressError::CancellationCleanupAfterEffectMissing
+            ))
+        );
+        assert_eq!(owner.progress(), &before_cleanup);
+
+        let mut foreign =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("foreign owner");
+        foreign
+            .request_cancellation(CancellationRequestObservation::new(17033).expect("cancel"))
+            .expect("foreign cancellation");
+        let foreign_barrier = foreign.seal().expect("foreign barrier");
+        let before_foreign = owner.progress().clone();
+        assert_eq!(
+            owner.accept_after_effect_reconciliation(
+                &foreign_barrier,
+                owner.progress().recovery_generation(),
+                source.clone(),
+                coordinator.clone(),
+            ),
+            Err(dispatch_owner::DispatchOwnerError::PermitOwnerMismatch)
+        );
+        assert_eq!(owner.progress(), &before_foreign);
+
+        owner
+            .accept_after_effect_reconciliation(
+                &barrier,
+                owner.progress().recovery_generation(),
+                source,
+                coordinator,
+            )
+            .expect("owner after-effect acceptance");
+        let before_stale_generation = owner.progress().clone();
+        assert_eq!(
+            owner.accept_cancellation_cleanup_observations(
+                &barrier,
+                0,
+                resource.clone(),
+                namespace.clone(),
+            ),
+            Err(dispatch_owner::DispatchOwnerError::Progress(
+                WorkProgressError::CancellationCleanupGenerationMismatch {
+                    expected: 1,
+                    actual: 0,
+                }
+            ))
+        );
+        assert_eq!(owner.progress(), &before_stale_generation);
+
+        let mut other = dispatch_owner::LiveDispatchOwner::new_for_test(
+            copy_progress_with_two_admission_claims(),
+        )
+        .expect("other owner");
+        other
+            .request_cancellation(CancellationRequestObservation::new(17034).expect("cancel"))
+            .expect("other cancellation");
+        let other_barrier = other.seal().expect("other barrier");
+        let (other_recovery, other_source, other_coordinator) =
+            empty_after_effect_inputs(other.progress(), other_barrier.dispatch_outcome().clone());
+        other
+            .accept_after_effect_reconciliation(
+                &other_barrier,
+                other.progress().recovery_generation(),
+                other_source,
+                other_coordinator,
+            )
+            .expect("other after-effect acceptance");
+        let (other_resource, other_namespace) = owner_pending_cleanup_observation_records(
+            &other,
+            &other_recovery,
+            other_barrier.dispatch_outcome(),
+            1,
+        );
+        let before_bad_lineage = owner.progress().clone();
+        assert!(
+            owner
+                .accept_cancellation_cleanup_observations(
+                    &barrier,
+                    owner.progress().recovery_generation(),
+                    other_resource,
+                    other_namespace,
+                )
+                .is_err()
+        );
+        assert_eq!(owner.progress(), &before_bad_lineage);
     }
 }
