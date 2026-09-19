@@ -16971,8 +16971,8 @@ mod tests {
     #[test]
     fn accepted_after_effect_source_receipts_raise_reacquisition_floor_and_replay_historically() {
         let (participants, source, _filesystem, source_id) = valid_topology(false);
-        let mut progress =
-            claimed_progress(participants, history_folder_args(source, source_id), 1405);
+        let args = history_folder_args(source, source_id.clone());
+        let mut progress = claimed_progress(participants.clone(), args.clone(), 1405);
         for role in [
             WorkUnitRole::SourceRead,
             WorkUnitRole::Prepare,
@@ -17079,6 +17079,202 @@ mod tests {
                 progress.recovery_generation(),
             ))
             .expect("accept observed source");
+        progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(
+                &progress,
+                args.clone(),
+                participants.clone(),
+            ))
+            .expect("snapshot with observed source receipt")
+            .validate_base()
+            .expect("snapshot validates observed source receipt");
+
+        let source_snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(
+                &progress,
+                args.clone(),
+                participants.clone(),
+            ))
+            .expect("source receipt snapshot");
+        let pending_source = CancellationSourceClosureObservationRecord::new(
+            source_snapshot
+                .after_effect_reconciliation()
+                .expect("after-effect state")
+                .source_closure_observation()
+                .manifest()
+                .clone(),
+            progress.execution_epoch(),
+            3,
+            source_closure_rows(
+                source_snapshot
+                    .after_effect_reconciliation()
+                    .expect("after-effect state")
+                    .source_closure_observation()
+                    .manifest(),
+            ),
+        )
+        .expect("pending source receipt");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &pending_source,
+                source_snapshot
+                    .after_effect_reconciliation()
+                    .expect("after-effect state")
+                    .recovery_inventory(),
+                source_snapshot
+                    .after_effect_reconciliation()
+                    .expect("after-effect state")
+                    .recovery_inventory()
+                    .dispatch_outcome(),
+            )
+            .expect("coordinator manifest");
+        let observed_coordinator_key = coordinator_manifest
+            .keys()
+            .first()
+            .copied()
+            .expect("coordinator closure key");
+        let observed_coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_manifest.clone(),
+            progress.execution_epoch(),
+            3,
+            coordinator_manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == observed_coordinator_key {
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: evidence_for(&progress, *key, 9),
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress.scope_for(*key).expect("coordinator scope").clone(),
+                            ),
+                        }
+                    } else {
+                        CancellationCoordinatorClosureOutcome::Pending
+                    };
+                    CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("observed coordinator receipt");
+        let accepted = source_snapshot
+            .after_effect_reconciliation()
+            .expect("after-effect state");
+        let dispatch = accepted.recovery_inventory().dispatch_outcome();
+        let never_entered_key = dispatch
+            .rows()
+            .iter()
+            .find(|row| matches!(row.outcome(), CancellationDispatchOutcome::NeverEntered))
+            .map(CancellationDispatchOutcomeRow::key)
+            .expect("never-entered dispatch row");
+        let uncertain_rows = dispatch
+            .rows()
+            .iter()
+            .map(|row| {
+                let outcome = if row.key() == never_entered_key {
+                    CancellationDispatchOutcome::EntryUncertain
+                } else {
+                    row.outcome().clone()
+                };
+                CancellationDispatchOutcomeRow::new(row.key(), outcome)
+            })
+            .collect();
+        let uncertain_dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch.manifest().clone(),
+            dispatch.observation_epoch(),
+            dispatch.recovery_generation(),
+            uncertain_rows,
+        )
+        .expect("uncertain dispatch");
+        let uncertain_recovery = progress
+            .cancellation_effect_recovery_inventory(&uncertain_dispatch)
+            .expect("uncertain recovery");
+        let uncertain_source_manifest = progress
+            .cancellation_source_closure_manifest(&uncertain_recovery, &uncertain_dispatch)
+            .expect("uncertain source manifest");
+        let uncertain_source = CancellationSourceClosureObservationRecord::new(
+            uncertain_source_manifest,
+            accepted.source_closure_observation().observation_epoch(),
+            accepted
+                .source_closure_observation()
+                .observation_generation()
+                + 1,
+            accepted.source_closure_observation().rows().to_vec(),
+        )
+        .expect("uncertain source");
+        let uncertain_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &uncertain_source,
+                &uncertain_recovery,
+                &uncertain_dispatch,
+            )
+            .expect("uncertain coordinator manifest");
+        let uncertain_coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            uncertain_coordinator_manifest,
+            accepted
+                .coordinator_closure_observation()
+                .observation_epoch(),
+            accepted
+                .coordinator_closure_observation()
+                .observation_generation()
+                + 1,
+            accepted.coordinator_closure_observation().rows().to_vec(),
+        )
+        .expect("uncertain coordinator");
+        let uncertain_after_effect = AfterEffectReconciliationObservation::new(
+            uncertain_recovery,
+            uncertain_source,
+            uncertain_coordinator,
+            accepted.execution_epoch(),
+            accepted.recovery_generation(),
+        );
+        let mut uncertain_snapshot =
+            serde_json::to_value(&source_snapshot).expect("snapshot value");
+        uncertain_snapshot["after_effect_reconciliation"] =
+            serde_json::to_value(uncertain_after_effect).expect("after-effect value");
+        let uncertain_snapshot: FullProgressSnapshotObservation =
+            serde_json::from_value(uncertain_snapshot).expect("uncertain dispatch snapshot");
+        let uncertain_error = uncertain_snapshot
+            .validate_base()
+            .expect_err("uncertain dispatch must fail");
+        assert!(matches!(
+            uncertain_error,
+            FullProgressSnapshotObservationError::AfterEffectValidation {
+                source: WorkProgressError::AfterEffectReconciliationDispatchIndeterminate,
+            }
+        ));
+
+        let mut mismatched_coordinator =
+            serde_json::to_value(&source_snapshot).expect("snapshot value");
+        mismatched_coordinator["after_effect_reconciliation"]["coordinator_closure_observation"] =
+            serde_json::to_value(&observed_coordinator).expect("coordinator value");
+        let mismatched_coordinator: FullProgressSnapshotObservation =
+            serde_json::from_value(mismatched_coordinator)
+                .expect("mismatched coordinator snapshot");
+        assert!(matches!(
+            mismatched_coordinator.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectValidation {
+                    source: WorkProgressError::CancellationCoordinatorClosureObservation(_),
+                }
+            )
+        ));
+
+        let mut partial_source = serde_json::to_value(&source_snapshot).expect("snapshot value");
+        partial_source["after_effect_reconciliation"]["source_closure_observation"] =
+            serde_json::to_value(&pending_source).expect("pending source value");
+        partial_source["after_effect_reconciliation"]["coordinator_closure_observation"] =
+            serde_json::to_value(&observed_coordinator).expect("coordinator value");
+        let partial_source: FullProgressSnapshotObservation =
+            serde_json::from_value(partial_source).expect("partial source snapshot");
+        assert!(matches!(
+            partial_source.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectValidation {
+                    source: WorkProgressError::AfterEffectReconciliationSourceClosureIncomplete,
+                }
+            )
+        ));
 
         let target = source_key.participant_id();
         let before_lower_reacquisition = progress.clone();
@@ -17183,6 +17379,11 @@ mod tests {
                 context: historical_context,
             }
         );
+        progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("reacquired historical source snapshot")
+            .validate_base()
+            .expect("reacquired historical source snapshot validates");
     }
 
     #[test]
@@ -19695,6 +19896,225 @@ mod tests {
         assert!(decoded.after_effect_reconciliation().is_some());
         assert!(decoded.cancellation_cleanup_observations().is_some());
         assert_eq!(cancelled, before);
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_retained_after_effect_headers_and_history() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(18106).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut progress);
+        let initial_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("initial after-effect snapshot");
+        initial_snapshot
+            .validate_base()
+            .expect("initial after-effect snapshot validates");
+
+        // A later cleanup observation advances the global generation while the accepted
+        // after-effect generation remains historical and must still validate.
+        accept_pending_cleanup_observations(&mut progress);
+        let cleanup_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("cleanup snapshot");
+        cleanup_snapshot
+            .validate_base()
+            .expect("cleanup snapshot retains valid after-effect state");
+
+        // Reacquisition changes the current epoch and scopes, but the accepted after-effect
+        // records retain their original observation epoch and historical context.
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                7,
+                2,
+                progress.execution_epoch(),
+            ))
+            .expect("reacquire source after accepted after-effect");
+        let reacquired_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("reacquired after-effect snapshot");
+        assert_eq!(
+            reacquired_snapshot
+                .after_effect_reconciliation()
+                .expect("retained after-effect")
+                .execution_epoch(),
+            0
+        );
+        reacquired_snapshot
+            .validate_base()
+            .expect("historical after-effect snapshot validates");
+    }
+
+    #[test]
+    fn full_progress_snapshot_rejects_retained_after_effect_corruption() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(18107).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut progress);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("after-effect snapshot");
+
+        let mut future_epoch = serde_json::to_value(&snapshot).expect("snapshot value");
+        future_epoch["after_effect_reconciliation"]["execution_epoch"] = json!(1);
+        let future_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(future_epoch).expect("future after-effect epoch shape");
+        assert!(matches!(
+            future_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectExecutionEpochFuture {
+                    accepted: 1,
+                    current: 0,
+                }
+            )
+        ));
+
+        let mut dispatch_epoch = serde_json::to_value(&snapshot).expect("snapshot value");
+        dispatch_epoch["after_effect_reconciliation"]["recovery_inventory"]["dispatch_outcome"]["observation_epoch"] =
+            json!(1);
+        let dispatch_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(dispatch_epoch).expect("dispatch epoch shape");
+        assert!(matches!(
+            dispatch_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectDispatchEpochMismatch {
+                    accepted: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let mut source_epoch = serde_json::to_value(&snapshot).expect("snapshot value");
+        source_epoch["after_effect_reconciliation"]["source_closure_observation"]["observation_epoch"] =
+            json!(1);
+        let source_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(source_epoch).expect("source epoch shape");
+        assert!(matches!(
+            source_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectSourceClosureEpochMismatch {
+                    accepted: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let mut coordinator_epoch = serde_json::to_value(&snapshot).expect("snapshot value");
+        coordinator_epoch["after_effect_reconciliation"]["coordinator_closure_observation"]["observation_epoch"] =
+            json!(1);
+        let coordinator_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(coordinator_epoch).expect("coordinator epoch shape");
+        assert!(matches!(
+            coordinator_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectCoordinatorClosureEpochMismatch {
+                    accepted: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let mut future_generation = serde_json::to_value(&snapshot).expect("snapshot value");
+        future_generation["after_effect_reconciliation"]["recovery_generation"] = json!(2);
+        let future_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(future_generation)
+                .expect("future after-effect generation shape");
+        assert!(matches!(
+            future_generation.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectGenerationFuture {
+                    accepted: 2,
+                    current: 1,
+                }
+            )
+        ));
+
+        let mut future_dispatch_generation =
+            serde_json::to_value(&snapshot).expect("snapshot value");
+        future_dispatch_generation["after_effect_reconciliation"]["recovery_inventory"]["dispatch_outcome"]
+            ["recovery_generation"] = json!(2);
+        let future_dispatch_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(future_dispatch_generation)
+                .expect("future dispatch generation shape");
+        assert!(matches!(
+            future_dispatch_generation.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectDispatchGenerationFuture {
+                    accepted: 1,
+                    actual: 2,
+                }
+            )
+        ));
+
+        let mut wrong_lineage = serde_json::to_value(&snapshot).expect("snapshot value");
+        wrong_lineage["after_effect_reconciliation"]["recovery_inventory"]["frozen_inventory"]["operation_id"] =
+            json!(Uuid::from_u128(18108).to_string());
+        let wrong_lineage: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_lineage).expect("wrong lineage shape");
+        assert!(matches!(
+            wrong_lineage.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AfterEffectValidation {
+                    source: WorkProgressError::CancellationEffectInventory(_),
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_after_effect_refinement_from_prepublish_dispatch() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(18109).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let mut prepublish = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        prepublish.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("uncertain prepublish dispatch");
+        progress
+            .finish_pre_publish_cancellation(prepublish)
+            .expect("retain uncertain prepublish dispatch");
+
+        let dispatch = all_never_dispatch_record(&progress);
+        let (recovery, source, coordinator) = empty_after_effect_inputs(&progress, dispatch);
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery,
+                source,
+                coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("refine prepublish dispatch into after-effect state");
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("refined after-effect snapshot");
+        assert_eq!(
+            snapshot
+                .after_effect_reconciliation()
+                .expect("after-effect state")
+                .recovery_generation(),
+            2
+        );
+        snapshot
+            .validate_base()
+            .expect("prepublish dispatch refinement validates");
     }
 
     #[test]

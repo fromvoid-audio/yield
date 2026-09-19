@@ -3,8 +3,9 @@
 //! This module captures the exact mutable progress observations together with the immutable
 //! intent retained by the caller.  The base validator checks topology, step shape, historical
 //! completion evidence, direct prerequisite consistency, and the bounded internal shape of retry,
-//! audit, and cancellation envelopes.  It intentionally does not validate advanced cancellation,
-//! recovery, claim-settlement, cleanup, or terminal semantics; a snapshot is not a durable schema,
+//! audit, cancellation envelopes, and retained after-effect reconciliation observations.  It
+//! intentionally does not validate advanced cancellation, recovery, claim-settlement, cleanup,
+//! or terminal semantics; a snapshot is not a durable schema,
 //! a restart record, or a progress authority. The production owner must retain this immutable intent
 //! from admission because capture cannot recover historical artifact provenance from the plan-only live progress
 //! value.
@@ -19,10 +20,11 @@ use super::super::participants::ParticipantValidationError;
 use super::super::work_plan::{WorkUnitApplicability, WorkUnitKey, WorkUnitRole};
 use super::{
     ActiveAudit, AdmissionClaimSettlementInventory, AfterEffectReconciliationObservation,
-    AuditTargetValidationError, CancellationCleanupObservation, CancellationInventory,
-    CancellationInventoryError, CancellationRequestObservation, CancellationRequestValidationError,
-    CancellationRoute, FullProgressDisposition, OperationPhase, ParticipantRequirement,
-    ParticipantScope, PrePublishCancellationObservation, ProgressStepStatus, RetryObservation,
+    AuditTargetValidationError, CancellationCleanupObservation,
+    CancellationDispatchOutcomeRecordError, CancellationInventory, CancellationInventoryError,
+    CancellationRequestObservation, CancellationRequestValidationError, CancellationRoute,
+    FullProgressDisposition, OperationPhase, ParticipantRequirement, ParticipantScope,
+    PrePublishCancellationObservation, ProgressStepStatus, RetryObservation,
     RetryObservationValidationError, WorkProgress, WorkProgressError, WorkProgressStep,
     historical_scope_matches_current, same_stable_source_identity,
 };
@@ -159,6 +161,121 @@ impl FullProgressSnapshotObservation {
         self.validate_cancellation_envelope()?;
         let validation_progress = self.validation_progress();
         self.validate_steps(&validation_progress)?;
+        self.validate_after_effect_reconciliation(&validation_progress)?;
+        Ok(())
+    }
+
+    fn validate_after_effect_reconciliation(
+        &self,
+        progress: &WorkProgress,
+    ) -> Result<(), FullProgressSnapshotObservationError> {
+        let Some(accepted) = self.after_effect_reconciliation.as_ref() else {
+            return Ok(());
+        };
+        if accepted.execution_epoch() > self.execution_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::AfterEffectExecutionEpochFuture {
+                    accepted: accepted.execution_epoch(),
+                    current: self.execution_epoch,
+                },
+            );
+        }
+
+        let recovery = accepted.recovery_inventory();
+        let dispatch = recovery.dispatch_outcome();
+        let source = accepted.source_closure_observation();
+        let coordinator = accepted.coordinator_closure_observation();
+        let accepted_epoch = accepted.execution_epoch();
+        if dispatch.observation_epoch() != accepted_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::AfterEffectDispatchEpochMismatch {
+                    accepted: accepted_epoch,
+                    actual: dispatch.observation_epoch(),
+                },
+            );
+        }
+        if source.observation_epoch() != accepted_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::AfterEffectSourceClosureEpochMismatch {
+                    accepted: accepted_epoch,
+                    actual: source.observation_epoch(),
+                },
+            );
+        }
+        if coordinator.observation_epoch() != accepted_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::AfterEffectCoordinatorClosureEpochMismatch {
+                    accepted: accepted_epoch,
+                    actual: coordinator.observation_epoch(),
+                },
+            );
+        }
+        if accepted.recovery_generation() == 0 {
+            return Err(FullProgressSnapshotObservationError::AfterEffectGenerationZero);
+        }
+        if accepted.recovery_generation() > self.recovery_generation {
+            return Err(
+                FullProgressSnapshotObservationError::AfterEffectGenerationFuture {
+                    accepted: accepted.recovery_generation(),
+                    current: self.recovery_generation,
+                },
+            );
+        }
+        if dispatch.recovery_generation() == 0 {
+            return Err(FullProgressSnapshotObservationError::AfterEffectDispatchGenerationZero);
+        }
+        if dispatch.recovery_generation() > accepted.recovery_generation() {
+            return Err(
+                FullProgressSnapshotObservationError::AfterEffectDispatchGenerationFuture {
+                    accepted: accepted.recovery_generation(),
+                    actual: dispatch.recovery_generation(),
+                },
+            );
+        }
+
+        progress
+            .validate_cancellation_effect_recovery_inventory(recovery, dispatch)
+            .map_err(
+                |source| FullProgressSnapshotObservationError::AfterEffectValidation { source },
+            )?;
+        progress
+            .validate_cancellation_source_closure_observation_record(source, recovery, dispatch)
+            .map_err(
+                |source| FullProgressSnapshotObservationError::AfterEffectValidation { source },
+            )?;
+        progress
+            .validate_cancellation_coordinator_closure_observation_record(
+                coordinator,
+                source,
+                recovery,
+                dispatch,
+            )
+            .map_err(
+                |source| FullProgressSnapshotObservationError::AfterEffectValidation { source },
+            )?;
+        super::validate_after_effect_phase_gates(dispatch, source, coordinator).map_err(
+            |source| FullProgressSnapshotObservationError::AfterEffectValidation { source },
+        )?;
+
+        if let Some(previous_dispatch) = self
+            .pre_publish_cancellation
+            .as_ref()
+            .and_then(PrePublishCancellationObservation::dispatch_outcome)
+        {
+            dispatch
+                .validate_transition(previous_dispatch, self.execution_epoch)
+                .map_err(|source| {
+                    FullProgressSnapshotObservationError::AfterEffectDispatchTransition { source }
+                })?;
+            if accepted.recovery_generation() <= previous_dispatch.recovery_generation() {
+                return Err(
+                    FullProgressSnapshotObservationError::AfterEffectGenerationNotAfterPrePublish {
+                        accepted: accepted.recovery_generation(),
+                        previous: previous_dispatch.recovery_generation(),
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -918,6 +1035,59 @@ pub enum FullProgressSnapshotObservationError {
     /// A cancellation-derived observation was retained without its envelope.
     #[error("full-progress snapshot cancellation observation {field} has no cancellation envelope")]
     CancellationObservationOrphaned { field: &'static str },
+    /// The accepted after-effect observation belongs to a future snapshot epoch.
+    #[error(
+        "full-progress snapshot after-effect execution epoch {accepted} is newer than current epoch {current}"
+    )]
+    AfterEffectExecutionEpochFuture { accepted: u64, current: u64 },
+    /// The retained dispatch record was captured at another accepted after-effect epoch.
+    #[error(
+        "full-progress snapshot after-effect dispatch epoch {actual} does not match accepted epoch {accepted}"
+    )]
+    AfterEffectDispatchEpochMismatch { accepted: u64, actual: u64 },
+    /// The retained source-closure record was captured at another accepted after-effect epoch.
+    #[error(
+        "full-progress snapshot after-effect source-closure epoch {actual} does not match accepted epoch {accepted}"
+    )]
+    AfterEffectSourceClosureEpochMismatch { accepted: u64, actual: u64 },
+    /// The retained coordinator-closure record was captured at another accepted after-effect epoch.
+    #[error(
+        "full-progress snapshot after-effect coordinator-closure epoch {actual} does not match accepted epoch {accepted}"
+    )]
+    AfterEffectCoordinatorClosureEpochMismatch { accepted: u64, actual: u64 },
+    /// The accepted after-effect generation was zero.
+    #[error("full-progress snapshot after-effect recovery generation must be positive")]
+    AfterEffectGenerationZero,
+    /// The accepted after-effect generation is newer than the snapshot's global generation.
+    #[error(
+        "full-progress snapshot after-effect generation {accepted} is newer than current recovery generation {current}"
+    )]
+    AfterEffectGenerationFuture { accepted: u64, current: u64 },
+    /// The retained dispatch record had no positive recovery generation.
+    #[error("full-progress snapshot after-effect dispatch recovery generation must be positive")]
+    AfterEffectDispatchGenerationZero,
+    /// The retained dispatch generation is newer than the accepted after-effect generation.
+    #[error(
+        "full-progress snapshot after-effect dispatch generation {actual} is newer than accepted generation {accepted}"
+    )]
+    AfterEffectDispatchGenerationFuture { accepted: u64, actual: u64 },
+    /// A delegated retained after-effect validator rejected the nested observations.
+    #[error("invalid full-progress snapshot after-effect reconciliation: {source}")]
+    AfterEffectValidation {
+        #[source]
+        source: WorkProgressError,
+    },
+    /// The retained after-effect dispatch did not monotonically refine prepublication dispatch.
+    #[error("invalid full-progress snapshot after-effect dispatch transition: {source}")]
+    AfterEffectDispatchTransition {
+        #[source]
+        source: CancellationDispatchOutcomeRecordError,
+    },
+    /// The accepted after-effect generation did not follow retained prepublication dispatch.
+    #[error(
+        "full-progress snapshot after-effect generation {accepted} is not newer than prepublication dispatch generation {previous}"
+    )]
+    AfterEffectGenerationNotAfterPrePublish { accepted: u64, previous: u64 },
     /// A progress row key differs from the frozen plan.
     #[error("full-progress snapshot step {index} key {actual:?} does not match {expected:?}")]
     StepKeyMismatch {
