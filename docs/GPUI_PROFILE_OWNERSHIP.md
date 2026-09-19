@@ -1532,3 +1532,19 @@ checks passed. These are untrusted observations only: they do not prove a
 durable wake, authorize artifact deferral, replace normal Readiness completion,
 or integrate the database or scheduler. Windows CI was not dispatched because
 the existing account billing restriction remains unresolved.
+
+Full-progress intent observations now retain the exact supplied operation ID,
+typed command arguments, initial participant descriptors and checkpoints, V1
+work plan, full-capacity observations, and admission-claim observations in one
+serde-bounded value. Validation rejects nil identities, noninitial participant
+checkpoints, command/participant mismatches, plans that do not exactly rederive
+from the frozen command and participants, invalid capacity arithmetic or shape,
+and claims that do not exactly cover the capacity plan. The value remains an
+untrusted topology observation: it does not reserve capacity, create journal
+rows, issue permits, or replace a future full-progress snapshot codec/store.
+
+Three focused intent-observation tests passed, together with no-default-feature
+library and GPUI checks, formatting, and diff checks. Full-progress persistence,
+codec/store integration, durable admission, readiness completion/deferral, and
+the remaining OPT-1337 owner work remain open; Windows CI was not dispatched
+because the existing account billing restriction remains unresolved.

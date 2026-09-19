@@ -16,6 +16,7 @@ pub mod coordinator;
 pub mod evidence;
 pub mod external_commands;
 pub mod full_capacity;
+pub mod full_progress_record;
 pub mod full_status;
 pub mod history_commands;
 pub mod model;
@@ -176,6 +177,8 @@ pub use full_capacity::{
     FULL_CAPACITY_PLAN_VERSION, FullCapacityAllocation, FullCapacityAllocationClass,
     FullCapacityPlan, FullCapacityValidationError, MAX_FULL_CAPACITY_ALLOCATIONS,
 };
+
+pub use full_progress_record::{FullProgressIntentObservation, FullProgressIntentObservationError};
 
 pub use full_status::FullProgressDisposition;
 
