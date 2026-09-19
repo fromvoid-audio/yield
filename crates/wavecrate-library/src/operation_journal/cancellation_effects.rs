@@ -12,6 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::admission_claims::AdmissionClaimInventory;
+use super::cancellation_dispatch::{
+    CancellationDispatchManifestError, CancellationDispatchOutcome,
+    CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
+    derive_cancellation_dispatch_manifest,
+};
 use super::cancellation_recovery::{
     CancellationInventory, CancellationInventoryError, MAX_CANCELLATION_ACTIONS,
 };
@@ -282,6 +287,21 @@ pub struct CancellationEffectInventory {
     bundles: Vec<CancellationEffectBundle>,
 }
 
+/// Bounded after-effect recovery observations derived from one frozen cancellation snapshot and
+/// one validated cancellation-wide dispatch outcome record.
+///
+/// The frozen inventory and dispatch record are retained in full even when a refined derivation
+/// has no bundle.  Only exact `ObservedAfterCancellation` rows overlay a temporary `Completed`
+/// status while deriving bundles; `NeverEntered` and `EntryUncertain` remain pending observations.
+/// This value is observational only and does not grant recovery, filesystem, source, cleanup, or
+/// terminal authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationEffectRecoveryInventory {
+    frozen_inventory: CancellationInventory,
+    dispatch_outcome: CancellationDispatchOutcomeRecord,
+    bundles: Vec<CancellationEffectBundle>,
+}
+
 /// Failure while validating local effect-inventory shape.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CancellationEffectInventoryValidationError {
@@ -391,6 +411,18 @@ pub enum CancellationEffectInventoryError {
     /// Candidate rows did not exactly match the derived V1 effect inventory.
     #[error("cancellation effect inventory candidate does not match the frozen derivation")]
     CandidateMismatch,
+    /// The candidate carried an invalid dispatch manifest binding.
+    #[error("invalid cancellation effect recovery dispatch manifest: {0}")]
+    DispatchManifest(#[source] CancellationDispatchManifestError),
+    /// The candidate carried an invalid dispatch outcome binding.
+    #[error("invalid cancellation effect recovery dispatch outcome: {0}")]
+    DispatchOutcome(#[source] CancellationDispatchOutcomeRecordError),
+    /// The candidate did not retain the exact frozen cancellation inventory.
+    #[error("cancellation effect recovery frozen inventory does not match")]
+    FrozenInventoryMismatch,
+    /// The candidate did not retain the exact dispatch outcome record.
+    #[error("cancellation effect recovery dispatch outcome does not match")]
+    DispatchOutcomeMismatch,
 }
 
 impl From<CancellationInventoryError> for CancellationEffectInventoryError {
@@ -427,38 +459,7 @@ impl CancellationEffectInventory {
 
     /// Validate bounded ordering and row totals without consulting owner authority.
     pub fn validate(&self) -> Result<(), CancellationEffectInventoryValidationError> {
-        if self.bundles.len() > MAX_CANCELLATION_EFFECT_BUNDLES {
-            return Err(CancellationEffectInventoryValidationError::TooManyBundles {
-                actual: self.bundles.len(),
-                maximum: MAX_CANCELLATION_EFFECT_BUNDLES,
-            });
-        }
-        let mut row_count = 0usize;
-        for (index, bundle) in self.bundles.iter().enumerate() {
-            bundle.validate()?;
-            row_count = row_count
-                .saturating_add(bundle.facts.len())
-                .saturating_add(bundle.source_closure.len());
-            if row_count > MAX_CANCELLATION_EFFECT_ROWS {
-                return Err(CancellationEffectInventoryValidationError::TooManyRows {
-                    actual: row_count,
-                    maximum: MAX_CANCELLATION_EFFECT_ROWS,
-                });
-            }
-            if index > 0 {
-                let previous = &self.bundles[index - 1];
-                if (previous.action_ordinal, previous.step_segment)
-                    >= (bundle.action_ordinal, bundle.step_segment)
-                {
-                    return Err(
-                        CancellationEffectInventoryValidationError::BundlesNotSortedOrUnique {
-                            index,
-                        },
-                    );
-                }
-            }
-        }
-        Ok(())
+        validate_bundles(&self.bundles)
     }
 
     /// Validate a candidate against the exact frozen plan, inventory, claims, and current steps.
@@ -528,6 +529,118 @@ impl CancellationEffectInventory {
     }
 }
 
+impl CancellationEffectRecoveryInventory {
+    /// Construct one bounded observational recovery inventory after validating its bundle rows.
+    pub(crate) fn new(
+        frozen_inventory: CancellationInventory,
+        dispatch_outcome: CancellationDispatchOutcomeRecord,
+        bundles: Vec<CancellationEffectBundle>,
+    ) -> Result<Self, CancellationEffectInventoryValidationError> {
+        validate_bundles(&bundles)?;
+        Ok(Self {
+            frozen_inventory,
+            dispatch_outcome,
+            bundles,
+        })
+    }
+
+    /// Validate exact retained source values and canonical refined bundles against current
+    /// progress.  This remains an observational candidate check and grants no authority.
+    pub fn validate_against(
+        &self,
+        operation_id: OperationId,
+        plan: &WorkPlan,
+        expected_inventory: &CancellationInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+        current_steps: &[WorkProgressStep],
+        admission_claims: &AdmissionClaimInventory,
+        execution_epoch: u64,
+    ) -> Result<(), CancellationEffectInventoryError> {
+        validate_bundles(&self.bundles).map_err(CancellationEffectInventoryError::Shape)?;
+        expected_inventory.validate_against(
+            operation_id,
+            plan,
+            current_steps,
+            execution_epoch,
+            admission_claims,
+        )?;
+        if &self.frozen_inventory != expected_inventory {
+            return Err(CancellationEffectInventoryError::FrozenInventoryMismatch);
+        }
+        let manifest = derive_cancellation_dispatch_manifest(
+            operation_id,
+            plan,
+            expected_inventory,
+            current_steps,
+            admission_claims,
+            execution_epoch,
+        )
+        .map_err(CancellationEffectInventoryError::DispatchManifest)?;
+        expected_dispatch_outcome
+            .validate_against(&manifest, execution_epoch)
+            .map_err(CancellationEffectInventoryError::DispatchOutcome)?;
+        if &self.dispatch_outcome != expected_dispatch_outcome {
+            return Err(CancellationEffectInventoryError::DispatchOutcomeMismatch);
+        }
+        let expected_bundles =
+            derive_recovery_bundles(plan, expected_inventory, expected_dispatch_outcome)?;
+        if self.bundles != expected_bundles {
+            return Err(CancellationEffectInventoryError::CandidateMismatch);
+        }
+        Ok(())
+    }
+
+    /// Borrow the exact frozen cancellation snapshot retained with this observation.
+    pub fn frozen_inventory(&self) -> &CancellationInventory {
+        &self.frozen_inventory
+    }
+
+    /// Borrow the exact dispatch outcome record retained with this observation.
+    pub fn dispatch_outcome(&self) -> &CancellationDispatchOutcomeRecord {
+        &self.dispatch_outcome
+    }
+
+    /// Borrow canonical refined effect bundles in action and V1 segment order.
+    pub fn bundles(&self) -> &[CancellationEffectBundle] {
+        &self.bundles
+    }
+}
+
+fn validate_bundles(
+    bundles: &[CancellationEffectBundle],
+) -> Result<(), CancellationEffectInventoryValidationError> {
+    if bundles.len() > MAX_CANCELLATION_EFFECT_BUNDLES {
+        return Err(CancellationEffectInventoryValidationError::TooManyBundles {
+            actual: bundles.len(),
+            maximum: MAX_CANCELLATION_EFFECT_BUNDLES,
+        });
+    }
+    let mut row_count = 0usize;
+    for (index, bundle) in bundles.iter().enumerate() {
+        bundle.validate()?;
+        row_count = row_count
+            .saturating_add(bundle.facts.len())
+            .saturating_add(bundle.source_closure.len());
+        if row_count > MAX_CANCELLATION_EFFECT_ROWS {
+            return Err(CancellationEffectInventoryValidationError::TooManyRows {
+                actual: row_count,
+                maximum: MAX_CANCELLATION_EFFECT_ROWS,
+            });
+        }
+        if index > 0 {
+            let previous = &bundles[index - 1];
+            if (previous.action_ordinal, previous.step_segment)
+                >= (bundle.action_ordinal, bundle.step_segment)
+            {
+                return Err(
+                    CancellationEffectInventoryValidationError::BundlesNotSortedOrUnique { index },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Derive an exact effect inventory after validating the frozen cancellation source.
 pub(crate) fn derive_cancellation_effect_inventory(
     operation_id: OperationId,
@@ -550,7 +663,77 @@ pub(crate) fn derive_cancellation_effect_inventory(
         });
     }
 
-    let groups = grouped_units(plan, inventory);
+    let bundles = derive_bundles(plan, inventory, &BTreeSet::new())?;
+    CancellationEffectInventory::new(
+        operation_id,
+        plan.plan_version(),
+        inventory.generation(),
+        inventory.execution_epoch(),
+        bundles,
+    )
+    .map_err(CancellationEffectInventoryError::Shape)
+}
+
+/// Derive an after-effect recovery inventory by overlaying only observed late completions on the
+/// frozen local statuses.  The frozen inventory and outcome record are cloned unchanged.
+pub(crate) fn derive_cancellation_effect_recovery_inventory(
+    operation_id: OperationId,
+    plan: &WorkPlan,
+    inventory: &CancellationInventory,
+    dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    current_steps: &[WorkProgressStep],
+    admission_claims: &AdmissionClaimInventory,
+    execution_epoch: u64,
+) -> Result<CancellationEffectRecoveryInventory, CancellationEffectInventoryError> {
+    inventory.validate_against(
+        operation_id,
+        plan,
+        current_steps,
+        execution_epoch,
+        admission_claims,
+    )?;
+    let manifest = derive_cancellation_dispatch_manifest(
+        operation_id,
+        plan,
+        inventory,
+        current_steps,
+        admission_claims,
+        execution_epoch,
+    )
+    .map_err(CancellationEffectInventoryError::DispatchManifest)?;
+    dispatch_outcome
+        .validate_against(&manifest, execution_epoch)
+        .map_err(CancellationEffectInventoryError::DispatchOutcome)?;
+    let bundles = derive_recovery_bundles(plan, inventory, dispatch_outcome)?;
+    CancellationEffectRecoveryInventory::new(inventory.clone(), dispatch_outcome.clone(), bundles)
+        .map_err(CancellationEffectInventoryError::Shape)
+}
+
+fn derive_recovery_bundles(
+    plan: &WorkPlan,
+    inventory: &CancellationInventory,
+    dispatch_outcome: &CancellationDispatchOutcomeRecord,
+) -> Result<Vec<CancellationEffectBundle>, CancellationEffectInventoryError> {
+    let late_completed = dispatch_outcome
+        .rows()
+        .iter()
+        .filter_map(|row| {
+            matches!(
+                row.outcome(),
+                CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+            )
+            .then_some(row.key())
+        })
+        .collect::<BTreeSet<_>>();
+    derive_bundles(plan, inventory, &late_completed)
+}
+
+fn derive_bundles(
+    plan: &WorkPlan,
+    inventory: &CancellationInventory,
+    late_completed: &BTreeSet<WorkUnitKey>,
+) -> Result<Vec<CancellationEffectBundle>, CancellationEffectInventoryError> {
+    let groups = grouped_units(plan, inventory, late_completed);
     let mut bundles = Vec::new();
     for ((action_ordinal, step_segment), units) in groups {
         if action_ordinal == GLOBAL_ACTION_ORDINAL {
@@ -569,14 +752,7 @@ pub(crate) fn derive_cancellation_effect_inventory(
     bundles.sort_by_key(|bundle: &CancellationEffectBundle| {
         (bundle.action_ordinal, bundle.step_segment)
     });
-    CancellationEffectInventory::new(
-        operation_id,
-        plan.plan_version(),
-        inventory.generation(),
-        inventory.execution_epoch(),
-        bundles,
-    )
-    .map_err(CancellationEffectInventoryError::Shape)
+    Ok(bundles)
 }
 
 #[derive(Clone, Copy)]
@@ -590,6 +766,7 @@ struct LocalUnit {
 fn grouped_units(
     plan: &WorkPlan,
     inventory: &CancellationInventory,
+    late_completed: &BTreeSet<WorkUnitKey>,
 ) -> BTreeMap<(u8, u16), Vec<LocalUnit>> {
     let mut groups = BTreeMap::new();
     for (unit, snapshot) in plan.units().iter().zip(inventory.steps()) {
@@ -604,7 +781,11 @@ fn grouped_units(
                 key,
                 requirement: unit.requirement(),
                 applicability: unit.applicability(),
-                status: snapshot.status(),
+                status: if late_completed.contains(&key) {
+                    ProgressStepStatus::Completed
+                } else {
+                    snapshot.status()
+                },
             });
     }
     groups

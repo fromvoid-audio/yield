@@ -1439,3 +1439,27 @@ and the no-default GPUI check, formatting, and diff checks passed. Live barrier
 ownership, after-effect recovery, readiness, persistence/admission integration,
 legacy coverage/session recovery, and filesystem execution remain open; the
 filesystem owner work is outside OPT-1337 under dependent OPT-1339.
+
+After-effect recovery now has a read-only inventory that retains the complete
+frozen cancellation snapshot and exact dispatch outcome record while deriving
+canonical bundles from a temporary overlay of only `ObservedAfterCancellation`
+keys. `NeverEntered` and `EntryUncertain` remain pending and are retained as
+obligations; preparation-only observations produce no bundle, later blocked
+trim work is not inferred, and each history segment remains distinct. Candidate
+validation accepts an explicitly supplied expected dispatch record and requires
+exact frozen facts, record rows, bundles, facts, and source closures. Retained
+late source and source-scoped coordinator observations also extend the accepted
+historical source revision floors: exact-fence checks require the same accepted
+fence, while reacquisition checks require stable source and observation identity.
+Unaccepted candidate records do not affect those floors.
+
+Eight recovery-inventory tests, sixty-one focused progress tests, forty-nine
+cancellation tests, and four cancellation-effect tests passed. The no-default
+operation-journal suite passed 337 tests with one ignored; library and GPUI
+no-default checks, formatting, and diff checks passed. This remains an
+in-memory observational milestone: no recovery executor, live barrier issuer,
+cleanup/settlement/terminal integration, durable full-progress persistence or
+codec, or filesystem mutation was added. Native Windows UI/audio acceptance,
+owner integration, and the remaining cancellation reconciliation work remain
+open under OPT-1337. Filesystem mutation implementation is outside OPT-1337 as
+dependent owner work under OPT-1339.

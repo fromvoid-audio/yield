@@ -29,7 +29,9 @@ use super::cancellation_dispatch::{
 };
 use super::cancellation_effects::{
     CancellationEffectInventory, CancellationEffectInventoryError,
+    CancellationEffectRecoveryInventory,
     derive_cancellation_effect_inventory as derive_effect_inventory,
+    derive_cancellation_effect_recovery_inventory as derive_effect_recovery_inventory,
 };
 use super::cancellation_recovery::{
     CancellationActionState, CancellationInventory, CancellationInventoryError, CancellationRoute,
@@ -1465,6 +1467,72 @@ impl WorkProgress {
         )
     }
 
+    /// Derive bounded after-effect observations from the exact frozen cancellation inventory and
+    /// one validated cancellation-wide dispatch outcome record.
+    ///
+    /// Only `ObservedAfterCancellation` rows overlay temporary completed statuses for local
+    /// recipe derivation.  The returned value retains the full frozen inventory and outcome
+    /// record; it grants no recovery, filesystem, source, cleanup, settlement, or terminal
+    /// authority.
+    pub fn cancellation_effect_recovery_inventory(
+        &self,
+        record: &CancellationDispatchOutcomeRecord,
+    ) -> Result<CancellationEffectRecoveryInventory, WorkProgressError> {
+        self.validate_completion_history()?;
+        self.validate_cancellation_dispatch_record(record)?;
+        let inventory = self
+            .cancellation_inventory
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationInventoryMissing)?;
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationAdmissionClaimsMissing)?;
+        derive_effect_recovery_inventory(
+            self.operation_id,
+            &self.plan,
+            inventory,
+            record,
+            &self.steps,
+            admission_claims,
+            self.execution_epoch,
+        )
+        .map_err(WorkProgressError::CancellationEffectInventory)
+    }
+
+    /// Validate one candidate against an explicitly supplied expected dispatch outcome and the
+    /// exact retained frozen inventory, then recompute its canonical refined bundles.  This is an
+    /// observational check only; callers choose whether the expected record is a new candidate
+    /// observation or an already accepted in-memory record.
+    pub fn validate_cancellation_effect_recovery_inventory(
+        &self,
+        candidate: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        self.validate_completion_history()?;
+        let inventory = self
+            .cancellation_inventory
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationInventoryMissing)?;
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::CancellationAdmissionClaimsMissing)?;
+        self.validate_cancellation_dispatch_record(candidate.dispatch_outcome())?;
+        self.validate_cancellation_dispatch_record(expected_dispatch_outcome)?;
+        candidate
+            .validate_against(
+                self.operation_id,
+                &self.plan,
+                inventory,
+                expected_dispatch_outcome,
+                &self.steps,
+                admission_claims,
+                self.execution_epoch,
+            )
+            .map_err(WorkProgressError::CancellationEffectInventory)
+    }
+
     /// Derive the exact cancellation-wide pending dispatch manifest from the frozen source.
     ///
     /// The manifest covers every applicable pending non-source-read unit in the frozen plan,
@@ -2768,7 +2836,8 @@ impl WorkProgress {
     }
 
     fn minimum_source_revision_for_fence(&self, fence: &StoredSourceFence) -> Option<u64> {
-        self.steps
+        let mut minimum = self
+            .steps
             .iter()
             .filter(|step| {
                 step.completion_context
@@ -2782,7 +2851,30 @@ impl WorkProgress {
                     .and_then(source_observation_for_evidence)
                     .map(SourceRevisionObservation::revision)
             })
-            .max()
+            .max();
+        if let Some(record) = self
+            .pre_publish_cancellation
+            .as_ref()
+            .and_then(PrePublishCancellationObservation::dispatch_outcome)
+        {
+            for row in record.rows() {
+                let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                if context
+                    .scope()
+                    .source_fence()
+                    .is_some_and(|candidate| candidate == fence)
+                {
+                    if let Some(observation) = source_observation_for_evidence(evidence) {
+                        minimum = Some(minimum.unwrap_or(0).max(observation.revision()));
+                    }
+                }
+            }
+        }
+        minimum
     }
 
     fn minimum_source_revision_for_stable_source(&self, fence: &StoredSourceFence) -> u64 {
@@ -2811,6 +2903,30 @@ impl WorkProgress {
             if let Some(observation) = observation {
                 if same_stable_source_identity_observation(observation, fence) {
                     minimum = minimum.max(observation.revision());
+                }
+            }
+        }
+        if let Some(record) = self
+            .pre_publish_cancellation
+            .as_ref()
+            .and_then(PrePublishCancellationObservation::dispatch_outcome)
+        {
+            for row in record.rows() {
+                let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                let Some(context_fence) = context.scope().source_fence() else {
+                    continue;
+                };
+                if !same_stable_source_identity(context_fence, fence) {
+                    continue;
+                }
+                if let Some(observation) = source_observation_for_evidence(evidence) {
+                    if same_stable_source_identity_observation(observation, fence) {
+                        minimum = minimum.max(observation.revision());
+                    }
                 }
             }
         }
@@ -3368,6 +3484,10 @@ pub enum WorkProgressError {
     /// A cancellation dispatch outcome record failed local binding or refinement validation.
     #[error("invalid work progress cancellation dispatch outcome: {0}")]
     CancellationDispatchOutcome(#[source] CancellationDispatchOutcomeRecordError),
+    /// A cancellation after-effect recovery inventory failed exact derivation or candidate
+    /// validation.
+    #[error("invalid work progress cancellation effect recovery inventory: {0}")]
+    CancellationEffectInventory(#[source] CancellationEffectInventoryError),
     /// A prepublication cleanup observation failed its bounded local shape validation.
     #[error("invalid work progress prepublication cleanup: {0}")]
     PrePublishCleanup(#[source] PrePublishCleanupValidationError),
@@ -3946,15 +4066,16 @@ mod tests {
         CancellationDispatchManifestError, CancellationDispatchManifestValidationError,
         CancellationDispatchOutcome, CancellationDispatchOutcomeRecord,
         CancellationDispatchOutcomeRecordError, CancellationDispatchOutcomeRow,
-        CancellationEffectFactKind, CancellationEffectOutcome, CancellationEffectRecipe,
-        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
-        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
-        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
-        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
-        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
-        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
-        HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+        CancellationEffectBundle, CancellationEffectFactKind, CancellationEffectOutcome,
+        CancellationEffectRecipe, CancellationEffectRecoveryInventory, CopyCollisionPolicy,
+        CopyEndpoint, CopyIntentArgs, CopySourceExpectation, CreateFolderIntentArgs,
+        EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
+        ExternalRawObservationLimits, ExternalRawObservationMetadata,
+        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
+        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan, HistoryAction,
+        HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
         HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
         HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
         HistoryWaveformRestore, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
@@ -4752,6 +4873,50 @@ mod tests {
         .expect("fenced harvest progress")
     }
 
+    fn fenced_harvest_progress_with_admission_claims() -> WorkProgress {
+        let (base, source, _filesystem, source_id) = valid_topology(false);
+        let source_fence = base
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::SourceDatabase)
+            .and_then(ParticipantDescriptor::source_fence)
+            .expect("source fence")
+            .clone();
+        let descriptors = base
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                let fence = if descriptor.kind() == ParticipantKind::Harvest {
+                    Some(source_fence.clone())
+                } else {
+                    descriptor.source_fence().cloned()
+                };
+                ParticipantDescriptor::new(
+                    descriptor.id(),
+                    descriptor.kind(),
+                    descriptor.requirement(),
+                    fence,
+                    descriptor.artifact_key().map(str::to_owned),
+                )
+                .expect("fenced harvest descriptor")
+            })
+            .collect();
+        let participants = ParticipantSet::new(descriptors, base.checkpoints().to_vec())
+            .expect("fenced harvest participants");
+        let args = copy_args_at(source, source_id, "copy.wav");
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("fenced harvest work plan");
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(1308)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("fenced harvest progress with claims")
+    }
+
     fn key_for(progress: &WorkProgress, action: u8, role: WorkUnitRole) -> WorkUnitKey {
         progress
             .steps()
@@ -4861,13 +5026,21 @@ mod tests {
         manifest: &CancellationDispatchManifest,
         observed: Option<(WorkUnitKey, StoredStepEvidence, CompletionContext)>,
     ) -> Vec<CancellationDispatchOutcomeRow> {
+        let observed = observed.into_iter().collect::<Vec<_>>();
+        dispatch_rows_with_observed(manifest, &observed)
+    }
+
+    fn dispatch_rows_with_observed(
+        manifest: &CancellationDispatchManifest,
+        observed: &[(WorkUnitKey, StoredStepEvidence, CompletionContext)],
+    ) -> Vec<CancellationDispatchOutcomeRow> {
         manifest
             .keys()
             .iter()
             .map(|key| {
                 let outcome = observed
-                    .as_ref()
-                    .filter(|(observed_key, _, _)| observed_key == key)
+                    .iter()
+                    .find(|(observed_key, _, _)| observed_key == key)
                     .map_or(
                         CancellationDispatchOutcome::EntryUncertain,
                         |(_, evidence, context)| {
@@ -4880,6 +5053,23 @@ mod tests {
                 CancellationDispatchOutcomeRow::new(*key, outcome)
             })
             .collect()
+    }
+
+    fn recovery_dispatch_record(
+        progress: &WorkProgress,
+        recovery_generation: u64,
+        observed: &[(WorkUnitKey, StoredStepEvidence, CompletionContext)],
+    ) -> CancellationDispatchOutcomeRecord {
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("cancellation dispatch manifest");
+        CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            recovery_generation,
+            dispatch_rows_with_observed(&manifest, observed),
+        )
+        .expect("cancellation dispatch record")
     }
 
     fn completed_source_progress() -> (WorkProgress, WorkUnitKey) {
@@ -6109,6 +6299,625 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_effect_recovery_late_origin_absence_confirms_without_source_reconcile() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            namespace_file_move_args(source, source_id),
+            1307,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::DestinationSourceReconcile,
+            WorkUnitRole::OriginRemovalStart,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1307).expect("cancel"))
+            .expect("staged move cancellation");
+        let late_key = key_for(&progress, 0, WorkUnitRole::OriginAbsence);
+        let record = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                late_key,
+                evidence_for(&progress, late_key, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(late_key).expect("absence scope").clone(),
+                ),
+            )],
+        );
+
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("late origin absence recovery effects");
+        let move_effect = recovery
+            .bundles()
+            .iter()
+            .find(|bundle| bundle.recipe() == CancellationEffectRecipe::StagedMove)
+            .expect("staged move bundle");
+        assert_eq!(
+            move_effect.outcome(),
+            CancellationEffectOutcome::RemovalConfirmed
+        );
+        assert!(
+            move_effect
+                .facts()
+                .iter()
+                .any(|fact| fact.kind() == CancellationEffectFactKind::OriginAbsence)
+        );
+        assert_eq!(
+            move_effect
+                .source_closure()
+                .iter()
+                .find(|closure| closure.key().role() == WorkUnitRole::OriginSourceReconcile)
+                .expect("origin source closure")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+        assert_eq!(
+            progress
+                .step_for(key_for(&progress, 0, WorkUnitRole::OriginSourceReconcile))
+                .expect("origin source reconcile")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_overlays_late_publish_without_future_trim() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("source endpoint");
+        let destination_endpoint = CopyEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("selected.wav").expect("destination path"),
+        )
+        .expect("destination endpoint");
+        let source_spec = WaveformSourceSpec::new(2, 48_000, 16, WaveformSampleFormat::Integer)
+            .expect("source spec");
+        let extraction = SelectionExtractIntentArgs::new(
+            source_endpoint,
+            7,
+            WaveformFileRevisionObservation::new("file", "change", 256, Some(3))
+                .expect("file revision"),
+            source_spec,
+            10,
+            WaveformEditFrameRange::new(2, 8).expect("selection range"),
+            SelectionOutputRecipe::RawWav(
+                RawWavExtractionRecipe::new(16, FiniteF32Bits::new(1.0).expect("gain"), 1)
+                    .expect("raw recipe"),
+            ),
+            SourcePlaybackType::OneShot,
+            destination_endpoint,
+            CopyCollisionPolicy::NoReplace,
+        )
+        .expect("extraction");
+        let args =
+            UniversalCommandArgs::SelectionOutput(SelectionOutputCommandArgs::ExtractAndTrim(
+                ExtractAndTrimIntentArgs::new(extraction, WaveformOutputSpec::float32(2, 48_000))
+                    .expect("compound arguments"),
+            ));
+        let plan =
+            super::super::work_plan::derive_work_plan(&args, &participants).expect("compound plan");
+        let mut progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(1301)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("compound progress");
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1301).expect("cancel"))
+            .expect("compound cancellation");
+        let publish = key_for(&progress, 0, WorkUnitRole::Publish);
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress.scope_for(publish).expect("publish scope").clone(),
+        );
+        let record = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(publish, evidence_for(&progress, publish, 7), context)],
+        );
+        let frozen = progress
+            .cancellation_inventory()
+            .expect("frozen cancellation inventory")
+            .clone();
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("recovery inventory");
+
+        assert_eq!(recovery.frozen_inventory(), &frozen);
+        assert_eq!(recovery.dispatch_outcome(), &record);
+        assert_eq!(recovery.bundles().len(), 1);
+        assert_eq!(recovery.bundles()[0].action_ordinal(), 0);
+        assert_eq!(
+            recovery.bundles()[0].recipe(),
+            CancellationEffectRecipe::StagedPublish
+        );
+        assert_eq!(
+            recovery.bundles()[0].outcome(),
+            CancellationEffectOutcome::Published
+        );
+        assert!(
+            recovery
+                .bundles()
+                .iter()
+                .all(|bundle| bundle.action_ordinal() != 1)
+        );
+        assert_eq!(
+            progress
+                .step_for(key_for(&progress, 1, WorkUnitRole::Publish))
+                .expect("future trim publish")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_keeps_mixed_history_segments_distinct() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1302);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1302).expect("cancel"))
+            .expect("history cancellation");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::QualifiedRelocation);
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(late_key)
+                .expect("late relocation scope")
+                .clone(),
+        );
+        let record = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(late_key, evidence_for(&progress, late_key, 7), context)],
+        );
+        let frozen_effects = progress
+            .cancellation_effect_inventory()
+            .expect("frozen effects");
+        assert_eq!(frozen_effects.bundles().len(), 1);
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("recovery effects");
+        assert_eq!(recovery.bundles().len(), 2);
+        assert_eq!(recovery.bundles()[0], frozen_effects.bundles()[0]);
+        assert_eq!(recovery.bundles()[1].action_ordinal(), 0);
+        assert_eq!(recovery.bundles()[1].step_segment(), 1);
+        assert_eq!(
+            recovery.bundles()[1].recipe(),
+            CancellationEffectRecipe::QualifiedRelocation
+        );
+        assert_eq!(
+            recovery.bundles()[1].outcome(),
+            CancellationEffectOutcome::QualifiedRelocationCompleted
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_refines_only_matching_source_closure() {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1303,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::RecoveryMaterialRetained,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::OriginRemovalStart,
+            WorkUnitRole::OriginAbsence,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1303).expect("cancel"))
+            .expect("history extraction cancellation");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::OriginSourceReconcile);
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(late_key)
+                .expect("late source closure scope")
+                .clone(),
+        );
+        let record = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(late_key, evidence_for(&progress, late_key, 7), context)],
+        );
+        let frozen_effects = progress
+            .cancellation_effect_inventory()
+            .expect("frozen effects")
+            .clone();
+        let steps_before_reacquisition = progress.steps().to_vec();
+        let frozen_inventory = progress
+            .cancellation_inventory()
+            .expect("frozen cancellation inventory")
+            .clone();
+        let before_reacquisition = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("pre-reacquisition recovery effects");
+        let source_participant =
+            key_for_step(&progress, 0, 0, WorkUnitRole::SourceRead).participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant,
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        let after_reacquisition = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("post-reacquisition recovery effects");
+
+        assert_eq!(before_reacquisition, after_reacquisition);
+        assert_eq!(progress.steps(), steps_before_reacquisition.as_slice());
+        assert_eq!(progress.cancellation_inventory(), Some(&frozen_inventory));
+        let extracted = &after_reacquisition.bundles()[1];
+        assert_eq!(
+            extracted.outcome(),
+            CancellationEffectOutcome::RemovalConfirmed
+        );
+        assert_eq!(
+            extracted
+                .source_closure()
+                .iter()
+                .find(|closure| closure.key() == late_key)
+                .expect("matching source closure")
+                .status(),
+            ProgressStepStatus::Completed
+        );
+        assert_eq!(
+            after_reacquisition.bundles()[0].source_closure(),
+            frozen_effects.bundles()[0].source_closure()
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_retains_merge_and_publish_late_facts() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            retained_resolution_args(source, source_id, true),
+            1304,
+        );
+        for role in [WorkUnitRole::SourceRead, WorkUnitRole::Prepare] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1304).expect("cancel"))
+            .expect("retained merge cancellation");
+        let merge = key_for(&progress, 0, WorkUnitRole::RetainedMerge);
+        let publish = key_for(&progress, 0, WorkUnitRole::Publish);
+        let observations = [
+            (
+                merge,
+                evidence_for(&progress, merge, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(merge).expect("merge scope").clone(),
+                ),
+            ),
+            (
+                publish,
+                evidence_for(&progress, publish, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(publish).expect("publish scope").clone(),
+                ),
+            ),
+        ];
+        let record = recovery_dispatch_record(&progress, 1, &observations);
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("retained merge recovery effects");
+        assert_eq!(recovery.bundles().len(), 1);
+        assert_eq!(
+            recovery.bundles()[0].recipe(),
+            CancellationEffectRecipe::RetainedMerge
+        );
+        assert_eq!(
+            recovery.bundles()[0]
+                .facts()
+                .iter()
+                .map(|fact| fact.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                CancellationEffectFactKind::RetainedMerge,
+                CancellationEffectFactKind::Publish,
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_keeps_preparation_and_uncertainty_without_bundles() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1305).expect("cancel"))
+            .expect("copy cancellation");
+        let frozen_inventory = progress
+            .cancellation_inventory()
+            .expect("frozen cancellation inventory")
+            .clone();
+        let uncertain = recovery_dispatch_record(&progress, 1, &[]);
+        let uncertain_recovery = progress
+            .cancellation_effect_recovery_inventory(&uncertain)
+            .expect("uncertain recovery effects");
+        assert!(uncertain_recovery.bundles().is_empty());
+        assert_eq!(uncertain_recovery.frozen_inventory(), &frozen_inventory);
+        assert!(
+            uncertain_recovery
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .all(|row| matches!(row.outcome(), CancellationDispatchOutcome::EntryUncertain))
+        );
+
+        let prepare = key_for(&progress, 0, WorkUnitRole::Prepare);
+        let observed = recovery_dispatch_record(
+            &progress,
+            2,
+            &[(
+                prepare,
+                evidence_for(&progress, prepare, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(prepare).expect("prepare scope").clone(),
+                ),
+            )],
+        );
+        let preparation_recovery = progress
+            .cancellation_effect_recovery_inventory(&observed)
+            .expect("preparation-only recovery effects");
+        assert!(preparation_recovery.bundles().is_empty());
+        assert_eq!(
+            preparation_recovery
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .expect("preparation row")
+                .outcome(),
+            &CancellationDispatchOutcome::ObservedAfterCancellation {
+                evidence: evidence_for(&progress, prepare, 7),
+                context: CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(prepare).expect("prepare scope").clone(),
+                ),
+            }
+        );
+        assert_eq!(preparation_recovery.frozen_inventory(), &frozen_inventory);
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_candidate_validation_rejects_row_changes() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            retained_resolution_args(source, source_id, true),
+            1306,
+        );
+        for role in [WorkUnitRole::SourceRead, WorkUnitRole::Prepare] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1306).expect("cancel"))
+            .expect("retained merge cancellation");
+        let merge = key_for(&progress, 0, WorkUnitRole::RetainedMerge);
+        let publish = key_for(&progress, 0, WorkUnitRole::Publish);
+        let record = recovery_dispatch_record(
+            &progress,
+            1,
+            &[
+                (
+                    merge,
+                    evidence_for(&progress, merge, 7),
+                    CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress.scope_for(merge).expect("merge scope").clone(),
+                    ),
+                ),
+                (
+                    publish,
+                    evidence_for(&progress, publish, 7),
+                    CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress.scope_for(publish).expect("publish scope").clone(),
+                    ),
+                ),
+            ],
+        );
+        let valid = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("valid recovery effects");
+        progress
+            .validate_cancellation_effect_recovery_inventory(&valid, &record)
+            .expect("valid candidate");
+        let bundle = valid.bundles()[0].clone();
+
+        let missing = CancellationEffectRecoveryInventory::new(
+            valid.frozen_inventory().clone(),
+            valid.dispatch_outcome().clone(),
+            Vec::new(),
+        )
+        .expect("missing bundle candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_effect_recovery_inventory(&missing, &record),
+            Err(WorkProgressError::CancellationEffectInventory(
+                CancellationEffectInventoryError::CandidateMismatch
+            ))
+        );
+
+        let extra_bundle = CancellationEffectBundle::new(
+            1,
+            0,
+            bundle.recipe(),
+            bundle.outcome(),
+            bundle.facts().to_vec(),
+            bundle.source_closure().to_vec(),
+        )
+        .expect("extra bundle shape");
+        let extra = CancellationEffectRecoveryInventory::new(
+            valid.frozen_inventory().clone(),
+            valid.dispatch_outcome().clone(),
+            vec![bundle.clone(), extra_bundle],
+        )
+        .expect("extra bundle candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_effect_recovery_inventory(&extra, &record),
+            Err(WorkProgressError::CancellationEffectInventory(
+                CancellationEffectInventoryError::CandidateMismatch
+            ))
+        );
+
+        let mut altered_facts = bundle.facts().to_vec();
+        altered_facts.pop();
+        let altered_fact_bundle = CancellationEffectBundle::new(
+            bundle.action_ordinal(),
+            bundle.step_segment(),
+            bundle.recipe(),
+            bundle.outcome(),
+            altered_facts,
+            bundle.source_closure().to_vec(),
+        )
+        .expect("altered fact bundle shape");
+        let altered_fact = CancellationEffectRecoveryInventory::new(
+            valid.frozen_inventory().clone(),
+            valid.dispatch_outcome().clone(),
+            vec![altered_fact_bundle],
+        )
+        .expect("altered fact candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_effect_recovery_inventory(&altered_fact, &record),
+            Err(WorkProgressError::CancellationEffectInventory(
+                CancellationEffectInventoryError::CandidateMismatch
+            ))
+        );
+
+        let altered_closure_bundle = CancellationEffectBundle::new(
+            bundle.action_ordinal(),
+            bundle.step_segment(),
+            bundle.recipe(),
+            bundle.outcome(),
+            bundle.facts().to_vec(),
+            Vec::new(),
+        )
+        .expect("altered closure bundle shape");
+        let altered_closure = CancellationEffectRecoveryInventory::new(
+            valid.frozen_inventory().clone(),
+            valid.dispatch_outcome().clone(),
+            vec![altered_closure_bundle],
+        )
+        .expect("altered closure candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_effect_recovery_inventory(&altered_closure, &record),
+            Err(WorkProgressError::CancellationEffectInventory(
+                CancellationEffectInventoryError::CandidateMismatch
+            ))
+        );
+    }
+
+    #[test]
+    fn cancellation_effect_recovery_validation_uses_explicit_expected_record() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1309).expect("cancel"))
+            .expect("cancellation request");
+        let old_record = recovery_dispatch_record(&progress, 1, &[]);
+        let mut authority = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        authority.dispatch_outcome = old_record.clone();
+        progress
+            .finish_pre_publish_cancellation(authority)
+            .expect("retain original dispatch record");
+
+        let observed_key = key_for(&progress, 0, WorkUnitRole::Stage);
+        let new_record = recovery_dispatch_record(
+            &progress,
+            2,
+            &[(
+                observed_key,
+                evidence_for(&progress, observed_key, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(observed_key)
+                        .expect("stage scope")
+                        .clone(),
+                ),
+            )],
+        );
+        let candidate = progress
+            .cancellation_effect_recovery_inventory(&new_record)
+            .expect("new observational record");
+        progress
+            .validate_cancellation_effect_recovery_inventory(&candidate, &new_record)
+            .expect("new expected record validates");
+        assert_eq!(
+            progress.validate_cancellation_effect_recovery_inventory(&candidate, &old_record),
+            Err(WorkProgressError::CancellationEffectInventory(
+                CancellationEffectInventoryError::DispatchOutcomeMismatch
+            ))
+        );
+    }
+
+    #[test]
     fn cancellation_dispatch_manifest_includes_later_history_and_global_pending_work() {
         let (participants, source, _filesystem, source_id) = valid_topology(false);
         let mut progress =
@@ -7005,6 +7814,99 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn retained_late_dispatch_revisions_fence_source_reacquisition() {
+        let mut progress = fenced_harvest_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1308).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let source_affect = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        let harvest = key_for(&progress, u8::MAX, WorkUnitRole::Harvest);
+        assert!(manifest.keys().contains(&source_affect));
+        assert!(manifest.keys().contains(&harvest));
+        let source_affect_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(source_affect)
+                .expect("source-affect scope")
+                .clone(),
+        );
+        let harvest_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress.scope_for(harvest).expect("harvest scope").clone(),
+        );
+        let record = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows_with_observed(
+                &manifest,
+                &[
+                    (
+                        source_affect,
+                        StoredStepEvidence::SourceCommitted {
+                            before_revision: 8,
+                            after: source_observation(&progress, source_affect, 8),
+                        },
+                        source_affect_context,
+                    ),
+                    (
+                        harvest,
+                        evidence_for(&progress, harvest, 9),
+                        harvest_context,
+                    ),
+                ],
+            ),
+        )
+        .expect("late dispatch record");
+        let mut authority = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        authority.dispatch_outcome = record.clone();
+        progress
+            .finish_pre_publish_cancellation(authority)
+            .expect("retain late dispatch record");
+
+        let before_rejected_reacquisition = progress.clone();
+        assert_eq!(
+            progress.reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_affect.participant_id(),
+                8,
+                2,
+                0,
+            )),
+            Err(WorkProgressError::SourceReacquisitionRevisionRegressed {
+                observed: 8,
+                minimum: 9,
+            })
+        );
+        assert_eq!(progress, before_rejected_reacquisition);
+
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_affect.participant_id(),
+                9,
+                2,
+                0,
+            ))
+            .expect("adequate source reacquisition");
+        progress
+            .validate_cancellation_dispatch_record(&record)
+            .expect("retained late record after reacquisition");
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&record)
+            .expect("recovery inventory after reacquisition");
+        assert_eq!(recovery.dispatch_outcome(), &record);
+        assert_eq!(progress.execution_epoch(), 1);
     }
 
     #[test]

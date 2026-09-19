@@ -56,8 +56,8 @@ pub use cancellation_effects::{
     CancellationEffectBundle, CancellationEffectFact, CancellationEffectFactKind,
     CancellationEffectInventory, CancellationEffectInventoryError,
     CancellationEffectInventoryValidationError, CancellationEffectOutcome,
-    CancellationEffectRecipe, CancellationEffectSourceClosure, MAX_CANCELLATION_EFFECT_BUNDLES,
-    MAX_CANCELLATION_EFFECT_ROWS,
+    CancellationEffectRecipe, CancellationEffectRecoveryInventory, CancellationEffectSourceClosure,
+    MAX_CANCELLATION_EFFECT_BUNDLES, MAX_CANCELLATION_EFFECT_ROWS,
 };
 
 pub use coordinator::{
