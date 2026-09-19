@@ -23,7 +23,8 @@ use super::admission_claims::{
     AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
 use super::cancellation_dispatch::{
-    CancellationDispatchManifest, CancellationDispatchManifestError,
+    CancellationDispatchManifest, CancellationDispatchManifestError, CancellationDispatchOutcome,
+    CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
     derive_cancellation_dispatch_manifest as derive_dispatch_manifest,
 };
 use super::cancellation_effects::{
@@ -563,7 +564,7 @@ pub struct CompletionContext {
 }
 
 impl CompletionContext {
-    fn new(execution_epoch: u64, scope: ParticipantScope) -> Self {
+    pub(crate) fn new(execution_epoch: u64, scope: ParticipantScope) -> Self {
         Self {
             execution_epoch,
             scope,
@@ -1279,50 +1280,7 @@ impl WorkProgress {
                 step.completion_context.as_ref(),
             ) {
                 (ProgressStepStatus::Completed, Some(evidence), Some(context)) => {
-                    let current_scope = self.scope_for(step.key).ok_or(
-                        WorkProgressError::ParticipantScopeMissing {
-                            participant_id: step.key.participant_id(),
-                        },
-                    )?;
-                    if context.execution_epoch > self.execution_epoch {
-                        return Err(WorkProgressError::CompletionContextEpochFuture {
-                            key: step.key,
-                            actual: context.execution_epoch,
-                            current: self.execution_epoch,
-                        });
-                    }
-                    if !historical_scope_matches_current(
-                        self.execution_epoch,
-                        context.execution_epoch,
-                        current_scope,
-                        &context.scope,
-                    ) {
-                        return Err(WorkProgressError::CompletionContextScopeMismatch {
-                            key: step.key,
-                        });
-                    }
-                    if let Some(fence) = context.scope.source_fence() {
-                        fence.validate()?;
-                    }
-                    evidence.validate()?;
-                    if let (Some(current_fence), Some(historical_fence)) =
-                        (current_scope.source_fence(), context.scope.source_fence())
-                    {
-                        if historical_fence.lease_epoch() < current_fence.lease_epoch() {
-                            if let Some(observation) = source_observation_for_evidence(evidence) {
-                                if observation.revision() > current_fence.source_revision() {
-                                    return Err(
-                                        WorkProgressError::CompletionHistoryRevisionBeyondCurrentFence {
-                                            key: step.key,
-                                            observed: observation.revision(),
-                                            current_revision: current_fence.source_revision(),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    validate_evidence_for_role(step.key.role(), &context.scope, evidence, None)?;
+                    self.validate_historical_completion(step.key, context, evidence)?;
                 }
                 (ProgressStepStatus::Completed, None, Some(_)) => {
                     return Err(WorkProgressError::CompletionEvidenceMissing { key: step.key });
@@ -1343,6 +1301,60 @@ impl WorkProgress {
             }
         }
         Ok(())
+    }
+
+    /// Validate one retained or late completion against its accepted historical context.
+    ///
+    /// This shared observational path keeps cancellation late-completion records subject to the
+    /// same scope, evidence, fence, and historical revision rules as normal completion history.
+    fn validate_historical_completion(
+        &self,
+        key: WorkUnitKey,
+        context: &CompletionContext,
+        evidence: &StoredStepEvidence,
+    ) -> Result<(), WorkProgressError> {
+        let current_scope =
+            self.scope_for(key)
+                .ok_or(WorkProgressError::ParticipantScopeMissing {
+                    participant_id: key.participant_id(),
+                })?;
+        if context.execution_epoch > self.execution_epoch {
+            return Err(WorkProgressError::CompletionContextEpochFuture {
+                key,
+                actual: context.execution_epoch,
+                current: self.execution_epoch,
+            });
+        }
+        if !historical_scope_matches_current(
+            self.execution_epoch,
+            context.execution_epoch,
+            current_scope,
+            &context.scope,
+        ) {
+            return Err(WorkProgressError::CompletionContextScopeMismatch { key });
+        }
+        if let Some(fence) = context.scope.source_fence() {
+            fence.validate()?;
+        }
+        evidence.validate()?;
+        if let (Some(current_fence), Some(historical_fence)) =
+            (current_scope.source_fence(), context.scope.source_fence())
+        {
+            if historical_fence.lease_epoch() < current_fence.lease_epoch() {
+                if let Some(observation) = source_observation_for_evidence(evidence) {
+                    if observation.revision() > current_fence.source_revision() {
+                        return Err(
+                            WorkProgressError::CompletionHistoryRevisionBeyondCurrentFence {
+                                key,
+                                observed: observation.revision(),
+                                current_revision: current_fence.source_revision(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        validate_evidence_for_role(key.role(), &context.scope, evidence, None)
     }
 
     /// Find one exact keyed step.
@@ -1445,6 +1457,30 @@ impl WorkProgress {
             admission_claims,
             self.execution_epoch,
         )
+    }
+
+    /// Validate one immutable cancellation-wide outcome record against current frozen progress.
+    ///
+    /// This checks only observational consistency.  It does not accept or store the record,
+    /// establish a cancellation barrier, release a claim, perform cleanup, or grant authority.
+    pub fn validate_cancellation_dispatch_record(
+        &self,
+        candidate: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let manifest = self
+            .cancellation_dispatch_manifest()
+            .map_err(WorkProgressError::CancellationDispatchManifest)?;
+        candidate
+            .validate_against(&manifest, self.execution_epoch)
+            .map_err(WorkProgressError::CancellationDispatchOutcome)?;
+        for row in candidate.rows() {
+            if let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                row.outcome()
+            {
+                self.validate_historical_completion(row.key(), context, evidence)?;
+            }
+        }
+        Ok(())
     }
 
     /// Return the bounded recovery-observation generation.
@@ -3242,6 +3278,12 @@ pub enum WorkProgressError {
     /// A nested evidence observation was malformed.
     #[error("invalid work progress evidence: {0}")]
     Evidence(#[from] ProgressEvidenceError),
+    /// The current frozen dispatch manifest could not be derived for an observation check.
+    #[error("invalid work progress cancellation dispatch manifest: {0}")]
+    CancellationDispatchManifest(#[source] CancellationDispatchManifestError),
+    /// A cancellation dispatch outcome record failed local binding or refinement validation.
+    #[error("invalid work progress cancellation dispatch outcome: {0}")]
+    CancellationDispatchOutcome(#[source] CancellationDispatchOutcomeRecordError),
     /// A prepublication cleanup observation failed its bounded local shape validation.
     #[error("invalid work progress prepublication cleanup: {0}")]
     PrePublishCleanup(#[source] PrePublishCleanupValidationError),
@@ -3785,6 +3827,8 @@ mod tests {
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
         AdmissionClaimValidationError, CancellationActionState, CancellationDispatchManifest,
         CancellationDispatchManifestError, CancellationDispatchManifestValidationError,
+        CancellationDispatchOutcome, CancellationDispatchOutcomeRecord,
+        CancellationDispatchOutcomeRecordError, CancellationDispatchOutcomeRow,
         CancellationEffectFactKind, CancellationEffectOutcome, CancellationEffectRecipe,
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
@@ -4659,6 +4703,31 @@ mod tests {
             execution_epoch: progress.execution_epoch,
             evidence,
         }
+    }
+
+    fn dispatch_rows(
+        manifest: &CancellationDispatchManifest,
+        observed: Option<(WorkUnitKey, StoredStepEvidence, CompletionContext)>,
+    ) -> Vec<CancellationDispatchOutcomeRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let outcome = observed
+                    .as_ref()
+                    .filter(|(observed_key, _, _)| observed_key == key)
+                    .map_or(
+                        CancellationDispatchOutcome::EntryUncertain,
+                        |(_, evidence, context)| {
+                            CancellationDispatchOutcome::ObservedAfterCancellation {
+                                evidence: evidence.clone(),
+                                context: context.clone(),
+                            }
+                        },
+                    );
+                CancellationDispatchOutcomeRow::new(*key, outcome)
+            })
+            .collect()
     }
 
     fn completed_source_progress() -> (WorkProgress, WorkUnitKey) {
@@ -6153,6 +6222,437 @@ mod tests {
             )
             .expect("retained capture epoch remains valid");
         assert_eq!(frozen.capture_epoch(), 0);
+    }
+
+    #[test]
+    fn cancellation_dispatch_outcome_record_requires_exact_manifest_coverage() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(322).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let observed_key = key_for(&progress, 0, WorkUnitRole::Stage);
+        assert!(manifest.keys().contains(&observed_key));
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(observed_key)
+                .expect("stage scope")
+                .clone(),
+        );
+        let record = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    observed_key,
+                    evidence_for(&progress, observed_key, 7),
+                    context,
+                )),
+            ),
+        )
+        .expect("outcome record");
+        let captured_later = CancellationDispatchManifest::new(
+            manifest.operation_id(),
+            manifest.plan_version(),
+            manifest.frozen_inventory_generation(),
+            manifest.capture_epoch() + 1,
+            manifest.keys().to_vec(),
+        )
+        .expect("later-capture manifest shape");
+        assert_eq!(
+            CancellationDispatchOutcomeRecord::new(
+                captured_later,
+                record.observation_epoch(),
+                record.recovery_generation(),
+                dispatch_rows(&manifest, None),
+            ),
+            Err(
+                CancellationDispatchOutcomeRecordError::ObservationEpochBeforeCapture {
+                    actual: 0,
+                    capture: 1,
+                }
+            )
+        );
+        let before = progress.clone();
+        progress
+            .validate_cancellation_dispatch_record(&record)
+            .expect("exact outcome record");
+        assert_eq!(progress, before);
+
+        let mut missing_rows = record.rows().to_vec();
+        missing_rows.pop();
+        let missing = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            record.observation_epoch(),
+            record.recovery_generation() + 1,
+            missing_rows,
+        )
+        .expect("missing-row candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_dispatch_record(&missing),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::RowCountMismatch {
+                    actual: manifest.keys().len() - 1,
+                    expected: manifest.keys().len(),
+                }
+            ))
+        );
+
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let mut extra_rows = record.rows().to_vec();
+        extra_rows.push(CancellationDispatchOutcomeRow::new(
+            source_key,
+            CancellationDispatchOutcome::EntryUncertain,
+        ));
+        extra_rows.sort_by_key(CancellationDispatchOutcomeRow::key);
+        let extra = CancellationDispatchOutcomeRecord::new(
+            manifest,
+            record.observation_epoch(),
+            record.recovery_generation() + 2,
+            extra_rows,
+        )
+        .expect("extra-row candidate shape");
+        assert!(matches!(
+            progress.validate_cancellation_dispatch_record(&extra),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::RowCountMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn cancellation_dispatch_outcome_validates_late_history_and_reacquisition() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 323);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(323).expect("cancel"))
+            .expect("history cancellation");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::SourceAffect);
+        assert!(manifest.keys().contains(&late_key));
+        let historical_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress.scope_for(late_key).expect("source scope").clone(),
+        );
+        let historical_evidence = evidence_for(&progress, late_key, 7);
+        let valid = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    late_key,
+                    historical_evidence.clone(),
+                    historical_context.clone(),
+                )),
+            ),
+        )
+        .expect("historical outcome record");
+        progress
+            .validate_cancellation_dispatch_record(&valid)
+            .expect("historical late completion");
+
+        let before_steps = progress.steps().to_vec();
+        let before_inventory = progress.cancellation_inventory().cloned();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                late_key.participant_id(),
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        progress
+            .validate_cancellation_dispatch_record(&valid)
+            .expect("historical record after reacquisition");
+        assert_eq!(progress.steps(), before_steps.as_slice());
+        assert_eq!(progress.cancellation_inventory().cloned(), before_inventory);
+
+        let wrong_role = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            valid.observation_epoch(),
+            2,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    late_key,
+                    StoredStepEvidence::Coordinator {
+                        receipt: CoordinatorReceiptSummary::new(
+                            CoordinatorReceiptKind::GlobalLibrary,
+                            1,
+                            None,
+                        ),
+                    },
+                    historical_context.clone(),
+                )),
+            ),
+        )
+        .expect("wrong-role record shape");
+        assert!(matches!(
+            progress.validate_cancellation_dispatch_record(&wrong_role),
+            Err(WorkProgressError::RoleEvidenceMismatch {
+                role: WorkUnitRole::SourceAffect
+            })
+        ));
+
+        let mut malformed_observation = source_observation(&progress, late_key, 7);
+        malformed_observation.lease_epoch = 0;
+        let malformed = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            valid.observation_epoch(),
+            2,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    late_key,
+                    StoredStepEvidence::SourceObserved {
+                        observation: malformed_observation,
+                    },
+                    historical_context.clone(),
+                )),
+            ),
+        )
+        .expect_err("malformed nested evidence");
+        assert!(matches!(
+            malformed,
+            CancellationDispatchOutcomeRecordError::Evidence { key, .. } if key == late_key
+        ));
+
+        let future_context = CompletionContext::new(
+            progress.execution_epoch() + 1,
+            progress
+                .scope_for(late_key)
+                .expect("current source scope")
+                .clone(),
+        );
+        let future = CancellationDispatchOutcomeRecord::new(
+            manifest,
+            progress.execution_epoch() + 1,
+            2,
+            dispatch_rows(
+                valid.manifest(),
+                Some((late_key, historical_evidence, future_context)),
+            ),
+        )
+        .expect("future-epoch record shape");
+        assert!(matches!(
+            progress.validate_cancellation_dispatch_record(&future),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::ObservationEpochFuture {
+                    actual: 2,
+                    current: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn cancellation_dispatch_outcome_refinement_is_monotonic() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(324).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let observed_key = key_for(&progress, 0, WorkUnitRole::Stage);
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(observed_key)
+                .expect("stage scope")
+                .clone(),
+        );
+        let uncertain = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            1,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("uncertain record");
+        assert!(uncertain.validate_transition(&uncertain, 0).is_ok());
+
+        let observed = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            2,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    observed_key,
+                    evidence_for(&progress, observed_key, 7),
+                    context.clone(),
+                )),
+            ),
+        )
+        .expect("observed record");
+        observed
+            .validate_transition(&uncertain, 0)
+            .expect("uncertain refinement");
+
+        let same_generation = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            1,
+            observed.rows().to_vec(),
+        )
+        .expect("same-generation candidate");
+        assert!(matches!(
+            same_generation.validate_transition(&uncertain, 0),
+            Err(
+                CancellationDispatchOutcomeRecordError::RecoveryGenerationRegression {
+                    previous: 1,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let epoch_previous = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            1,
+            1,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("later observation epoch");
+        let epoch_regression = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            2,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("regressed observation epoch");
+        assert!(matches!(
+            epoch_regression.validate_transition(&epoch_previous, 1),
+            Err(
+                CancellationDispatchOutcomeRecordError::ObservationEpochRegression {
+                    previous: 1,
+                    actual: 0,
+                }
+            )
+        ));
+
+        let never_entered = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            2,
+            manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    CancellationDispatchOutcomeRow::new(
+                        *key,
+                        CancellationDispatchOutcome::NeverEntered,
+                    )
+                })
+                .collect(),
+        )
+        .expect("never-entered record");
+        assert!(matches!(
+            never_entered.validate_transition(&uncertain, 0),
+            Ok(())
+        ));
+        let observed_after_never = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            3,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    observed_key,
+                    evidence_for(&progress, observed_key, 7),
+                    context.clone(),
+                )),
+            ),
+        )
+        .expect("observed after never-entered candidate");
+        assert!(matches!(
+            observed_after_never.validate_transition(&never_entered, 0),
+            Err(CancellationDispatchOutcomeRecordError::NeverEnteredChanged { .. })
+        ));
+
+        let relabeled = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            3,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("relabelled record");
+        assert!(matches!(
+            relabeled.validate_transition(&observed, 0),
+            Err(CancellationDispatchOutcomeRecordError::LateObservationChanged { key })
+                if key == observed_key
+        ));
+
+        let changed_evidence = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            3,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    observed_key,
+                    StoredStepEvidence::Filesystem {
+                        receipt: FilesystemReceiptSummary::new(FilesystemReceiptKind::Stage, 2),
+                    },
+                    context.clone(),
+                )),
+            ),
+        )
+        .expect("changed-evidence record");
+        assert!(matches!(
+            changed_evidence.validate_transition(&observed, 0),
+            Err(CancellationDispatchOutcomeRecordError::LateObservationChanged { key })
+                if key == observed_key
+        ));
+
+        let changed_context = CompletionContext::new(
+            0,
+            progress
+                .scopes
+                .iter()
+                .find(|scope| scope.participant_id != observed_key.participant_id())
+                .expect("different participant scope")
+                .clone(),
+        );
+        let context_changed = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            0,
+            3,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    observed_key,
+                    evidence_for(&progress, observed_key, 7),
+                    changed_context,
+                )),
+            ),
+        )
+        .expect("changed-context record");
+        assert!(matches!(
+            context_changed.validate_transition(&observed, 0),
+            Err(CancellationDispatchOutcomeRecordError::LateObservationChanged { key })
+                if key == observed_key
+        ));
     }
 
     #[test]

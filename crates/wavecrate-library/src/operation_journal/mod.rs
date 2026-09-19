@@ -47,7 +47,9 @@ pub use cancellation_recovery::{
 
 pub use cancellation_dispatch::{
     CancellationDispatchManifest, CancellationDispatchManifestError,
-    CancellationDispatchManifestValidationError, MAX_CANCELLATION_DISPATCH_KEYS,
+    CancellationDispatchManifestValidationError, CancellationDispatchOutcome,
+    CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
+    CancellationDispatchOutcomeRow, MAX_CANCELLATION_DISPATCH_KEYS, MAX_CANCELLATION_DISPATCH_ROWS,
 };
 
 pub use cancellation_effects::{

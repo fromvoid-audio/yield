@@ -1394,3 +1394,24 @@ work-progress tests passed, together with library and GPUI checks without defaul
 features, formatting, and diff checks. No barrier issuer/refinement, cancellation
 outcome, persistence/codec, or filesystem mutation implementation was added;
 filesystem mutation remains dependent owner work outside OPT-1337.
+
+The cancellation dispatch lane now has an immutable observational outcome record
+for the exact frozen manifest. Each bounded, sorted row is typed as
+`NeverEntered`, `EntryUncertain`, or `ObservedAfterCancellation`; only the last
+variant retains typed step evidence and its accepted historical completion
+context. Record validation binds the operation, plan, inventory generation,
+capture and observation epochs, exact key coverage, nested evidence shape, and
+historical source-fence rules. Refinement accepts exact replay, requires a
+newer recovery generation for changes, prevents observation-epoch regression,
+allows uncertainty to refine, and prevents rewriting no-entry or accepted late
+completion evidence/context. A capture-floor guard rejects observations predating
+the frozen cancellation boundary.
+
+Three outcome-record tests, forty-nine focused progress tests, and forty-one
+cancellation tests passed, together with library and GPUI checks without default
+features, formatting, and diff checks. This remains an in-memory observational
+milestone: a future private current-epoch barrier authority, record acceptance
+and storage, cancellation gating, recovery reconciliation, and durable
+full-progress persistence/codec remain open. Native Windows UI/audio acceptance
+also remains separate. Filesystem mutation implementation is outside OPT-1337 as
+dependent owner work.
