@@ -162,6 +162,7 @@ impl FullProgressSnapshotObservation {
         let validation_progress = self.validation_progress();
         self.validate_steps(&validation_progress)?;
         self.validate_after_effect_reconciliation(&validation_progress)?;
+        self.validate_cancellation_cleanup_observations(&validation_progress)?;
         Ok(())
     }
 
@@ -275,6 +276,178 @@ impl FullProgressSnapshotObservation {
                     },
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn validate_cancellation_cleanup_observations(
+        &self,
+        progress: &WorkProgress,
+    ) -> Result<(), FullProgressSnapshotObservationError> {
+        let Some(cleanup) = self.cancellation_cleanup_observations.as_ref() else {
+            return Ok(());
+        };
+        let Some(after_effect) = self.after_effect_reconciliation.as_ref() else {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupAfterEffectMissing,
+            );
+        };
+
+        let resource = cleanup.resource_cleanup_observation();
+        let namespace = cleanup.namespace_cleanup_observation();
+        let cleanup_manifest = resource.manifest().cleanup_manifest();
+        let cleanup_recovery = cleanup_manifest.recovery_inventory();
+        let cleanup_dispatch = cleanup_manifest.dispatch_outcome();
+        let cleanup_epoch = cleanup.execution_epoch();
+        let cleanup_generation = cleanup.recovery_generation();
+        let linked_after_effect_generation = cleanup.after_effect_generation();
+
+        if cleanup_epoch > self.execution_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupExecutionEpochFuture {
+                    cleanup: cleanup_epoch,
+                    current: self.execution_epoch,
+                },
+            );
+        }
+        if resource.observation_epoch() != cleanup_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupResourceEpochMismatch {
+                    cleanup: cleanup_epoch,
+                    actual: resource.observation_epoch(),
+                },
+            );
+        }
+        if namespace.observation_epoch() != cleanup_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupNamespaceEpochMismatch {
+                    cleanup: cleanup_epoch,
+                    actual: namespace.observation_epoch(),
+                },
+            );
+        }
+        if cleanup_dispatch.observation_epoch() != cleanup_epoch {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupDispatchEpochMismatch {
+                    cleanup: cleanup_epoch,
+                    actual: cleanup_dispatch.observation_epoch(),
+                },
+            );
+        }
+        if linked_after_effect_generation == 0 {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupAfterEffectGenerationZero,
+            );
+        }
+        if cleanup_generation == 0 {
+            return Err(FullProgressSnapshotObservationError::CancellationCleanupGenerationZero);
+        }
+        if linked_after_effect_generation >= cleanup_generation {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupAfterEffectGenerationNotBeforeCleanup {
+                    after_effect: linked_after_effect_generation,
+                    cleanup: cleanup_generation,
+                },
+            );
+        }
+        if cleanup_generation > self.recovery_generation {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupGenerationFuture {
+                    cleanup: cleanup_generation,
+                    current: self.recovery_generation,
+                },
+            );
+        }
+        if cleanup_dispatch.recovery_generation() > linked_after_effect_generation {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupDispatchGenerationFuture {
+                    dispatch: cleanup_dispatch.recovery_generation(),
+                    after_effect: linked_after_effect_generation,
+                },
+            );
+        }
+        if linked_after_effect_generation > after_effect.recovery_generation() {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupAfterEffectGenerationFuture {
+                    cleanup: linked_after_effect_generation,
+                    current: after_effect.recovery_generation(),
+                },
+            );
+        }
+
+        progress
+            .validate_cancellation_effect_recovery_inventory(cleanup_recovery, cleanup_dispatch)
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationCleanupValidation { source }
+            })?;
+        progress
+            .validate_cancellation_cleanup_manifest(
+                cleanup_manifest,
+                cleanup_recovery,
+                cleanup_dispatch,
+            )
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationCleanupValidation { source }
+            })?;
+        progress
+            .validate_cancellation_resource_cleanup_observation_record(
+                resource,
+                cleanup_manifest,
+                cleanup_recovery,
+                cleanup_dispatch,
+            )
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationCleanupValidation { source }
+            })?;
+        if namespace.manifest().cleanup_manifest() != cleanup_manifest {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationCleanupNamespaceLineageMismatch,
+            );
+        }
+        progress
+            .validate_cancellation_namespace_cleanup_observation_record(
+                namespace,
+                cleanup_manifest,
+                cleanup_recovery,
+                cleanup_dispatch,
+            )
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationCleanupValidation { source }
+            })?;
+
+        let current_after_effect_generation = after_effect.recovery_generation();
+        if linked_after_effect_generation == current_after_effect_generation {
+            if cleanup_epoch != after_effect.execution_epoch() {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationCleanupAfterEffectEpochMismatch {
+                        cleanup: cleanup_epoch,
+                        after_effect: after_effect.execution_epoch(),
+                    },
+                );
+            }
+            if cleanup_recovery != after_effect.recovery_inventory() {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationCleanupAfterEffectInventoryMismatch,
+                );
+            }
+        } else {
+            if cleanup_generation >= current_after_effect_generation {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationCleanupGenerationNotBeforeCurrentAfterEffect {
+                        cleanup: cleanup_generation,
+                        after_effect: current_after_effect_generation,
+                    },
+                );
+            }
+            after_effect
+                .recovery_inventory()
+                .dispatch_outcome()
+                .validate_transition(cleanup_dispatch, self.execution_epoch)
+                .map_err(|source| {
+                    FullProgressSnapshotObservationError::CancellationCleanupDispatchTransition {
+                        source,
+                    }
+                })?;
         }
         Ok(())
     }
@@ -1035,6 +1208,81 @@ pub enum FullProgressSnapshotObservationError {
     /// A cancellation-derived observation was retained without its envelope.
     #[error("full-progress snapshot cancellation observation {field} has no cancellation envelope")]
     CancellationObservationOrphaned { field: &'static str },
+    /// Retained cleanup observations belong to a future snapshot epoch.
+    #[error(
+        "full-progress snapshot cleanup observation epoch {cleanup} is newer than current epoch {current}"
+    )]
+    CancellationCleanupExecutionEpochFuture { cleanup: u64, current: u64 },
+    /// The resource-cleanup record was not captured at the cleanup observation epoch.
+    #[error(
+        "full-progress snapshot resource-cleanup observation epoch {actual} does not match cleanup epoch {cleanup}"
+    )]
+    CancellationCleanupResourceEpochMismatch { cleanup: u64, actual: u64 },
+    /// The namespace-cleanup record was not captured at the cleanup observation epoch.
+    #[error(
+        "full-progress snapshot namespace-cleanup observation epoch {actual} does not match cleanup epoch {cleanup}"
+    )]
+    CancellationCleanupNamespaceEpochMismatch { cleanup: u64, actual: u64 },
+    /// The cleanup lineage dispatch record was not captured at the cleanup observation epoch.
+    #[error(
+        "full-progress snapshot cleanup dispatch epoch {actual} does not match cleanup epoch {cleanup}"
+    )]
+    CancellationCleanupDispatchEpochMismatch { cleanup: u64, actual: u64 },
+    /// The cleanup record did not link to a positive after-effect generation.
+    #[error("full-progress snapshot cleanup after-effect generation must be positive")]
+    CancellationCleanupAfterEffectGenerationZero,
+    /// The cleanup observation did not retain a positive global recovery generation.
+    #[error("full-progress snapshot cleanup recovery generation must be positive")]
+    CancellationCleanupGenerationZero,
+    /// The cleanup global generation did not follow its linked after-effect generation.
+    #[error(
+        "full-progress snapshot cleanup after-effect generation {after_effect} is not before cleanup generation {cleanup}"
+    )]
+    CancellationCleanupAfterEffectGenerationNotBeforeCleanup { after_effect: u64, cleanup: u64 },
+    /// The cleanup global generation is newer than the snapshot generation.
+    #[error(
+        "full-progress snapshot cleanup generation {cleanup} is newer than current recovery generation {current}"
+    )]
+    CancellationCleanupGenerationFuture { cleanup: u64, current: u64 },
+    /// The retained cleanup dispatch generation is newer than its linked after-effect generation.
+    #[error(
+        "full-progress snapshot cleanup dispatch generation {dispatch} is newer than linked after-effect generation {after_effect}"
+    )]
+    CancellationCleanupDispatchGenerationFuture { dispatch: u64, after_effect: u64 },
+    /// The cleanup record links to an after-effect generation newer than the retained state.
+    #[error(
+        "full-progress snapshot cleanup after-effect generation {cleanup} is newer than retained generation {current}"
+    )]
+    CancellationCleanupAfterEffectGenerationFuture { cleanup: u64, current: u64 },
+    /// A cleanup record's resource and namespace manifests retained different lineage.
+    #[error("full-progress snapshot cleanup resource and namespace lineages do not match")]
+    CancellationCleanupNamespaceLineageMismatch,
+    /// A nested cleanup validator rejected the retained historical observations.
+    #[error("invalid full-progress snapshot cancellation cleanup observation: {source}")]
+    CancellationCleanupValidation {
+        #[source]
+        source: WorkProgressError,
+    },
+    /// A retained cleanup dispatch did not monotonically refine the current after-effect dispatch.
+    #[error("invalid full-progress snapshot cleanup dispatch transition: {source}")]
+    CancellationCleanupDispatchTransition {
+        #[source]
+        source: CancellationDispatchOutcomeRecordError,
+    },
+    /// Cleanup from an older after-effect generation was retained after a newer generation without
+    /// leaving room for the cleanup generation between them.
+    #[error(
+        "full-progress snapshot cleanup generation {cleanup} is not before current after-effect generation {after_effect}"
+    )]
+    CancellationCleanupGenerationNotBeforeCurrentAfterEffect { cleanup: u64, after_effect: u64 },
+    /// Cleanup linked to the current after-effect generation was captured at another epoch.
+    #[error(
+        "full-progress snapshot cleanup epoch {cleanup} does not match linked after-effect epoch {after_effect}"
+    )]
+    CancellationCleanupAfterEffectEpochMismatch { cleanup: u64, after_effect: u64 },
+    /// Cleanup linked to the current after-effect generation retained another recovery inventory.
+    #[error("full-progress snapshot cleanup recovery inventory does not match linked after-effect")]
+    CancellationCleanupAfterEffectInventoryMismatch,
     /// The accepted after-effect observation belongs to a future snapshot epoch.
     #[error(
         "full-progress snapshot after-effect execution epoch {accepted} is newer than current epoch {current}"

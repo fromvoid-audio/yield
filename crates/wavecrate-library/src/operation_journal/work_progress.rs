@@ -19947,6 +19947,144 @@ mod tests {
         reacquired_snapshot
             .validate_base()
             .expect("historical after-effect snapshot validates");
+
+        // A later current-epoch after-effect refresh leaves the cleanup observation stale but
+        // valid. Snapshot validation uses the cleanup record's own historical lineage and
+        // requires the newer dispatch to refine that retained dispatch.
+        refresh_after_effect_headers_after_reacquisition(&mut progress);
+        let refreshed_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("refreshed after-effect snapshot");
+        refreshed_snapshot
+            .validate_base()
+            .expect("stale cleanup remains valid after after-effect refresh");
+        assert_eq!(
+            refreshed_snapshot
+                .cancellation_cleanup_observations()
+                .expect("retained cleanup")
+                .after_effect_generation(),
+            1
+        );
+        assert_eq!(
+            refreshed_snapshot
+                .after_effect_reconciliation()
+                .expect("refreshed after-effect")
+                .recovery_generation(),
+            3
+        );
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_observed_cleanup_context_after_reacquisition() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(18118).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut progress);
+        let (pending_resource, pending_namespace) =
+            accept_pending_cleanup_observations(&mut progress);
+        let resource_key = pending_resource.manifest().keys()[0];
+        let resource_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(resource_key)
+                .expect("resource scope")
+                .clone(),
+        );
+        let observed_resource = CancellationResourceCleanupObservationRecord::new(
+            pending_resource.manifest().clone(),
+            progress.execution_epoch(),
+            2,
+            pending_resource
+                .manifest()
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == resource_key {
+                        CancellationResourceCleanupOutcome::Preserved {
+                            owner_revision: 1,
+                            context: resource_context.clone(),
+                        }
+                    } else {
+                        CancellationResourceCleanupOutcome::Pending
+                    };
+                    CancellationResourceCleanupObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("observed resource cleanup");
+        progress
+            .accept_cancellation_cleanup_observations(cleanup_observation_authority(
+                &progress,
+                observed_resource,
+                pending_namespace,
+                progress.recovery_generation(),
+            ))
+            .expect("accept observed cleanup");
+
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("observed cleanup snapshot");
+        snapshot
+            .validate_base()
+            .expect("observed cleanup snapshot validates");
+
+        let mut zero_owner_revision = serde_json::to_value(&snapshot).expect("snapshot");
+        zero_owner_revision["cancellation_cleanup_observations"]["resource_cleanup_observation"]
+            ["rows"][0]["outcome"]["Preserved"]["owner_revision"] = json!(0);
+        let zero_owner_revision: FullProgressSnapshotObservation =
+            serde_json::from_value(zero_owner_revision).expect("owner revision shape");
+        assert!(matches!(
+            zero_owner_revision.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupValidation {
+                    source: WorkProgressError::CancellationResourceCleanupObservation(_),
+                }
+            )
+        ));
+
+        let mut future_context = serde_json::to_value(&snapshot).expect("snapshot");
+        future_context["cancellation_cleanup_observations"]["resource_cleanup_observation"]["rows"]
+            [0]["outcome"]["Preserved"]["context"]["execution_epoch"] = json!(1);
+        let future_context: FullProgressSnapshotObservation =
+            serde_json::from_value(future_context).expect("context epoch shape");
+        assert!(matches!(
+            future_context.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupValidation {
+                    source: WorkProgressError::CancellationResourceCleanupObservation(_),
+                }
+            )
+        ));
+
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                7,
+                2,
+                progress.execution_epoch(),
+            ))
+            .expect("reacquire after observed cleanup");
+        let reacquired_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("reacquired observed cleanup snapshot");
+        reacquired_snapshot
+            .validate_base()
+            .expect("historical observed cleanup remains valid");
+        let observed_context = reacquired_snapshot
+            .cancellation_cleanup_observations()
+            .expect("cleanup observations")
+            .resource_cleanup_observation()
+            .rows()
+            .iter()
+            .find_map(|row| match row.outcome() {
+                CancellationResourceCleanupOutcome::Preserved { context, .. } => Some(context),
+                _ => None,
+            })
+            .expect("observed historical context");
+        assert_eq!(observed_context.execution_epoch(), 0);
     }
 
     #[test]
@@ -20061,6 +20199,224 @@ mod tests {
             Err(
                 FullProgressSnapshotObservationError::AfterEffectValidation {
                     source: WorkProgressError::CancellationEffectInventory(_),
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn full_progress_snapshot_rejects_retained_cleanup_lineage_corruption() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(18118).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut progress);
+        accept_pending_cleanup_observations(&mut progress);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("cleanup snapshot");
+        snapshot.validate_base().expect("valid cleanup snapshot");
+
+        let mut resource_generation_zero = serde_json::to_value(&snapshot).expect("snapshot");
+        resource_generation_zero["cancellation_cleanup_observations"]["resource_cleanup_observation"]
+            ["observation_generation"] = json!(0);
+        let resource_generation_zero: FullProgressSnapshotObservation =
+            serde_json::from_value(resource_generation_zero).expect("resource generation shape");
+        assert!(matches!(
+            resource_generation_zero.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupValidation {
+                    source: WorkProgressError::CancellationResourceCleanupObservation(_),
+                }
+            )
+        ));
+
+        let mut wrong_resource_key = serde_json::to_value(&snapshot).expect("snapshot");
+        wrong_resource_key["cancellation_cleanup_observations"]["resource_cleanup_observation"]["rows"]
+            [0]["key"]["step_ordinal"] = json!(999);
+        let wrong_resource_key: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_resource_key).expect("resource key shape");
+        assert!(matches!(
+            wrong_resource_key.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupValidation {
+                    source: WorkProgressError::CancellationResourceCleanupObservation(_),
+                }
+            )
+        ));
+
+        let mut wrong_namespace_lineage = serde_json::to_value(&snapshot).expect("snapshot");
+        wrong_namespace_lineage["cancellation_cleanup_observations"]["namespace_cleanup_observation"]
+            ["manifest"]["cleanup_manifest"]["recovery_inventory"]["frozen_inventory"]["operation_id"] =
+            json!(Uuid::from_u128(18119).to_string());
+        let wrong_namespace_lineage: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_namespace_lineage).expect("namespace lineage shape");
+        assert!(matches!(
+            wrong_namespace_lineage.validate_base(),
+            Err(FullProgressSnapshotObservationError::CancellationCleanupNamespaceLineageMismatch)
+        ));
+
+        let mut future_cleanup_epoch = serde_json::to_value(&snapshot).expect("snapshot");
+        future_cleanup_epoch["cancellation_cleanup_observations"]["execution_epoch"] = json!(1);
+        let future_cleanup_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(future_cleanup_epoch).expect("cleanup epoch shape");
+        assert!(matches!(
+            future_cleanup_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupExecutionEpochFuture {
+                    cleanup: 1,
+                    current: 0,
+                }
+            )
+        ));
+
+        let mut resource_epoch = serde_json::to_value(&snapshot).expect("snapshot");
+        resource_epoch["cancellation_cleanup_observations"]["resource_cleanup_observation"]["observation_epoch"] =
+            json!(1);
+        let resource_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(resource_epoch).expect("resource epoch shape");
+        assert!(matches!(
+            resource_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupResourceEpochMismatch {
+                    cleanup: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let mut dispatch_epoch = serde_json::to_value(&snapshot).expect("snapshot");
+        dispatch_epoch["cancellation_cleanup_observations"]["resource_cleanup_observation"]["manifest"]
+            ["cleanup_manifest"]["recovery_inventory"]["dispatch_outcome"]["observation_epoch"] =
+            json!(1);
+        let dispatch_epoch: FullProgressSnapshotObservation =
+            serde_json::from_value(dispatch_epoch).expect("dispatch epoch shape");
+        assert!(matches!(
+            dispatch_epoch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupDispatchEpochMismatch {
+                    cleanup: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let mut linked_generation_zero = serde_json::to_value(&snapshot).expect("snapshot");
+        linked_generation_zero["cancellation_cleanup_observations"]["after_effect_generation"] =
+            json!(0);
+        let linked_generation_zero: FullProgressSnapshotObservation =
+            serde_json::from_value(linked_generation_zero).expect("linked generation shape");
+        assert!(matches!(
+            linked_generation_zero.validate_base(),
+            Err(FullProgressSnapshotObservationError::CancellationCleanupAfterEffectGenerationZero)
+        ));
+
+        let mut equal_generations = serde_json::to_value(&snapshot).expect("snapshot");
+        equal_generations["cancellation_cleanup_observations"]["recovery_generation"] = json!(1);
+        let equal_generations: FullProgressSnapshotObservation =
+            serde_json::from_value(equal_generations).expect("equal generation shape");
+        assert!(matches!(
+            equal_generations.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupAfterEffectGenerationNotBeforeCleanup {
+                    after_effect: 1,
+                    cleanup: 1,
+                }
+            )
+        ));
+
+        let mut cleanup_generation_future = serde_json::to_value(&snapshot).expect("snapshot");
+        cleanup_generation_future["cancellation_cleanup_observations"]["recovery_generation"] =
+            json!(3);
+        let cleanup_generation_future: FullProgressSnapshotObservation =
+            serde_json::from_value(cleanup_generation_future).expect("future cleanup generation");
+        assert!(matches!(
+            cleanup_generation_future.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupGenerationFuture {
+                    cleanup: 3,
+                    current: 2,
+                }
+            )
+        ));
+
+        let mut dispatch_generation_future = serde_json::to_value(&snapshot).expect("snapshot");
+        dispatch_generation_future["cancellation_cleanup_observations"]["resource_cleanup_observation"]
+            ["manifest"]["cleanup_manifest"]["recovery_inventory"]["dispatch_outcome"]["recovery_generation"] =
+            json!(2);
+        let dispatch_generation_future: FullProgressSnapshotObservation =
+            serde_json::from_value(dispatch_generation_future).expect("future dispatch generation");
+        assert!(matches!(
+            dispatch_generation_future.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupDispatchGenerationFuture {
+                    dispatch: 2,
+                    after_effect: 1,
+                }
+            )
+        ));
+
+        let mut dispatch_generation_zero = serde_json::to_value(&snapshot).expect("snapshot");
+        dispatch_generation_zero["cancellation_cleanup_observations"]["resource_cleanup_observation"]
+            ["manifest"]["cleanup_manifest"]["recovery_inventory"]["dispatch_outcome"]["recovery_generation"] =
+            json!(0);
+        let dispatch_generation_zero: FullProgressSnapshotObservation =
+            serde_json::from_value(dispatch_generation_zero)
+                .expect("zero dispatch generation shape");
+        let dispatch_generation_zero_result = dispatch_generation_zero.validate_base();
+        assert!(matches!(
+            dispatch_generation_zero_result,
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupValidation {
+                    source: WorkProgressError::CancellationDispatchOutcome(
+                        CancellationDispatchOutcomeRecordError::RecoveryGenerationZero,
+                    ),
+                }
+            )
+        ));
+
+        let mut wrong_recovery = serde_json::to_value(&snapshot).expect("snapshot");
+        wrong_recovery["cancellation_cleanup_observations"]["resource_cleanup_observation"]["manifest"]
+            ["cleanup_manifest"]["recovery_inventory"]["frozen_inventory"]["operation_id"] =
+            json!(Uuid::from_u128(18120).to_string());
+        let wrong_recovery: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_recovery).expect("wrong recovery shape");
+        assert!(matches!(
+            wrong_recovery.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupValidation {
+                    source: WorkProgressError::CancellationEffectInventory(_),
+                }
+            )
+        ));
+
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                7,
+                2,
+                progress.execution_epoch(),
+            ))
+            .expect("reacquire before stale-generation corruption");
+        refresh_after_effect_headers_after_reacquisition(&mut progress);
+        let refreshed_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("refreshed cleanup snapshot");
+        let mut stale_cleanup_generation =
+            serde_json::to_value(&refreshed_snapshot).expect("snapshot");
+        stale_cleanup_generation["cancellation_cleanup_observations"]["recovery_generation"] =
+            json!(3);
+        let stale_cleanup_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(stale_cleanup_generation)
+                .expect("stale cleanup generation shape");
+        assert!(matches!(
+            stale_cleanup_generation.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationCleanupGenerationNotBeforeCurrentAfterEffect {
+                    cleanup: 3,
+                    after_effect: 3,
                 }
             )
         ));
