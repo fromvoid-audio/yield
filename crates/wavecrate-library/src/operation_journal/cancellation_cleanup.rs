@@ -486,3 +486,566 @@ impl CancellationResourceCleanupObservationRecord {
         &self.rows
     }
 }
+
+/// Maximum number of applicable namespace/disposition keys retained by one cancellation record.
+pub const MAX_CANCELLATION_NAMESPACE_CLEANUP_KEYS: usize =
+    super::cancellation_effects::MAX_CANCELLATION_CLEANUP_KEYS;
+/// Maximum number of namespace/disposition observation rows retained by one record.
+pub const MAX_CANCELLATION_NAMESPACE_CLEANUP_ROWS: usize = MAX_CANCELLATION_NAMESPACE_CLEANUP_KEYS;
+
+fn is_namespace_cleanup_role(role: WorkUnitRole) -> bool {
+    matches!(
+        role,
+        WorkUnitRole::Publish
+            | WorkUnitRole::QualifiedRelocation
+            | WorkUnitRole::RetainedMerge
+            | WorkUnitRole::OriginAbsence
+            | WorkUnitRole::RetainedObjectAbsence
+            | WorkUnitRole::RestoreRecordPrepared
+    )
+}
+
+fn allows_no_operation_claim(role: WorkUnitRole) -> bool {
+    matches!(
+        role,
+        WorkUnitRole::Publish | WorkUnitRole::QualifiedRelocation | WorkUnitRole::RetainedMerge
+    )
+}
+
+fn allows_absent(role: WorkUnitRole) -> bool {
+    matches!(
+        role,
+        WorkUnitRole::OriginAbsence
+            | WorkUnitRole::RetainedObjectAbsence
+            | WorkUnitRole::RestoreRecordPrepared
+    )
+}
+
+/// Exact applicable namespace/disposition keys selected from one cleanup manifest.
+///
+/// The complete cleanup manifest remains bound, including its recovery inventory, dispatch
+/// outcome, and operation-wide claim identities.  These keys describe local namespace or
+/// disposition obligations only; they do not prove entry, absence, adoption, rollback, or
+/// completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationNamespaceCleanupManifest {
+    cleanup_manifest: CancellationCleanupManifest,
+    keys: Vec<WorkUnitKey>,
+}
+
+impl CancellationNamespaceCleanupManifest {
+    /// Construct one untrusted namespace/disposition manifest candidate.
+    pub fn new(
+        cleanup_manifest: CancellationCleanupManifest,
+        keys: Vec<WorkUnitKey>,
+    ) -> Result<Self, CancellationNamespaceCleanupManifestValidationError> {
+        let manifest = Self {
+            cleanup_manifest,
+            keys,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Derive canonical applicable namespace/disposition keys from one cleanup manifest.
+    pub fn derive(
+        cleanup_manifest: &CancellationCleanupManifest,
+    ) -> Result<Self, CancellationNamespaceCleanupManifestValidationError> {
+        let mut keys = cleanup_manifest
+            .segments()
+            .iter()
+            .flat_map(|segment| segment.applicable_keys())
+            .filter(|key| is_namespace_cleanup_role(key.role()))
+            .copied()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        Self::new(cleanup_manifest.clone(), keys)
+    }
+
+    /// Validate bounded key ordering and role membership without consulting live progress.
+    pub fn validate(&self) -> Result<(), CancellationNamespaceCleanupManifestValidationError> {
+        if self.keys.len() > MAX_CANCELLATION_NAMESPACE_CLEANUP_KEYS {
+            return Err(
+                CancellationNamespaceCleanupManifestValidationError::TooManyKeys {
+                    actual: self.keys.len(),
+                    maximum: MAX_CANCELLATION_NAMESPACE_CLEANUP_KEYS,
+                },
+            );
+        }
+        for (index, key) in self.keys.iter().enumerate().skip(1) {
+            if self.keys[index - 1] >= *key {
+                return Err(
+                    CancellationNamespaceCleanupManifestValidationError::KeysNotSortedOrUnique {
+                        index,
+                    },
+                );
+            }
+        }
+        if let Some(key) = self
+            .keys
+            .iter()
+            .copied()
+            .find(|key| !is_namespace_cleanup_role(key.role()))
+        {
+            return Err(
+                CancellationNamespaceCleanupManifestValidationError::UnexpectedRole { key },
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate exact cleanup-manifest lineage and canonical key coverage.
+    pub fn validate_against(
+        &self,
+        expected: &CancellationNamespaceCleanupManifest,
+    ) -> Result<(), CancellationNamespaceCleanupManifestError> {
+        self.validate()?;
+        expected.validate()?;
+        if self.cleanup_manifest != expected.cleanup_manifest {
+            return Err(CancellationNamespaceCleanupManifestError::CleanupManifestMismatch);
+        }
+        if self.keys != expected.keys {
+            return Err(CancellationNamespaceCleanupManifestError::CandidateMismatch);
+        }
+        Ok(())
+    }
+
+    /// Borrow the complete cleanup manifest, including operation-wide recovery claim identities.
+    pub fn cleanup_manifest(&self) -> &CancellationCleanupManifest {
+        &self.cleanup_manifest
+    }
+
+    /// Borrow the exact dispatch outcome retained by the bound cleanup lineage.
+    pub fn dispatch_outcome(
+        &self,
+    ) -> &super::cancellation_dispatch::CancellationDispatchOutcomeRecord {
+        self.cleanup_manifest.dispatch_outcome()
+    }
+
+    /// Borrow canonical applicable namespace/disposition keys.
+    pub fn keys(&self) -> &[WorkUnitKey] {
+        &self.keys
+    }
+}
+
+/// Failure while validating the bounded namespace/disposition manifest shape.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CancellationNamespaceCleanupManifestValidationError {
+    /// The manifest retained more keys than the frozen-plan bound.
+    #[error("cancellation namespace-cleanup manifest has {actual} keys, maximum is {maximum}")]
+    TooManyKeys {
+        /// Number of supplied keys.
+        actual: usize,
+        /// Maximum accepted key count.
+        maximum: usize,
+    },
+    /// Namespace/disposition keys were not strictly sorted or contain a duplicate.
+    #[error(
+        "cancellation namespace-cleanup manifest keys are not sorted or unique at index {index}"
+    )]
+    KeysNotSortedOrUnique {
+        /// Index at which ordering failed.
+        index: usize,
+    },
+    /// A candidate named a role outside the namespace/disposition contract.
+    #[error("cancellation namespace-cleanup manifest contains unexpected role for {key:?}")]
+    UnexpectedRole {
+        /// Key carrying the unexpected role.
+        key: WorkUnitKey,
+    },
+}
+
+/// Failure while validating a namespace/disposition manifest against canonical inputs.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CancellationNamespaceCleanupManifestError {
+    /// The candidate had an invalid local shape.
+    #[error("invalid cancellation namespace-cleanup manifest shape: {0}")]
+    Shape(#[source] CancellationNamespaceCleanupManifestValidationError),
+    /// The candidate retained a different full cleanup manifest.
+    #[error("cancellation namespace-cleanup manifest cleanup lineage does not match")]
+    CleanupManifestMismatch,
+    /// The candidate keys did not match canonical applicable keys.
+    #[error("cancellation namespace-cleanup manifest candidate does not match")]
+    CandidateMismatch,
+}
+
+impl From<CancellationNamespaceCleanupManifestValidationError>
+    for CancellationNamespaceCleanupManifestError
+{
+    fn from(error: CancellationNamespaceCleanupManifestValidationError) -> Self {
+        Self::Shape(error)
+    }
+}
+
+/// One typed cancellation-local namespace/disposition observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CancellationNamespaceCleanupOutcome {
+    /// No namespace/disposition observation has been retained for this planned key.
+    Pending,
+    /// The owner observed that no application operation claim was retained.
+    ///
+    /// This is an untrusted ownership observation.  It is not a NeverEntered proof, rollback
+    /// proof, or completion proof.
+    NoOperationClaim {
+        /// Positive owner-local observation revision, unrelated to source revisions.
+        owner_revision: u64,
+        /// Historical participant scope and execution epoch accepted with the observation.
+        context: CompletionContext,
+    },
+    /// The owner observed the namespace or disposition preserved.
+    ///
+    /// This does not prove adoption, qualification, or a current capability.
+    Preserved {
+        /// Positive owner-local observation revision, unrelated to source revisions.
+        owner_revision: u64,
+        /// Historical participant scope and execution epoch accepted with the observation.
+        context: CompletionContext,
+    },
+    /// The owner observed the namespace or disposition absent.
+    ///
+    /// This does not prove NeverEntered, rollback completion, or release authority.
+    Absent {
+        /// Positive owner-local observation revision, unrelated to source revisions.
+        owner_revision: u64,
+        /// Historical participant scope and execution epoch accepted with the observation.
+        context: CompletionContext,
+    },
+}
+
+/// One exact namespace/disposition key and its cancellation-local observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationNamespaceCleanupObservationRow {
+    key: WorkUnitKey,
+    outcome: CancellationNamespaceCleanupOutcome,
+}
+
+impl CancellationNamespaceCleanupObservationRow {
+    /// Construct one untrusted namespace/disposition observation row.
+    pub fn new(key: WorkUnitKey, outcome: CancellationNamespaceCleanupOutcome) -> Self {
+        Self { key, outcome }
+    }
+
+    /// Return the exact namespace/disposition key.
+    pub const fn key(&self) -> WorkUnitKey {
+        self.key
+    }
+
+    /// Borrow the typed cancellation-local outcome.
+    pub fn outcome(&self) -> &CancellationNamespaceCleanupOutcome {
+        &self.outcome
+    }
+}
+
+/// Immutable cancellation-local namespace/disposition observations bound to one exact manifest.
+///
+/// This record is observational only.  It never completes normal progress, proves absence,
+/// adoption, rollback, or qualification, maps or discharges operation-wide claims, grants
+/// cleanup authority, or authorizes a terminal transition.  Later contradictory observations are
+/// retained as observations; a future qualified-outcome guard adjudicates them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationNamespaceCleanupObservationRecord {
+    manifest: CancellationNamespaceCleanupManifest,
+    observation_epoch: u64,
+    observation_generation: u64,
+    rows: Vec<CancellationNamespaceCleanupObservationRow>,
+}
+
+/// Failure while validating one namespace/disposition observation record.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum CancellationNamespaceCleanupObservationRecordError {
+    /// The bound namespace/disposition manifest had an invalid shape.
+    #[error("invalid cancellation namespace-cleanup manifest: {0}")]
+    Manifest(#[source] CancellationNamespaceCleanupManifestError),
+    /// The record carried no positive observation generation.
+    #[error("cancellation namespace-cleanup observation generation must be greater than zero")]
+    ObservationGenerationZero,
+    /// The observation boundary predates its bound dispatch observation.
+    #[error(
+        "cancellation namespace-cleanup observation epoch {actual} predates dispatch epoch {dispatch}"
+    )]
+    ObservationEpochBeforeDispatch {
+        /// Epoch carried by the candidate record.
+        actual: u64,
+        /// Epoch retained by the bound dispatch record.
+        dispatch: u64,
+    },
+    /// The record exceeded the bounded row count.
+    #[error("cancellation namespace-cleanup observation has {actual} rows, maximum is {maximum}")]
+    TooManyRows {
+        /// Number of supplied rows.
+        actual: usize,
+        /// Maximum accepted row count.
+        maximum: usize,
+    },
+    /// Rows were not strictly sorted or contained a duplicate key.
+    #[error(
+        "cancellation namespace-cleanup observation rows are not sorted or unique at index {index}"
+    )]
+    RowsNotSortedOrUnique {
+        /// Index at which ordering failed.
+        index: usize,
+    },
+    /// An owner-local revision was not positive.
+    #[error("cancellation namespace-cleanup owner revision is zero for {key:?}")]
+    OwnerRevisionZero {
+        /// Key carrying the invalid revision.
+        key: WorkUnitKey,
+    },
+    /// No-operation-claim is not admissible for this role.
+    #[error(
+        "cancellation namespace-cleanup no-operation-claim is not admissible for {key:?} ({role:?})"
+    )]
+    NoOperationClaimNotAllowed {
+        /// Key carrying the disallowed outcome.
+        key: WorkUnitKey,
+        /// Role selected by the frozen plan.
+        role: WorkUnitRole,
+    },
+    /// Absent is not admissible for this role.
+    #[error("cancellation namespace-cleanup absent is not admissible for {key:?} ({role:?})")]
+    AbsentNotAllowed {
+        /// Key carrying the disallowed outcome.
+        key: WorkUnitKey,
+        /// Role selected by the frozen plan.
+        role: WorkUnitRole,
+    },
+    /// A nested historical source fence was malformed.
+    #[error("invalid cancellation namespace-cleanup context for {key:?}: {source}")]
+    ContextScope {
+        /// Key carrying the malformed context.
+        key: WorkUnitKey,
+        /// Nested participant validation failure.
+        #[source]
+        source: ParticipantValidationError,
+    },
+    /// A late context was newer than the record boundary.
+    #[error(
+        "cancellation namespace-cleanup context epoch {context_epoch} is newer than observation epoch {observation_epoch} for {key:?}"
+    )]
+    ContextEpochAfterObservation {
+        /// Key carrying the late context.
+        key: WorkUnitKey,
+        /// Context execution epoch.
+        context_epoch: u64,
+        /// Record observation epoch.
+        observation_epoch: u64,
+    },
+    /// The record did not retain the expected namespace/disposition manifest.
+    #[error("cancellation namespace-cleanup observation manifest does not match")]
+    ManifestMismatch,
+    /// The observation boundary is newer than current progress.
+    #[error(
+        "cancellation namespace-cleanup observation epoch {actual} is newer than current epoch {current}"
+    )]
+    ObservationEpochFuture {
+        /// Epoch carried by the candidate record.
+        actual: u64,
+        /// Current progress execution epoch.
+        current: u64,
+    },
+    /// The record did not cover every expected key exactly once.
+    #[error(
+        "cancellation namespace-cleanup observation row count {actual} does not match manifest count {expected}"
+    )]
+    RowCountMismatch {
+        /// Number of supplied rows.
+        actual: usize,
+        /// Number of expected keys.
+        expected: usize,
+    },
+    /// A row key did not match the canonical key at its position.
+    #[error(
+        "cancellation namespace-cleanup observation row {index} key {actual:?} does not match manifest key {expected:?}"
+    )]
+    RowKeyMismatch {
+        /// Row position carrying the mismatch.
+        index: usize,
+        /// Supplied row key.
+        actual: WorkUnitKey,
+        /// Expected row key.
+        expected: WorkUnitKey,
+    },
+}
+
+impl CancellationNamespaceCleanupObservationRecord {
+    /// Construct one untrusted namespace/disposition record after local shape validation.
+    pub fn new(
+        manifest: CancellationNamespaceCleanupManifest,
+        observation_epoch: u64,
+        observation_generation: u64,
+        rows: Vec<CancellationNamespaceCleanupObservationRow>,
+    ) -> Result<Self, CancellationNamespaceCleanupObservationRecordError> {
+        let record = Self {
+            manifest,
+            observation_epoch,
+            observation_generation,
+            rows,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Validate local shape, role/outcome admissibility, nested fence shape, and epoch lineage.
+    pub fn validate(&self) -> Result<(), CancellationNamespaceCleanupObservationRecordError> {
+        self.manifest
+            .validate()
+            .map_err(CancellationNamespaceCleanupManifestError::from)
+            .map_err(CancellationNamespaceCleanupObservationRecordError::Manifest)?;
+        if self.observation_generation == 0 {
+            return Err(
+                CancellationNamespaceCleanupObservationRecordError::ObservationGenerationZero,
+            );
+        }
+        let dispatch_epoch = self.manifest.dispatch_outcome().observation_epoch();
+        if self.observation_epoch < dispatch_epoch {
+            return Err(
+                CancellationNamespaceCleanupObservationRecordError::ObservationEpochBeforeDispatch {
+                    actual: self.observation_epoch,
+                    dispatch: dispatch_epoch,
+                },
+            );
+        }
+        if self.rows.len() > MAX_CANCELLATION_NAMESPACE_CLEANUP_ROWS {
+            return Err(
+                CancellationNamespaceCleanupObservationRecordError::TooManyRows {
+                    actual: self.rows.len(),
+                    maximum: MAX_CANCELLATION_NAMESPACE_CLEANUP_ROWS,
+                },
+            );
+        }
+        for (index, row) in self.rows.iter().enumerate() {
+            if index > 0 && self.rows[index - 1].key >= row.key {
+                return Err(
+                    CancellationNamespaceCleanupObservationRecordError::RowsNotSortedOrUnique {
+                        index,
+                    },
+                );
+            }
+            let role = row.key.role();
+            let (owner_revision, context) = match row.outcome() {
+                CancellationNamespaceCleanupOutcome::Pending => continue,
+                CancellationNamespaceCleanupOutcome::NoOperationClaim {
+                    owner_revision,
+                    context,
+                } => {
+                    if !allows_no_operation_claim(role) {
+                        return Err(
+                            CancellationNamespaceCleanupObservationRecordError::NoOperationClaimNotAllowed {
+                                key: row.key,
+                                role,
+                            },
+                        );
+                    }
+                    (*owner_revision, context)
+                }
+                CancellationNamespaceCleanupOutcome::Preserved {
+                    owner_revision,
+                    context,
+                } => (*owner_revision, context),
+                CancellationNamespaceCleanupOutcome::Absent {
+                    owner_revision,
+                    context,
+                } => {
+                    if !allows_absent(role) {
+                        return Err(
+                            CancellationNamespaceCleanupObservationRecordError::AbsentNotAllowed {
+                                key: row.key,
+                                role,
+                            },
+                        );
+                    }
+                    (*owner_revision, context)
+                }
+            };
+            if owner_revision == 0 {
+                return Err(
+                    CancellationNamespaceCleanupObservationRecordError::OwnerRevisionZero {
+                        key: row.key,
+                    },
+                );
+            }
+            context
+                .scope()
+                .source_fence()
+                .map(StoredSourceFence::validate)
+                .transpose()
+                .map_err(|source| {
+                    CancellationNamespaceCleanupObservationRecordError::ContextScope {
+                        key: row.key,
+                        source,
+                    }
+                })?;
+            if context.execution_epoch() > self.observation_epoch {
+                return Err(
+                    CancellationNamespaceCleanupObservationRecordError::ContextEpochAfterObservation {
+                        key: row.key,
+                        context_epoch: context.execution_epoch(),
+                        observation_epoch: self.observation_epoch,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate exact manifest coverage and current observation epoch.
+    pub fn validate_against(
+        &self,
+        manifest: &CancellationNamespaceCleanupManifest,
+        current_execution_epoch: u64,
+    ) -> Result<(), CancellationNamespaceCleanupObservationRecordError> {
+        self.validate()?;
+        self.manifest
+            .validate_against(manifest)
+            .map_err(|_| CancellationNamespaceCleanupObservationRecordError::ManifestMismatch)?;
+        if self.observation_epoch > current_execution_epoch {
+            return Err(
+                CancellationNamespaceCleanupObservationRecordError::ObservationEpochFuture {
+                    actual: self.observation_epoch,
+                    current: current_execution_epoch,
+                },
+            );
+        }
+        if self.rows.len() != manifest.keys().len() {
+            return Err(
+                CancellationNamespaceCleanupObservationRecordError::RowCountMismatch {
+                    actual: self.rows.len(),
+                    expected: manifest.keys().len(),
+                },
+            );
+        }
+        for (index, (expected, row)) in manifest.keys().iter().zip(&self.rows).enumerate() {
+            if row.key != *expected {
+                return Err(
+                    CancellationNamespaceCleanupObservationRecordError::RowKeyMismatch {
+                        index,
+                        actual: row.key,
+                        expected: *expected,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrow the exact namespace/disposition manifest bound to this record.
+    pub fn manifest(&self) -> &CancellationNamespaceCleanupManifest {
+        &self.manifest
+    }
+
+    /// Return the observation execution epoch.
+    pub const fn observation_epoch(&self) -> u64 {
+        self.observation_epoch
+    }
+
+    /// Return the positive observation generation.
+    pub const fn observation_generation(&self) -> u64 {
+        self.observation_generation
+    }
+
+    /// Borrow exact sorted namespace/disposition observation rows.
+    pub fn rows(&self) -> &[CancellationNamespaceCleanupObservationRow] {
+        &self.rows
+    }
+}

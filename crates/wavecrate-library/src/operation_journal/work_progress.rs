@@ -23,6 +23,9 @@ use super::admission_claims::{
     AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
 use super::cancellation_cleanup::{
+    CancellationNamespaceCleanupManifest, CancellationNamespaceCleanupManifestError,
+    CancellationNamespaceCleanupObservationRecord,
+    CancellationNamespaceCleanupObservationRecordError, CancellationNamespaceCleanupOutcome,
     CancellationResourceCleanupManifest, CancellationResourceCleanupManifestError,
     CancellationResourceCleanupObservationRecord,
     CancellationResourceCleanupObservationRecordError, CancellationResourceCleanupOutcome,
@@ -1769,6 +1772,80 @@ impl WorkProgress {
                 CancellationResourceCleanupOutcome::Pending => continue,
                 CancellationResourceCleanupOutcome::Preserved { context, .. }
                 | CancellationResourceCleanupOutcome::Absent { context, .. } => context,
+            };
+            self.validate_historical_context_for_unit(row.key(), context)?;
+        }
+        Ok(())
+    }
+
+    /// Derive the exact applicable namespace/disposition manifest from one explicit cleanup
+    /// lineage.
+    ///
+    /// The returned value is observational only.  It does not complete normal progress, prove
+    /// absence, adoption, rollback, qualification, or authorize cleanup or release.
+    pub fn cancellation_namespace_cleanup_manifest(
+        &self,
+        expected_cleanup_manifest: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<CancellationNamespaceCleanupManifest, WorkProgressError> {
+        self.validate_cancellation_cleanup_manifest(
+            expected_cleanup_manifest,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        CancellationNamespaceCleanupManifest::derive(expected_cleanup_manifest).map_err(|error| {
+            WorkProgressError::CancellationNamespaceCleanupManifest(
+                CancellationNamespaceCleanupManifestError::from(error),
+            )
+        })
+    }
+
+    /// Validate one namespace/disposition manifest against explicit cleanup lineage.
+    pub fn validate_cancellation_namespace_cleanup_manifest(
+        &self,
+        candidate: &CancellationNamespaceCleanupManifest,
+        expected_cleanup_manifest: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let expected = self.cancellation_namespace_cleanup_manifest(
+            expected_cleanup_manifest,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&expected)
+            .map_err(WorkProgressError::CancellationNamespaceCleanupManifest)
+    }
+
+    /// Validate one immutable cancellation-local namespace/disposition observation record.
+    ///
+    /// The expected cleanup manifest, recovery inventory, and dispatch outcome are explicit so
+    /// an observational candidate cannot silently substitute retained state.  Rows retain
+    /// historical participant context only; they do not synthesize completion evidence, affect
+    /// source-revision floors, or change normal/frozen progress.
+    pub fn validate_cancellation_namespace_cleanup_observation_record(
+        &self,
+        candidate: &CancellationNamespaceCleanupObservationRecord,
+        expected_cleanup_manifest: &CancellationCleanupManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let manifest = self.cancellation_namespace_cleanup_manifest(
+            expected_cleanup_manifest,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&manifest, self.execution_epoch)
+            .map_err(WorkProgressError::CancellationNamespaceCleanupObservation)?;
+        for row in candidate.rows() {
+            let context = match row.outcome() {
+                CancellationNamespaceCleanupOutcome::Pending => continue,
+                CancellationNamespaceCleanupOutcome::NoOperationClaim { context, .. }
+                | CancellationNamespaceCleanupOutcome::Preserved { context, .. }
+                | CancellationNamespaceCleanupOutcome::Absent { context, .. } => context,
             };
             self.validate_historical_context_for_unit(row.key(), context)?;
         }
@@ -4511,6 +4588,15 @@ pub enum WorkProgressError {
     CancellationResourceCleanupObservation(
         #[source] CancellationResourceCleanupObservationRecordError,
     ),
+    /// A cancellation-local namespace/disposition manifest failed exact derivation or validation.
+    #[error("invalid work progress cancellation namespace-cleanup manifest: {0}")]
+    CancellationNamespaceCleanupManifest(#[source] CancellationNamespaceCleanupManifestError),
+    /// A cancellation-local namespace/disposition observation failed exact binding or context
+    /// validation.
+    #[error("invalid work progress cancellation namespace-cleanup observation: {0}")]
+    CancellationNamespaceCleanupObservation(
+        #[source] CancellationNamespaceCleanupObservationRecordError,
+    ),
     /// A cancellation-local source-closure manifest failed exact derivation or validation.
     #[error("invalid work progress cancellation source-closure manifest: {0}")]
     CancellationSourceClosureManifest(#[source] SourceClosureManifestError),
@@ -5204,6 +5290,9 @@ mod tests {
         CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
         CancellationDispatchOutcomeRow, CancellationEffectBundle, CancellationEffectFactKind,
         CancellationEffectOutcome, CancellationEffectRecipe, CancellationEffectRecoveryInventory,
+        CancellationNamespaceCleanupManifest, CancellationNamespaceCleanupObservationRecord,
+        CancellationNamespaceCleanupObservationRecordError,
+        CancellationNamespaceCleanupObservationRow, CancellationNamespaceCleanupOutcome,
         CancellationResourceCleanupManifest, CancellationResourceCleanupManifestValidationError,
         CancellationResourceCleanupObservationRecord,
         CancellationResourceCleanupObservationRecordError,
@@ -5838,6 +5927,37 @@ mod tests {
                 CancellationResourceCleanupObservationRow::new(
                     *key,
                     CancellationResourceCleanupOutcome::Pending,
+                )
+            })
+            .collect()
+    }
+
+    fn namespace_cleanup_manifest_for(
+        progress: &mut WorkProgress,
+        request_value: i64,
+    ) -> (
+        CancellationDispatchOutcomeRecord,
+        CancellationEffectRecoveryInventory,
+        CancellationCleanupManifest,
+        CancellationNamespaceCleanupManifest,
+    ) {
+        let (dispatch, recovery, cleanup) = cleanup_manifest_for(progress, request_value);
+        let namespace = progress
+            .cancellation_namespace_cleanup_manifest(&cleanup, &recovery, &dispatch)
+            .expect("namespace cleanup manifest");
+        (dispatch, recovery, cleanup, namespace)
+    }
+
+    fn pending_namespace_cleanup_rows(
+        manifest: &CancellationNamespaceCleanupManifest,
+    ) -> Vec<CancellationNamespaceCleanupObservationRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationNamespaceCleanupObservationRow::new(
+                    *key,
+                    CancellationNamespaceCleanupOutcome::Pending,
                 )
             })
             .collect()
@@ -10261,6 +10381,567 @@ mod tests {
             ),
             Err(WorkProgressError::CancellationResourceCleanupObservation(
                 CancellationResourceCleanupObservationRecordError::ManifestMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn cancellation_namespace_cleanup_manifest_covers_all_recipe_shapes() {
+        let assert_roles = |manifest: &CancellationNamespaceCleanupManifest| {
+            assert!(manifest.keys().iter().all(|key| {
+                matches!(
+                    key.role(),
+                    WorkUnitRole::Publish
+                        | WorkUnitRole::QualifiedRelocation
+                        | WorkUnitRole::RetainedMerge
+                        | WorkUnitRole::OriginAbsence
+                        | WorkUnitRole::RetainedObjectAbsence
+                        | WorkUnitRole::RestoreRecordPrepared
+                )
+            }));
+            assert!(manifest.keys().iter().all(|key| {
+                !matches!(
+                    key.role(),
+                    WorkUnitRole::OriginRemovalStart
+                        | WorkUnitRole::SelectedRetainedObjectDisposition
+                        | WorkUnitRole::ExternalAudit
+                )
+            }));
+        };
+
+        let mut staged_publish = copy_progress_with_admission_claims();
+        let (_, _, _, staged_publish_namespace) =
+            namespace_cleanup_manifest_for(&mut staged_publish, 1530);
+        assert_roles(&staged_publish_namespace);
+        assert!(
+            staged_publish_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::Publish)
+        );
+
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut staged_move = claimed_progress(
+            participants.clone(),
+            namespace_file_move_args(source, source_id.clone()),
+            1531,
+        );
+        let (_, _, _, staged_move_namespace) =
+            namespace_cleanup_manifest_for(&mut staged_move, 1531);
+        assert_roles(&staged_move_namespace);
+        assert!(
+            staged_move_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::Publish)
+        );
+        assert!(
+            staged_move_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::OriginAbsence)
+        );
+
+        let mut qualified = claimed_progress(
+            participants.clone(),
+            history_folder_args(source, source_id.clone()),
+            1532,
+        );
+        let (_, _, _, qualified_namespace) = namespace_cleanup_manifest_for(&mut qualified, 1532);
+        assert_roles(&qualified_namespace);
+        assert!(
+            qualified_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::QualifiedRelocation)
+        );
+        assert!(
+            qualified_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::OriginAbsence)
+        );
+
+        let mut retained_merge = claimed_progress(
+            participants.clone(),
+            retained_resolution_args(source, source_id.clone(), true),
+            1533,
+        );
+        let (_, _, _, retained_merge_namespace) =
+            namespace_cleanup_manifest_for(&mut retained_merge, 1533);
+        assert_roles(&retained_merge_namespace);
+        assert!(
+            retained_merge_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::RetainedMerge)
+        );
+
+        let mut retained_disposition = claimed_progress(
+            participants.clone(),
+            retained_resolution_args(source, source_id.clone(), false),
+            1534,
+        );
+        let (_, _, _, retained_disposition_namespace) =
+            namespace_cleanup_manifest_for(&mut retained_disposition, 1534);
+        assert_roles(&retained_disposition_namespace);
+        assert!(
+            retained_disposition_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::RetainedObjectAbsence)
+        );
+        assert!(
+            retained_disposition_namespace
+                .keys()
+                .iter()
+                .all(|key| key.role() != WorkUnitRole::SelectedRetainedObjectDisposition)
+        );
+
+        let mut external_audit = claimed_progress(
+            participants.clone(),
+            external_reconciliation_args(source, filesystem, source_id.clone()),
+            1535,
+        );
+        let (_, _, _, external_namespace) =
+            namespace_cleanup_manifest_for(&mut external_audit, 1535);
+        assert_roles(&external_namespace);
+        assert!(external_namespace.keys().is_empty());
+
+        let mut history_restore = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1536,
+        );
+        let (_, _, _, history_namespace) =
+            namespace_cleanup_manifest_for(&mut history_restore, 1536);
+        assert_roles(&history_namespace);
+        assert!(
+            history_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::Publish)
+        );
+        assert!(
+            history_namespace
+                .keys()
+                .iter()
+                .any(|key| key.role() == WorkUnitRole::OriginAbsence)
+        );
+        assert!(
+            history_namespace.keys().len()
+                < history_namespace
+                    .cleanup_manifest()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment.keys().len())
+                    .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn cancellation_namespace_cleanup_observations_enforce_roles_and_retain_contradictions() {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_restore_with_extracted_args(source, filesystem, source_id),
+            1537,
+        );
+        let (dispatch, recovery, cleanup, namespace) =
+            namespace_cleanup_manifest_for(&mut progress, 1537);
+        let rows: Vec<CancellationNamespaceCleanupObservationRow> = namespace
+            .keys()
+            .iter()
+            .map(|key| {
+                let context = CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(*key).expect("namespace scope").clone(),
+                );
+                let outcome = match key.role() {
+                    WorkUnitRole::Publish
+                    | WorkUnitRole::QualifiedRelocation
+                    | WorkUnitRole::RetainedMerge => {
+                        CancellationNamespaceCleanupOutcome::NoOperationClaim {
+                            owner_revision: 1,
+                            context,
+                        }
+                    }
+                    WorkUnitRole::OriginAbsence
+                    | WorkUnitRole::RetainedObjectAbsence
+                    | WorkUnitRole::RestoreRecordPrepared => {
+                        CancellationNamespaceCleanupOutcome::Absent {
+                            owner_revision: 1,
+                            context,
+                        }
+                    }
+                    role => panic!("unexpected namespace role {role:?}"),
+                };
+                CancellationNamespaceCleanupObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let record = CancellationNamespaceCleanupObservationRecord::new(
+            namespace.clone(),
+            progress.execution_epoch(),
+            1,
+            rows.clone(),
+        )
+        .expect("namespace observation record");
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress.cancellation_inventory().cloned();
+        let claims_before = progress.admission_claims().cloned();
+        progress
+            .validate_cancellation_namespace_cleanup_observation_record(
+                &record, &cleanup, &recovery, &dispatch,
+            )
+            .expect("namespace observation validation");
+
+        let contradiction_key = namespace
+            .keys()
+            .iter()
+            .copied()
+            .find(|key| {
+                matches!(
+                    key.role(),
+                    WorkUnitRole::OriginAbsence
+                        | WorkUnitRole::RetainedObjectAbsence
+                        | WorkUnitRole::RestoreRecordPrepared
+                )
+            })
+            .expect("absence-compatible namespace key");
+        let contradiction_rows: Vec<CancellationNamespaceCleanupObservationRow> = rows
+            .iter()
+            .map(|row| {
+                if row.key() == contradiction_key {
+                    CancellationNamespaceCleanupObservationRow::new(
+                        contradiction_key,
+                        CancellationNamespaceCleanupOutcome::Preserved {
+                            owner_revision: 2,
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress
+                                    .scope_for(contradiction_key)
+                                    .expect("contradiction scope")
+                                    .clone(),
+                            ),
+                        },
+                    )
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
+        let contradiction = CancellationNamespaceCleanupObservationRecord::new(
+            namespace.clone(),
+            progress.execution_epoch(),
+            2,
+            contradiction_rows,
+        )
+        .expect("contradictory namespace observation");
+        progress
+            .validate_cancellation_namespace_cleanup_observation_record(
+                &contradiction,
+                &cleanup,
+                &recovery,
+                &dispatch,
+            )
+            .expect("contradictory observation remains observational");
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), inventory_before.as_ref());
+        assert_eq!(progress.admission_claims(), claims_before.as_ref());
+
+        let publish = namespace
+            .keys()
+            .iter()
+            .copied()
+            .find(|key| key.role() == WorkUnitRole::Publish)
+            .expect("publish namespace key");
+        let absent_on_publish: Vec<CancellationNamespaceCleanupObservationRow> = rows
+            .iter()
+            .map(|row| {
+                if row.key() == publish {
+                    CancellationNamespaceCleanupObservationRow::new(
+                        publish,
+                        CancellationNamespaceCleanupOutcome::Absent {
+                            owner_revision: 1,
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress.scope_for(publish).expect("publish scope").clone(),
+                            ),
+                        },
+                    )
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            CancellationNamespaceCleanupObservationRecord::new(
+                namespace.clone(),
+                progress.execution_epoch(),
+                1,
+                absent_on_publish,
+            ),
+            Err(
+                CancellationNamespaceCleanupObservationRecordError::AbsentNotAllowed {
+                    key: publish,
+                    role: WorkUnitRole::Publish,
+                }
+            )
+        );
+
+        let no_operation_on_absence: Vec<CancellationNamespaceCleanupObservationRow> = rows
+            .iter()
+            .map(|row| {
+                if row.key() == contradiction_key {
+                    CancellationNamespaceCleanupObservationRow::new(
+                        contradiction_key,
+                        CancellationNamespaceCleanupOutcome::NoOperationClaim {
+                            owner_revision: 1,
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress
+                                    .scope_for(contradiction_key)
+                                    .expect("absence scope")
+                                    .clone(),
+                            ),
+                        },
+                    )
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
+        assert_eq!(
+            CancellationNamespaceCleanupObservationRecord::new(
+                namespace,
+                progress.execution_epoch(),
+                1,
+                no_operation_on_absence,
+            ),
+            Err(
+                CancellationNamespaceCleanupObservationRecordError::NoOperationClaimNotAllowed {
+                    key: contradiction_key,
+                    role: contradiction_key.role(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn cancellation_namespace_cleanup_observations_preserve_context_and_reject_shape_errors() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            history_folder_args(source, source_id.clone()),
+            1538,
+        );
+        let (dispatch, recovery, cleanup, namespace) =
+            namespace_cleanup_manifest_for(&mut progress, 1538);
+        let rows: Vec<CancellationNamespaceCleanupObservationRow> = namespace
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationNamespaceCleanupObservationRow::new(
+                    *key,
+                    CancellationNamespaceCleanupOutcome::Preserved {
+                        owner_revision: u64::MAX,
+                        context: CompletionContext::new(
+                            progress.execution_epoch(),
+                            progress.scope_for(*key).expect("namespace scope").clone(),
+                        ),
+                    },
+                )
+            })
+            .collect();
+        let record = CancellationNamespaceCleanupObservationRecord::new(
+            namespace.clone(),
+            progress.execution_epoch(),
+            1,
+            rows.clone(),
+        )
+        .expect("namespace context record");
+        progress
+            .validate_cancellation_namespace_cleanup_observation_record(
+                &record, &cleanup, &recovery, &dispatch,
+            )
+            .expect("namespace context validation");
+
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress.cancellation_inventory().cloned();
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let source_participant = source_key.participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant,
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        progress
+            .validate_cancellation_namespace_cleanup_observation_record(
+                &record, &cleanup, &recovery, &dispatch,
+            )
+            .expect("historical namespace context remains valid");
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), inventory_before.as_ref());
+
+        let key = namespace.keys()[0];
+        let mut wrong_context =
+            CompletionContext::new(0, progress.scope_for(key).expect("namespace scope").clone());
+        wrong_context.scope.source_fence = progress
+            .scope_for(source_key)
+            .and_then(ParticipantScope::source_fence)
+            .cloned();
+        let wrong_rows = namespace
+            .keys()
+            .iter()
+            .map(|candidate| {
+                let context = if *candidate == key {
+                    wrong_context.clone()
+                } else {
+                    CompletionContext::new(
+                        0,
+                        progress
+                            .scope_for(*candidate)
+                            .expect("namespace scope")
+                            .clone(),
+                    )
+                };
+                CancellationNamespaceCleanupObservationRow::new(
+                    *candidate,
+                    CancellationNamespaceCleanupOutcome::Preserved {
+                        owner_revision: 1,
+                        context,
+                    },
+                )
+            })
+            .collect();
+        let wrong =
+            CancellationNamespaceCleanupObservationRecord::new(namespace.clone(), 0, 1, wrong_rows)
+                .expect("wrong-fence record shape");
+        assert_eq!(
+            progress.validate_cancellation_namespace_cleanup_observation_record(
+                &wrong, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CompletionContextScopeMismatch { key })
+        );
+
+        let zero_generation = CancellationNamespaceCleanupObservationRecord::new(
+            namespace.clone(),
+            progress.execution_epoch(),
+            0,
+            pending_namespace_cleanup_rows(&namespace),
+        );
+        assert_eq!(
+            zero_generation,
+            Err(CancellationNamespaceCleanupObservationRecordError::ObservationGenerationZero)
+        );
+        let zero_owner = namespace
+            .keys()
+            .iter()
+            .map(|candidate| {
+                CancellationNamespaceCleanupObservationRow::new(
+                    *candidate,
+                    if *candidate == *namespace.keys().first().expect("namespace key") {
+                        CancellationNamespaceCleanupOutcome::Preserved {
+                            owner_revision: 0,
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress
+                                    .scope_for(*candidate)
+                                    .expect("namespace scope")
+                                    .clone(),
+                            ),
+                        }
+                    } else {
+                        CancellationNamespaceCleanupOutcome::Pending
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            CancellationNamespaceCleanupObservationRecord::new(
+                namespace.clone(),
+                progress.execution_epoch(),
+                1,
+                zero_owner,
+            ),
+            Err(
+                CancellationNamespaceCleanupObservationRecordError::OwnerRevisionZero {
+                    key: namespace.keys()[0],
+                }
+            )
+        );
+        let missing = CancellationNamespaceCleanupObservationRecord::new(
+            namespace.clone(),
+            0,
+            1,
+            rows.iter().skip(1).cloned().collect(),
+        )
+        .expect("missing row shape");
+        assert!(matches!(
+            progress.validate_cancellation_namespace_cleanup_observation_record(
+                &missing, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CancellationNamespaceCleanupObservation(
+                CancellationNamespaceCleanupObservationRecordError::RowCountMismatch { .. }
+            ))
+        ));
+        let extra_key = WorkUnitKey::new(
+            u8::MAX,
+            u16::MAX,
+            participant_id(999),
+            WorkUnitRole::Publish,
+        );
+        let mut extra_rows = pending_namespace_cleanup_rows(&namespace);
+        extra_rows.push(CancellationNamespaceCleanupObservationRow::new(
+            extra_key,
+            CancellationNamespaceCleanupOutcome::Pending,
+        ));
+        let extra =
+            CancellationNamespaceCleanupObservationRecord::new(namespace.clone(), 0, 1, extra_rows)
+                .expect("extra row shape");
+        assert!(matches!(
+            progress.validate_cancellation_namespace_cleanup_observation_record(
+                &extra, &cleanup, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CancellationNamespaceCleanupObservation(
+                CancellationNamespaceCleanupObservationRecordError::RowCountMismatch { .. }
+            ))
+        ));
+
+        let mut reordered = rows;
+        reordered.reverse();
+        assert!(matches!(
+            CancellationNamespaceCleanupObservationRecord::new(namespace, 0, 1, reordered,),
+            Err(CancellationNamespaceCleanupObservationRecordError::RowsNotSortedOrUnique { .. })
+        ));
+
+        let (participants, source, source_id) = {
+            let (participants, source, _filesystem, source_id) = valid_topology(false);
+            (participants, source, source_id)
+        };
+        let mut other =
+            claimed_progress(participants, history_folder_args(source, source_id), 1539);
+        let (_, _, _, other_namespace) = namespace_cleanup_manifest_for(&mut other, 1539);
+        let wrong_lineage = CancellationNamespaceCleanupObservationRecord::new(
+            other_namespace.clone(),
+            0,
+            1,
+            pending_namespace_cleanup_rows(&other_namespace),
+        )
+        .expect("wrong-lineage record shape");
+        assert!(matches!(
+            progress.validate_cancellation_namespace_cleanup_observation_record(
+                &wrong_lineage,
+                &cleanup,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CancellationNamespaceCleanupObservation(
+                CancellationNamespaceCleanupObservationRecordError::ManifestMismatch
             ))
         ));
     }

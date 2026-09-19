@@ -48,11 +48,16 @@ pub use cancellation_recovery::{
 };
 
 pub use cancellation_cleanup::{
-    CancellationResourceCleanupManifest, CancellationResourceCleanupManifestError,
-    CancellationResourceCleanupManifestValidationError,
+    CancellationNamespaceCleanupManifest, CancellationNamespaceCleanupManifestError,
+    CancellationNamespaceCleanupManifestValidationError,
+    CancellationNamespaceCleanupObservationRecord,
+    CancellationNamespaceCleanupObservationRecordError, CancellationNamespaceCleanupObservationRow,
+    CancellationNamespaceCleanupOutcome, CancellationResourceCleanupManifest,
+    CancellationResourceCleanupManifestError, CancellationResourceCleanupManifestValidationError,
     CancellationResourceCleanupObservationRecord,
     CancellationResourceCleanupObservationRecordError, CancellationResourceCleanupObservationRow,
-    CancellationResourceCleanupOutcome, MAX_CANCELLATION_RESOURCE_CLEANUP_KEYS,
+    CancellationResourceCleanupOutcome, MAX_CANCELLATION_NAMESPACE_CLEANUP_KEYS,
+    MAX_CANCELLATION_NAMESPACE_CLEANUP_ROWS, MAX_CANCELLATION_RESOURCE_CLEANUP_KEYS,
     MAX_CANCELLATION_RESOURCE_CLEANUP_ROWS,
 };
 
