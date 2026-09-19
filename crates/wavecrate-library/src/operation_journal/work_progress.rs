@@ -66,6 +66,10 @@ use super::participants::{
     ParticipantRequirement, ParticipantSet, ParticipantTextField, ParticipantTextViolation,
     ParticipantValidationError, StoredSourceFence,
 };
+use super::readiness_scheduling::{
+    ReadinessDeferralManifest, ReadinessDeferralManifestError, ReadinessSchedulingObservationError,
+    ReadinessSchedulingObservationRecord, derive_readiness_deferral_manifest,
+};
 use super::work_plan::{
     GLOBAL_ACTION_ORDINAL, MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite,
     WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
@@ -2158,6 +2162,78 @@ impl WorkProgress {
             {
                 self.validate_historical_completion(row.key(), context, evidence)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Derive the exact readiness prerequisites for an explicit optional-artifact selection.
+    ///
+    /// This is a read-only planner observation.  It does not inspect step completion, defer an
+    /// artifact, schedule a target, or establish a durable readiness owner.
+    pub fn readiness_deferral_manifest(
+        &self,
+        selected_artifact_keys: &[WorkUnitKey],
+    ) -> Result<ReadinessDeferralManifest, WorkProgressError> {
+        derive_readiness_deferral_manifest(
+            self.operation_id,
+            &self.plan,
+            &self.scopes,
+            selected_artifact_keys,
+        )
+        .map_err(WorkProgressError::ReadinessDeferralManifest)
+    }
+
+    /// Validate one current-epoch readiness scheduling observation against an explicit selection.
+    ///
+    /// The record is an untrusted observation only.  Every row must bind the current participant
+    /// scope and source fence, and its source revision must meet the existing accepted-progress
+    /// floor.  No row is stored and this method cannot defer an Artifact or grant scheduling
+    /// authority.
+    pub fn validate_readiness_scheduling_observation_record(
+        &self,
+        candidate: &ReadinessSchedulingObservationRecord,
+        selected_artifact_keys: &[WorkUnitKey],
+    ) -> Result<(), WorkProgressError> {
+        let manifest = self.readiness_deferral_manifest(selected_artifact_keys)?;
+        candidate
+            .validate_against(&manifest)
+            .map_err(WorkProgressError::ReadinessSchedulingObservation)?;
+        if candidate.observation_epoch() != self.execution_epoch {
+            return Err(WorkProgressError::ReadinessSchedulingEpochMismatch {
+                expected: self.execution_epoch,
+                actual: candidate.observation_epoch(),
+            });
+        }
+        for row in candidate.rows() {
+            let current_scope = self.scope_for(row.readiness_key()).ok_or(
+                WorkProgressError::ParticipantScopeMissing {
+                    participant_id: row.readiness_key().participant_id(),
+                },
+            )?;
+            if row.context().execution_epoch() != self.execution_epoch {
+                return Err(WorkProgressError::ReadinessSchedulingContextEpochMismatch {
+                    key: row.readiness_key(),
+                    expected: self.execution_epoch,
+                    actual: row.context().execution_epoch(),
+                });
+            }
+            if row.context().scope() != current_scope {
+                return Err(WorkProgressError::ReadinessSchedulingScopeMismatch {
+                    key: row.readiness_key(),
+                });
+            }
+            let fence = current_scope.source_fence().ok_or(
+                WorkProgressError::ReadinessSchedulingSourceFenceMissing {
+                    key: row.readiness_key(),
+                },
+            )?;
+            let minimum_revision = self.minimum_source_revision_for_fence(fence);
+            validate_source_observation(
+                WorkUnitRole::Readiness,
+                row.source_observation(),
+                fence,
+                minimum_revision,
+            )?;
         }
         Ok(())
     }
@@ -5115,6 +5191,46 @@ pub enum WorkProgressError {
     CancellationCoordinatorClosureObservation(
         #[source] CancellationCoordinatorClosureObservationRecordError,
     ),
+    /// A readiness deferral manifest failed exact planner derivation or validation.
+    #[error("invalid work progress readiness deferral manifest: {0}")]
+    ReadinessDeferralManifest(#[source] ReadinessDeferralManifestError),
+    /// A readiness scheduling observation failed bounded exact validation.
+    #[error("invalid work progress readiness scheduling observation: {0}")]
+    ReadinessSchedulingObservation(#[source] ReadinessSchedulingObservationError),
+    /// The readiness scheduling record was not captured at the current execution epoch.
+    #[error(
+        "work progress readiness scheduling observation epoch {actual} does not match expected epoch {expected}"
+    )]
+    ReadinessSchedulingEpochMismatch {
+        /// Current execution epoch.
+        expected: u64,
+        /// Candidate record epoch.
+        actual: u64,
+    },
+    /// A readiness row carried another execution epoch.
+    #[error(
+        "work progress readiness row {key:?} context epoch {actual} does not match expected epoch {expected}"
+    )]
+    ReadinessSchedulingContextEpochMismatch {
+        /// Readiness key carrying the mismatched context.
+        key: WorkUnitKey,
+        /// Current execution epoch.
+        expected: u64,
+        /// Candidate context epoch.
+        actual: u64,
+    },
+    /// A readiness row did not bind the current participant scope.
+    #[error("work progress readiness row scope does not match {key:?}")]
+    ReadinessSchedulingScopeMismatch {
+        /// Readiness key carrying the mismatched scope.
+        key: WorkUnitKey,
+    },
+    /// A readiness participant lacked the source fence required for scheduling observation.
+    #[error("work progress readiness row has no source fence: {key:?}")]
+    ReadinessSchedulingSourceFenceMissing {
+        /// Readiness key whose scope is unfenced.
+        key: WorkUnitKey,
+    },
     /// The private after-effect reconciliation authority did not bind this operation or plan.
     #[error("work progress after-effect reconciliation authority does not match")]
     AfterEffectReconciliationAuthorityMismatch,
@@ -5917,28 +6033,30 @@ mod tests {
         CancellationSourceClosureOutcome, CoordinatorClosureManifest,
         CoordinatorClosureManifestError, CoordinatorClosureManifestValidationError,
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
-        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
-        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
-        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
-        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
-        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
-        HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+        CreateFolderIntentArgs, DurableReadinessWakeObservation, EvidenceBatchId,
+        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
+        ExternalRawObservationLimits, ExternalRawObservationMetadata,
+        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
+        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan, HistoryAction,
+        HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
         HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
         HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
-        HistoryWaveformRestore, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
-        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
-        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
-        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
-        ParticipantCheckpointState, RawWavExtractionRecipe, RetainedDeleteId,
-        RetainedFolderObservation, RetainedPurgeDecision, RetainedPurgeIntentArgs,
-        RetainedRecoveryRootKind, RetainedResolutionCommandArgs, RetainedResolutionStage,
-        RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId, SelectionExtractIntentArgs,
-        SelectionOutputCommandArgs, SelectionOutputRecipe, SourceClosureManifest,
-        SourceClosureManifestError, SourceClosureManifestValidationError, StoredRelativePath,
-        UniversalCommandArgs, WaveformEditFrameRange, WaveformFileRevisionObservation,
-        WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
-        fingerprint_selected_entry_json,
+        HistoryWaveformRestore, MAX_READINESS_CONTRACT_VERSION_BYTES, NamespaceCommandArgs,
+        NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation, NamespaceDirectoryLocator,
+        NamespaceEntryEndpoint, NamespaceEntryExpectation, NamespaceFileExpectation,
+        NamespaceLeafName, NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget,
+        ParticipantCheckpoint, ParticipantCheckpointState, RawWavExtractionRecipe,
+        ReadinessSchedulingObservationRecord, ReadinessSchedulingObservationRow,
+        ReadinessTargetSetSummary, RetainedDeleteId, RetainedFolderObservation,
+        RetainedPurgeDecision, RetainedPurgeIntentArgs, RetainedRecoveryRootKind,
+        RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedRestoreIntentArgs,
+        RetryErrorClass, RetryLeaseId, SelectionExtractIntentArgs, SelectionOutputCommandArgs,
+        SelectionOutputRecipe, SourceClosureManifest, SourceClosureManifestError,
+        SourceClosureManifestValidationError, StoredRelativePath, UniversalCommandArgs,
+        WaveformEditFrameRange, WaveformFileRevisionObservation, WaveformOutputSpec,
+        WaveformSampleFormat, WaveformSourceSpec, fingerprint_selected_entry_json,
     };
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use uuid::Uuid;
@@ -6402,6 +6520,158 @@ mod tests {
             admission_claims(12),
         )
         .expect("copy progress with optional claim observation")
+    }
+
+    fn cross_source_optional_progress() -> WorkProgress {
+        let source_a = participant_id(301);
+        let source_b = participant_id(302);
+        let filesystem = participant_id(303);
+        let global = participant_id(304);
+        let harvest = participant_id(305);
+        let projection_a = participant_id(306);
+        let readiness_a = participant_id(307);
+        let projection_b = participant_id(308);
+        let readiness_b = participant_id(309);
+        let artifact_a = participant_id(310);
+        let artifact_b = participant_id(311);
+        let source_a_id = SourceId::from_string("source-a");
+        let source_b_id = SourceId::from_string("source-b");
+        let fence_a = StoredSourceFence::new(source_a_id.clone(), "root-a", "db-a", 1, 7, 1)
+            .expect("source A fence");
+        let fence_b = StoredSourceFence::new(source_b_id.clone(), "root-b", "db-b", 1, 8, 1)
+            .expect("source B fence");
+        let descriptors = vec![
+            ParticipantDescriptor::new(
+                source_a,
+                ParticipantKind::SourceDatabase,
+                ParticipantRequirement::Required,
+                Some(fence_a.clone()),
+                None,
+            )
+            .expect("source A"),
+            ParticipantDescriptor::new(
+                source_b,
+                ParticipantKind::SourceDatabase,
+                ParticipantRequirement::Required,
+                Some(fence_b.clone()),
+                None,
+            )
+            .expect("source B"),
+            ParticipantDescriptor::new(
+                filesystem,
+                ParticipantKind::Filesystem,
+                ParticipantRequirement::Required,
+                None,
+                None,
+            )
+            .expect("filesystem"),
+            ParticipantDescriptor::new(
+                global,
+                ParticipantKind::GlobalLibrary,
+                ParticipantRequirement::Required,
+                None,
+                None,
+            )
+            .expect("global"),
+            ParticipantDescriptor::new(
+                harvest,
+                ParticipantKind::Harvest,
+                ParticipantRequirement::Required,
+                None,
+                None,
+            )
+            .expect("harvest"),
+            ParticipantDescriptor::new(
+                projection_a,
+                ParticipantKind::Projection,
+                ParticipantRequirement::Required,
+                Some(fence_a.clone()),
+                None,
+            )
+            .expect("projection A"),
+            ParticipantDescriptor::new(
+                readiness_a,
+                ParticipantKind::Readiness,
+                ParticipantRequirement::Required,
+                Some(fence_a.clone()),
+                None,
+            )
+            .expect("readiness A"),
+            ParticipantDescriptor::new(
+                projection_b,
+                ParticipantKind::Projection,
+                ParticipantRequirement::Required,
+                Some(fence_b.clone()),
+                None,
+            )
+            .expect("projection B"),
+            ParticipantDescriptor::new(
+                readiness_b,
+                ParticipantKind::Readiness,
+                ParticipantRequirement::Required,
+                Some(fence_b.clone()),
+                None,
+            )
+            .expect("readiness B"),
+            ParticipantDescriptor::new(
+                artifact_a,
+                ParticipantKind::Artifact,
+                ParticipantRequirement::OptionalRebuildable,
+                Some(fence_a),
+                Some("waveform-a".to_owned()),
+            )
+            .expect("Artifact A"),
+            ParticipantDescriptor::new(
+                artifact_b,
+                ParticipantKind::Artifact,
+                ParticipantRequirement::OptionalRebuildable,
+                Some(fence_b),
+                Some("waveform-b".to_owned()),
+            )
+            .expect("Artifact B"),
+        ];
+        let checkpoints = descriptors
+            .iter()
+            .map(|descriptor| {
+                ParticipantCheckpoint::new(
+                    descriptor.id(),
+                    ParticipantCheckpointState::Pending,
+                    None,
+                    None,
+                )
+                .expect("checkpoint")
+            })
+            .collect();
+        let participants = ParticipantSet::new(descriptors, checkpoints).expect("participants");
+        let source = NamespaceEntryEndpoint::new(
+            source_a,
+            source_a_id,
+            StoredRelativePath::new("source.wav").expect("source path"),
+            NamespaceEntryExpectation::RegularFile(
+                NamespaceFileExpectation::new(7, "source-file", 32, Some(4))
+                    .expect("source expectation"),
+            ),
+        )
+        .expect("source endpoint");
+        let destination = NamespaceDirectoryEndpoint::new(
+            source_b,
+            source_b_id,
+            NamespaceDirectoryLocator::Root,
+            NamespaceDirectoryExpectation::new(8, "root-b", None).expect("destination parent"),
+        )
+        .expect("destination endpoint");
+        let args = UniversalCommandArgs::Namespace(NamespaceCommandArgs::Move(
+            NamespaceMoveIntentArgs::new(source, destination).expect("cross-source move"),
+        ));
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("cross-source plan");
+        WorkProgress::from_plan(
+            OperationId::from_uuid(Uuid::from_u128(312)),
+            &plan,
+            &args,
+            &participants,
+        )
+        .expect("cross-source progress")
     }
 
     fn copy_progress_with_two_admission_claims() -> WorkProgress {
@@ -7063,6 +7333,40 @@ mod tests {
             revision,
         )
         .expect("source observation")
+    }
+
+    fn readiness_row(
+        progress: &WorkProgress,
+        key: WorkUnitKey,
+        wake_value: u128,
+    ) -> ReadinessSchedulingObservationRow {
+        let revision = progress
+            .scope_for(key)
+            .and_then(ParticipantScope::source_fence)
+            .expect("readiness fence")
+            .source_revision();
+        readiness_row_at(progress, key, wake_value, revision)
+    }
+
+    fn readiness_row_at(
+        progress: &WorkProgress,
+        key: WorkUnitKey,
+        wake_value: u128,
+        revision: u64,
+    ) -> ReadinessSchedulingObservationRow {
+        let scope = progress.scope_for(key).expect("readiness scope").clone();
+        ReadinessSchedulingObservationRow::new(
+            key,
+            CompletionContext::new(progress.execution_epoch(), scope),
+            source_observation(progress, key, revision),
+            1,
+            1,
+            "readiness-test-contract-v1",
+            ReadinessTargetSetSummary::new([0x2a; 32], 0).expect("target summary"),
+            DurableReadinessWakeObservation::new(Uuid::from_u128(wake_value), 1)
+                .expect("wake observation"),
+        )
+        .expect("readiness row")
     }
 
     fn evidence_for(
@@ -13479,6 +13783,570 @@ mod tests {
             optional.disposition(),
             FullProgressDisposition::SucceededWithDeferredArtifacts
         );
+    }
+
+    #[test]
+    fn readiness_deferral_observation_binds_all_prerequisites_without_mutation() {
+        let progress = copy_progress(true);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional Artifact");
+        let before = progress.clone();
+        let manifest = progress
+            .readiness_deferral_manifest(&[artifact])
+            .expect("readiness manifest");
+        assert_eq!(manifest.artifact_keys(), &[artifact]);
+        assert!(!manifest.readiness_keys().is_empty());
+        assert!(manifest.readiness_keys().iter().all(|key| {
+            progress
+                .plan()
+                .prerequisites()
+                .iter()
+                .any(|edge| edge.prerequisite() == *key && edge.dependent() == artifact)
+        }));
+
+        let rows = manifest
+            .readiness_keys()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| readiness_row(&progress, *key, 700 + index as u128))
+            .collect();
+        let record = ReadinessSchedulingObservationRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            rows,
+        )
+        .expect("readiness observation record");
+        progress
+            .validate_readiness_scheduling_observation_record(&record, &[artifact])
+            .expect("current readiness observation");
+        assert_eq!(progress, before);
+        assert_eq!(
+            progress
+                .step_for(artifact)
+                .expect("optional Artifact step")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+    }
+
+    #[test]
+    fn readiness_manifest_binds_each_artifact_to_its_same_source_readiness() {
+        let progress = cross_source_optional_progress();
+        let artifacts = progress
+            .steps()
+            .iter()
+            .filter(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 2);
+        let before = progress.clone();
+        let manifest = progress
+            .readiness_deferral_manifest(&artifacts)
+            .expect("cross-source readiness manifest");
+        assert_eq!(manifest.bindings().len(), 2);
+        assert_eq!(manifest.readiness_keys().len(), 2);
+        for binding in manifest.bindings() {
+            let artifact_scope = progress
+                .scope_for(binding.artifact_key())
+                .expect("Artifact scope");
+            let readiness_scope = progress
+                .scope_for(binding.readiness_key())
+                .expect("Readiness scope");
+            assert_eq!(
+                artifact_scope.source_fence(),
+                readiness_scope.source_fence()
+            );
+        }
+        let rows = manifest
+            .readiness_keys()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| readiness_row(&progress, *key, 750 + index as u128))
+            .collect();
+        let record = ReadinessSchedulingObservationRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            rows,
+        )
+        .expect("cross-source record");
+        progress
+            .validate_readiness_scheduling_observation_record(&record, &artifacts)
+            .expect("cross-source readiness record");
+        assert_eq!(progress, before);
+
+        let mut wrong_binding = serde_json::to_value(&manifest).expect("manifest JSON");
+        wrong_binding["bindings"][0]["readiness_key"] =
+            serde_json::to_value(manifest.bindings()[1].readiness_key())
+                .expect("readiness key JSON");
+        wrong_binding["bindings"][1]["readiness_key"] =
+            serde_json::to_value(manifest.bindings()[0].readiness_key())
+                .expect("readiness key JSON");
+        let wrong_binding: ReadinessDeferralManifest =
+            serde_json::from_value(wrong_binding).expect("wrong binding shape");
+        let wrong_binding_rows = wrong_binding
+            .readiness_keys()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| readiness_row(&progress, *key, 760 + index as u128))
+            .collect();
+        let wrong_binding_record = ReadinessSchedulingObservationRecord::new(
+            wrong_binding,
+            progress.execution_epoch(),
+            1,
+            wrong_binding_rows,
+        )
+        .expect("wrong binding record shape");
+        assert!(matches!(
+            progress.validate_readiness_scheduling_observation_record(
+                &wrong_binding_record,
+                &artifacts,
+            ),
+            Err(WorkProgressError::ReadinessSchedulingObservation(
+                ReadinessSchedulingObservationError::Manifest(
+                    ReadinessDeferralManifestError::ExpectedManifestMismatch
+                )
+            ))
+        ));
+
+        let duplicate_wake_rows = manifest
+            .readiness_keys()
+            .iter()
+            .map(|key| readiness_row(&progress, *key, 761))
+            .collect();
+        assert!(matches!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest.clone(),
+                progress.execution_epoch(),
+                1,
+                duplicate_wake_rows,
+            ),
+            Err(ReadinessSchedulingObservationError::DuplicateWakeId { .. })
+        ));
+
+        let mut reordered_rows = manifest
+            .readiness_keys()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| readiness_row(&progress, *key, 770 + index as u128))
+            .collect::<Vec<_>>();
+        reordered_rows.reverse();
+        assert!(matches!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest,
+                progress.execution_epoch(),
+                1,
+                reordered_rows,
+            ),
+            Err(ReadinessSchedulingObservationError::RowsNotSortedUnique)
+        ));
+    }
+
+    #[test]
+    fn readiness_deferral_observation_rejects_selection_and_shape_errors() {
+        let progress = copy_progress(true);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional Artifact");
+        let readiness = progress
+            .steps()
+            .iter()
+            .find(|step| step.key().role() == WorkUnitRole::Readiness)
+            .map(WorkProgressStep::key)
+            .expect("Readiness");
+        assert!(matches!(
+            progress.readiness_deferral_manifest(&[]),
+            Err(WorkProgressError::ReadinessDeferralManifest(
+                ReadinessDeferralManifestError::EmptyArtifactSelection
+            ))
+        ));
+        assert!(matches!(
+            progress.readiness_deferral_manifest(&[readiness]),
+            Err(WorkProgressError::ReadinessDeferralManifest(
+                ReadinessDeferralManifestError::SelectedUnitNotArtifact { .. }
+            ))
+        ));
+        assert!(matches!(
+            progress.readiness_deferral_manifest(&[artifact, artifact]),
+            Err(WorkProgressError::ReadinessDeferralManifest(
+                ReadinessDeferralManifestError::ArtifactKeysNotSortedUnique
+            ))
+        ));
+
+        let manifest = progress
+            .readiness_deferral_manifest(&[artifact])
+            .expect("readiness manifest");
+        let row = readiness_row(&progress, manifest.readiness_keys()[0], 701);
+        assert!(matches!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest.clone(),
+                progress.execution_epoch(),
+                0,
+                vec![row.clone()],
+            ),
+            Err(ReadinessSchedulingObservationError::ZeroObservationGeneration)
+        ));
+        assert!(matches!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest.clone(),
+                progress.execution_epoch(),
+                1,
+                Vec::new(),
+            ),
+            Err(ReadinessSchedulingObservationError::RowCoverageMismatch { .. })
+        ));
+        assert!(matches!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest.clone(),
+                progress.execution_epoch(),
+                1,
+                vec![row.clone(), row.clone()],
+            ),
+            Err(ReadinessSchedulingObservationError::RowCoverageMismatch { .. })
+        ));
+        assert!(matches!(
+            ReadinessTargetSetSummary::new([0; 32], -1),
+            Err(ReadinessSchedulingObservationError::NegativeMembershipCount { .. })
+        ));
+        assert!(matches!(
+            DurableReadinessWakeObservation::new(Uuid::nil(), 1),
+            Err(ReadinessSchedulingObservationError::NilWakeId)
+        ));
+        assert!(matches!(
+            DurableReadinessWakeObservation::new(Uuid::from_u128(702), 0),
+            Err(ReadinessSchedulingObservationError::ZeroWakeOwnerRevision)
+        ));
+        assert!(matches!(
+            ReadinessSchedulingObservationRow::new(
+                readiness,
+                row.context().clone(),
+                row.source_observation().clone(),
+                row.source_generation(),
+                row.readiness_revision(),
+                "   ",
+                *row.target_set(),
+                row.wake().clone(),
+            ),
+            Err(ReadinessSchedulingObservationError::EmptyContractVersion)
+        ));
+        let long_contract_version = "x".repeat(MAX_READINESS_CONTRACT_VERSION_BYTES + 1);
+        assert!(matches!(
+            ReadinessSchedulingObservationRow::new(
+                readiness,
+                row.context().clone(),
+                row.source_observation().clone(),
+                row.source_generation(),
+                row.readiness_revision(),
+                long_contract_version,
+                *row.target_set(),
+                row.wake().clone(),
+            ),
+            Err(ReadinessSchedulingObservationError::ContractVersionTooLong { .. })
+        ));
+        let padded_contract = ReadinessSchedulingObservationRow::new(
+            readiness,
+            row.context().clone(),
+            row.source_observation().clone(),
+            row.source_generation(),
+            row.readiness_revision(),
+            " readiness-test-contract-v1 ",
+            *row.target_set(),
+            row.wake().clone(),
+        )
+        .expect("padded contract version remains exact");
+        assert_eq!(
+            padded_contract.contract_version(),
+            " readiness-test-contract-v1 "
+        );
+
+        let mut malformed_digest = serde_json::to_value(
+            ReadinessTargetSetSummary::new([0; 32], 0).expect("target summary"),
+        )
+        .expect("target JSON");
+        malformed_digest["membership_digest"] = serde_json::json!(vec![0; 31]);
+        assert!(serde_json::from_value::<ReadinessTargetSetSummary>(malformed_digest).is_err());
+
+        let mut negative_generation = serde_json::to_value(&row).expect("row JSON");
+        negative_generation["source_generation"] = serde_json::json!(-1);
+        let negative_generation: ReadinessSchedulingObservationRow =
+            serde_json::from_value(negative_generation).expect("negative generation shape");
+        assert!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest.clone(),
+                progress.execution_epoch(),
+                1,
+                vec![negative_generation],
+            )
+            .is_err()
+        );
+        let mut negative_revision = serde_json::to_value(&row).expect("row JSON");
+        negative_revision["readiness_revision"] = serde_json::json!(-1);
+        let negative_revision: ReadinessSchedulingObservationRow =
+            serde_json::from_value(negative_revision).expect("negative revision shape");
+        assert!(
+            ReadinessSchedulingObservationRecord::new(
+                manifest.clone(),
+                progress.execution_epoch(),
+                1,
+                vec![negative_revision],
+            )
+            .is_err()
+        );
+
+        let mut wrong_manifest = serde_json::to_value(&manifest).expect("manifest JSON");
+        wrong_manifest["operation_id"] = serde_json::json!(Uuid::from_u128(703).to_string());
+        let wrong_manifest: ReadinessDeferralManifest =
+            serde_json::from_value(wrong_manifest).expect("wrong manifest shape");
+        let wrong_record = ReadinessSchedulingObservationRecord::new(
+            wrong_manifest,
+            progress.execution_epoch(),
+            1,
+            vec![row],
+        )
+        .expect("wrong manifest record shape");
+        assert!(matches!(
+            progress.validate_readiness_scheduling_observation_record(&wrong_record, &[artifact]),
+            Err(WorkProgressError::ReadinessSchedulingObservation(
+                ReadinessSchedulingObservationError::Manifest(
+                    ReadinessDeferralManifestError::ExpectedManifestMismatch
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn readiness_manifest_rejects_duplicate_wrong_kind_and_invalid_scope_inputs() {
+        let progress = copy_progress(true);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional Artifact");
+
+        let mut duplicate_scopes = progress.scopes.clone();
+        duplicate_scopes.push(duplicate_scopes[0].clone());
+        assert!(matches!(
+            super::super::readiness_scheduling::derive_readiness_deferral_manifest(
+                progress.operation_id,
+                &progress.plan,
+                &duplicate_scopes,
+                &[artifact],
+            ),
+            Err(ReadinessDeferralManifestError::DuplicateParticipantScope { .. })
+        ));
+
+        let artifact_index = progress
+            .scopes
+            .iter()
+            .position(|scope| scope.participant_id() == artifact.participant_id())
+            .expect("Artifact scope");
+        let mut wrong_kind_scopes = progress.scopes.clone();
+        let artifact_scope = wrong_kind_scopes[artifact_index].clone();
+        wrong_kind_scopes[artifact_index] = ParticipantScope {
+            participant_id: artifact_scope.participant_id,
+            kind: ParticipantKind::Readiness,
+            source_fence: artifact_scope.source_fence,
+        };
+        assert!(matches!(
+            super::super::readiness_scheduling::derive_readiness_deferral_manifest(
+                progress.operation_id,
+                &progress.plan,
+                &wrong_kind_scopes,
+                &[artifact],
+            ),
+            Err(ReadinessDeferralManifestError::ScopeKindMismatch {
+                expected: ParticipantKind::Artifact,
+                actual: ParticipantKind::Readiness,
+                ..
+            })
+        ));
+
+        let mut missing_fence_scopes = progress.scopes.clone();
+        let artifact_scope = missing_fence_scopes[artifact_index].clone();
+        missing_fence_scopes[artifact_index] = ParticipantScope {
+            participant_id: artifact_scope.participant_id,
+            kind: artifact_scope.kind,
+            source_fence: None,
+        };
+        assert!(matches!(
+            super::super::readiness_scheduling::derive_readiness_deferral_manifest(
+                progress.operation_id,
+                &progress.plan,
+                &missing_fence_scopes,
+                &[artifact],
+            ),
+            Err(ReadinessDeferralManifestError::ArtifactSourceFenceMissing { key })
+                if key == artifact
+        ));
+
+        let mut invalid_fence_json =
+            serde_json::to_value(&progress.scopes[artifact_index]).expect("Artifact scope JSON");
+        invalid_fence_json["source_fence"]["lease_epoch"] = serde_json::json!(0);
+        let invalid_fence_scope: ParticipantScope =
+            serde_json::from_value(invalid_fence_json).expect("invalid fence shape");
+        let mut invalid_fence_scopes = progress.scopes.clone();
+        invalid_fence_scopes[artifact_index] = invalid_fence_scope;
+        assert!(matches!(
+            super::super::readiness_scheduling::derive_readiness_deferral_manifest(
+                progress.operation_id,
+                &progress.plan,
+                &invalid_fence_scopes,
+                &[artifact],
+            ),
+            Err(ReadinessDeferralManifestError::ScopeFenceInvalid(
+                ParticipantValidationError::InvalidLeaseEpoch
+            ))
+        ));
+    }
+
+    #[test]
+    fn readiness_scheduling_requires_current_scopes_and_source_floors_atomically() {
+        let mut progress = copy_progress(true);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional Artifact");
+        let manifest = progress
+            .readiness_deferral_manifest(&[artifact])
+            .expect("readiness manifest");
+        let readiness = manifest.readiness_keys()[0];
+        let valid_row = readiness_row(&progress, readiness, 704);
+
+        let future_context = ReadinessSchedulingObservationRow::new(
+            readiness,
+            CompletionContext::new(
+                progress.execution_epoch() + 1,
+                progress.scope_for(readiness).expect("scope").clone(),
+            ),
+            source_observation(&progress, readiness, 7),
+            1,
+            1,
+            "readiness-test-contract-v1",
+            *valid_row.target_set(),
+            valid_row.wake().clone(),
+        )
+        .expect("future context row");
+        let future_record = ReadinessSchedulingObservationRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            vec![future_context],
+        )
+        .expect("future context record");
+        let before = progress.clone();
+        assert!(matches!(
+            progress.validate_readiness_scheduling_observation_record(&future_record, &[artifact]),
+            Err(WorkProgressError::ReadinessSchedulingContextEpochMismatch { .. })
+        ));
+        assert_eq!(progress, before);
+
+        let wrong_scope = ReadinessSchedulingObservationRow::new(
+            readiness,
+            CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(artifact)
+                    .expect("Artifact scope")
+                    .clone(),
+            ),
+            source_observation(&progress, readiness, 7),
+            1,
+            1,
+            "readiness-test-contract-v1",
+            *valid_row.target_set(),
+            DurableReadinessWakeObservation::new(Uuid::from_u128(705), 1).expect("wake"),
+        )
+        .expect("wrong scope row");
+        let wrong_scope_record = ReadinessSchedulingObservationRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            vec![wrong_scope],
+        )
+        .expect("wrong scope record");
+        assert!(matches!(
+            progress
+                .validate_readiness_scheduling_observation_record(&wrong_scope_record, &[artifact]),
+            Err(WorkProgressError::ReadinessSchedulingScopeMismatch { .. })
+        ));
+
+        let wrong_source = SourceRevisionObservation::new(
+            SourceId::from_string("other-source"),
+            "root-a",
+            "db-a",
+            1,
+            1,
+            7,
+        )
+        .expect("wrong source observation");
+        let wrong_source_row = ReadinessSchedulingObservationRow::new(
+            readiness,
+            CompletionContext::new(
+                progress.execution_epoch(),
+                progress.scope_for(readiness).expect("scope").clone(),
+            ),
+            wrong_source,
+            1,
+            1,
+            "readiness-test-contract-v1",
+            *valid_row.target_set(),
+            DurableReadinessWakeObservation::new(Uuid::from_u128(706), 1).expect("wake"),
+        )
+        .expect("wrong source row");
+        let wrong_source_record = ReadinessSchedulingObservationRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            vec![wrong_source_row],
+        )
+        .expect("wrong source record");
+        assert!(matches!(
+            progress.validate_readiness_scheduling_observation_record(
+                &wrong_source_record,
+                &[artifact]
+            ),
+            Err(WorkProgressError::SourceFenceMismatch {
+                role: WorkUnitRole::Readiness
+            })
+        ));
+
+        let source_read = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                source_read,
+                evidence_for(&progress, source_read, 9),
+            ))
+            .expect("raise source floor");
+        let stale_row = readiness_row_at(&progress, readiness, 707, 8);
+        let stale_record = ReadinessSchedulingObservationRecord::new(
+            manifest,
+            progress.execution_epoch(),
+            1,
+            vec![stale_row],
+        )
+        .expect("stale source record");
+        let before_stale = progress.clone();
+        assert!(matches!(
+            progress.validate_readiness_scheduling_observation_record(&stale_record, &[artifact]),
+            Err(WorkProgressError::SourceRevisionRegressed {
+                role: WorkUnitRole::Readiness,
+                observed: 8,
+                minimum: 9,
+            })
+        ));
+        assert_eq!(progress, before_stale);
     }
 
     #[test]

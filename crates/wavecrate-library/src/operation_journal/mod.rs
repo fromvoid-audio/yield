@@ -22,6 +22,7 @@ pub mod model;
 pub mod namespace_commands;
 pub mod owner;
 pub mod participants;
+pub mod readiness_scheduling;
 pub mod removal_commands;
 pub mod render_commands;
 pub mod retained_resolution_commands;
@@ -90,6 +91,14 @@ pub use cancellation_reconciliation::{
     MAX_CANCELLATION_COORDINATOR_CLOSURE_ROWS, MAX_CANCELLATION_SOURCE_CLOSURE_KEYS,
     MAX_CANCELLATION_SOURCE_CLOSURE_ROWS, SourceClosureManifest, SourceClosureManifestError,
     SourceClosureManifestValidationError,
+};
+
+pub use readiness_scheduling::{
+    DurableReadinessWakeObservation, MAX_READINESS_CONTRACT_VERSION_BYTES,
+    ReadinessArtifactBinding, ReadinessDeferralManifest, ReadinessDeferralManifestError,
+    ReadinessSchedulingObservationError, ReadinessSchedulingObservationRecord,
+    ReadinessSchedulingObservationRow, ReadinessTargetSetSummary,
+    derive_readiness_deferral_manifest,
 };
 
 pub use coordinator::{

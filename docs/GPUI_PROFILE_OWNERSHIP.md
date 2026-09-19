@@ -1510,3 +1510,25 @@ receipt transition or accepting guard, cleanup/settlement/terminal integration,
 owner/barrier integration, durable persistence/codec, filesystem execution, or
 native Windows UI/audio acceptance was added. Filesystem mutation remains
 outside OPT-1337 as dependent owner work under OPT-1339.
+
+Readiness scheduling now has a bounded observational manifest for an explicit
+optional-Artifact selection. Each selected Artifact binds to exactly one direct
+Required Readiness prerequisite whose current participant fence is identical;
+cross-source edges do not substitute for that same-source binding. The record
+retains the exact plan and binding lineage, sorted Readiness rows, bounded
+target-set digest/count, nonnegative source-generation and readiness-revision
+observations, a bounded contract version, and a caller-reported durable-wake
+identity and owner revision.
+
+Public derivation rejects duplicate or oversized participant-scope collections,
+wrong participant kinds, missing or invalid source fences, malformed selections,
+and ambiguous or missing same-source prerequisites. WorkProgress rederives the
+explicit expected manifest and validates the record at the current execution
+epoch, exact current scopes and source fences, and the existing source-revision
+floor without mutating progress. Twenty-one readiness-focused tests, 108
+WorkProgress tests, 984 library tests with three ignored, and seven profile
+admission tests passed; no-default library and GPUI checks, formatting, and diff
+checks passed. These are untrusted observations only: they do not prove a
+durable wake, authorize artifact deferral, replace normal Readiness completion,
+or integrate the database or scheduler. Windows CI was not dispatched because
+the existing account billing restriction remains unresolved.
