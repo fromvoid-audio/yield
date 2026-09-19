@@ -72,6 +72,12 @@ use super::work_plan::{
 };
 use crate::sample_sources::SourceId;
 
+/// Private in-memory work-unit dispatch ownership.  The module has no production constructor;
+/// admission/provider integration must issue a future owner after establishing real ownership.
+#[allow(dead_code)]
+#[path = "work_progress/dispatch_owner.rs"]
+pub(super) mod dispatch_owner;
+
 /// One bounded source revision observation attached to a progress completion.
 ///
 /// The source identity, root and database identities, lifecycle generation, and lease epoch are
@@ -17584,5 +17590,510 @@ mod tests {
             Err(WorkProgressError::CancellationCleanupGenerationOverflow)
         );
         assert_eq!(progress, before_overflow);
+    }
+
+    #[test]
+    fn live_dispatch_owner_consumes_only_valid_normal_completion() {
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("live owner");
+        let source = key_for(owner.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = owner.issue(source).expect("reserve source");
+        let entered = owner.enter(reserved).expect("enter source");
+        let before = owner.progress().clone();
+
+        let failure = owner
+            .complete(
+                entered,
+                StoredStepEvidence::Filesystem {
+                    receipt: FilesystemReceiptSummary::new(FilesystemReceiptKind::Stage, 1),
+                },
+            )
+            .expect_err("wrong evidence must be retryable");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::Progress(
+                WorkProgressError::RoleEvidenceMismatch {
+                    role: WorkUnitRole::SourceRead,
+                },
+            )
+        );
+        let (error, entered) = failure.into_parts();
+        assert_eq!(
+            error,
+            dispatch_owner::DispatchOwnerError::Progress(WorkProgressError::RoleEvidenceMismatch {
+                role: WorkUnitRole::SourceRead,
+            },)
+        );
+        assert_eq!(owner.progress(), &before);
+        assert_eq!(
+            owner.ledger_state(source),
+            Some(dispatch_owner::DispatchLedgerState::Entered)
+        );
+
+        assert_eq!(
+            owner
+                .complete(entered, evidence_for(owner.progress(), source, 7))
+                .expect("valid source completion"),
+            ProgressApplyOutcome::Applied
+        );
+        assert_eq!(
+            owner
+                .progress()
+                .step_for(source)
+                .expect("source step")
+                .status(),
+            ProgressStepStatus::Completed
+        );
+        assert_eq!(
+            owner.ledger_state(source),
+            Some(dispatch_owner::DispatchLedgerState::CompletedNormally)
+        );
+    }
+
+    #[test]
+    fn live_dispatch_owner_rejects_resumed_progress_as_a_fresh_fixture() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(17005).expect("cancel"))
+            .expect("cancel resumed seed");
+        assert!(matches!(
+            dispatch_owner::LiveDispatchOwner::new_for_test(progress),
+            Err(dispatch_owner::DispatchOwnerError::NonFreshProgressSeed)
+        ));
+    }
+
+    #[test]
+    fn live_dispatch_owner_cancellation_closes_entry_and_seals_after_return() {
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("live owner");
+        let source = key_for(owner.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = owner.issue(source).expect("reserve source");
+        let request = CancellationRequestObservation::new(1701).expect("cancel request");
+        owner
+            .request_cancellation(request)
+            .expect("request cancellation");
+        assert_eq!(
+            owner.lifecycle(),
+            dispatch_owner::DispatchOwnerLifecycle::CancelDraining
+        );
+
+        let pending_non_source = owner
+            .progress()
+            .steps()
+            .iter()
+            .find(|step| {
+                step.status() == ProgressStepStatus::Pending
+                    && step.key().role() != WorkUnitRole::SourceRead
+            })
+            .map(WorkProgressStep::key)
+            .expect("pending non-source key");
+        assert!(matches!(
+            owner.issue(pending_non_source),
+            Err(dispatch_owner::DispatchOwnerError::IssuanceClosed)
+        ));
+        let manifest = owner
+            .progress()
+            .cancellation_dispatch_manifest()
+            .expect("frozen dispatch manifest");
+        assert!(manifest.keys().contains(&pending_non_source));
+
+        let failure = owner
+            .enter(reserved)
+            .expect_err("cancellation must reject entry");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::IssuanceClosed
+        );
+        let (error, reserved) = failure.into_parts();
+        assert_eq!(error, dispatch_owner::DispatchOwnerError::IssuanceClosed);
+        assert_eq!(
+            owner.ledger_state(source),
+            Some(dispatch_owner::DispatchLedgerState::Reserved)
+        );
+        assert!(matches!(
+            owner.seal(),
+            Err(dispatch_owner::DispatchOwnerError::OutstandingPermits { count: 1 })
+        ));
+
+        owner
+            .return_reserved(reserved)
+            .expect("explicit no-entry return");
+        let barrier = owner.seal().expect("sealed barrier");
+        assert_eq!(
+            owner.lifecycle(),
+            dispatch_owner::DispatchOwnerLifecycle::Sealed
+        );
+        assert!(
+            barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .all(|row| row.key().role() != WorkUnitRole::SourceRead)
+        );
+        assert!(
+            barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == pending_non_source)
+                .is_some_and(|row| row.outcome() == &CancellationDispatchOutcome::NeverEntered)
+        );
+        let sealed_record = barrier.dispatch_outcome().clone();
+        assert!(barrier.validate_for_owner(&owner).is_ok());
+
+        owner
+            .request_cancellation(request)
+            .expect("exact cancellation replay");
+        let replay = owner.seal().expect("exact seal replay");
+        assert_eq!(replay.dispatch_outcome(), &sealed_record);
+        assert!(replay.validate_for_owner(&owner).is_ok());
+    }
+
+    #[test]
+    fn live_dispatch_owner_preparation_completion_keeps_later_work_never_entered() {
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("live owner");
+        let source = key_for(owner.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = owner.issue(source).expect("source reservation");
+        let source_entered = owner.enter(source_reserved).expect("source entry");
+        owner
+            .complete(source_entered, evidence_for(owner.progress(), source, 7))
+            .expect("source completion");
+        let prepare = key_for(owner.progress(), 0, WorkUnitRole::Prepare);
+        let prepare_reserved = owner.issue(prepare).expect("prepare reservation");
+        let prepare_entered = owner.enter(prepare_reserved).expect("prepare entry");
+        owner
+            .complete(prepare_entered, evidence_for(owner.progress(), prepare, 7))
+            .expect("prepare completion");
+        let stage = key_for(owner.progress(), 0, WorkUnitRole::Stage);
+        let publish = key_for(owner.progress(), 0, WorkUnitRole::Publish);
+        assert!(matches!(
+            owner.issue(publish),
+            Err(dispatch_owner::DispatchOwnerError::PrerequisiteIncomplete {
+                dependent,
+                ..
+            }) if dependent == publish
+        ));
+        let before_steps = owner.progress().steps().to_vec();
+        owner
+            .request_cancellation(CancellationRequestObservation::new(17017).expect("cancel"))
+            .expect("preparation-only cancellation");
+        let manifest = owner
+            .progress()
+            .cancellation_dispatch_manifest()
+            .expect("frozen dispatch manifest");
+        assert!(
+            owner
+                .progress()
+                .cancellation_effect_inventory()
+                .expect("prepared-only effect inventory")
+                .bundles()
+                .is_empty()
+        );
+        assert!(!manifest.keys().contains(&prepare));
+        assert!(manifest.keys().contains(&stage));
+        assert!(manifest.keys().contains(&publish));
+        let barrier = owner.seal().expect("preparation-only barrier");
+        assert_eq!(owner.progress().steps(), before_steps.as_slice());
+        assert!(
+            barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == stage)
+                .is_some_and(|row| row.outcome() == &CancellationDispatchOutcome::NeverEntered)
+        );
+        assert!(
+            barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == publish)
+                .is_some_and(|row| row.outcome() == &CancellationDispatchOutcome::NeverEntered)
+        );
+    }
+
+    #[test]
+    fn live_dispatch_owner_dropped_permits_remain_outstanding() {
+        let mut reserved_owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("reserved owner");
+        let source = key_for(reserved_owner.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = reserved_owner.issue(source).expect("source reservation");
+        reserved_owner
+            .request_cancellation(CancellationRequestObservation::new(17015).expect("cancel"))
+            .expect("reserved cancellation");
+        drop(reserved);
+        assert!(matches!(
+            reserved_owner.seal(),
+            Err(dispatch_owner::DispatchOwnerError::OutstandingPermits { count: 1 })
+        ));
+
+        let mut entered_owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("entered owner");
+        let source = key_for(entered_owner.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = entered_owner.issue(source).expect("source reservation");
+        let entered = entered_owner.enter(reserved).expect("source entry");
+        entered_owner
+            .request_cancellation(CancellationRequestObservation::new(17016).expect("cancel"))
+            .expect("entered cancellation");
+        drop(entered);
+        assert!(matches!(
+            entered_owner.seal(),
+            Err(dispatch_owner::DispatchOwnerError::OutstandingPermits { count: 1 })
+        ));
+    }
+
+    #[test]
+    fn live_dispatch_owner_retains_uncertain_and_late_outcomes_without_step_mutation() {
+        let mut entered_uncertain =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("entered-uncertain owner");
+        let source = key_for(entered_uncertain.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = entered_uncertain.issue(source).expect("source reservation");
+        let source_entered = entered_uncertain
+            .enter(source_reserved)
+            .expect("source entry");
+        entered_uncertain
+            .request_cancellation(CancellationRequestObservation::new(1700).expect("cancel"))
+            .expect("entered-uncertain cancellation");
+        assert!(matches!(
+            entered_uncertain.seal(),
+            Err(dispatch_owner::DispatchOwnerError::OutstandingPermits { count: 1 })
+        ));
+        entered_uncertain
+            .retire_entered_uncertain(source_entered)
+            .expect("entered-uncertain retirement");
+        assert_eq!(
+            entered_uncertain.ledger_state(source),
+            Some(dispatch_owner::DispatchLedgerState::ReturnedUncertain)
+        );
+        let entered_uncertain_barrier = entered_uncertain.seal().expect("uncertain barrier");
+        assert!(
+            entered_uncertain_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .all(|row| row.key().role() != WorkUnitRole::SourceRead)
+        );
+
+        let mut uncertain =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("uncertain owner");
+        let source = key_for(uncertain.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = uncertain.issue(source).expect("source reservation");
+        let source_entered = uncertain.enter(source_reserved).expect("source entry");
+        uncertain
+            .complete(
+                source_entered,
+                evidence_for(uncertain.progress(), source, 7),
+            )
+            .expect("source completion");
+        let prepare = key_for(uncertain.progress(), 0, WorkUnitRole::Prepare);
+        let prepare_reserved = uncertain.issue(prepare).expect("prepare reservation");
+        uncertain
+            .retire_reserved_uncertain(prepare_reserved)
+            .expect("uncertain reservation retirement");
+        uncertain
+            .request_cancellation(CancellationRequestObservation::new(1702).expect("cancel"))
+            .expect("uncertain cancellation");
+        let uncertain_barrier = uncertain.seal().expect("uncertain barrier");
+        assert!(
+            uncertain_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .is_some_and(|row| {
+                    row.outcome() == &CancellationDispatchOutcome::EntryUncertain
+                })
+        );
+
+        let mut failed_entry =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("failed-entry owner");
+        let source = key_for(failed_entry.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = failed_entry.issue(source).expect("source reservation");
+        let source_entered = failed_entry.enter(source_reserved).expect("source entry");
+        failed_entry
+            .complete(
+                source_entered,
+                evidence_for(failed_entry.progress(), source, 7),
+            )
+            .expect("source completion");
+        let prepare = key_for(failed_entry.progress(), 0, WorkUnitRole::Prepare);
+        let prepare_reserved = failed_entry.issue(prepare).expect("prepare reservation");
+        let prepare_entered = failed_entry.enter(prepare_reserved).expect("prepare entry");
+        let failure = failed_entry
+            .complete(
+                prepare_entered,
+                StoredStepEvidence::Filesystem {
+                    receipt: FilesystemReceiptSummary::new(FilesystemReceiptKind::Stage, 1),
+                },
+            )
+            .expect_err("failed normal entry must remain uncertain");
+        assert!(matches!(
+            failure.error(),
+            dispatch_owner::DispatchOwnerError::Progress(WorkProgressError::RoleEvidenceMismatch {
+                role: WorkUnitRole::Prepare
+            })
+        ));
+        let (_, prepare_entered) = failure.into_parts();
+        failed_entry
+            .request_cancellation(CancellationRequestObservation::new(17021).expect("cancel"))
+            .expect("failed-entry cancellation");
+        failed_entry
+            .retire_entered_uncertain(prepare_entered)
+            .expect("failed-entry uncertainty");
+        let failed_entry_barrier = failed_entry.seal().expect("failed-entry barrier");
+        assert!(
+            failed_entry_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .is_some_and(|row| row.outcome() == &CancellationDispatchOutcome::EntryUncertain)
+        );
+
+        let mut source_late =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("source-late owner");
+        let source = key_for(source_late.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = source_late.issue(source).expect("source reservation");
+        let source_entered = source_late.enter(source_reserved).expect("source entry");
+        source_late
+            .request_cancellation(CancellationRequestObservation::new(17025).expect("cancel"))
+            .expect("source-late cancellation");
+        source_late
+            .retire_entered_completed(
+                source_entered,
+                evidence_for(source_late.progress(), source, 7),
+            )
+            .expect("late source completion");
+        assert_eq!(
+            source_late.ledger_state(source),
+            Some(dispatch_owner::DispatchLedgerState::CompletedAfterCancellation)
+        );
+        let source_late_barrier = source_late.seal().expect("source-late barrier");
+        assert!(
+            source_late_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .all(|row| row.key().role() != WorkUnitRole::SourceRead)
+        );
+
+        let mut late =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("late owner");
+        let source = key_for(late.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = late.issue(source).expect("source reservation");
+        let source_entered = late.enter(source_reserved).expect("source entry");
+        late.complete(source_entered, evidence_for(late.progress(), source, 7))
+            .expect("source completion");
+        let prepare = key_for(late.progress(), 0, WorkUnitRole::Prepare);
+        let prepare_reserved = late.issue(prepare).expect("prepare reservation");
+        let prepare_entered = late.enter(prepare_reserved).expect("prepare entry");
+        let before_steps = late.progress().steps().to_vec();
+        late.request_cancellation(CancellationRequestObservation::new(1703).expect("cancel"))
+            .expect("late cancellation");
+        let context = late
+            .retire_entered_completed(prepare_entered, evidence_for(late.progress(), prepare, 7))
+            .expect("late completion");
+        assert_eq!(context.execution_epoch(), late.progress().execution_epoch());
+        assert_eq!(late.progress().steps(), before_steps.as_slice());
+        assert_eq!(
+            late.progress()
+                .step_for(prepare)
+                .expect("prepare step")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+        let late_barrier = late.seal().expect("late barrier");
+        assert!(
+            late_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .is_some_and(|row| {
+                    matches!(
+                        row.outcome(),
+                        CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+                    )
+                })
+        );
+        assert!(
+            late_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .all(|row| row.key() != source)
+        );
+    }
+
+    #[test]
+    fn live_dispatch_owner_rejects_cross_owner_and_attempt_overflow_atomically() {
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("owner");
+        let source = key_for(owner.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = owner.issue(source).expect("source reservation");
+        let mut foreign =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("foreign owner");
+        let failure = foreign.enter(reserved).expect_err("cross-owner entry");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::PermitOwnerMismatch
+        );
+        let (error, reserved) = failure.into_parts();
+        assert_eq!(
+            error,
+            dispatch_owner::DispatchOwnerError::PermitOwnerMismatch
+        );
+        assert!(foreign.ledger_state(source).is_none());
+        owner
+            .return_reserved(reserved)
+            .expect("recover reservation");
+
+        let mut overflow =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("overflow owner");
+        let source = key_for(overflow.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = overflow.issue(source).expect("source reservation");
+        let source_entered = overflow.enter(source_reserved).expect("source entry");
+        overflow
+            .complete(source_entered, evidence_for(overflow.progress(), source, 7))
+            .expect("source completion");
+        let prepare = key_for(overflow.progress(), 0, WorkUnitRole::Prepare);
+        overflow.set_next_attempt_for_test(u64::MAX);
+        let before = overflow.progress().clone();
+        assert!(matches!(
+            overflow.issue(prepare),
+            Err(dispatch_owner::DispatchOwnerError::AttemptIdExhausted)
+        ));
+        assert_eq!(overflow.progress(), &before);
+        assert!(overflow.ledger_state(prepare).is_none());
+
+        let mut generation_overflow =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("generation-overflow owner");
+        generation_overflow.set_recovery_generation_for_test(u64::MAX);
+        generation_overflow
+            .request_cancellation(CancellationRequestObservation::new(17018).expect("cancel"))
+            .expect("generation-overflow cancellation");
+        assert!(matches!(
+            generation_overflow.seal(),
+            Err(dispatch_owner::DispatchOwnerError::RecoveryGenerationExhausted)
+        ));
+        assert_eq!(
+            generation_overflow.lifecycle(),
+            dispatch_owner::DispatchOwnerLifecycle::CancelDraining
+        );
     }
 }
