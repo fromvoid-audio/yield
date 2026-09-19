@@ -2,11 +2,12 @@
 //!
 //! This module captures the exact mutable progress observations together with the immutable
 //! intent retained by the caller.  The base validator checks topology, step shape, historical
-//! completion evidence, and direct prerequisite consistency.  It intentionally does not validate
-//! advanced phase, retry, audit, cancellation, recovery, or terminal semantics; a snapshot is
-//! not a durable schema, a restart record, or a progress authority. The production owner must
-//! retain this immutable intent from admission because capture cannot recover historical artifact
-//! provenance from the plan-only live progress value.
+//! completion evidence, direct prerequisite consistency, and the bounded internal shape of retry
+//! and audit overlays.  It intentionally does not validate advanced phase, cancellation,
+//! recovery, or terminal semantics; a snapshot is not a durable schema, a restart record, or a
+//! progress authority. The production owner must retain this immutable intent from admission
+//! because capture cannot recover historical artifact provenance from the plan-only live progress
+//! value.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,9 +19,10 @@ use super::super::participants::ParticipantValidationError;
 use super::super::work_plan::{WorkUnitApplicability, WorkUnitKey, WorkUnitRole};
 use super::{
     ActiveAudit, AdmissionClaimSettlementInventory, AfterEffectReconciliationObservation,
-    CancellationCleanupObservation, CancellationInventory, CancellationRequestObservation,
-    FullProgressDisposition, OperationPhase, ParticipantRequirement, ParticipantScope,
-    PrePublishCancellationObservation, ProgressStepStatus, RetryObservation, WorkProgress,
+    AuditTargetValidationError, CancellationCleanupObservation, CancellationInventory,
+    CancellationRequestObservation, FullProgressDisposition, OperationPhase,
+    ParticipantRequirement, ParticipantScope, PrePublishCancellationObservation,
+    ProgressStepStatus, RetryObservation, RetryObservationValidationError, WorkProgress,
     WorkProgressError, WorkProgressStep, historical_scope_matches_current,
     same_stable_source_identity,
 };
@@ -142,17 +144,105 @@ impl FullProgressSnapshotObservation {
     /// Validate this snapshot's topology and retained completion history without live progress.
     ///
     /// This is deliberately a partial consistency check.  It proves that the supplied intent,
-    /// current scopes, frozen plan rows, retained completion history, and direct prerequisite
-    /// relationships agree with one another, while preserving advanced state-family observations
-    /// without claiming to validate their recovery or terminal semantics.
+    /// current scopes, frozen plan rows, retained completion history, direct prerequisite
+    /// relationships, and the internal retry/audit observation shape agree with one another,
+    /// while preserving advanced state-family observations without claiming to validate their
+    /// recovery or terminal semantics.
     pub(crate) fn validate_base(&self) -> Result<(), FullProgressSnapshotObservationError> {
         self.intent
             .validate()
             .map_err(FullProgressSnapshotObservationError::Intent)?;
         self.validate_scopes()?;
         self.validate_step_bounds()?;
+        self.validate_retry_state()?;
+        self.validate_audit_state()?;
         let validation_progress = self.validation_progress();
         self.validate_steps(&validation_progress)?;
+        Ok(())
+    }
+
+    fn validate_retry_state(&self) -> Result<(), FullProgressSnapshotObservationError> {
+        for (slot, observation) in [
+            ("active", self.retry_observation.as_ref()),
+            ("last", self.last_retry_observation.as_ref()),
+        ] {
+            let Some(observation) = observation else {
+                continue;
+            };
+            observation.validate().map_err(|source| {
+                FullProgressSnapshotObservationError::RetryObservation { slot, source }
+            })?;
+            if observation.lease_expiry_unix_ms() <= observation.next_retry_unix_ms() {
+                return Err(FullProgressSnapshotObservationError::RetryWindowEmpty {
+                    slot,
+                    next_retry_unix_ms: observation.next_retry_unix_ms(),
+                    lease_expiry_unix_ms: observation.lease_expiry_unix_ms(),
+                });
+            }
+        }
+
+        if let Some(active) = self.retry_observation.as_ref() {
+            let Some(last) = self.last_retry_observation.as_ref() else {
+                return Err(FullProgressSnapshotObservationError::RetryHistoryMissing);
+            };
+            if active != last {
+                return Err(FullProgressSnapshotObservationError::RetryObservationMismatch);
+            }
+        }
+        if self.disposition == FullProgressDisposition::RetryPending
+            && self.retry_observation.is_none()
+        {
+            return Err(FullProgressSnapshotObservationError::RetryPendingObservationMissing);
+        }
+        Ok(())
+    }
+
+    fn validate_audit_state(&self) -> Result<(), FullProgressSnapshotObservationError> {
+        match self.active_audit.as_ref() {
+            Some(active) => {
+                if self.disposition != FullProgressDisposition::AuditRequired {
+                    return Err(
+                        FullProgressSnapshotObservationError::AuditDispositionMismatch {
+                            disposition: self.disposition,
+                        },
+                    );
+                }
+                if active.generation == 0 {
+                    return Err(FullProgressSnapshotObservationError::AuditGenerationZero);
+                }
+                if active.generation != self.audit_generation {
+                    return Err(
+                        FullProgressSnapshotObservationError::AuditGenerationMismatch {
+                            active: active.generation,
+                            retained: self.audit_generation,
+                        },
+                    );
+                }
+                active
+                    .observation
+                    .validate_for_plan(self.intent.plan())
+                    .map_err(FullProgressSnapshotObservationError::AuditObservation)?;
+                match active.suspended_hold {
+                    super::AuditSuspendedHold::RetryPending if self.retry_observation.is_none() => {
+                        return Err(FullProgressSnapshotObservationError::AuditRetryHoldMissing);
+                    }
+                    super::AuditSuspendedHold::CancelRequestedBeforePublish
+                    | super::AuditSuspendedHold::CancelRequestedAfterPublish
+                    | super::AuditSuspendedHold::CancelRequestedAfterObservedEffect
+                        if self.cancellation_request.is_none() =>
+                    {
+                        return Err(
+                            FullProgressSnapshotObservationError::AuditCancellationHoldMissing,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            None if self.disposition == FullProgressDisposition::AuditRequired => {
+                return Err(FullProgressSnapshotObservationError::AuditStateMissing);
+            }
+            None => {}
+        }
         Ok(())
     }
 
@@ -545,6 +635,61 @@ pub enum FullProgressSnapshotObservationError {
     /// The snapshot had the wrong number of progress rows.
     #[error("full-progress snapshot has {actual} steps, expected {expected}")]
     StepCountMismatch { actual: usize, expected: usize },
+    /// A retained retry observation failed its bounded validation.
+    #[error("invalid full-progress snapshot {slot} retry observation: {source}")]
+    RetryObservation {
+        /// Retry observation slot being validated.
+        slot: &'static str,
+        #[source]
+        /// Underlying retry observation error.
+        source: RetryObservationValidationError,
+    },
+    /// A retained retry lease ended at or before its next retry boundary.
+    #[error(
+        "full-progress snapshot {slot} retry lease expires at {lease_expiry_unix_ms}, not after next retry {next_retry_unix_ms}"
+    )]
+    RetryWindowEmpty {
+        /// Retry observation slot being validated.
+        slot: &'static str,
+        /// Next retry timestamp.
+        next_retry_unix_ms: i64,
+        /// Lease expiry timestamp.
+        lease_expiry_unix_ms: i64,
+    },
+    /// An active retry did not retain the exact historical retry observation.
+    #[error("full-progress snapshot active retry observation has no matching last observation")]
+    RetryHistoryMissing,
+    /// Active and last retry observations disagree.
+    #[error("full-progress snapshot active and last retry observations differ")]
+    RetryObservationMismatch,
+    /// RetryPending disposition had no active retry observation.
+    #[error("full-progress snapshot RetryPending disposition has no active retry observation")]
+    RetryPendingObservationMissing,
+    /// A retained audit observation failed its bounded target validation.
+    #[error("invalid full-progress snapshot audit observation: {0}")]
+    AuditObservation(#[source] AuditTargetValidationError),
+    /// AuditRequired disposition had no active audit overlay.
+    #[error("full-progress snapshot AuditRequired disposition has no active audit overlay")]
+    AuditStateMissing,
+    /// An active audit overlay was retained under another disposition.
+    #[error("full-progress snapshot active audit is retained under disposition {disposition:?}")]
+    AuditDispositionMismatch {
+        disposition: FullProgressDisposition,
+    },
+    /// An active audit overlay must have a positive generation.
+    #[error("full-progress snapshot active audit generation must be positive")]
+    AuditGenerationZero,
+    /// Active audit generation differed from retained audit generation.
+    #[error(
+        "full-progress snapshot active audit generation {active} differs from retained generation {retained}"
+    )]
+    AuditGenerationMismatch { active: u64, retained: u64 },
+    /// An audit suspended a retry without retaining its retry observation.
+    #[error("full-progress snapshot audit retry hold has no retry observation")]
+    AuditRetryHoldMissing,
+    /// An audit suspended cancellation without retaining its request observation.
+    #[error("full-progress snapshot audit cancellation hold has no cancellation request")]
+    AuditCancellationHoldMissing,
     /// A progress row key differs from the frozen plan.
     #[error("full-progress snapshot step {index} key {actual:?} does not match {expected:?}")]
     StepKeyMismatch {

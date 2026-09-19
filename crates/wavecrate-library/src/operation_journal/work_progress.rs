@@ -19679,6 +19679,234 @@ mod tests {
     }
 
     #[test]
+    fn full_progress_snapshot_validates_retry_history_and_clearing() {
+        let mut retry = copy_progress_with_admission_claims();
+        let retry_observation = RetryObservation::new(
+            1,
+            100,
+            200,
+            RetryLeaseId::new("snapshot-retry-state").expect("retry lease"),
+            300,
+            RetryErrorClass::TransientAvailability,
+            "snapshot retry state",
+            None,
+        )
+        .expect("retry observation");
+        retry
+            .request_retry(retry_observation.clone())
+            .expect("request retry");
+        let snapshot = retry
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retry))
+            .expect("active retry snapshot");
+        snapshot.validate_base().expect("valid active retry");
+
+        let mut mismatch = serde_json::to_value(&snapshot).expect("snapshot value");
+        mismatch["retry_observation"]["attempt"] = json!(2);
+        let mismatch: FullProgressSnapshotObservation =
+            serde_json::from_value(mismatch).expect("mismatched retry shape");
+        assert!(matches!(
+            mismatch.validate_base(),
+            Err(FullProgressSnapshotObservationError::RetryObservationMismatch)
+        ));
+
+        let mut missing_last = serde_json::to_value(&snapshot).expect("snapshot value");
+        missing_last["last_retry_observation"] = serde_json::Value::Null;
+        let missing_last: FullProgressSnapshotObservation =
+            serde_json::from_value(missing_last).expect("missing last retry shape");
+        assert!(matches!(
+            missing_last.validate_base(),
+            Err(FullProgressSnapshotObservationError::RetryHistoryMissing)
+        ));
+
+        let mut missing_active = serde_json::to_value(&snapshot).expect("snapshot value");
+        missing_active["retry_observation"] = serde_json::Value::Null;
+        let missing_active: FullProgressSnapshotObservation =
+            serde_json::from_value(missing_active).expect("missing active retry shape");
+        assert!(matches!(
+            missing_active.validate_base(),
+            Err(FullProgressSnapshotObservationError::RetryPendingObservationMissing)
+        ));
+
+        let mut empty_window = serde_json::to_value(&snapshot).expect("snapshot value");
+        empty_window["retry_observation"]["lease_expiry_unix_ms"] = json!(200);
+        let empty_window: FullProgressSnapshotObservation =
+            serde_json::from_value(empty_window).expect("empty retry window shape");
+        assert!(matches!(
+            empty_window.validate_base(),
+            Err(FullProgressSnapshotObservationError::RetryWindowEmpty { slot: "active", .. })
+        ));
+
+        let mut malformed = serde_json::to_value(&snapshot).expect("snapshot value");
+        malformed["retry_observation"]["attempt"] = json!(0);
+        let malformed: FullProgressSnapshotObservation =
+            serde_json::from_value(malformed).expect("malformed retry shape");
+        assert!(matches!(
+            malformed.validate_base(),
+            Err(FullProgressSnapshotObservationError::RetryObservation {
+                slot: "active",
+                source: RetryObservationValidationError::ZeroAttempt,
+            })
+        ));
+
+        let mut resumed = retry.clone();
+        resumed
+            .resume_retry(VerifiedRetryResume {
+                operation_id: resumed.operation_id,
+                plan: resumed.plan.clone(),
+                retry_observation,
+                now_unix_ms: 200,
+                expected_execution_epoch: 0,
+            })
+            .expect("resume retry");
+        let resumed_snapshot = resumed
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&resumed))
+            .expect("resumed retry snapshot");
+        assert!(resumed_snapshot.retry_observation().is_none());
+        assert!(resumed_snapshot.last_retry_observation().is_some());
+        resumed_snapshot
+            .validate_base()
+            .expect("cleared active retry remains valid");
+        publish_prefix(&mut resumed);
+        resumed
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&resumed))
+            .expect("normal completion after retry resume")
+            .validate_base()
+            .expect("normal completion clears active retry");
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_audit_overlay_and_suspended_holds() {
+        let mut audit = copy_progress_with_admission_claims();
+        publish_prefix(&mut audit);
+        audit
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("require audit");
+        let snapshot = audit
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&audit))
+            .expect("active audit snapshot");
+        snapshot.validate_base().expect("valid active audit");
+
+        let mut missing = serde_json::to_value(&snapshot).expect("snapshot value");
+        missing["active_audit"] = serde_json::Value::Null;
+        let missing: FullProgressSnapshotObservation =
+            serde_json::from_value(missing).expect("missing audit shape");
+        assert!(matches!(
+            missing.validate_base(),
+            Err(FullProgressSnapshotObservationError::AuditStateMissing)
+        ));
+
+        let mut forbidden = serde_json::to_value(&snapshot).expect("snapshot value");
+        forbidden["disposition"] = json!("None");
+        let forbidden: FullProgressSnapshotObservation =
+            serde_json::from_value(forbidden).expect("forbidden audit disposition shape");
+        assert!(matches!(
+            forbidden.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AuditDispositionMismatch {
+                    disposition: FullProgressDisposition::None,
+                }
+            )
+        ));
+
+        let mut zero_generation = serde_json::to_value(&snapshot).expect("snapshot value");
+        zero_generation["active_audit"]["generation"] = json!(0);
+        let zero_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(zero_generation).expect("zero audit generation shape");
+        assert!(matches!(
+            zero_generation.validate_base(),
+            Err(FullProgressSnapshotObservationError::AuditGenerationZero)
+        ));
+
+        let mut generation_mismatch = serde_json::to_value(&snapshot).expect("snapshot value");
+        generation_mismatch["active_audit"]["generation"] = json!(2);
+        let generation_mismatch: FullProgressSnapshotObservation =
+            serde_json::from_value(generation_mismatch).expect("audit generation shape");
+        assert!(matches!(
+            generation_mismatch.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::AuditGenerationMismatch {
+                    active: 2,
+                    retained: 1,
+                }
+            )
+        ));
+
+        let mut invalid_target = serde_json::to_value(&snapshot).expect("snapshot value");
+        invalid_target["active_audit"]["observation"]["target"] = json!({ "Steps": [] });
+        let invalid_target: FullProgressSnapshotObservation =
+            serde_json::from_value(invalid_target).expect("invalid audit target shape");
+        assert!(matches!(
+            invalid_target.validate_base(),
+            Err(FullProgressSnapshotObservationError::AuditObservation(
+                AuditTargetValidationError::Empty
+            ))
+        ));
+
+        let mut retry = copy_progress_with_admission_claims();
+        publish_prefix(&mut retry);
+        let retry_observation = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("snapshot-audit-hold").expect("retry lease"),
+            10,
+            RetryErrorClass::TransientContention,
+            "audit hold",
+            None,
+        )
+        .expect("retry observation");
+        retry
+            .request_retry(retry_observation.clone())
+            .expect("request retry");
+        retry
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::UncertainEvidence,
+            ))
+            .expect("audit over retry");
+        retry
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retry))
+            .expect("retry audit snapshot")
+            .validate_base()
+            .expect("retry remains retained under audit");
+        retry
+            .request_cancellation(CancellationRequestObservation::new(18102).expect("cancel"))
+            .expect("cancellation under audit");
+        retry
+            .resolve_audit(audit_resolution_authority(&retry, 1, 0))
+            .expect("resolve retry cancellation audit");
+        assert_eq!(
+            retry.disposition(),
+            FullProgressDisposition::CancelRequestedAfterPublish
+        );
+        retry
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retry))
+            .expect("retry retained after audit resolution")
+            .validate_base()
+            .expect("retry remains retained under cancellation");
+
+        let mut resolved = copy_progress_with_admission_claims();
+        publish_prefix(&mut resolved);
+        resolved
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("require audit for history");
+        resolved
+            .resolve_audit(audit_resolution_authority(&resolved, 1, 0))
+            .expect("resolve audit for history");
+        let resolved_snapshot = resolved
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&resolved))
+            .expect("historical audit generation snapshot");
+        assert!(resolved_snapshot.audit_observation().is_none());
+        assert_eq!(resolved_snapshot.audit_generation(), 1);
+        resolved_snapshot
+            .validate_base()
+            .expect("historical audit generation without active overlay");
+    }
+
+    #[test]
     fn snapshot_nested_observation_payloads_reject_unknown_fields() {
         fn assert_unknown_payload_rejected<T>(value: T)
         where
