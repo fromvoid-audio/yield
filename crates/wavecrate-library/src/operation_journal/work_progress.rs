@@ -900,6 +900,66 @@ pub struct PrePublishCancellationObservation {
     dispatch_outcome: Option<CancellationDispatchOutcomeRecord>,
 }
 
+/// Immutable accepted cancellation-local after-effect reconciliation state.
+///
+/// This value retains the complete refined effect inventory and both cancellation-local receipt
+/// records.  It is an in-memory observation only: it does not complete normal progress, release
+/// claims, perform cleanup, establish a terminal disposition, or issue any live participant
+/// authority.  A fresh private authority must validate a candidate before this value is stored.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AfterEffectReconciliationObservation {
+    recovery_inventory: CancellationEffectRecoveryInventory,
+    source_closure_observation: CancellationSourceClosureObservationRecord,
+    coordinator_closure_observation: CancellationCoordinatorClosureObservationRecord,
+    execution_epoch: u64,
+    recovery_generation: u64,
+}
+
+impl AfterEffectReconciliationObservation {
+    fn new(
+        recovery_inventory: CancellationEffectRecoveryInventory,
+        source_closure_observation: CancellationSourceClosureObservationRecord,
+        coordinator_closure_observation: CancellationCoordinatorClosureObservationRecord,
+        execution_epoch: u64,
+        recovery_generation: u64,
+    ) -> Self {
+        Self {
+            recovery_inventory,
+            source_closure_observation,
+            coordinator_closure_observation,
+            execution_epoch,
+            recovery_generation,
+        }
+    }
+
+    /// Borrow the exact accepted after-effect recovery inventory.
+    pub fn recovery_inventory(&self) -> &CancellationEffectRecoveryInventory {
+        &self.recovery_inventory
+    }
+
+    /// Borrow the exact accepted source-closure observation.
+    pub fn source_closure_observation(&self) -> &CancellationSourceClosureObservationRecord {
+        &self.source_closure_observation
+    }
+
+    /// Borrow the exact accepted coordinator-closure observation.
+    pub fn coordinator_closure_observation(
+        &self,
+    ) -> &CancellationCoordinatorClosureObservationRecord {
+        &self.coordinator_closure_observation
+    }
+
+    /// Return the execution epoch accepted with this reconciliation state.
+    pub const fn execution_epoch(&self) -> u64 {
+        self.execution_epoch
+    }
+
+    /// Return the recovery-observation generation accepted with this state.
+    pub const fn recovery_generation(&self) -> u64 {
+        self.recovery_generation
+    }
+}
+
 /// Failure while validating the bounded local shape of prepublication cleanup observations.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum PrePublishCleanupValidationError {
@@ -1154,6 +1214,24 @@ struct VerifiedPrePublishCancellation {
     dispatch_outcome: CancellationDispatchOutcomeRecord,
 }
 
+/// Private owner-issued authority for retaining one current after-effect reconciliation state.
+///
+/// The authority is deliberately non-serialized and has no production constructor.  A future
+/// owner must bind the operation, exact plan, current execution epoch, frozen cancellation
+/// inventory, and explicit refined cancellation-local records before handing it to progress.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct VerifiedAfterEffectReconciliation {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    cancellation_inventory: CancellationInventory,
+    expected_recovery_generation: u64,
+    recovery_inventory: CancellationEffectRecoveryInventory,
+    source_closure_observation: CancellationSourceClosureObservationRecord,
+    coordinator_closure_observation: CancellationCoordinatorClosureObservationRecord,
+}
+
 /// Origin state required by one prepublication cleanup action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrePublishOriginPolicy {
@@ -1201,6 +1279,7 @@ pub struct WorkProgress {
     origin_policies: Vec<PrePublishActionPolicy>,
     recovery_generation: u64,
     pre_publish_cancellation: Option<PrePublishCancellationObservation>,
+    after_effect_reconciliation: Option<AfterEffectReconciliationObservation>,
 }
 
 #[allow(dead_code)]
@@ -1261,6 +1340,7 @@ impl WorkProgress {
             origin_policies: derive_origin_policies(args, plan),
             recovery_generation: 0,
             pre_publish_cancellation: None,
+            after_effect_reconciliation: None,
         })
     }
 
@@ -1765,6 +1845,210 @@ impl WorkProgress {
         Ok(())
     }
 
+    /// Accept one private, current-epoch after-effect reconciliation state without changing
+    /// normal progress or deriving a terminal cancellation outcome.
+    #[allow(dead_code)]
+    fn accept_after_effect_reconciliation(
+        &mut self,
+        authority: VerifiedAfterEffectReconciliation,
+    ) -> Result<(), WorkProgressError> {
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::AfterEffectReconciliationAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::AfterEffectReconciliationEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        if self.active_audit.is_some() || self.disposition == FullProgressDisposition::AuditRequired
+        {
+            return Err(WorkProgressError::AfterEffectReconciliationAuditActive);
+        }
+        if self.disposition.is_terminal() {
+            return Err(WorkProgressError::TerminalTransitionForbidden);
+        }
+        let Some(cancellation_request) = self.cancellation_request else {
+            return Err(WorkProgressError::CancellationNotRequested);
+        };
+        let Some(current_inventory) = self.cancellation_inventory.as_ref() else {
+            return Err(WorkProgressError::CancellationInventoryMissing);
+        };
+        let expected_disposition = match current_inventory.route() {
+            CancellationRoute::BeforePublish => {
+                FullProgressDisposition::CancelRequestedBeforePublish
+            }
+            CancellationRoute::AfterPublish => FullProgressDisposition::CancelRequestedAfterPublish,
+            CancellationRoute::AfterObservedEffect => {
+                FullProgressDisposition::CancelRequestedAfterObservedEffect
+            }
+        };
+        if self.disposition != expected_disposition {
+            return Err(WorkProgressError::AfterEffectReconciliationStateInvalid);
+        }
+        if authority.cancellation_inventory != *current_inventory {
+            return Err(WorkProgressError::AfterEffectReconciliationInventoryMismatch);
+        }
+        authority.cancellation_inventory.validate_against(
+            self.operation_id,
+            &self.plan,
+            &self.steps,
+            self.execution_epoch,
+            self.admission_claims
+                .as_ref()
+                .ok_or(WorkProgressError::CancellationAdmissionClaimsMissing)?,
+        )?;
+        let dispatch_outcome = authority.recovery_inventory.dispatch_outcome();
+        if dispatch_outcome.observation_epoch() != self.execution_epoch {
+            return Err(
+                WorkProgressError::AfterEffectReconciliationDispatchEpochMismatch {
+                    expected: self.execution_epoch,
+                    actual: dispatch_outcome.observation_epoch(),
+                },
+            );
+        }
+        if authority.source_closure_observation.observation_epoch() != self.execution_epoch {
+            return Err(
+                WorkProgressError::AfterEffectReconciliationSourceClosureEpochMismatch {
+                    expected: self.execution_epoch,
+                    actual: authority.source_closure_observation.observation_epoch(),
+                },
+            );
+        }
+        if authority
+            .coordinator_closure_observation
+            .observation_epoch()
+            != self.execution_epoch
+        {
+            return Err(
+                WorkProgressError::AfterEffectReconciliationCoordinatorClosureEpochMismatch {
+                    expected: self.execution_epoch,
+                    actual: authority
+                        .coordinator_closure_observation
+                        .observation_epoch(),
+                },
+            );
+        }
+
+        // Validate every explicit lineage and nested historical receipt before consulting or
+        // changing the accepted after-effect state.  These methods intentionally take explicit
+        // expected records, so a candidate cannot silently substitute retained state.
+        self.validate_completion_history()?;
+        self.validate_cancellation_effect_recovery_inventory(
+            &authority.recovery_inventory,
+            dispatch_outcome,
+        )?;
+        self.validate_cancellation_source_closure_observation_record(
+            &authority.source_closure_observation,
+            &authority.recovery_inventory,
+            dispatch_outcome,
+        )?;
+        self.validate_cancellation_coordinator_closure_observation_record(
+            &authority.coordinator_closure_observation,
+            &authority.source_closure_observation,
+            &authority.recovery_inventory,
+            dispatch_outcome,
+        )?;
+        validate_after_effect_phase_gates(
+            dispatch_outcome,
+            &authority.source_closure_observation,
+            &authority.coordinator_closure_observation,
+        )?;
+
+        let generation_is_current =
+            authority.expected_recovery_generation == self.recovery_generation;
+        let generation_is_replay = authority
+            .expected_recovery_generation
+            .checked_add(1)
+            .is_some_and(|generation| generation == self.recovery_generation);
+        let existing = self.after_effect_reconciliation.as_ref();
+        let candidate_matches_existing = existing.is_some_and(|existing| {
+            existing.recovery_inventory == authority.recovery_inventory
+                && existing.source_closure_observation == authority.source_closure_observation
+                && existing.coordinator_closure_observation
+                    == authority.coordinator_closure_observation
+                && existing.execution_epoch == authority.execution_epoch
+        });
+        if candidate_matches_existing {
+            if (generation_is_current || generation_is_replay)
+                && existing
+                    .is_some_and(|state| state.recovery_generation == self.recovery_generation)
+            {
+                return Ok(());
+            }
+        }
+        if !generation_is_current {
+            return Err(
+                WorkProgressError::AfterEffectReconciliationGenerationMismatch {
+                    expected: self.recovery_generation,
+                    actual: authority.expected_recovery_generation,
+                },
+            );
+        }
+        let next_recovery_generation = self
+            .recovery_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::AfterEffectReconciliationGenerationOverflow)?;
+        let previous_dispatch = self
+            .after_effect_reconciliation
+            .as_ref()
+            .map(|state| state.recovery_inventory.dispatch_outcome())
+            .or_else(|| {
+                self.pre_publish_cancellation
+                    .as_ref()
+                    .and_then(PrePublishCancellationObservation::dispatch_outcome)
+            });
+        let dispatch_replays_previous =
+            previous_dispatch.is_some_and(|previous| previous == dispatch_outcome);
+        if !dispatch_replays_previous
+            && dispatch_outcome.recovery_generation() != next_recovery_generation
+        {
+            return Err(
+                WorkProgressError::AfterEffectReconciliationDispatchGenerationMismatch {
+                    expected: next_recovery_generation,
+                    actual: dispatch_outcome.recovery_generation(),
+                },
+            );
+        }
+        if let Some(previous_dispatch) = previous_dispatch {
+            if !dispatch_replays_previous {
+                dispatch_outcome
+                    .validate_transition(previous_dispatch, self.execution_epoch)
+                    .map_err(WorkProgressError::CancellationDispatchOutcome)?;
+            }
+        }
+        if let Some(previous) = existing {
+            if previous.source_closure_observation() != &authority.source_closure_observation {
+                validate_after_effect_source_transition(
+                    previous.source_closure_observation(),
+                    &authority.source_closure_observation,
+                )?;
+            }
+            if previous.coordinator_closure_observation()
+                != &authority.coordinator_closure_observation
+            {
+                validate_after_effect_coordinator_transition(
+                    previous.coordinator_closure_observation(),
+                    &authority.coordinator_closure_observation,
+                )?;
+            }
+        }
+
+        // The request is intentionally read above to make the cancellation hold explicit.  Keep
+        // the value live through validation so a future owner integration cannot accidentally
+        // turn this method into a generic post-operation state setter.
+        let _ = cancellation_request;
+        self.after_effect_reconciliation = Some(AfterEffectReconciliationObservation::new(
+            authority.recovery_inventory,
+            authority.source_closure_observation,
+            authority.coordinator_closure_observation,
+            authority.execution_epoch,
+            next_recovery_generation,
+        ));
+        self.recovery_generation = next_recovery_generation;
+        Ok(())
+    }
+
     /// Return the bounded recovery-observation generation.
     pub const fn recovery_generation(&self) -> u64 {
         self.recovery_generation
@@ -1773,6 +2057,11 @@ impl WorkProgress {
     /// Borrow the retained prepublication cancellation observation, when present.
     pub fn pre_publish_cancellation(&self) -> Option<&PrePublishCancellationObservation> {
         self.pre_publish_cancellation.as_ref()
+    }
+
+    /// Borrow the accepted nonterminal after-effect reconciliation state, when present.
+    pub fn after_effect_reconciliation(&self) -> Option<&AfterEffectReconciliationObservation> {
+        self.after_effect_reconciliation.as_ref()
     }
 
     /// Record a bounded retry disposition without changing any step completion.
@@ -2380,6 +2669,9 @@ impl WorkProgress {
     ) -> Result<(), WorkProgressError> {
         if authority.operation_id != self.operation_id || authority.plan != self.plan {
             return Err(WorkProgressError::PrePublishCancellationAuthorityMismatch);
+        }
+        if self.after_effect_reconciliation.is_some() {
+            return Err(WorkProgressError::PrePublishCancellationAfterEffectReconciliationActive);
         }
         if authority.execution_epoch != self.execution_epoch {
             return Err(WorkProgressError::PrePublishCancellationEpochMismatch {
@@ -3207,6 +3499,56 @@ impl WorkProgress {
                 }
             }
         }
+        if let Some(accepted) = self.after_effect_reconciliation.as_ref() {
+            for row in accepted.recovery_inventory().dispatch_outcome().rows() {
+                let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                if context
+                    .scope()
+                    .source_fence()
+                    .is_some_and(|candidate| candidate == fence)
+                {
+                    if let Some(observation) = source_observation_for_evidence(evidence) {
+                        minimum = Some(minimum.unwrap_or(0).max(observation.revision()));
+                    }
+                }
+            }
+            for row in accepted.source_closure_observation().rows() {
+                let CancellationSourceClosureOutcome::Observed { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                if context
+                    .scope()
+                    .source_fence()
+                    .is_some_and(|candidate| candidate == fence)
+                {
+                    if let Some(observation) = source_observation_for_evidence(evidence) {
+                        minimum = Some(minimum.unwrap_or(0).max(observation.revision()));
+                    }
+                }
+            }
+            for row in accepted.coordinator_closure_observation().rows() {
+                let CancellationCoordinatorClosureOutcome::Observed { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                if context
+                    .scope()
+                    .source_fence()
+                    .is_some_and(|candidate| candidate == fence)
+                {
+                    if let Some(observation) = source_observation_for_evidence(evidence) {
+                        minimum = Some(minimum.unwrap_or(0).max(observation.revision()));
+                    }
+                }
+            }
+        }
         minimum
     }
 
@@ -3246,6 +3588,62 @@ impl WorkProgress {
         {
             for row in record.rows() {
                 let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                let Some(context_fence) = context.scope().source_fence() else {
+                    continue;
+                };
+                if !same_stable_source_identity(context_fence, fence) {
+                    continue;
+                }
+                if let Some(observation) = source_observation_for_evidence(evidence) {
+                    if same_stable_source_identity_observation(observation, fence) {
+                        minimum = minimum.max(observation.revision());
+                    }
+                }
+            }
+        }
+        if let Some(accepted) = self.after_effect_reconciliation.as_ref() {
+            for row in accepted.recovery_inventory().dispatch_outcome().rows() {
+                let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                let Some(context_fence) = context.scope().source_fence() else {
+                    continue;
+                };
+                if !same_stable_source_identity(context_fence, fence) {
+                    continue;
+                }
+                if let Some(observation) = source_observation_for_evidence(evidence) {
+                    if same_stable_source_identity_observation(observation, fence) {
+                        minimum = minimum.max(observation.revision());
+                    }
+                }
+            }
+            for row in accepted.source_closure_observation().rows() {
+                let CancellationSourceClosureOutcome::Observed { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                let Some(context_fence) = context.scope().source_fence() else {
+                    continue;
+                };
+                if !same_stable_source_identity(context_fence, fence) {
+                    continue;
+                }
+                if let Some(observation) = source_observation_for_evidence(evidence) {
+                    if same_stable_source_identity_observation(observation, fence) {
+                        minimum = minimum.max(observation.revision());
+                    }
+                }
+            }
+            for row in accepted.coordinator_closure_observation().rows() {
+                let CancellationCoordinatorClosureOutcome::Observed { evidence, context } =
                     row.outcome()
                 else {
                     continue;
@@ -3499,6 +3897,131 @@ fn validate_pre_publish_unstarted_quiescence_transition(
                 != Some(PrePublishAbsenceObservation::Absent);
         if quiescence_regressed || staging_regressed || recovery_regressed {
             return Err(WorkProgressError::PrePublishCancellationQuiescenceReplayConflict);
+        }
+    }
+    Ok(())
+}
+
+fn validate_after_effect_phase_gates(
+    dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    source_closure_observation: &CancellationSourceClosureObservationRecord,
+    coordinator_closure_observation: &CancellationCoordinatorClosureObservationRecord,
+) -> Result<(), WorkProgressError> {
+    let dispatch_determinate = dispatch_outcome
+        .rows()
+        .iter()
+        .all(|row| !matches!(row.outcome(), CancellationDispatchOutcome::EntryUncertain));
+    let source_observed = source_closure_observation.rows().iter().any(|row| {
+        matches!(
+            row.outcome(),
+            CancellationSourceClosureOutcome::Observed { .. }
+        )
+    });
+    let coordinator_observed = coordinator_closure_observation.rows().iter().any(|row| {
+        matches!(
+            row.outcome(),
+            CancellationCoordinatorClosureOutcome::Observed { .. }
+        )
+    });
+    if !dispatch_determinate && (source_observed || coordinator_observed) {
+        return Err(WorkProgressError::AfterEffectReconciliationDispatchIndeterminate);
+    }
+    if coordinator_observed
+        && source_closure_observation
+            .rows()
+            .iter()
+            .any(|row| matches!(row.outcome(), CancellationSourceClosureOutcome::Pending))
+    {
+        return Err(WorkProgressError::AfterEffectReconciliationSourceClosureIncomplete);
+    }
+    Ok(())
+}
+
+fn validate_after_effect_source_transition(
+    previous: &CancellationSourceClosureObservationRecord,
+    candidate: &CancellationSourceClosureObservationRecord,
+) -> Result<(), WorkProgressError> {
+    if candidate.observation_generation() <= previous.observation_generation() {
+        return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+    }
+    let previous_has_observed = previous.rows().iter().any(|row| {
+        matches!(
+            row.outcome(),
+            CancellationSourceClosureOutcome::Observed { .. }
+        )
+    });
+    if previous_has_observed && previous.manifest().keys() != candidate.manifest().keys() {
+        return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+    }
+    for previous_row in previous.rows() {
+        let Some(candidate_row) = candidate
+            .rows()
+            .iter()
+            .find(|row| row.key() == previous_row.key())
+        else {
+            if matches!(
+                previous_row.outcome(),
+                CancellationSourceClosureOutcome::Observed { .. }
+            ) {
+                return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+            }
+            continue;
+        };
+        if let CancellationSourceClosureOutcome::Observed { .. } = previous_row.outcome()
+            && candidate_row.outcome() != previous_row.outcome()
+        {
+            return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+        }
+    }
+    Ok(())
+}
+
+fn validate_after_effect_coordinator_transition(
+    previous: &CancellationCoordinatorClosureObservationRecord,
+    candidate: &CancellationCoordinatorClosureObservationRecord,
+) -> Result<(), WorkProgressError> {
+    if candidate.observation_generation() <= previous.observation_generation() {
+        return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+    }
+    let previous_has_observed = previous.rows().iter().any(|row| {
+        matches!(
+            row.outcome(),
+            CancellationCoordinatorClosureOutcome::Observed { .. }
+        )
+    });
+    if previous_has_observed
+        && (previous.manifest().keys() != candidate.manifest().keys()
+            || previous
+                .manifest()
+                .source_closure_observation()
+                .manifest()
+                .keys()
+                != candidate
+                    .manifest()
+                    .source_closure_observation()
+                    .manifest()
+                    .keys())
+    {
+        return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+    }
+    for previous_row in previous.rows() {
+        let Some(candidate_row) = candidate
+            .rows()
+            .iter()
+            .find(|row| row.key() == previous_row.key())
+        else {
+            if matches!(
+                previous_row.outcome(),
+                CancellationCoordinatorClosureOutcome::Observed { .. }
+            ) {
+                return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
+            }
+            continue;
+        };
+        if let CancellationCoordinatorClosureOutcome::Observed { .. } = previous_row.outcome()
+            && candidate_row.outcome() != previous_row.outcome()
+        {
+            return Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict);
         }
     }
     Ok(())
@@ -3837,6 +4360,99 @@ pub enum WorkProgressError {
     CancellationCoordinatorClosureObservation(
         #[source] CancellationCoordinatorClosureObservationRecordError,
     ),
+    /// The private after-effect reconciliation authority did not bind this operation or plan.
+    #[error("work progress after-effect reconciliation authority does not match")]
+    AfterEffectReconciliationAuthorityMismatch,
+    /// The private after-effect reconciliation authority carried another execution epoch.
+    #[error(
+        "work progress after-effect reconciliation epoch {actual} does not match expected epoch {expected}"
+    )]
+    AfterEffectReconciliationEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the authority.
+        actual: u64,
+    },
+    /// The retained dispatch record was not captured at the current owner epoch.
+    #[error(
+        "work progress after-effect dispatch epoch {actual} does not match expected epoch {expected}"
+    )]
+    AfterEffectReconciliationDispatchEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the dispatch record.
+        actual: u64,
+    },
+    /// The retained source-closure record was not captured at the current owner epoch.
+    #[error(
+        "work progress after-effect source-closure epoch {actual} does not match expected epoch {expected}"
+    )]
+    AfterEffectReconciliationSourceClosureEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the source-closure record.
+        actual: u64,
+    },
+    /// The retained coordinator-closure record was not captured at the current owner epoch.
+    #[error(
+        "work progress after-effect coordinator-closure epoch {actual} does not match expected epoch {expected}"
+    )]
+    AfterEffectReconciliationCoordinatorClosureEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the coordinator-closure record.
+        actual: u64,
+    },
+    /// A retained after-effect state did not bind the frozen cancellation inventory.
+    #[error("work progress after-effect reconciliation cancellation inventory does not match")]
+    AfterEffectReconciliationInventoryMismatch,
+    /// The accepted after-effect generation could not advance without wrapping.
+    #[error("work progress after-effect reconciliation generation overflowed")]
+    AfterEffectReconciliationGenerationOverflow,
+    /// The authority expected another accepted after-effect generation.
+    #[error(
+        "work progress after-effect reconciliation generation {actual} does not match expected generation {expected}"
+    )]
+    AfterEffectReconciliationGenerationMismatch {
+        /// Generation currently retained by progress.
+        expected: u64,
+        /// Generation supplied by the authority.
+        actual: u64,
+    },
+    /// A changed after-effect dispatch record did not advance with the accepted state.
+    #[error(
+        "work progress after-effect dispatch generation {actual} does not match expected generation {expected}"
+    )]
+    AfterEffectReconciliationDispatchGenerationMismatch {
+        /// Generation required for a changed accepted state.
+        expected: u64,
+        /// Generation supplied by the dispatch record.
+        actual: u64,
+    },
+    /// The cancellation route or disposition cannot retain this after-effect observation.
+    #[error("work progress after-effect reconciliation state is invalid")]
+    AfterEffectReconciliationStateInvalid,
+    /// An audit overlay is active and must be resolved before accepting after-effect state.
+    #[error("work progress after-effect reconciliation cannot be accepted while audit is active")]
+    AfterEffectReconciliationAuditActive,
+    /// A late source or coordinator receipt was retained while dispatch remained uncertain.
+    #[error(
+        "work progress after-effect reconciliation requires determinate dispatch before retaining late receipts"
+    )]
+    AfterEffectReconciliationDispatchIndeterminate,
+    /// A coordinator receipt was retained before every required source receipt was observed.
+    #[error(
+        "work progress after-effect reconciliation requires all source closures before coordinator receipts"
+    )]
+    AfterEffectReconciliationSourceClosureIncomplete,
+    /// A candidate changed an already observed source or coordinator receipt.
+    #[error("work progress after-effect reconciliation receipt replay conflicts")]
+    AfterEffectReconciliationReceiptReplayConflict,
+    /// A prepublication authority attempted to bypass accepted after-effect state.
+    #[error(
+        "work progress prepublication cancellation cannot bypass accepted after-effect reconciliation"
+    )]
+    PrePublishCancellationAfterEffectReconciliationActive,
     /// A prepublication cleanup observation failed its bounded local shape validation.
     #[error("invalid work progress prepublication cleanup: {0}")]
     PrePublishCleanup(#[source] PrePublishCleanupValidationError),
@@ -5421,6 +6037,31 @@ mod tests {
             .collect()
     }
 
+    fn dispatch_rows_with_never_entered(
+        manifest: &CancellationDispatchManifest,
+        observed: &[(WorkUnitKey, StoredStepEvidence, CompletionContext)],
+    ) -> Vec<CancellationDispatchOutcomeRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let outcome = observed
+                    .iter()
+                    .find(|(observed_key, _, _)| observed_key == key)
+                    .map_or(
+                        CancellationDispatchOutcome::NeverEntered,
+                        |(_, evidence, context)| {
+                            CancellationDispatchOutcome::ObservedAfterCancellation {
+                                evidence: evidence.clone(),
+                                context: context.clone(),
+                            }
+                        },
+                    );
+                CancellationDispatchOutcomeRow::new(*key, outcome)
+            })
+            .collect()
+    }
+
     fn recovery_dispatch_record(
         progress: &WorkProgress,
         recovery_generation: u64,
@@ -5480,6 +6121,105 @@ mod tests {
             coordinator_closure_rows(&manifest),
         )
         .expect("coordinator closure record")
+    }
+
+    fn after_effect_authority(
+        progress: &WorkProgress,
+        recovery_inventory: CancellationEffectRecoveryInventory,
+        source_closure_observation: CancellationSourceClosureObservationRecord,
+        coordinator_closure_observation: CancellationCoordinatorClosureObservationRecord,
+        expected_recovery_generation: u64,
+    ) -> VerifiedAfterEffectReconciliation {
+        VerifiedAfterEffectReconciliation {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch,
+            cancellation_inventory: progress
+                .cancellation_inventory
+                .as_ref()
+                .expect("cancellation inventory")
+                .clone(),
+            expected_recovery_generation,
+            recovery_inventory,
+            source_closure_observation,
+            coordinator_closure_observation,
+        }
+    }
+
+    fn empty_after_effect_inputs(
+        progress: &WorkProgress,
+        dispatch: CancellationDispatchOutcomeRecord,
+    ) -> (
+        CancellationEffectRecoveryInventory,
+        CancellationSourceClosureObservationRecord,
+        CancellationCoordinatorClosureObservationRecord,
+    ) {
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source closure manifest");
+        let source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source closure observation");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source, &recovery, &dispatch)
+            .expect("coordinator closure manifest");
+        let coordinator =
+            coordinator_closure_record(coordinator_manifest, progress.execution_epoch(), 1);
+        (recovery, source, coordinator)
+    }
+
+    fn assert_after_effect_acceptance_preserves_frozen_state(
+        mut progress: WorkProgress,
+        request_id: i64,
+        expected_route: CancellationRoute,
+    ) {
+        progress
+            .request_cancellation(CancellationRequestObservation::new(request_id).expect("cancel"))
+            .expect("request cancellation");
+        assert_eq!(
+            progress
+                .cancellation_inventory()
+                .expect("cancellation inventory")
+                .route(),
+            expected_route
+        );
+        let before_steps = progress.steps().to_vec();
+        let before_plan = progress.plan.clone();
+        let before_inventory = progress.cancellation_inventory().cloned();
+        let before_claims = progress.admission_claims().cloned();
+        let before_settlement = progress.claim_settlement().cloned();
+        let before_request = progress.cancellation_request();
+        let before_phase = progress.phase();
+        let before_disposition = progress.disposition();
+        let dispatch = all_never_dispatch_record(&progress);
+        let (recovery, source, coordinator) = empty_after_effect_inputs(&progress, dispatch);
+
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery,
+                source,
+                coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("accept nonterminal after-effect state");
+
+        assert_eq!(progress.plan, before_plan);
+        assert_eq!(progress.steps(), before_steps.as_slice());
+        assert_eq!(progress.cancellation_inventory(), before_inventory.as_ref());
+        assert_eq!(progress.admission_claims(), before_claims.as_ref());
+        assert_eq!(progress.claim_settlement(), before_settlement.as_ref());
+        assert_eq!(progress.cancellation_request(), before_request);
+        assert_eq!(progress.phase(), before_phase);
+        assert_eq!(progress.disposition(), before_disposition);
+        assert_eq!(progress.recovery_generation(), 1);
     }
 
     fn completed_source_progress() -> (WorkProgress, WorkUnitKey) {
@@ -12311,5 +13051,1169 @@ mod tests {
             progress.disposition(),
             FullProgressDisposition::AuditRequired
         );
+    }
+
+    #[test]
+    fn accepted_after_effect_reconciliation_is_nonterminal_and_blocks_prepublish_bypass() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1401).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch = all_never_dispatch_record(&progress);
+        let (recovery, source, coordinator) = empty_after_effect_inputs(&progress, dispatch);
+        let before_steps = progress.steps().to_vec();
+        let before_inventory = progress.cancellation_inventory().cloned();
+        let before_phase = progress.phase();
+        let before_disposition = progress.disposition();
+
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source.clone(),
+                coordinator.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("accept nonterminal after-effect state");
+        assert_eq!(progress.recovery_generation(), 1);
+        assert_eq!(progress.phase(), before_phase);
+        assert_eq!(progress.disposition(), before_disposition);
+        assert_eq!(progress.steps(), before_steps.as_slice());
+        assert_eq!(progress.cancellation_inventory(), before_inventory.as_ref());
+        assert_eq!(
+            progress
+                .after_effect_reconciliation()
+                .expect("accepted state")
+                .recovery_inventory(),
+            &recovery
+        );
+
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery,
+                source,
+                coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("exact acknowledgement-loss replay");
+        assert_eq!(progress.recovery_generation(), 1);
+
+        let before_bypass = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            )),
+            Err(WorkProgressError::PrePublishCancellationAfterEffectReconciliationActive)
+        );
+        assert_eq!(progress, before_bypass);
+    }
+
+    #[test]
+    fn after_effect_reconciliation_accepts_after_publish_and_observed_effect_routes() {
+        let mut published = copy_progress_with_admission_claims();
+        publish_prefix(&mut published);
+        assert_after_effect_acceptance_preserves_frozen_state(
+            published,
+            1410,
+            CancellationRoute::AfterPublish,
+        );
+
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut observed = claimed_progress(
+            participants,
+            retained_resolution_args(source, source_id, false),
+            1411,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::SelectedRetainedObjectDisposition,
+        ] {
+            apply_role(&mut observed, 0, role);
+        }
+        assert_after_effect_acceptance_preserves_frozen_state(
+            observed,
+            1411,
+            CancellationRoute::AfterObservedEffect,
+        );
+    }
+
+    #[test]
+    fn after_effect_reconciliation_rejects_malformed_headers_and_stale_authority_atomically() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1412).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch = all_never_dispatch_record(&progress);
+        let (recovery, source, coordinator) = empty_after_effect_inputs(&progress, dispatch);
+        let authority = after_effect_authority(
+            &progress,
+            recovery.clone(),
+            source.clone(),
+            coordinator.clone(),
+            progress.recovery_generation(),
+        );
+
+        let before_wrong_operation = progress.clone();
+        let mut wrong_operation = authority.clone();
+        wrong_operation.operation_id = OperationId::from_uuid(Uuid::from_u128(1413));
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(wrong_operation),
+            Err(WorkProgressError::AfterEffectReconciliationAuthorityMismatch)
+        );
+        assert_eq!(progress, before_wrong_operation);
+
+        let before_wrong_epoch = progress.clone();
+        let mut wrong_epoch = authority.clone();
+        wrong_epoch.execution_epoch = progress.execution_epoch() + 1;
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(wrong_epoch),
+            Err(WorkProgressError::AfterEffectReconciliationEpochMismatch {
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(progress, before_wrong_epoch);
+
+        let mut other = copy_progress_with_two_admission_claims();
+        other
+            .request_cancellation(CancellationRequestObservation::new(1414).expect("cancel"))
+            .expect("other cancellation");
+        let other_dispatch = all_never_dispatch_record(&other);
+        let (other_recovery, other_source, other_coordinator) =
+            empty_after_effect_inputs(&other, other_dispatch);
+        let before_wrong_lineage = progress.clone();
+        let mut wrong_lineage = authority.clone();
+        wrong_lineage.recovery_inventory = other_recovery;
+        wrong_lineage.source_closure_observation = other_source;
+        wrong_lineage.coordinator_closure_observation = other_coordinator;
+        assert!(
+            progress
+                .accept_after_effect_reconciliation(wrong_lineage)
+                .is_err()
+        );
+        assert_eq!(progress, before_wrong_lineage);
+
+        progress
+            .accept_after_effect_reconciliation(authority.clone())
+            .expect("accept valid state");
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                7,
+                2,
+                progress.execution_epoch(),
+            ))
+            .expect("reacquire source");
+        let before_stale_authority = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(authority),
+            Err(WorkProgressError::AfterEffectReconciliationEpochMismatch {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(progress, before_stale_authority);
+    }
+
+    #[test]
+    fn after_effect_reconciliation_preserves_audit_hold() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::LateCollision,
+            ))
+            .expect("require audit");
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1406).expect("cancel"))
+            .expect("request cancellation under audit");
+        let dispatch = all_never_dispatch_record(&progress);
+        let (recovery, source, coordinator) = empty_after_effect_inputs(&progress, dispatch);
+        let before = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery,
+                source,
+                coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationAuditActive)
+        );
+        assert_eq!(progress, before);
+    }
+
+    #[test]
+    fn after_effect_generation_replay_at_max_is_stable_and_new_state_overflows() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1403).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch = all_never_dispatch_record(&progress);
+        let (recovery, source, coordinator) = empty_after_effect_inputs(&progress, dispatch);
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source.clone(),
+                coordinator.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("accept initial state");
+        progress.recovery_generation = u64::MAX;
+        progress
+            .after_effect_reconciliation
+            .as_mut()
+            .expect("accepted state")
+            .recovery_generation = u64::MAX;
+
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source.clone(),
+                coordinator.clone(),
+                u64::MAX,
+            ))
+            .expect("maximum-generation exact replay remains idempotent");
+
+        let source_manifest = source.manifest().clone();
+        let changed_source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            Vec::new(),
+        )
+        .expect("changed empty source wrapper");
+        let changed_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &changed_source,
+                &recovery,
+                recovery.dispatch_outcome(),
+            )
+            .expect("changed coordinator manifest");
+        let changed_coordinator =
+            coordinator_closure_record(changed_coordinator_manifest, progress.execution_epoch(), 2);
+        let before_overflow = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery,
+                changed_source,
+                changed_coordinator,
+                u64::MAX,
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationGenerationOverflow)
+        );
+        assert_eq!(progress, before_overflow);
+    }
+
+    #[test]
+    fn after_effect_phase_gates_reject_uncertain_dispatch_and_partial_source_closure() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1404);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1404).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch_manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::QualifiedRelocation);
+        let late_observation = (
+            late_key,
+            evidence_for(&progress, late_key, 7),
+            CompletionContext::new(
+                progress.execution_epoch(),
+                progress.scope_for(late_key).expect("late scope").clone(),
+            ),
+        );
+        let uncertain_dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows_with_observed(&dispatch_manifest, &[late_observation.clone()]),
+        )
+        .expect("uncertain dispatch record");
+        let uncertain_recovery = progress
+            .cancellation_effect_recovery_inventory(&uncertain_dispatch)
+            .expect("uncertain recovery inventory");
+        let uncertain_source_manifest = progress
+            .cancellation_source_closure_manifest(&uncertain_recovery, &uncertain_dispatch)
+            .expect("uncertain source manifest");
+        let source_key = uncertain_source_manifest.keys()[0];
+        let source_observed = CancellationSourceClosureObservationRecord::new(
+            uncertain_source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            vec![CancellationSourceClosureObservationRow::new(
+                source_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: evidence_for(&progress, source_key, 8),
+                    context: CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress
+                            .scope_for(source_key)
+                            .expect("source scope")
+                            .clone(),
+                    ),
+                },
+            )],
+        )
+        .expect("source observation");
+        let uncertain_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &source_observed,
+                &uncertain_recovery,
+                &uncertain_dispatch,
+            )
+            .expect("uncertain coordinator manifest");
+        let uncertain_coordinator = coordinator_closure_record(
+            uncertain_coordinator_manifest,
+            progress.execution_epoch(),
+            1,
+        );
+        let before_uncertain = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                uncertain_recovery,
+                source_observed.clone(),
+                uncertain_coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationDispatchIndeterminate)
+        );
+        assert_eq!(progress, before_uncertain);
+
+        let determinate_dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows_with_never_entered(&dispatch_manifest, &[late_observation]),
+        )
+        .expect("determinate dispatch record");
+        let determinate_recovery = progress
+            .cancellation_effect_recovery_inventory(&determinate_dispatch)
+            .expect("determinate recovery inventory");
+        let determinate_source_manifest = progress
+            .cancellation_source_closure_manifest(&determinate_recovery, &determinate_dispatch)
+            .expect("determinate source manifest");
+        let source_observed = CancellationSourceClosureObservationRecord::new(
+            determinate_source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            source_closure_rows(&determinate_source_manifest)
+                .into_iter()
+                .map(|row| {
+                    CancellationSourceClosureObservationRow::new(
+                        row.key(),
+                        CancellationSourceClosureOutcome::Observed {
+                            evidence: evidence_for(&progress, row.key(), 8),
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress.scope_for(row.key()).expect("source scope").clone(),
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+        )
+        .expect("determinate source observation");
+        let determinate_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &source_observed,
+                &determinate_recovery,
+                &determinate_dispatch,
+            )
+            .expect("determinate coordinator manifest");
+        let determinate_coordinator = coordinator_closure_record(
+            determinate_coordinator_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+        );
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                determinate_recovery.clone(),
+                source_observed,
+                determinate_coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("determinate dispatch with source receipts");
+
+        let pending_source = CancellationSourceClosureObservationRecord::new(
+            determinate_source_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            source_closure_rows(&determinate_source_manifest),
+        )
+        .expect("pending source observation");
+        let partial_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &pending_source,
+                &determinate_recovery,
+                &determinate_dispatch,
+            )
+            .expect("partial coordinator manifest");
+        let coordinator_key = partial_coordinator_manifest.keys()[0];
+        let partial_coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            partial_coordinator_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            partial_coordinator_manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == coordinator_key {
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: evidence_for(&progress, *key, 8),
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress.scope_for(*key).expect("coordinator scope").clone(),
+                            ),
+                        }
+                    } else {
+                        CancellationCoordinatorClosureOutcome::Pending
+                    };
+                    CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("partial coordinator observation");
+        let before_partial = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                determinate_recovery,
+                pending_source,
+                partial_coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationSourceClosureIncomplete)
+        );
+        assert_eq!(progress, before_partial);
+    }
+
+    #[test]
+    fn accepted_after_effect_source_receipts_raise_reacquisition_floor_and_replay_historically() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1405);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1405).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch_manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::QualifiedRelocation);
+        let late_observation = (
+            late_key,
+            evidence_for(&progress, late_key, 7),
+            CompletionContext::new(
+                progress.execution_epoch(),
+                progress.scope_for(late_key).expect("late scope").clone(),
+            ),
+        );
+        let dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows_with_never_entered(&dispatch_manifest, &[late_observation]),
+        )
+        .expect("dispatch record");
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        let source_key = source_manifest.keys()[0];
+        let pending_source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("pending source");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&pending_source, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        let pending_coordinator =
+            coordinator_closure_record(coordinator_manifest, progress.execution_epoch(), 1);
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                pending_source,
+                pending_coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("accept pending after-effect state");
+
+        let historical_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(source_key)
+                .expect("source scope")
+                .clone(),
+        );
+        let historical_evidence = evidence_for(&progress, source_key, 8);
+        let observed_source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            vec![CancellationSourceClosureObservationRow::new(
+                source_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: historical_evidence.clone(),
+                    context: historical_context.clone(),
+                },
+            )],
+        )
+        .expect("observed source");
+        let observed_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&observed_source, &recovery, &dispatch)
+            .expect("observed coordinator manifest");
+        let observed_coordinator = coordinator_closure_record(
+            observed_coordinator_manifest,
+            progress.execution_epoch(),
+            2,
+        );
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                observed_source,
+                observed_coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("accept observed source");
+
+        let target = source_key.participant_id();
+        let before_lower_reacquisition = progress.clone();
+        assert_eq!(
+            progress.reacquire_source(source_reacquisition_authority(
+                &progress,
+                target,
+                7,
+                2,
+                progress.execution_epoch(),
+            )),
+            Err(WorkProgressError::SourceReacquisitionRevisionRegressed {
+                observed: 7,
+                minimum: 8,
+            })
+        );
+        assert_eq!(progress, before_lower_reacquisition);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                target,
+                8,
+                2,
+                progress.execution_epoch(),
+            ))
+            .expect("reacquire at accepted historical floor");
+        assert_eq!(progress.execution_epoch(), 1);
+
+        let (late_evidence, late_context) = recovery
+            .dispatch_outcome()
+            .rows()
+            .iter()
+            .find(|row| row.key() == late_key)
+            .and_then(|row| match row.outcome() {
+                CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } => {
+                    Some((evidence.clone(), context.clone()))
+                }
+                _ => None,
+            })
+            .expect("late dispatch evidence");
+        let refreshed_manifest = recovery.dispatch_outcome().manifest().clone();
+        let refreshed_dispatch = CancellationDispatchOutcomeRecord::new(
+            refreshed_manifest.clone(),
+            progress.execution_epoch(),
+            3,
+            dispatch_rows_with_never_entered(
+                &refreshed_manifest,
+                &[(late_key, late_evidence, late_context)],
+            ),
+        )
+        .expect("refreshed dispatch");
+        let refreshed_recovery = progress
+            .cancellation_effect_recovery_inventory(&refreshed_dispatch)
+            .expect("refreshed recovery");
+        let refreshed_source_manifest = progress
+            .cancellation_source_closure_manifest(&refreshed_recovery, &refreshed_dispatch)
+            .expect("refreshed source manifest");
+        let refreshed_source = CancellationSourceClosureObservationRecord::new(
+            refreshed_source_manifest.clone(),
+            progress.execution_epoch(),
+            3,
+            vec![CancellationSourceClosureObservationRow::new(
+                source_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: historical_evidence.clone(),
+                    context: historical_context.clone(),
+                },
+            )],
+        )
+        .expect("refreshed source");
+        let refreshed_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &refreshed_source,
+                &refreshed_recovery,
+                &refreshed_dispatch,
+            )
+            .expect("refreshed coordinator manifest");
+        let refreshed_coordinator = coordinator_closure_record(
+            refreshed_coordinator_manifest,
+            progress.execution_epoch(),
+            3,
+        );
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                refreshed_recovery,
+                refreshed_source,
+                refreshed_coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("accept refreshed current-epoch headers with historical receipt");
+        assert_eq!(progress.recovery_generation(), 3);
+        assert_eq!(
+            progress
+                .after_effect_reconciliation()
+                .expect("refreshed accepted state")
+                .source_closure_observation()
+                .rows()[0]
+                .outcome(),
+            &CancellationSourceClosureOutcome::Observed {
+                evidence: historical_evidence,
+                context: historical_context,
+            }
+        );
+    }
+
+    #[test]
+    fn accepted_after_effect_coordinator_receipt_raises_reacquisition_floor_and_replays_historically()
+     {
+        let mut progress = fenced_harvest_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1415).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch_manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let source_affect = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        let harvest = key_for(&progress, u8::MAX, WorkUnitRole::Harvest);
+        assert!(dispatch_manifest.keys().contains(&source_affect));
+        assert!(dispatch_manifest.keys().contains(&harvest));
+        assert!(
+            progress
+                .scope_for(harvest)
+                .expect("harvest scope")
+                .source_fence()
+                .is_some()
+        );
+        let source_affect_evidence = StoredStepEvidence::SourceCommitted {
+            before_revision: 8,
+            after: source_observation(&progress, source_affect, 8),
+        };
+        let source_affect_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(source_affect)
+                .expect("source-affect scope")
+                .clone(),
+        );
+        let dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows_with_never_entered(
+                &dispatch_manifest,
+                &[(
+                    source_affect,
+                    source_affect_evidence.clone(),
+                    source_affect_context.clone(),
+                )],
+            ),
+        )
+        .expect("dispatch record");
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        let source_pending = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source record");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_pending, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        assert!(coordinator_manifest.keys().contains(&harvest));
+        let coordinator_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress.scope_for(harvest).expect("harvest scope").clone(),
+        );
+        let coordinator_evidence = evidence_for(&progress, harvest, 9);
+        let coordinator_observed = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            coordinator_manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == harvest {
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: coordinator_evidence.clone(),
+                            context: coordinator_context.clone(),
+                        }
+                    } else {
+                        CancellationCoordinatorClosureOutcome::Pending
+                    };
+                    CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("coordinator observation");
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source_pending,
+                coordinator_observed.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("accept coordinator receipt");
+
+        let before_lower_reacquisition = progress.clone();
+        assert_eq!(
+            progress.reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_affect.participant_id(),
+                8,
+                2,
+                progress.execution_epoch(),
+            )),
+            Err(WorkProgressError::SourceReacquisitionRevisionRegressed {
+                observed: 8,
+                minimum: 9,
+            })
+        );
+        assert_eq!(progress, before_lower_reacquisition);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_affect.participant_id(),
+                9,
+                2,
+                progress.execution_epoch(),
+            ))
+            .expect("reacquire at coordinator receipt floor");
+
+        let refreshed_dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            dispatch_rows_with_never_entered(
+                &dispatch_manifest,
+                &[(
+                    source_affect,
+                    source_affect_evidence.clone(),
+                    source_affect_context.clone(),
+                )],
+            ),
+        )
+        .expect("refreshed dispatch");
+        let refreshed_recovery = progress
+            .cancellation_effect_recovery_inventory(&refreshed_dispatch)
+            .expect("refreshed recovery");
+        let refreshed_source_manifest = progress
+            .cancellation_source_closure_manifest(&refreshed_recovery, &refreshed_dispatch)
+            .expect("refreshed source manifest");
+        let refreshed_source = CancellationSourceClosureObservationRecord::new(
+            refreshed_source_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            source_closure_rows(&refreshed_source_manifest),
+        )
+        .expect("refreshed source");
+        let refreshed_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &refreshed_source,
+                &refreshed_recovery,
+                &refreshed_dispatch,
+            )
+            .expect("refreshed coordinator manifest");
+        let refreshed_coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            refreshed_coordinator_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            refreshed_coordinator_manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == harvest {
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: coordinator_evidence.clone(),
+                            context: coordinator_context.clone(),
+                        }
+                    } else {
+                        CancellationCoordinatorClosureOutcome::Pending
+                    };
+                    CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("refreshed coordinator");
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                refreshed_recovery,
+                refreshed_source,
+                refreshed_coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("replay historical coordinator receipt after reacquisition");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(progress.recovery_generation(), 2);
+        let retained = progress
+            .after_effect_reconciliation()
+            .expect("refreshed accepted state")
+            .coordinator_closure_observation()
+            .rows()
+            .iter()
+            .find(|row| row.key() == harvest)
+            .expect("retained harvest receipt");
+        assert_eq!(
+            retained.outcome(),
+            &CancellationCoordinatorClosureOutcome::Observed {
+                evidence: coordinator_evidence,
+                context: coordinator_context,
+            }
+        );
+    }
+
+    #[test]
+    fn after_effect_receipt_refinement_reuses_identical_dispatch_and_rejects_drop() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1402);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1402).expect("cancel"))
+            .expect("request cancellation");
+        let dispatch_manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::QualifiedRelocation);
+        let late_observation = (
+            late_key,
+            evidence_for(&progress, late_key, 7),
+            CompletionContext::new(
+                progress.execution_epoch(),
+                progress.scope_for(late_key).expect("late scope").clone(),
+            ),
+        );
+        let dispatch = CancellationDispatchOutcomeRecord::new(
+            dispatch_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows_with_never_entered(&dispatch_manifest, &[late_observation]),
+        )
+        .expect("determinate late dispatch");
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        assert_eq!(source_manifest.keys().len(), 1);
+        let source_pending = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("pending source record");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_pending, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        let coordinator_pending =
+            coordinator_closure_record(coordinator_manifest, progress.execution_epoch(), 1);
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source_pending.clone(),
+                coordinator_pending.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("accept initial state");
+
+        let source_key = source_manifest.keys()[0];
+        let source_observed = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            vec![CancellationSourceClosureObservationRow::new(
+                source_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: evidence_for(&progress, source_key, 8),
+                    context: CompletionContext::new(
+                        0,
+                        progress
+                            .scope_for(source_key)
+                            .expect("source scope")
+                            .clone(),
+                    ),
+                },
+            )],
+        )
+        .expect("observed source record");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observed, &recovery, &dispatch)
+            .expect("refined coordinator manifest");
+        let coordinator_pending =
+            coordinator_closure_record(coordinator_manifest, progress.execution_epoch(), 2);
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source_observed.clone(),
+                coordinator_pending.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("refine source receipt without dispatch rewrite");
+        assert_eq!(progress.recovery_generation(), 2);
+        assert_eq!(
+            progress
+                .after_effect_reconciliation()
+                .expect("accepted refinement")
+                .recovery_inventory()
+                .dispatch_outcome()
+                .recovery_generation(),
+            1
+        );
+
+        let coordinator_key = coordinator_pending.manifest().keys()[0];
+        let coordinator_observed = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_pending.manifest().clone(),
+            progress.execution_epoch(),
+            3,
+            coordinator_pending
+                .manifest()
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == coordinator_key {
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: evidence_for(&progress, *key, 8),
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress.scope_for(*key).expect("coordinator scope").clone(),
+                            ),
+                        }
+                    } else {
+                        CancellationCoordinatorClosureOutcome::Pending
+                    };
+                    CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("observed coordinator record");
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source_observed.clone(),
+                coordinator_observed.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("refine coordinator receipt without source wrapper rewrite");
+        assert_eq!(progress.recovery_generation(), 3);
+
+        let lower_source = CancellationSourceClosureObservationRecord::new(
+            source_observed.manifest().clone(),
+            progress.execution_epoch(),
+            1,
+            source_observed.rows().to_vec(),
+        )
+        .expect("lower-generation source record");
+        let lower_source_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&lower_source, &recovery, &dispatch)
+            .expect("lower-source coordinator manifest");
+        let lower_source_coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            lower_source_coordinator_manifest,
+            progress.execution_epoch(),
+            coordinator_observed.observation_generation(),
+            coordinator_observed.rows().to_vec(),
+        )
+        .expect("lower-source coordinator record");
+        let before_lower_source = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                lower_source,
+                lower_source_coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict)
+        );
+        assert_eq!(progress, before_lower_source);
+
+        let lower_coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_observed.manifest().clone(),
+            progress.execution_epoch(),
+            2,
+            coordinator_observed.rows().to_vec(),
+        )
+        .expect("lower-generation coordinator record");
+        let before_lower_coordinator = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                source_observed.clone(),
+                lower_coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict)
+        );
+        assert_eq!(progress, before_lower_coordinator);
+
+        let same_generation_source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            vec![CancellationSourceClosureObservationRow::new(
+                source_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: evidence_for(&progress, source_key, 9),
+                    context: CompletionContext::new(
+                        0,
+                        progress
+                            .scope_for(source_key)
+                            .expect("source scope")
+                            .clone(),
+                    ),
+                },
+            )],
+        )
+        .expect("same-generation source record");
+        let same_generation_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(
+                &same_generation_source,
+                &recovery,
+                &dispatch,
+            )
+            .expect("same-generation coordinator manifest");
+        let same_generation_coordinator = coordinator_closure_record(
+            same_generation_coordinator_manifest,
+            progress.execution_epoch(),
+            2,
+        );
+        let before_same_generation = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery.clone(),
+                same_generation_source,
+                same_generation_coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict)
+        );
+        assert_eq!(progress, before_same_generation);
+
+        let dropped_source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            3,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("dropped source shape");
+        let dropped_coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&dropped_source, &recovery, &dispatch)
+            .expect("dropped coordinator manifest");
+        let dropped_coordinator =
+            coordinator_closure_record(dropped_coordinator_manifest, progress.execution_epoch(), 3);
+        let before_drop = progress.clone();
+        assert_eq!(
+            progress.accept_after_effect_reconciliation(after_effect_authority(
+                &progress,
+                recovery,
+                dropped_source,
+                dropped_coordinator,
+                progress.recovery_generation(),
+            )),
+            Err(WorkProgressError::AfterEffectReconciliationReceiptReplayConflict)
+        );
+        assert_eq!(progress, before_drop);
     }
 }

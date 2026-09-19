@@ -213,9 +213,9 @@ pub use work_plan::{
     derive_work_plan, derive_work_plan_v1, validate_work_plan,
 };
 pub use work_progress::{
-    AuditTarget, AuditTargetValidationError, CompletionContext, CoordinatorDeficit,
-    CoordinatorReceiptKind, CoordinatorReceiptSummary, FilesystemReceiptKind,
-    FilesystemReceiptSummary, MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS,
+    AfterEffectReconciliationObservation, AuditTarget, AuditTargetValidationError,
+    CompletionContext, CoordinatorDeficit, CoordinatorReceiptKind, CoordinatorReceiptSummary,
+    FilesystemReceiptKind, FilesystemReceiptSummary, MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS,
     MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS, ParticipantScope, PrePublishAbsenceObservation,
     PrePublishActionCleanup, PrePublishCancellationObservation, PrePublishCleanupObservation,
     PrePublishCleanupValidationError, PrePublishFinalClaimObservation,
