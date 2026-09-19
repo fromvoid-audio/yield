@@ -9,6 +9,7 @@
 //! validation does not authenticate an owner or capability, establish freshness, prove adoption,
 //! or grant release authority.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::cancellation_effects::CancellationCleanupManifest;
@@ -27,7 +28,8 @@ pub const MAX_CANCELLATION_RESOURCE_CLEANUP_ROWS: usize = MAX_CANCELLATION_RESOU
 /// The complete cleanup manifest, including operation-wide recovery claim identities, remains
 /// bound to this view.  The selected keys are only planned resource obligations; they do not
 /// prove that a resource was entered, adopted, preserved, or removed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationResourceCleanupManifest {
     cleanup_manifest: CancellationCleanupManifest,
     keys: Vec<WorkUnitKey>,
@@ -179,7 +181,8 @@ impl From<CancellationResourceCleanupManifestValidationError>
 }
 
 /// One cancellation-local resource observation outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum CancellationResourceCleanupOutcome {
     /// No resource observation has been retained for this planned key.
     Pending,
@@ -202,7 +205,8 @@ pub enum CancellationResourceCleanupOutcome {
 }
 
 /// One exact resource-cleanup key and its typed cancellation-local observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationResourceCleanupObservationRow {
     key: WorkUnitKey,
     outcome: CancellationResourceCleanupOutcome,
@@ -230,7 +234,8 @@ impl CancellationResourceCleanupObservationRow {
 /// This record is observational only.  It never completes normal steps, proves adoption or
 /// absence, maps or discharges operation-wide claims, grants cleanup authority, or authorizes a
 /// terminal transition.  `Preserved` is not adopted, and `Absent` does not prove `NeverEntered`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationResourceCleanupObservationRecord {
     manifest: CancellationResourceCleanupManifest,
     observation_epoch: u64,
@@ -534,7 +539,8 @@ fn allows_absent(role: WorkUnitRole) -> bool {
 /// outcome, and operation-wide claim identities.  These keys describe local namespace or
 /// disposition obligations only; they do not prove entry, absence, adoption, rollback, or
 /// completion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationNamespaceCleanupManifest {
     cleanup_manifest: CancellationCleanupManifest,
     keys: Vec<WorkUnitKey>,
@@ -686,7 +692,8 @@ impl From<CancellationNamespaceCleanupManifestValidationError>
 }
 
 /// One typed cancellation-local namespace/disposition observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum CancellationNamespaceCleanupOutcome {
     /// No namespace/disposition observation has been retained for this planned key.
     Pending,
@@ -724,7 +731,8 @@ pub enum CancellationNamespaceCleanupOutcome {
 }
 
 /// One exact namespace/disposition key and its cancellation-local observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationNamespaceCleanupObservationRow {
     key: WorkUnitKey,
     outcome: CancellationNamespaceCleanupOutcome,
@@ -753,7 +761,8 @@ impl CancellationNamespaceCleanupObservationRow {
 /// adoption, rollback, or qualification, maps or discharges operation-wide claims, grants
 /// cleanup authority, or authorizes a terminal transition.  Later contradictory observations are
 /// retained as observations; a future qualified-outcome guard adjudicates them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationNamespaceCleanupObservationRecord {
     manifest: CancellationNamespaceCleanupManifest,
     observation_epoch: u64,

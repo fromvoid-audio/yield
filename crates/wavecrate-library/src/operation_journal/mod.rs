@@ -246,6 +246,7 @@ pub use work_progress::{
     AfterEffectReconciliationObservation, AuditTarget, AuditTargetValidationError,
     CancellationCleanupObservation, CompletionContext, CoordinatorDeficit, CoordinatorReceiptKind,
     CoordinatorReceiptSummary, FilesystemReceiptKind, FilesystemReceiptSummary,
+    FullProgressSnapshotObservation, FullProgressSnapshotObservationError,
     MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS, MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS,
     ParticipantScope, PrePublishAbsenceObservation, PrePublishActionCleanup,
     PrePublishCancellationObservation, PrePublishCleanupObservation,

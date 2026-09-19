@@ -296,7 +296,8 @@ pub struct CancellationEffectInventory {
 /// status while deriving bundles; `NeverEntered` and `EntryUncertain` remain pending observations.
 /// This value is observational only and does not grant recovery, filesystem, source, cleanup, or
 /// terminal authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationEffectRecoveryInventory {
     frozen_inventory: CancellationInventory,
     dispatch_outcome: CancellationDispatchOutcomeRecord,
@@ -314,7 +315,8 @@ pub const MAX_CANCELLATION_CLEANUP_KEYS: usize = MAX_CANCELLATION_EFFECT_ROWS;
 /// `applicable_keys` list is derived from the planner's `Required` applicability and is only a
 /// convenience view; neither list proves that a cleanup action was never entered, adopted, or
 /// completed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationCleanupSegment {
     action_ordinal: u8,
     step_segment: u16,
@@ -459,7 +461,8 @@ impl CancellationCleanupSegment {
 /// This manifest retains the complete recovery lineage and separately lists operation-wide
 /// recovery-payload claim identities.  It is observational only: membership, pending status, or
 /// a missing local role never proves no entry, absence, adoption, release, or terminal completion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationCleanupManifest {
     recovery_inventory: CancellationEffectRecoveryInventory,
     segments: Vec<CancellationCleanupSegment>,

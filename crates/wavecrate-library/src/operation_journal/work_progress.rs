@@ -82,6 +82,12 @@ use crate::sample_sources::SourceId;
 #[path = "work_progress/dispatch_owner.rs"]
 pub(super) mod dispatch_owner;
 
+/// Bounded, non-authoritative full-progress snapshot observations.
+#[path = "work_progress/snapshot.rs"]
+pub(super) mod snapshot;
+
+pub use snapshot::{FullProgressSnapshotObservation, FullProgressSnapshotObservationError};
+
 /// One bounded source revision observation attached to a progress completion.
 ///
 /// The source identity, root and database identities, lifecycle generation, and lease epoch are
@@ -523,7 +529,7 @@ impl ProgressAuditObservation {
 }
 
 /// The progress disposition hidden beneath an active audit overlay.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum AuditSuspendedHold {
     /// No retry or cancellation disposition was active when the audit began.
     None,
@@ -538,7 +544,8 @@ enum AuditSuspendedHold {
 }
 
 /// Current audit overlay with its exact generation and suspended disposition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ActiveAudit {
     generation: u64,
     observation: ProgressAuditObservation,
@@ -627,7 +634,8 @@ pub enum ProgressStepStatus {
 }
 
 /// One exact work-plan key and its guarded progress status.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkProgressStep {
     key: WorkUnitKey,
     requirement: ParticipantRequirement,
@@ -926,7 +934,8 @@ pub struct PrePublishCancellationObservation {
 /// records.  It is an in-memory observation only: it does not complete normal progress, release
 /// claims, perform cleanup, establish a terminal disposition, or issue any live participant
 /// authority.  A fresh private authority must validate a candidate before this value is stored.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AfterEffectReconciliationObservation {
     recovery_inventory: CancellationEffectRecoveryInventory,
     source_closure_observation: CancellationSourceClosureObservationRecord,
@@ -986,7 +995,8 @@ impl AfterEffectReconciliationObservation {
 /// absence, cleanup capability, claim settlement, or a terminal cancellation outcome.  The
 /// resource and namespace records retain the bounded recovery/dispatch lineage; this state keeps
 /// only the accepted after-effect generation as its linkage.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationCleanupObservation {
     resource_cleanup_observation: CancellationResourceCleanupObservationRecord,
     namespace_cleanup_observation: CancellationNamespaceCleanupObservationRecord,
@@ -6039,9 +6049,10 @@ mod tests {
         ExternalRawObservationLimits, ExternalRawObservationMetadata,
         ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
         ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan, HistoryAction,
-        HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
-        HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+        FullProgressIntentObservation, HistoryAction, HistoryDirection,
+        HistoryExtractedFileObservation, HistoryFolderMove, HistoryFolderRelocation,
+        HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
         HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
         HistoryWaveformRestore, MAX_READINESS_CONTRACT_VERSION_BYTES, NamespaceCommandArgs,
         NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation, NamespaceDirectoryLocator,
@@ -6059,6 +6070,7 @@ mod tests {
         WaveformSampleFormat, WaveformSourceSpec, fingerprint_selected_entry_json,
     };
     use crate::sample_sources::{SourceId, SourcePlaybackType};
+    use serde_json::json;
     use uuid::Uuid;
 
     fn participant_id(value: u128) -> ParticipantId {
@@ -6381,6 +6393,84 @@ mod tests {
         let plan = super::super::work_plan::derive_work_plan(&args, &participants)
             .expect("copy work plan");
         (participants, args, plan)
+    }
+
+    fn copy_snapshot_intent(progress: &WorkProgress) -> FullProgressIntentObservation {
+        let (participants, args, plan) = copy_plan_inputs();
+        assert_eq!(progress.plan(), &plan);
+        FullProgressIntentObservation::new(
+            progress.operation_id(),
+            args,
+            participants,
+            plan,
+            admission_capacity_plan(),
+            progress
+                .admission_claims()
+                .expect("admission claims")
+                .clone(),
+        )
+        .expect("full-progress snapshot intent")
+    }
+
+    fn copy_progress_with_initial_artifact_fence_split(
+        source_revision_delta: u64,
+        lease_epoch_delta: u64,
+    ) -> (WorkProgress, FullProgressIntentObservation) {
+        let (base, source, _filesystem, source_id) = valid_topology(true);
+        let descriptors = base
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                let fence = if descriptor.kind() == ParticipantKind::Artifact {
+                    let old = descriptor.source_fence().expect("artifact fence");
+                    Some(
+                        StoredSourceFence::new(
+                            old.source_id().clone(),
+                            old.root_identity(),
+                            old.database_identity(),
+                            old.lifecycle_generation(),
+                            old.source_revision() + source_revision_delta,
+                            old.lease_epoch() + lease_epoch_delta,
+                        )
+                        .expect("split artifact fence"),
+                    )
+                } else {
+                    descriptor.source_fence().cloned()
+                };
+                ParticipantDescriptor::new(
+                    descriptor.id(),
+                    descriptor.kind(),
+                    descriptor.requirement(),
+                    fence,
+                    descriptor.artifact_key().map(str::to_owned),
+                )
+                .expect("split descriptor")
+            })
+            .collect();
+        let participants = ParticipantSet::new(descriptors, base.checkpoints().to_vec())
+            .expect("initial artifact split participant set");
+        let args = copy_args_at(source, source_id, "copy.wav");
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("initial artifact split work plan");
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(2301 + lease_epoch_delta as u128)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("initial artifact split progress");
+        let intent = FullProgressIntentObservation::new(
+            progress.operation_id(),
+            args,
+            participants,
+            plan,
+            admission_capacity_plan(),
+            progress.admission_claims().expect("claims").clone(),
+        )
+        .expect("initial artifact split intent");
+        (progress, intent)
     }
 
     fn admission_capacity_plan() -> FullCapacityPlan {
@@ -19304,5 +19394,498 @@ mod tests {
                 .is_err()
         );
         assert_eq!(owner.progress(), &before_bad_lineage);
+    }
+
+    #[test]
+    fn full_progress_snapshot_captures_initial_state_and_roundtrips_exactly() {
+        let progress = copy_progress_with_admission_claims();
+        let before = progress.clone();
+        let intent = copy_snapshot_intent(&progress);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&intent)
+            .expect("initial full-progress snapshot");
+
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot JSON");
+        let decoded: FullProgressSnapshotObservation =
+            serde_json::from_str(&encoded).expect("snapshot JSON roundtrip");
+        assert_eq!(decoded, snapshot);
+        decoded
+            .validate_base()
+            .expect("decoded snapshot base validation");
+        assert_eq!(progress, before);
+
+        let mut unknown = serde_json::to_value(&snapshot).expect("snapshot value");
+        unknown
+            .as_object_mut()
+            .expect("snapshot object")
+            .insert("unknown_snapshot_field".to_owned(), json!(true));
+        assert!(serde_json::from_value::<FullProgressSnapshotObservation>(unknown).is_err());
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_completed_history_after_reacquisition() {
+        let mut progress = copy_progress_with_admission_claims();
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("reacquired full-progress snapshot");
+        assert_eq!(
+            snapshot
+                .steps()
+                .iter()
+                .find(|step| step.key() == source_key)
+                .expect("source row")
+                .status(),
+            ProgressStepStatus::Completed
+        );
+        let decoded: FullProgressSnapshotObservation =
+            serde_json::from_str(&serde_json::to_string(&snapshot).expect("snapshot JSON"))
+                .expect("reacquired snapshot JSON");
+        decoded
+            .validate_base()
+            .expect("historical completion remains valid");
+    }
+
+    #[test]
+    fn full_progress_snapshot_rejects_split_current_source_fences() {
+        let mut progress = copy_progress_with_admission_claims();
+        let source_participant = progress
+            .scopes
+            .iter()
+            .find(|scope| scope.kind() == ParticipantKind::SourceDatabase)
+            .expect("source participant")
+            .participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant,
+                7,
+                2,
+                0,
+            ))
+            .expect("coherent source reacquisition");
+
+        let coherent = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("coherent reacquired snapshot");
+        coherent.validate_base().expect("coherent current fences");
+
+        let mut split = serde_json::to_value(&coherent).expect("snapshot value");
+        let scopes = split
+            .get_mut("scopes")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("snapshot scopes");
+        let source_fenced = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, scope)| {
+                scope
+                    .get("source_fence")
+                    .is_some_and(|fence| !fence.is_null())
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(
+            source_fenced.len() >= 2,
+            "expected related source-fenced scopes"
+        );
+        let split_index = source_fenced[1];
+        let split_fence = scopes[split_index]
+            .get_mut("source_fence")
+            .expect("source fence")
+            .as_object_mut()
+            .expect("source fence object");
+        split_fence.insert("source_revision".to_owned(), json!(8));
+        split_fence.insert("lease_epoch".to_owned(), json!(3));
+
+        let split: FullProgressSnapshotObservation =
+            serde_json::from_value(split).expect("split fence shape");
+        assert!(matches!(
+            split.validate_base(),
+            Err(FullProgressSnapshotObservationError::ScopeStableFenceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn full_progress_snapshot_accepts_initial_artifact_revision_split_after_retry_resume() {
+        let (progress, intent) = copy_progress_with_initial_artifact_fence_split(1, 0);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&intent)
+            .expect("initial artifact revision split snapshot");
+        let decoded: FullProgressSnapshotObservation =
+            serde_json::from_str(&serde_json::to_string(&snapshot).expect("split snapshot JSON"))
+                .expect("split snapshot roundtrip");
+        decoded
+            .validate_base()
+            .expect("initial split remains valid observation");
+
+        let mut resumed = progress.clone();
+        let retry_observation = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("snapshot-split-retry").expect("retry lease"),
+            2,
+            RetryErrorClass::TransientContention,
+            "snapshot split retry",
+            None,
+        )
+        .expect("retry observation");
+        resumed
+            .request_retry(retry_observation.clone())
+            .expect("request retry");
+        resumed
+            .resume_retry(VerifiedRetryResume {
+                operation_id: resumed.operation_id,
+                plan: resumed.plan.clone(),
+                retry_observation,
+                now_unix_ms: 1,
+                expected_execution_epoch: 0,
+            })
+            .expect("resume retry");
+        assert_eq!(resumed.execution_epoch(), 1);
+        let resumed_snapshot = resumed
+            .capture_full_progress_snapshot(&intent)
+            .expect("unchanged initial split after retry resume");
+        resumed_snapshot
+            .validate_base()
+            .expect("resumed split remains valid observation");
+    }
+
+    #[test]
+    fn full_progress_snapshot_rejects_rebind_at_existing_initial_max_lease() {
+        let (progress, intent) = copy_progress_with_initial_artifact_fence_split(0, 1);
+        let mut resumed = progress.clone();
+        let retry_observation = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("snapshot-lease-split-retry").expect("retry lease"),
+            2,
+            RetryErrorClass::TransientContention,
+            "snapshot lease split retry",
+            None,
+        )
+        .expect("retry observation");
+        resumed
+            .request_retry(retry_observation.clone())
+            .expect("request retry");
+        resumed
+            .resume_retry(VerifiedRetryResume {
+                operation_id: resumed.operation_id,
+                plan: resumed.plan.clone(),
+                retry_observation,
+                now_unix_ms: 1,
+                expected_execution_epoch: 0,
+            })
+            .expect("resume retry");
+
+        let snapshot = resumed
+            .capture_full_progress_snapshot(&intent)
+            .expect("split lease snapshot before unification");
+        let mut unified = serde_json::to_value(&snapshot).expect("snapshot value");
+        let scopes = unified
+            .get_mut("scopes")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("snapshot scopes");
+        let artifact_fence = scopes
+            .iter()
+            .find(|scope| scope["kind"] == json!("Artifact"))
+            .and_then(|scope| scope.get("source_fence"))
+            .expect("artifact fence")
+            .clone();
+        for scope in scopes {
+            if scope
+                .get("source_fence")
+                .is_some_and(|fence| !fence.is_null())
+            {
+                scope["source_fence"] = artifact_fence.clone();
+            }
+        }
+        let unified: FullProgressSnapshotObservation =
+            serde_json::from_value(unified).expect("unified fence shape");
+        assert!(matches!(
+            unified.validate_base(),
+            Err(FullProgressSnapshotObservationError::ScopeStableFenceLeaseNotAdvanced { .. })
+        ));
+    }
+
+    #[test]
+    fn full_progress_snapshot_retains_retry_audit_and_cancellation_observations() {
+        let mut retry = copy_progress_with_admission_claims();
+        retry
+            .request_retry(
+                RetryObservation::new(
+                    1,
+                    100,
+                    200,
+                    RetryLeaseId::new("snapshot-retry").expect("retry lease"),
+                    300,
+                    RetryErrorClass::TransientAvailability,
+                    "snapshot-test",
+                    None,
+                )
+                .expect("retry observation"),
+            )
+            .expect("retry request");
+        let retry_snapshot = retry
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retry))
+            .expect("retry snapshot");
+        assert!(retry_snapshot.retry_observation().is_some());
+        assert!(retry_snapshot.last_retry_observation().is_some());
+
+        let mut audit = copy_progress_with_admission_claims();
+        publish_prefix(&mut audit);
+        audit
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("audit request");
+        let audit_snapshot = audit
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&audit))
+            .expect("audit snapshot");
+        assert!(audit_snapshot.audit_observation().is_some());
+        assert_eq!(audit_snapshot.audit_generation(), 1);
+
+        let mut cancelled = copy_progress_with_admission_claims();
+        cancelled
+            .request_cancellation(CancellationRequestObservation::new(18101).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut cancelled);
+        accept_pending_cleanup_observations(&mut cancelled);
+        let before = cancelled.clone();
+        let cancellation_snapshot = cancelled
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&cancelled))
+            .expect("cancellation snapshot");
+        let decoded: FullProgressSnapshotObservation = serde_json::from_str(
+            &serde_json::to_string(&cancellation_snapshot).expect("cancellation JSON"),
+        )
+        .expect("cancellation snapshot JSON");
+        assert_eq!(decoded, cancellation_snapshot);
+        assert!(decoded.after_effect_reconciliation().is_some());
+        assert!(decoded.cancellation_cleanup_observations().is_some());
+        assert_eq!(cancelled, before);
+    }
+
+    #[test]
+    fn snapshot_nested_observation_payloads_reject_unknown_fields() {
+        fn assert_unknown_payload_rejected<T>(value: T)
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned,
+        {
+            let mut encoded = serde_json::to_value(value).expect("nested observation JSON");
+            encoded
+                .as_object_mut()
+                .expect("externally tagged observation")
+                .values_mut()
+                .next()
+                .expect("observation payload")
+                .as_object_mut()
+                .expect("struct observation payload")
+                .insert("unknown_nested_field".to_owned(), json!(true));
+            assert!(serde_json::from_value::<T>(encoded).is_err());
+        }
+
+        let progress = copy_progress_with_admission_claims();
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let stage_key = key_for(&progress, 0, WorkUnitRole::Stage);
+        let publish_key = key_for(&progress, 0, WorkUnitRole::Publish);
+        let coordinator_key = progress
+            .steps()
+            .iter()
+            .find(|step| expected_coordinator_receipt(step.key().role()).is_some())
+            .map(WorkProgressStep::key)
+            .expect("coordinator work-plan role");
+
+        assert_unknown_payload_rejected(CancellationSourceClosureOutcome::Observed {
+            evidence: evidence_for(&progress, source_key, 1),
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(source_key)
+                    .expect("source scope")
+                    .clone(),
+            ),
+        });
+        assert_unknown_payload_rejected(CancellationCoordinatorClosureOutcome::Observed {
+            evidence: evidence_for(&progress, coordinator_key, 1),
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(coordinator_key)
+                    .expect("coordinator scope")
+                    .clone(),
+            ),
+        });
+        assert_unknown_payload_rejected(CancellationResourceCleanupOutcome::Preserved {
+            owner_revision: 1,
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress.scope_for(stage_key).expect("stage scope").clone(),
+            ),
+        });
+        assert_unknown_payload_rejected(CancellationNamespaceCleanupOutcome::Preserved {
+            owner_revision: 1,
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(publish_key)
+                    .expect("publish scope")
+                    .clone(),
+            ),
+        });
+    }
+
+    #[test]
+    fn full_progress_snapshot_base_rejects_binding_and_step_corruption() {
+        let progress = copy_progress_with_admission_claims();
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("snapshot");
+
+        let intent = copy_snapshot_intent(&progress);
+        let other_progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(1205)),
+            progress.plan(),
+            intent.args(),
+            intent.participants(),
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("other progress");
+        let other_intent = copy_snapshot_intent(&other_progress);
+        assert!(matches!(
+            progress.capture_full_progress_snapshot(&other_intent),
+            Err(FullProgressSnapshotObservationError::OperationIdMismatch)
+        ));
+
+        let mut reordered = serde_json::to_value(&snapshot).expect("snapshot value");
+        reordered
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array")
+            .swap(0, 1);
+        let reordered: FullProgressSnapshotObservation =
+            serde_json::from_value(reordered).expect("reordered snapshot shape");
+        assert!(matches!(
+            reordered.validate_base(),
+            Err(FullProgressSnapshotObservationError::StepKeyMismatch { .. })
+        ));
+
+        let mut deferred = serde_json::to_value(&snapshot).expect("snapshot value");
+        deferred
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array")[0]
+            .as_object_mut()
+            .expect("step object")
+            .insert("status".to_owned(), json!("Deferred"));
+        let deferred: FullProgressSnapshotObservation =
+            serde_json::from_value(deferred).expect("deferred snapshot shape");
+        assert!(matches!(
+            deferred.validate_base(),
+            Err(FullProgressSnapshotObservationError::DeferredRoleInvalid { .. })
+                | Err(FullProgressSnapshotObservationError::StepApplicabilityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn full_progress_snapshot_base_rejects_history_and_dependency_corruption() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("completed snapshot");
+
+        let mut missing_evidence = serde_json::to_value(&snapshot).expect("snapshot value");
+        missing_evidence
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array")
+            .iter_mut()
+            .find(|step| step["key"]["role"] == json!("SourceRead"))
+            .expect("source step")
+            .as_object_mut()
+            .expect("source step object")
+            .insert("evidence".to_owned(), serde_json::Value::Null);
+        let missing_evidence: FullProgressSnapshotObservation =
+            serde_json::from_value(missing_evidence).expect("missing evidence shape");
+        assert!(matches!(
+            missing_evidence.validate_base(),
+            Err(FullProgressSnapshotObservationError::Completion {
+                source: WorkProgressError::CompletionEvidenceMissing { .. }
+            })
+        ));
+
+        let mut future_context = serde_json::to_value(&snapshot).expect("snapshot value");
+        future_context
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array")
+            .iter_mut()
+            .find(|step| step["key"]["role"] == json!("SourceRead"))
+            .expect("source step")
+            .get_mut("completion_context")
+            .expect("completion context")
+            .as_object_mut()
+            .expect("completion context object")
+            .insert("execution_epoch".to_owned(), json!(1));
+        let future_context: FullProgressSnapshotObservation =
+            serde_json::from_value(future_context).expect("future context shape");
+        assert!(matches!(
+            future_context.validate_base(),
+            Err(FullProgressSnapshotObservationError::Completion {
+                source: WorkProgressError::CompletionContextEpochFuture { .. }
+            })
+        ));
+
+        let mut wrong_requirement = serde_json::to_value(&snapshot).expect("snapshot value");
+        wrong_requirement
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array")
+            .iter_mut()
+            .find(|step| step["key"]["role"] == json!("SourceRead"))
+            .expect("source step")
+            .as_object_mut()
+            .expect("source step object")
+            .insert("requirement".to_owned(), json!("OptionalRebuildable"));
+        let wrong_requirement: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_requirement).expect("wrong requirement shape");
+        assert!(matches!(
+            wrong_requirement.validate_base(),
+            Err(FullProgressSnapshotObservationError::StepRequirementMismatch { .. })
+        ));
+
+        let mut dependency_hole = serde_json::to_value(&snapshot).expect("snapshot value");
+        let stage = dependency_hole
+            .get_mut("steps")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("steps array")
+            .iter_mut()
+            .find(|step| step["key"]["role"] == json!("Stage"))
+            .expect("stage step")
+            .as_object_mut()
+            .expect("stage step object");
+        stage.insert("status".to_owned(), json!("Pending"));
+        stage.insert("evidence".to_owned(), serde_json::Value::Null);
+        stage.insert("completion_context".to_owned(), serde_json::Value::Null);
+        let dependency_hole: FullProgressSnapshotObservation =
+            serde_json::from_value(dependency_hole).expect("dependency hole shape");
+        assert!(matches!(
+            dependency_hole.validate_base(),
+            Err(FullProgressSnapshotObservationError::PrerequisiteIncomplete { .. })
+        ));
     }
 }

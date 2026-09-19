@@ -4,6 +4,7 @@
 //! inventory.  It records observational receipts without completing normal progress, issuing a
 //! source capability, or authorizing cleanup, settlement, terminal cancellation, or persistence.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::cancellation_effects::CancellationEffectRecoveryInventory;
@@ -22,7 +23,8 @@ pub const MAX_CANCELLATION_SOURCE_CLOSURE_ROWS: usize = MAX_CANCELLATION_SOURCE_
 /// The manifest retains the complete recovery inventory that produced it.  It is an observation
 /// of cancellation-local obligations only: membership, pending status, or an absent key does not
 /// prove source state, grant a source capability, or authorize recovery or cleanup.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceClosureManifest {
     recovery_inventory: CancellationEffectRecoveryInventory,
     keys: Vec<WorkUnitKey>,
@@ -144,7 +146,8 @@ impl SourceClosureManifest {
 ///
 /// `Pending` carries no receipt.  `Observed` retains historical evidence and context without
 /// changing the corresponding normal progress step.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum CancellationSourceClosureOutcome {
     /// No cancellation-local source receipt has been retained for this closure key.
     Pending,
@@ -158,7 +161,8 @@ pub enum CancellationSourceClosureOutcome {
 }
 
 /// One exact source-closure key and its cancellation-local observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationSourceClosureObservationRow {
     key: WorkUnitKey,
     outcome: CancellationSourceClosureOutcome,
@@ -186,7 +190,8 @@ impl CancellationSourceClosureObservationRow {
 /// This record is observational data only.  It does not transition normal steps, prove source
 /// state, issue a source capability, or authorize cleanup, settlement, terminal cancellation, or
 /// persistence.  Transition and refinement policy belongs to a later accepting guard.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationSourceClosureObservationRecord {
     manifest: SourceClosureManifest,
     observation_epoch: u64,
@@ -458,7 +463,8 @@ pub const MAX_CANCELLATION_COORDINATOR_CLOSURE_ROWS: usize =
 /// The source-closure record is retained in full so a coordinator receipt cannot be detached
 /// from the recovery inventory, dispatch outcome, or frozen cancellation lineage that selected
 /// it.  The manifest remains observational and grants no coordinator or terminal authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoordinatorClosureManifest {
     source_closure_observation: CancellationSourceClosureObservationRecord,
     keys: Vec<WorkUnitKey>,
@@ -565,7 +571,8 @@ impl CoordinatorClosureManifest {
 }
 
 /// One typed cancellation-local coordinator-closure observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum CancellationCoordinatorClosureOutcome {
     /// No cancellation-local coordinator receipt has been retained for this key.
     Pending,
@@ -579,7 +586,8 @@ pub enum CancellationCoordinatorClosureOutcome {
 }
 
 /// One exact coordinator-closure key and its cancellation-local observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationCoordinatorClosureObservationRow {
     key: WorkUnitKey,
     outcome: CancellationCoordinatorClosureOutcome,
@@ -603,7 +611,8 @@ impl CancellationCoordinatorClosureObservationRow {
 }
 
 /// Immutable cancellation-local coordinator-closure observations bound to one exact manifest.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationCoordinatorClosureObservationRecord {
     manifest: CoordinatorClosureManifest,
     observation_epoch: u64,

@@ -1548,3 +1548,23 @@ library and GPUI checks, formatting, and diff checks. Full-progress persistence,
 codec/store integration, durable admission, readiness completion/deferral, and
 the remaining OPT-1337 owner work remain open; Windows CI was not dispatched
 because the existing account billing restriction remains unresolved.
+
+Raw full-progress snapshot observations now retain one exact frozen intent plus
+the complete bounded mutable WorkProgress state: participant scopes, ordered
+step rows, phase and disposition, retry and audit observations, cancellation and
+claim observations, recovery generation, and accepted cancellation records. The
+capture path uses exhaustive field binding, while the standalone partial/base
+validator independently checks intent topology, exact plan rows, historical
+completion evidence, direct prerequisite completion and epoch ordering, and
+relative current-fence rebinding for stable source groups. Initial source-fence
+distributions remain intact; a changed group must rebind coherently at a lease
+strictly newer than its maximum initial lease.
+
+Eight focused snapshot tests and 117 WorkProgress tests passed, together with
+no-default-feature library and GPUI checks, formatting, and diff checks. This is
+an in-memory raw observation and partial/base-validation milestone only: advanced
+phase, retry, audit, cancellation, recovery, terminal and trusted-persistence
+validation, durable full-progress codec/store/restore, restart integration, and
+authority remain open. No live owner, permit, barrier, filesystem mutation, or
+native Windows UI/audio acceptance was added; Windows CI was not dispatched
+because the existing account billing restriction remains unresolved.
