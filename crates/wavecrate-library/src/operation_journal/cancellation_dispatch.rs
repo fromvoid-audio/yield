@@ -7,6 +7,7 @@
 //! required, or whether any recovery or dispatch authority exists.  The module does not issue a
 //! barrier, inspect a source or filesystem, mutate progress, or produce a cancellation outcome.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::admission_claims::AdmissionClaimInventory;
@@ -30,7 +31,8 @@ pub const MAX_CANCELLATION_DISPATCH_ROWS: usize = MAX_CANCELLATION_DISPATCH_KEYS
 /// work, prove idleness or absence, or grant a barrier, recovery, filesystem, source, or terminal
 /// authority.  A retained capture epoch may be older than current progress after source
 /// reacquisition; a future issuer can bind a separate barrier to the current epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationDispatchManifest {
     operation_id: OperationId,
     plan_version: u16,
@@ -261,7 +263,7 @@ pub(crate) fn derive_cancellation_dispatch_manifest(
 /// carry no evidence or context, so a caller cannot represent an accidental late-completion
 /// payload under an uncertain or no-entry result.  None of these observations grants dispatch,
 /// barrier, recovery, cleanup, or terminal authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CancellationDispatchOutcome {
     /// No dispatch entry was observed for the obligation.
     NeverEntered,
@@ -277,7 +279,8 @@ pub enum CancellationDispatchOutcome {
 }
 
 /// One exact frozen dispatch key and its cancellation-wide outcome observation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationDispatchOutcomeRow {
     key: WorkUnitKey,
     outcome: CancellationDispatchOutcome,
@@ -306,7 +309,8 @@ impl CancellationDispatchOutcomeRow {
 /// that produced its exact rows.  It remains a candidate observation until a future private
 /// barrier owner validates and accepts it; constructing or validating this value does not grant
 /// authority and does not mutate `WorkProgress`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancellationDispatchOutcomeRecord {
     manifest: CancellationDispatchManifest,
     observation_epoch: u64,

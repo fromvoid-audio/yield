@@ -520,7 +520,8 @@ struct ActiveAudit {
 ///
 /// A scope is an observation of participant kind and source fence.  It is not a lease, owner
 /// capability, filesystem root, or permission to perform the role.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParticipantScope {
     participant_id: ParticipantId,
     kind: ParticipantKind,
@@ -557,7 +558,8 @@ impl ParticipantScope {
 /// The context is retained only in memory so a completion can be replayed after source
 /// reacquisition against the historical epoch and participant fence that accepted it.  It is an
 /// observation, not an owner capability or completion authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionContext {
     execution_epoch: u64,
     scope: ParticipantScope,
@@ -882,6 +884,11 @@ pub struct PrePublishCancellationObservation {
     cleanup: PrePublishCleanupObservation,
     unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
     settlement: AdmissionClaimSettlementInventory,
+    /// The accepted dispatch observation is retained for owner replay when present.  Older
+    /// observational values may omit this optional field; decoding one never creates the
+    /// private authority required to finish cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_outcome: Option<CancellationDispatchOutcomeRecord>,
 }
 
 /// Failure while validating the bounded local shape of prepublication cleanup observations.
@@ -972,6 +979,25 @@ impl PrePublishCancellationObservation {
             cleanup,
             unstarted_quiescence,
             settlement,
+            dispatch_outcome: None,
+        }
+    }
+
+    /// Construct one stored observation with its accepted in-memory dispatch record.
+    ///
+    /// The record remains observational data until a private owner authority validates it
+    /// against current progress; this constructor does not grant cleanup or terminal authority.
+    pub fn with_dispatch_outcome(
+        cleanup: PrePublishCleanupObservation,
+        unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
+        settlement: AdmissionClaimSettlementInventory,
+        dispatch_outcome: CancellationDispatchOutcomeRecord,
+    ) -> Self {
+        Self {
+            cleanup,
+            unstarted_quiescence,
+            settlement,
+            dispatch_outcome: Some(dispatch_outcome),
         }
     }
 
@@ -988,6 +1014,11 @@ impl PrePublishCancellationObservation {
     /// Borrow the bounded claim settlement observations.
     pub fn settlement(&self) -> &AdmissionClaimSettlementInventory {
         &self.settlement
+    }
+
+    /// Borrow the accepted in-memory cancellation dispatch outcome, when present.
+    pub fn dispatch_outcome(&self) -> Option<&CancellationDispatchOutcomeRecord> {
+        self.dispatch_outcome.as_ref()
     }
 }
 
@@ -1111,6 +1142,7 @@ struct VerifiedPrePublishCancellation {
     cleanup: PrePublishCleanupObservation,
     unstarted_quiescence: PrePublishUnstartedQuiescenceObservation,
     settlement: AdmissionClaimSettlementInventory,
+    dispatch_outcome: CancellationDispatchOutcomeRecord,
 }
 
 /// Origin state required by one prepublication cleanup action.
@@ -2105,6 +2137,14 @@ impl WorkProgress {
                 actual: authority.execution_epoch,
             });
         }
+        if authority.dispatch_outcome.observation_epoch() != self.execution_epoch {
+            return Err(
+                WorkProgressError::PrePublishCancellationDispatchEpochMismatch {
+                    expected: self.execution_epoch,
+                    actual: authority.dispatch_outcome.observation_epoch(),
+                },
+            );
+        }
         let generation_is_current =
             authority.expected_recovery_generation == self.recovery_generation;
         let generation_is_replay = authority
@@ -2142,6 +2182,17 @@ impl WorkProgress {
             return Err(WorkProgressError::PrePublishCancellationStateInvalid);
         }
 
+        self.validate_cancellation_dispatch_record(&authority.dispatch_outcome)?;
+        let next_recovery_generation = self
+            .recovery_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::PrePublishCancellationRecoveryGenerationOverflow)?;
+        let dispatch_complete = authority
+            .dispatch_outcome
+            .rows()
+            .iter()
+            .all(|row| matches!(row.outcome(), CancellationDispatchOutcome::NeverEntered));
+
         authority
             .cleanup
             .validate()
@@ -2162,7 +2213,7 @@ impl WorkProgress {
             &authority.cancellation_inventory,
             &authority.cleanup,
             admission_claims,
-            unstarted_quiescence_complete,
+            unstarted_quiescence_complete && dispatch_complete,
         )?;
         self.validate_pre_publish_settlement(
             &authority.cancellation_inventory,
@@ -2170,12 +2221,17 @@ impl WorkProgress {
             &authority.cleanup,
             &authority.settlement,
             unstarted_quiescence_complete,
+            dispatch_complete,
         )?;
 
         if let Some(existing) = &self.pre_publish_cancellation {
+            let dispatch_matches = existing
+                .dispatch_outcome()
+                .is_some_and(|stored| stored == &authority.dispatch_outcome);
             if existing.cleanup() == &authority.cleanup
                 && existing.unstarted_quiescence() == &authority.unstarted_quiescence
                 && existing.settlement() == &authority.settlement
+                && dispatch_matches
             {
                 if generation_is_current || generation_is_replay {
                     return Ok(());
@@ -2188,6 +2244,22 @@ impl WorkProgress {
                         actual: authority.expected_recovery_generation,
                     },
                 );
+            }
+            if !dispatch_matches {
+                if authority.dispatch_outcome.recovery_generation() != next_recovery_generation {
+                    return Err(
+                        WorkProgressError::PrePublishCancellationDispatchGenerationMismatch {
+                            expected: next_recovery_generation,
+                            actual: authority.dispatch_outcome.recovery_generation(),
+                        },
+                    );
+                }
+                if let Some(previous) = existing.dispatch_outcome() {
+                    authority
+                        .dispatch_outcome
+                        .validate_transition(previous, self.execution_epoch)
+                        .map_err(WorkProgressError::CancellationDispatchOutcome)?;
+                }
             }
             validate_pre_publish_unstarted_quiescence_transition(
                 existing.unstarted_quiescence(),
@@ -2210,24 +2282,29 @@ impl WorkProgress {
         } else if self.disposition == FullProgressDisposition::CancelledBeforePublish {
             return Err(WorkProgressError::PrePublishCancellationStateInvalid);
         }
-
-        let next_recovery_generation = self
-            .recovery_generation
-            .checked_add(1)
-            .ok_or(WorkProgressError::PrePublishCancellationRecoveryGenerationOverflow)?;
+        if self.pre_publish_cancellation.is_none()
+            && authority.dispatch_outcome.recovery_generation() != next_recovery_generation
+        {
+            return Err(
+                WorkProgressError::PrePublishCancellationDispatchGenerationMismatch {
+                    expected: next_recovery_generation,
+                    actual: authority.dispatch_outcome.recovery_generation(),
+                },
+            );
+        }
         let settled = authority
             .settlement
             .satisfies_prepublication_cancellation(admission_claims)
             .map_err(WorkProgressError::PrePublishCancellationSettlement)?;
-        self.pre_publish_cancellation = Some(
-            PrePublishCancellationObservation::with_unstarted_quiescence(
+        self.pre_publish_cancellation =
+            Some(PrePublishCancellationObservation::with_dispatch_outcome(
                 authority.cleanup,
                 authority.unstarted_quiescence,
                 authority.settlement,
-            ),
-        );
+                authority.dispatch_outcome,
+            ));
         self.recovery_generation = next_recovery_generation;
-        if cleanup_complete && settled {
+        if cleanup_complete && dispatch_complete && unstarted_quiescence_complete && settled {
             self.phase = OperationPhase::Terminal;
             self.disposition = FullProgressDisposition::CancelledBeforePublish;
         }
@@ -2553,6 +2630,7 @@ impl WorkProgress {
         cleanup: &PrePublishCleanupObservation,
         settlement: &AdmissionClaimSettlementInventory,
         unstarted_quiescence_complete: bool,
+        dispatch_complete: bool,
     ) -> Result<(), WorkProgressError> {
         settlement
             .validate_against(admission_claims)
@@ -2565,6 +2643,12 @@ impl WorkProgress {
                 .expect("validated settlement coverage");
             if observed.outcome() == AdmissionClaimSettlementOutcome::Held {
                 continue;
+            }
+            if !dispatch_complete {
+                return Err(WorkProgressError::PrePublishCancellationDispatchIncomplete);
+            }
+            if !unstarted_quiescence_complete {
+                return Err(WorkProgressError::PrePublishCancellationSettlementGateIncomplete);
             }
             let compatible = match claim.allocation_class() {
                 FullCapacityAllocationClass::DestinationStaging
@@ -3676,6 +3760,27 @@ pub enum WorkProgressError {
         /// Epoch supplied by the cleanup authority.
         actual: u64,
     },
+    /// The private prepublication cancellation authority carried a dispatch record from
+    /// another execution epoch.
+    #[error(
+        "work progress prepublication cancellation dispatch epoch {actual} does not match expected epoch {expected}"
+    )]
+    PrePublishCancellationDispatchEpochMismatch {
+        /// Current execution epoch required by progress.
+        expected: u64,
+        /// Epoch supplied by the dispatch outcome record.
+        actual: u64,
+    },
+    /// A new or changed dispatch outcome record did not advance with the recovery observation.
+    #[error(
+        "work progress prepublication cancellation dispatch generation {actual} does not match expected generation {expected}"
+    )]
+    PrePublishCancellationDispatchGenerationMismatch {
+        /// Record generation required for a new or changed outcome record.
+        expected: u64,
+        /// Generation supplied by the outcome record.
+        actual: u64,
+    },
     /// A private prepublication cancellation authority carried another cleanup generation.
     #[error(
         "work progress prepublication cancellation generation {actual} does not match expected generation {expected}"
@@ -3733,6 +3838,18 @@ pub enum WorkProgressError {
         /// Class whose release is unsafe while cleanup is incomplete.
         allocation_class: super::full_capacity::FullCapacityAllocationClass,
     },
+    /// A non-held claim settlement was submitted before every dispatch row was proven
+    /// `NeverEntered`.
+    #[error(
+        "work progress prepublication cancellation dispatch is incomplete; non-held settlement is not authorized"
+    )]
+    PrePublishCancellationDispatchIncomplete,
+    /// A non-held settlement for a retained claim was submitted before the unstarted-action
+    /// quiescence gate was complete.
+    #[error(
+        "work progress prepublication cancellation settlement requires dispatch and unstarted quiescence completeness"
+    )]
+    PrePublishCancellationSettlementGateIncomplete,
     /// A changed settlement attempted to rewrite an already settled claim.
     #[error("work progress prepublication settlement replay conflicts with a settled claim")]
     PrePublishCancellationSettlementReplayConflict,
@@ -4383,6 +4500,40 @@ mod tests {
         }
     }
 
+    fn all_never_dispatch_record(progress: &WorkProgress) -> CancellationDispatchOutcomeRecord {
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("cancellation dispatch manifest");
+        let rows = manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationDispatchOutcomeRow::new(*key, CancellationDispatchOutcome::NeverEntered)
+            })
+            .collect();
+        CancellationDispatchOutcomeRecord::new(
+            manifest,
+            progress.execution_epoch,
+            progress
+                .recovery_generation
+                .checked_add(1)
+                .expect("dispatch recovery generation"),
+            rows,
+        )
+        .expect("all-never dispatch record")
+    }
+
+    fn dispatch_outcome_for_authority(
+        progress: &WorkProgress,
+    ) -> CancellationDispatchOutcomeRecord {
+        progress
+            .pre_publish_cancellation()
+            .and_then(PrePublishCancellationObservation::dispatch_outcome)
+            .filter(|stored| stored.observation_epoch() == progress.execution_epoch)
+            .cloned()
+            .unwrap_or_else(|| all_never_dispatch_record(progress))
+    }
+
     fn pre_publish_cleanup_authority(
         progress: &WorkProgress,
         cleanup: PrePublishCleanupObservation,
@@ -4416,6 +4567,7 @@ mod tests {
             cleanup,
             unstarted_quiescence,
             settlement,
+            dispatch_outcome: dispatch_outcome_for_authority(progress),
         }
     }
 
@@ -6326,6 +6478,395 @@ mod tests {
     }
 
     #[test]
+    fn prepublish_observation_round_trips_dispatch_outcome_and_preserves_legacy_absence() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(3221).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let observed_key = *manifest.keys().first().expect("dispatch key");
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(observed_key)
+                .expect("observed scope")
+                .clone(),
+        );
+        let record = CancellationDispatchOutcomeRecord::new(
+            manifest,
+            progress.execution_epoch(),
+            1,
+            dispatch_rows(
+                &progress
+                    .cancellation_dispatch_manifest()
+                    .expect("dispatch manifest replay"),
+                Some((
+                    observed_key,
+                    evidence_for(&progress, observed_key, 7),
+                    context,
+                )),
+            ),
+        )
+        .expect("observed dispatch record");
+        let observation = PrePublishCancellationObservation::with_dispatch_outcome(
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            PrePublishUnstartedQuiescenceObservation::new(Vec::new()).expect("quiescence"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+            record,
+        );
+        let encoded = serde_json::to_value(&observation).expect("observation JSON");
+        assert!(encoded.get("dispatch_outcome").is_some());
+        let decoded: PrePublishCancellationObservation =
+            serde_json::from_value(encoded).expect("observation JSON round trip");
+        let decoded_record = decoded
+            .dispatch_outcome()
+            .expect("dispatch outcome retained after decode");
+        progress
+            .validate_cancellation_dispatch_record(decoded_record)
+            .expect("decoded record validates before private use");
+        assert_eq!(decoded, observation);
+
+        let legacy = PrePublishCancellationObservation::new(
+            PrePublishCleanupObservation::new(Vec::new()).expect("legacy cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        let legacy_json = serde_json::to_value(&legacy).expect("legacy observation JSON");
+        assert!(legacy_json.get("dispatch_outcome").is_none());
+        let decoded_legacy: PrePublishCancellationObservation =
+            serde_json::from_value(legacy_json).expect("legacy observation decodes");
+        assert!(decoded_legacy.dispatch_outcome().is_none());
+    }
+
+    #[test]
+    fn prepublish_dispatch_outcomes_keep_late_uncertainty_held_and_block_release() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(3222).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let held = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+
+        let mut uncertain = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            held.clone(),
+        );
+        uncertain.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("uncertain dispatch record");
+        progress
+            .finish_pre_publish_cancellation(uncertain)
+            .expect("retain uncertain dispatch observation");
+        assert_eq!(progress.recovery_generation(), 1);
+        assert!(
+            progress
+                .pre_publish_cancellation()
+                .expect("retained cancellation")
+                .dispatch_outcome()
+                .expect("retained dispatch outcome")
+                .rows()
+                .iter()
+                .all(|row| matches!(row.outcome(), CancellationDispatchOutcome::EntryUncertain))
+        );
+
+        let before_release = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            )),
+            Err(WorkProgressError::PrePublishCancellationDispatchIncomplete)
+        );
+        assert_eq!(progress, before_release);
+
+        let observed_key = key_for(&progress, 0, WorkUnitRole::Stage);
+        let observed_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(observed_key)
+                .expect("observed scope")
+                .clone(),
+        );
+        let mut observed = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            held,
+        );
+        observed.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            dispatch_rows(
+                &manifest,
+                Some((
+                    observed_key,
+                    evidence_for(&progress, observed_key, 7),
+                    observed_context,
+                )),
+            ),
+        )
+        .expect("observed dispatch record");
+        progress
+            .finish_pre_publish_cancellation(observed)
+            .expect("retain late dispatch observation");
+        assert_eq!(progress.recovery_generation(), 2);
+        assert!(
+            progress
+                .pre_publish_cancellation()
+                .expect("retained observed cancellation")
+                .settlement()
+                .settlements()
+                .iter()
+                .all(|row| row.outcome() == AdmissionClaimSettlementOutcome::Held)
+        );
+
+        let before_observed_release = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &progress,
+                PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+            )),
+            Err(WorkProgressError::PrePublishCancellationDispatchIncomplete)
+        );
+        assert_eq!(progress, before_observed_release);
+
+        let rewrite_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(observed_key)
+                .expect("observed scope replay")
+                .clone(),
+        );
+        let mut rewritten_observation = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        rewritten_observation.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            progress
+                .cancellation_dispatch_manifest()
+                .expect("dispatch manifest replay"),
+            progress.execution_epoch(),
+            3,
+            dispatch_rows(
+                &progress
+                    .cancellation_dispatch_manifest()
+                    .expect("dispatch manifest replay"),
+                Some((
+                    observed_key,
+                    StoredStepEvidence::Filesystem {
+                        receipt: FilesystemReceiptSummary::new(FilesystemReceiptKind::Stage, 2),
+                    },
+                    rewrite_context,
+                )),
+            ),
+        )
+        .expect("rewritten late observation record");
+        let before_rewrite = progress.clone();
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(rewritten_observation),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::LateObservationChanged { key }
+            )) if key == observed_key
+        ));
+        assert_eq!(progress, before_rewrite);
+
+        let mut retained_progress =
+            copy_progress_with_claim_class(FullCapacityAllocationClass::JournalRecord, 3225);
+        apply_role(&mut retained_progress, 0, WorkUnitRole::SourceRead);
+        retained_progress
+            .request_cancellation(CancellationRequestObservation::new(3225).expect("cancel"))
+            .expect("retained cancellation request");
+        let retained_manifest = retained_progress
+            .cancellation_dispatch_manifest()
+            .expect("retained dispatch manifest");
+        let mut retained_uncertain = pre_publish_cleanup_authority(
+            &retained_progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&retained_progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        retained_uncertain.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            retained_manifest.clone(),
+            retained_progress.execution_epoch(),
+            1,
+            dispatch_rows(&retained_manifest, None),
+        )
+        .expect("retained uncertain record");
+        retained_progress
+            .finish_pre_publish_cancellation(retained_uncertain)
+            .expect("retain uncertain retained-charge observation");
+        let before_consumed = retained_progress.clone();
+        assert_eq!(
+            retained_progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &retained_progress,
+                PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                settlement_inventory(
+                    &retained_progress,
+                    AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+                ),
+            )),
+            Err(WorkProgressError::PrePublishCancellationDispatchIncomplete)
+        );
+        assert_eq!(retained_progress, before_consumed);
+
+        let mut complete_dispatch = pre_publish_cleanup_authority(
+            &retained_progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&retained_progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        complete_dispatch.dispatch_outcome = all_never_dispatch_record(&retained_progress);
+        retained_progress
+            .finish_pre_publish_cancellation(complete_dispatch)
+            .expect("retain complete dispatch observation");
+        let before_quiescence_gate = retained_progress.clone();
+        assert_eq!(
+            retained_progress.finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &retained_progress,
+                PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+                settlement_inventory(
+                    &retained_progress,
+                    AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+                ),
+            )),
+            Err(WorkProgressError::PrePublishCancellationSettlementGateIncomplete)
+        );
+        assert_eq!(retained_progress, before_quiescence_gate);
+    }
+
+    #[test]
+    fn prepublish_dispatch_outcome_binding_and_refinement_fail_atomically() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(3223).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let held = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held);
+
+        let mut wrong_manifest_authority = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            held.clone(),
+        );
+        let wrong_manifest = CancellationDispatchManifest::new(
+            OperationId::from_uuid(Uuid::from_u128(3224)),
+            manifest.plan_version(),
+            manifest.frozen_inventory_generation(),
+            manifest.capture_epoch(),
+            manifest.keys().to_vec(),
+        )
+        .expect("wrong manifest shape");
+        wrong_manifest_authority.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            wrong_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            dispatch_rows(&wrong_manifest, None),
+        )
+        .expect("wrong manifest record");
+        let before_wrong_manifest = progress.clone();
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(wrong_manifest_authority),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::ManifestMismatch
+            ))
+        ));
+        assert_eq!(progress, before_wrong_manifest);
+
+        let mut missing_rows_authority = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            held.clone(),
+        );
+        let mut missing_rows = dispatch_rows(&manifest, None);
+        missing_rows.pop();
+        missing_rows_authority.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            missing_rows,
+        )
+        .expect("missing rows record shape");
+        let before_missing_rows = progress.clone();
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(missing_rows_authority),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::RowCountMismatch { .. }
+            ))
+        ));
+        assert_eq!(progress, before_missing_rows);
+
+        let mut wrong_generation_authority = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            held.clone(),
+        );
+        wrong_generation_authority.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            manifest.clone(),
+            progress.execution_epoch(),
+            2,
+            dispatch_rows(&manifest, None),
+        )
+        .expect("wrong generation record");
+        let before_wrong_generation = progress.clone();
+        assert_eq!(
+            progress.finish_pre_publish_cancellation(wrong_generation_authority),
+            Err(
+                WorkProgressError::PrePublishCancellationDispatchGenerationMismatch {
+                    expected: 1,
+                    actual: 2,
+                }
+            )
+        );
+        assert_eq!(progress, before_wrong_generation);
+
+        let mut accepted = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            held,
+        );
+        accepted.dispatch_outcome = all_never_dispatch_record(&progress);
+        progress
+            .finish_pre_publish_cancellation(accepted)
+            .expect("accept complete dispatch observation");
+        let before_contradiction = progress.clone();
+        let mut contradiction = pre_publish_cleanup_authority(
+            &progress,
+            PrePublishCleanupObservation::new(Vec::new()).expect("cleanup"),
+            settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
+        );
+        contradiction.dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+            manifest,
+            progress.execution_epoch(),
+            2,
+            dispatch_rows(
+                &progress
+                    .cancellation_dispatch_manifest()
+                    .expect("dispatch manifest replay"),
+                None,
+            ),
+        )
+        .expect("contradictory dispatch record");
+        assert!(matches!(
+            progress.finish_pre_publish_cancellation(contradiction),
+            Err(WorkProgressError::CancellationDispatchOutcome(
+                CancellationDispatchOutcomeRecordError::NeverEnteredChanged { .. }
+            ))
+        ));
+        assert_eq!(progress, before_contradiction);
+    }
+
+    #[test]
     fn cancellation_dispatch_outcome_validates_late_history_and_reacquisition() {
         let (participants, source, _filesystem, source_id) = valid_topology(false);
         let mut progress =
@@ -7758,11 +8299,7 @@ mod tests {
                 cleanup.clone(),
                 settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
             )),
-            Err(
-                WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
-                    allocation_class: FullCapacityAllocationClass::DestinationStaging,
-                }
-            )
+            Err(WorkProgressError::PrePublishCancellationSettlementGateIncomplete)
         );
         assert_eq!(progress, before_staging_release);
 
@@ -7779,11 +8316,7 @@ mod tests {
                     ],
                 ),
             )),
-            Err(
-                WorkProgressError::PrePublishCancellationSettlementCleanupIncomplete {
-                    allocation_class: FullCapacityAllocationClass::OperationRecoveryPayload,
-                }
-            )
+            Err(WorkProgressError::PrePublishCancellationSettlementGateIncomplete)
         );
         assert_eq!(progress, before_recovery_release);
     }
@@ -8143,7 +8676,7 @@ mod tests {
                 settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Held),
             ))
             .expect("current epoch retained proof");
-        assert_eq!(progress.recovery_generation(), 1);
+        assert_eq!(progress.recovery_generation(), 2);
         assert_eq!(
             progress.disposition(),
             FullProgressDisposition::CancelRequestedBeforePublish
@@ -8401,6 +8934,7 @@ mod tests {
                     &published,
                     AdmissionClaimSettlementOutcome::Held,
                 ),
+                dispatch_outcome: all_never_dispatch_record(&published),
             }),
             Err(WorkProgressError::PrePublishCancellationRouteInvalid {
                 route: CancellationRoute::AfterPublish,

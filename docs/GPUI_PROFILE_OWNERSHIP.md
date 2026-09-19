@@ -1415,3 +1415,27 @@ and storage, cancellation gating, recovery reconciliation, and durable
 full-progress persistence/codec remain open. Native Windows UI/audio acceptance
 also remains separate. Filesystem mutation implementation is outside OPT-1337 as
 dependent owner work.
+
+The private prepublication cancellation gate now requires one accepted,
+serde-preserved observational dispatch record bound to the exact frozen manifest
+and current execution epoch. Every manifest row must be `NeverEntered` before
+cleanup, non-held claim settlement, or terminal cancellation can proceed; the
+existing unstarted-action quiescence proof remains a second required gate.
+`EntryUncertain` and `ObservedAfterCancellation` rows are retained with `Held`
+settlements and remain nonterminal. New or changed records advance the shared
+recovery generation and pass monotonic refinement checks; exact replay may reuse
+the accepted record, while source reacquisition requires a fresh current-epoch
+record and preserves historical late evidence.
+
+The accepted record is retained in the observational prepublication value. Its
+`Some` serde representation round-trips typed late evidence and completion
+context; legacy observations without the optional field decode as `None` and
+remain incomplete until a private authority supplies a record. This is not a
+durable full-progress codec or a live barrier issuer. Fifty-two focused progress
+tests and forty-one cancellation tests passed, including the atomic gate,
+generation, replay, reacquisition, late-evidence, and serde regressions. The
+no-default-feature operation-journal suite passed 328 tests with one ignored,
+and the no-default GPUI check, formatting, and diff checks passed. Live barrier
+ownership, after-effect recovery, readiness, persistence/admission integration,
+legacy coverage/session recovery, and filesystem execution remain open; the
+filesystem owner work is outside OPT-1337 under dependent OPT-1339.
