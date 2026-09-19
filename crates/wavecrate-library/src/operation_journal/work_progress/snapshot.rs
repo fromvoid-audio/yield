@@ -2,11 +2,11 @@
 //!
 //! This module captures the exact mutable progress observations together with the immutable
 //! intent retained by the caller.  The base validator checks topology, step shape, historical
-//! completion evidence, direct prerequisite consistency, and the bounded internal shape of retry
-//! and audit overlays.  It intentionally does not validate advanced phase, cancellation,
-//! recovery, or terminal semantics; a snapshot is not a durable schema, a restart record, or a
-//! progress authority. The production owner must retain this immutable intent from admission
-//! because capture cannot recover historical artifact provenance from the plan-only live progress
+//! completion evidence, direct prerequisite consistency, and the bounded internal shape of retry,
+//! audit, and cancellation envelopes.  It intentionally does not validate advanced cancellation,
+//! recovery, claim-settlement, cleanup, or terminal semantics; a snapshot is not a durable schema,
+//! a restart record, or a progress authority. The production owner must retain this immutable intent
+//! from admission because capture cannot recover historical artifact provenance from the plan-only live progress
 //! value.
 
 use serde::{Deserialize, Serialize};
@@ -20,11 +20,11 @@ use super::super::work_plan::{WorkUnitApplicability, WorkUnitKey, WorkUnitRole};
 use super::{
     ActiveAudit, AdmissionClaimSettlementInventory, AfterEffectReconciliationObservation,
     AuditTargetValidationError, CancellationCleanupObservation, CancellationInventory,
-    CancellationRequestObservation, FullProgressDisposition, OperationPhase,
-    ParticipantRequirement, ParticipantScope, PrePublishCancellationObservation,
-    ProgressStepStatus, RetryObservation, RetryObservationValidationError, WorkProgress,
-    WorkProgressError, WorkProgressStep, historical_scope_matches_current,
-    same_stable_source_identity,
+    CancellationInventoryError, CancellationRequestObservation, CancellationRequestValidationError,
+    CancellationRoute, FullProgressDisposition, OperationPhase, ParticipantRequirement,
+    ParticipantScope, PrePublishCancellationObservation, ProgressStepStatus, RetryObservation,
+    RetryObservationValidationError, WorkProgress, WorkProgressError, WorkProgressStep,
+    historical_scope_matches_current, same_stable_source_identity,
 };
 
 /// A complete bounded in-memory progress observation tied to one frozen intent.
@@ -145,9 +145,9 @@ impl FullProgressSnapshotObservation {
     ///
     /// This is deliberately a partial consistency check.  It proves that the supplied intent,
     /// current scopes, frozen plan rows, retained completion history, direct prerequisite
-    /// relationships, and the internal retry/audit observation shape agree with one another,
-    /// while preserving advanced state-family observations without claiming to validate their
-    /// recovery or terminal semantics.
+    /// relationships, the internal retry/audit observation shape, and the bounded cancellation
+    /// envelope agree with one another, while preserving advanced state-family observations
+    /// without claiming to validate their recovery or terminal semantics.
     pub(crate) fn validate_base(&self) -> Result<(), FullProgressSnapshotObservationError> {
         self.intent
             .validate()
@@ -156,6 +156,7 @@ impl FullProgressSnapshotObservation {
         self.validate_step_bounds()?;
         self.validate_retry_state()?;
         self.validate_audit_state()?;
+        self.validate_cancellation_envelope()?;
         let validation_progress = self.validation_progress();
         self.validate_steps(&validation_progress)?;
         Ok(())
@@ -193,6 +194,123 @@ impl FullProgressSnapshotObservation {
             && self.retry_observation.is_none()
         {
             return Err(FullProgressSnapshotObservationError::RetryPendingObservationMissing);
+        }
+        Ok(())
+    }
+
+    fn validate_cancellation_envelope(&self) -> Result<(), FullProgressSnapshotObservationError> {
+        match (
+            self.cancellation_request,
+            self.cancellation_inventory.as_ref(),
+        ) {
+            (Some(request), Some(inventory)) => {
+                request
+                    .validate()
+                    .map_err(FullProgressSnapshotObservationError::CancellationRequest)?;
+                inventory
+                    .validate_against(
+                        self.intent.operation_id(),
+                        self.intent.plan(),
+                        &self.steps,
+                        self.execution_epoch,
+                        self.intent.admission_claims(),
+                    )
+                    .map_err(FullProgressSnapshotObservationError::CancellationInventory)?;
+
+                if self.disposition == FullProgressDisposition::AuditRequired {
+                    let Some(active) = self.active_audit.as_ref() else {
+                        return Err(
+                            FullProgressSnapshotObservationError::CancellationAuditHoldMissing {
+                                route: inventory.route(),
+                            },
+                        );
+                    };
+                    if !cancellation_audit_hold_matches_route(
+                        active.suspended_hold,
+                        inventory.route(),
+                    ) {
+                        return Err(
+                            FullProgressSnapshotObservationError::CancellationAuditHoldMismatch {
+                                route: inventory.route(),
+                            },
+                        );
+                    }
+                } else if !cancellation_disposition_matches_route(
+                    self.disposition,
+                    inventory.route(),
+                ) {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationDispositionMismatch {
+                            route: inventory.route(),
+                            disposition: self.disposition,
+                        },
+                    );
+                }
+
+                if self.pre_publish_cancellation.is_some()
+                    && inventory.route() != CancellationRoute::BeforePublish
+                {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationPrePublishRouteInvalid {
+                            route: inventory.route(),
+                        },
+                    );
+                }
+                if self.cancellation_cleanup_observations.is_some()
+                    && self.after_effect_reconciliation.is_none()
+                {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationCleanupAfterEffectMissing,
+                    );
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationEnvelopePairMismatch {
+                        request_present: self.cancellation_request.is_some(),
+                        inventory_present: self.cancellation_inventory.is_some(),
+                    },
+                );
+            }
+            (None, None) => {
+                if cancellation_disposition_requires_envelope(self.disposition) {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationDispositionMissingEnvelope {
+                            disposition: self.disposition,
+                        },
+                    );
+                }
+                if self
+                    .active_audit
+                    .as_ref()
+                    .is_some_and(|active| cancellation_audit_hold(active.suspended_hold))
+                {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationAuditHoldOrphaned,
+                    );
+                }
+                if self.pre_publish_cancellation.is_some() {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationObservationOrphaned {
+                            field: "pre_publish_cancellation",
+                        },
+                    );
+                }
+                if self.after_effect_reconciliation.is_some() {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationObservationOrphaned {
+                            field: "after_effect_reconciliation",
+                        },
+                    );
+                }
+                if self.cancellation_cleanup_observations.is_some() {
+                    return Err(
+                        FullProgressSnapshotObservationError::CancellationObservationOrphaned {
+                            field: "cancellation_cleanup_observations",
+                        },
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -572,6 +690,67 @@ impl FullProgressSnapshotObservation {
     }
 }
 
+fn cancellation_disposition_requires_envelope(disposition: FullProgressDisposition) -> bool {
+    matches!(
+        disposition,
+        FullProgressDisposition::CancelRequestedBeforePublish
+            | FullProgressDisposition::CancelRequestedAfterPublish
+            | FullProgressDisposition::CancelRequestedAfterObservedEffect
+            | FullProgressDisposition::CancelledBeforePublish
+            | FullProgressDisposition::CancelledAfterPublish
+            | FullProgressDisposition::CancelledAfterObservedEffect
+    )
+}
+
+fn cancellation_disposition_matches_route(
+    disposition: FullProgressDisposition,
+    route: CancellationRoute,
+) -> bool {
+    match route {
+        CancellationRoute::BeforePublish => matches!(
+            disposition,
+            FullProgressDisposition::CancelRequestedBeforePublish
+                | FullProgressDisposition::CancelledBeforePublish
+        ),
+        CancellationRoute::AfterPublish => matches!(
+            disposition,
+            FullProgressDisposition::CancelRequestedAfterPublish
+                | FullProgressDisposition::CancelledAfterPublish
+        ),
+        CancellationRoute::AfterObservedEffect => matches!(
+            disposition,
+            FullProgressDisposition::CancelRequestedAfterObservedEffect
+                | FullProgressDisposition::CancelledAfterObservedEffect
+        ),
+    }
+}
+
+fn cancellation_audit_hold(hold: super::AuditSuspendedHold) -> bool {
+    matches!(
+        hold,
+        super::AuditSuspendedHold::CancelRequestedBeforePublish
+            | super::AuditSuspendedHold::CancelRequestedAfterPublish
+            | super::AuditSuspendedHold::CancelRequestedAfterObservedEffect
+    )
+}
+
+fn cancellation_audit_hold_matches_route(
+    hold: super::AuditSuspendedHold,
+    route: CancellationRoute,
+) -> bool {
+    match route {
+        CancellationRoute::BeforePublish => {
+            hold == super::AuditSuspendedHold::CancelRequestedBeforePublish
+        }
+        CancellationRoute::AfterPublish => {
+            hold == super::AuditSuspendedHold::CancelRequestedAfterPublish
+        }
+        CancellationRoute::AfterObservedEffect => {
+            hold == super::AuditSuspendedHold::CancelRequestedAfterObservedEffect
+        }
+    }
+}
+
 /// Failure while validating the partial full-progress snapshot observation boundary.
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -690,6 +869,55 @@ pub enum FullProgressSnapshotObservationError {
     /// An audit suspended cancellation without retaining its request observation.
     #[error("full-progress snapshot audit cancellation hold has no cancellation request")]
     AuditCancellationHoldMissing,
+    /// A cancellation request and its frozen inventory were not retained as a pair.
+    #[error(
+        "full-progress snapshot cancellation envelope is incomplete (request present: {request_present}, inventory present: {inventory_present})"
+    )]
+    CancellationEnvelopePairMismatch {
+        request_present: bool,
+        inventory_present: bool,
+    },
+    /// A cancellation request observation failed its bounded validation.
+    #[error("invalid full-progress snapshot cancellation request: {0}")]
+    CancellationRequest(#[source] CancellationRequestValidationError),
+    /// A frozen cancellation inventory failed validation against the snapshot intent and rows.
+    #[error("invalid full-progress snapshot cancellation inventory: {0}")]
+    CancellationInventory(#[source] CancellationInventoryError),
+    /// A cancellation disposition did not match the frozen inventory route.
+    #[error(
+        "full-progress snapshot cancellation route {route:?} does not match disposition {disposition:?}"
+    )]
+    CancellationDispositionMismatch {
+        route: CancellationRoute,
+        disposition: FullProgressDisposition,
+    },
+    /// A cancellation disposition was retained without its request/inventory envelope.
+    #[error("full-progress snapshot disposition {disposition:?} requires a cancellation envelope")]
+    CancellationDispositionMissingEnvelope {
+        disposition: FullProgressDisposition,
+    },
+    /// AuditRequired retained a cancellation route without an active cancellation hold.
+    #[error("full-progress snapshot cancellation route {route:?} has no matching audit hold")]
+    CancellationAuditHoldMissing { route: CancellationRoute },
+    /// AuditRequired retained a hold for another cancellation route.
+    #[error("full-progress snapshot audit cancellation hold does not match route {route:?}")]
+    CancellationAuditHoldMismatch { route: CancellationRoute },
+    /// An audit cancellation hold was retained without a cancellation envelope.
+    #[error("full-progress snapshot audit cancellation hold has no cancellation envelope")]
+    CancellationAuditHoldOrphaned,
+    /// A retained prepublication observation was paired with a non-before-publish route.
+    #[error(
+        "full-progress snapshot prepublication cancellation observation is invalid for route {route:?}"
+    )]
+    CancellationPrePublishRouteInvalid { route: CancellationRoute },
+    /// Cleanup observations require a retained after-effect observation.
+    #[error(
+        "full-progress snapshot cleanup observations have no retained after-effect observation"
+    )]
+    CancellationCleanupAfterEffectMissing,
+    /// A cancellation-derived observation was retained without its envelope.
+    #[error("full-progress snapshot cancellation observation {field} has no cancellation envelope")]
+    CancellationObservationOrphaned { field: &'static str },
     /// A progress row key differs from the frozen plan.
     #[error("full-progress snapshot step {index} key {actual:?} does not match {expected:?}")]
     StepKeyMismatch {
