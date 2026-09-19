@@ -232,10 +232,11 @@ pub use work_plan::{
 };
 pub use work_progress::{
     AfterEffectReconciliationObservation, AuditTarget, AuditTargetValidationError,
-    CompletionContext, CoordinatorDeficit, CoordinatorReceiptKind, CoordinatorReceiptSummary,
-    FilesystemReceiptKind, FilesystemReceiptSummary, MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS,
-    MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS, ParticipantScope, PrePublishAbsenceObservation,
-    PrePublishActionCleanup, PrePublishCancellationObservation, PrePublishCleanupObservation,
+    CancellationCleanupObservation, CompletionContext, CoordinatorDeficit, CoordinatorReceiptKind,
+    CoordinatorReceiptSummary, FilesystemReceiptKind, FilesystemReceiptSummary,
+    MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_ACTIONS, MAX_PRE_PUBLISH_UNSTARTED_QUIESCENCE_KEYS,
+    ParticipantScope, PrePublishAbsenceObservation, PrePublishActionCleanup,
+    PrePublishCancellationObservation, PrePublishCleanupObservation,
     PrePublishCleanupValidationError, PrePublishFinalClaimObservation,
     PrePublishOriginalStateObservation, PrePublishUnstartedQuiescenceAction,
     PrePublishUnstartedQuiescenceObservation, PrePublishUnstartedQuiescenceResult,

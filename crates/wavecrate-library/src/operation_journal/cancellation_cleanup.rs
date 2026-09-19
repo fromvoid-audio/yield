@@ -3,6 +3,11 @@
 //! This module records observations for the exact applicable staging and retained-recovery
 //! obligations in a validated cleanup manifest.  The values do not complete normal progress,
 //! prove adoption or absence, discharge operation-wide claims, or grant cleanup authority.
+//!
+//! An `owner_revision` is a caller-asserted, immutable monotonic observation revision scoped to
+//! `(OperationId, WorkUnitKey)` and maintained across execution reacquisition.  Positive shape
+//! validation does not authenticate an owner or capability, establish freshness, prove adoption,
+//! or grant release authority.
 
 use thiserror::Error;
 
@@ -180,14 +185,16 @@ pub enum CancellationResourceCleanupOutcome {
     Pending,
     /// The owner observed the resource preserved, without proving adoption or qualification.
     Preserved {
-        /// Positive owner-local observation revision, unrelated to source revisions.
+        /// Caller-asserted positive revision, monotonic for `(OperationId, WorkUnitKey)` across
+        /// reacquisition; validation does not authenticate ownership or prove freshness.
         owner_revision: u64,
         /// Historical participant context accepted with the observation.
         context: CompletionContext,
     },
     /// The owner observed the resource absent, without proving it was never entered or releasable.
     Absent {
-        /// Positive owner-local observation revision, unrelated to source revisions.
+        /// Caller-asserted positive revision, monotonic for `(OperationId, WorkUnitKey)` across
+        /// reacquisition; validation does not authenticate ownership or prove freshness.
         owner_revision: u64,
         /// Historical participant context accepted with the observation.
         context: CompletionContext,
@@ -688,7 +695,8 @@ pub enum CancellationNamespaceCleanupOutcome {
     /// This is an untrusted ownership observation.  It is not a NeverEntered proof, rollback
     /// proof, or completion proof.
     NoOperationClaim {
-        /// Positive owner-local observation revision, unrelated to source revisions.
+        /// Caller-asserted positive revision, monotonic for `(OperationId, WorkUnitKey)` across
+        /// reacquisition; validation does not authenticate ownership or prove freshness.
         owner_revision: u64,
         /// Historical participant scope and execution epoch accepted with the observation.
         context: CompletionContext,
@@ -697,7 +705,8 @@ pub enum CancellationNamespaceCleanupOutcome {
     ///
     /// This does not prove adoption, qualification, or a current capability.
     Preserved {
-        /// Positive owner-local observation revision, unrelated to source revisions.
+        /// Caller-asserted positive revision, monotonic for `(OperationId, WorkUnitKey)` across
+        /// reacquisition; validation does not authenticate ownership or prove freshness.
         owner_revision: u64,
         /// Historical participant scope and execution epoch accepted with the observation.
         context: CompletionContext,
@@ -706,7 +715,8 @@ pub enum CancellationNamespaceCleanupOutcome {
     ///
     /// This does not prove NeverEntered, rollback completion, or release authority.
     Absent {
-        /// Positive owner-local observation revision, unrelated to source revisions.
+        /// Caller-asserted positive revision, monotonic for `(OperationId, WorkUnitKey)` across
+        /// reacquisition; validation does not authenticate ownership or prove freshness.
         owner_revision: u64,
         /// Historical participant scope and execution epoch accepted with the observation.
         context: CompletionContext,
