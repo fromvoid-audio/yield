@@ -1375,5 +1375,22 @@ Forty-three focused progress tests, one cancellation-recovery test, and five
 cancellation-effect tests passed, together with library and GPUI checks without
 default features, formatting, and diff checks. This is an in-memory observational
 milestone: full progress persistence/codec, cancellation recovery and local
-reconciliation, owner integration, filesystem execution, and native Windows
-UI/audio acceptance remain open under OPT-1337.
+reconciliation, owner integration, and native Windows UI/audio acceptance remain
+open under OPT-1337. Filesystem mutation implementation is outside OPT-1337 as
+dependent owner work.
+
+The cancellation-wide dispatch manifest now derives every frozen `Pending`,
+applicable (`Required`), non-`SourceRead` work-unit key across all action and
+history segments, including applicable global recipe units and later blocked work
+that may become dispatchable after in-flight prerequisites settle. Completed,
+`NotApplicable`, `Deferred`, and `SourceRead` units remain excluded. The immutable
+manifest binds the operation, plan version, frozen inventory generation, capture
+epoch and exact sorted unique key set; canonical validation reuses frozen-inventory
+validation and permits the retained capture epoch after source reacquisition.
+Membership, pending status, idleness, or absence remains observational and proves
+neither entry nor barrier, recovery, filesystem, source, or terminal authority.
+Three dispatch-manifest tests, thirty-eight cancellation tests, and forty-six
+work-progress tests passed, together with library and GPUI checks without default
+features, formatting, and diff checks. No barrier issuer/refinement, cancellation
+outcome, persistence/codec, or filesystem mutation implementation was added;
+filesystem mutation remains dependent owner work outside OPT-1337.

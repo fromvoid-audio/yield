@@ -6,6 +6,7 @@
 //! retains those capabilities for the lifetime of its connection.
 
 pub mod admission_claims;
+pub mod cancellation_dispatch;
 pub mod cancellation_effects;
 pub mod cancellation_recovery;
 pub mod codec;
@@ -42,6 +43,11 @@ pub use cancellation_recovery::{
     CancellationActionSnapshot, CancellationActionState, CancellationInventory,
     CancellationInventoryError, CancellationRoute, CancellationStepSnapshot,
     MAX_CANCELLATION_ACTIONS, MAX_CANCELLATION_STEPS,
+};
+
+pub use cancellation_dispatch::{
+    CancellationDispatchManifest, CancellationDispatchManifestError,
+    CancellationDispatchManifestValidationError, MAX_CANCELLATION_DISPATCH_KEYS,
 };
 
 pub use cancellation_effects::{

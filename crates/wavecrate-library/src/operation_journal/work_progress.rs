@@ -22,6 +22,10 @@ use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlementInventory,
     AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
+use super::cancellation_dispatch::{
+    CancellationDispatchManifest, CancellationDispatchManifestError,
+    derive_cancellation_dispatch_manifest as derive_dispatch_manifest,
+};
 use super::cancellation_effects::{
     CancellationEffectInventory, CancellationEffectInventoryError,
     derive_cancellation_effect_inventory as derive_effect_inventory,
@@ -1408,6 +1412,32 @@ impl WorkProgress {
             .as_ref()
             .ok_or(CancellationEffectInventoryError::AdmissionClaimsMissing)?;
         derive_effect_inventory(
+            self.operation_id,
+            &self.plan,
+            inventory,
+            &self.steps,
+            admission_claims,
+            self.execution_epoch,
+        )
+    }
+
+    /// Derive the exact cancellation-wide pending dispatch manifest from the frozen source.
+    ///
+    /// The manifest covers every applicable pending non-source-read unit in the frozen plan,
+    /// including later history segments and global recipe units.  It remains an observation only:
+    /// it does not issue a barrier or grant recovery, filesystem, source, or terminal authority.
+    pub fn cancellation_dispatch_manifest(
+        &self,
+    ) -> Result<CancellationDispatchManifest, CancellationDispatchManifestError> {
+        let inventory = self
+            .cancellation_inventory
+            .as_ref()
+            .ok_or(CancellationDispatchManifestError::CancellationInventoryMissing)?;
+        let admission_claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(CancellationDispatchManifestError::AdmissionClaimsMissing)?;
+        derive_dispatch_manifest(
             self.operation_id,
             &self.plan,
             inventory,
@@ -3753,16 +3783,17 @@ mod tests {
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
-        AdmissionClaimValidationError, CancellationActionState, CancellationEffectFactKind,
-        CancellationEffectOutcome, CancellationEffectRecipe, CopyCollisionPolicy, CopyEndpoint,
-        CopyIntentArgs, CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId,
-        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
-        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
-        ExternalRawObservationLimits, ExternalRawObservationMetadata,
-        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
-        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan, HistoryAction,
-        HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+        AdmissionClaimValidationError, CancellationActionState, CancellationDispatchManifest,
+        CancellationDispatchManifestError, CancellationDispatchManifestValidationError,
+        CancellationEffectFactKind, CancellationEffectOutcome, CancellationEffectRecipe,
+        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
+        CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
+        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
+        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
+        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+        HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
         HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
         HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
         HistoryWaveformRestore, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
@@ -5854,6 +5885,274 @@ mod tests {
                 .status(),
             ProgressStepStatus::Pending
         );
+    }
+
+    #[test]
+    fn cancellation_dispatch_manifest_includes_later_history_and_global_pending_work() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 317);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(317).expect("cancel"))
+            .expect("history cancellation");
+
+        let inventory = progress
+            .cancellation_inventory()
+            .expect("cancellation inventory");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        assert_eq!(manifest.operation_id(), progress.operation_id());
+        assert_eq!(manifest.plan_version(), progress.plan().plan_version());
+        assert_eq!(
+            manifest.frozen_inventory_generation(),
+            inventory.generation()
+        );
+        assert_eq!(manifest.capture_epoch(), inventory.execution_epoch());
+        assert!(manifest.keys().iter().any(|key| {
+            key.action_ordinal() == 0
+                && key.step_ordinal() / super::super::work_plan::STEP_HISTORY_STRIDE == 1
+                && key.role() == WorkUnitRole::QualifiedRelocation
+        }));
+        assert!(
+            manifest.keys().iter().any(|key| {
+                key.action_ordinal() == super::super::work_plan::GLOBAL_ACTION_ORDINAL
+            })
+        );
+        assert!(
+            manifest
+                .keys()
+                .iter()
+                .all(|key| key.role() != WorkUnitRole::SourceRead)
+        );
+        for key in manifest.keys() {
+            let unit = progress
+                .plan()
+                .units()
+                .iter()
+                .find(|unit| unit.key() == *key)
+                .expect("manifest plan key");
+            let snapshot = inventory
+                .steps()
+                .iter()
+                .find(|snapshot| snapshot.key() == *key)
+                .expect("manifest inventory key");
+            assert_eq!(unit.applicability(), WorkUnitApplicability::Required);
+            assert_eq!(snapshot.status(), ProgressStepStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn cancellation_dispatch_manifest_excludes_completed_inapplicable_deferred_and_source_reads() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let parent = NamespaceDirectoryEndpoint::new(
+            source,
+            source_id.clone(),
+            NamespaceDirectoryLocator::Root,
+            NamespaceDirectoryExpectation::new(7, "root-a", Some(1)).expect("root"),
+        )
+        .expect("parent");
+        let args = UniversalCommandArgs::Namespace(NamespaceCommandArgs::CreateFolder(
+            CreateFolderIntentArgs::new(parent, NamespaceLeafName::new("created").expect("leaf"))
+                .expect("create-folder arguments"),
+        ));
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("create-folder plan");
+        let mut progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(318)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("create-folder progress");
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::Prepare);
+        let stage = key_for(&progress, 0, WorkUnitRole::Stage);
+        let copy_validated = key_for(&progress, 0, WorkUnitRole::CopyValidated);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(318).expect("cancel"))
+            .expect("create-folder cancellation");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("create-folder dispatch manifest");
+        assert!(
+            !manifest
+                .keys()
+                .contains(&key_for(&progress, 0, WorkUnitRole::SourceRead))
+        );
+        assert!(
+            !manifest
+                .keys()
+                .contains(&key_for(&progress, 0, WorkUnitRole::Prepare))
+        );
+        assert!(!manifest.keys().contains(&stage));
+        assert!(!manifest.keys().contains(&copy_validated));
+        assert!(manifest.keys().iter().all(|key| {
+            progress
+                .plan()
+                .units()
+                .iter()
+                .find(|unit| unit.key() == *key)
+                .is_some_and(|unit| unit.applicability() == WorkUnitApplicability::Required)
+        }));
+        assert!(
+            manifest
+                .keys()
+                .iter()
+                .all(|key| key.role() != WorkUnitRole::SourceRead)
+        );
+
+        let mut optional = copy_progress_with_admission_claims_and_optional();
+        complete_required(&mut optional);
+        let artifact = optional
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        optional
+            .defer_optional_artifact(artifact)
+            .expect("defer optional artifact");
+        optional
+            .request_cancellation(CancellationRequestObservation::new(319).expect("cancel"))
+            .expect("deferred cancellation");
+        assert!(
+            optional
+                .cancellation_dispatch_manifest()
+                .expect("deferred dispatch manifest")
+                .keys()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cancellation_dispatch_manifest_validates_canonical_keys_and_survives_reacquisition() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(320).expect("cancel"))
+            .expect("cancellation request");
+        let manifest = progress
+            .cancellation_dispatch_manifest()
+            .expect("dispatch manifest");
+        let inventory = progress
+            .cancellation_inventory()
+            .expect("cancellation inventory");
+        let claims = progress.admission_claims().expect("admission claims");
+        let mut missing = manifest.keys().to_vec();
+        missing.remove(0);
+        let missing = CancellationDispatchManifest::new(
+            manifest.operation_id(),
+            manifest.plan_version(),
+            manifest.frozen_inventory_generation(),
+            manifest.capture_epoch(),
+            missing,
+        )
+        .expect("missing-key candidate shape");
+        assert_eq!(
+            missing.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                inventory,
+                progress.steps(),
+                claims,
+                progress.execution_epoch(),
+            ),
+            Err(CancellationDispatchManifestError::CandidateMismatch)
+        );
+
+        let mut extra_keys = manifest.keys().to_vec();
+        extra_keys.push(key_for(&progress, 0, WorkUnitRole::SourceRead));
+        extra_keys.sort();
+        let extra = CancellationDispatchManifest::new(
+            manifest.operation_id(),
+            manifest.plan_version(),
+            manifest.frozen_inventory_generation(),
+            manifest.capture_epoch(),
+            extra_keys,
+        )
+        .expect("extra-key candidate shape");
+        assert_eq!(
+            extra.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                inventory,
+                progress.steps(),
+                claims,
+                progress.execution_epoch(),
+            ),
+            Err(CancellationDispatchManifestError::CandidateMismatch)
+        );
+
+        let mut reordered_keys = manifest.keys().to_vec();
+        reordered_keys.reverse();
+        assert!(matches!(
+            CancellationDispatchManifest::new(
+                manifest.operation_id(),
+                manifest.plan_version(),
+                manifest.frozen_inventory_generation(),
+                manifest.capture_epoch(),
+                reordered_keys,
+            ),
+            Err(CancellationDispatchManifestValidationError::KeysNotSortedOrUnique { .. })
+        ));
+
+        let wrong_binding = CancellationDispatchManifest::new(
+            OperationId::from_uuid(Uuid::from_u128(321)),
+            manifest.plan_version(),
+            manifest.frozen_inventory_generation(),
+            manifest.capture_epoch(),
+            manifest.keys().to_vec(),
+        )
+        .expect("wrong-binding candidate shape");
+        assert_eq!(
+            wrong_binding.validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                inventory,
+                progress.steps(),
+                claims,
+                progress.execution_epoch(),
+            ),
+            Err(CancellationDispatchManifestError::OperationIdMismatch)
+        );
+
+        let frozen = manifest.clone();
+        let target = key_for(&progress, 0, WorkUnitRole::SourceRead).participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(&progress, target, 7, 2, 0))
+            .expect("source reacquisition");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(
+            progress
+                .cancellation_dispatch_manifest()
+                .expect("reacquired manifest"),
+            frozen
+        );
+        frozen
+            .validate_against(
+                progress.operation_id(),
+                progress.plan(),
+                progress
+                    .cancellation_inventory()
+                    .expect("reacquired inventory"),
+                progress.steps(),
+                progress.admission_claims().expect("reacquired claims"),
+                progress.execution_epoch(),
+            )
+            .expect("retained capture epoch remains valid");
+        assert_eq!(frozen.capture_epoch(), 0);
     }
 
     #[test]
