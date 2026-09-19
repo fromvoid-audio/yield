@@ -1343,3 +1343,17 @@ features, formatting and diff checks. This remains observational: no recovery
 issuer, filesystem execution, durable progress persistence, or native Windows
 UI/audio acceptance was added. After-effect recovery, cancellation-local
 reconciliation, owner integration and the remaining OPT-1337 work remain open.
+
+Normal-success settlement now rejects `Released` for retained `JournalRecord`,
+`ExistingDestination`, and `ExistingRecoveryPayload` claims before replay or
+mutation. `Held` remains a nonterminal observation; `ConsumedOrTransferred` may
+complete success after required work and optional-artifact decisions resolve;
+unrelated allocation classes retain their existing released/consumed allowances.
+Exact claim coverage, authority and epoch binding, monotonic settlement, and
+acknowledgement-loss replay checks remain unchanged. Eight admission-claim tests
+and thirty-nine progress tests passed, together with library and GPUI checks
+without default features, formatting, and diff checks. This closes the
+normal-success settlement-class policy gap without adding live capacity or
+release authority, persistence/codec, cancellation, filesystem execution, or
+native Windows UI/audio acceptance. After-effect recovery, cancellation-local
+reconciliation, owner integration, and the remaining OPT-1337 work remain open.

@@ -365,6 +365,42 @@ impl AdmissionClaimSettlementInventory {
         Ok(true)
     }
 
+    /// Validate exact settlement coverage for normal success.
+    ///
+    /// Retained journal and existing-data charges may be consumed or transferred, but a normal
+    /// success settlement may not report them as released. Other allocation classes retain their
+    /// existing released or consumed settlement allowances. `Held` remains a valid nonterminal
+    /// observation for every class.
+    pub(crate) fn validate_normal_success_settlement(
+        &self,
+        claims: &AdmissionClaimInventory,
+    ) -> Result<(), AdmissionClaimValidationError> {
+        self.validate_against(claims)?;
+        for claim in claims.claims() {
+            let settlement = self
+                .settlements
+                .iter()
+                .find(|settlement| settlement.claim_id() == claim.claim_id())
+                .expect("validated settlement coverage");
+            let retained_charge = matches!(
+                claim.allocation_class(),
+                FullCapacityAllocationClass::JournalRecord
+                    | FullCapacityAllocationClass::ExistingDestination
+                    | FullCapacityAllocationClass::ExistingRecoveryPayload
+            );
+            if retained_charge && settlement.outcome() == AdmissionClaimSettlementOutcome::Released
+            {
+                return Err(
+                    AdmissionClaimValidationError::NormalSuccessRetainedChargeReleased {
+                        claim_id: claim.claim_id(),
+                        allocation_class: claim.allocation_class(),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Return whether every retained settlement observation is `Released`.
     ///
     /// This is a classification predicate over observations, not a release proof.  Callers must
@@ -596,6 +632,17 @@ pub enum AdmissionClaimValidationError {
     MissingSettlement {
         /// Claim identity without a settlement.
         claim_id: AdmissionClaimId,
+    },
+    /// Normal success attempted to release a charge retained by the durable-result or existing-data
+    /// owner.
+    #[error(
+        "normal-success settlement cannot release retained claim {claim_id} class {allocation_class:?}"
+    )]
+    NormalSuccessRetainedChargeReleased {
+        /// Claim carrying the retained charge.
+        claim_id: AdmissionClaimId,
+        /// Retained allocation class whose charge cannot be released on normal success.
+        allocation_class: FullCapacityAllocationClass,
     },
     /// A full-capacity plan failed validation before claim coverage could be checked.
     #[error("invalid full capacity plan: {0}")]
@@ -1083,5 +1130,85 @@ mod tests {
             incomplete.satisfies_prepublication_cancellation(&claims),
             Err(AdmissionClaimValidationError::SettlementCountMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn normal_success_settlement_preserves_retained_charge_classes() {
+        let retained_classes = [
+            FullCapacityAllocationClass::JournalRecord,
+            FullCapacityAllocationClass::ExistingDestination,
+            FullCapacityAllocationClass::ExistingRecoveryPayload,
+        ];
+        for (index, allocation_class) in retained_classes.iter().enumerate() {
+            let id = (100 + index) as u128;
+            let claims = AdmissionClaimInventory::new(vec![claim(id, 1, *allocation_class, 1)])
+                .expect("retained claim");
+            let released = AdmissionClaimSettlementInventory::new(vec![settlement(
+                id,
+                AdmissionClaimSettlementOutcome::Released,
+            )])
+            .expect("released settlement");
+            assert_eq!(
+                released.validate_normal_success_settlement(&claims),
+                Err(
+                    AdmissionClaimValidationError::NormalSuccessRetainedChargeReleased {
+                        claim_id: claim_id(id),
+                        allocation_class: *allocation_class,
+                    }
+                )
+            );
+
+            let held = AdmissionClaimSettlementInventory::new(vec![settlement(
+                id,
+                AdmissionClaimSettlementOutcome::Held,
+            )])
+            .expect("held settlement");
+            held.validate_normal_success_settlement(&claims)
+                .expect("held is a valid nonterminal observation");
+
+            let consumed = AdmissionClaimSettlementInventory::new(vec![settlement(
+                id,
+                AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+            )])
+            .expect("consumed settlement");
+            consumed
+                .validate_normal_success_settlement(&claims)
+                .expect("consumed retained charge is valid");
+        }
+
+        let unrelated_classes = [
+            FullCapacityAllocationClass::DestinationStaging,
+            FullCapacityAllocationClass::OperationRecoveryPayload,
+            FullCapacityAllocationClass::SourceDatabaseCommit,
+            FullCapacityAllocationClass::SourceWalShm,
+            FullCapacityAllocationClass::GlobalDatabaseCommit,
+            FullCapacityAllocationClass::GlobalWalShm,
+        ];
+        let claims = AdmissionClaimInventory::new(
+            unrelated_classes
+                .iter()
+                .enumerate()
+                .map(|(index, allocation_class)| {
+                    claim((200 + index) as u128, 1, *allocation_class, 1)
+                })
+                .collect(),
+        )
+        .expect("unrelated claims");
+        let released = AdmissionClaimSettlementInventory::new(
+            unrelated_classes
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    settlement(
+                        (200 + index) as u128,
+                        AdmissionClaimSettlementOutcome::Released,
+                    )
+                })
+                .collect(),
+        )
+        .expect("unrelated released settlements");
+        released
+            .validate_normal_success_settlement(&claims)
+            .expect("unrelated released classes remain allowed");
     }
 }

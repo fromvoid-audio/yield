@@ -1844,7 +1844,7 @@ impl WorkProgress {
         }
         authority
             .settlement
-            .validate_against(&authority.admission_claims)
+            .validate_normal_success_settlement(&authority.admission_claims)
             .map_err(WorkProgressError::ClaimSettlement)?;
         if let Some(existing) = &self.claim_settlement {
             if existing == &authority.settlement {
@@ -3533,15 +3533,16 @@ mod tests {
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
-        CancellationActionState, CancellationEffectFactKind, CancellationEffectOutcome,
-        CancellationEffectRecipe, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
-        CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary,
-        ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
-        ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
-        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
-        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
-        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
-        HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+        AdmissionClaimValidationError, CancellationActionState, CancellationEffectFactKind,
+        CancellationEffectOutcome, CancellationEffectRecipe, CopyCollisionPolicy, CopyEndpoint,
+        CopyIntentArgs, CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId,
+        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
+        ExternalRawObservationLimits, ExternalRawObservationMetadata,
+        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
+        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan, HistoryAction,
+        HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
         HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
         HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
         HistoryWaveformRestore, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
@@ -3908,6 +3909,44 @@ mod tests {
             .expect("claim"),
         ])
         .expect("claim inventory")
+    }
+
+    fn copy_progress_with_claim_class(
+        allocation_class: FullCapacityAllocationClass,
+        operation_value: u128,
+    ) -> WorkProgress {
+        let (participants, args, plan) = copy_plan_inputs();
+        let capacity_plan = FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 1 },
+                1,
+                allocation_class,
+                12,
+                12,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("class capacity allocation"),
+        ])
+        .expect("class capacity plan");
+        let claims = AdmissionClaimInventory::new(vec![
+            AdmissionClaim::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("class claim id"),
+                VolumeIdentity { device: 1 },
+                allocation_class,
+                12,
+            )
+            .expect("class claim"),
+        ])
+        .expect("class claim inventory");
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(operation_value)),
+            &plan,
+            &args,
+            &participants,
+            &capacity_plan,
+            claims,
+        )
+        .expect("class progress")
     }
 
     fn two_claim_capacity_plan() -> FullCapacityPlan {
@@ -5536,6 +5575,92 @@ mod tests {
             optional.disposition(),
             FullProgressDisposition::SucceededWithDeferredArtifacts
         );
+    }
+
+    #[test]
+    fn normal_success_settlement_enforces_retained_charge_classes_atomically() {
+        let retained_classes = [
+            FullCapacityAllocationClass::JournalRecord,
+            FullCapacityAllocationClass::ExistingDestination,
+            FullCapacityAllocationClass::ExistingRecoveryPayload,
+        ];
+        for (index, allocation_class) in retained_classes.iter().enumerate() {
+            let operation_value = 500_u128 + (index as u128 * 10);
+            let mut released = copy_progress_with_claim_class(*allocation_class, operation_value);
+            complete_required(&mut released);
+            let before = released.clone();
+            let result = released.apply_verified_claim_settlement(settlement_authority(
+                &released,
+                settlement_inventory(&released, AdmissionClaimSettlementOutcome::Released),
+            ));
+            assert_eq!(
+                result,
+                Err(WorkProgressError::ClaimSettlement(
+                    AdmissionClaimValidationError::NormalSuccessRetainedChargeReleased {
+                        claim_id: AdmissionClaimId::from_uuid(Uuid::from_u128(201))
+                            .expect("claim id"),
+                        allocation_class: *allocation_class,
+                    }
+                ))
+            );
+            assert_eq!(released, before);
+
+            let mut held = copy_progress_with_claim_class(*allocation_class, operation_value + 1);
+            complete_required(&mut held);
+            assert_eq!(
+                held.apply_verified_claim_settlement(settlement_authority(
+                    &held,
+                    settlement_inventory(&held, AdmissionClaimSettlementOutcome::Held),
+                )),
+                Ok(ProgressApplyOutcome::Applied)
+            );
+            assert_eq!(held.phase(), OperationPhase::ReadinessScheduled);
+            assert_eq!(held.disposition(), FullProgressDisposition::None);
+            assert_eq!(
+                held.claim_settlement()
+                    .expect("held settlement")
+                    .settlements()[0]
+                    .outcome(),
+                AdmissionClaimSettlementOutcome::Held
+            );
+
+            let mut consumed =
+                copy_progress_with_claim_class(*allocation_class, operation_value + 2);
+            complete_required(&mut consumed);
+            assert_eq!(
+                consumed.apply_verified_claim_settlement(settlement_authority(
+                    &consumed,
+                    settlement_inventory(
+                        &consumed,
+                        AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+                    ),
+                )),
+                Ok(ProgressApplyOutcome::Applied)
+            );
+            assert_eq!(consumed.phase(), OperationPhase::Terminal);
+            assert_eq!(consumed.disposition(), FullProgressDisposition::Succeeded);
+        }
+
+        let unrelated_classes = [
+            FullCapacityAllocationClass::DestinationStaging,
+            FullCapacityAllocationClass::OperationRecoveryPayload,
+            FullCapacityAllocationClass::SourceDatabaseCommit,
+            FullCapacityAllocationClass::SourceWalShm,
+            FullCapacityAllocationClass::GlobalDatabaseCommit,
+            FullCapacityAllocationClass::GlobalWalShm,
+        ];
+        for (index, allocation_class) in unrelated_classes.iter().enumerate() {
+            let mut progress =
+                copy_progress_with_claim_class(*allocation_class, 600_u128 + index as u128);
+            complete_required(&mut progress);
+            progress
+                .apply_verified_claim_settlement(settlement_authority(
+                    &progress,
+                    settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released),
+                ))
+                .expect("unrelated released class remains allowed");
+            assert_eq!(progress.disposition(), FullProgressDisposition::Succeeded);
+        }
     }
 
     #[test]
