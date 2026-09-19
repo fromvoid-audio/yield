@@ -62,10 +62,16 @@ pub use cancellation_effects::{
 };
 
 pub use cancellation_reconciliation::{
+    CancellationCoordinatorClosureObservationRecord,
+    CancellationCoordinatorClosureObservationRecordError,
+    CancellationCoordinatorClosureObservationRow, CancellationCoordinatorClosureOutcome,
     CancellationSourceClosureObservationRecord, CancellationSourceClosureObservationRecordError,
     CancellationSourceClosureObservationRow, CancellationSourceClosureOutcome,
-    MAX_CANCELLATION_SOURCE_CLOSURE_KEYS, MAX_CANCELLATION_SOURCE_CLOSURE_ROWS,
-    SourceClosureManifest, SourceClosureManifestError, SourceClosureManifestValidationError,
+    CoordinatorClosureManifest, CoordinatorClosureManifestError,
+    CoordinatorClosureManifestValidationError, MAX_CANCELLATION_COORDINATOR_CLOSURE_KEYS,
+    MAX_CANCELLATION_COORDINATOR_CLOSURE_ROWS, MAX_CANCELLATION_SOURCE_CLOSURE_KEYS,
+    MAX_CANCELLATION_SOURCE_CLOSURE_ROWS, SourceClosureManifest, SourceClosureManifestError,
+    SourceClosureManifestValidationError,
 };
 
 pub use coordinator::{

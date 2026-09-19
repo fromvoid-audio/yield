@@ -1484,3 +1484,29 @@ terminal cancellation, owner/barrier integration, durable persistence/codec,
 and filesystem execution remain open. Native Windows UI/audio acceptance is
 separate. Filesystem mutation implementation remains outside OPT-1337 as
 dependent owner work under OPT-1339.
+
+Cancellation-local coordinator-closure observations now retain an exact,
+validated source-closure record and select only required, applicable global
+coordinator roles. Unfenced global roles are included when a recovery effect or
+captured/late `SourceCommitted` observation exists; source-fenced roles are
+limited to stable identities linked by non-`NotApplicable` effect closures or
+those source commits. Optional artifacts, action-local history/trim units, and
+preparation-only observations remain excluded. Rows are bounded, sorted, and
+typed as `Pending` or `Observed` with coordinator evidence and historical
+context; explicit source, recovery, and dispatch lineage keeps validation
+observational and state-independent.
+
+Source-scoped coordinator receipts and source-closure receipts now use the
+maximum source revision from immutable completed progress and bound dispatch
+lineage, with linked source-closure receipts extending the coordinator floor.
+The existing role validator checks both sides of `SourceCommitted` intervals,
+so a stale `before_revision` cannot pass behind a newer `after` observation.
+Reacquisition preserves valid historical receipts without using a new current
+fence as an arbitrary cancellation floor. Seven coordinator-focused tests,
+seventy-one focused progress tests, and five cancellation tests passed,
+together with no-default-feature library and GPUI checks, formatting, and diff
+checks. This remains an in-memory observational milestone: no coordinator
+receipt transition or accepting guard, cleanup/settlement/terminal integration,
+owner/barrier integration, durable persistence/codec, filesystem execution, or
+native Windows UI/audio acceptance was added. Filesystem mutation remains
+outside OPT-1337 as dependent owner work under OPT-1339.

@@ -34,8 +34,11 @@ use super::cancellation_effects::{
     derive_cancellation_effect_recovery_inventory as derive_effect_recovery_inventory,
 };
 use super::cancellation_reconciliation::{
+    CancellationCoordinatorClosureObservationRecord,
+    CancellationCoordinatorClosureObservationRecordError, CancellationCoordinatorClosureOutcome,
     CancellationSourceClosureObservationRecord, CancellationSourceClosureObservationRecordError,
-    CancellationSourceClosureOutcome, SourceClosureManifest, SourceClosureManifestError,
+    CancellationSourceClosureOutcome, CoordinatorClosureManifest, CoordinatorClosureManifestError,
+    SourceClosureManifest, SourceClosureManifestError,
 };
 use super::cancellation_recovery::{
     CancellationActionState, CancellationInventory, CancellationInventoryError, CancellationRoute,
@@ -54,8 +57,8 @@ use super::participants::{
     ParticipantValidationError, StoredSourceFence,
 };
 use super::work_plan::{
-    MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite, WorkUnitApplicability,
-    WorkUnitKey, WorkUnitRole,
+    GLOBAL_ACTION_ORDINAL, MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite,
+    WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
 };
 use crate::sample_sources::SourceId;
 
@@ -1599,6 +1602,114 @@ impl WorkProgress {
             if let CancellationSourceClosureOutcome::Observed { evidence, context } = row.outcome()
             {
                 self.validate_historical_completion(row.key(), context, evidence)?;
+                if let Some(fence) = context.scope().source_fence() {
+                    if let Some(minimum) = self.cancellation_source_revision_floor(
+                        fence,
+                        expected_dispatch_outcome,
+                        None,
+                    ) {
+                        validate_evidence_for_role(
+                            row.key().role(),
+                            context.scope(),
+                            evidence,
+                            Some(minimum),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Derive the exact cancellation-local coordinator-closure manifest from one validated
+    /// source-closure observation and its complete recovery lineage.
+    ///
+    /// Required applicable global coordinator units are selected only when a cancellation-local
+    /// effect or source commit exists.  Source-fenced coordinator units are narrowed to stable
+    /// source identities linked by an observed effect closure or source commit.  Normal
+    /// coordinator completion status is intentionally not used as cancellation evidence.
+    pub fn cancellation_coordinator_closure_manifest(
+        &self,
+        source_closure_observation: &CancellationSourceClosureObservationRecord,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<CoordinatorClosureManifest, WorkProgressError> {
+        self.validate_cancellation_source_closure_observation_record(
+            source_closure_observation,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        let keys = self.derive_cancellation_coordinator_closure_keys(
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        );
+        CoordinatorClosureManifest::new(source_closure_observation.clone(), keys).map_err(|error| {
+            WorkProgressError::CancellationCoordinatorClosureManifest(
+                CoordinatorClosureManifestError::from(error),
+            )
+        })
+    }
+
+    /// Validate one candidate coordinator-closure manifest against explicit source, recovery,
+    /// and dispatch lineage.
+    pub fn validate_cancellation_coordinator_closure_manifest(
+        &self,
+        candidate: &CoordinatorClosureManifest,
+        expected_source_closure_observation: &CancellationSourceClosureObservationRecord,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let expected = self.cancellation_coordinator_closure_manifest(
+            expected_source_closure_observation,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&expected)
+            .map_err(WorkProgressError::CancellationCoordinatorClosureManifest)
+    }
+
+    /// Validate one immutable cancellation-local coordinator-closure observation record.
+    ///
+    /// The expected source-closure record, recovery inventory, and dispatch outcome are explicit
+    /// so candidate validation cannot silently substitute retained state.  This method is
+    /// observational only and does not complete normal coordinator steps or grant authority.
+    pub fn validate_cancellation_coordinator_closure_observation_record(
+        &self,
+        candidate: &CancellationCoordinatorClosureObservationRecord,
+        expected_source_closure_observation: &CancellationSourceClosureObservationRecord,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let manifest = self.cancellation_coordinator_closure_manifest(
+            expected_source_closure_observation,
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&manifest, self.execution_epoch)
+            .map_err(WorkProgressError::CancellationCoordinatorClosureObservation)?;
+        for row in candidate.rows() {
+            let CancellationCoordinatorClosureOutcome::Observed { evidence, context } =
+                row.outcome()
+            else {
+                continue;
+            };
+            self.validate_historical_completion(row.key(), context, evidence)?;
+            let Some(fence) = context.scope().source_fence() else {
+                continue;
+            };
+            if let Some(minimum) = self.cancellation_source_revision_floor(
+                fence,
+                expected_dispatch_outcome,
+                Some(expected_source_closure_observation),
+            ) {
+                validate_evidence_for_role(
+                    row.key().role(),
+                    context.scope(),
+                    evidence,
+                    Some(minimum),
+                )?;
             }
         }
         Ok(())
@@ -2899,6 +3010,157 @@ impl WorkProgress {
         Err(WorkProgressError::CancellationOutcomeUnavailable)
     }
 
+    fn derive_cancellation_coordinator_closure_keys(
+        &self,
+        recovery_inventory: &CancellationEffectRecoveryInventory,
+        dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Vec<WorkUnitKey> {
+        let mut has_recovery_effect = !recovery_inventory.bundles().is_empty();
+        let mut affected_source_fences = Vec::<StoredSourceFence>::new();
+        let mut retain_source_identity = |context: &CompletionContext| {
+            let Some(fence) = context.scope().source_fence() else {
+                return;
+            };
+            if !affected_source_fences
+                .iter()
+                .any(|candidate| same_stable_source_identity(candidate, fence))
+            {
+                affected_source_fences.push(fence.clone());
+            }
+        };
+
+        for bundle in recovery_inventory.bundles() {
+            for closure in bundle.source_closure() {
+                if closure.status() == ProgressStepStatus::NotApplicable {
+                    continue;
+                }
+                if let Some(scope) = self.scope_for(closure.key()) {
+                    if scope.source_fence().is_some() {
+                        let context = CompletionContext::new(self.execution_epoch, scope.clone());
+                        retain_source_identity(&context);
+                    }
+                }
+            }
+        }
+        for step in &self.steps {
+            if step.status != ProgressStepStatus::Completed
+                || !matches!(
+                    step.evidence.as_ref(),
+                    Some(StoredStepEvidence::SourceCommitted { .. })
+                )
+            {
+                continue;
+            }
+            has_recovery_effect = true;
+            if let Some(context) = step.completion_context.as_ref() {
+                retain_source_identity(context);
+            }
+        }
+        for row in dispatch_outcome.rows() {
+            let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                row.outcome()
+            else {
+                continue;
+            };
+            if !matches!(evidence, StoredStepEvidence::SourceCommitted { .. }) {
+                continue;
+            }
+            has_recovery_effect = true;
+            retain_source_identity(context);
+        }
+
+        if !has_recovery_effect {
+            return Vec::new();
+        }
+        let mut keys = self
+            .plan
+            .units()
+            .iter()
+            .filter(|unit| {
+                unit.key().action_ordinal() == GLOBAL_ACTION_ORDINAL
+                    && unit.requirement() == ParticipantRequirement::Required
+                    && unit.applicability() == WorkUnitApplicability::Required
+                    && matches!(
+                        unit.key().role(),
+                        WorkUnitRole::GlobalLibrary
+                            | WorkUnitRole::Harvest
+                            | WorkUnitRole::Projection
+                            | WorkUnitRole::Readiness
+                            | WorkUnitRole::Artifact
+                    )
+            })
+            .filter(|unit| {
+                let Some(scope) = self.scope_for(unit.key()) else {
+                    return false;
+                };
+                match scope.source_fence() {
+                    Some(fence) => affected_source_fences
+                        .iter()
+                        .any(|candidate| same_stable_source_identity(candidate, fence)),
+                    None => true,
+                }
+            })
+            .map(|unit| unit.key())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    fn cancellation_source_revision_floor(
+        &self,
+        fence: &StoredSourceFence,
+        dispatch_outcome: &CancellationDispatchOutcomeRecord,
+        source_closure_observation: Option<&CancellationSourceClosureObservationRecord>,
+    ) -> Option<u64> {
+        let mut minimum = None;
+        let mut consider = |context: &CompletionContext, evidence: &StoredStepEvidence| {
+            let Some(context_fence) = context.scope().source_fence() else {
+                return;
+            };
+            if !same_stable_source_identity(context_fence, fence) {
+                return;
+            }
+            let Some(observation) = source_observation_for_evidence(evidence) else {
+                return;
+            };
+            if !same_stable_source_identity_observation(observation, fence) {
+                return;
+            }
+            minimum = Some(minimum.unwrap_or(0).max(observation.revision()));
+        };
+
+        for step in &self.steps {
+            if step.status != ProgressStepStatus::Completed {
+                continue;
+            }
+            if let (Some(context), Some(evidence)) =
+                (step.completion_context.as_ref(), step.evidence.as_ref())
+            {
+                consider(context, evidence);
+            }
+        }
+        for row in dispatch_outcome.rows() {
+            let CancellationDispatchOutcome::ObservedAfterCancellation { evidence, context } =
+                row.outcome()
+            else {
+                continue;
+            };
+            consider(context, evidence);
+        }
+        if let Some(source_closure_observation) = source_closure_observation {
+            for row in source_closure_observation.rows() {
+                let CancellationSourceClosureOutcome::Observed { evidence, context } =
+                    row.outcome()
+                else {
+                    continue;
+                };
+                consider(context, evidence);
+            }
+        }
+        minimum
+    }
+
     #[allow(dead_code)]
     fn scope_for(&self, key: WorkUnitKey) -> Option<&ParticipantScope> {
         self.scopes
@@ -3566,6 +3828,15 @@ pub enum WorkProgressError {
     /// validation.
     #[error("invalid work progress cancellation source-closure observation: {0}")]
     CancellationSourceClosureObservation(#[source] CancellationSourceClosureObservationRecordError),
+    /// A cancellation-local coordinator-closure manifest failed exact derivation or validation.
+    #[error("invalid work progress cancellation coordinator-closure manifest: {0}")]
+    CancellationCoordinatorClosureManifest(#[source] CoordinatorClosureManifestError),
+    /// A cancellation-local coordinator-closure observation failed exact binding or evidence
+    /// validation.
+    #[error("invalid work progress cancellation coordinator-closure observation: {0}")]
+    CancellationCoordinatorClosureObservation(
+        #[source] CancellationCoordinatorClosureObservationRecordError,
+    ),
     /// A prepublication cleanup observation failed its bounded local shape validation.
     #[error("invalid work progress prepublication cleanup: {0}")]
     PrePublishCleanup(#[source] PrePublishCleanupValidationError),
@@ -4140,18 +4411,23 @@ mod tests {
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlement,
         AdmissionClaimSettlementInventory, AdmissionClaimSettlementOutcome,
-        AdmissionClaimValidationError, CancellationActionState, CancellationDispatchManifest,
-        CancellationDispatchManifestError, CancellationDispatchManifestValidationError,
-        CancellationDispatchOutcome, CancellationDispatchOutcomeRecord,
-        CancellationDispatchOutcomeRecordError, CancellationDispatchOutcomeRow,
-        CancellationEffectBundle, CancellationEffectFactKind, CancellationEffectOutcome,
-        CancellationEffectRecipe, CancellationEffectRecoveryInventory,
+        AdmissionClaimValidationError, CancellationActionState,
+        CancellationCoordinatorClosureObservationRecord,
+        CancellationCoordinatorClosureObservationRecordError,
+        CancellationCoordinatorClosureObservationRow, CancellationCoordinatorClosureOutcome,
+        CancellationDispatchManifest, CancellationDispatchManifestError,
+        CancellationDispatchManifestValidationError, CancellationDispatchOutcome,
+        CancellationDispatchOutcomeRecord, CancellationDispatchOutcomeRecordError,
+        CancellationDispatchOutcomeRow, CancellationEffectBundle, CancellationEffectFactKind,
+        CancellationEffectOutcome, CancellationEffectRecipe, CancellationEffectRecoveryInventory,
         CancellationSourceClosureObservationRecord,
         CancellationSourceClosureObservationRecordError, CancellationSourceClosureObservationRow,
-        CancellationSourceClosureOutcome, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
-        CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary,
-        ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
-        ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        CancellationSourceClosureOutcome, CoordinatorClosureManifest,
+        CoordinatorClosureManifestError, CoordinatorClosureManifestValidationError,
+        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
+        CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
+        ExternalRawEventKind, ExternalRawNativeAccounting, ExternalRawObservation,
+        ExternalRawObservationEnvelope, ExternalRawObservationLimits,
         ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
         ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
         FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
@@ -5007,6 +5283,15 @@ mod tests {
             .expect("work-plan role")
     }
 
+    fn global_key(progress: &WorkProgress, role: WorkUnitRole) -> WorkUnitKey {
+        progress
+            .steps()
+            .iter()
+            .find(|step| step.key().action_ordinal() == u8::MAX && step.key().role() == role)
+            .map(WorkProgressStep::key)
+            .expect("global work-plan role")
+    }
+
     fn key_for_step(
         progress: &WorkProgress,
         action: u8,
@@ -5166,6 +5451,35 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn coordinator_closure_rows(
+        manifest: &CoordinatorClosureManifest,
+    ) -> Vec<CancellationCoordinatorClosureObservationRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationCoordinatorClosureObservationRow::new(
+                    *key,
+                    CancellationCoordinatorClosureOutcome::Pending,
+                )
+            })
+            .collect()
+    }
+
+    fn coordinator_closure_record(
+        manifest: CoordinatorClosureManifest,
+        observation_epoch: u64,
+        observation_generation: u64,
+    ) -> CancellationCoordinatorClosureObservationRecord {
+        CancellationCoordinatorClosureObservationRecord::new(
+            manifest.clone(),
+            observation_epoch,
+            observation_generation,
+            coordinator_closure_rows(&manifest),
+        )
+        .expect("coordinator closure record")
     }
 
     fn completed_source_progress() -> (WorkProgress, WorkUnitKey) {
@@ -7179,6 +7493,959 @@ mod tests {
                 &current_dispatch,
             )
             .expect("current source-closure record validates");
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_selects_effect_linked_global_and_source_roles() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1313);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1313).expect("cancel"))
+            .expect("history cancellation");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::QualifiedRelocation);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                late_key,
+                evidence_for(&progress, late_key, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(late_key).expect("late scope").clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source-closure manifest");
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source-closure observation");
+        let manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observation, &recovery, &dispatch)
+            .expect("coordinator manifest");
+
+        assert!(
+            manifest.keys().iter().all(|key| {
+                key.action_ordinal() == super::super::work_plan::GLOBAL_ACTION_ORDINAL
+            })
+        );
+        for role in [
+            WorkUnitRole::GlobalLibrary,
+            WorkUnitRole::Harvest,
+            WorkUnitRole::Projection,
+            WorkUnitRole::Readiness,
+        ] {
+            assert!(manifest.keys().contains(&global_key(&progress, role)));
+        }
+        let record = coordinator_closure_record(manifest.clone(), dispatch.observation_epoch(), 1);
+        progress
+            .validate_cancellation_coordinator_closure_observation_record(
+                &record,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("pending coordinator observation validates");
+
+        let missing = CoordinatorClosureManifest::new(
+            source_observation,
+            manifest.keys()[..manifest.keys().len() - 1].to_vec(),
+        )
+        .expect("missing coordinator manifest shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_manifest(
+                &missing,
+                record.manifest().source_closure_observation(),
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CancellationCoordinatorClosureManifest(
+                CoordinatorClosureManifestError::CandidateMismatch
+            ))
+        );
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_excludes_optional_artifact_and_future_action_keys() {
+        let mut progress = copy_progress_with_admission_claims_and_optional();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1314).expect("cancel"))
+            .expect("copy cancellation");
+        let publish = key_for(&progress, 0, WorkUnitRole::Publish);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                publish,
+                evidence_for(&progress, publish, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(publish).expect("publish scope").clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("copy recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("copy source-closure manifest");
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source-closure observation");
+        let manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observation, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        assert!(manifest.keys().iter().all(|key| {
+            key.action_ordinal() == super::super::work_plan::GLOBAL_ACTION_ORDINAL
+                && key.role() != WorkUnitRole::Artifact
+        }));
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_no_effect_is_empty_and_late_source_commit_selects_roles() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut preparation = claimed_progress(
+            participants.clone(),
+            copy_args_at(source, source_id.clone(), "copy.wav"),
+            1315,
+        );
+        apply_role(&mut preparation, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut preparation, 0, WorkUnitRole::Prepare);
+        preparation
+            .request_cancellation(CancellationRequestObservation::new(1315).expect("cancel"))
+            .expect("preparation cancellation");
+        let preparation_dispatch = recovery_dispatch_record(&preparation, 1, &[]);
+        let preparation_recovery = preparation
+            .cancellation_effect_recovery_inventory(&preparation_dispatch)
+            .expect("preparation recovery");
+        let preparation_source_manifest = preparation
+            .cancellation_source_closure_manifest(&preparation_recovery, &preparation_dispatch)
+            .expect("preparation source manifest");
+        assert!(preparation_source_manifest.keys().is_empty());
+        let preparation_source_observation = CancellationSourceClosureObservationRecord::new(
+            preparation_source_manifest,
+            preparation_dispatch.observation_epoch(),
+            1,
+            Vec::new(),
+        )
+        .expect("preparation source observation");
+        let preparation_coordinator = preparation
+            .cancellation_coordinator_closure_manifest(
+                &preparation_source_observation,
+                &preparation_recovery,
+                &preparation_dispatch,
+            )
+            .expect("preparation coordinator manifest");
+        assert!(preparation_coordinator.keys().is_empty());
+
+        let mut late_source =
+            claimed_progress(participants, history_folder_args(source, source_id), 1316);
+        late_source
+            .request_cancellation(CancellationRequestObservation::new(1316).expect("cancel"))
+            .expect("late source cancellation");
+        let source_key = key_for_step(&late_source, 0, 0, WorkUnitRole::SourceAffect);
+        let source_dispatch = recovery_dispatch_record(
+            &late_source,
+            1,
+            &[(
+                source_key,
+                evidence_for(&late_source, source_key, 8),
+                CompletionContext::new(
+                    late_source.execution_epoch(),
+                    late_source
+                        .scope_for(source_key)
+                        .expect("source scope")
+                        .clone(),
+                ),
+            )],
+        );
+        let source_recovery = late_source
+            .cancellation_effect_recovery_inventory(&source_dispatch)
+            .expect("late source recovery");
+        let source_manifest = late_source
+            .cancellation_source_closure_manifest(&source_recovery, &source_dispatch)
+            .expect("late source manifest");
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            source_dispatch.observation_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("late source observation");
+        let coordinator = late_source
+            .cancellation_coordinator_closure_manifest(
+                &source_observation,
+                &source_recovery,
+                &source_dispatch,
+            )
+            .expect("late source coordinator manifest");
+        assert!(
+            coordinator
+                .keys()
+                .contains(&global_key(&late_source, WorkUnitRole::GlobalLibrary))
+        );
+        assert!(
+            coordinator
+                .keys()
+                .contains(&global_key(&late_source, WorkUnitRole::Harvest))
+        );
+        assert!(
+            coordinator.keys().iter().all(|key| {
+                key.action_ordinal() == super::super::work_plan::GLOBAL_ACTION_ORDINAL
+            })
+        );
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_rejects_stale_linked_source_revision() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1317);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1317).expect("cancel"))
+            .expect("history cancellation");
+        let source_key = key_for_step(&progress, 0, 0, WorkUnitRole::SourceAffect);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                source_key,
+                evidence_for(&progress, source_key, 9),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(source_key)
+                        .expect("source scope")
+                        .clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("source recovery");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source observation");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observation, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        let coordinator_key = coordinator_manifest
+            .keys()
+            .iter()
+            .copied()
+            .find(|key| {
+                progress
+                    .scope_for(*key)
+                    .and_then(ParticipantScope::source_fence)
+                    .is_some()
+            })
+            .expect("source-fenced coordinator");
+        let stale_rows = coordinator_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let outcome = if *key == coordinator_key {
+                    CancellationCoordinatorClosureOutcome::Observed {
+                        evidence: evidence_for(&progress, *key, 8),
+                        context: CompletionContext::new(
+                            progress.execution_epoch(),
+                            progress.scope_for(*key).expect("coordinator scope").clone(),
+                        ),
+                    }
+                } else {
+                    CancellationCoordinatorClosureOutcome::Pending
+                };
+                CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let stale = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            stale_rows,
+        )
+        .expect("stale coordinator observation shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &stale,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::SourceRevisionRegressed {
+                role: coordinator_key.role(),
+                observed: 8,
+                minimum: 9,
+            })
+        );
+        let valid_rows = coordinator_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let outcome = if *key == coordinator_key {
+                    CancellationCoordinatorClosureOutcome::Observed {
+                        evidence: evidence_for(&progress, *key, 9),
+                        context: CompletionContext::new(
+                            progress.execution_epoch(),
+                            progress.scope_for(*key).expect("coordinator scope").clone(),
+                        ),
+                    }
+                } else {
+                    CancellationCoordinatorClosureOutcome::Pending
+                };
+                CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let valid = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_manifest,
+            dispatch.observation_epoch(),
+            1,
+            valid_rows,
+        )
+        .expect("valid coordinator observation shape");
+        progress
+            .validate_cancellation_coordinator_closure_observation_record(
+                &valid,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("coordinator revision at linked floor validates");
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_rejects_bad_receipts_lineage_and_coverage() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1318);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1318).expect("cancel"))
+            .expect("history cancellation");
+        let source_key = key_for_step(&progress, 0, 0, WorkUnitRole::SourceAffect);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                source_key,
+                evidence_for(&progress, source_key, 9),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(source_key)
+                        .expect("source scope")
+                        .clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("source recovery");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source observation");
+        let manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observation, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        let source_coordinator = manifest
+            .keys()
+            .iter()
+            .copied()
+            .find(|key| {
+                progress
+                    .scope_for(*key)
+                    .and_then(ParticipantScope::source_fence)
+                    .is_some()
+            })
+            .expect("source-fenced coordinator");
+        let global = global_key(&progress, WorkUnitRole::GlobalLibrary);
+        let make_record = |target: WorkUnitKey,
+                           outcome: CancellationCoordinatorClosureOutcome|
+         -> CancellationCoordinatorClosureObservationRecord {
+            let rows = manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    if *key == target {
+                        CancellationCoordinatorClosureObservationRow::new(*key, outcome.clone())
+                    } else {
+                        CancellationCoordinatorClosureObservationRow::new(
+                            *key,
+                            CancellationCoordinatorClosureOutcome::Pending,
+                        )
+                    }
+                })
+                .collect();
+            CancellationCoordinatorClosureObservationRecord::new(
+                manifest.clone(),
+                dispatch.observation_epoch(),
+                1,
+                rows,
+            )
+            .expect("coordinator record shape")
+        };
+
+        let wrong_kind = make_record(
+            global,
+            CancellationCoordinatorClosureOutcome::Observed {
+                evidence: StoredStepEvidence::Coordinator {
+                    receipt: CoordinatorReceiptSummary::new(
+                        CoordinatorReceiptKind::Harvest,
+                        1,
+                        None,
+                    ),
+                },
+                context: CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(global).expect("global scope").clone(),
+                ),
+            },
+        );
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &wrong_kind,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::RoleEvidenceMismatch {
+                role: WorkUnitRole::GlobalLibrary,
+            })
+        );
+
+        let deficit = make_record(
+            global,
+            CancellationCoordinatorClosureOutcome::Observed {
+                evidence: StoredStepEvidence::Coordinator {
+                    receipt: CoordinatorReceiptSummary::new(
+                        CoordinatorReceiptKind::GlobalLibrary,
+                        1,
+                        Some(CoordinatorDeficit::RequiredParticipant(
+                            global.participant_id(),
+                        )),
+                    ),
+                },
+                context: CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(global).expect("global scope").clone(),
+                ),
+            },
+        );
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &deficit,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CoordinatorDeficitPresent {
+                role: WorkUnitRole::GlobalLibrary,
+            })
+        );
+
+        let missing_rows = manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                if *key == source_coordinator {
+                    CancellationCoordinatorClosureObservationRow::new(
+                        *key,
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: StoredStepEvidence::Coordinator {
+                                receipt: CoordinatorReceiptSummary::new(
+                                    expected_coordinator_receipt(key.role()).expect("receipt kind"),
+                                    1,
+                                    None,
+                                ),
+                            },
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress
+                                    .scope_for(source_coordinator)
+                                    .expect("source coordinator scope")
+                                    .clone(),
+                            ),
+                        },
+                    )
+                } else {
+                    CancellationCoordinatorClosureObservationRow::new(
+                        *key,
+                        CancellationCoordinatorClosureOutcome::Pending,
+                    )
+                }
+            })
+            .collect();
+        let missing_receipt = CancellationCoordinatorClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            missing_rows,
+        )
+        .expect("missing receipt record shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &missing_receipt,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CoordinatorSourceObservationMissing {
+                role: source_coordinator.role(),
+            })
+        );
+
+        let wrong_scope = make_record(
+            source_coordinator,
+            CancellationCoordinatorClosureOutcome::Observed {
+                evidence: evidence_for(&progress, source_coordinator, 9),
+                context: CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(global).expect("wrong scope").clone(),
+                ),
+            },
+        );
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &wrong_scope,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CompletionContextScopeMismatch {
+                key: source_coordinator,
+            })
+        );
+
+        let future = CancellationCoordinatorClosureObservationRecord::new(
+            manifest.clone(),
+            progress.execution_epoch() + 1,
+            1,
+            coordinator_closure_rows(&manifest),
+        )
+        .expect("future coordinator record shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &future,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(
+                WorkProgressError::CancellationCoordinatorClosureObservation(
+                    CancellationCoordinatorClosureObservationRecordError::ObservationEpochFuture {
+                        actual: 1,
+                        current: 0,
+                    }
+                )
+            )
+        );
+
+        let duplicate_key = manifest.keys()[0];
+        assert_eq!(
+            CoordinatorClosureManifest::new(
+                source_observation.clone(),
+                vec![duplicate_key, duplicate_key],
+            ),
+            Err(CoordinatorClosureManifestValidationError::KeysNotSortedOrUnique { index: 1 })
+        );
+        let missing_rows = CancellationCoordinatorClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            Vec::new(),
+        )
+        .expect("missing coordinator rows shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &missing_rows,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(
+                WorkProgressError::CancellationCoordinatorClosureObservation(
+                    CancellationCoordinatorClosureObservationRecordError::RowCountMismatch {
+                        actual: 0,
+                        expected: manifest.keys().len(),
+                    }
+                )
+            )
+        );
+
+        let other_source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest,
+            dispatch.observation_epoch(),
+            2,
+            source_closure_rows(source_observation.manifest()),
+        )
+        .expect("alternate source observation");
+        let mismatched_manifest =
+            CoordinatorClosureManifest::new(other_source_observation, manifest.keys().to_vec())
+                .expect("mismatched coordinator manifest shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_manifest(
+                &mismatched_manifest,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CancellationCoordinatorClosureManifest(
+                CoordinatorClosureManifestError::SourceClosureObservationMismatch
+            ))
+        );
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_historical_observation_survives_reacquisition() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1319);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1319).expect("cancel"))
+            .expect("history cancellation");
+        let source_key = key_for_step(&progress, 0, 0, WorkUnitRole::SourceAffect);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                source_key,
+                evidence_for(&progress, source_key, 8),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(source_key)
+                        .expect("source scope")
+                        .clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("source recovery");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("source observation");
+        let manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observation, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        let source_coordinator = manifest
+            .keys()
+            .iter()
+            .copied()
+            .find(|key| {
+                progress
+                    .scope_for(*key)
+                    .and_then(ParticipantScope::source_fence)
+                    .is_some()
+            })
+            .expect("source-fenced coordinator");
+        let rows = manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                if *key == source_coordinator {
+                    CancellationCoordinatorClosureObservationRow::new(
+                        *key,
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: evidence_for(&progress, *key, 8),
+                            context: CompletionContext::new(
+                                progress.execution_epoch(),
+                                progress.scope_for(*key).expect("coordinator scope").clone(),
+                            ),
+                        },
+                    )
+                } else {
+                    CancellationCoordinatorClosureObservationRow::new(
+                        *key,
+                        CancellationCoordinatorClosureOutcome::Pending,
+                    )
+                }
+            })
+            .collect();
+        let observation = CancellationCoordinatorClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            rows,
+        )
+        .expect("coordinator observation");
+        progress
+            .validate_cancellation_coordinator_closure_observation_record(
+                &observation,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("historical coordinator observation validates");
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress
+            .cancellation_inventory()
+            .expect("frozen inventory")
+            .clone();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                8,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        progress
+            .validate_cancellation_coordinator_closure_observation_record(
+                &observation,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("historical coordinator observation survives reacquisition");
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), Some(&inventory_before));
+    }
+
+    #[test]
+    fn cancellation_coordinator_closure_floor_includes_linked_source_receipts() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            namespace_file_move_args(source, source_id),
+            1320,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        let destination_reconcile = key_for(&progress, 0, WorkUnitRole::DestinationSourceReconcile);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                destination_reconcile,
+                evidence_for(&progress, destination_reconcile, 9),
+            ))
+            .expect("destination reconciliation at revision nine");
+        apply_role(&mut progress, 0, WorkUnitRole::OriginRemovalStart);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1320).expect("cancel"))
+            .expect("move cancellation");
+        let late_key = key_for(&progress, 0, WorkUnitRole::OriginAbsence);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                late_key,
+                evidence_for(&progress, late_key, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(late_key).expect("absence scope").clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("move recovery");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source manifest");
+        let pending_source = key_for(&progress, 0, WorkUnitRole::OriginSourceReconcile);
+        assert_eq!(source_manifest.keys(), &[pending_source]);
+        assert_eq!(
+            progress.cancellation_source_revision_floor(
+                progress
+                    .scope_for(pending_source)
+                    .expect("pending source scope")
+                    .source_fence()
+                    .expect("pending source fence"),
+                &dispatch,
+                None,
+            ),
+            Some(9)
+        );
+        let stale_source_rows = source_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationSourceClosureObservationRow::new(
+                    *key,
+                    CancellationSourceClosureOutcome::Observed {
+                        evidence: StoredStepEvidence::SourceCommitted {
+                            before_revision: 8,
+                            after: source_observation(&progress, *key, 10),
+                        },
+                        context: CompletionContext::new(
+                            progress.execution_epoch(),
+                            progress
+                                .scope_for(*key)
+                                .expect("source closure scope")
+                                .clone(),
+                        ),
+                    },
+                )
+            })
+            .collect();
+        let stale_source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            stale_source_rows,
+        )
+        .expect("stale source closure observation shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_observation_record(
+                &stale_source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::SourceRevisionRegressed {
+                role: WorkUnitRole::OriginSourceReconcile,
+                observed: 8,
+                minimum: 9,
+            })
+        );
+        let source_rows = source_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationSourceClosureObservationRow::new(
+                    *key,
+                    CancellationSourceClosureOutcome::Observed {
+                        evidence: StoredStepEvidence::SourceCommitted {
+                            before_revision: 9,
+                            after: source_observation(&progress, *key, 10),
+                        },
+                        context: CompletionContext::new(
+                            progress.execution_epoch(),
+                            progress
+                                .scope_for(*key)
+                                .expect("source closure scope")
+                                .clone(),
+                        ),
+                    },
+                )
+            })
+            .collect();
+        let source_observation = CancellationSourceClosureObservationRecord::new(
+            source_manifest,
+            dispatch.observation_epoch(),
+            1,
+            source_rows,
+        )
+        .expect("source closure observation");
+        progress
+            .validate_cancellation_source_closure_observation_record(
+                &source_observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("source closure receipt validates");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source_observation, &recovery, &dispatch)
+            .expect("coordinator manifest");
+        let coordinator_key = coordinator_manifest
+            .keys()
+            .iter()
+            .copied()
+            .find(|key| {
+                progress
+                    .scope_for(*key)
+                    .and_then(ParticipantScope::source_fence)
+                    .is_some()
+            })
+            .expect("source-fenced coordinator");
+        let stale_rows = coordinator_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let outcome = if *key == coordinator_key {
+                    CancellationCoordinatorClosureOutcome::Observed {
+                        evidence: evidence_for(&progress, *key, 8),
+                        context: CompletionContext::new(
+                            progress.execution_epoch(),
+                            progress.scope_for(*key).expect("coordinator scope").clone(),
+                        ),
+                    }
+                } else {
+                    CancellationCoordinatorClosureOutcome::Pending
+                };
+                CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let stale = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_manifest,
+            dispatch.observation_epoch(),
+            1,
+            stale_rows,
+        )
+        .expect("stale coordinator receipt shape");
+        assert_eq!(
+            progress.validate_cancellation_coordinator_closure_observation_record(
+                &stale,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::SourceRevisionRegressed {
+                role: coordinator_key.role(),
+                observed: 8,
+                minimum: 10,
+            })
+        );
     }
 
     #[test]
