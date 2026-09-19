@@ -547,6 +547,36 @@ impl ParticipantScope {
     }
 }
 
+/// Immutable context accepted with one completed step.
+///
+/// The context is retained only in memory so a completion can be replayed after source
+/// reacquisition against the historical epoch and participant fence that accepted it.  It is an
+/// observation, not an owner capability or completion authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionContext {
+    execution_epoch: u64,
+    scope: ParticipantScope,
+}
+
+impl CompletionContext {
+    fn new(execution_epoch: u64, scope: ParticipantScope) -> Self {
+        Self {
+            execution_epoch,
+            scope,
+        }
+    }
+
+    /// Return the execution epoch accepted with the completion.
+    pub const fn execution_epoch(&self) -> u64 {
+        self.execution_epoch
+    }
+
+    /// Borrow the full participant scope accepted with the completion.
+    pub fn scope(&self) -> &ParticipantScope {
+        &self.scope
+    }
+}
+
 /// Per-key progress status derived from the frozen plan.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProgressStepStatus {
@@ -567,6 +597,7 @@ pub struct WorkProgressStep {
     requirement: ParticipantRequirement,
     status: ProgressStepStatus,
     evidence: Option<StoredStepEvidence>,
+    completion_context: Option<CompletionContext>,
 }
 
 /// Bounded observation of the final-claim state during prepublication cleanup.
@@ -975,6 +1006,11 @@ impl WorkProgressStep {
     pub fn evidence(&self) -> Option<&StoredStepEvidence> {
         self.evidence.as_ref()
     }
+
+    /// Borrow the historical context accepted with a completed step.
+    pub fn completion_context(&self) -> Option<&CompletionContext> {
+        self.completion_context.as_ref()
+    }
 }
 
 /// Result of applying a verified completion inside the crate.
@@ -1157,6 +1193,7 @@ impl WorkProgress {
                     WorkUnitApplicability::NotApplicable => ProgressStepStatus::NotApplicable,
                 },
                 evidence: None,
+                completion_context: None,
             });
         }
         Ok(Self {
@@ -1223,6 +1260,85 @@ impl WorkProgress {
     /// Borrow every exact keyed step in frozen plan order.
     pub fn steps(&self) -> &[WorkProgressStep] {
         &self.steps
+    }
+
+    /// Validate retained completion observations against their accepted historical context.
+    ///
+    /// This is an observational check only.  It uses each completed step's accepted participant
+    /// scope and evidence, allowing a stable source fence to be rebound while rejecting malformed
+    /// or future historical contexts.
+    pub fn validate_completion_history(&self) -> Result<(), WorkProgressError> {
+        for step in &self.steps {
+            match (
+                step.status,
+                step.evidence.as_ref(),
+                step.completion_context.as_ref(),
+            ) {
+                (ProgressStepStatus::Completed, Some(evidence), Some(context)) => {
+                    let current_scope = self.scope_for(step.key).ok_or(
+                        WorkProgressError::ParticipantScopeMissing {
+                            participant_id: step.key.participant_id(),
+                        },
+                    )?;
+                    if context.execution_epoch > self.execution_epoch {
+                        return Err(WorkProgressError::CompletionContextEpochFuture {
+                            key: step.key,
+                            actual: context.execution_epoch,
+                            current: self.execution_epoch,
+                        });
+                    }
+                    if !historical_scope_matches_current(
+                        self.execution_epoch,
+                        context.execution_epoch,
+                        current_scope,
+                        &context.scope,
+                    ) {
+                        return Err(WorkProgressError::CompletionContextScopeMismatch {
+                            key: step.key,
+                        });
+                    }
+                    if let Some(fence) = context.scope.source_fence() {
+                        fence.validate()?;
+                    }
+                    evidence.validate()?;
+                    if let (Some(current_fence), Some(historical_fence)) =
+                        (current_scope.source_fence(), context.scope.source_fence())
+                    {
+                        if historical_fence.lease_epoch() < current_fence.lease_epoch() {
+                            if let Some(observation) = source_observation_for_evidence(evidence) {
+                                if observation.revision() > current_fence.source_revision() {
+                                    return Err(
+                                        WorkProgressError::CompletionHistoryRevisionBeyondCurrentFence {
+                                            key: step.key,
+                                            observed: observation.revision(),
+                                            current_revision: current_fence.source_revision(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    validate_evidence_for_role(step.key.role(), &context.scope, evidence, None)?;
+                }
+                (ProgressStepStatus::Completed, None, Some(_)) => {
+                    return Err(WorkProgressError::CompletionEvidenceMissing { key: step.key });
+                }
+                (ProgressStepStatus::Completed, Some(_), None) => {
+                    return Err(WorkProgressError::CompletionContextMissing { key: step.key });
+                }
+                (ProgressStepStatus::Completed, None, None) => {
+                    return Err(WorkProgressError::CompletionContextMissing { key: step.key });
+                }
+                (_, Some(_), _) => {
+                    return Err(WorkProgressError::CompletionEvidenceUnexpected { key: step.key });
+                }
+                (_, _, Some(_)) => {
+                    return Err(WorkProgressError::CompletionContextUnexpected { key: step.key });
+                }
+                (_, None, None) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Find one exact keyed step.
@@ -1727,6 +1843,28 @@ impl WorkProgress {
             .ok_or(WorkProgressError::UnknownWorkUnit {
                 key: completion.key,
             })?;
+        self.validate_completion_history()?;
+        let current_status = self.steps[index].status;
+        if current_status == ProgressStepStatus::Completed {
+            let accepted_context = self.steps[index].completion_context.as_ref().ok_or(
+                WorkProgressError::CompletionContextMissing {
+                    key: completion.key,
+                },
+            )?;
+            let accepted_evidence = self.steps[index].evidence.as_ref().ok_or(
+                WorkProgressError::CompletionEvidenceMissing {
+                    key: completion.key,
+                },
+            )?;
+            let replay_context =
+                CompletionContext::new(completion.execution_epoch, completion.scope.clone());
+            if accepted_context == &replay_context && accepted_evidence == &completion.evidence {
+                return Ok(ProgressApplyOutcome::Replay);
+            }
+            return Err(WorkProgressError::CompletionReplayConflict {
+                key: completion.key,
+            });
+        }
         let expected_scope = self
             .scopes
             .iter()
@@ -1738,15 +1876,6 @@ impl WorkProgress {
             || completion.scope.participant_id != completion.key.participant_id()
         {
             return Err(WorkProgressError::ParticipantScopeMismatch {
-                key: completion.key,
-            });
-        }
-        let current_status = self.steps[index].status;
-        if current_status == ProgressStepStatus::Completed {
-            if self.steps[index].evidence.as_ref() == Some(&completion.evidence) {
-                return Ok(ProgressApplyOutcome::Replay);
-            }
-            return Err(WorkProgressError::CompletionReplayConflict {
                 key: completion.key,
             });
         }
@@ -1802,6 +1931,10 @@ impl WorkProgress {
         )?;
         self.steps[index].status = ProgressStepStatus::Completed;
         self.steps[index].evidence = Some(completion.evidence);
+        self.steps[index].completion_context = Some(CompletionContext::new(
+            completion.execution_epoch,
+            completion.scope,
+        ));
         if self.disposition == FullProgressDisposition::RetryPending {
             self.disposition = FullProgressDisposition::None;
             self.retry_observation = None;
@@ -2488,19 +2621,16 @@ impl WorkProgress {
         self.steps
             .iter()
             .filter(|step| {
-                self.scope_for(step.key)
-                    .and_then(ParticipantScope::source_fence)
+                step.completion_context
+                    .as_ref()
+                    .and_then(|context| context.scope.source_fence())
                     .is_some_and(|candidate| candidate == fence)
             })
-            .filter_map(|step| match step.evidence.as_ref() {
-                Some(StoredStepEvidence::SourceObserved { observation })
-                | Some(StoredStepEvidence::SourceCommitted {
-                    after: observation, ..
-                }) => Some(observation.revision()),
-                Some(StoredStepEvidence::Coordinator { receipt }) => receipt
-                    .source_observation()
-                    .map(SourceRevisionObservation::revision),
-                _ => None,
+            .filter_map(|step| {
+                step.evidence
+                    .as_ref()
+                    .and_then(source_observation_for_evidence)
+                    .map(SourceRevisionObservation::revision)
             })
             .max()
     }
@@ -2515,23 +2645,19 @@ impl WorkProgress {
             }
         }
         for step in &self.steps {
-            let Some(scope_fence) = self
-                .scope_for(step.key)
-                .and_then(ParticipantScope::source_fence)
-            else {
+            let Some(context) = step.completion_context.as_ref() else {
+                continue;
+            };
+            let Some(scope_fence) = context.scope.source_fence() else {
                 continue;
             };
             if !same_stable_source_identity(scope_fence, fence) {
                 continue;
             }
-            let observation = match step.evidence.as_ref() {
-                Some(StoredStepEvidence::SourceObserved { observation })
-                | Some(StoredStepEvidence::SourceCommitted {
-                    after: observation, ..
-                }) => Some(observation),
-                Some(StoredStepEvidence::Coordinator { receipt }) => receipt.source_observation(),
-                _ => None,
-            };
+            let observation = step
+                .evidence
+                .as_ref()
+                .and_then(source_observation_for_evidence);
             if let Some(observation) = observation {
                 if same_stable_source_identity_observation(observation, fence) {
                     minimum = minimum.max(observation.revision());
@@ -2986,6 +3112,46 @@ fn same_stable_source_identity(left: &StoredSourceFence, right: &StoredSourceFen
         && left.lifecycle_generation() == right.lifecycle_generation()
 }
 
+fn historical_scope_matches_current(
+    current_epoch: u64,
+    historical_epoch: u64,
+    current: &ParticipantScope,
+    historical: &ParticipantScope,
+) -> bool {
+    if current.participant_id != historical.participant_id || current.kind != historical.kind {
+        return false;
+    }
+    if historical_epoch == current_epoch {
+        return current == historical;
+    }
+    match (current.source_fence(), historical.source_fence()) {
+        (Some(current), Some(historical)) => {
+            same_stable_source_identity(current, historical)
+                && historical.lease_epoch() <= current.lease_epoch()
+                && if historical.lease_epoch() == current.lease_epoch() {
+                    historical == current
+                } else {
+                    historical.source_revision() <= current.source_revision()
+                }
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn source_observation_for_evidence(
+    evidence: &StoredStepEvidence,
+) -> Option<&SourceRevisionObservation> {
+    match evidence {
+        StoredStepEvidence::SourceObserved { observation }
+        | StoredStepEvidence::SourceCommitted {
+            after: observation, ..
+        } => Some(observation),
+        StoredStepEvidence::Coordinator { receipt } => receipt.source_observation(),
+        StoredStepEvidence::Filesystem { .. } => None,
+    }
+}
+
 fn same_stable_source_identity_observation(
     observation: &SourceRevisionObservation,
     fence: &StoredSourceFence,
@@ -3256,6 +3422,60 @@ pub enum WorkProgressError {
     CompletionReplayConflict {
         /// Key whose replay evidence changed.
         key: WorkUnitKey,
+    },
+    /// A completed step had no accepted historical context.
+    #[error("work progress completed step has no accepted context: {key:?}")]
+    CompletionContextMissing {
+        /// Key whose accepted context was absent.
+        key: WorkUnitKey,
+    },
+    /// A completed step had no retained evidence.
+    #[error("work progress completed step has no retained evidence: {key:?}")]
+    CompletionEvidenceMissing {
+        /// Key whose retained evidence was absent.
+        key: WorkUnitKey,
+    },
+    /// A non-completed step carried an accepted historical context.
+    #[error("work progress non-completed step has unexpected context: {key:?}")]
+    CompletionContextUnexpected {
+        /// Key carrying the unexpected context.
+        key: WorkUnitKey,
+    },
+    /// A non-completed step carried retained completion evidence.
+    #[error("work progress non-completed step has unexpected evidence: {key:?}")]
+    CompletionEvidenceUnexpected {
+        /// Key carrying the unexpected evidence.
+        key: WorkUnitKey,
+    },
+    /// A retained completion context did not match the current participant identity or kind.
+    #[error("work progress completion context scope does not match {key:?}")]
+    CompletionContextScopeMismatch {
+        /// Key carrying the mismatched historical context.
+        key: WorkUnitKey,
+    },
+    /// A retained completion context belonged to a future execution epoch.
+    #[error(
+        "work progress completion context epoch {actual} is newer than current epoch {current} for {key:?}"
+    )]
+    CompletionContextEpochFuture {
+        /// Key carrying the future context.
+        key: WorkUnitKey,
+        /// Historical epoch observed on the malformed context.
+        actual: u64,
+        /// Current epoch retained by progress.
+        current: u64,
+    },
+    /// A historical source observation exceeded the currently rebound fence baseline.
+    #[error(
+        "work progress completion history revision {observed} exceeds current fence revision {current_revision} for {key:?}"
+    )]
+    CompletionHistoryRevisionBeyondCurrentFence {
+        /// Key carrying the historical observation.
+        key: WorkUnitKey,
+        /// Revision retained by the historical evidence.
+        observed: u64,
+        /// Current source-fence baseline.
+        current_revision: u64,
     },
     /// The evidence role did not match the exact work role.
     #[error("work progress evidence role does not match {role:?}")]
@@ -4410,6 +4630,13 @@ mod tests {
         }
     }
 
+    fn completed_source_progress() -> (WorkProgress, WorkUnitKey) {
+        let mut progress = copy_progress(false);
+        let key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        (progress, key)
+    }
+
     fn source_reacquisition_authority(
         progress: &WorkProgress,
         target_participant_id: ParticipantId,
@@ -4658,6 +4885,406 @@ mod tests {
         assert!(matches!(
             progress.apply_verified_completion(foreign_completion),
             Err(WorkProgressError::PlanMismatch)
+        ));
+    }
+
+    #[test]
+    fn completion_context_survives_source_reacquisition_and_replays_historically() {
+        let mut progress = copy_progress(false);
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let source_evidence = evidence_for(&progress, source_key, 7);
+        let historical_replay = completion(&progress, source_key, source_evidence.clone());
+        progress
+            .apply_verified_completion(completion(&progress, source_key, source_evidence.clone()))
+            .expect("source completion applies");
+        let accepted_context = progress
+            .step_for(source_key)
+            .expect("source step")
+            .completion_context()
+            .expect("accepted completion context")
+            .clone();
+        assert_eq!(accepted_context.execution_epoch(), 0);
+        assert_eq!(
+            accepted_context
+                .scope()
+                .source_fence()
+                .expect("accepted source fence")
+                .lease_epoch(),
+            1
+        );
+
+        let pending_key = key_for(&progress, 0, WorkUnitRole::Prepare);
+        let stale_pending = completion(
+            &progress,
+            pending_key,
+            evidence_for(&progress, pending_key, 7),
+        );
+        let source_participant_id = source_key.participant_id();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant_id,
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(
+            progress
+                .step_for(source_key)
+                .expect("source step")
+                .completion_context(),
+            Some(&accepted_context)
+        );
+        progress
+            .validate_completion_history()
+            .expect("historical completion remains valid");
+
+        let before_replay = progress.clone();
+        assert_eq!(
+            progress.apply_verified_completion(historical_replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+        assert_eq!(progress, before_replay);
+
+        let relabeled = completion(&progress, source_key, source_evidence);
+        let before_conflict = progress.clone();
+        assert_eq!(
+            progress.apply_verified_completion(relabeled),
+            Err(WorkProgressError::CompletionReplayConflict { key: source_key })
+        );
+        assert_eq!(progress, before_conflict);
+
+        assert!(matches!(
+            progress.apply_verified_completion(stale_pending),
+            Err(WorkProgressError::ExecutionEpochMismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn completion_history_rejects_malformed_context_and_evidence() {
+        let source_key = {
+            let progress = copy_progress(false);
+            key_for(&progress, 0, WorkUnitRole::SourceRead)
+        };
+
+        let mut missing_context = copy_progress(false);
+        apply_role(&mut missing_context, 0, WorkUnitRole::SourceRead);
+        missing_context
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .completion_context = None;
+        assert_eq!(
+            missing_context.validate_completion_history(),
+            Err(WorkProgressError::CompletionContextMissing { key: source_key })
+        );
+
+        let mut missing_evidence = copy_progress(false);
+        apply_role(&mut missing_evidence, 0, WorkUnitRole::SourceRead);
+        missing_evidence
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .evidence = None;
+        assert_eq!(
+            missing_evidence.validate_completion_history(),
+            Err(WorkProgressError::CompletionEvidenceMissing { key: source_key })
+        );
+
+        let mut future_context = copy_progress(false);
+        apply_role(&mut future_context, 0, WorkUnitRole::SourceRead);
+        let current_epoch = future_context.execution_epoch();
+        future_context
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .completion_context
+            .as_mut()
+            .expect("completion context")
+            .execution_epoch = current_epoch + 1;
+        assert_eq!(
+            future_context.validate_completion_history(),
+            Err(WorkProgressError::CompletionContextEpochFuture {
+                key: source_key,
+                actual: current_epoch + 1,
+                current: current_epoch,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_history_rejects_historical_fence_and_evidence_shape_regressions() {
+        let (mut future_lease, source_key) = completed_source_progress();
+        future_lease.execution_epoch = 1;
+        let context = future_lease
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .completion_context
+            .as_mut()
+            .expect("completion context");
+        let current_fence = context.scope.source_fence().expect("source fence").clone();
+        context.scope.source_fence = Some(
+            StoredSourceFence::new(
+                current_fence.source_id().clone(),
+                current_fence.root_identity(),
+                current_fence.database_identity(),
+                current_fence.lifecycle_generation(),
+                current_fence.source_revision(),
+                current_fence.lease_epoch() + 1,
+            )
+            .expect("future historical lease"),
+        );
+        assert_eq!(
+            future_lease.validate_completion_history(),
+            Err(WorkProgressError::CompletionContextScopeMismatch { key: source_key })
+        );
+
+        let (mut same_lease_changed_base, source_key) = completed_source_progress();
+        same_lease_changed_base.execution_epoch = 1;
+        let context = same_lease_changed_base
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .completion_context
+            .as_mut()
+            .expect("completion context");
+        let current_fence = context.scope.source_fence().expect("source fence").clone();
+        context.scope.source_fence = Some(
+            StoredSourceFence::new(
+                current_fence.source_id().clone(),
+                current_fence.root_identity(),
+                current_fence.database_identity(),
+                current_fence.lifecycle_generation(),
+                current_fence.source_revision() - 1,
+                current_fence.lease_epoch(),
+            )
+            .expect("same-lease changed base revision"),
+        );
+        assert_eq!(
+            same_lease_changed_base.validate_completion_history(),
+            Err(WorkProgressError::CompletionContextScopeMismatch { key: source_key })
+        );
+
+        let (mut future_base, source_key) = completed_source_progress();
+        let source_participant_id = source_key.participant_id();
+        future_base
+            .reacquire_source(source_reacquisition_authority(
+                &future_base,
+                source_participant_id,
+                8,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        let context = future_base
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .completion_context
+            .as_mut()
+            .expect("completion context");
+        let historical_fence = context
+            .scope
+            .source_fence()
+            .expect("historical source fence")
+            .clone();
+        context.scope.source_fence = Some(
+            StoredSourceFence::new(
+                historical_fence.source_id().clone(),
+                historical_fence.root_identity(),
+                historical_fence.database_identity(),
+                historical_fence.lifecycle_generation(),
+                9,
+                historical_fence.lease_epoch(),
+            )
+            .expect("future historical base revision"),
+        );
+        assert_eq!(
+            future_base.validate_completion_history(),
+            Err(WorkProgressError::CompletionContextScopeMismatch { key: source_key })
+        );
+
+        let mut old_observation = copy_progress(false);
+        let source_key = key_for(&old_observation, 0, WorkUnitRole::SourceRead);
+        let historical_observation = source_observation(&old_observation, source_key, 8);
+        old_observation
+            .apply_verified_completion(completion(
+                &old_observation,
+                source_key,
+                StoredStepEvidence::SourceObserved {
+                    observation: historical_observation,
+                },
+            ))
+            .expect("historical source observation");
+        old_observation
+            .reacquire_source(source_reacquisition_authority(
+                &old_observation,
+                source_key.participant_id(),
+                8,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        let current_scope = old_observation
+            .scopes
+            .iter_mut()
+            .find(|scope| scope.participant_id == source_key.participant_id())
+            .expect("current source scope");
+        let current_fence = current_scope
+            .source_fence()
+            .expect("current source fence")
+            .clone();
+        current_scope.source_fence = Some(
+            StoredSourceFence::new(
+                current_fence.source_id().clone(),
+                current_fence.root_identity(),
+                current_fence.database_identity(),
+                current_fence.lifecycle_generation(),
+                7,
+                current_fence.lease_epoch(),
+            )
+            .expect("lowered current baseline"),
+        );
+        assert!(matches!(
+            old_observation.validate_completion_history(),
+            Err(WorkProgressError::CompletionHistoryRevisionBeyondCurrentFence {
+                key: observed_key,
+                observed: 8,
+                current_revision: 7,
+            }) if observed_key == source_key
+        ));
+
+        let (mut malformed_evidence, source_key) = completed_source_progress();
+        let evidence = malformed_evidence
+            .steps
+            .iter_mut()
+            .find(|step| step.key == source_key)
+            .expect("source step")
+            .evidence
+            .as_mut()
+            .expect("source evidence");
+        let StoredStepEvidence::SourceObserved { observation } = evidence else {
+            panic!("source read evidence");
+        };
+        observation.lease_epoch = 0;
+        assert!(matches!(
+            malformed_evidence.validate_completion_history(),
+            Err(WorkProgressError::Evidence(
+                ProgressEvidenceError::InvalidSourceObservation(
+                    ParticipantValidationError::InvalidLeaseEpoch
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn historical_source_revisions_remain_fenced_after_multiple_reacquisitions() {
+        let mut progress = fenced_harvest_progress();
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        let source_participant_id = source_key.participant_id();
+        apply_role(&mut progress, 0, WorkUnitRole::SourceRead);
+        for role in [
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        let source_affect = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                source_affect,
+                StoredStepEvidence::SourceCommitted {
+                    before_revision: 7,
+                    after: source_observation(&progress, source_affect, 9),
+                },
+            ))
+            .expect("historical source revision");
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant_id,
+                9,
+                2,
+                0,
+            ))
+            .expect("first source reacquisition");
+        apply_role(&mut progress, u8::MAX, WorkUnitRole::GlobalLibrary);
+        let harvest_key = key_for(&progress, u8::MAX, WorkUnitRole::Harvest);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                harvest_key,
+                evidence_for(&progress, harvest_key, 9),
+            ))
+            .expect("historical harvest revision");
+        let harvest_context = progress
+            .step_for(harvest_key)
+            .expect("harvest step")
+            .completion_context()
+            .expect("harvest context")
+            .clone();
+        assert_eq!(harvest_context.execution_epoch(), 1);
+        assert_eq!(
+            harvest_context
+                .scope()
+                .source_fence()
+                .expect("harvest source fence")
+                .lease_epoch(),
+            2
+        );
+
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_participant_id,
+                9,
+                3,
+                1,
+            ))
+            .expect("second source reacquisition");
+        progress
+            .validate_completion_history()
+            .expect("historical contexts remain valid");
+        let projection = key_for(&progress, u8::MAX, WorkUnitRole::Projection);
+        progress
+            .apply_verified_completion(completion(
+                &progress,
+                projection,
+                evidence_for(&progress, projection, 10),
+            ))
+            .expect("current projection revision");
+        let readiness = key_for(&progress, u8::MAX, WorkUnitRole::Readiness);
+        let stale_readiness =
+            CoordinatorReceiptSummary::new(CoordinatorReceiptKind::Readiness, 1, None)
+                .with_source_observation(source_observation(&progress, readiness, 9));
+        assert!(matches!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                StoredStepEvidence::Coordinator {
+                    receipt: stale_readiness,
+                },
+            )),
+            Err(WorkProgressError::SourceRevisionRegressed {
+                role: WorkUnitRole::Readiness,
+                observed: 9,
+                minimum: 10,
+            })
         ));
     }
 

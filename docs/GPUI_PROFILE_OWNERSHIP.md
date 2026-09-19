@@ -1357,3 +1357,23 @@ normal-success settlement-class policy gap without adding live capacity or
 release authority, persistence/codec, cancellation, filesystem execution, or
 native Windows UI/audio acceptance. After-effect recovery, cancellation-local
 reconciliation, owner integration, and the remaining OPT-1337 work remain open.
+
+In-memory full progress now retains a read-only completion context alongside
+completed evidence: the accepted execution epoch and full participant scope,
+including an optional source fence. Completed replay compares that exact
+historical context and evidence before current-scope checks, so the original
+authority can replay after source reacquisition while a payload relabeled with a
+new epoch or fence is rejected. History validation requires evidence and context
+exactly for completed steps, validates nested evidence shape, permits only a
+stable-source fence rebind with bounded lease/base revisions, and checks old-lease
+observations against the current fence baseline. Source revision floors use
+accepted historical scopes while retaining the maximum observed revision and the
+current fence baseline. The cancellation inventory remains an equality-stable
+key/status snapshot.
+
+Forty-three focused progress tests, one cancellation-recovery test, and five
+cancellation-effect tests passed, together with library and GPUI checks without
+default features, formatting, and diff checks. This is an in-memory observational
+milestone: full progress persistence/codec, cancellation recovery and local
+reconciliation, owner integration, filesystem execution, and native Windows
+UI/audio acceptance remain open under OPT-1337.
