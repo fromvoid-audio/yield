@@ -1463,3 +1463,24 @@ codec, or filesystem mutation was added. Native Windows UI/audio acceptance,
 owner integration, and the remaining cancellation reconciliation work remain
 open under OPT-1337. Filesystem mutation implementation is outside OPT-1337 as
 dependent owner work under OPT-1339.
+
+Cancellation-local source-closure observations now derive an exact sorted union
+of pending source-closure keys from a validated after-effect recovery inventory,
+while retaining the complete frozen snapshot, dispatch outcome, and bundle
+lineage. Each bounded row is typed as `Pending` or `Observed`; observed
+`StoredStepEvidence` and `CompletionContext` are checked through the shared
+historical scope, fence, epoch, and role validation path. Record validation
+requires positive generation, exact manifest and row coverage, a dispatch
+observation epoch floor, and a current-progress epoch ceiling. Reacquisition
+preserves valid historical receipts, while normal steps and frozen cancellation
+facts remain unchanged. Explicit recovery and dispatch arguments keep candidate
+validation observational and state-independent.
+
+Three source-closure tests, sixty-four focused progress tests, and fifty-two
+cancellation tests passed, together with no-default-feature library and GPUI
+checks, formatting, and diff checks. This is an immutable observation milestone:
+source-closure transition/rebase policy, accepting guards, cleanup/settlement,
+terminal cancellation, owner/barrier integration, durable persistence/codec,
+and filesystem execution remain open. Native Windows UI/audio acceptance is
+separate. Filesystem mutation implementation remains outside OPT-1337 as
+dependent owner work under OPT-1339.

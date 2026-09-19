@@ -8,6 +8,7 @@
 pub mod admission_claims;
 pub mod cancellation_dispatch;
 pub mod cancellation_effects;
+pub mod cancellation_reconciliation;
 pub mod cancellation_recovery;
 pub mod codec;
 pub mod coordinator;
@@ -58,6 +59,13 @@ pub use cancellation_effects::{
     CancellationEffectInventoryValidationError, CancellationEffectOutcome,
     CancellationEffectRecipe, CancellationEffectRecoveryInventory, CancellationEffectSourceClosure,
     MAX_CANCELLATION_EFFECT_BUNDLES, MAX_CANCELLATION_EFFECT_ROWS,
+};
+
+pub use cancellation_reconciliation::{
+    CancellationSourceClosureObservationRecord, CancellationSourceClosureObservationRecordError,
+    CancellationSourceClosureObservationRow, CancellationSourceClosureOutcome,
+    MAX_CANCELLATION_SOURCE_CLOSURE_KEYS, MAX_CANCELLATION_SOURCE_CLOSURE_ROWS,
+    SourceClosureManifest, SourceClosureManifestError, SourceClosureManifestValidationError,
 };
 
 pub use coordinator::{

@@ -33,6 +33,10 @@ use super::cancellation_effects::{
     derive_cancellation_effect_inventory as derive_effect_inventory,
     derive_cancellation_effect_recovery_inventory as derive_effect_recovery_inventory,
 };
+use super::cancellation_reconciliation::{
+    CancellationSourceClosureObservationRecord, CancellationSourceClosureObservationRecordError,
+    CancellationSourceClosureOutcome, SourceClosureManifest, SourceClosureManifestError,
+};
 use super::cancellation_recovery::{
     CancellationActionState, CancellationInventory, CancellationInventoryError, CancellationRoute,
     MAX_CANCELLATION_ACTIONS,
@@ -1531,6 +1535,73 @@ impl WorkProgress {
                 self.execution_epoch,
             )
             .map_err(WorkProgressError::CancellationEffectInventory)
+    }
+
+    /// Derive the exact pending source-closure manifest from one validated after-effect inventory.
+    ///
+    /// The manifest retains the full recovery lineage and is an observation only.  It does not
+    /// complete normal progress, issue source authority, or authorize cleanup or settlement.
+    pub fn cancellation_source_closure_manifest(
+        &self,
+        recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<SourceClosureManifest, WorkProgressError> {
+        self.validate_cancellation_effect_recovery_inventory(
+            recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        SourceClosureManifest::derive(recovery_inventory.clone()).map_err(|error| {
+            WorkProgressError::CancellationSourceClosureManifest(SourceClosureManifestError::from(
+                error,
+            ))
+        })
+    }
+
+    /// Validate one candidate source-closure manifest against an explicitly supplied recovery
+    /// inventory and dispatch lineage.
+    ///
+    /// This is a read-only observational check.  The expected values are explicit so a caller
+    /// can validate a candidate observation without implicitly consulting accepted state.
+    pub fn validate_cancellation_source_closure_manifest(
+        &self,
+        candidate: &SourceClosureManifest,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let expected = self.cancellation_source_closure_manifest(
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&expected)
+            .map_err(WorkProgressError::CancellationSourceClosureManifest)
+    }
+
+    /// Validate one immutable cancellation-local source-closure observation record.
+    ///
+    /// The record is checked against explicit recovery and dispatch lineage, current execution
+    /// epoch, and the same historical participant/evidence rules used by retained completions.
+    /// It does not mutate normal steps, frozen inventories, claims, or terminal state.
+    pub fn validate_cancellation_source_closure_observation_record(
+        &self,
+        candidate: &CancellationSourceClosureObservationRecord,
+        expected_recovery_inventory: &CancellationEffectRecoveryInventory,
+        expected_dispatch_outcome: &CancellationDispatchOutcomeRecord,
+    ) -> Result<(), WorkProgressError> {
+        let manifest = self.cancellation_source_closure_manifest(
+            expected_recovery_inventory,
+            expected_dispatch_outcome,
+        )?;
+        candidate
+            .validate_against(&manifest, self.execution_epoch)
+            .map_err(WorkProgressError::CancellationSourceClosureObservation)?;
+        for row in candidate.rows() {
+            if let CancellationSourceClosureOutcome::Observed { evidence, context } = row.outcome()
+            {
+                self.validate_historical_completion(row.key(), context, evidence)?;
+            }
+        }
+        Ok(())
     }
 
     /// Derive the exact cancellation-wide pending dispatch manifest from the frozen source.
@@ -3488,6 +3559,13 @@ pub enum WorkProgressError {
     /// validation.
     #[error("invalid work progress cancellation effect recovery inventory: {0}")]
     CancellationEffectInventory(#[source] CancellationEffectInventoryError),
+    /// A cancellation-local source-closure manifest failed exact derivation or validation.
+    #[error("invalid work progress cancellation source-closure manifest: {0}")]
+    CancellationSourceClosureManifest(#[source] SourceClosureManifestError),
+    /// A cancellation-local source-closure observation failed exact binding or evidence
+    /// validation.
+    #[error("invalid work progress cancellation source-closure observation: {0}")]
+    CancellationSourceClosureObservation(#[source] CancellationSourceClosureObservationRecordError),
     /// A prepublication cleanup observation failed its bounded local shape validation.
     #[error("invalid work progress prepublication cleanup: {0}")]
     PrePublishCleanup(#[source] PrePublishCleanupValidationError),
@@ -4067,15 +4145,17 @@ mod tests {
         CancellationDispatchOutcome, CancellationDispatchOutcomeRecord,
         CancellationDispatchOutcomeRecordError, CancellationDispatchOutcomeRow,
         CancellationEffectBundle, CancellationEffectFactKind, CancellationEffectOutcome,
-        CancellationEffectRecipe, CancellationEffectRecoveryInventory, CopyCollisionPolicy,
-        CopyEndpoint, CopyIntentArgs, CopySourceExpectation, CreateFolderIntentArgs,
-        EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
-        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
-        ExternalRawObservationLimits, ExternalRawObservationMetadata,
-        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
-        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan, HistoryAction,
-        HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
+        CancellationEffectRecipe, CancellationEffectRecoveryInventory,
+        CancellationSourceClosureObservationRecord,
+        CancellationSourceClosureObservationRecordError, CancellationSourceClosureObservationRow,
+        CancellationSourceClosureOutcome, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs,
+        CopySourceExpectation, CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary,
+        ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
+        ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
+        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+        HistoryAction, HistoryDirection, HistoryExtractedFileObservation, HistoryFolderMove,
         HistoryFolderRelocation, HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
         HistoryRestoreTargetExpectation, HistoryScopeId, HistoryUndoRedoIntentArgs,
         HistoryWaveformRestore, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
@@ -4086,7 +4166,8 @@ mod tests {
         RetainedFolderObservation, RetainedPurgeDecision, RetainedPurgeIntentArgs,
         RetainedRecoveryRootKind, RetainedResolutionCommandArgs, RetainedResolutionStage,
         RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId, SelectionExtractIntentArgs,
-        SelectionOutputCommandArgs, SelectionOutputRecipe, StoredRelativePath,
+        SelectionOutputCommandArgs, SelectionOutputRecipe, SourceClosureManifest,
+        SourceClosureManifestError, SourceClosureManifestValidationError, StoredRelativePath,
         UniversalCommandArgs, WaveformEditFrameRange, WaveformFileRevisionObservation,
         WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
         fingerprint_selected_entry_json,
@@ -5070,6 +5151,21 @@ mod tests {
             dispatch_rows_with_observed(&manifest, observed),
         )
         .expect("cancellation dispatch record")
+    }
+
+    fn source_closure_rows(
+        manifest: &SourceClosureManifest,
+    ) -> Vec<CancellationSourceClosureObservationRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                CancellationSourceClosureObservationRow::new(
+                    *key,
+                    CancellationSourceClosureOutcome::Pending,
+                )
+            })
+            .collect()
     }
 
     fn completed_source_progress() -> (WorkProgress, WorkUnitKey) {
@@ -6624,6 +6720,465 @@ mod tests {
             after_reacquisition.bundles()[0].source_closure(),
             frozen_effects.bundles()[0].source_closure()
         );
+    }
+
+    #[test]
+    fn cancellation_source_closure_observation_tracks_staged_move_pending_source() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress = claimed_progress(
+            participants,
+            namespace_file_move_args(source, source_id),
+            1310,
+        );
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::DestinationSourceReconcile,
+            WorkUnitRole::OriginRemovalStart,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1310).expect("cancel"))
+            .expect("staged move cancellation");
+
+        let late_key = key_for(&progress, 0, WorkUnitRole::OriginAbsence);
+        let late_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(late_key)
+                .expect("origin absence scope")
+                .clone(),
+        );
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(late_key, evidence_for(&progress, late_key, 7), late_context)],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source-closure manifest");
+        let pending_key = key_for(&progress, 0, WorkUnitRole::OriginSourceReconcile);
+        assert_eq!(manifest.keys(), &[pending_key]);
+        assert_eq!(
+            recovery.bundles()[0]
+                .source_closure()
+                .iter()
+                .find(|closure| closure.key() == pending_key)
+                .expect("origin source closure")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+
+        let context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(pending_key)
+                .expect("origin source reconcile scope")
+                .clone(),
+        );
+        let observation = CancellationSourceClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            vec![CancellationSourceClosureObservationRow::new(
+                pending_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: evidence_for(&progress, pending_key, 7),
+                    context,
+                },
+            )],
+        )
+        .expect("source-closure observation");
+        progress
+            .validate_cancellation_source_closure_observation_record(
+                &observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("source-closure observation validates");
+
+        let missing_rows = CancellationSourceClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            2,
+            Vec::new(),
+        )
+        .expect("missing-row record shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_observation_record(
+                &missing_rows,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CancellationSourceClosureObservation(
+                CancellationSourceClosureObservationRecordError::RowCountMismatch {
+                    actual: 0,
+                    expected: 1,
+                }
+            ))
+        );
+
+        let wrong_scope = CancellationSourceClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            2,
+            vec![CancellationSourceClosureObservationRow::new(
+                pending_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: evidence_for(&progress, pending_key, 7),
+                    context: CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress.scope_for(late_key).expect("wrong scope").clone(),
+                    ),
+                },
+            )],
+        )
+        .expect("wrong-scope record shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_observation_record(
+                &wrong_scope,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::CompletionContextScopeMismatch { key: pending_key })
+        );
+
+        let wrong_evidence = CancellationSourceClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            2,
+            vec![CancellationSourceClosureObservationRow::new(
+                pending_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: StoredStepEvidence::Filesystem {
+                        receipt: FilesystemReceiptSummary::new(
+                            FilesystemReceiptKind::OriginAbsence,
+                            1,
+                        ),
+                    },
+                    context: CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress
+                            .scope_for(pending_key)
+                            .expect("source closure scope")
+                            .clone(),
+                    ),
+                },
+            )],
+        )
+        .expect("wrong-evidence record shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_observation_record(
+                &wrong_evidence,
+                &recovery,
+                &dispatch,
+            ),
+            Err(WorkProgressError::RoleEvidenceMismatch {
+                role: WorkUnitRole::OriginSourceReconcile,
+            })
+        );
+
+        let future_context = CancellationSourceClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            2,
+            vec![CancellationSourceClosureObservationRow::new(
+                pending_key,
+                CancellationSourceClosureOutcome::Observed {
+                    evidence: evidence_for(&progress, pending_key, 7),
+                    context: CompletionContext::new(
+                        progress.execution_epoch() + 1,
+                        progress
+                            .scope_for(pending_key)
+                            .expect("source closure scope")
+                            .clone(),
+                    ),
+                },
+            )],
+        );
+        assert_eq!(
+            future_context,
+            Err(
+                CancellationSourceClosureObservationRecordError::ContextEpochAfterObservation {
+                    key: pending_key,
+                    context_epoch: progress.execution_epoch() + 1,
+                    observation_epoch: dispatch.observation_epoch(),
+                }
+            )
+        );
+
+        assert_eq!(
+            progress
+                .step_for(pending_key)
+                .expect("origin source reconcile")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+        assert_eq!(
+            recovery.bundles()[0]
+                .facts()
+                .iter()
+                .find(|fact| fact.kind() == CancellationEffectFactKind::OriginAbsence)
+                .map(|fact| fact.key()),
+            Some(late_key)
+        );
+    }
+
+    #[test]
+    fn cancellation_source_closure_manifest_is_exact_across_history_segments() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1311);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut progress, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1311).expect("cancel"))
+            .expect("history cancellation");
+        let late_key = key_for_step(&progress, 0, 1, WorkUnitRole::QualifiedRelocation);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                late_key,
+                evidence_for(&progress, late_key, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(late_key).expect("late scope").clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("history recovery inventory");
+        let manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("history source-closure manifest");
+        let pending_key = key_for_step(&progress, 0, 1, WorkUnitRole::SourceAffect);
+        let completed_key = key_for_step(&progress, 0, 0, WorkUnitRole::SourceAffect);
+        assert_eq!(manifest.keys(), &[pending_key]);
+        assert!(!manifest.keys().contains(&completed_key));
+
+        let missing = SourceClosureManifest::new(recovery.clone(), Vec::new())
+            .expect("missing manifest candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_manifest(&missing, &recovery, &dispatch,),
+            Err(WorkProgressError::CancellationSourceClosureManifest(
+                SourceClosureManifestError::CandidateMismatch
+            ))
+        );
+
+        assert_eq!(
+            SourceClosureManifest::new(recovery.clone(), vec![pending_key, pending_key]),
+            Err(SourceClosureManifestValidationError::KeysNotSortedOrUnique { index: 1 })
+        );
+
+        let mut extra_keys = vec![pending_key, completed_key];
+        extra_keys.sort();
+        let extra = SourceClosureManifest::new(recovery.clone(), extra_keys)
+            .expect("extra manifest candidate shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_manifest(&extra, &recovery, &dispatch,),
+            Err(WorkProgressError::CancellationSourceClosureManifest(
+                SourceClosureManifestError::CandidateMismatch
+            ))
+        );
+
+        let wrong_row = CancellationSourceClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            vec![CancellationSourceClosureObservationRow::new(
+                completed_key,
+                CancellationSourceClosureOutcome::Pending,
+            )],
+        )
+        .expect("wrong-row record shape");
+        assert_eq!(
+            progress.validate_cancellation_source_closure_observation_record(
+                &wrong_row, &recovery, &dispatch,
+            ),
+            Err(WorkProgressError::CancellationSourceClosureObservation(
+                CancellationSourceClosureObservationRecordError::RowKeyMismatch {
+                    index: 0,
+                    actual: completed_key,
+                    expected: pending_key,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn cancellation_source_closure_source_observed_survives_reacquisition_and_epoch_binding() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let mut progress =
+            claimed_progress(participants, history_folder_args(source, source_id), 1312);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1312).expect("cancel"))
+            .expect("history cancellation");
+        let late_key = key_for_step(&progress, 0, 0, WorkUnitRole::QualifiedRelocation);
+        let dispatch = recovery_dispatch_record(
+            &progress,
+            1,
+            &[(
+                late_key,
+                evidence_for(&progress, late_key, 7),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(late_key).expect("late scope").clone(),
+                ),
+            )],
+        );
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("late relocation recovery inventory");
+        let manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source-closure manifest");
+        let source_read = key_for_step(&progress, 0, 0, WorkUnitRole::SourceRead);
+        let source_affect = key_for_step(&progress, 0, 0, WorkUnitRole::SourceAffect);
+        assert_eq!(manifest.keys().len(), 2);
+        assert!(manifest.keys().contains(&source_read));
+        assert!(manifest.keys().contains(&source_affect));
+
+        let source_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(source_read)
+                .expect("source scope")
+                .clone(),
+        );
+        let rows = manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                if *key == source_read {
+                    CancellationSourceClosureObservationRow::new(
+                        *key,
+                        CancellationSourceClosureOutcome::Observed {
+                            evidence: evidence_for(&progress, *key, 7),
+                            context: source_context.clone(),
+                        },
+                    )
+                } else {
+                    CancellationSourceClosureObservationRow::new(
+                        *key,
+                        CancellationSourceClosureOutcome::Pending,
+                    )
+                }
+            })
+            .collect();
+        let observation = CancellationSourceClosureObservationRecord::new(
+            manifest,
+            dispatch.observation_epoch(),
+            1,
+            rows,
+        )
+        .expect("source observed record");
+        progress
+            .validate_cancellation_source_closure_observation_record(
+                &observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("source observed record validates");
+
+        let steps_before = progress.steps().to_vec();
+        let inventory_before = progress
+            .cancellation_inventory()
+            .expect("frozen cancellation inventory")
+            .clone();
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_read.participant_id(),
+                8,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        progress
+            .validate_cancellation_source_closure_observation_record(
+                &observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("historical source-closure record validates");
+        assert_eq!(progress.steps(), steps_before.as_slice());
+        assert_eq!(progress.cancellation_inventory(), Some(&inventory_before));
+
+        let current_dispatch = recovery_dispatch_record(
+            &progress,
+            2,
+            &[(
+                late_key,
+                evidence_for(&progress, late_key, 8),
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(late_key)
+                        .expect("current late scope")
+                        .clone(),
+                ),
+            )],
+        );
+        let current_recovery = progress
+            .cancellation_effect_recovery_inventory(&current_dispatch)
+            .expect("current recovery inventory");
+        let current_manifest = progress
+            .cancellation_source_closure_manifest(&current_recovery, &current_dispatch)
+            .expect("current source-closure manifest");
+        let before_dispatch = CancellationSourceClosureObservationRecord::new(
+            current_manifest.clone(),
+            0,
+            2,
+            source_closure_rows(&current_manifest),
+        );
+        assert_eq!(
+            before_dispatch,
+            Err(
+                CancellationSourceClosureObservationRecordError::ObservationEpochBeforeDispatch {
+                    actual: 0,
+                    dispatch: current_dispatch.observation_epoch(),
+                }
+            )
+        );
+        let current_rows = source_closure_rows(&current_manifest);
+        let current_observation = CancellationSourceClosureObservationRecord::new(
+            current_manifest,
+            current_dispatch.observation_epoch(),
+            2,
+            current_rows,
+        )
+        .expect("current source-closure record");
+        progress
+            .validate_cancellation_source_closure_observation_record(
+                &current_observation,
+                &current_recovery,
+                &current_dispatch,
+            )
+            .expect("current source-closure record validates");
     }
 
     #[test]
