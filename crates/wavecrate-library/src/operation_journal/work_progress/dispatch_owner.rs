@@ -270,6 +270,7 @@ impl<P> PermitFailure<P> {
 ///
 /// This value is an in-memory owner binding only.  It does not settle claims, transition
 /// terminal progress, authorize cleanup, or grant filesystem capability.
+#[derive(Clone)]
 pub(super) struct VerifiedCancellationBarrier {
     owner_id: u64,
     operation_id: OperationId,
@@ -280,6 +281,24 @@ pub(super) struct VerifiedCancellationBarrier {
 }
 
 impl VerifiedCancellationBarrier {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        operation_id: OperationId,
+        plan: WorkPlan,
+        execution_epoch: u64,
+        cancellation_inventory: super::CancellationInventory,
+        dispatch_outcome: CancellationDispatchOutcomeRecord,
+    ) -> Self {
+        Self {
+            owner_id: 0,
+            operation_id,
+            plan,
+            execution_epoch,
+            cancellation_inventory,
+            dispatch_outcome,
+        }
+    }
+
     /// Borrow the exact validated dispatch outcome retained by this barrier.
     pub(super) fn dispatch_outcome(&self) -> &CancellationDispatchOutcomeRecord {
         &self.dispatch_outcome

@@ -37,8 +37,8 @@ use super::cancellation_dispatch::{
     derive_cancellation_dispatch_manifest as derive_dispatch_manifest,
 };
 use super::cancellation_effects::{
-    CancellationCleanupManifest, CancellationCleanupManifestError, CancellationEffectInventory,
-    CancellationEffectInventoryError, CancellationEffectRecipe,
+    CancellationCleanupManifest, CancellationCleanupManifestError, CancellationEffectFactKind,
+    CancellationEffectInventory, CancellationEffectInventoryError, CancellationEffectRecipe,
     CancellationEffectRecoveryInventory, derive_cancellation_cleanup_manifest,
     derive_cancellation_effect_inventory as derive_effect_inventory,
     derive_cancellation_effect_recovery_inventory as derive_effect_recovery_inventory,
@@ -72,8 +72,8 @@ use super::readiness_scheduling::{
     ReadinessSchedulingObservationRow, derive_readiness_deferral_manifest,
 };
 use super::work_plan::{
-    GLOBAL_ACTION_ORDINAL, MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite,
-    WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
+    GLOBAL_ACTION_ORDINAL, MAX_WORK_PLAN_UNITS, STEP_HISTORY_STRIDE, WorkPlan, WorkPlanError,
+    WorkPrerequisite, WorkUnitApplicability, WorkUnitKey, WorkUnitRole,
 };
 use crate::sample_sources::SourceId;
 
@@ -88,6 +88,19 @@ pub(super) mod dispatch_owner;
 pub(super) mod snapshot;
 
 pub use snapshot::{FullProgressSnapshotObservation, FullProgressSnapshotObservationError};
+
+#[path = "work_progress/terminal_outcomes.rs"]
+pub(super) mod terminal_outcomes;
+
+use terminal_outcomes::{
+    BlockedByUserDecisionObservation, BlockedByUserObservation, CompensationParticipantKind,
+    CompensationReceiptObservation, CompensationReconciliationObservation, CompensationResultKind,
+    CompensationResultObservation, FailedDataLossRiskObservation, FailedPreservingDataObservation,
+    MAX_TERMINAL_OUTCOME_ROWS, OriginRestorationObservation, RecoveryExhaustionObservation,
+    RolledBackObservation, SafetyEscalationObservation, TerminalDispatchQuiescenceObservation,
+    TerminalDispatchQuiescenceOutcome, TerminalOutcomeObservation, TerminalResourceObservation,
+    TerminalResourceOutcome,
+};
 
 /// One bounded source revision observation attached to a progress completion.
 ///
@@ -1587,6 +1600,193 @@ struct PostPublishCancellationAuthority {
     claim_proofs: Vec<ForwardClaimQualificationProof>,
 }
 
+/// Private recipe-specific compensation proof issued by a live recovery owner.
+///
+/// The serializable receipt carried by the observation is intentionally duplicated inside this
+/// non-serializable enum.  This keeps every recipe boundary explicit and prevents a decoded row
+/// from being promoted into a compensation authority.
+#[allow(dead_code)]
+#[derive(Clone)]
+enum VerifiedCompensationReceipt {
+    StagedPublish(VerifiedCompensationReceiptPayload),
+    StagedMove(VerifiedCompensationReceiptPayload),
+    QualifiedRelocation(VerifiedCompensationReceiptPayload),
+    RetainedMerge(VerifiedCompensationReceiptPayload),
+    RetainedDisposition(VerifiedCompensationReceiptPayload),
+    ExternalAudit(VerifiedCompensationReceiptPayload),
+    HistoryUndoExtractedRemoval(VerifiedCompensationReceiptPayload),
+}
+
+#[derive(Clone)]
+struct VerifiedCompensationReceiptPayload {
+    observation: CompensationReceiptObservation,
+    evidence: Vec<(WorkUnitKey, CompletionContext, StoredStepEvidence)>,
+}
+
+impl VerifiedCompensationReceipt {
+    fn observation(&self) -> CompensationReceiptObservation {
+        match self {
+            Self::StagedPublish(payload)
+            | Self::StagedMove(payload)
+            | Self::QualifiedRelocation(payload)
+            | Self::RetainedMerge(payload)
+            | Self::RetainedDisposition(payload)
+            | Self::ExternalAudit(payload)
+            | Self::HistoryUndoExtractedRemoval(payload) => payload.observation.clone(),
+        }
+    }
+
+    fn evidence(&self) -> &[(WorkUnitKey, CompletionContext, StoredStepEvidence)] {
+        match self {
+            Self::StagedPublish(payload)
+            | Self::StagedMove(payload)
+            | Self::QualifiedRelocation(payload)
+            | Self::RetainedMerge(payload)
+            | Self::RetainedDisposition(payload)
+            | Self::ExternalAudit(payload)
+            | Self::HistoryUndoExtractedRemoval(payload) => &payload.evidence,
+        }
+    }
+
+    fn results(&self) -> &[CompensationResultObservation] {
+        match self {
+            Self::StagedPublish(payload)
+            | Self::StagedMove(payload)
+            | Self::QualifiedRelocation(payload)
+            | Self::RetainedMerge(payload)
+            | Self::RetainedDisposition(payload)
+            | Self::ExternalAudit(payload)
+            | Self::HistoryUndoExtractedRemoval(payload) => &payload.observation.results,
+        }
+    }
+
+    #[cfg(test)]
+    fn results_mut(&mut self) -> &mut Vec<CompensationResultObservation> {
+        match self {
+            Self::StagedPublish(payload)
+            | Self::StagedMove(payload)
+            | Self::QualifiedRelocation(payload)
+            | Self::RetainedMerge(payload)
+            | Self::RetainedDisposition(payload)
+            | Self::ExternalAudit(payload)
+            | Self::HistoryUndoExtractedRemoval(payload) => &mut payload.observation.results,
+        }
+    }
+
+    fn recipe(&self) -> CancellationEffectRecipe {
+        match self {
+            Self::StagedPublish(_) => CancellationEffectRecipe::StagedPublish,
+            Self::StagedMove(_) => CancellationEffectRecipe::StagedMove,
+            Self::QualifiedRelocation(_) => CancellationEffectRecipe::QualifiedRelocation,
+            Self::RetainedMerge(_) => CancellationEffectRecipe::RetainedMerge,
+            Self::RetainedDisposition(_) => CancellationEffectRecipe::RetainedDisposition,
+            Self::ExternalAudit(_) => CancellationEffectRecipe::ExternalAudit,
+            Self::HistoryUndoExtractedRemoval(_) => {
+                CancellationEffectRecipe::HistoryUndoExtractedRemoval
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VerifiedOriginRestorationProof(OriginRestorationObservation);
+
+#[derive(Clone)]
+struct VerifiedCompensationReconciliationProof(CompensationReconciliationObservation);
+
+#[derive(Clone)]
+struct VerifiedTerminalResourceProof(TerminalResourceObservation);
+
+#[derive(Clone)]
+struct VerifiedBlockedByUserDecisionProof(BlockedByUserDecisionObservation);
+
+#[derive(Clone)]
+struct VerifiedRecoveryExhaustionProof(RecoveryExhaustionObservation);
+
+#[derive(Clone)]
+struct VerifiedSafetyEscalationProof(SafetyEscalationObservation);
+
+#[derive(Clone)]
+struct VerifiedTerminalDispatchQuiescenceProof {
+    barrier: dispatch_owner::VerifiedCancellationBarrier,
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    eligible_keys: Vec<WorkUnitKey>,
+    observation: TerminalDispatchQuiescenceObservation,
+}
+
+/// Private owner-issued authority for one of the four previously unsupported terminal outcomes.
+///
+/// Every variant carries a typed proof family in addition to the bounded observation.  No
+/// constructor is exposed here, and snapshot rehydration only retains observations.
+#[allow(dead_code)]
+#[derive(Clone)]
+enum VerifiedTerminalOutcomeAuthority {
+    RolledBack(VerifiedRolledBackAuthority),
+    BlockedByUser(VerifiedBlockedByUserAuthority),
+    FailedPreservingData(VerifiedFailedPreservingDataAuthority),
+    FailedDataLossRisk(VerifiedFailedDataLossRiskAuthority),
+}
+
+#[derive(Clone)]
+struct VerifiedRolledBackAuthority {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    expected_recovery_generation: u64,
+    next_recovery_generation: u64,
+    claim_inventory: AdmissionClaimInventory,
+    observation: RolledBackObservation,
+    compensation_receipts: Vec<VerifiedCompensationReceipt>,
+    origin_restorations: Vec<VerifiedOriginRestorationProof>,
+    reconciliations: Vec<VerifiedCompensationReconciliationProof>,
+    resource_observations: Vec<VerifiedTerminalResourceProof>,
+    dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof,
+}
+
+#[derive(Clone)]
+struct VerifiedBlockedByUserAuthority {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    expected_recovery_generation: u64,
+    next_recovery_generation: u64,
+    claim_inventory: AdmissionClaimInventory,
+    cancellation_inventory: CancellationInventory,
+    observation: BlockedByUserObservation,
+    decision: VerifiedBlockedByUserDecisionProof,
+    dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof,
+}
+
+#[derive(Clone)]
+struct VerifiedFailedPreservingDataAuthority {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    expected_recovery_generation: u64,
+    next_recovery_generation: u64,
+    claim_inventory: AdmissionClaimInventory,
+    observation: FailedPreservingDataObservation,
+    exhaustion: VerifiedRecoveryExhaustionProof,
+    resource_observations: Vec<VerifiedTerminalResourceProof>,
+    dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof,
+}
+
+#[derive(Clone)]
+struct VerifiedFailedDataLossRiskAuthority {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    expected_recovery_generation: u64,
+    next_recovery_generation: u64,
+    claim_inventory: AdmissionClaimInventory,
+    observation: FailedDataLossRiskObservation,
+    escalation: VerifiedSafetyEscalationProof,
+    resource_observations: Vec<VerifiedTerminalResourceProof>,
+    dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof,
+}
+
 /// Pure guarded progress over one exact frozen work plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkProgress {
@@ -1611,6 +1811,7 @@ pub struct WorkProgress {
     after_effect_reconciliation: Option<AfterEffectReconciliationObservation>,
     cancellation_cleanup_observations: Option<CancellationCleanupObservation>,
     forward_cancellation_observation: Option<ForwardCancellationObservation>,
+    terminal_outcome_observation: Option<TerminalOutcomeObservation>,
     readiness_deferral_batches: Vec<ReadinessDeferralBatchObservation>,
 }
 
@@ -1675,6 +1876,7 @@ impl WorkProgress {
             after_effect_reconciliation: None,
             cancellation_cleanup_observations: None,
             forward_cancellation_observation: None,
+            terminal_outcome_observation: None,
             readiness_deferral_batches: Vec::new(),
         })
     }
@@ -3063,6 +3265,11 @@ impl WorkProgress {
         &self,
     ) -> Option<&ForwardCancellationObservation> {
         self.forward_cancellation_observation.as_ref()
+    }
+
+    /// Borrow the retained guarded terminal-outcome observation, when present.
+    pub(crate) fn terminal_outcome_observation(&self) -> Option<&TerminalOutcomeObservation> {
+        self.terminal_outcome_observation.as_ref()
     }
 
     /// Record a bounded retry disposition without changing any step completion.
@@ -4983,6 +5190,1469 @@ impl WorkProgress {
         Ok(ProgressApplyOutcome::Applied)
     }
 
+    /// Apply one private proof-bearing authority for a previously unsupported terminal outcome.
+    ///
+    /// Every branch validates the complete candidate before changing any field.  The serialized
+    /// counterpart is retained only after the live proof checks pass; it is never accepted as an
+    /// authority by itself.
+    #[allow(dead_code)]
+    fn apply_verified_terminal_outcome(
+        &mut self,
+        authority: VerifiedTerminalOutcomeAuthority,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        match authority {
+            VerifiedTerminalOutcomeAuthority::RolledBack(authority) => {
+                self.apply_verified_rolled_back(authority)
+            }
+            VerifiedTerminalOutcomeAuthority::BlockedByUser(authority) => {
+                self.apply_verified_blocked_by_user(authority)
+            }
+            VerifiedTerminalOutcomeAuthority::FailedPreservingData(authority) => {
+                self.apply_verified_failed_preserving_data(authority)
+            }
+            VerifiedTerminalOutcomeAuthority::FailedDataLossRisk(authority) => {
+                self.apply_verified_failed_data_loss_risk(authority)
+            }
+        }
+    }
+
+    fn validate_terminal_authority_header(
+        &self,
+        operation_id: OperationId,
+        plan: &WorkPlan,
+        execution_epoch: u64,
+        expected_recovery_generation: u64,
+        next_recovery_generation: u64,
+        claim_inventory: &AdmissionClaimInventory,
+        observation: &TerminalOutcomeObservation,
+        disposition: FullProgressDisposition,
+    ) -> Result<bool, WorkProgressError> {
+        if operation_id != self.operation_id || plan != &self.plan {
+            return Err(WorkProgressError::TerminalOutcomeAuthorityMismatch);
+        }
+        if execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::TerminalOutcomeEpochMismatch {
+                expected: self.execution_epoch,
+                actual: execution_epoch,
+            });
+        }
+        if next_recovery_generation
+            != expected_recovery_generation
+                .checked_add(1)
+                .ok_or(WorkProgressError::TerminalOutcomeGenerationOverflow)?
+        {
+            return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                expected: expected_recovery_generation
+                    .checked_add(1)
+                    .unwrap_or(u64::MAX),
+                actual: next_recovery_generation,
+            });
+        }
+        let Some(current_claims) = self.admission_claims.as_ref() else {
+            return Err(WorkProgressError::TerminalOutcomeClaimsMissing);
+        };
+        if claim_inventory != current_claims {
+            return Err(WorkProgressError::TerminalOutcomeClaimsMismatch);
+        }
+        if self.phase == OperationPhase::Terminal
+            && self.disposition == disposition
+            && self.recovery_generation == next_recovery_generation
+            && self.terminal_outcome_observation.as_ref() == Some(observation)
+        {
+            return Ok(true);
+        }
+        if expected_recovery_generation != self.recovery_generation {
+            return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                expected: self.recovery_generation,
+                actual: expected_recovery_generation,
+            });
+        }
+        let expected_next = self
+            .recovery_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::TerminalOutcomeGenerationOverflow)?;
+        if next_recovery_generation != expected_next {
+            return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                expected: expected_next,
+                actual: next_recovery_generation,
+            });
+        }
+        if self.phase == OperationPhase::Terminal || self.disposition.is_terminal() {
+            return Err(WorkProgressError::TerminalTransitionForbidden);
+        }
+        if self.terminal_outcome_observation.is_some() {
+            return Err(WorkProgressError::TerminalOutcomeStateInvalid);
+        }
+        Ok(false)
+    }
+
+    fn validate_terminal_settlement(
+        &self,
+        settlement: &AdmissionClaimSettlementInventory,
+        reject_held: bool,
+    ) -> Result<(), WorkProgressError> {
+        let claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::TerminalOutcomeClaimsMissing)?;
+        settlement
+            .validate_against(claims)
+            .map_err(|_| WorkProgressError::TerminalOutcomeSettlementIncomplete)?;
+        if self
+            .claim_settlement
+            .as_ref()
+            .is_some_and(|current| current != settlement)
+        {
+            return Err(WorkProgressError::TerminalOutcomeSettlementIncomplete);
+        }
+        if reject_held
+            && settlement
+                .settlements()
+                .iter()
+                .any(|row| row.outcome() == AdmissionClaimSettlementOutcome::Held)
+        {
+            return Err(WorkProgressError::TerminalOutcomeSettlementIncomplete);
+        }
+        if settlement.settlements().iter().any(|row| {
+            claims
+                .claims()
+                .iter()
+                .find(|claim| claim.claim_id() == row.claim_id())
+                .is_some_and(|claim| {
+                    matches!(
+                        claim.allocation_class(),
+                        FullCapacityAllocationClass::JournalRecord
+                            | FullCapacityAllocationClass::ExistingDestination
+                            | FullCapacityAllocationClass::ExistingRecoveryPayload
+                    ) && row.outcome() == AdmissionClaimSettlementOutcome::Released
+                })
+        }) {
+            return Err(WorkProgressError::TerminalOutcomeRetainedChargeReleased);
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_dispatch_quiescence_proof(
+        &self,
+        proof: &VerifiedTerminalDispatchQuiescenceProof,
+        expected_observation: &TerminalDispatchQuiescenceObservation,
+        expected_recovery_generation: u64,
+        require_quiesced: bool,
+    ) -> Result<(), WorkProgressError> {
+        let dispatch_outcome = proof.barrier.dispatch_outcome();
+        let manifest = dispatch_outcome.manifest();
+        let ledger_keys = dispatch_outcome
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                (!matches!(row.outcome(), CancellationDispatchOutcome::NeverEntered))
+                    .then_some(row.key())
+            })
+            .collect::<Vec<_>>();
+        if proof.barrier.operation_id() != self.operation_id
+            || proof.barrier.execution_epoch() != self.execution_epoch
+            || manifest.operation_id() != self.operation_id
+            || manifest.plan_version() != self.plan.plan_version()
+            || dispatch_outcome.observation_epoch() != self.execution_epoch
+            || dispatch_outcome.recovery_generation() > expected_recovery_generation
+            || self
+                .cancellation_inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory != proof.barrier.cancellation_inventory())
+            || proof.operation_id != self.operation_id
+            || proof.plan != self.plan
+            || proof.execution_epoch != self.execution_epoch
+            || proof.observation != *expected_observation
+            || proof.observation.execution_epoch != self.execution_epoch
+            || proof.observation.keys != proof.eligible_keys
+            || ledger_keys != proof.eligible_keys
+            || proof.eligible_keys.len() > MAX_TERMINAL_OUTCOME_ROWS
+            || proof
+                .eligible_keys
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+            || proof
+                .eligible_keys
+                .iter()
+                .any(|key| !self.plan.units().iter().any(|unit| unit.key() == *key))
+        {
+            return Err(WorkProgressError::TerminalOutcomeQuiescenceInvalid);
+        }
+        self.validate_terminal_quiescence(&proof.observation, require_quiesced)
+    }
+
+    fn validate_terminal_decision_proof(
+        &self,
+        authority: &VerifiedBlockedByUserAuthority,
+    ) -> Result<(), WorkProgressError> {
+        if authority.cancellation_inventory
+            != self
+                .cancellation_inventory
+                .as_ref()
+                .ok_or(WorkProgressError::CancellationInventoryMissing)?
+                .clone()
+            || authority.decision.0 != authority.observation.decision
+            || authority.dispatch_quiescence.barrier.dispatch_outcome()
+                != &authority.observation.dispatch_outcome
+        {
+            return Err(WorkProgressError::BlockedByUserDecisionInvalid);
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_failure_preservation_proof(
+        &self,
+        authority: &VerifiedFailedPreservingDataAuthority,
+    ) -> Result<(), WorkProgressError> {
+        if authority.exhaustion.0 != authority.observation.exhaustion
+            || authority.resource_observations.len()
+                != authority.observation.resource_observations.len()
+            || authority
+                .resource_observations
+                .iter()
+                .map(|proof| &proof.0)
+                .ne(authority.observation.resource_observations.iter())
+        {
+            return Err(WorkProgressError::RecoveryExhaustionMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_data_loss_risk_proof(
+        &self,
+        authority: &VerifiedFailedDataLossRiskAuthority,
+    ) -> Result<(), WorkProgressError> {
+        if authority.escalation.0 != authority.observation.escalation
+            || authority.resource_observations.len()
+                != authority.observation.resource_observations.len()
+            || authority
+                .resource_observations
+                .iter()
+                .map(|proof| &proof.0)
+                .ne(authority.observation.resource_observations.iter())
+        {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        }
+        Ok(())
+    }
+
+    fn apply_verified_rolled_back(
+        &mut self,
+        authority: VerifiedRolledBackAuthority,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        let observation = TerminalOutcomeObservation::RolledBack(authority.observation.clone());
+        let replay = self.validate_terminal_authority_header(
+            authority.operation_id,
+            &authority.plan,
+            authority.execution_epoch,
+            authority.expected_recovery_generation,
+            authority.next_recovery_generation,
+            &authority.claim_inventory,
+            &observation,
+            FullProgressDisposition::RolledBack,
+        )?;
+        if replay {
+            self.validate_terminal_outcome_payload(
+                &observation,
+                FullProgressDisposition::RolledBack,
+                authority.next_recovery_generation,
+                true,
+            )?;
+            self.validate_verified_compensation_proofs(&authority)?;
+            self.validate_terminal_settlement(&authority.observation.claim_settlement, true)?;
+            self.validate_terminal_dispatch_quiescence_proof(
+                &authority.dispatch_quiescence,
+                &authority.observation.dispatch_quiescence,
+                authority.next_recovery_generation,
+                true,
+            )?;
+            return Ok(ProgressApplyOutcome::Replay);
+        }
+        self.validate_terminal_outcome_payload(
+            &observation,
+            FullProgressDisposition::RolledBack,
+            authority.next_recovery_generation,
+            false,
+        )?;
+        self.validate_verified_compensation_proofs(&authority)?;
+        self.validate_terminal_settlement(&authority.observation.claim_settlement, true)?;
+        self.validate_terminal_dispatch_quiescence_proof(
+            &authority.dispatch_quiescence,
+            &authority.observation.dispatch_quiescence,
+            authority.next_recovery_generation,
+            true,
+        )?;
+        self.terminal_outcome_observation = Some(observation);
+        self.claim_settlement = Some(authority.observation.claim_settlement.clone());
+        self.recovery_generation = authority.next_recovery_generation;
+        self.phase = OperationPhase::Terminal;
+        self.disposition = FullProgressDisposition::RolledBack;
+        Ok(ProgressApplyOutcome::Applied)
+    }
+
+    fn apply_verified_blocked_by_user(
+        &mut self,
+        authority: VerifiedBlockedByUserAuthority,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        let observation = TerminalOutcomeObservation::BlockedByUser(authority.observation.clone());
+        let replay = self.validate_terminal_authority_header(
+            authority.operation_id,
+            &authority.plan,
+            authority.execution_epoch,
+            authority.expected_recovery_generation,
+            authority.next_recovery_generation,
+            &authority.claim_inventory,
+            &observation,
+            FullProgressDisposition::BlockedByUser,
+        )?;
+        if replay {
+            self.validate_terminal_outcome_payload(
+                &observation,
+                FullProgressDisposition::BlockedByUser,
+                authority.next_recovery_generation,
+                true,
+            )?;
+            self.validate_terminal_decision_proof(&authority)?;
+            self.validate_terminal_settlement(&authority.observation.settlement, true)?;
+            self.validate_terminal_dispatch_quiescence_proof(
+                &authority.dispatch_quiescence,
+                &authority.observation.dispatch_quiescence,
+                authority.next_recovery_generation,
+                true,
+            )?;
+            return Ok(ProgressApplyOutcome::Replay);
+        }
+        if authority.cancellation_inventory
+            != self
+                .cancellation_inventory
+                .clone()
+                .ok_or(WorkProgressError::CancellationInventoryMissing)?
+        {
+            return Err(WorkProgressError::TerminalOutcomeClaimsMismatch);
+        }
+        self.validate_terminal_outcome_payload(
+            &observation,
+            FullProgressDisposition::BlockedByUser,
+            authority.next_recovery_generation,
+            false,
+        )?;
+        let TerminalOutcomeObservation::BlockedByUser(blocked) = &observation else {
+            unreachable!();
+        };
+        if blocked.decision != authority.decision.0 {
+            return Err(WorkProgressError::BlockedByUserDecisionInvalid);
+        }
+        self.validate_terminal_settlement(&authority.observation.settlement, true)?;
+        self.validate_terminal_dispatch_quiescence_proof(
+            &authority.dispatch_quiescence,
+            &authority.observation.dispatch_quiescence,
+            authority.next_recovery_generation,
+            true,
+        )?;
+        self.terminal_outcome_observation = Some(observation);
+        self.claim_settlement = Some(authority.observation.settlement.clone());
+        self.recovery_generation = authority.next_recovery_generation;
+        self.phase = OperationPhase::Terminal;
+        self.disposition = FullProgressDisposition::BlockedByUser;
+        Ok(ProgressApplyOutcome::Applied)
+    }
+
+    fn apply_verified_failed_preserving_data(
+        &mut self,
+        authority: VerifiedFailedPreservingDataAuthority,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        let observation =
+            TerminalOutcomeObservation::FailedPreservingData(authority.observation.clone());
+        let replay = self.validate_terminal_authority_header(
+            authority.operation_id,
+            &authority.plan,
+            authority.execution_epoch,
+            authority.expected_recovery_generation,
+            authority.next_recovery_generation,
+            &authority.claim_inventory,
+            &observation,
+            FullProgressDisposition::FailedPreservingData,
+        )?;
+        if replay {
+            self.validate_terminal_outcome_payload(
+                &observation,
+                FullProgressDisposition::FailedPreservingData,
+                authority.next_recovery_generation,
+                true,
+            )?;
+            self.validate_terminal_failure_preservation_proof(&authority)?;
+            self.validate_terminal_settlement(&authority.observation.claim_settlement, false)?;
+            self.validate_terminal_dispatch_quiescence_proof(
+                &authority.dispatch_quiescence,
+                &authority.observation.dispatch_quiescence,
+                authority.next_recovery_generation,
+                false,
+            )?;
+            return Ok(ProgressApplyOutcome::Replay);
+        }
+        self.validate_terminal_outcome_payload(
+            &observation,
+            FullProgressDisposition::FailedPreservingData,
+            authority.next_recovery_generation,
+            false,
+        )?;
+        let TerminalOutcomeObservation::FailedPreservingData(failed) = &observation else {
+            unreachable!();
+        };
+        if failed.exhaustion != authority.exhaustion.0 {
+            return Err(WorkProgressError::RecoveryExhaustionMismatch);
+        }
+        if failed
+            .resource_observations
+            .iter()
+            .zip(authority.resource_observations.iter().map(|proof| &proof.0))
+            .any(|(candidate, proof)| candidate != proof)
+            || failed.resource_observations.len() != authority.resource_observations.len()
+        {
+            return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+        }
+        self.validate_terminal_settlement(&authority.observation.claim_settlement, false)?;
+        self.validate_terminal_dispatch_quiescence_proof(
+            &authority.dispatch_quiescence,
+            &authority.observation.dispatch_quiescence,
+            authority.next_recovery_generation,
+            false,
+        )?;
+        self.terminal_outcome_observation = Some(observation);
+        self.claim_settlement = Some(authority.observation.claim_settlement.clone());
+        self.recovery_generation = authority.next_recovery_generation;
+        self.phase = OperationPhase::Terminal;
+        self.disposition = FullProgressDisposition::FailedPreservingData;
+        Ok(ProgressApplyOutcome::Applied)
+    }
+
+    fn apply_verified_failed_data_loss_risk(
+        &mut self,
+        authority: VerifiedFailedDataLossRiskAuthority,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        let observation =
+            TerminalOutcomeObservation::FailedDataLossRisk(authority.observation.clone());
+        let replay = self.validate_terminal_authority_header(
+            authority.operation_id,
+            &authority.plan,
+            authority.execution_epoch,
+            authority.expected_recovery_generation,
+            authority.next_recovery_generation,
+            &authority.claim_inventory,
+            &observation,
+            FullProgressDisposition::FailedDataLossRisk,
+        )?;
+        if replay {
+            self.validate_terminal_outcome_payload(
+                &observation,
+                FullProgressDisposition::FailedDataLossRisk,
+                authority.next_recovery_generation,
+                true,
+            )?;
+            self.validate_terminal_data_loss_risk_proof(&authority)?;
+            self.validate_terminal_settlement(&authority.observation.claim_settlement, false)?;
+            self.validate_terminal_dispatch_quiescence_proof(
+                &authority.dispatch_quiescence,
+                &authority.observation.dispatch_quiescence,
+                authority.next_recovery_generation,
+                false,
+            )?;
+            return Ok(ProgressApplyOutcome::Replay);
+        }
+        self.validate_terminal_outcome_payload(
+            &observation,
+            FullProgressDisposition::FailedDataLossRisk,
+            authority.next_recovery_generation,
+            false,
+        )?;
+        let TerminalOutcomeObservation::FailedDataLossRisk(risk) = &observation else {
+            unreachable!();
+        };
+        if risk.escalation != authority.escalation.0 {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        }
+        if risk
+            .resource_observations
+            .iter()
+            .zip(authority.resource_observations.iter().map(|proof| &proof.0))
+            .any(|(candidate, proof)| candidate != proof)
+            || risk.resource_observations.len() != authority.resource_observations.len()
+        {
+            return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+        }
+        self.validate_terminal_settlement(&authority.observation.claim_settlement, false)?;
+        self.validate_terminal_dispatch_quiescence_proof(
+            &authority.dispatch_quiescence,
+            &authority.observation.dispatch_quiescence,
+            authority.next_recovery_generation,
+            false,
+        )?;
+        self.claim_settlement = Some(authority.observation.claim_settlement.clone());
+        self.terminal_outcome_observation = Some(observation);
+        self.recovery_generation = authority.next_recovery_generation;
+        self.phase = OperationPhase::Terminal;
+        self.disposition = FullProgressDisposition::FailedDataLossRisk;
+        Ok(ProgressApplyOutcome::Applied)
+    }
+
+    /// Validate a retained terminal observation without creating any live authority.
+    pub(super) fn validate_terminal_outcome_observation(
+        &self,
+        observation: &TerminalOutcomeObservation,
+    ) -> Result<(), WorkProgressError> {
+        let disposition = Self::terminal_observation_disposition(observation);
+        if self.phase != OperationPhase::Terminal || self.disposition != disposition {
+            return Err(WorkProgressError::TerminalOutcomeStateInvalid);
+        }
+        self.validate_terminal_outcome_payload(
+            observation,
+            disposition,
+            self.recovery_generation,
+            true,
+        )
+    }
+
+    fn validate_terminal_outcome_payload(
+        &self,
+        observation: &TerminalOutcomeObservation,
+        disposition: FullProgressDisposition,
+        expected_recovery_generation: u64,
+        terminal_snapshot: bool,
+    ) -> Result<(), WorkProgressError> {
+        match observation {
+            TerminalOutcomeObservation::RolledBack(observation) => {
+                if observation.execution_epoch != self.execution_epoch
+                    || observation.recovery_generation != expected_recovery_generation
+                {
+                    return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                        expected: expected_recovery_generation,
+                        actual: observation.recovery_generation,
+                    });
+                }
+                self.validate_rolled_back_observation(observation, terminal_snapshot)
+            }
+            TerminalOutcomeObservation::BlockedByUser(observation) => {
+                if observation.execution_epoch != self.execution_epoch
+                    || observation.recovery_generation != expected_recovery_generation
+                {
+                    return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                        expected: expected_recovery_generation,
+                        actual: observation.recovery_generation,
+                    });
+                }
+                self.validate_blocked_by_user_observation(observation, terminal_snapshot)
+            }
+            TerminalOutcomeObservation::FailedPreservingData(observation) => {
+                if observation.execution_epoch != self.execution_epoch
+                    || observation.recovery_generation != expected_recovery_generation
+                {
+                    return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                        expected: expected_recovery_generation,
+                        actual: observation.recovery_generation,
+                    });
+                }
+                self.validate_failed_preserving_data_observation(observation, terminal_snapshot)
+            }
+            TerminalOutcomeObservation::FailedDataLossRisk(observation) => {
+                if observation.execution_epoch != self.execution_epoch
+                    || observation.recovery_generation != expected_recovery_generation
+                {
+                    return Err(WorkProgressError::TerminalOutcomeGenerationMismatch {
+                        expected: expected_recovery_generation,
+                        actual: observation.recovery_generation,
+                    });
+                }
+                self.validate_failed_data_loss_risk_observation(observation, terminal_snapshot)
+            }
+        }
+        .and_then(|()| {
+            if Self::terminal_observation_disposition(observation) == disposition {
+                Ok(())
+            } else {
+                Err(WorkProgressError::TerminalOutcomeStateInvalid)
+            }
+        })
+    }
+
+    fn validate_verified_compensation_proofs(
+        &self,
+        authority: &VerifiedRolledBackAuthority,
+    ) -> Result<(), WorkProgressError> {
+        if authority.dispatch_quiescence.barrier.dispatch_outcome()
+            != authority.observation.effect_inventory.dispatch_outcome()
+        {
+            return Err(WorkProgressError::RolledBackEffectInventoryMismatch);
+        }
+        let observation = &authority.observation;
+        if observation.effect_inventory.bundles().is_empty() {
+            return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+        }
+        if authority.compensation_receipts.len() != observation.compensation_receipts.len()
+            || authority
+                .compensation_receipts
+                .iter()
+                .map(VerifiedCompensationReceipt::observation)
+                .ne(observation.compensation_receipts.iter().cloned())
+        {
+            return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+        }
+        if authority
+            .compensation_receipts
+            .iter()
+            .zip(observation.compensation_receipts.iter())
+            .any(|(proof, receipt)| proof.recipe() != receipt.recipe)
+        {
+            return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+        }
+        for (proof, receipt) in authority
+            .compensation_receipts
+            .iter()
+            .zip(observation.compensation_receipts.iter())
+        {
+            if receipt.evidence_keys.is_empty() || proof.evidence().is_empty() {
+                return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+            }
+            let mut proof_keys = proof
+                .evidence()
+                .iter()
+                .map(|(key, _, _)| *key)
+                .collect::<Vec<_>>();
+            proof_keys.sort_unstable();
+            proof_keys.dedup();
+            if proof_keys != receipt.evidence_keys {
+                return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+            }
+            if proof.results() != receipt.results.as_slice() {
+                return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+            }
+            for (key, context, evidence) in proof.evidence() {
+                self.validate_historical_completion(*key, context, evidence)
+                    .map_err(|_| WorkProgressError::RolledBackCompensationReceiptMismatch)?;
+            }
+        }
+        if authority.origin_restorations.len() != observation.origin_restorations.len()
+            || authority
+                .origin_restorations
+                .iter()
+                .map(|proof| proof.0.clone())
+                .ne(observation.origin_restorations.iter().cloned())
+        {
+            return Err(WorkProgressError::RolledBackOriginRestorationMissing);
+        }
+        if authority.reconciliations.len() != observation.reconciliations.len()
+            || authority
+                .reconciliations
+                .iter()
+                .map(|proof| proof.0.clone())
+                .ne(observation.reconciliations.iter().cloned())
+        {
+            return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+        }
+        if authority.resource_observations.len() != observation.resource_observations.len()
+            || authority
+                .resource_observations
+                .iter()
+                .map(|proof| proof.0.clone())
+                .ne(observation.resource_observations.iter().cloned())
+        {
+            return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+        }
+        Ok(())
+    }
+
+    fn validate_rolled_back_observation(
+        &self,
+        observation: &RolledBackObservation,
+        terminal_snapshot: bool,
+    ) -> Result<(), WorkProgressError> {
+        if !terminal_snapshot
+            && (observation.prior_phase != self.phase
+                || observation.prior_disposition != self.disposition)
+        {
+            return Err(WorkProgressError::TerminalOutcomeStateInvalid);
+        }
+        if observation.prior_phase == OperationPhase::Terminal
+            || !matches!(
+                observation.prior_disposition,
+                FullProgressDisposition::CancelRequestedAfterPublish
+                    | FullProgressDisposition::CancelRequestedAfterObservedEffect
+            )
+        {
+            return Err(WorkProgressError::RolledBackEffectInventoryMismatch);
+        }
+        let Some(inventory) = self.cancellation_inventory.as_ref() else {
+            return Err(WorkProgressError::CancellationInventoryMissing);
+        };
+        if !matches!(
+            inventory.route(),
+            CancellationRoute::AfterPublish | CancellationRoute::AfterObservedEffect
+        ) {
+            return Err(WorkProgressError::RolledBackEffectInventoryMismatch);
+        }
+        observation
+            .effect_inventory
+            .validate_against(
+                self.operation_id,
+                &self.plan,
+                inventory,
+                observation.effect_inventory.dispatch_outcome(),
+                &self.steps,
+                self.admission_claims
+                    .as_ref()
+                    .ok_or(WorkProgressError::TerminalOutcomeClaimsMissing)?,
+                self.execution_epoch,
+            )
+            .map_err(|_| WorkProgressError::RolledBackEffectInventoryMismatch)?;
+        if observation.effect_inventory.frozen_inventory() != inventory {
+            return Err(WorkProgressError::RolledBackEffectInventoryMismatch);
+        }
+        if observation.compensation_receipts.len() != observation.effect_inventory.bundles().len()
+            || observation.compensation_receipts.len() > MAX_TERMINAL_OUTCOME_ROWS
+        {
+            return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+        }
+        for (bundle, receipt) in observation
+            .effect_inventory
+            .bundles()
+            .iter()
+            .zip(&observation.compensation_receipts)
+        {
+            if bundle.action_ordinal() != receipt.action_ordinal
+                || bundle.step_segment() != receipt.step_segment
+                || bundle.recipe() != receipt.recipe
+            {
+                return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+            }
+            let mut expected_keys = bundle
+                .facts()
+                .iter()
+                .map(|fact| fact.key())
+                .chain(bundle.source_closure().iter().map(|closure| closure.key()))
+                .collect::<Vec<_>>();
+            expected_keys.sort_unstable();
+            expected_keys.dedup();
+            if receipt.evidence_keys != expected_keys {
+                return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+            }
+            self.validate_compensation_receipt_results(bundle, receipt)?;
+        }
+        self.validate_origin_restorations(observation)?;
+        self.validate_compensation_reconciliations(observation)?;
+        self.validate_terminal_resources(
+            &observation.resource_observations,
+            &observation.claim_settlement,
+            false,
+            false,
+        )?;
+        self.validate_terminal_quiescence(&observation.dispatch_quiescence, true)?;
+        Ok(())
+    }
+
+    fn validate_compensation_receipt_results(
+        &self,
+        bundle: &super::cancellation_effects::CancellationEffectBundle,
+        receipt: &CompensationReceiptObservation,
+    ) -> Result<(), WorkProgressError> {
+        let expected_keys = bundle
+            .facts()
+            .iter()
+            .map(|fact| fact.key())
+            .collect::<Vec<_>>();
+        if expected_keys.is_empty()
+            || receipt.results.len() != expected_keys.len()
+            || receipt.results.len() > MAX_TERMINAL_OUTCOME_ROWS
+        {
+            return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+        }
+        for (key, result) in expected_keys.iter().zip(&receipt.results) {
+            if result.original_key != *key {
+                return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+            }
+            let expected = expected_compensation_result_kind(bundle.recipe(), key.role());
+            self.validate_compensation_result(
+                result,
+                expected,
+                bundle.action_ordinal(),
+                bundle.step_segment(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_compensation_result(
+        &self,
+        result: &CompensationResultObservation,
+        expected: CompensationResultKind,
+        action_ordinal: u8,
+        step_segment: u16,
+    ) -> Result<(), WorkProgressError> {
+        if result.outcome != expected
+            || result.owner_revision == 0
+            || result.original_key.action_ordinal() != action_ordinal
+            || result.original_key.step_ordinal() / STEP_HISTORY_STRIDE != step_segment
+            || result.context.execution_epoch != self.execution_epoch
+        {
+            return Err(WorkProgressError::RolledBackCompensationReceiptMismatch);
+        }
+        self.validate_historical_context_for_unit(result.original_key, &result.context)
+            .map_err(|_| WorkProgressError::RolledBackCompensationReceiptMismatch)?;
+        Ok(())
+    }
+
+    fn validate_origin_restorations(
+        &self,
+        observation: &RolledBackObservation,
+    ) -> Result<(), WorkProgressError> {
+        let mut required = BTreeSet::new();
+        for bundle in observation.effect_inventory.bundles() {
+            let mut removal_fact = false;
+            for fact in bundle.facts() {
+                if matches!(
+                    fact.kind(),
+                    CancellationEffectFactKind::OriginRemovalStart
+                        | CancellationEffectFactKind::OriginAbsence
+                        | CancellationEffectFactKind::QualifiedRelocation
+                        | CancellationEffectFactKind::RetainedObjectAbsence
+                ) {
+                    removal_fact = true;
+                    required.insert(fact.key());
+                }
+            }
+            if !removal_fact
+                && matches!(
+                    bundle.recipe(),
+                    CancellationEffectRecipe::StagedMove
+                        | CancellationEffectRecipe::QualifiedRelocation
+                        | CancellationEffectRecipe::HistoryUndoExtractedRemoval
+                )
+            {
+                for fact in bundle.facts() {
+                    required.insert(fact.key());
+                }
+            }
+        }
+        if required.len() != observation.origin_restorations.len()
+            || required.len() > MAX_TERMINAL_OUTCOME_ROWS
+        {
+            return Err(WorkProgressError::RolledBackOriginRestorationMissing);
+        }
+        for (expected, restoration) in required.iter().zip(&observation.origin_restorations) {
+            let result = &restoration.result;
+            let Some(bundle) = observation
+                .effect_inventory
+                .bundles()
+                .iter()
+                .find(|bundle| bundle.facts().iter().any(|fact| fact.key() == *expected))
+            else {
+                return Err(WorkProgressError::RolledBackOriginRestorationMissing);
+            };
+            if expected != &result.original_key
+                || result.outcome != CompensationResultKind::OriginRestored
+            {
+                return Err(WorkProgressError::RolledBackOriginRestorationMissing);
+            }
+            self.validate_compensation_result(
+                result,
+                CompensationResultKind::OriginRestored,
+                bundle.action_ordinal(),
+                bundle.step_segment(),
+            )
+            .map_err(|_| WorkProgressError::RolledBackOriginRestorationMissing)?;
+        }
+        Ok(())
+    }
+
+    fn validate_compensation_reconciliations(
+        &self,
+        observation: &RolledBackObservation,
+    ) -> Result<(), WorkProgressError> {
+        let reconciliations = &observation.reconciliations;
+        if reconciliations.len() > MAX_TERMINAL_OUTCOME_ROWS {
+            return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+        }
+        let mut expected = BTreeMap::<WorkUnitKey, CompensationParticipantKind>::new();
+        for key in observation
+            .effect_inventory
+            .bundles()
+            .iter()
+            .flat_map(|bundle| {
+                bundle
+                    .facts()
+                    .iter()
+                    .map(|fact| fact.key())
+                    .chain(bundle.source_closure().iter().map(|row| row.key()))
+            })
+        {
+            let Some(scope) = self.scope_for(key) else {
+                continue;
+            };
+            let kind = match scope.kind() {
+                ParticipantKind::SourceDatabase => Some(CompensationParticipantKind::Source),
+                ParticipantKind::GlobalLibrary
+                | ParticipantKind::Harvest
+                | ParticipantKind::Projection
+                | ParticipantKind::Readiness
+                | ParticipantKind::Artifact => Some(CompensationParticipantKind::Coordinator),
+                ParticipantKind::Filesystem => None,
+            };
+            if let Some(kind) = kind {
+                expected.insert(key, kind);
+            }
+        }
+        for key in self.derive_cancellation_coordinator_closure_keys(
+            &observation.effect_inventory,
+            observation.effect_inventory.dispatch_outcome(),
+        ) {
+            expected.insert(key, CompensationParticipantKind::Coordinator);
+        }
+        if expected.len() > MAX_TERMINAL_OUTCOME_ROWS || reconciliations.len() != expected.len() {
+            return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+        }
+        let mut previous = None;
+        let mut observed_keys = BTreeSet::new();
+        for row in reconciliations {
+            if previous.is_some_and(|value| value >= row.key) || !observed_keys.insert(row.key) {
+                return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+            }
+            previous = Some(row.key);
+            let Some(expected_kind) = expected.get(&row.key).copied() else {
+                return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+            };
+            if row.kind != expected_kind
+                || row.key.participant_id() != row.participant_id
+                || !self.plan.units().iter().any(|unit| unit.key() == row.key)
+                || row.context != row.result.context
+                || row.result.original_key != row.key
+                || row.result.outcome != CompensationResultKind::ExternalStateReconciled
+            {
+                return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+            }
+            self.validate_historical_completion(row.key, &row.context, &row.evidence)
+                .map_err(|_| WorkProgressError::RolledBackReconciliationIncomplete)?;
+            self.validate_compensation_result(
+                &row.result,
+                CompensationResultKind::ExternalStateReconciled,
+                row.key.action_ordinal(),
+                row.key.step_ordinal() / STEP_HISTORY_STRIDE,
+            )
+            .map_err(|_| WorkProgressError::RolledBackReconciliationIncomplete)?;
+        }
+        if observed_keys != expected.keys().copied().collect::<BTreeSet<_>>() {
+            return Err(WorkProgressError::RolledBackReconciliationIncomplete);
+        }
+        Ok(())
+    }
+
+    fn validate_blocked_by_user_observation(
+        &self,
+        observation: &BlockedByUserObservation,
+        terminal_snapshot: bool,
+    ) -> Result<(), WorkProgressError> {
+        if !matches!(
+            observation.prior_phase,
+            OperationPhase::IntentDurable | OperationPhase::Prepared
+        ) {
+            return Err(WorkProgressError::BlockedByUserPhaseInvalid);
+        }
+        if observation.prior_disposition != FullProgressDisposition::CancelRequestedBeforePublish {
+            return Err(WorkProgressError::BlockedByUserProofIncomplete);
+        }
+        if !terminal_snapshot
+            && (self.phase != observation.prior_phase
+                || self.disposition != observation.prior_disposition)
+        {
+            return Err(WorkProgressError::BlockedByUserPhaseInvalid);
+        }
+        if self.active_audit.is_some() || self.disposition == FullProgressDisposition::AuditRequired
+        {
+            return Err(WorkProgressError::PrePublishCancellationAuditActive);
+        }
+        let Some(inventory) = self.cancellation_inventory.as_ref() else {
+            return Err(WorkProgressError::CancellationInventoryMissing);
+        };
+        let Some(claims) = self.admission_claims.as_ref() else {
+            return Err(WorkProgressError::TerminalOutcomeClaimsMissing);
+        };
+        if inventory.route() != CancellationRoute::BeforePublish
+            || observation.dispatch_outcome.observation_epoch() != self.execution_epoch
+        {
+            return Err(WorkProgressError::BlockedByUserProofIncomplete);
+        }
+        inventory
+            .validate_against(
+                self.operation_id,
+                &self.plan,
+                &self.steps,
+                self.execution_epoch,
+                claims,
+            )
+            .map_err(|_| WorkProgressError::BlockedByUserProofIncomplete)?;
+        self.validate_cancellation_dispatch_record(&observation.dispatch_outcome)?;
+        observation
+            .cleanup
+            .validate()
+            .map_err(WorkProgressError::PrePublishCleanup)?;
+        observation
+            .unstarted_quiescence
+            .validate()
+            .map_err(WorkProgressError::PrePublishUnstartedQuiescence)?;
+        let eligible_keys = self.uncheckpointed_first_effect_keys(inventory);
+        let unstarted_complete = self.validate_pre_publish_unstarted_quiescence(
+            inventory,
+            &observation.unstarted_quiescence,
+            &eligible_keys,
+            claims,
+        )?;
+        let dispatch_complete = observation
+            .dispatch_outcome
+            .rows()
+            .iter()
+            .all(|row| matches!(row.outcome(), CancellationDispatchOutcome::NeverEntered));
+        let cleanup_complete = self.validate_pre_publish_cleanup(
+            inventory,
+            &observation.cleanup,
+            claims,
+            unstarted_complete && dispatch_complete,
+        )?;
+        self.validate_pre_publish_settlement(
+            inventory,
+            claims,
+            &observation.cleanup,
+            &observation.settlement,
+            unstarted_complete,
+            dispatch_complete,
+        )?;
+        let settled = observation
+            .settlement
+            .satisfies_prepublication_cancellation(claims)
+            .map_err(WorkProgressError::PrePublishCancellationSettlement)?;
+        let action = &observation.decision;
+        if action.context.execution_epoch() != self.execution_epoch
+            || action.context.scope().participant_id() != action.participant_id
+            || action.key.participant_id() != action.participant_id
+            || !self
+                .plan
+                .units()
+                .iter()
+                .any(|unit| unit.key() == action.key)
+            || !inventory
+                .actions()
+                .iter()
+                .any(|candidate| candidate.action_ordinal() == action.key.action_ordinal())
+        {
+            return Err(WorkProgressError::BlockedByUserDecisionInvalid);
+        }
+        self.validate_historical_context_for_unit(action.key, &action.context)
+            .map_err(|_| WorkProgressError::BlockedByUserDecisionInvalid)?;
+        if !(cleanup_complete && dispatch_complete && unstarted_complete && settled) {
+            return Err(WorkProgressError::BlockedByUserProofIncomplete);
+        }
+        Ok(())
+    }
+
+    fn validate_failed_preserving_data_observation(
+        &self,
+        observation: &FailedPreservingDataObservation,
+        terminal_snapshot: bool,
+    ) -> Result<(), WorkProgressError> {
+        if observation.prior_phase == OperationPhase::Terminal
+            || !matches!(
+                observation.prior_disposition,
+                FullProgressDisposition::RetryPending
+                    | FullProgressDisposition::PartialNeedsRetry
+                    | FullProgressDisposition::AuditRequired
+            )
+        {
+            return Err(WorkProgressError::TerminalOutcomeStateInvalid);
+        }
+        if !terminal_snapshot
+            && (self.phase != observation.prior_phase
+                || self.disposition != observation.prior_disposition)
+        {
+            return Err(WorkProgressError::TerminalOutcomeStateInvalid);
+        }
+        self.validate_recovery_exhaustion(&observation.exhaustion)?;
+        self.validate_terminal_resources(
+            &observation.resource_observations,
+            &observation.claim_settlement,
+            false,
+            true,
+        )?;
+        self.validate_terminal_quiescence(&observation.dispatch_quiescence, false)
+    }
+
+    fn validate_failed_data_loss_risk_observation(
+        &self,
+        observation: &FailedDataLossRiskObservation,
+        terminal_snapshot: bool,
+    ) -> Result<(), WorkProgressError> {
+        if !observation.prior_phase.is_post_publication()
+            || observation.prior_disposition != FullProgressDisposition::AuditRequired
+        {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        }
+        if !terminal_snapshot
+            && (self.phase != observation.prior_phase
+                || self.disposition != observation.prior_disposition)
+        {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        }
+        let Some(active) = self.active_audit.as_ref() else {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        };
+        if active.generation != observation.escalation.audit_generation
+            || observation.escalation.audit_generation != self.audit_generation
+            || observation.escalation.context.execution_epoch() > self.execution_epoch
+            || observation.escalation.context.scope().participant_id()
+                != observation.escalation.participant_key.participant_id()
+            || !self
+                .plan
+                .units()
+                .iter()
+                .any(|unit| unit.key() == observation.escalation.participant_key)
+        {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        }
+        let target_matches = match active.observation.target() {
+            AuditTarget::WholeOperation => true,
+            AuditTarget::Steps(keys) => keys.contains(&observation.escalation.participant_key),
+        };
+        if !target_matches {
+            return Err(WorkProgressError::DataLossRiskEscalationInvalid);
+        }
+        self.validate_historical_completion(
+            observation.escalation.participant_key,
+            &observation.escalation.context,
+            &observation.escalation.evidence,
+        )
+        .map_err(|_| WorkProgressError::DataLossRiskEscalationInvalid)?;
+        self.validate_terminal_resources(
+            &observation.resource_observations,
+            &observation.claim_settlement,
+            true,
+            true,
+        )?;
+        if observation
+            .resource_observations
+            .iter()
+            .any(|resource| resource.outcome != TerminalResourceOutcome::Retained)
+            || observation
+                .claim_settlement
+                .settlements()
+                .iter()
+                .any(|settlement| settlement.outcome() == AdmissionClaimSettlementOutcome::Released)
+        {
+            return Err(WorkProgressError::DataLossRiskDestructiveCleanup);
+        }
+        self.validate_terminal_quiescence(&observation.dispatch_quiescence, false)
+    }
+
+    fn validate_recovery_exhaustion(
+        &self,
+        exhaustion: &RecoveryExhaustionObservation,
+    ) -> Result<(), WorkProgressError> {
+        if exhaustion.attempt_budget == 0
+            || exhaustion.exhausted_attempt < exhaustion.attempt_budget
+            || exhaustion.last_retry.attempt() != exhaustion.exhausted_attempt
+            || exhaustion.failed_participants.is_empty()
+            || exhaustion.failed_participants.len() > MAX_TERMINAL_OUTCOME_ROWS
+        {
+            return Err(WorkProgressError::RecoveryExhaustionMismatch);
+        }
+        exhaustion
+            .last_retry
+            .validate()
+            .map_err(|_| WorkProgressError::RecoveryExhaustionMismatch)?;
+        let retained_history = self
+            .last_retry_observation
+            .as_ref()
+            .or(self.retry_observation.as_ref());
+        if retained_history != Some(&exhaustion.last_retry) {
+            return Err(WorkProgressError::RecoveryExhaustionMismatch);
+        }
+        for (index, failed) in exhaustion.failed_participants.iter().enumerate() {
+            if index > 0 && exhaustion.failed_participants[index - 1].key >= failed.key {
+                return Err(WorkProgressError::FailedParticipantEvidenceInvalid);
+            }
+            let Some(step) = self.steps.iter().find(|step| step.key() == failed.key) else {
+                return Err(WorkProgressError::FailedParticipantEvidenceInvalid);
+            };
+            if !matches!(
+                step.status(),
+                ProgressStepStatus::Pending | ProgressStepStatus::Deferred
+            ) || failed.attempt == 0
+                || failed.attempt != exhaustion.exhausted_attempt
+                || failed.context.execution_epoch() > self.execution_epoch
+                || failed.context.scope().participant_id() != failed.key.participant_id()
+            {
+                return Err(WorkProgressError::FailedParticipantEvidenceInvalid);
+            }
+            self.validate_historical_completion(failed.key, &failed.context, &failed.evidence)
+                .map_err(|_| WorkProgressError::FailedParticipantEvidenceInvalid)?;
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_resources(
+        &self,
+        resources: &[TerminalResourceObservation],
+        settlement: &AdmissionClaimSettlementInventory,
+        data_loss_risk: bool,
+        require_retained: bool,
+    ) -> Result<(), WorkProgressError> {
+        let claims = self
+            .admission_claims
+            .as_ref()
+            .ok_or(WorkProgressError::TerminalOutcomeClaimsMissing)?;
+        settlement
+            .validate_against(claims)
+            .map_err(|_| WorkProgressError::TerminalOutcomeSettlementIncomplete)?;
+        if resources.len() != claims.claims().len() || resources.len() > MAX_TERMINAL_OUTCOME_ROWS {
+            return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+        }
+        let mut class_state = BTreeMap::<FullCapacityAllocationClass, (bool, bool)>::new();
+        for (index, resource) in resources.iter().enumerate() {
+            if index > 0 && resources[index - 1].claim_id >= resource.claim_id {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            }
+            let Some(claim) = claims
+                .claims()
+                .iter()
+                .find(|claim| claim.claim_id() == resource.claim_id)
+            else {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            };
+            let Some(settlement_row) = settlement
+                .settlements()
+                .iter()
+                .find(|row| row.claim_id() == resource.claim_id)
+            else {
+                return Err(WorkProgressError::TerminalOutcomeSettlementIncomplete);
+            };
+            let Some(current_scope) = self
+                .scopes
+                .iter()
+                .find(|scope| scope.participant_id() == resource.context.scope().participant_id())
+            else {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            };
+            if resource.owner_revision == 0
+                || !historical_scope_matches_current(
+                    self.execution_epoch,
+                    resource.context.execution_epoch(),
+                    current_scope,
+                    resource.context.scope(),
+                )
+                || resource
+                    .keys
+                    .iter()
+                    .any(|key| key.participant_id() != resource.context.scope().participant_id())
+            {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            }
+            if resource.keys.len() > MAX_TERMINAL_OUTCOME_ROWS
+                || resource
+                    .keys
+                    .windows(2)
+                    .any(|window| window[0] >= window[1])
+                || resource
+                    .keys
+                    .iter()
+                    .any(|key| !self.plan.units().iter().any(|unit| unit.key() == *key))
+            {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            }
+            let class = claim.allocation_class();
+            let expected_keys =
+                self.terminal_resource_keys(class, resource.context.scope().participant_id());
+            if resource.keys != expected_keys {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            }
+            if expected_keys.is_empty() {
+                return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+            }
+            for key in &resource.keys {
+                self.validate_historical_context_for_unit(*key, &resource.context)
+                    .map_err(|_| WorkProgressError::TerminalOutcomeResourceInvalid)?;
+            }
+            if matches!(
+                class,
+                FullCapacityAllocationClass::DestinationStaging
+                    | FullCapacityAllocationClass::OperationRecoveryPayload
+            ) {
+                let Some(cleanup) = self.cancellation_cleanup_observations.as_ref() else {
+                    return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+                };
+                let role = if class == FullCapacityAllocationClass::DestinationStaging {
+                    WorkUnitRole::Stage
+                } else {
+                    WorkUnitRole::RecoveryMaterialRetained
+                };
+                for key in &resource.keys {
+                    let Some(row) = cleanup
+                        .resource_cleanup_observation()
+                        .rows()
+                        .iter()
+                        .find(|row| row.key() == *key)
+                    else {
+                        return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+                    };
+                    if row.key().role() != role {
+                        return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+                    }
+                    let (owner_revision, context, outcome) = match row.outcome() {
+                        CancellationResourceCleanupOutcome::Absent {
+                            owner_revision,
+                            context,
+                        } => (*owner_revision, context, TerminalResourceOutcome::Absent),
+                        CancellationResourceCleanupOutcome::Preserved {
+                            owner_revision,
+                            context,
+                        } => (*owner_revision, context, TerminalResourceOutcome::Retained),
+                        CancellationResourceCleanupOutcome::Pending => {
+                            return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+                        }
+                    };
+                    if owner_revision != resource.owner_revision
+                        || context != &resource.context
+                        || outcome != resource.outcome
+                    {
+                        return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+                    }
+                }
+            }
+            if (data_loss_risk || require_retained)
+                && resource.outcome != TerminalResourceOutcome::Retained
+            {
+                return Err(WorkProgressError::DataLossRiskDestructiveCleanup);
+            }
+            let state = class_state.entry(class).or_insert((false, true));
+            if resource.outcome == TerminalResourceOutcome::Absent {
+                state.1 = state.1 && true;
+            } else {
+                state.1 = false;
+            }
+            state.0 =
+                state.0 || settlement_row.outcome() == AdmissionClaimSettlementOutcome::Released;
+            match settlement_row.outcome() {
+                AdmissionClaimSettlementOutcome::Released => {
+                    if matches!(
+                        claim.allocation_class(),
+                        FullCapacityAllocationClass::JournalRecord
+                            | FullCapacityAllocationClass::ExistingDestination
+                            | FullCapacityAllocationClass::ExistingRecoveryPayload
+                    ) {
+                        return Err(WorkProgressError::TerminalOutcomeRetainedChargeReleased);
+                    }
+                    if resource.outcome != TerminalResourceOutcome::Absent {
+                        return Err(WorkProgressError::TerminalOutcomeResourceReleaseUnproven);
+                    }
+                }
+                AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                | AdmissionClaimSettlementOutcome::Held => {
+                    if resource.outcome != TerminalResourceOutcome::Retained {
+                        return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+                    }
+                }
+            }
+        }
+        if class_state
+            .values()
+            .any(|(has_released, all_absent)| *has_released && !*all_absent)
+        {
+            return Err(WorkProgressError::TerminalOutcomeResourceInvalid);
+        }
+        Ok(())
+    }
+
+    fn terminal_resource_keys(
+        &self,
+        class: FullCapacityAllocationClass,
+        participant_id: ParticipantId,
+    ) -> Vec<WorkUnitKey> {
+        let mut keys = self
+            .cancellation_cleanup_observations
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    class,
+                    FullCapacityAllocationClass::DestinationStaging
+                        | FullCapacityAllocationClass::OperationRecoveryPayload
+                )
+            })
+            .map(|cleanup| {
+                let role = if class == FullCapacityAllocationClass::DestinationStaging {
+                    WorkUnitRole::Stage
+                } else {
+                    WorkUnitRole::RecoveryMaterialRetained
+                };
+                cleanup
+                    .resource_cleanup_observation()
+                    .rows()
+                    .iter()
+                    .filter(|row| {
+                        row.key().participant_id() == participant_id && row.key().role() == role
+                    })
+                    .map(|row| row.key())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                self.plan
+                    .units()
+                    .iter()
+                    .filter(|unit| unit.key().participant_id() == participant_id)
+                    .map(|unit| unit.key())
+                    .collect::<Vec<_>>()
+            });
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    fn validate_terminal_quiescence(
+        &self,
+        quiescence: &TerminalDispatchQuiescenceObservation,
+        require_quiesced: bool,
+    ) -> Result<(), WorkProgressError> {
+        if quiescence.execution_epoch != self.execution_epoch
+            || quiescence.keys.len() > MAX_TERMINAL_OUTCOME_ROWS
+            || quiescence
+                .keys
+                .windows(2)
+                .any(|window| window[0] >= window[1])
+            || quiescence
+                .keys
+                .iter()
+                .any(|key| !self.plan.units().iter().any(|unit| unit.key() == *key))
+            || (require_quiesced
+                && (quiescence.outcome != TerminalDispatchQuiescenceOutcome::Quiesced
+                    || !quiescence.keys.is_empty()))
+        {
+            return Err(WorkProgressError::TerminalOutcomeQuiescenceInvalid);
+        }
+        if quiescence.outcome == TerminalDispatchQuiescenceOutcome::PreservedForRecovery
+            && quiescence.keys.is_empty()
+        {
+            return Err(WorkProgressError::TerminalOutcomeQuiescenceInvalid);
+        }
+        Ok(())
+    }
+
+    fn terminal_observation_disposition(
+        observation: &TerminalOutcomeObservation,
+    ) -> FullProgressDisposition {
+        match observation {
+            TerminalOutcomeObservation::RolledBack(_) => FullProgressDisposition::RolledBack,
+            TerminalOutcomeObservation::BlockedByUser(_) => FullProgressDisposition::BlockedByUser,
+            TerminalOutcomeObservation::FailedPreservingData(_) => {
+                FullProgressDisposition::FailedPreservingData
+            }
+            TerminalOutcomeObservation::FailedDataLossRisk(_) => {
+                FullProgressDisposition::FailedDataLossRisk
+            }
+        }
+    }
+
     fn derive_cancellation_coordinator_closure_keys(
         &self,
         recovery_inventory: &CancellationEffectRecoveryInventory,
@@ -6115,6 +7785,31 @@ fn expected_filesystem_receipt(role: WorkUnitRole) -> Option<FilesystemReceiptKi
         WorkUnitRole::ExternalAudit => FilesystemReceiptKind::ExternalAudit,
         _ => return None,
     })
+}
+
+fn expected_compensation_result_kind(
+    recipe: CancellationEffectRecipe,
+    role: WorkUnitRole,
+) -> CompensationResultKind {
+    match (recipe, role) {
+        (CancellationEffectRecipe::ExternalAudit, _)
+        | (_, WorkUnitRole::ExternalAudit)
+        | (CancellationEffectRecipe::StagedMove, WorkUnitRole::OriginSourceReconcile)
+        | (CancellationEffectRecipe::QualifiedRelocation, WorkUnitRole::OriginSourceReconcile)
+        | (CancellationEffectRecipe::HistoryUndoExtractedRemoval, WorkUnitRole::SourceAffect) => {
+            CompensationResultKind::ExternalStateReconciled
+        }
+        (CancellationEffectRecipe::HistoryUndoExtractedRemoval, _)
+        | (_, WorkUnitRole::QualifiedRelocation)
+        | (_, WorkUnitRole::OriginRemovalStart)
+        | (_, WorkUnitRole::OriginAbsence)
+        | (_, WorkUnitRole::RetainedObjectAbsence) => CompensationResultKind::OriginRestored,
+        (_, WorkUnitRole::Publish) => CompensationResultKind::PublishedOutputRemoved,
+        (_, WorkUnitRole::RetainedMerge) | (_, WorkUnitRole::SelectedRetainedObjectDisposition) => {
+            CompensationResultKind::RetainedStateRestored
+        }
+        _ => CompensationResultKind::ExternalStateReconciled,
+    }
 }
 
 #[allow(dead_code)]
@@ -7508,6 +9203,93 @@ pub enum WorkProgressError {
         "work progress prepublication unstarted quiescence replay conflicts with a decisive observation"
     )]
     PrePublishCancellationQuiescenceReplayConflict,
+    /// A terminal outcome authority did not bind the exact operation or frozen plan.
+    #[error("work progress terminal outcome authority does not match")]
+    TerminalOutcomeAuthorityMismatch,
+    /// A terminal outcome authority carried another execution epoch.
+    #[error(
+        "work progress terminal outcome epoch {actual} does not match expected epoch {expected}"
+    )]
+    TerminalOutcomeEpochMismatch {
+        /// Epoch required by the current progress value.
+        expected: u64,
+        /// Epoch carried by the rejected authority.
+        actual: u64,
+    },
+    /// A terminal outcome authority carried another recovery generation.
+    #[error("work progress terminal outcome recovery generation does not match")]
+    TerminalOutcomeGenerationMismatch {
+        /// Recovery generation required by the current progress value.
+        expected: u64,
+        /// Recovery generation carried by the rejected authority.
+        actual: u64,
+    },
+    /// The terminal outcome generation could not advance without wrapping.
+    #[error("work progress terminal outcome recovery generation overflowed")]
+    TerminalOutcomeGenerationOverflow,
+    /// A terminal outcome was applied to an incompatible progress state.
+    #[error("work progress terminal outcome state is invalid")]
+    TerminalOutcomeStateInvalid,
+    /// A terminal outcome replay changed its proof-bearing observation.
+    #[error("work progress terminal outcome replay conflicts")]
+    TerminalOutcomeReplayConflict,
+    /// The terminal outcome carried an invalid bounded observation.
+    #[error("invalid work progress terminal outcome observation")]
+    TerminalOutcomeObservationInvalid,
+    /// The terminal outcome had no retained admission claims.
+    #[error("work progress terminal outcome admission claims are missing")]
+    TerminalOutcomeClaimsMissing,
+    /// A terminal outcome authority carried another exact admission-claim inventory.
+    #[error("work progress terminal outcome admission claims do not match")]
+    TerminalOutcomeClaimsMismatch,
+    /// The terminal outcome did not cover every admitted claim exactly once.
+    #[error("work progress terminal outcome claim settlement is incomplete")]
+    TerminalOutcomeSettlementIncomplete,
+    /// A retained journal or existing-data charge was released by a terminal failure/rollback.
+    #[error("work progress terminal outcome released a retained allocation charge")]
+    TerminalOutcomeRetainedChargeReleased,
+    /// A terminal outcome released a resource without a matching absence observation.
+    #[error("work progress terminal outcome resource release lacks absence evidence")]
+    TerminalOutcomeResourceReleaseUnproven,
+    /// A terminal outcome retained an invalid resource observation.
+    #[error("work progress terminal outcome resource observation is invalid")]
+    TerminalOutcomeResourceInvalid,
+    /// A terminal outcome retained an invalid dispatch-quiescence observation.
+    #[error("work progress terminal outcome dispatch quiescence is invalid")]
+    TerminalOutcomeQuiescenceInvalid,
+    /// A rollback effect inventory did not match the exact current cancellation inventory.
+    #[error("work progress rollback effect inventory does not match")]
+    RolledBackEffectInventoryMismatch,
+    /// A rollback receipt did not match one exact observed effect recipe and key set.
+    #[error("work progress rollback compensation receipt does not match")]
+    RolledBackCompensationReceiptMismatch,
+    /// A rollback origin-removal effect had no matching origin-restoration proof.
+    #[error("work progress rollback origin restoration proof is missing")]
+    RolledBackOriginRestorationMissing,
+    /// A rollback source/coordinator reconciliation row was incomplete or misbound.
+    #[error("work progress rollback participant reconciliation is incomplete")]
+    RolledBackReconciliationIncomplete,
+    /// BlockedByUser may only terminate from an intent/prepared prepublication state.
+    #[error("work progress blocked-by-user phase is invalid")]
+    BlockedByUserPhaseInvalid,
+    /// BlockedByUser requires an explicit current participant-tied decision.
+    #[error("work progress blocked-by-user decision is invalid")]
+    BlockedByUserDecisionInvalid,
+    /// A blocked-by-user terminal observation had incomplete prepublication proof.
+    #[error("work progress blocked-by-user prepublication proof is incomplete")]
+    BlockedByUserProofIncomplete,
+    /// The bounded recovery exhaustion receipt did not match retained retry history.
+    #[error("work progress recovery exhaustion does not match retained retry history")]
+    RecoveryExhaustionMismatch,
+    /// A failed participant row was not tied to an actual incomplete plan participant.
+    #[error("work progress failed participant evidence is invalid")]
+    FailedParticipantEvidenceInvalid,
+    /// A data-loss-risk outcome had no matching active audit or escalation evidence.
+    #[error("work progress data-loss-risk escalation is invalid")]
+    DataLossRiskEscalationInvalid,
+    /// A data-loss-risk outcome attempted destructive or release-safe cleanup.
+    #[error("work progress data-loss-risk outcome cannot release uncertain resources")]
+    DataLossRiskDestructiveCleanup,
 }
 
 impl From<RetryObservationValidationError> for WorkProgressError {
@@ -7524,6 +9306,9 @@ impl From<CancellationRequestValidationError> for WorkProgressError {
 
 #[cfg(test)]
 mod tests {
+    use super::terminal_outcomes::{
+        BlockedByUserActionKind, FailedParticipantObservation, SafetyEscalationReason,
+    };
     use super::*;
     use crate::app_dirs::{AppRootGuard, WritableProfileGuard};
     use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity};
@@ -7805,6 +9590,14 @@ mod tests {
     }
 
     fn history_folder_args(source: ParticipantId, source_id: SourceId) -> UniversalCommandArgs {
+        history_folder_args_with_relocations(source, source_id, 2)
+    }
+
+    fn history_folder_args_with_relocations(
+        source: ParticipantId,
+        source_id: SourceId,
+        relocation_count: usize,
+    ) -> UniversalCommandArgs {
         let root = NamespaceDirectoryEndpoint::new(
             source,
             source_id.clone(),
@@ -7812,35 +9605,37 @@ mod tests {
             NamespaceDirectoryExpectation::new(7, "root-a", None).expect("root"),
         )
         .expect("history root");
-        let relocation = |source_path: &str, source_identity: &str, destination_path: &str| {
-            let source_entry = NamespaceEntryEndpoint::new(
-                source,
-                source_id.clone(),
-                StoredRelativePath::new(source_path).expect("source path"),
-                NamespaceEntryExpectation::Directory(
-                    NamespaceDirectoryExpectation::new(7, source_identity, None)
-                        .expect("source directory"),
-                ),
-            )
-            .expect("source entry");
-            let destination = CopyEndpoint::new(
-                source,
-                source_id.clone(),
-                StoredRelativePath::new(destination_path).expect("destination path"),
-            )
-            .expect("destination");
-            HistoryFolderRelocation::new(source_entry, destination).expect("relocation")
-        };
-        let action = HistoryAction::FolderMove(
-            HistoryFolderMove::new(
-                root,
-                vec![
-                    relocation("folder/a", "folder-a", "archive/a"),
-                    relocation("folder/b", "folder-b", "archive/b"),
-                ],
-            )
-            .expect("folder move"),
-        );
+        let relocation =
+            |source_path: String, source_identity: String, destination_path: String| {
+                let source_entry = NamespaceEntryEndpoint::new(
+                    source,
+                    source_id.clone(),
+                    StoredRelativePath::new(&source_path).expect("source path"),
+                    NamespaceEntryExpectation::Directory(
+                        NamespaceDirectoryExpectation::new(7, &source_identity, None)
+                            .expect("source directory"),
+                    ),
+                )
+                .expect("source entry");
+                let destination = CopyEndpoint::new(
+                    source,
+                    source_id.clone(),
+                    StoredRelativePath::new(&destination_path).expect("destination path"),
+                )
+                .expect("destination");
+                HistoryFolderRelocation::new(source_entry, destination).expect("relocation")
+            };
+        let moves = (0..relocation_count)
+            .map(|index| {
+                relocation(
+                    format!("folder/{index}"),
+                    format!("folder-{index}"),
+                    format!("archive/{index}"),
+                )
+            })
+            .collect();
+        let action =
+            HistoryAction::FolderMove(HistoryFolderMove::new(root, moves).expect("folder move"));
         UniversalCommandArgs::History(
             HistoryUndoRedoIntentArgs::new(
                 HistoryScopeId::from_uuid(Uuid::from_u128(310)),
@@ -8211,9 +10006,13 @@ mod tests {
     }
 
     fn copy_progress_with_admission_claims() -> WorkProgress {
+        copy_progress_with_admission_claims_for(205)
+    }
+
+    fn copy_progress_with_admission_claims_for(operation_value: u128) -> WorkProgress {
         let (participants, args, plan) = copy_plan_inputs();
         WorkProgress::from_plan_with_admission_observations(
-            OperationId::from_uuid(Uuid::from_u128(205)),
+            OperationId::from_uuid(Uuid::from_u128(operation_value)),
             &plan,
             &args,
             &participants,
@@ -9466,6 +11265,47 @@ mod tests {
             admission_claims(12),
         )
         .expect("progress with claim observation")
+    }
+
+    fn claimed_progress_with_class(
+        participants: ParticipantSet,
+        args: UniversalCommandArgs,
+        operation_value: u128,
+        allocation_class: FullCapacityAllocationClass,
+    ) -> WorkProgress {
+        let plan =
+            super::super::work_plan::derive_work_plan(&args, &participants).expect("work plan");
+        let capacity = FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 1 },
+                1,
+                allocation_class,
+                12,
+                12,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("capacity allocation"),
+        ])
+        .expect("capacity plan");
+        let claims = AdmissionClaimInventory::new(vec![
+            AdmissionClaim::new(
+                AdmissionClaimId::from_uuid(Uuid::from_u128(201)).expect("claim id"),
+                VolumeIdentity { device: 1 },
+                allocation_class,
+                12,
+            )
+            .expect("claim"),
+        ])
+        .expect("claim inventory");
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(operation_value)),
+            &plan,
+            &args,
+            &participants,
+            &capacity,
+            claims,
+        )
+        .expect("progress with class claim observation")
     }
 
     fn retained_folder_observation(
@@ -27804,6 +29644,1444 @@ mod tests {
         ));
         assert!(dependency_hole.rehydrate_observation().is_err());
     }
+
+    fn terminal_dispatch_barrier_for(
+        progress: &WorkProgress,
+        dispatch_generation: u64,
+        preserve_entry: bool,
+    ) -> (
+        dispatch_owner::VerifiedCancellationBarrier,
+        CancellationDispatchOutcomeRecord,
+        Option<WorkUnitKey>,
+    ) {
+        let inventory = if let Some(inventory) = progress.cancellation_inventory.as_ref() {
+            inventory.clone()
+        } else {
+            let mut seed = progress.clone();
+            seed.phase = OperationPhase::IntentDurable;
+            seed.disposition = FullProgressDisposition::None;
+            seed.retry_observation = None;
+            seed.last_retry_observation = None;
+            seed.active_audit = None;
+            seed.audit_generation = 0;
+            seed.cancellation_request = None;
+            seed.cancellation_inventory = None;
+            seed.claim_settlement = None;
+            seed.recovery_generation = 0;
+            seed.pre_publish_cancellation = None;
+            seed.after_effect_reconciliation = None;
+            seed.cancellation_cleanup_observations = None;
+            seed.forward_cancellation_observation = None;
+            seed.terminal_outcome_observation = None;
+            seed.request_cancellation(
+                CancellationRequestObservation::new(9001).expect("barrier cancellation"),
+            )
+            .expect("barrier cancellation request");
+            seed.cancellation_inventory
+                .expect("barrier cancellation inventory")
+        };
+        let manifest = progress
+            .cancellation_inventory
+            .as_ref()
+            .map(|_| {
+                progress
+                    .cancellation_dispatch_manifest()
+                    .expect("barrier manifest")
+            })
+            .unwrap_or_else(|| {
+                let mut seed = progress.clone();
+                seed.phase = OperationPhase::IntentDurable;
+                seed.disposition = FullProgressDisposition::None;
+                seed.retry_observation = None;
+                seed.last_retry_observation = None;
+                seed.active_audit = None;
+                seed.audit_generation = 0;
+                seed.cancellation_request = None;
+                seed.cancellation_inventory = None;
+                seed.claim_settlement = None;
+                seed.recovery_generation = 0;
+                seed.pre_publish_cancellation = None;
+                seed.after_effect_reconciliation = None;
+                seed.cancellation_cleanup_observations = None;
+                seed.forward_cancellation_observation = None;
+                seed.terminal_outcome_observation = None;
+                seed.request_cancellation(
+                    CancellationRequestObservation::new(9001).expect("barrier manifest cancel"),
+                )
+                .expect("barrier manifest cancellation request");
+                seed.cancellation_dispatch_manifest()
+                    .expect("barrier manifest")
+            });
+        let uncertain_key = preserve_entry.then(|| {
+            manifest
+                .keys()
+                .first()
+                .copied()
+                .expect("preserved dispatch key")
+        });
+        let rows = manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let outcome = if Some(*key) == uncertain_key {
+                    CancellationDispatchOutcome::EntryUncertain
+                } else {
+                    CancellationDispatchOutcome::NeverEntered
+                };
+                CancellationDispatchOutcomeRow::new(*key, outcome)
+            })
+            .collect();
+        let dispatch = CancellationDispatchOutcomeRecord::new(
+            manifest,
+            progress.execution_epoch(),
+            dispatch_generation,
+            rows,
+        )
+        .expect("terminal dispatch record");
+        let barrier = dispatch_owner::VerifiedCancellationBarrier::for_test(
+            progress.operation_id,
+            progress.plan.clone(),
+            progress.execution_epoch(),
+            inventory,
+            dispatch.clone(),
+        );
+        (barrier, dispatch, uncertain_key)
+    }
+
+    fn terminal_resource_observation_for_claim(
+        progress: &WorkProgress,
+        claim_index: usize,
+        outcome: TerminalResourceOutcome,
+    ) -> TerminalResourceObservation {
+        let claim = progress
+            .admission_claims
+            .as_ref()
+            .expect("terminal resource claims")
+            .claims()
+            .get(claim_index)
+            .expect("terminal resource claim index");
+        let participant_id = progress
+            .plan
+            .units()
+            .iter()
+            .find(|unit| {
+                progress
+                    .scope_for(unit.key())
+                    .is_some_and(|scope| scope.kind() == ParticipantKind::Filesystem)
+            })
+            .map(|unit| unit.key().participant_id())
+            .expect("filesystem terminal resource participant");
+        let keys = progress.terminal_resource_keys(claim.allocation_class(), participant_id);
+        let first_key = keys.first().copied().expect("terminal resource key");
+        TerminalResourceObservation {
+            claim_id: claim.claim_id(),
+            outcome,
+            keys,
+            owner_revision: 1,
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(first_key)
+                    .expect("terminal resource scope")
+                    .clone(),
+            ),
+        }
+    }
+
+    fn terminal_snapshot_intent(
+        progress: &WorkProgress,
+        allocation_class: FullCapacityAllocationClass,
+    ) -> FullProgressIntentObservation {
+        let capacity = FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 1 },
+                1,
+                allocation_class,
+                12,
+                12,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("terminal snapshot capacity"),
+        ])
+        .expect("terminal snapshot capacity plan");
+        copy_snapshot_intent_with_capacity(progress, capacity)
+    }
+
+    fn historical_context_and_evidence(
+        progress: &WorkProgress,
+        key: WorkUnitKey,
+    ) -> (CompletionContext, StoredStepEvidence) {
+        let context = progress
+            .step_for(key)
+            .and_then(WorkProgressStep::completion_context)
+            .cloned()
+            .unwrap_or_else(|| {
+                CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(key).expect("historical scope").clone(),
+                )
+            });
+        let evidence = progress
+            .step_for(key)
+            .and_then(WorkProgressStep::evidence)
+            .cloned()
+            .unwrap_or_else(|| evidence_for(progress, key, 7));
+        (context, evidence)
+    }
+
+    fn rollback_compensation_proofs(
+        progress: &WorkProgress,
+        inventory: &CancellationEffectRecoveryInventory,
+    ) -> (
+        Vec<CompensationReceiptObservation>,
+        Vec<VerifiedCompensationReceipt>,
+        Vec<VerifiedOriginRestorationProof>,
+        Vec<VerifiedCompensationReconciliationProof>,
+    ) {
+        let mut observations = Vec::new();
+        let mut proofs = Vec::new();
+        let mut origin_restorations = Vec::new();
+        let mut reconciliation_keys = BTreeMap::<WorkUnitKey, CompensationParticipantKind>::new();
+        for bundle in inventory.bundles() {
+            let mut evidence_keys = bundle
+                .facts()
+                .iter()
+                .map(|fact| fact.key())
+                .chain(bundle.source_closure().iter().map(|row| row.key()))
+                .collect::<Vec<_>>();
+            evidence_keys.sort_unstable();
+            evidence_keys.dedup();
+            let evidence = evidence_keys
+                .iter()
+                .map(|key| {
+                    let (context, evidence) = historical_context_and_evidence(progress, *key);
+                    (*key, context, evidence)
+                })
+                .collect::<Vec<_>>();
+            let results = bundle
+                .facts()
+                .iter()
+                .map(|fact| {
+                    let key = fact.key();
+                    let context = CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress.scope_for(key).expect("compensation scope").clone(),
+                    );
+                    CompensationResultObservation {
+                        outcome: expected_compensation_result_kind(bundle.recipe(), key.role()),
+                        original_key: key,
+                        action_ordinal: bundle.action_ordinal(),
+                        step_segment: bundle.step_segment(),
+                        context,
+                        owner_revision: 1,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let observation = CompensationReceiptObservation {
+                action_ordinal: bundle.action_ordinal(),
+                step_segment: bundle.step_segment(),
+                recipe: bundle.recipe(),
+                evidence_keys,
+                results: results.clone(),
+            };
+            let payload = VerifiedCompensationReceiptPayload {
+                observation: observation.clone(),
+                evidence,
+            };
+            let proof = match bundle.recipe() {
+                CancellationEffectRecipe::StagedPublish => {
+                    VerifiedCompensationReceipt::StagedPublish(payload)
+                }
+                CancellationEffectRecipe::StagedMove => {
+                    VerifiedCompensationReceipt::StagedMove(payload)
+                }
+                CancellationEffectRecipe::QualifiedRelocation => {
+                    VerifiedCompensationReceipt::QualifiedRelocation(payload)
+                }
+                CancellationEffectRecipe::RetainedMerge => {
+                    VerifiedCompensationReceipt::RetainedMerge(payload)
+                }
+                CancellationEffectRecipe::RetainedDisposition => {
+                    VerifiedCompensationReceipt::RetainedDisposition(payload)
+                }
+                CancellationEffectRecipe::ExternalAudit => {
+                    VerifiedCompensationReceipt::ExternalAudit(payload)
+                }
+                CancellationEffectRecipe::HistoryUndoExtractedRemoval => {
+                    VerifiedCompensationReceipt::HistoryUndoExtractedRemoval(payload)
+                }
+            };
+            for result in &results {
+                if result.outcome == CompensationResultKind::OriginRestored {
+                    let restoration = OriginRestorationObservation {
+                        result: result.clone(),
+                    };
+                    origin_restorations.push(VerifiedOriginRestorationProof(restoration));
+                }
+            }
+            for key in &observation.evidence_keys {
+                let Some(scope) = progress.scope_for(*key) else {
+                    continue;
+                };
+                let kind = match scope.kind() {
+                    ParticipantKind::SourceDatabase => Some(CompensationParticipantKind::Source),
+                    ParticipantKind::GlobalLibrary
+                    | ParticipantKind::Harvest
+                    | ParticipantKind::Projection
+                    | ParticipantKind::Readiness
+                    | ParticipantKind::Artifact => Some(CompensationParticipantKind::Coordinator),
+                    ParticipantKind::Filesystem => None,
+                };
+                let Some(kind) = kind else { continue };
+                reconciliation_keys.insert(*key, kind);
+            }
+            observations.push(observation);
+            proofs.push(proof);
+        }
+        for key in progress
+            .derive_cancellation_coordinator_closure_keys(inventory, inventory.dispatch_outcome())
+        {
+            reconciliation_keys.insert(key, CompensationParticipantKind::Coordinator);
+        }
+        let reconciliations = reconciliation_keys
+            .into_iter()
+            .map(|(key, kind)| {
+                let (context, evidence) = historical_context_and_evidence(progress, key);
+                let result = CompensationResultObservation {
+                    outcome: CompensationResultKind::ExternalStateReconciled,
+                    original_key: key,
+                    action_ordinal: key.action_ordinal(),
+                    step_segment: key.step_ordinal() / STEP_HISTORY_STRIDE,
+                    context: CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress
+                            .scope_for(key)
+                            .expect("reconciliation scope")
+                            .clone(),
+                    ),
+                    owner_revision: 1,
+                };
+                VerifiedCompensationReconciliationProof(CompensationReconciliationObservation {
+                    kind,
+                    participant_id: key.participant_id(),
+                    key,
+                    context,
+                    evidence,
+                    result,
+                })
+            })
+            .collect();
+        (observations, proofs, origin_restorations, reconciliations)
+    }
+
+    #[test]
+    fn guarded_terminal_rolled_back_applies_replays_and_round_trips_snapshot() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(9101).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+
+        let prior_phase = progress.phase();
+        let prior_disposition = progress.disposition();
+        let expected_recovery_generation = progress.recovery_generation();
+        let next_recovery_generation = expected_recovery_generation + 1;
+        let effect_inventory = progress
+            .after_effect_reconciliation()
+            .expect("after-effect")
+            .recovery_inventory()
+            .clone();
+        let (barrier, dispatch, _) = terminal_dispatch_barrier_for(
+            &progress,
+            effect_inventory.dispatch_outcome().recovery_generation(),
+            false,
+        );
+        assert_eq!(&dispatch, effect_inventory.dispatch_outcome());
+        let (receipt_observations, receipt_proofs, origin_proofs, reconciliation_proofs) =
+            rollback_compensation_proofs(&progress, &effect_inventory);
+        assert!(!receipt_observations.is_empty());
+        let claim_inventory = progress.admission_claims().expect("claims").clone();
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        let resource =
+            terminal_resource_observation_for_claim(&progress, 0, TerminalResourceOutcome::Absent);
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+            keys: Vec::new(),
+        };
+        let observation = RolledBackObservation {
+            execution_epoch: progress.execution_epoch(),
+            recovery_generation: next_recovery_generation,
+            prior_phase,
+            prior_disposition,
+            effect_inventory,
+            compensation_receipts: receipt_observations,
+            origin_restorations: Vec::new(),
+            reconciliations: reconciliation_proofs
+                .iter()
+                .map(|proof| proof.0.clone())
+                .collect(),
+            resource_observations: vec![resource.clone()],
+            claim_settlement: settlement.clone(),
+            dispatch_quiescence: quiescence.clone(),
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::RolledBack(VerifiedRolledBackAuthority {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch(),
+            expected_recovery_generation,
+            next_recovery_generation,
+            claim_inventory,
+            observation,
+            compensation_receipts: receipt_proofs,
+            origin_restorations: origin_proofs,
+            reconciliations: reconciliation_proofs,
+            resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+            dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                barrier,
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                eligible_keys: Vec::new(),
+                observation: quiescence,
+            },
+        });
+        let before_rejection = progress.clone();
+        let mut wrong_origin = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::RolledBack(candidate) = &mut wrong_origin {
+            let key = key_for(&progress, 0, WorkUnitRole::Publish);
+            let restoration = OriginRestorationObservation {
+                result: CompensationResultObservation {
+                    outcome: CompensationResultKind::OriginRestored,
+                    original_key: key,
+                    action_ordinal: key.action_ordinal(),
+                    step_segment: key.step_ordinal() / STEP_HISTORY_STRIDE,
+                    context: CompletionContext::new(
+                        progress.execution_epoch(),
+                        progress.scope_for(key).expect("origin scope").clone(),
+                    ),
+                    owner_revision: 1,
+                },
+            };
+            candidate
+                .observation
+                .origin_restorations
+                .push(restoration.clone());
+            candidate
+                .origin_restorations
+                .push(VerifiedOriginRestorationProof(restoration));
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(wrong_origin),
+            Err(WorkProgressError::RolledBackOriginRestorationMissing)
+        );
+        assert_eq!(progress, before_rejection);
+
+        let before_rejection = progress.clone();
+        let mut missing_receipt = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::RolledBack(candidate) = &mut missing_receipt {
+            candidate.observation.compensation_receipts.clear();
+            candidate.compensation_receipts.clear();
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(missing_receipt),
+            Err(WorkProgressError::RolledBackCompensationReceiptMismatch)
+        );
+        assert_eq!(progress, before_rejection);
+        let replay = authority.clone();
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        let snapshot = progress
+            .capture_full_progress_snapshot(&terminal_snapshot_intent(
+                &progress,
+                FullCapacityAllocationClass::DestinationStaging,
+            ))
+            .expect("rolled-back snapshot");
+        snapshot
+            .validate_base()
+            .expect("rolled-back snapshot validation");
+        assert_rehydrates_snapshot(&snapshot);
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+    }
+
+    #[test]
+    fn guarded_terminal_reconciliation_keeps_distinct_same_participant_keys() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let args = history_folder_args_with_relocations(source, source_id, 65);
+        let mut progress = claimed_progress_with_class(
+            participants,
+            args,
+            9206,
+            FullCapacityAllocationClass::ExistingDestination,
+        );
+        complete_required(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(9206).expect("cancel"))
+            .expect("history cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+
+        let expected_recovery_generation = progress.recovery_generation();
+        let next_recovery_generation = expected_recovery_generation + 1;
+        let effect_inventory = progress
+            .after_effect_reconciliation()
+            .expect("after-effect")
+            .recovery_inventory()
+            .clone();
+        let (barrier, dispatch, _) = terminal_dispatch_barrier_for(
+            &progress,
+            effect_inventory.dispatch_outcome().recovery_generation(),
+            false,
+        );
+        assert_eq!(&dispatch, effect_inventory.dispatch_outcome());
+        let (receipt_observations, receipt_proofs, origin_proofs, reconciliation_proofs) =
+            rollback_compensation_proofs(&progress, &effect_inventory);
+        let reconciliation_keys = reconciliation_proofs
+            .iter()
+            .map(|proof| proof.0.key)
+            .collect::<Vec<_>>();
+        assert!(
+            reconciliation_keys.len() > super::super::participants::MAX_PARTICIPANTS,
+            "regression requires more rows than participant count"
+        );
+        assert!(
+            reconciliation_keys
+                .windows(2)
+                .all(|window| window[0] < window[1]),
+            "reconciliation keys remain exact and ordered"
+        );
+        assert!(
+            reconciliation_keys
+                .windows(2)
+                .any(|window| window[0].participant_id() == window[1].participant_id()),
+            "multiple segments share one participant"
+        );
+
+        let settlement = settlement_inventory(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        let resource = terminal_resource_observation_for_claim(
+            &progress,
+            0,
+            TerminalResourceOutcome::Retained,
+        );
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+            keys: Vec::new(),
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::RolledBack(VerifiedRolledBackAuthority {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch(),
+            expected_recovery_generation,
+            next_recovery_generation,
+            claim_inventory: progress.admission_claims().expect("claims").clone(),
+            observation: RolledBackObservation {
+                execution_epoch: progress.execution_epoch(),
+                recovery_generation: next_recovery_generation,
+                prior_phase: progress.phase(),
+                prior_disposition: progress.disposition(),
+                effect_inventory,
+                compensation_receipts: receipt_observations,
+                origin_restorations: origin_proofs.iter().map(|proof| proof.0.clone()).collect(),
+                reconciliations: reconciliation_proofs
+                    .iter()
+                    .map(|proof| proof.0.clone())
+                    .collect(),
+                resource_observations: vec![resource.clone()],
+                claim_settlement: settlement.clone(),
+                dispatch_quiescence: quiescence.clone(),
+            },
+            compensation_receipts: receipt_proofs,
+            origin_restorations: origin_proofs,
+            reconciliations: reconciliation_proofs,
+            resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+            dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                barrier,
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                eligible_keys: Vec::new(),
+                observation: quiescence,
+            },
+        });
+        let before_rejection = progress.clone();
+        let mut missing = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::RolledBack(candidate) = &mut missing {
+            candidate
+                .observation
+                .reconciliations
+                .pop()
+                .expect("reconciliation row");
+            candidate
+                .reconciliations
+                .pop()
+                .expect("reconciliation proof");
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(missing),
+            Err(WorkProgressError::RolledBackReconciliationIncomplete)
+        );
+        assert_eq!(progress, before_rejection);
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+    }
+
+    #[test]
+    fn guarded_terminal_blocked_by_user_applies_replays_and_round_trips_snapshot() {
+        let mut progress = copy_progress_with_admission_claims();
+        progress
+            .request_cancellation(CancellationRequestObservation::new(9102).expect("cancel"))
+            .expect("before-publish cancellation");
+        let prior_phase = progress.phase();
+        let prior_disposition = progress.disposition();
+        let next_recovery_generation = progress.recovery_generation() + 1;
+        let (_barrier, dispatch, _) = terminal_dispatch_barrier_for(&progress, 1, false);
+        let (barrier, _, _) = terminal_dispatch_barrier_for(&progress, 1, false);
+        let decision_key = key_for(&progress, 0, WorkUnitRole::Prepare);
+        let decision = BlockedByUserDecisionObservation {
+            kind: BlockedByUserActionKind::UserDecision,
+            participant_id: decision_key.participant_id(),
+            key: decision_key,
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(decision_key)
+                    .expect("decision scope")
+                    .clone(),
+            ),
+        };
+        let cleanup = PrePublishCleanupObservation::new(Vec::new()).expect("cleanup");
+        let unstarted_quiescence =
+            PrePublishUnstartedQuiescenceObservation::new(Vec::new()).expect("quiescence");
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        let observation = BlockedByUserObservation {
+            execution_epoch: progress.execution_epoch(),
+            recovery_generation: next_recovery_generation,
+            prior_phase,
+            prior_disposition,
+            decision: decision.clone(),
+            cleanup,
+            unstarted_quiescence,
+            settlement: settlement.clone(),
+            dispatch_outcome: dispatch.clone(),
+            dispatch_quiescence: TerminalDispatchQuiescenceObservation {
+                execution_epoch: progress.execution_epoch(),
+                outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+                keys: Vec::new(),
+            },
+        };
+        let authority =
+            VerifiedTerminalOutcomeAuthority::BlockedByUser(VerifiedBlockedByUserAuthority {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                expected_recovery_generation: progress.recovery_generation(),
+                next_recovery_generation,
+                claim_inventory: progress.admission_claims().expect("claims").clone(),
+                cancellation_inventory: progress
+                    .cancellation_inventory()
+                    .expect("inventory")
+                    .clone(),
+                observation,
+                decision: VerifiedBlockedByUserDecisionProof(decision),
+                dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                    barrier,
+                    operation_id: progress.operation_id,
+                    plan: progress.plan.clone(),
+                    execution_epoch: progress.execution_epoch(),
+                    eligible_keys: Vec::new(),
+                    observation: TerminalDispatchQuiescenceObservation {
+                        execution_epoch: progress.execution_epoch(),
+                        outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+                        keys: Vec::new(),
+                    },
+                },
+            });
+        let before_rejection = progress.clone();
+        let mut wrong_cleanup = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::BlockedByUser(candidate) = &mut wrong_cleanup {
+            candidate.observation.cleanup =
+                PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+                    0,
+                    Some(PrePublishFinalClaimObservation::NoFinalClaim),
+                    Some(PrePublishOriginalStateObservation::Preserved),
+                    Some(PrePublishAbsenceObservation::Absent),
+                    None,
+                )])
+                .expect("wrong cleanup");
+        }
+        assert!(matches!(
+            progress.apply_verified_terminal_outcome(wrong_cleanup),
+            Err(WorkProgressError::BlockedByUserProofIncomplete
+                | WorkProgressError::PrePublishCleanupActionSetMismatch { .. })
+        ));
+        assert_eq!(progress, before_rejection);
+
+        let before_rejection = progress.clone();
+        let mut wrong_quiescence = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::BlockedByUser(candidate) = &mut wrong_quiescence {
+            candidate
+                .dispatch_quiescence
+                .eligible_keys
+                .push(decision_key);
+            candidate
+                .dispatch_quiescence
+                .observation
+                .keys
+                .push(decision_key);
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(wrong_quiescence),
+            Err(WorkProgressError::TerminalOutcomeQuiescenceInvalid)
+        );
+        assert_eq!(progress, before_rejection);
+        let replay = authority.clone();
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        let snapshot = progress
+            .capture_full_progress_snapshot(&terminal_snapshot_intent(
+                &progress,
+                FullCapacityAllocationClass::DestinationStaging,
+            ))
+            .expect("blocked snapshot");
+        snapshot
+            .validate_base()
+            .expect("blocked snapshot validation");
+        assert_rehydrates_snapshot(&snapshot);
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+    }
+
+    #[test]
+    fn guarded_terminal_failed_preserving_data_applies_replays_and_round_trips_snapshot() {
+        let mut progress =
+            copy_progress_with_claim_class(FullCapacityAllocationClass::JournalRecord, 9103);
+        let retry = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("terminal-preserving").expect("retry lease"),
+            10,
+            RetryErrorClass::TransientContention,
+            "busy",
+            None,
+        )
+        .expect("retry observation");
+        progress
+            .request_retry(retry.clone())
+            .expect("retry request");
+        let (barrier, _dispatch, uncertain_key) = terminal_dispatch_barrier_for(&progress, 1, true);
+        let failed_key = uncertain_key.expect("failed pending key");
+        let (context, evidence) = historical_context_and_evidence(&progress, failed_key);
+        let exhaustion = RecoveryExhaustionObservation {
+            attempt_budget: 1,
+            exhausted_attempt: 1,
+            last_retry: retry,
+            failed_participants: vec![FailedParticipantObservation {
+                key: failed_key,
+                attempt: 1,
+                context,
+                evidence,
+            }],
+        };
+        let resource = terminal_resource_observation_for_claim(
+            &progress,
+            0,
+            TerminalResourceOutcome::Retained,
+        );
+        let settlement = settlement_inventory(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        let next_recovery_generation = progress.recovery_generation() + 1;
+        let observation = FailedPreservingDataObservation {
+            execution_epoch: progress.execution_epoch(),
+            recovery_generation: next_recovery_generation,
+            prior_phase: progress.phase(),
+            prior_disposition: progress.disposition(),
+            exhaustion: exhaustion.clone(),
+            resource_observations: vec![resource.clone()],
+            claim_settlement: settlement.clone(),
+            dispatch_quiescence: TerminalDispatchQuiescenceObservation {
+                execution_epoch: progress.execution_epoch(),
+                outcome: TerminalDispatchQuiescenceOutcome::PreservedForRecovery,
+                keys: vec![failed_key],
+            },
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::FailedPreservingData(
+            VerifiedFailedPreservingDataAuthority {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                expected_recovery_generation: progress.recovery_generation(),
+                next_recovery_generation,
+                claim_inventory: progress.admission_claims().expect("claims").clone(),
+                observation,
+                exhaustion: VerifiedRecoveryExhaustionProof(exhaustion),
+                resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+                dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                    barrier,
+                    operation_id: progress.operation_id,
+                    plan: progress.plan.clone(),
+                    execution_epoch: progress.execution_epoch(),
+                    eligible_keys: vec![failed_key],
+                    observation: TerminalDispatchQuiescenceObservation {
+                        execution_epoch: progress.execution_epoch(),
+                        outcome: TerminalDispatchQuiescenceOutcome::PreservedForRecovery,
+                        keys: vec![failed_key],
+                    },
+                },
+            },
+        );
+        let before_rejection = progress.clone();
+        let mut exhausted_wrongly = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::FailedPreservingData(candidate) =
+            &mut exhausted_wrongly
+        {
+            candidate.observation.exhaustion.exhausted_attempt = 2;
+            candidate.exhaustion.0.exhausted_attempt = 2;
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(exhausted_wrongly),
+            Err(WorkProgressError::RecoveryExhaustionMismatch)
+        );
+        assert_eq!(progress, before_rejection);
+
+        let before_rejection = progress.clone();
+        let mut released_retained_claim = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::FailedPreservingData(candidate) =
+            &mut released_retained_claim
+        {
+            candidate.observation.claim_settlement =
+                settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(released_retained_claim),
+            Err(WorkProgressError::TerminalOutcomeRetainedChargeReleased)
+        );
+        assert_eq!(progress, before_rejection);
+
+        let mut max_progress = progress.clone();
+        max_progress.recovery_generation = u64::MAX - 1;
+        let mut max_authority = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::FailedPreservingData(candidate) =
+            &mut max_authority
+        {
+            candidate.expected_recovery_generation = u64::MAX - 1;
+            candidate.next_recovery_generation = u64::MAX;
+            candidate.observation.recovery_generation = u64::MAX;
+        }
+        let max_replay = max_authority.clone();
+        assert_eq!(
+            max_progress.apply_verified_terminal_outcome(max_authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(
+            max_progress.apply_verified_terminal_outcome(max_replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+        let replay = authority.clone();
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        let snapshot = progress
+            .capture_full_progress_snapshot(&terminal_snapshot_intent(
+                &progress,
+                FullCapacityAllocationClass::JournalRecord,
+            ))
+            .expect("preserved-data snapshot");
+        snapshot
+            .validate_base()
+            .expect("preserved-data snapshot validation");
+        assert_rehydrates_snapshot(&snapshot);
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+    }
+
+    #[test]
+    fn guarded_terminal_failed_data_loss_risk_applies_replays_and_round_trips_snapshot() {
+        let mut progress =
+            copy_progress_with_claim_class(FullCapacityAllocationClass::JournalRecord, 9104);
+        publish_prefix(&mut progress);
+        progress
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::UncertainEvidence,
+            ))
+            .expect("audit request");
+        let escalation_key = key_for(&progress, 0, WorkUnitRole::Publish);
+        let (context, evidence) = historical_context_and_evidence(&progress, escalation_key);
+        let escalation = SafetyEscalationObservation {
+            reason: SafetyEscalationReason::DispatchEntryUncertain,
+            audit_generation: progress.audit_generation(),
+            participant_key: escalation_key,
+            context,
+            evidence,
+        };
+        let resource = terminal_resource_observation_for_claim(
+            &progress,
+            0,
+            TerminalResourceOutcome::Retained,
+        );
+        let settlement = settlement_inventory(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        let next_recovery_generation = progress.recovery_generation() + 1;
+        let (barrier, _dispatch, uncertain_key) = terminal_dispatch_barrier_for(&progress, 1, true);
+        let observation = FailedDataLossRiskObservation {
+            execution_epoch: progress.execution_epoch(),
+            recovery_generation: next_recovery_generation,
+            prior_phase: progress.phase(),
+            prior_disposition: progress.disposition(),
+            escalation: escalation.clone(),
+            resource_observations: vec![resource.clone()],
+            claim_settlement: settlement.clone(),
+            dispatch_quiescence: TerminalDispatchQuiescenceObservation {
+                execution_epoch: progress.execution_epoch(),
+                outcome: TerminalDispatchQuiescenceOutcome::PreservedForRecovery,
+                keys: vec![uncertain_key.expect("uncertain dispatch key")],
+            },
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::FailedDataLossRisk(
+            VerifiedFailedDataLossRiskAuthority {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                expected_recovery_generation: progress.recovery_generation(),
+                next_recovery_generation,
+                claim_inventory: progress.admission_claims().expect("claims").clone(),
+                observation,
+                escalation: VerifiedSafetyEscalationProof(escalation),
+                resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+                dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                    barrier,
+                    operation_id: progress.operation_id,
+                    plan: progress.plan.clone(),
+                    execution_epoch: progress.execution_epoch(),
+                    eligible_keys: vec![uncertain_key.expect("uncertain dispatch key")],
+                    observation: TerminalDispatchQuiescenceObservation {
+                        execution_epoch: progress.execution_epoch(),
+                        outcome: TerminalDispatchQuiescenceOutcome::PreservedForRecovery,
+                        keys: vec![uncertain_key.expect("uncertain dispatch key")],
+                    },
+                },
+            },
+        );
+        let before_rejection = progress.clone();
+        let mut stale_audit = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::FailedDataLossRisk(candidate) = &mut stale_audit {
+            candidate.observation.escalation.audit_generation += 1;
+        }
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(stale_audit),
+            Err(WorkProgressError::DataLossRiskEscalationInvalid)
+        );
+        assert_eq!(progress, before_rejection);
+        let replay = authority.clone();
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        let snapshot = progress
+            .capture_full_progress_snapshot(&terminal_snapshot_intent(
+                &progress,
+                FullCapacityAllocationClass::JournalRecord,
+            ))
+            .expect("data-loss-risk snapshot");
+        snapshot
+            .validate_base()
+            .expect("data-loss-risk snapshot validation");
+        assert_rehydrates_snapshot(&snapshot);
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+    }
+
+    fn capture_guarded_terminal_snapshot(
+        mut progress: WorkProgress,
+        authority: VerifiedTerminalOutcomeAuthority,
+        allocation_class: FullCapacityAllocationClass,
+    ) -> FullProgressSnapshotObservation {
+        progress
+            .apply_verified_terminal_outcome(authority)
+            .expect("terminal owner application");
+        let snapshot = progress
+            .capture_full_progress_snapshot(&terminal_snapshot_intent(&progress, allocation_class))
+            .expect("terminal owner snapshot");
+        snapshot
+            .validate_base()
+            .expect("terminal owner snapshot validation");
+        snapshot
+    }
+
+    pub(super) fn guarded_terminal_origin_restoration_snapshot() -> FullProgressSnapshotObservation
+    {
+        let (participants, source, filesystem, source_id) = valid_topology(false);
+        let args = history_restore_with_extracted_args(source, filesystem, source_id);
+        let mut progress = claimed_progress(participants.clone(), args.clone(), 9205);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::RecoveryMaterialRetained,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        for role in [
+            WorkUnitRole::OriginRemovalStart,
+            WorkUnitRole::OriginAbsence,
+        ] {
+            apply_step(&mut progress, 0, 1, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(9205).expect("cancel"))
+            .expect("history cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+
+        let expected_recovery_generation = progress.recovery_generation();
+        let next_recovery_generation = expected_recovery_generation + 1;
+        let effect_inventory = progress
+            .after_effect_reconciliation()
+            .expect("after-effect")
+            .recovery_inventory()
+            .clone();
+        let (barrier, dispatch, _) = terminal_dispatch_barrier_for(
+            &progress,
+            effect_inventory.dispatch_outcome().recovery_generation(),
+            false,
+        );
+        assert_eq!(&dispatch, effect_inventory.dispatch_outcome());
+        let (receipt_observations, receipt_proofs, origin_proofs, reconciliation_proofs) =
+            rollback_compensation_proofs(&progress, &effect_inventory);
+        assert!(
+            !origin_proofs.is_empty(),
+            "history rollback has origin effects"
+        );
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+            keys: Vec::new(),
+        };
+        let resource =
+            terminal_resource_observation_for_claim(&progress, 0, TerminalResourceOutcome::Absent);
+        let authority = VerifiedTerminalOutcomeAuthority::RolledBack(VerifiedRolledBackAuthority {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch(),
+            expected_recovery_generation,
+            next_recovery_generation,
+            claim_inventory: progress.admission_claims().expect("claims").clone(),
+            observation: RolledBackObservation {
+                execution_epoch: progress.execution_epoch(),
+                recovery_generation: next_recovery_generation,
+                prior_phase: progress.phase(),
+                prior_disposition: progress.disposition(),
+                effect_inventory,
+                compensation_receipts: receipt_observations,
+                origin_restorations: origin_proofs.iter().map(|proof| proof.0.clone()).collect(),
+                reconciliations: reconciliation_proofs
+                    .iter()
+                    .map(|proof| proof.0.clone())
+                    .collect(),
+                resource_observations: vec![resource.clone()],
+                claim_settlement: settlement_inventory(
+                    &progress,
+                    AdmissionClaimSettlementOutcome::Released,
+                ),
+                dispatch_quiescence: quiescence.clone(),
+            },
+            compensation_receipts: receipt_proofs,
+            origin_restorations: origin_proofs,
+            reconciliations: reconciliation_proofs,
+            resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+            dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                barrier,
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                eligible_keys: Vec::new(),
+                observation: quiescence,
+            },
+        });
+        let mut forward_only = authority.clone();
+        if let VerifiedTerminalOutcomeAuthority::RolledBack(candidate) = &mut forward_only {
+            let index = candidate
+                .observation
+                .compensation_receipts
+                .iter()
+                .position(|receipt| {
+                    receipt
+                        .results
+                        .iter()
+                        .any(|result| result.outcome == CompensationResultKind::OriginRestored)
+                })
+                .expect("origin compensation receipt");
+            candidate.observation.compensation_receipts[index]
+                .results
+                .retain(|result| result.outcome != CompensationResultKind::OriginRestored);
+            candidate.compensation_receipts[index]
+                .results_mut()
+                .retain(|result| result.outcome != CompensationResultKind::OriginRestored);
+            candidate.origin_restorations.clear();
+        }
+        let before_rejection = progress.clone();
+        assert_eq!(
+            progress.apply_verified_terminal_outcome(forward_only),
+            Err(WorkProgressError::RolledBackCompensationReceiptMismatch)
+        );
+        assert_eq!(progress, before_rejection);
+        progress
+            .apply_verified_terminal_outcome(authority)
+            .expect("origin restoration terminal outcome");
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("origin restoration snapshot");
+        snapshot
+            .validate_base()
+            .expect("origin restoration validation");
+        snapshot
+    }
+
+    pub(super) fn guarded_terminal_store_snapshots() -> Vec<FullProgressSnapshotObservation> {
+        let mut snapshots = Vec::with_capacity(4);
+
+        let mut progress = copy_progress_with_admission_claims_for(9201);
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(9201).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+        let expected_recovery_generation = progress.recovery_generation();
+        let next_recovery_generation = expected_recovery_generation + 1;
+        let effect_inventory = progress
+            .after_effect_reconciliation()
+            .expect("after-effect")
+            .recovery_inventory()
+            .clone();
+        let (barrier, dispatch, _) = terminal_dispatch_barrier_for(
+            &progress,
+            effect_inventory.dispatch_outcome().recovery_generation(),
+            false,
+        );
+        assert_eq!(&dispatch, effect_inventory.dispatch_outcome());
+        let (receipt_observations, receipt_proofs, origin_proofs, reconciliation_proofs) =
+            rollback_compensation_proofs(&progress, &effect_inventory);
+        let claim_inventory = progress.admission_claims().expect("claims").clone();
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        let resource =
+            terminal_resource_observation_for_claim(&progress, 0, TerminalResourceOutcome::Absent);
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+            keys: Vec::new(),
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::RolledBack(VerifiedRolledBackAuthority {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch(),
+            expected_recovery_generation,
+            next_recovery_generation,
+            claim_inventory,
+            observation: RolledBackObservation {
+                execution_epoch: progress.execution_epoch(),
+                recovery_generation: next_recovery_generation,
+                prior_phase: progress.phase(),
+                prior_disposition: progress.disposition(),
+                effect_inventory,
+                compensation_receipts: receipt_observations,
+                origin_restorations: Vec::new(),
+                reconciliations: reconciliation_proofs
+                    .iter()
+                    .map(|proof| proof.0.clone())
+                    .collect(),
+                resource_observations: vec![resource.clone()],
+                claim_settlement: settlement.clone(),
+                dispatch_quiescence: quiescence.clone(),
+            },
+            compensation_receipts: receipt_proofs,
+            origin_restorations: origin_proofs,
+            reconciliations: reconciliation_proofs,
+            resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+            dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                barrier,
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                eligible_keys: Vec::new(),
+                observation: quiescence,
+            },
+        });
+        snapshots.push(capture_guarded_terminal_snapshot(
+            progress,
+            authority,
+            FullCapacityAllocationClass::DestinationStaging,
+        ));
+
+        let mut progress = copy_progress_with_admission_claims_for(9202);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(9202).expect("cancel"))
+            .expect("before-publish cancellation");
+        let next_recovery_generation = progress.recovery_generation() + 1;
+        let (barrier, dispatch, _) = terminal_dispatch_barrier_for(&progress, 1, false);
+        let decision_key = key_for(&progress, 0, WorkUnitRole::Prepare);
+        let decision = BlockedByUserDecisionObservation {
+            kind: BlockedByUserActionKind::UserDecision,
+            participant_id: decision_key.participant_id(),
+            key: decision_key,
+            context: CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(decision_key)
+                    .expect("decision scope")
+                    .clone(),
+            ),
+        };
+        let cleanup = PrePublishCleanupObservation::new(Vec::new()).expect("cleanup");
+        let unstarted_quiescence =
+            PrePublishUnstartedQuiescenceObservation::new(Vec::new()).expect("quiescence");
+        let settlement = settlement_inventory(&progress, AdmissionClaimSettlementOutcome::Released);
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::Quiesced,
+            keys: Vec::new(),
+        };
+        let authority =
+            VerifiedTerminalOutcomeAuthority::BlockedByUser(VerifiedBlockedByUserAuthority {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                expected_recovery_generation: progress.recovery_generation(),
+                next_recovery_generation,
+                claim_inventory: progress.admission_claims().expect("claims").clone(),
+                cancellation_inventory: progress
+                    .cancellation_inventory()
+                    .expect("inventory")
+                    .clone(),
+                observation: BlockedByUserObservation {
+                    execution_epoch: progress.execution_epoch(),
+                    recovery_generation: next_recovery_generation,
+                    prior_phase: progress.phase(),
+                    prior_disposition: progress.disposition(),
+                    decision: decision.clone(),
+                    cleanup,
+                    unstarted_quiescence,
+                    settlement: settlement.clone(),
+                    dispatch_outcome: dispatch,
+                    dispatch_quiescence: quiescence.clone(),
+                },
+                decision: VerifiedBlockedByUserDecisionProof(decision),
+                dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                    barrier,
+                    operation_id: progress.operation_id,
+                    plan: progress.plan.clone(),
+                    execution_epoch: progress.execution_epoch(),
+                    eligible_keys: Vec::new(),
+                    observation: quiescence,
+                },
+            });
+        snapshots.push(capture_guarded_terminal_snapshot(
+            progress,
+            authority,
+            FullCapacityAllocationClass::DestinationStaging,
+        ));
+
+        let mut progress =
+            copy_progress_with_claim_class(FullCapacityAllocationClass::JournalRecord, 9203);
+        let retry = RetryObservation::new(
+            1,
+            0,
+            1,
+            RetryLeaseId::new("terminal-preserving-store").expect("retry lease"),
+            10,
+            RetryErrorClass::TransientContention,
+            "busy",
+            None,
+        )
+        .expect("retry observation");
+        progress
+            .request_retry(retry.clone())
+            .expect("retry request");
+        let (barrier, _dispatch, uncertain_key) = terminal_dispatch_barrier_for(&progress, 1, true);
+        let failed_key = uncertain_key.expect("failed pending key");
+        let (context, evidence) = historical_context_and_evidence(&progress, failed_key);
+        let exhaustion = RecoveryExhaustionObservation {
+            attempt_budget: 1,
+            exhausted_attempt: 1,
+            last_retry: retry,
+            failed_participants: vec![FailedParticipantObservation {
+                key: failed_key,
+                attempt: 1,
+                context,
+                evidence,
+            }],
+        };
+        let resource = terminal_resource_observation_for_claim(
+            &progress,
+            0,
+            TerminalResourceOutcome::Retained,
+        );
+        let settlement = settlement_inventory(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        let next_recovery_generation = progress.recovery_generation() + 1;
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::PreservedForRecovery,
+            keys: vec![failed_key],
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::FailedPreservingData(
+            VerifiedFailedPreservingDataAuthority {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                expected_recovery_generation: progress.recovery_generation(),
+                next_recovery_generation,
+                claim_inventory: progress.admission_claims().expect("claims").clone(),
+                observation: FailedPreservingDataObservation {
+                    execution_epoch: progress.execution_epoch(),
+                    recovery_generation: next_recovery_generation,
+                    prior_phase: progress.phase(),
+                    prior_disposition: progress.disposition(),
+                    exhaustion: exhaustion.clone(),
+                    resource_observations: vec![resource.clone()],
+                    claim_settlement: settlement.clone(),
+                    dispatch_quiescence: quiescence.clone(),
+                },
+                exhaustion: VerifiedRecoveryExhaustionProof(exhaustion),
+                resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+                dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                    barrier,
+                    operation_id: progress.operation_id,
+                    plan: progress.plan.clone(),
+                    execution_epoch: progress.execution_epoch(),
+                    eligible_keys: vec![failed_key],
+                    observation: quiescence,
+                },
+            },
+        );
+        snapshots.push(capture_guarded_terminal_snapshot(
+            progress,
+            authority,
+            FullCapacityAllocationClass::JournalRecord,
+        ));
+
+        let mut progress =
+            copy_progress_with_claim_class(FullCapacityAllocationClass::JournalRecord, 9204);
+        publish_prefix(&mut progress);
+        progress
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::UncertainEvidence,
+            ))
+            .expect("audit request");
+        let escalation_key = key_for(&progress, 0, WorkUnitRole::Publish);
+        let (context, evidence) = historical_context_and_evidence(&progress, escalation_key);
+        let escalation = SafetyEscalationObservation {
+            reason: SafetyEscalationReason::DispatchEntryUncertain,
+            audit_generation: progress.audit_generation(),
+            participant_key: escalation_key,
+            context,
+            evidence,
+        };
+        let resource = terminal_resource_observation_for_claim(
+            &progress,
+            0,
+            TerminalResourceOutcome::Retained,
+        );
+        let settlement = settlement_inventory(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        let next_recovery_generation = progress.recovery_generation() + 1;
+        let (barrier, _dispatch, uncertain_key) = terminal_dispatch_barrier_for(&progress, 1, true);
+        let uncertain_key = uncertain_key.expect("uncertain dispatch key");
+        let quiescence = TerminalDispatchQuiescenceObservation {
+            execution_epoch: progress.execution_epoch(),
+            outcome: TerminalDispatchQuiescenceOutcome::PreservedForRecovery,
+            keys: vec![uncertain_key],
+        };
+        let authority = VerifiedTerminalOutcomeAuthority::FailedDataLossRisk(
+            VerifiedFailedDataLossRiskAuthority {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                execution_epoch: progress.execution_epoch(),
+                expected_recovery_generation: progress.recovery_generation(),
+                next_recovery_generation,
+                claim_inventory: progress.admission_claims().expect("claims").clone(),
+                observation: FailedDataLossRiskObservation {
+                    execution_epoch: progress.execution_epoch(),
+                    recovery_generation: next_recovery_generation,
+                    prior_phase: progress.phase(),
+                    prior_disposition: progress.disposition(),
+                    escalation: escalation.clone(),
+                    resource_observations: vec![resource.clone()],
+                    claim_settlement: settlement.clone(),
+                    dispatch_quiescence: quiescence.clone(),
+                },
+                escalation: VerifiedSafetyEscalationProof(escalation),
+                resource_observations: vec![VerifiedTerminalResourceProof(resource)],
+                dispatch_quiescence: VerifiedTerminalDispatchQuiescenceProof {
+                    barrier,
+                    operation_id: progress.operation_id,
+                    plan: progress.plan.clone(),
+                    execution_epoch: progress.execution_epoch(),
+                    eligible_keys: vec![uncertain_key],
+                    observation: quiescence,
+                },
+            },
+        );
+        snapshots.push(capture_guarded_terminal_snapshot(
+            progress,
+            authority,
+            FullCapacityAllocationClass::JournalRecord,
+        ));
+
+        snapshots
+    }
+
+    #[test]
+    fn guarded_terminal_origin_restoration_result_round_trips_codec() {
+        let snapshot = guarded_terminal_origin_restoration_snapshot();
+        let record =
+            super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot.clone())
+                .expect("origin restoration record");
+        let bytes = super::super::full_progress_codec::encode(&record).expect("origin codec");
+        let decoded = super::super::full_progress_codec::decode(&bytes).expect("origin decode");
+        assert_eq!(decoded.snapshot(), &snapshot);
+        let rehydrated = decoded
+            .snapshot()
+            .rehydrate_observation()
+            .expect("origin decoded rehydrates");
+        let recaptured = rehydrated
+            .capture_full_progress_snapshot(decoded.snapshot().intent())
+            .expect("origin decoded recaptures");
+        assert_eq!(&recaptured, decoded.snapshot());
+    }
 }
 
 #[cfg(test)]
@@ -27812,6 +31090,17 @@ pub(crate) fn test_full_progress_store_snapshots() -> (
     FullProgressSnapshotObservation,
 ) {
     tests::full_progress_store_snapshots()
+}
+
+#[cfg(test)]
+pub(crate) fn test_guarded_terminal_store_snapshots() -> Vec<FullProgressSnapshotObservation> {
+    tests::guarded_terminal_store_snapshots()
+}
+
+#[cfg(test)]
+pub(crate) fn test_guarded_terminal_origin_restoration_snapshot() -> FullProgressSnapshotObservation
+{
+    tests::guarded_terminal_origin_restoration_snapshot()
 }
 
 #[cfg(test)]

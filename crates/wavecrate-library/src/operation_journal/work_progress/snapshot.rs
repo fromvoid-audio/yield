@@ -25,9 +25,9 @@ use super::{
     CancellationInventoryError, CancellationRequestObservation, CancellationRequestValidationError,
     CancellationRoute, ForwardCancellationObservation, FullProgressDisposition, OperationPhase,
     ParticipantRequirement, ParticipantScope, PrePublishCancellationObservation,
-    ProgressStepStatus, RetryObservation, RetryObservationValidationError, WorkProgress,
-    WorkProgressError, WorkProgressStep, historical_scope_matches_current,
-    same_stable_source_identity,
+    ProgressStepStatus, RetryObservation, RetryObservationValidationError,
+    TerminalOutcomeObservation, WorkProgress, WorkProgressError, WorkProgressStep,
+    historical_scope_matches_current, same_stable_source_identity,
 };
 
 /// A complete bounded in-memory progress observation tied to one frozen intent.
@@ -58,6 +58,8 @@ pub struct FullProgressSnapshotObservation {
     cancellation_cleanup_observations: Option<CancellationCleanupObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forward_cancellation_observation: Option<ForwardCancellationObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_outcome_observation: Option<TerminalOutcomeObservation>,
     readiness_deferral_batches: Vec<ReadinessDeferralBatchObservation>,
 }
 
@@ -155,6 +157,12 @@ impl FullProgressSnapshotObservation {
         self.forward_cancellation_observation.as_ref()
     }
 
+    /// Borrow the retained guarded terminal-outcome observation, when present.
+    #[allow(dead_code)]
+    pub(crate) fn terminal_outcome_observation(&self) -> Option<&TerminalOutcomeObservation> {
+        self.terminal_outcome_observation.as_ref()
+    }
+
     /// Borrow compact accepted optional-artifact deferral history.
     pub fn readiness_deferral_batches(&self) -> &[ReadinessDeferralBatchObservation] {
         &self.readiness_deferral_batches
@@ -188,6 +196,7 @@ impl FullProgressSnapshotObservation {
         self.validate_cancellation_cleanup_observations(&validation_progress)?;
         self.validate_pre_publish_cancellation(&validation_progress)?;
         self.validate_forward_cancellation(&validation_progress)?;
+        self.validate_terminal_outcome(&validation_progress)?;
         self.validate_lifecycle_consistency(&validation_progress)?;
         Ok(())
     }
@@ -706,6 +715,46 @@ impl FullProgressSnapshotObservation {
             )
     }
 
+    fn validate_terminal_outcome(
+        &self,
+        progress: &WorkProgress,
+    ) -> Result<(), FullProgressSnapshotObservationError> {
+        let terminal_disposition = matches!(
+            self.disposition,
+            FullProgressDisposition::RolledBack
+                | FullProgressDisposition::BlockedByUser
+                | FullProgressDisposition::FailedPreservingData
+                | FullProgressDisposition::FailedDataLossRisk
+        );
+        match (
+            self.terminal_outcome_observation.as_ref(),
+            terminal_disposition,
+        ) {
+            (Some(observation), true) => {
+                if self.phase != OperationPhase::Terminal {
+                    return Err(
+                        FullProgressSnapshotObservationError::TerminalOutcomeStateMismatch {
+                            disposition: self.disposition,
+                            phase: self.phase,
+                        },
+                    );
+                }
+                progress
+                    .validate_terminal_outcome_observation(observation)
+                    .map_err(|source| {
+                        FullProgressSnapshotObservationError::TerminalOutcomeValidation { source }
+                    })
+            }
+            (None, true) => Err(
+                FullProgressSnapshotObservationError::TerminalOutcomeMissing {
+                    disposition: self.disposition,
+                },
+            ),
+            (Some(_), false) => Err(FullProgressSnapshotObservationError::TerminalOutcomeOrphaned),
+            (None, false) => Ok(()),
+        }
+    }
+
     fn validate_lifecycle_consistency(
         &self,
         progress: &WorkProgress,
@@ -724,6 +773,10 @@ impl FullProgressSnapshotObservation {
                 | FullProgressDisposition::CancelledBeforePublish
                 | FullProgressDisposition::CancelledAfterPublish
                 | FullProgressDisposition::CancelledAfterObservedEffect
+                | FullProgressDisposition::RolledBack
+                | FullProgressDisposition::BlockedByUser
+                | FullProgressDisposition::FailedPreservingData
+                | FullProgressDisposition::FailedDataLossRisk
         );
         if !supported {
             return Err(
@@ -754,6 +807,10 @@ impl FullProgressSnapshotObservation {
                 | FullProgressDisposition::CancelledBeforePublish
                 | FullProgressDisposition::CancelledAfterPublish
                 | FullProgressDisposition::CancelledAfterObservedEffect
+                | FullProgressDisposition::RolledBack
+                | FullProgressDisposition::BlockedByUser
+                | FullProgressDisposition::FailedPreservingData
+                | FullProgressDisposition::FailedDataLossRisk
         );
         if terminal {
             if self.phase != OperationPhase::Terminal {
@@ -791,7 +848,9 @@ impl FullProgressSnapshotObservation {
                 | FullProgressDisposition::CancelRequestedBeforePublish
                 | FullProgressDisposition::CancelRequestedAfterPublish
                 | FullProgressDisposition::CancelRequestedAfterObservedEffect
-                | FullProgressDisposition::CancelledBeforePublish => true,
+                | FullProgressDisposition::CancelledBeforePublish
+                | FullProgressDisposition::FailedPreservingData
+                | FullProgressDisposition::FailedDataLossRisk => true,
                 FullProgressDisposition::AuditRequired => {
                     self.active_audit.as_ref().is_some_and(|active| {
                         matches!(
@@ -845,7 +904,14 @@ impl FullProgressSnapshotObservation {
                 settlement
                     .validate_normal_success_settlement(claims)
                     .map_err(FullProgressSnapshotObservationError::ClaimSettlement)?;
-                if !forward_terminal {
+                let guarded_terminal = matches!(
+                    self.disposition,
+                    FullProgressDisposition::RolledBack
+                        | FullProgressDisposition::BlockedByUser
+                        | FullProgressDisposition::FailedPreservingData
+                        | FullProgressDisposition::FailedDataLossRisk
+                );
+                if !forward_terminal && !guarded_terminal {
                     let settled = settlement.all_settled_without_held();
                     if !progress.all_required_complete() || !progress.optional_artifacts_resolved()
                     {
@@ -887,9 +953,21 @@ impl FullProgressSnapshotObservation {
         }
 
         let expected_recovery_generation = self
-            .forward_cancellation_observation
+            .terminal_outcome_observation
             .as_ref()
-            .map(|forward| forward.recovery_generation)
+            .map(|observation| match observation {
+                TerminalOutcomeObservation::RolledBack(value) => value.recovery_generation,
+                TerminalOutcomeObservation::BlockedByUser(value) => value.recovery_generation,
+                TerminalOutcomeObservation::FailedPreservingData(value) => {
+                    value.recovery_generation
+                }
+                TerminalOutcomeObservation::FailedDataLossRisk(value) => value.recovery_generation,
+            })
+            .or_else(|| {
+                self.forward_cancellation_observation
+                    .as_ref()
+                    .map(|forward| forward.recovery_generation)
+            })
             .or_else(|| {
                 self.after_effect_reconciliation
                     .as_ref()
@@ -911,6 +989,7 @@ impl FullProgressSnapshotObservation {
             ),
             None if self.pre_publish_cancellation.is_none()
                 && self.cancellation_cleanup_observations.is_none()
+                && self.terminal_outcome_observation.is_none()
                 && self.recovery_generation != 0 =>
             {
                 Err(
@@ -1085,7 +1164,12 @@ impl FullProgressSnapshotObservation {
     fn validate_audit_state(&self) -> Result<(), FullProgressSnapshotObservationError> {
         match self.active_audit.as_ref() {
             Some(active) => {
-                if self.disposition != FullProgressDisposition::AuditRequired {
+                if !matches!(
+                    self.disposition,
+                    FullProgressDisposition::AuditRequired
+                        | FullProgressDisposition::FailedPreservingData
+                        | FullProgressDisposition::FailedDataLossRisk
+                ) {
                     return Err(
                         FullProgressSnapshotObservationError::AuditDispositionMismatch {
                             disposition: self.disposition,
@@ -1187,6 +1271,7 @@ impl FullProgressSnapshotObservation {
             after_effect_reconciliation: self.after_effect_reconciliation.clone(),
             cancellation_cleanup_observations: self.cancellation_cleanup_observations.clone(),
             forward_cancellation_observation: self.forward_cancellation_observation.clone(),
+            terminal_outcome_observation: self.terminal_outcome_observation.clone(),
             readiness_deferral_batches: self.readiness_deferral_batches.clone(),
         }
     }
@@ -1461,6 +1546,9 @@ impl FullProgressSnapshotObservation {
         if self.forward_cancellation_observation != progress.forward_cancellation_observation {
             return Err(mismatch("forward_cancellation_observation"));
         }
+        if self.terminal_outcome_observation != progress.terminal_outcome_observation {
+            return Err(mismatch("terminal_outcome_observation"));
+        }
         if self.readiness_deferral_batches != progress.readiness_deferral_batches {
             return Err(mismatch("readiness_deferral_batches"));
         }
@@ -1477,6 +1565,7 @@ fn cancellation_disposition_requires_envelope(disposition: FullProgressDispositi
             | FullProgressDisposition::CancelledBeforePublish
             | FullProgressDisposition::CancelledAfterPublish
             | FullProgressDisposition::CancelledAfterObservedEffect
+            | FullProgressDisposition::BlockedByUser
     )
 }
 
@@ -1489,16 +1578,19 @@ fn cancellation_disposition_matches_route(
             disposition,
             FullProgressDisposition::CancelRequestedBeforePublish
                 | FullProgressDisposition::CancelledBeforePublish
+                | FullProgressDisposition::BlockedByUser
         ),
         CancellationRoute::AfterPublish => matches!(
             disposition,
             FullProgressDisposition::CancelRequestedAfterPublish
                 | FullProgressDisposition::CancelledAfterPublish
+                | FullProgressDisposition::RolledBack
         ),
         CancellationRoute::AfterObservedEffect => matches!(
             disposition,
             FullProgressDisposition::CancelRequestedAfterObservedEffect
                 | FullProgressDisposition::CancelledAfterObservedEffect
+                | FullProgressDisposition::RolledBack
         ),
     }
 }
@@ -1922,6 +2014,30 @@ pub enum FullProgressSnapshotObservationError {
         #[source]
         source: WorkProgressError,
     },
+    /// A supported guarded terminal disposition omitted its bounded observation.
+    #[error(
+        "full-progress snapshot terminal disposition {disposition:?} has no terminal observation"
+    )]
+    TerminalOutcomeMissing {
+        disposition: FullProgressDisposition,
+    },
+    /// A terminal outcome observation was retained under a non-terminal disposition.
+    #[error("full-progress snapshot terminal outcome observation is orphaned")]
+    TerminalOutcomeOrphaned,
+    /// A guarded terminal disposition was retained outside the terminal phase.
+    #[error(
+        "full-progress snapshot terminal outcome disposition {disposition:?} has phase {phase:?}"
+    )]
+    TerminalOutcomeStateMismatch {
+        disposition: FullProgressDisposition,
+        phase: OperationPhase,
+    },
+    /// The nested terminal outcome observation failed exact validation.
+    #[error("invalid full-progress snapshot terminal outcome observation: {source}")]
+    TerminalOutcomeValidation {
+        #[source]
+        source: WorkProgressError,
+    },
     /// The accepted after-effect observation belongs to a future snapshot epoch.
     #[error(
         "full-progress snapshot after-effect execution epoch {accepted} is newer than current epoch {current}"
@@ -2094,6 +2210,7 @@ impl WorkProgress {
             after_effect_reconciliation,
             cancellation_cleanup_observations,
             forward_cancellation_observation,
+            terminal_outcome_observation,
             readiness_deferral_batches,
         } = self;
         let snapshot = FullProgressSnapshotObservation {
@@ -2115,6 +2232,7 @@ impl WorkProgress {
             after_effect_reconciliation: after_effect_reconciliation.clone(),
             cancellation_cleanup_observations: cancellation_cleanup_observations.clone(),
             forward_cancellation_observation: forward_cancellation_observation.clone(),
+            terminal_outcome_observation: terminal_outcome_observation.clone(),
             readiness_deferral_batches: readiness_deferral_batches.clone(),
         };
         snapshot.validate_base()?;
