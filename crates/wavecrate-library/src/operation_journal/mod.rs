@@ -14,6 +14,7 @@ pub mod cancellation_recovery;
 pub mod codec;
 pub mod coordinator;
 pub mod decoded_edit_commands;
+pub mod decoded_export_batch_commands;
 pub mod decoded_export_commands;
 pub mod evidence;
 pub mod external_commands;
@@ -123,6 +124,10 @@ pub use coordinator::{
 pub use decoded_edit_commands::{
     DecodedEditIntentArgs, DecodedEditOperation, DecodedEditOperationArgs,
     DecodedEditValidationError, MAX_DECODED_EDIT_RANGES,
+};
+pub use decoded_export_batch_commands::{
+    DecodedExportBatchFailurePolicy, DecodedExportBatchIntentArgs, DecodedExportBatchOutput,
+    DecodedExportBatchValidationError, MAX_DECODED_EXPORT_BATCH_OUTPUTS,
 };
 pub use decoded_export_commands::{
     DecodedExportChannelBehavior, DecodedExportDither, DecodedExportIntentArgs,

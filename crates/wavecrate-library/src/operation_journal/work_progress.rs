@@ -6662,9 +6662,10 @@ mod tests {
         CoordinatorClosureManifestError, CoordinatorClosureManifestValidationError,
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         CreateFolderIntentArgs, DecodedEditIntentArgs, DecodedEditOperationArgs,
-        DecodedExportIntentArgs, DecodedExportOutputPolicy, DecodedExportRegistrationMetadata,
-        DecodedExportSampleFormat, DecodedExportSampleRate, DurableReadinessWakeObservation,
-        EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        DecodedExportBatchIntentArgs, DecodedExportBatchOutput, DecodedExportIntentArgs,
+        DecodedExportOutputPolicy, DecodedExportRegistrationMetadata, DecodedExportSampleFormat,
+        DecodedExportSampleRate, DurableReadinessWakeObservation, EvidenceBatchId,
+        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
         ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
         ExternalRawObservationLimits, ExternalRawObservationMetadata,
         ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
@@ -7332,6 +7333,60 @@ mod tests {
             admission_claims(12),
         )
         .expect("decoded export progress");
+        (progress, participants, args)
+    }
+
+    fn decoded_export_batch_progress() -> (WorkProgress, ParticipantSet, UniversalCommandArgs) {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("decoded batch source endpoint");
+        let outputs = ["a.wav", "b.wav"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                DecodedExportBatchOutput::new(
+                    WaveformEditFrameRange::new(10 + index as u64, 40 + index as u64)
+                        .expect("batch range"),
+                    CopyEndpoint::new(
+                        source,
+                        source_id.clone(),
+                        StoredRelativePath::new(path).expect("batch destination path"),
+                    )
+                    .expect("batch destination endpoint"),
+                )
+                .expect("batch output")
+            })
+            .collect();
+        let batch = DecodedExportBatchIntentArgs::from_reference(
+            source_endpoint,
+            7,
+            WaveformFileRevisionObservation::new("file-id", "change-marker", 1024, Some(3))
+                .expect("decoded batch file revision"),
+            WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                .expect("decoded batch source spec"),
+            100,
+            outputs,
+            DecodedExportOutputPolicy::default(),
+            Some(-2),
+            20,
+        )
+        .expect("decoded batch arguments");
+        let args = UniversalCommandArgs::DecodedExportBatch(batch);
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("decoded batch work plan");
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(209)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("decoded batch progress");
         (progress, participants, args)
     }
 
@@ -21816,6 +21871,38 @@ mod tests {
                 ))
                 .expect("decoded export snapshot"),
         );
+
+        let (decoded_export_batch, participants, args) = decoded_export_batch_progress();
+        roundtrip(
+            decoded_export_batch
+                .capture_full_progress_snapshot(&snapshot_intent_for(
+                    &decoded_export_batch,
+                    args,
+                    participants,
+                ))
+                .expect("decoded export batch snapshot"),
+        );
+    }
+
+    #[test]
+    fn full_progress_codec_rejects_invalid_decoded_export_batch_child() {
+        let (progress, participants, args) = decoded_export_batch_progress();
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("decoded export batch snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("decoded export batch record");
+        let bytes = super::super::full_progress_codec::encode(&record).expect("encode");
+        let mut invalid: serde_json::Value = serde_json::from_slice(&bytes).expect("value");
+        invalid["snapshot"]["intent"]["args"]["DecodedExportBatch"]["outputs"][0]["range"] =
+            serde_json::json!({"start_frame": 50, "end_frame": 10});
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&invalid).expect("invalid child bytes")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+                | Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
     }
 
     #[test]

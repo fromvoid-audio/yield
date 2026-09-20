@@ -3251,6 +3251,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
                 "schema-v6 cannot carry full-progress-only DecodedExport arguments",
             ));
         }
+        UniversalCommandArgs::DecodedExportBatch(_) => {
+            return Err(String::from(
+                "schema-v6 cannot carry full-progress-only DecodedExportBatch arguments",
+            ));
+        }
         UniversalCommandArgs::Namespace(_) => {
             return Err(String::from(
                 "schema-v6 cannot carry schema-v8 namespace arguments",
@@ -3593,6 +3598,7 @@ fn validate_tagged_coordinator_shape(
         UniversalCommandArgs::WaveformEdit(_) => "WaveformEdit",
         UniversalCommandArgs::DecodedEdit(_) => "DecodedEdit",
         UniversalCommandArgs::DecodedExport(_) => "DecodedExport",
+        UniversalCommandArgs::DecodedExportBatch(_) => "DecodedExportBatch",
         UniversalCommandArgs::Namespace(_) => "Namespace",
         UniversalCommandArgs::Render(_) => "Render",
         UniversalCommandArgs::Removal(_) => "Removal",
@@ -3630,6 +3636,9 @@ fn validate_tagged_coordinator_shape(
             "DecodedExport" => {
                 format!("{schema_name} cannot carry full-progress-only DecodedExport arguments")
             }
+            "DecodedExportBatch" => format!(
+                "{schema_name} cannot carry full-progress-only DecodedExportBatch arguments"
+            ),
             _ => format!("{schema_name} cannot carry {variant} arguments"),
         });
     }
@@ -3740,7 +3749,8 @@ pub(super) fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &
 mod tests {
     use super::*;
     use crate::operation_journal::{
-        DecodedEditIntentArgs, DecodedExportIntentArgs, UniversalCommandKind,
+        DecodedEditIntentArgs, DecodedExportBatchIntentArgs, DecodedExportIntentArgs,
+        UniversalCommandKind,
     };
     use crate::operation_journal::{RecordConsistency, classify_record};
 
@@ -5090,6 +5100,86 @@ mod tests {
         )
         .expect("V15 external reconciliation record");
         v15_record.universal_command_args = Some(UniversalCommandArgs::DecodedExport(decoded_args));
+        assert!(matches!(
+            encode(&v15_record),
+            Err(EncodeError::InvalidV15Record { ref reason })
+                if reason.contains("full-progress-only")
+        ));
+    }
+
+    #[test]
+    fn decoded_export_batch_is_rejected_by_legacy_v7_and_v15_encode_and_decode() {
+        let copy = v6_command_fixture("Copy");
+        let batch_arguments = serde_json::json!({
+            "source": copy["universal_command_args"]["Copy"]["source"],
+            "source_revision": 7,
+            "source_file_revision": {
+                "filesystem_identity": "file-identity",
+                "change_marker": "change-marker",
+                "byte_len": 1024,
+                "modified_unix_ns": 11
+            },
+            "source_spec": {
+                "channels": 2,
+                "sample_rate": 48000,
+                "bits_per_sample": 16,
+                "sample_format": "Integer"
+            },
+            "total_frames": 10,
+            "outputs": [{
+                "range": {"start_frame": 2, "end_frame": 8},
+                "destination": copy["universal_command_args"]["Copy"]["destination"]
+            }],
+            "output_policy": {
+                "sample_rate": "source",
+                "sample_format": "float32",
+                "channel_behavior": "preserve-mono-stereo",
+                "dither": "none"
+            },
+            "rating": 0,
+            "requested_edge_fade_frames": 1,
+            "failure_policy": "continue-and-report-per-output",
+            "collision_policy": "NoReplace"
+        });
+        let tagged = serde_json::json!({"DecodedExportBatch": batch_arguments});
+
+        let mut v7 = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        v7["universal_intent"]["command_kind"] = Value::from("Export");
+        v7["universal_command_args"] = tagged.clone();
+        assert!(matches!(
+            decode(&serde_json::to_vec(&v7).expect("V7 decoded-export-batch bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let decoded_args: DecodedExportBatchIntentArgs =
+            serde_json::from_value(tagged["DecodedExportBatch"].clone())
+                .expect("decoded-export-batch typed arguments");
+        let mut v7_record = decode(
+            &serde_json::to_vec(&v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8)))
+                .expect("V7 waveform bytes"),
+        )
+        .expect("V7 waveform record");
+        v7_record.universal_command_args = Some(UniversalCommandArgs::DecodedExportBatch(
+            decoded_args.clone(),
+        ));
+        assert!(matches!(
+            encode(&v7_record),
+            Err(EncodeError::InvalidV7Record { ref reason })
+                if reason.contains("full-progress-only")
+        ));
+
+        let mut v15 = v15_external_reconciliation_fixture();
+        v15["universal_command_args"] = tagged;
+        assert!(matches!(
+            decode(&serde_json::to_vec(&v15).expect("V15 decoded-export-batch bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+        let mut v15_record = decode(
+            &serde_json::to_vec(&v15_external_reconciliation_fixture())
+                .expect("V15 external reconciliation bytes"),
+        )
+        .expect("V15 external reconciliation record");
+        v15_record.universal_command_args =
+            Some(UniversalCommandArgs::DecodedExportBatch(decoded_args));
         assert!(matches!(
             encode(&v15_record),
             Err(EncodeError::InvalidV15Record { ref reason })

@@ -958,6 +958,12 @@ fn collect_topology(
             collect_copy_endpoint(collected, command.source(), true, true)?;
             collect_copy_endpoint(collected, command.destination(), false, true)?;
         }
+        UniversalCommandArgs::DecodedExportBatch(command) => {
+            collect_copy_endpoint(collected, command.source(), true, true)?;
+            for output in command.outputs() {
+                collect_copy_endpoint(collected, output.destination(), false, true)?;
+            }
+        }
         UniversalCommandArgs::Namespace(command) => match command {
             NamespaceCommandArgs::Rename(command) => {
                 collect_namespace_entry(collected, command.source(), true, true)?;
@@ -1297,6 +1303,24 @@ fn derive_actions(
             )?;
             action_spans.push(span);
         }
+        UniversalCommandArgs::DecodedExportBatch(command) => {
+            let source = required_source(topology, command.source().participant_id())?;
+            for (index, output) in command.outputs().iter().enumerate() {
+                let action = u8::try_from(index).map_err(|_| WorkPlanError::StepOrdinalOverflow)?;
+                let destination = required_source(topology, output.destination().participant_id())?;
+                let mut span = ActionSpan::default();
+                add_staged_mutation(
+                    builder,
+                    &mut span,
+                    action,
+                    0,
+                    topology.filesystem,
+                    source,
+                    destination.participant_id,
+                )?;
+                action_spans.push(span);
+            }
+        }
         UniversalCommandArgs::Namespace(command) => {
             let mut span = ActionSpan::default();
             match command {
@@ -1533,8 +1557,10 @@ fn derive_actions(
             action_spans.push(span);
         }
     }
-    for pair in action_spans.windows(2) {
-        chain_spans(builder, &pair[0], &pair[1])?;
+    if !matches!(args, UniversalCommandArgs::DecodedExportBatch(_)) {
+        for pair in action_spans.windows(2) {
+            chain_spans(builder, &pair[0], &pair[1])?;
+        }
     }
     Ok(())
 }
@@ -2528,13 +2554,14 @@ mod tests {
     use super::*;
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        DecodedEditIntentArgs, DecodedEditOperationArgs, DecodedExportChannelBehavior,
-        DecodedExportDither, DecodedExportIntentArgs, DecodedExportOutputPolicy,
-        DecodedExportRegistrationMetadata, DecodedExportSampleFormat, DecodedExportSampleRate,
-        ExternalRootBindingId, FiniteF32Bits, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
-        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
-        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
-        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
+        DecodedEditIntentArgs, DecodedEditOperationArgs, DecodedExportBatchIntentArgs,
+        DecodedExportBatchOutput, DecodedExportChannelBehavior, DecodedExportDither,
+        DecodedExportIntentArgs, DecodedExportOutputPolicy, DecodedExportRegistrationMetadata,
+        DecodedExportSampleFormat, DecodedExportSampleRate, ExternalRootBindingId, FiniteF32Bits,
+        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
+        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
+        NamespaceFileExpectation, NamespaceLeafName, NamespaceMoveIntentArgs,
+        NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
         ParticipantCheckpointState, ParticipantDescriptor, RawWavExtractionRecipe,
         RemovalCommandArgs, RetainedDeleteId, RetainedFolderObservation, RetainedPurgeDecision,
         RetainedPurgeIntentArgs, RetainedRecoveryRootKind, RetainedResolutionCommandArgs,
@@ -3670,5 +3697,81 @@ mod tests {
         assert!(plan.units().iter().any(|unit| {
             unit.key().role() == WorkUnitRole::SourceAffect && unit.key().participant_id() == source
         }));
+    }
+
+    #[test]
+    fn decoded_export_batch_keeps_output_spans_independent_and_fans_into_global() {
+        let (participants, source, _filesystem, source_id) = valid_topology();
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("source endpoint");
+        let outputs = ["a.wav", "b.wav"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                DecodedExportBatchOutput::new(
+                    WaveformEditFrameRange::new(10 + index as u64, 40 + index as u64)
+                        .expect("range"),
+                    CopyEndpoint::new(
+                        source,
+                        source_id.clone(),
+                        StoredRelativePath::new(path).expect("destination path"),
+                    )
+                    .expect("destination endpoint"),
+                )
+                .expect("batch output")
+            })
+            .collect();
+        let batch = DecodedExportBatchIntentArgs::from_reference(
+            source_endpoint,
+            7,
+            WaveformFileRevisionObservation::new("file", "change", 256, Some(3))
+                .expect("file revision"),
+            WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                .expect("source spec"),
+            100,
+            outputs,
+            DecodedExportOutputPolicy::default(),
+            None,
+            4,
+        )
+        .expect("decoded export batch arguments");
+        let args = UniversalCommandArgs::DecodedExportBatch(batch);
+        let plan = derive_work_plan(&args, &participants).expect("decoded export batch plan");
+        plan.validate()
+            .expect("decoded export batch plan validates");
+
+        let first_tail =
+            WorkUnitKey::new(0, STEP_SOURCE_AFFECT, source, WorkUnitRole::SourceAffect);
+        let second_tail =
+            WorkUnitKey::new(1, STEP_SOURCE_AFFECT, source, WorkUnitRole::SourceAffect);
+        let global = WorkUnitKey::new(
+            GLOBAL_ACTION_ORDINAL,
+            STEP_GLOBAL_LIBRARY,
+            ParticipantId::from_uuid(Uuid::from_u128(3)),
+            WorkUnitRole::GlobalLibrary,
+        );
+        assert!(
+            plan.prerequisites()
+                .contains(&WorkPrerequisite::new(first_tail, global,))
+        );
+        assert!(
+            plan.prerequisites()
+                .contains(&WorkPrerequisite::new(second_tail, global,))
+        );
+        assert!(!plan.prerequisites().contains(&WorkPrerequisite::new(
+            first_tail,
+            WorkUnitKey::new(1, STEP_SOURCE_READ, source, WorkUnitRole::SourceRead),
+        )));
+        assert_eq!(
+            plan.units()
+                .iter()
+                .filter(|unit| unit.key().role() == WorkUnitRole::Publish)
+                .count(),
+            2
+        );
     }
 }
