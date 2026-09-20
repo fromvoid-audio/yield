@@ -628,6 +628,26 @@ impl SourceDatabase {
         Ok(source_lease.publication_fence())
     }
 
+    /// Return the verified root and main-file identities used by the source-local journal reader.
+    ///
+    /// This is observation metadata only.  The retained profile, database-file binding, and
+    /// source lease are revalidated before the identities are exposed to a read transaction.
+    pub(crate) fn legacy_journal_dedup_binding(&self) -> Result<(String, String), SourceDbError> {
+        let profile_guard = self
+            .profile_guard
+            .as_ref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        self.validate_profile_owned_open(profile_guard)?;
+        let binding = self
+            .database_file_binding
+            .as_deref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        Ok((
+            binding.root().identity().to_owned(),
+            binding.identity().to_owned(),
+        ))
+    }
+
     /// Return the retained lease control connection's change count for ownership tests.
     #[cfg(test)]
     pub(crate) fn source_lease_control_total_changes_for_tests(

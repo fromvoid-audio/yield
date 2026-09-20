@@ -7,6 +7,7 @@
 
 use std::fmt::Display;
 
+use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use thiserror::Error;
 
@@ -16,7 +17,7 @@ use super::entry::FileOpJournalEntry;
 
 /// Maximum number of legacy journal rows returned by one page.
 pub const MAX_LEGACY_JOURNAL_ROWS_PER_PAGE: usize = 16;
-/// Maximum number of legacy text bytes materialized by one page.
+/// Maximum number of bounded legacy fingerprint/value bytes materialized by one page.
 pub const MAX_LEGACY_JOURNAL_BYTES_PER_PAGE: usize = 2 * 1024 * 1024;
 /// Maximum number of bytes materialized from one legacy text field.
 pub const MAX_LEGACY_JOURNAL_FIELD_BYTES: usize = 64 * 1024;
@@ -25,6 +26,10 @@ pub const MAX_LEGACY_JOURNAL_PREVIEW_BYTES: usize = 256;
 
 const PAGE_QUERY_LIMIT: i64 = (MAX_LEGACY_JOURNAL_ROWS_PER_PAGE + 1) as i64;
 const LEGACY_COLUMN_COUNT: usize = 18;
+const MAX_LEGACY_JOURNAL_SCHEMA_COLUMNS: usize = 32;
+const MAX_LEGACY_JOURNAL_SCHEMA_NAME_BYTES: usize = 256;
+const LEGACY_DEDUP_FINGERPRINT_VERSION: u8 = 1;
+const LEGACY_DEDUP_FINGERPRINT_DOMAIN: &[u8] = b"wavecrate.legacy-journal.dedup\0";
 
 const LEGACY_COLUMNS: [&str; LEGACY_COLUMN_COUNT] = [
     "id",
@@ -247,12 +252,102 @@ pub enum LegacyJournalRowOutcome {
     Retained(LegacyJournalRetentionReason),
 }
 
+/// A complete, versioned identity for one raw legacy journal row.
+///
+/// The source and database identities come from the retained bindings validated at the scan
+/// boundary.  The digest covers every known SQLite cell in the fixed canonical column order;
+/// it is not derived from a decoded entry or a bounded diagnostic preview.  Version one hashes a
+/// domain marker, the version byte, and for each column its UTF-8 name length/name, storage-class
+/// tag, value length, and complete raw value.  Integers and real values use fixed-width little
+/// endian bytes; text and blobs retain their SQLite bytes; NULL has a distinct empty value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyJournalDedupIdentity {
+    root_identity: String,
+    database_identity: String,
+    rowid: i64,
+    fingerprint_version: u8,
+    fingerprint: [u8; 32],
+}
+
+impl LegacyJournalDedupIdentity {
+    /// Return the verified database-root identity containing the source journal.
+    pub fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    /// Return the verified SQLite main-file identity.
+    pub fn database_identity(&self) -> &str {
+        &self.database_identity
+    }
+
+    /// Return the SQLite rowid included in this identity.
+    pub fn rowid(&self) -> i64 {
+        self.rowid
+    }
+
+    /// Return the canonical raw-cell fingerprint version.
+    pub fn fingerprint_version(&self) -> u8 {
+        self.fingerprint_version
+    }
+
+    /// Return the complete BLAKE3 fingerprint of the canonical raw cells.
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+}
+
+/// A bounded reason why a complete legacy dedup identity could not be produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LegacyJournalDedupIdentityUnavailable {
+    /// The physical table did not expose exactly the known legacy columns.
+    Schema {
+        /// Bounded schema diagnostic.
+        reason: String,
+    },
+    /// One raw SQLite value exceeded the per-cell bound.
+    ValueTooLarge {
+        /// Field whose complete value was not materialized.
+        field: LegacyJournalField,
+        /// SQLite byte length, when available.
+        declared: Option<i64>,
+    },
+    /// A raw SQLite representation could not be fingerprinted completely.
+    ValueUnavailable {
+        /// Field whose raw value was unavailable.
+        field: LegacyJournalField,
+        /// Bounded diagnostic.
+        reason: String,
+    },
+    /// The row changed between candidate metadata and bounded raw-cell read.
+    RowChanged {
+        /// Bounded diagnostic.
+        reason: String,
+    },
+    /// The candidate row disappeared before the raw-cell read.
+    RowDisappeared,
+    /// The complete canonical row would exceed the page materialization bound.
+    RowTooLarge {
+        /// Canonical encoded byte count when it was representable.
+        declared: Option<i64>,
+    },
+}
+
+/// Result of the scanner's bounded attempt to produce a legacy dedup identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LegacyJournalDedupIdentityResult {
+    /// A complete identity was produced from the verified source binding and raw cells.
+    Complete(LegacyJournalDedupIdentity),
+    /// The row remains observable, but its complete identity is unavailable.
+    Unavailable(LegacyJournalDedupIdentityUnavailable),
+}
+
 /// One bounded legacy journal row observation.
 #[derive(Clone, Debug)]
 pub struct LegacyJournalEntry {
     rowid: i64,
     key: LegacyJournalKey,
     outcome: LegacyJournalRowOutcome,
+    dedup_identity: LegacyJournalDedupIdentityResult,
     bytes: usize,
 }
 
@@ -272,7 +367,12 @@ impl LegacyJournalEntry {
         &self.outcome
     }
 
-    /// Return the text bytes materialized for this row.
+    /// Return the complete identity or bounded unavailability reason for this row.
+    pub fn dedup_identity(&self) -> &LegacyJournalDedupIdentityResult {
+        &self.dedup_identity
+    }
+
+    /// Return the bounded raw/fingerprint bytes materialized for this row.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -336,7 +436,7 @@ impl LegacyJournalPage {
         self.done
     }
 
-    /// Return the aggregate text bytes materialized for this page.
+    /// Return the aggregate bounded raw/fingerprint bytes materialized for this page.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -372,6 +472,7 @@ pub fn scan_page(
     cursor: Option<LegacyJournalCursor>,
 ) -> Result<LegacyJournalPage, LegacyJournalScanError> {
     let before_fence = db.source_publication_fence()?;
+    let source_binding = db.legacy_journal_dedup_binding()?;
     if !before_fence.is_live() {
         return Err(LegacyJournalScanError::StaleCursor {
             reason: String::from("source ownership has been retired"),
@@ -393,7 +494,12 @@ pub fn scan_page(
         .connection
         .unchecked_transaction()
         .map_err(scan_sql_error)?;
-    let page_result = scan_page_in_transaction(&transaction, cursor.as_ref(), &before_fence);
+    let page_result = scan_page_in_transaction(
+        &transaction,
+        cursor.as_ref(),
+        &before_fence,
+        &source_binding,
+    );
     let rollback_result = transaction.rollback().map_err(scan_sql_error);
     let mut page = match (page_result, rollback_result) {
         (_, Err(error)) => return Err(error),
@@ -413,6 +519,7 @@ fn scan_page_in_transaction(
     transaction: &Transaction<'_>,
     cursor: Option<&LegacyJournalCursor>,
     publication_fence: &SourcePublicationFence,
+    source_binding: &(String, String),
 ) -> Result<LegacyJournalPage, LegacyJournalScanError> {
     let (upper_rowid, after_rowid) = match cursor {
         Some(cursor) => (Some(cursor.upper_rowid), Some(cursor.after_rowid)),
@@ -427,6 +534,19 @@ fn scan_page_in_transaction(
         });
     };
 
+    let schema = load_legacy_schema(transaction)?;
+    if let LegacySchemaStatus::Unavailable {
+        reason,
+        projection_safe: false,
+    } = &schema
+    {
+        return Err(LegacyJournalScanError::RequiresAudit {
+            reason: match reason {
+                LegacyJournalDedupIdentityUnavailable::Schema { reason } => reason.clone(),
+                _ => String::from("legacy journal schema cannot be safely projected"),
+            },
+        });
+    }
     let candidates = load_candidates(transaction, upper_rowid, after_rowid)?;
     let mut entries = Vec::with_capacity(MAX_LEGACY_JOURNAL_ROWS_PER_PAGE);
     let mut bytes = 0_usize;
@@ -439,18 +559,34 @@ fn scan_page_in_transaction(
             break;
         }
 
-        if let Some(reason) = candidate.metadata_issue() {
-            last_rowid = Some(candidate.rowid);
-            entries.push(LegacyJournalEntry {
-                rowid: candidate.rowid,
-                key: candidate.key(),
-                outcome: LegacyJournalRowOutcome::Retained(reason),
-                bytes: 0,
-            });
-            continue;
-        }
-
-        let row_bytes = candidate.text_bytes()?;
+        let row_bytes = match candidate.fingerprint_bytes() {
+            Ok(bytes) => bytes,
+            Err(LegacyJournalDedupIdentityUnavailable::ValueTooLarge { field, declared }) => {
+                last_rowid = Some(candidate.rowid);
+                entries.push(LegacyJournalEntry {
+                    rowid: candidate.rowid,
+                    key: candidate.key(),
+                    outcome: LegacyJournalRowOutcome::Retained(
+                        candidate.metadata_issue().unwrap_or(
+                            LegacyJournalRetentionReason::SizeInvalid {
+                                field,
+                                declared,
+                                reason: String::from(
+                                    "legacy raw value exceeds the bounded field size",
+                                ),
+                            },
+                        ),
+                    ),
+                    dedup_identity: unavailable_for_schema_or_row(
+                        &schema,
+                        LegacyJournalDedupIdentityUnavailable::ValueTooLarge { field, declared },
+                    ),
+                    bytes: 0,
+                });
+                continue;
+            }
+            Err(_) => candidate.text_bytes()?,
+        };
         if row_bytes > MAX_LEGACY_JOURNAL_BYTES_PER_PAGE {
             last_rowid = Some(candidate.rowid);
             entries.push(LegacyJournalEntry {
@@ -463,6 +599,12 @@ fn scan_page_in_transaction(
                         reason: String::from("row exceeds the bounded page byte budget"),
                     },
                 ),
+                dedup_identity: unavailable_for_schema_or_row(
+                    &schema,
+                    LegacyJournalDedupIdentityUnavailable::RowTooLarge {
+                        declared: i64::try_from(row_bytes).ok(),
+                    },
+                ),
                 bytes: 0,
             });
             continue;
@@ -472,27 +614,42 @@ fn scan_page_in_transaction(
             break;
         }
 
-        let (outcome, loaded_bytes) = match load_bounded_row(transaction, candidate)? {
-            BoundedRow::Missing => (
+        let loaded = load_bounded_row(transaction, candidate, source_binding, &schema)?;
+        let (outcome, dedup_identity, loaded_bytes) = match loaded {
+            BoundedRow::Missing { identity } => (
                 LegacyJournalRowOutcome::Retained(LegacyJournalRetentionReason::RowDisappeared {
                     rowid: candidate.rowid,
                 }),
+                identity,
                 0,
             ),
-            BoundedRow::Changed(reason) => (
+            BoundedRow::Changed { reason, identity } => (
                 LegacyJournalRowOutcome::Retained(LegacyJournalRetentionReason::RowChanged {
                     rowid: candidate.rowid,
                     reason,
                 }),
+                identity,
                 0,
             ),
-            BoundedRow::Decoded { entry, bytes } => {
-                (LegacyJournalRowOutcome::Decoded(entry), bytes)
-            }
-            BoundedRow::Malformed { malformed, bytes } => (
+            BoundedRow::Decoded {
+                entry,
+                identity,
+                bytes,
+            } => (LegacyJournalRowOutcome::Decoded(entry), identity, bytes),
+            BoundedRow::Malformed {
+                malformed,
+                identity,
+                bytes,
+            } => (
                 LegacyJournalRowOutcome::Retained(map_malformed(malformed)),
+                identity,
                 bytes,
             ),
+            BoundedRow::Retained {
+                reason,
+                identity,
+                bytes,
+            } => (LegacyJournalRowOutcome::Retained(reason), identity, bytes),
         };
         bytes = bytes.saturating_add(loaded_bytes);
         last_rowid = Some(candidate.rowid);
@@ -500,6 +657,7 @@ fn scan_page_in_transaction(
             rowid: candidate.rowid,
             key: candidate.key(),
             outcome,
+            dedup_identity,
             bytes: loaded_bytes,
         });
     }
@@ -555,6 +713,93 @@ fn load_upper_rowid(connection: &Connection) -> Result<Option<i64>, LegacyJourna
         .optional()
         .map_err(SourceDbError::from)
         .map_err(LegacyJournalScanError::from)
+}
+
+#[derive(Clone, Debug)]
+enum LegacySchemaStatus {
+    Complete,
+    Unavailable {
+        reason: LegacyJournalDedupIdentityUnavailable,
+        projection_safe: bool,
+    },
+}
+
+fn load_legacy_schema(
+    connection: &Connection,
+) -> Result<LegacySchemaStatus, LegacyJournalScanError> {
+    let mut statement = connection
+        .prepare("SELECT name, hidden FROM pragma_table_xinfo('file_ops_journal') ORDER BY cid")
+        .map_err(SourceDbError::from)?;
+    let mut rows = statement.query([]).map_err(SourceDbError::from)?;
+    let mut names = Vec::with_capacity(LEGACY_COLUMN_COUNT);
+    while let Some(row) = rows.next().map_err(scan_sql_error)? {
+        if names.len() >= MAX_LEGACY_JOURNAL_SCHEMA_COLUMNS {
+            return Ok(LegacySchemaStatus::Unavailable {
+                reason: LegacyJournalDedupIdentityUnavailable::Schema {
+                    reason: String::from("legacy journal schema exposes too many columns"),
+                },
+                projection_safe: false,
+            });
+        }
+        let name = match row.get_ref(0).map_err(scan_sql_error)? {
+            rusqlite::types::ValueRef::Text(bytes)
+                if bytes.len() <= MAX_LEGACY_JOURNAL_SCHEMA_NAME_BYTES =>
+            {
+                String::from_utf8(bytes.to_vec()).map_err(|_| {
+                    LegacyJournalScanError::RequiresAudit {
+                        reason: String::from("legacy journal schema column name is not UTF-8"),
+                    }
+                })?
+            }
+            rusqlite::types::ValueRef::Text(_) => format!("__unbounded_{}", names.len()),
+            _ => format!("__invalid_{}", names.len()),
+        };
+        let hidden: i64 = row.get(1).map_err(scan_sql_error)?;
+        if hidden != 0 {
+            names.push(format!("__hidden_{}", names.len()));
+            continue;
+        }
+        names.push(name);
+    }
+
+    if names.len() != LEGACY_COLUMN_COUNT {
+        let projection_safe = LEGACY_COLUMNS
+            .iter()
+            .all(|column| names.iter().any(|name| name == column));
+        return Ok(LegacySchemaStatus::Unavailable {
+            reason: LegacyJournalDedupIdentityUnavailable::Schema {
+                reason: String::from("legacy journal schema is missing or has extra columns"),
+            },
+            projection_safe,
+        });
+    }
+    names.sort_unstable();
+    let mut expected = LEGACY_COLUMNS.to_vec();
+    expected.sort_unstable();
+    if names != expected {
+        let projection_safe = LEGACY_COLUMNS
+            .iter()
+            .all(|column| names.iter().any(|name| name == column));
+        return Ok(LegacySchemaStatus::Unavailable {
+            reason: LegacyJournalDedupIdentityUnavailable::Schema {
+                reason: String::from("legacy journal schema column set is not canonical"),
+            },
+            projection_safe,
+        });
+    }
+    Ok(LegacySchemaStatus::Complete)
+}
+
+fn unavailable_for_schema_or_row(
+    schema: &LegacySchemaStatus,
+    row: LegacyJournalDedupIdentityUnavailable,
+) -> LegacyJournalDedupIdentityResult {
+    match schema {
+        LegacySchemaStatus::Complete => LegacyJournalDedupIdentityResult::Unavailable(row),
+        LegacySchemaStatus::Unavailable { reason, .. } => {
+            LegacyJournalDedupIdentityResult::Unavailable(reason.clone())
+        }
+    }
 }
 
 fn load_candidates(
@@ -734,18 +979,89 @@ impl LegacyCandidate {
                     })
             })
     }
+
+    fn fingerprint_bytes(&self) -> Result<usize, LegacyJournalDedupIdentityUnavailable> {
+        let mut bytes = LEGACY_DEDUP_FINGERPRINT_DOMAIN
+            .len()
+            .saturating_add(std::mem::size_of::<u8>());
+        for (index, field) in self.fields.iter().enumerate() {
+            let descriptor = LegacyJournalField::from_index(index);
+            let name = LEGACY_COLUMNS[index].as_bytes();
+            bytes = bytes
+                .checked_add(std::mem::size_of::<u32>())
+                .and_then(|total| total.checked_add(name.len()))
+                .and_then(|total| total.checked_add(std::mem::size_of::<u8>()))
+                .and_then(|total| total.checked_add(std::mem::size_of::<u64>()))
+                .ok_or_else(|| LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                    field: descriptor,
+                    reason: String::from("legacy fingerprint byte count overflowed"),
+                })?;
+            let value_bytes = match field.sql_type.as_str() {
+                "null" => 0,
+                "integer" | "real" => std::mem::size_of::<i64>(),
+                "text" | "blob" => {
+                    let Some(length) = field.length else {
+                        return Err(LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                            field: descriptor,
+                            reason: String::from("raw value length is unavailable"),
+                        });
+                    };
+                    if length < 0
+                        || usize::try_from(length)
+                            .map_or(true, |value| value > MAX_LEGACY_JOURNAL_FIELD_BYTES)
+                    {
+                        return Err(LegacyJournalDedupIdentityUnavailable::ValueTooLarge {
+                            field: descriptor,
+                            declared: Some(length),
+                        });
+                    }
+                    usize::try_from(length).map_err(|_| {
+                        LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                            field: descriptor,
+                            reason: String::from("raw value length cannot be represented safely"),
+                        }
+                    })?
+                }
+                sql_type => {
+                    return Err(LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                        field: descriptor,
+                        reason: format!("unsupported SQLite storage class `{sql_type}`"),
+                    });
+                }
+            };
+            bytes = bytes.checked_add(value_bytes).ok_or_else(|| {
+                LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                    field: descriptor,
+                    reason: String::from("legacy fingerprint byte count overflowed"),
+                }
+            })?;
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Debug)]
 enum BoundedRow {
-    Missing,
-    Changed(String),
+    Missing {
+        identity: LegacyJournalDedupIdentityResult,
+    },
+    Changed {
+        reason: String,
+        identity: LegacyJournalDedupIdentityResult,
+    },
     Decoded {
         entry: FileOpJournalEntry,
+        identity: LegacyJournalDedupIdentityResult,
         bytes: usize,
     },
     Malformed {
         malformed: MalformedJournalEntry,
+        identity: LegacyJournalDedupIdentityResult,
+        bytes: usize,
+    },
+    Retained {
+        reason: LegacyJournalRetentionReason,
+        identity: LegacyJournalDedupIdentityResult,
         bytes: usize,
     },
 }
@@ -753,21 +1069,18 @@ enum BoundedRow {
 fn load_bounded_row(
     connection: &Connection,
     candidate: &LegacyCandidate,
+    source_binding: &(String, String),
+    schema: &LegacySchemaStatus,
 ) -> Result<BoundedRow, LegacyJournalScanError> {
     let values = LEGACY_COLUMNS
         .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let descriptor = LegacyJournalField::from_index(index);
-            if descriptor.is_text() {
-                format!(
-                    "CASE WHEN typeof({column}) = 'text' AND length(CAST({column} AS BLOB)) <= {MAX_LEGACY_JOURNAL_FIELD_BYTES} THEN {column} ELSE NULL END"
-                )
-            } else {
-                format!(
-                    "CASE WHEN typeof({column}) IN ('integer', 'null') THEN {column} ELSE NULL END"
-                )
-            }
+        .map(|column| {
+            format!(
+                "CASE WHEN typeof({column}) IN ('null', 'integer', 'real')
+                     OR (typeof({column}) IN ('text', 'blob')
+                         AND length(CAST({column} AS BLOB)) <= {MAX_LEGACY_JOURNAL_FIELD_BYTES})
+                     THEN {column} ELSE NULL END"
+            )
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -788,7 +1101,12 @@ fn load_bounded_row(
         .query(params![candidate.rowid])
         .map_err(SourceDbError::from)?;
     let Some(row) = rows.next().map_err(scan_sql_error)? else {
-        return Ok(BoundedRow::Missing);
+        return Ok(BoundedRow::Missing {
+            identity: unavailable_for_schema_or_row(
+                schema,
+                LegacyJournalDedupIdentityUnavailable::RowDisappeared,
+            ),
+        });
     };
     let mut current_fields = Vec::with_capacity(LEGACY_COLUMN_COUNT);
     for index in 0..LEGACY_COLUMN_COUNT {
@@ -808,15 +1126,163 @@ fn load_bounded_row(
             current.sql_type != candidate.sql_type || current.length != candidate.length
         })
     {
-        return Ok(BoundedRow::Changed(String::from(
-            "legacy row metadata changed during bounded read",
-        )));
+        return Ok(BoundedRow::Changed {
+            reason: String::from("legacy row metadata changed during bounded read"),
+            identity: unavailable_for_schema_or_row(
+                schema,
+                LegacyJournalDedupIdentityUnavailable::RowChanged {
+                    reason: String::from("legacy row metadata changed during bounded read"),
+                },
+            ),
+        });
     }
-    let bytes = candidate.text_bytes()?;
+
+    let bytes = match candidate.fingerprint_bytes() {
+        Ok(bytes) => bytes,
+        Err(unavailable) => {
+            let identity = unavailable_for_schema_or_row(schema, unavailable);
+            let reason =
+                candidate
+                    .metadata_issue()
+                    .unwrap_or(LegacyJournalRetentionReason::Malformed {
+                        id: match candidate.key() {
+                            LegacyJournalKey::Text(value)
+                            | LegacyJournalKey::TextPreview(value) => Some(value),
+                            LegacyJournalKey::Invalid { .. } => None,
+                        },
+                        detail: String::from("legacy raw value could not be fingerprinted"),
+                    });
+            return Ok(BoundedRow::Retained {
+                reason,
+                identity,
+                bytes: 0,
+            });
+        }
+    };
+    let identity = if matches!(schema, LegacySchemaStatus::Complete) {
+        match fingerprint_row(row, candidate.rowid, source_binding) {
+            Ok(identity) => LegacyJournalDedupIdentityResult::Complete(identity),
+            Err(unavailable) => {
+                let reason =
+                    candidate
+                        .metadata_issue()
+                        .unwrap_or(LegacyJournalRetentionReason::Malformed {
+                            id: match candidate.key() {
+                                LegacyJournalKey::Text(value)
+                                | LegacyJournalKey::TextPreview(value) => Some(value),
+                                LegacyJournalKey::Invalid { .. } => None,
+                            },
+                            detail: String::from("legacy raw value could not be fingerprinted"),
+                        });
+                return Ok(BoundedRow::Retained {
+                    reason,
+                    identity: LegacyJournalDedupIdentityResult::Unavailable(unavailable),
+                    bytes: 0,
+                });
+            }
+        }
+    } else {
+        unavailable_for_schema_or_row(
+            schema,
+            LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                field: LegacyJournalField::Row,
+                reason: String::from("legacy journal schema is not canonical"),
+            },
+        )
+    };
+    if let Some(reason) = candidate.metadata_issue() {
+        return Ok(BoundedRow::Retained {
+            reason,
+            identity,
+            bytes,
+        });
+    }
     match decode_journal_row(row) {
-        Ok(entry) => Ok(BoundedRow::Decoded { entry, bytes }),
-        Err(malformed) => Ok(BoundedRow::Malformed { malformed, bytes }),
+        Ok(entry) => Ok(BoundedRow::Decoded {
+            entry,
+            identity,
+            bytes,
+        }),
+        Err(malformed) => Ok(BoundedRow::Malformed {
+            malformed,
+            identity,
+            bytes,
+        }),
     }
+}
+
+fn fingerprint_row(
+    row: &rusqlite::Row<'_>,
+    rowid: i64,
+    source_binding: &(String, String),
+) -> Result<LegacyJournalDedupIdentity, LegacyJournalDedupIdentityUnavailable> {
+    let mut hasher = Hasher::new();
+    hasher.update(LEGACY_DEDUP_FINGERPRINT_DOMAIN);
+    hasher.update(&[LEGACY_DEDUP_FINGERPRINT_VERSION]);
+    for (index, column) in LEGACY_COLUMNS.iter().enumerate() {
+        let descriptor = LegacyJournalField::from_index(index);
+        let name = column.as_bytes();
+        let name_len = u32::try_from(name.len()).map_err(|_| {
+            LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                field: descriptor,
+                reason: String::from("legacy fingerprint column name is too long"),
+            }
+        })?;
+        hasher.update(&name_len.to_le_bytes());
+        hasher.update(name);
+        let value = row.get_ref(index).map_err(|_| {
+            LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                field: descriptor,
+                reason: String::from("legacy raw value could not be read"),
+            }
+        })?;
+        let tag = match value {
+            rusqlite::types::ValueRef::Null => 0_u8,
+            rusqlite::types::ValueRef::Integer(_) => 1_u8,
+            rusqlite::types::ValueRef::Real(_) => 2_u8,
+            rusqlite::types::ValueRef::Text(_) => 3_u8,
+            rusqlite::types::ValueRef::Blob(_) => 4_u8,
+        };
+        hasher.update(&[tag]);
+        match value {
+            rusqlite::types::ValueRef::Null => {
+                hasher.update(&0_u64.to_le_bytes());
+            }
+            rusqlite::types::ValueRef::Integer(value) => {
+                hasher.update(&8_u64.to_le_bytes());
+                hasher.update(&value.to_le_bytes());
+            }
+            rusqlite::types::ValueRef::Real(value) => {
+                hasher.update(&8_u64.to_le_bytes());
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+            rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+                if value.len() > MAX_LEGACY_JOURNAL_FIELD_BYTES {
+                    return Err(LegacyJournalDedupIdentityUnavailable::ValueTooLarge {
+                        field: descriptor,
+                        declared: i64::try_from(value.len()).ok(),
+                    });
+                }
+                let length = u64::try_from(value.len()).map_err(|_| {
+                    LegacyJournalDedupIdentityUnavailable::ValueUnavailable {
+                        field: descriptor,
+                        reason: String::from(
+                            "legacy raw value length cannot be represented safely",
+                        ),
+                    }
+                })?;
+                hasher.update(&length.to_le_bytes());
+                hasher.update(value);
+            }
+        }
+    }
+    Ok(LegacyJournalDedupIdentity {
+        root_identity: source_binding.0.clone(),
+        database_identity: source_binding.1.clone(),
+        rowid,
+        fingerprint_version: LEGACY_DEDUP_FINGERPRINT_VERSION,
+        fingerprint: *hasher.finalize().as_bytes(),
+    })
 }
 
 fn map_malformed(malformed: MalformedJournalEntry) -> LegacyJournalRetentionReason {
@@ -997,6 +1463,217 @@ mod tests {
             ids,
             HashSet::from(["copy-intent", "copy-target", "move-staged", "move-source",])
         );
+    }
+
+    #[test]
+    fn dedup_identity_is_complete_stable_and_source_bound() {
+        let fixture = ReaderFixture::new();
+        insert_copy(&fixture.db, None, "identity-row", "intent", "identity.wav");
+
+        let first = scan_page(&fixture.db, None).expect("first identity page");
+        let first_identity = first.entries()[0].dedup_identity().clone();
+        let second = scan_page(&fixture.db, None).expect("second identity page");
+        assert_eq!(second.entries()[0].dedup_identity(), &first_identity);
+        let LegacyJournalDedupIdentityResult::Complete(identity) = first_identity else {
+            panic!("bounded canonical legacy row should have a complete identity");
+        };
+        assert_eq!(identity.rowid(), first.entries()[0].rowid());
+        assert_eq!(
+            identity.fingerprint_version(),
+            LEGACY_DEDUP_FINGERPRINT_VERSION
+        );
+        assert!(!identity.root_identity().is_empty());
+        assert!(!identity.database_identity().is_empty());
+        assert_ne!(identity.fingerprint(), &[0; 32]);
+    }
+
+    #[test]
+    fn dedup_identity_survives_reopen_of_the_same_bound_database() {
+        let runtime = TestRuntimeGuard::acquire();
+        let app_root = tempdir().expect("app root");
+        let app_root_guard =
+            AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
+                .expect("app root override");
+        let profile = WritableProfileGuard::acquire_current().expect("profile owner");
+        let source_root = tempdir().expect("source root");
+        let database_root = tempdir().expect("database root");
+        let db = SourceDatabase::open_for_source_write_with_profile_guard(
+            source_root.path(),
+            &profile,
+            database_root.path(),
+        )
+        .expect("owned source database");
+        insert_copy(&db, None, "reopen-identity", "intent", "reopen.wav");
+        let before = scan_page(&db, None).expect("pre-close identity page");
+        let before_identity = before.entries()[0].dedup_identity().clone();
+        drop(db);
+
+        let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+            source_root.path(),
+            &profile,
+            database_root.path(),
+        )
+        .expect("reopened source database");
+        let after = scan_page(&reopened, None).expect("post-reopen identity page");
+        assert_eq!(after.entries()[0].dedup_identity(), &before_identity);
+        drop(reopened);
+        drop(profile);
+        drop(app_root_guard);
+        drop(app_root);
+        drop(source_root);
+        drop(database_root);
+        drop(runtime);
+    }
+
+    #[test]
+    fn dedup_fingerprint_covers_raw_values_beyond_previews_and_sqlite_types() {
+        let fixture = ReaderFixture::new();
+        let long_a = format!("{}a", "x".repeat(MAX_LEGACY_JOURNAL_PREVIEW_BYTES + 64));
+        let long_b = format!("{}b", "x".repeat(MAX_LEGACY_JOURNAL_PREVIEW_BYTES + 64));
+        insert_copy(&fixture.db, None, "raw-long", "intent", &long_a);
+        fixture
+            .db
+            .connection
+            .execute(
+                "INSERT INTO file_ops_journal
+                    (id, op_type, stage, target_relative, file_size, created_at)
+                 VALUES ('raw-type', 'copy', 'intent', 'type.wav', 1, 1)",
+                [],
+            )
+            .expect("raw type rows");
+        let before = scan_page(&fixture.db, None).expect("raw fingerprint page");
+        let before_long = before
+            .entries()
+            .iter()
+            .find(
+                |entry| matches!(entry.key(), LegacyJournalKey::Text(value) if value == "raw-long"),
+            )
+            .expect("long row")
+            .dedup_identity()
+            .clone();
+        let mut type_fingerprints = vec![
+            before
+                .entries()
+                .iter()
+                .find(|entry| {
+                    matches!(entry.key(), LegacyJournalKey::Text(value) if value == "raw-type")
+                })
+                .expect("raw type row")
+                .dedup_identity()
+                .clone(),
+        ];
+        for raw_value in ["1.5", "'text'", "zeroblob(1)", "NULL"] {
+            fixture
+                .db
+                .connection
+                .execute(
+                    &format!(
+                        "UPDATE file_ops_journal SET file_size = {raw_value} WHERE id = 'raw-type'"
+                    ),
+                    [],
+                )
+                .expect("change raw SQLite type");
+            let page = scan_page(&fixture.db, None).expect("raw type fingerprint page");
+            type_fingerprints.push(
+                page.entries()
+                    .iter()
+                    .find(|entry| {
+                        matches!(entry.key(), LegacyJournalKey::Text(value) if value == "raw-type")
+                    })
+                    .expect("raw type row")
+                    .dedup_identity()
+                    .clone(),
+            );
+        }
+        assert!(
+            type_fingerprints
+                .iter()
+                .all(|identity| matches!(identity, LegacyJournalDedupIdentityResult::Complete(_)))
+        );
+        for left in 0..type_fingerprints.len() {
+            for right in (left + 1)..type_fingerprints.len() {
+                assert_ne!(type_fingerprints[left], type_fingerprints[right]);
+            }
+        }
+
+        fixture
+            .db
+            .connection
+            .execute(
+                "UPDATE file_ops_journal SET target_relative = ?1 WHERE id = 'raw-long'",
+                params![long_b],
+            )
+            .expect("change raw tail");
+        let after = scan_page(&fixture.db, None).expect("changed raw fingerprint page");
+        let after_long = after
+            .entries()
+            .iter()
+            .find(
+                |entry| matches!(entry.key(), LegacyJournalKey::Text(value) if value == "raw-long"),
+            )
+            .expect("changed long row")
+            .dedup_identity();
+        assert_ne!(&before_long, after_long);
+    }
+
+    #[test]
+    fn malformed_and_extra_schema_rows_retain_bounded_identity_evidence() {
+        let fixture = ReaderFixture::new();
+        fixture
+            .db
+            .connection
+            .execute(
+                "INSERT INTO file_ops_journal
+                    (id, op_type, stage, target_relative, file_size, created_at)
+                 VALUES ('malformed-identity', 'copy', 'intent', 'bad.wav', 'bad', 1)",
+                [],
+            )
+            .expect("malformed row");
+        let page = scan_page(&fixture.db, None).expect("malformed identity page");
+        assert!(matches!(
+            page.entries()[0].outcome(),
+            LegacyJournalRowOutcome::Retained(LegacyJournalRetentionReason::TypeInvalid { .. })
+        ));
+        assert!(matches!(
+            page.entries()[0].dedup_identity(),
+            LegacyJournalDedupIdentityResult::Complete(_)
+        ));
+
+        fixture
+            .db
+            .connection
+            .execute(
+                "ALTER TABLE file_ops_journal ADD COLUMN future_extra TEXT",
+                [],
+            )
+            .expect("extra schema column");
+        let extra_page = scan_page(&fixture.db, None).expect("extra schema page");
+        assert!(extra_page.entries().iter().all(|entry| matches!(
+            entry.dedup_identity(),
+            LegacyJournalDedupIdentityResult::Unavailable(
+                LegacyJournalDedupIdentityUnavailable::Schema { .. }
+            )
+        )));
+    }
+
+    #[test]
+    fn oversized_raw_value_has_unavailable_identity_without_partial_digest() {
+        let fixture = ReaderFixture::new();
+        let oversized = "x".repeat(MAX_LEGACY_JOURNAL_FIELD_BYTES + 1);
+        insert_copy(
+            &fixture.db,
+            None,
+            "oversized-identity",
+            "intent",
+            &oversized,
+        );
+        let page = scan_page(&fixture.db, None).expect("oversized identity page");
+        assert!(matches!(
+            page.entries()[0].dedup_identity(),
+            LegacyJournalDedupIdentityResult::Unavailable(
+                LegacyJournalDedupIdentityUnavailable::ValueTooLarge { .. }
+            )
+        ));
     }
 
     #[test]
@@ -1321,6 +1998,11 @@ mod tests {
             .expect("upper rowid")
             .expect("row");
         let candidates = load_candidates(&transaction, upper, None).expect("metadata preflight");
+        let source_binding = fixture
+            .db
+            .legacy_journal_dedup_binding()
+            .expect("dedup binding");
+        let schema = load_legacy_schema(&transaction).expect("legacy schema");
 
         let writer = Connection::open(&fixture.db.db_path).expect("second connection");
         writer
@@ -1334,7 +2016,8 @@ mod tests {
             .expect("same-length concurrent update");
         drop(writer);
 
-        let loaded = load_bounded_row(&transaction, &candidates[0]).expect("snapshot row");
+        let loaded = load_bounded_row(&transaction, &candidates[0], &source_binding, &schema)
+            .expect("snapshot row");
         match loaded {
             BoundedRow::Decoded { entry, .. } => {
                 assert_eq!(entry.target_relative, PathBuf::from("first.wav"));

@@ -30,8 +30,9 @@ pub use entry::{
     staged_relative_for_target,
 };
 pub use reader::{
-    LegacyJournalCursor, LegacyJournalEntry, LegacyJournalField, LegacyJournalKey,
-    LegacyJournalPage, LegacyJournalRetentionReason, LegacyJournalRowOutcome,
+    LegacyJournalCursor, LegacyJournalDedupIdentity, LegacyJournalDedupIdentityResult,
+    LegacyJournalDedupIdentityUnavailable, LegacyJournalEntry, LegacyJournalField,
+    LegacyJournalKey, LegacyJournalPage, LegacyJournalRetentionReason, LegacyJournalRowOutcome,
     LegacyJournalScanError, MAX_LEGACY_JOURNAL_BYTES_PER_PAGE, MAX_LEGACY_JOURNAL_FIELD_BYTES,
     MAX_LEGACY_JOURNAL_PREVIEW_BYTES, MAX_LEGACY_JOURNAL_ROWS_PER_PAGE,
 };
