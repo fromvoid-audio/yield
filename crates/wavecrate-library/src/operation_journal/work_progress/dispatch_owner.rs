@@ -195,6 +195,28 @@ impl EnteredDispatchPermit {
     }
 }
 
+/// Opaque permit for reporting a late completion after an uncertain retirement.
+///
+/// This permit is observational only.  It cannot re-enter or issue work, and dropping it leaves
+/// the owner's already-retired ledger entry unchanged.  Its owner identity binds it to the
+/// owner's immutable plan transitively.
+#[derive(Debug)]
+pub(super) struct LateObservationPermit {
+    binding: PermitBinding,
+}
+
+impl LateObservationPermit {
+    /// Return the exact key bound to this late observation.
+    pub(super) const fn key(&self) -> WorkUnitKey {
+        self.binding.key
+    }
+
+    /// Return the monotonic attempt identifier bound to this late observation.
+    pub(super) const fn attempt_id(&self) -> u64 {
+        self.binding.attempt_id
+    }
+}
+
 /// Validation failure that returns the original opaque permit for explicit retry or retirement.
 ///
 /// Successful transitions consume their input token.  A failed validation leaves the owner's
@@ -609,10 +631,13 @@ impl LiveDispatchOwner {
     }
 
     /// Retire a reserved permit as entry-uncertain when the caller cannot establish no entry.
+    ///
+    /// The returned permit may later report one validated late completion.  It does not reopen
+    /// issuance or establish any cleanup, recovery, or adoption authority.
     pub(super) fn retire_reserved_uncertain(
         &mut self,
         permit: DispatchPermit,
-    ) -> Result<(), PermitFailure<DispatchPermit>> {
+    ) -> Result<LateObservationPermit, PermitFailure<DispatchPermit>> {
         if let Err(error) = self.validate_binding(&permit.binding) {
             return Err(PermitFailure::new(error, permit));
         }
@@ -623,13 +648,14 @@ impl LiveDispatchOwner {
         ) {
             return Err(PermitFailure::new(error, permit));
         }
+        let binding = permit.binding.clone();
         self.ledger.insert(
             permit.key(),
             DispatchLedgerEntry::ReturnedUncertain {
                 attempt_id: permit.attempt_id(),
             },
         );
-        Ok(())
+        Ok(LateObservationPermit { binding })
     }
 
     /// Request cancellation and close future issuance/entry atomically.
@@ -651,10 +677,13 @@ impl LiveDispatchOwner {
     }
 
     /// Retire an entered permit as unknown-effect after cancellation.
+    ///
+    /// The returned permit may later report one validated late completion.  It does not reopen
+    /// issuance or establish any cleanup, recovery, or adoption authority.
     pub(super) fn retire_entered_uncertain(
         &mut self,
         permit: EnteredDispatchPermit,
-    ) -> Result<(), PermitFailure<EnteredDispatchPermit>> {
+    ) -> Result<LateObservationPermit, PermitFailure<EnteredDispatchPermit>> {
         if let Err(error) = self.require_cancellation_draining() {
             return Err(PermitFailure::new(error, permit));
         }
@@ -668,13 +697,14 @@ impl LiveDispatchOwner {
         ) {
             return Err(PermitFailure::new(error, permit));
         }
+        let binding = permit.binding.clone();
         self.ledger.insert(
             permit.key(),
             DispatchLedgerEntry::ReturnedUncertain {
                 attempt_id: permit.attempt_id(),
             },
         );
-        Ok(())
+        Ok(LateObservationPermit { binding })
     }
 
     /// Retire an entered permit with validated late evidence and retain its historical context.
@@ -718,6 +748,89 @@ impl LiveDispatchOwner {
         Ok(context)
     }
 
+    /// Report one validated late completion for an uncertain retirement.
+    ///
+    /// The permit is consumed on success.  Validation failures return the same permit and leave
+    /// the ledger, frozen progress, and sealed outcome unchanged.  A sealed effect-bearing
+    /// dispatch record is rebuilt at the next global recovery generation; local refinements before
+    /// accepted progress advances deliberately reuse that same prospective generation.
+    pub(super) fn report_late_observation(
+        &mut self,
+        permit: LateObservationPermit,
+        evidence: StoredStepEvidence,
+    ) -> Result<CompletionContext, PermitFailure<LateObservationPermit>> {
+        if self.lifecycle == DispatchOwnerLifecycle::Open {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::LateRetirementBeforeCancellation,
+                permit,
+            ));
+        }
+        if let Err(error) = self.validate_binding(&permit.binding) {
+            return Err(PermitFailure::new(error, permit));
+        }
+        if let Err(error) = self.require_ledger_state(
+            permit.key(),
+            permit.attempt_id(),
+            DispatchLedgerState::ReturnedUncertain,
+        ) {
+            return Err(PermitFailure::new(error, permit));
+        }
+        let context =
+            CompletionContext::new(permit.binding.execution_epoch, permit.binding.scope.clone());
+        if let Err(error) =
+            self.progress
+                .validate_historical_completion(permit.key(), &context, &evidence)
+        {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::Progress(error),
+                permit,
+            ));
+        }
+        let entry = DispatchLedgerEntry::CompletedAfterCancellation {
+            attempt_id: permit.attempt_id(),
+            evidence,
+            context: context.clone(),
+        };
+
+        let replacement = if self.lifecycle == DispatchOwnerLifecycle::Sealed
+            && self
+                .sealed_dispatch_outcome
+                .as_ref()
+                .is_some_and(|record| record.rows().iter().any(|row| row.key() == permit.key()))
+        {
+            let Some(recovery_generation) = self.progress.recovery_generation.checked_add(1) else {
+                return Err(PermitFailure::new(
+                    DispatchOwnerError::RecoveryGenerationExhausted,
+                    permit,
+                ));
+            };
+            let candidate =
+                self.build_dispatch_outcome(recovery_generation, Some((permit.key(), &entry)));
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(error) => return Err(PermitFailure::new(error, permit)),
+            };
+            if let Err(error) = self
+                .progress
+                .validate_cancellation_dispatch_record(&candidate)
+            {
+                return Err(PermitFailure::new(
+                    DispatchOwnerError::Progress(error),
+                    permit,
+                ));
+            }
+            Some(candidate)
+        } else {
+            None
+        };
+
+        self.ledger.insert(permit.key(), entry);
+        if let Some(replacement) = replacement {
+            self.sealed_dispatch_outcome = Some(replacement);
+        }
+        Ok(context)
+    }
+
     /// Seal a private current-epoch barrier after every issued permit has an explicit outcome.
     pub(super) fn seal(&mut self) -> Result<VerifiedCancellationBarrier, DispatchOwnerError> {
         if self.lifecycle == DispatchOwnerLifecycle::Sealed {
@@ -747,17 +860,34 @@ impl LiveDispatchOwner {
         if outstanding != 0 {
             return Err(DispatchOwnerError::OutstandingPermits { count: outstanding });
         }
-        let manifest = self.progress.cancellation_dispatch_manifest()?;
         let recovery_generation = self
             .progress
             .recovery_generation
             .checked_add(1)
             .ok_or(DispatchOwnerError::RecoveryGenerationExhausted)?;
+        let dispatch_outcome = self.build_dispatch_outcome(recovery_generation, None)?;
+        self.progress
+            .validate_cancellation_dispatch_record(&dispatch_outcome)?;
+        self.sealed_dispatch_outcome = Some(dispatch_outcome.clone());
+        self.lifecycle = DispatchOwnerLifecycle::Sealed;
+        Ok(self.barrier(dispatch_outcome))
+    }
+
+    fn build_dispatch_outcome(
+        &self,
+        recovery_generation: u64,
+        replacement: Option<(WorkUnitKey, &DispatchLedgerEntry)>,
+    ) -> Result<CancellationDispatchOutcomeRecord, DispatchOwnerError> {
+        let manifest = self.progress.cancellation_dispatch_manifest()?;
         let rows = manifest
             .keys()
             .iter()
             .map(|key| {
-                let outcome = match self.ledger.get(key) {
+                let entry = replacement
+                    .filter(|(replacement_key, _)| replacement_key == key)
+                    .map(|(_, entry)| entry)
+                    .or_else(|| self.ledger.get(key));
+                let outcome = match entry {
                     None | Some(DispatchLedgerEntry::ReturnedNeverEntered { .. }) => {
                         CancellationDispatchOutcome::NeverEntered
                     }
@@ -783,17 +913,13 @@ impl LiveDispatchOwner {
                 Ok(CancellationDispatchOutcomeRow::new(*key, outcome))
             })
             .collect::<Result<Vec<_>, DispatchOwnerError>>()?;
-        let dispatch_outcome = CancellationDispatchOutcomeRecord::new(
+        CancellationDispatchOutcomeRecord::new(
             manifest,
             self.progress.execution_epoch,
             recovery_generation,
             rows,
-        )?;
-        self.progress
-            .validate_cancellation_dispatch_record(&dispatch_outcome)?;
-        self.sealed_dispatch_outcome = Some(dispatch_outcome.clone());
-        self.lifecycle = DispatchOwnerLifecycle::Sealed;
-        Ok(self.barrier(dispatch_outcome))
+        )
+        .map_err(DispatchOwnerError::DispatchOutcome)
     }
 
     /// Accept the existing private after-effect reconciliation guard using this owner's sealed

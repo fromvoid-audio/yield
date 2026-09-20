@@ -20724,6 +20724,507 @@ mod tests {
     }
 
     #[test]
+    fn live_dispatch_owner_reports_uncertain_late_completion_before_and_after_seal() {
+        let mut before_seal =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("before-seal owner");
+        let source = key_for(before_seal.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = before_seal.issue(source).expect("source reservation");
+        let source_entered = before_seal.enter(source_reserved).expect("source entry");
+        before_seal
+            .complete(
+                source_entered,
+                evidence_for(before_seal.progress(), source, 7),
+            )
+            .expect("source completion");
+        let prepare = key_for(before_seal.progress(), 0, WorkUnitRole::Prepare);
+        let prepare_reserved = before_seal.issue(prepare).expect("prepare reservation");
+        let prepare_entered = before_seal.enter(prepare_reserved).expect("prepare entry");
+        let before_steps = before_seal.progress().steps().to_vec();
+        before_seal
+            .request_cancellation(CancellationRequestObservation::new(17100).expect("cancel"))
+            .expect("before-seal cancellation");
+        let late = before_seal
+            .retire_entered_uncertain(prepare_entered)
+            .expect("uncertain retirement returns reporting permit");
+        let context = before_seal
+            .report_late_observation(late, evidence_for(before_seal.progress(), prepare, 7))
+            .expect("late completion before seal");
+        assert_eq!(
+            context.execution_epoch(),
+            before_seal.progress().execution_epoch()
+        );
+        assert_eq!(before_seal.progress().steps(), before_steps.as_slice());
+        assert_eq!(
+            before_seal.ledger_state(prepare),
+            Some(dispatch_owner::DispatchLedgerState::CompletedAfterCancellation)
+        );
+        let before_barrier = before_seal.seal().expect("before-seal barrier");
+        assert!(
+            before_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .is_some_and(|row| {
+                    matches!(
+                        row.outcome(),
+                        CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+                    )
+                })
+        );
+
+        let mut after_seal =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("after-seal owner");
+        let source = key_for(after_seal.progress(), 0, WorkUnitRole::SourceRead);
+        let source_reserved = after_seal.issue(source).expect("source reservation");
+        let source_entered = after_seal.enter(source_reserved).expect("source entry");
+        after_seal
+            .complete(
+                source_entered,
+                evidence_for(after_seal.progress(), source, 7),
+            )
+            .expect("source completion");
+        let prepare = key_for(after_seal.progress(), 0, WorkUnitRole::Prepare);
+        let prepare_reserved = after_seal.issue(prepare).expect("prepare reservation");
+        let prepare_entered = after_seal.enter(prepare_reserved).expect("prepare entry");
+        after_seal
+            .request_cancellation(CancellationRequestObservation::new(17101).expect("cancel"))
+            .expect("after-seal cancellation");
+        let late = after_seal
+            .retire_entered_uncertain(prepare_entered)
+            .expect("uncertain retirement returns reporting permit");
+        let old_barrier = after_seal.seal().expect("initial sealed barrier");
+        assert!(
+            old_barrier
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .is_some_and(|row| row.outcome() == &CancellationDispatchOutcome::EntryUncertain)
+        );
+        let before_report = after_seal.progress().clone();
+        after_seal
+            .report_late_observation(late, evidence_for(after_seal.progress(), prepare, 7))
+            .expect("late completion after seal");
+        assert_eq!(after_seal.progress(), &before_report);
+        assert_eq!(
+            after_seal.ledger_state(prepare),
+            Some(dispatch_owner::DispatchLedgerState::CompletedAfterCancellation)
+        );
+        assert_eq!(
+            old_barrier.validate_for_owner(&after_seal),
+            Err(dispatch_owner::DispatchOwnerError::BarrierStateMismatch)
+        );
+        let latest = after_seal.seal().expect("refined sealed barrier");
+        assert_eq!(
+            latest.dispatch_outcome().recovery_generation(),
+            old_barrier.dispatch_outcome().recovery_generation()
+        );
+        assert!(
+            latest
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == prepare)
+                .is_some_and(|row| {
+                    matches!(
+                        row.outcome(),
+                        CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+                    )
+                })
+        );
+        assert!(latest.validate_for_owner(&after_seal).is_ok());
+        assert_eq!(
+            after_seal
+                .seal()
+                .expect("stable refined seal")
+                .dispatch_outcome(),
+            latest.dispatch_outcome()
+        );
+
+        let mut late_source =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
+                .expect("late-source owner");
+        let source = key_for(late_source.progress(), 0, WorkUnitRole::SourceRead);
+        let reserved = late_source.issue(source).expect("late-source reservation");
+        let entered = late_source.enter(reserved).expect("late-source entry");
+        late_source
+            .request_cancellation(CancellationRequestObservation::new(17105).expect("cancel"))
+            .expect("late-source cancellation");
+        let late = late_source
+            .retire_entered_uncertain(entered)
+            .expect("late-source reporting permit");
+        let sealed = late_source.seal().expect("late-source barrier");
+        let before_report = late_source.progress().clone();
+        late_source
+            .report_late_observation(late, evidence_for(late_source.progress(), source, 7))
+            .expect("late source report");
+        assert_eq!(late_source.progress(), &before_report);
+        assert_eq!(
+            late_source.ledger_state(source),
+            Some(dispatch_owner::DispatchLedgerState::CompletedAfterCancellation)
+        );
+        let refined = late_source.seal().expect("late-source refined barrier");
+        assert_eq!(refined.dispatch_outcome(), sealed.dispatch_outcome());
+        assert!(
+            refined
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .all(|row| row.key() != source)
+        );
+    }
+
+    #[test]
+    fn live_dispatch_owner_late_refinements_reuse_prospective_generation_then_advance() {
+        let (base, source, _filesystem, source_id) = valid_topology(true);
+        let mut descriptors = base.descriptors().to_vec();
+        let artifact_fence = descriptors
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::Artifact)
+            .and_then(|descriptor| descriptor.source_fence().cloned())
+            .expect("artifact fence");
+        for (participant, artifact_key) in [
+            (participant_id(8), "waveform-b"),
+            (participant_id(9), "waveform-c"),
+        ] {
+            descriptors.push(
+                ParticipantDescriptor::new(
+                    participant,
+                    ParticipantKind::Artifact,
+                    ParticipantRequirement::OptionalRebuildable,
+                    Some(artifact_fence.clone()),
+                    Some(artifact_key.to_owned()),
+                )
+                .expect("additional artifact descriptor"),
+            );
+        }
+        let checkpoints = descriptors
+            .iter()
+            .map(|descriptor| {
+                ParticipantCheckpoint::new(
+                    descriptor.id(),
+                    ParticipantCheckpointState::Pending,
+                    None,
+                    None,
+                )
+                .expect("artifact checkpoint")
+            })
+            .collect();
+        let participants = ParticipantSet::new(descriptors, checkpoints).expect("participants");
+        let args = copy_args_at(source, source_id, "copy.wav");
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("three-artifact work plan");
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(17102)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("three-artifact progress");
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(progress).expect("artifact owner");
+        let artifact_keys: Vec<_> = owner
+            .progress()
+            .steps()
+            .iter()
+            .filter(|step| step.key().role() == WorkUnitRole::Artifact)
+            .map(|step| step.key())
+            .collect();
+        assert_eq!(artifact_keys.len(), 3);
+
+        // Close every prerequisite through the owner, leaving the independent optional
+        // artifacts pending so their uncertain attempts can be refined separately.
+        loop {
+            let pending: Vec<_> = owner
+                .progress()
+                .steps()
+                .iter()
+                .filter(|step| {
+                    step.status() == ProgressStepStatus::Pending
+                        && step.key().role() != WorkUnitRole::Artifact
+                })
+                .map(|step| step.key())
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            let mut advanced = false;
+            for key in pending {
+                match owner.issue(key) {
+                    Ok(reserved) => {
+                        let entered = owner.enter(reserved).expect("ready entry");
+                        owner
+                            .complete(entered, evidence_for(owner.progress(), key, 7))
+                            .expect("ready completion");
+                        advanced = true;
+                    }
+                    Err(dispatch_owner::DispatchOwnerError::PrerequisiteIncomplete { .. }) => {}
+                    Err(error) => panic!("unexpected prerequisite setup error: {error:?}"),
+                }
+            }
+            assert!(advanced, "prerequisites made no progress");
+        }
+        let mut late_permits = Vec::new();
+        for key in &artifact_keys {
+            let reserved = owner.issue(*key).expect("artifact reservation");
+            late_permits.push(
+                owner
+                    .retire_reserved_uncertain(reserved)
+                    .expect("late reporting permit"),
+            );
+        }
+        owner
+            .request_cancellation(CancellationRequestObservation::new(17103).expect("cancel"))
+            .expect("cancellation");
+        let initial = owner.seal().expect("initial barrier");
+        assert_eq!(initial.dispatch_outcome().recovery_generation(), 1);
+        assert!(
+            initial
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .filter(|row| artifact_keys.contains(&row.key()))
+                .all(|row| row.outcome() == &CancellationDispatchOutcome::EntryUncertain)
+        );
+
+        owner
+            .report_late_observation(
+                late_permits.remove(0),
+                evidence_for(owner.progress(), artifact_keys[0], 7),
+            )
+            .expect("first late refinement");
+        let first_refinement = owner.seal().expect("first refined barrier");
+        assert_eq!(first_refinement.dispatch_outcome().recovery_generation(), 1);
+        assert!(
+            first_refinement
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == artifact_keys[0])
+                .is_some_and(|row| {
+                    matches!(
+                        row.outcome(),
+                        CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+                    )
+                })
+        );
+        assert!(
+            first_refinement
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .find(|row| row.key() == artifact_keys[1])
+                .is_some_and(|row| row.outcome() == &CancellationDispatchOutcome::EntryUncertain)
+        );
+
+        owner
+            .report_late_observation(
+                late_permits.remove(0),
+                evidence_for(owner.progress(), artifact_keys[1], 7),
+            )
+            .expect("second late refinement before accepted state");
+        let second_refinement = owner.seal().expect("second refined barrier");
+        assert_eq!(
+            second_refinement.dispatch_outcome().recovery_generation(),
+            1
+        );
+        assert!(
+            second_refinement
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .filter(|row| artifact_keys[..2].contains(&row.key()))
+                .all(|row| {
+                    matches!(
+                        row.outcome(),
+                        CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+                    )
+                })
+        );
+        assert_eq!(
+            initial.validate_for_owner(&owner),
+            Err(dispatch_owner::DispatchOwnerError::BarrierStateMismatch)
+        );
+
+        let (_recovery, source_closure, coordinator_closure) = empty_after_effect_inputs(
+            owner.progress(),
+            second_refinement.dispatch_outcome().clone(),
+        );
+        owner
+            .accept_after_effect_reconciliation(
+                &second_refinement,
+                owner.progress().recovery_generation(),
+                source_closure,
+                coordinator_closure,
+            )
+            .expect("accept first prospective dispatch");
+        assert_eq!(owner.progress().recovery_generation(), 1);
+
+        owner
+            .report_late_observation(
+                late_permits.remove(0),
+                evidence_for(owner.progress(), artifact_keys[2], 7),
+            )
+            .expect("second late refinement after accepted state");
+        let second_refinement = owner.seal().expect("second refined barrier");
+        assert_eq!(
+            second_refinement.dispatch_outcome().recovery_generation(),
+            2
+        );
+        assert_eq!(
+            first_refinement.validate_for_owner(&owner),
+            Err(dispatch_owner::DispatchOwnerError::BarrierStateMismatch)
+        );
+        assert!(
+            second_refinement
+                .dispatch_outcome()
+                .rows()
+                .iter()
+                .filter(|row| artifact_keys.contains(&row.key()))
+                .all(|row| {
+                    matches!(
+                        row.outcome(),
+                        CancellationDispatchOutcome::ObservedAfterCancellation { .. }
+                    )
+                })
+        );
+        let recovery = owner
+            .progress()
+            .cancellation_effect_recovery_inventory(second_refinement.dispatch_outcome())
+            .expect("second recovery inventory");
+        let source_manifest = owner
+            .progress()
+            .cancellation_source_closure_manifest(&recovery, second_refinement.dispatch_outcome())
+            .expect("second source manifest");
+        let source_closure = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            owner.progress().execution_epoch(),
+            2,
+            source_closure_rows(&source_manifest),
+        )
+        .expect("second source closure");
+        let coordinator_manifest = owner
+            .progress()
+            .cancellation_coordinator_closure_manifest(
+                &source_closure,
+                &recovery,
+                second_refinement.dispatch_outcome(),
+            )
+            .expect("second coordinator manifest");
+        let coordinator_closure =
+            coordinator_closure_record(coordinator_manifest, owner.progress().execution_epoch(), 2);
+        owner
+            .accept_after_effect_reconciliation(
+                &second_refinement,
+                owner.progress().recovery_generation(),
+                source_closure,
+                coordinator_closure,
+            )
+            .expect("accept second prospective dispatch");
+        assert_eq!(owner.progress().recovery_generation(), 2);
+    }
+
+    #[test]
+    fn live_dispatch_owner_late_observation_errors_preserve_token_and_state() {
+        let make_uncertain = || {
+            let mut owner = dispatch_owner::LiveDispatchOwner::new_for_test(
+                copy_progress_with_admission_claims(),
+            )
+            .expect("uncertain owner");
+            let source = key_for(owner.progress(), 0, WorkUnitRole::SourceRead);
+            let source_reserved = owner.issue(source).expect("source reservation");
+            let source_entered = owner.enter(source_reserved).expect("source entry");
+            owner
+                .complete(source_entered, evidence_for(owner.progress(), source, 7))
+                .expect("source completion");
+            let prepare = key_for(owner.progress(), 0, WorkUnitRole::Prepare);
+            let reserved = owner.issue(prepare).expect("prepare reservation");
+            let entered = owner.enter(reserved).expect("prepare entry");
+            owner
+                .request_cancellation(CancellationRequestObservation::new(17104).expect("cancel"))
+                .expect("cancellation");
+            let permit = owner
+                .retire_entered_uncertain(entered)
+                .expect("uncertain retirement");
+            (owner, prepare, permit)
+        };
+
+        let (mut owner, prepare, token) = make_uncertain();
+        let barrier = owner.seal().expect("sealed barrier");
+        let before_bad = owner.progress().clone();
+        let failure = owner
+            .report_late_observation(
+                token,
+                StoredStepEvidence::Filesystem {
+                    receipt: FilesystemReceiptSummary::new(FilesystemReceiptKind::Stage, 1),
+                },
+            )
+            .expect_err("wrong late evidence");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::Progress(
+                WorkProgressError::RoleEvidenceMismatch {
+                    role: WorkUnitRole::Prepare,
+                },
+            )
+        );
+        let (_, token) = failure.into_parts();
+        assert_eq!(owner.progress(), &before_bad);
+        assert_eq!(
+            owner.ledger_state(prepare),
+            Some(dispatch_owner::DispatchLedgerState::ReturnedUncertain)
+        );
+
+        owner.set_recovery_generation_for_test(u64::MAX);
+        let before_overflow = owner.progress().clone();
+        let failure = owner
+            .report_late_observation(token, evidence_for(owner.progress(), prepare, 7))
+            .expect_err("late generation overflow");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::RecoveryGenerationExhausted
+        );
+        let (_, token) = failure.into_parts();
+        assert_eq!(owner.progress(), &before_overflow);
+        assert!(barrier.validate_for_owner(&owner).is_ok());
+
+        owner.set_recovery_generation_for_test(0);
+        owner
+            .report_late_observation(token, evidence_for(owner.progress(), prepare, 7))
+            .expect("recover token after overflow");
+        assert!(barrier.validate_for_owner(&owner).is_err());
+        assert_eq!(
+            owner.ledger_state(prepare),
+            Some(dispatch_owner::DispatchLedgerState::CompletedAfterCancellation)
+        );
+
+        let (mut foreign, foreign_prepare, foreign_token) = make_uncertain();
+        let foreign_failure = owner
+            .report_late_observation(foreign_token, evidence_for(owner.progress(), prepare, 7))
+            .expect_err("foreign late token");
+        assert_eq!(
+            foreign_failure.error(),
+            &dispatch_owner::DispatchOwnerError::PermitOwnerMismatch
+        );
+        let (_, foreign_token) = foreign_failure.into_parts();
+        assert_eq!(
+            foreign.ledger_state(foreign_prepare),
+            Some(dispatch_owner::DispatchLedgerState::ReturnedUncertain)
+        );
+        foreign
+            .report_late_observation(
+                foreign_token,
+                evidence_for(foreign.progress(), foreign_prepare, 7),
+            )
+            .expect("foreign token remains usable by its owner");
+    }
+
+    #[test]
     fn live_dispatch_owner_rejects_cross_owner_and_attempt_overflow_atomically() {
         let mut owner =
             dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_admission_claims())
