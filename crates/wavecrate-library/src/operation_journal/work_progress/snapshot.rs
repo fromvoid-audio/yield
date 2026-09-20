@@ -638,6 +638,7 @@ impl FullProgressSnapshotObservation {
             self.disposition,
             FullProgressDisposition::None
                 | FullProgressDisposition::RetryPending
+                | FullProgressDisposition::PartialNeedsRetry
                 | FullProgressDisposition::AuditRequired
                 | FullProgressDisposition::CancelRequestedBeforePublish
                 | FullProgressDisposition::CancelRequestedAfterPublish
@@ -652,6 +653,20 @@ impl FullProgressSnapshotObservation {
                     disposition: self.disposition,
                 },
             );
+        }
+
+        let partial_retry_is_active = self.disposition
+            == FullProgressDisposition::PartialNeedsRetry
+            || (self.disposition == FullProgressDisposition::AuditRequired
+                && self.active_audit.as_ref().is_some_and(|active| {
+                    active.suspended_hold == super::AuditSuspendedHold::PartialNeedsRetry
+                }));
+        if partial_retry_is_active {
+            progress
+                .validate_partial_retry_eligibility()
+                .map_err(|source| {
+                    FullProgressSnapshotObservationError::PartialRetryEligibility { source }
+                })?;
         }
 
         let terminal = matches!(
@@ -692,6 +707,7 @@ impl FullProgressSnapshotObservation {
         if self.retry_observation.is_some() {
             let retry_allowed = match self.disposition {
                 FullProgressDisposition::RetryPending
+                | FullProgressDisposition::PartialNeedsRetry
                 | FullProgressDisposition::CancelRequestedBeforePublish
                 | FullProgressDisposition::CancelRequestedAfterPublish
                 | FullProgressDisposition::CancelRequestedAfterObservedEffect
@@ -701,6 +717,7 @@ impl FullProgressSnapshotObservation {
                         matches!(
                             active.suspended_hold,
                             super::AuditSuspendedHold::RetryPending
+                                | super::AuditSuspendedHold::PartialNeedsRetry
                                 | super::AuditSuspendedHold::CancelRequestedBeforePublish
                                 | super::AuditSuspendedHold::CancelRequestedAfterPublish
                                 | super::AuditSuspendedHold::CancelRequestedAfterObservedEffect
@@ -851,6 +868,11 @@ impl FullProgressSnapshotObservation {
         {
             return Err(FullProgressSnapshotObservationError::RetryPendingObservationMissing);
         }
+        if self.disposition == FullProgressDisposition::PartialNeedsRetry
+            && self.retry_observation.is_none()
+        {
+            return Err(FullProgressSnapshotObservationError::PartialNeedsRetryObservationMissing);
+        }
         Ok(())
     }
 
@@ -997,7 +1019,10 @@ impl FullProgressSnapshotObservation {
                     .validate_for_plan(self.intent.plan())
                     .map_err(FullProgressSnapshotObservationError::AuditObservation)?;
                 match active.suspended_hold {
-                    super::AuditSuspendedHold::RetryPending if self.retry_observation.is_none() => {
+                    super::AuditSuspendedHold::RetryPending
+                    | super::AuditSuspendedHold::PartialNeedsRetry
+                        if self.retry_observation.is_none() =>
+                    {
                         return Err(FullProgressSnapshotObservationError::AuditRetryHoldMissing);
                     }
                     super::AuditSuspendedHold::CancelRequestedBeforePublish
@@ -1525,6 +1550,15 @@ pub enum FullProgressSnapshotObservationError {
     /// RetryPending disposition had no active retry observation.
     #[error("full-progress snapshot RetryPending disposition has no active retry observation")]
     RetryPendingObservationMissing,
+    /// PartialNeedsRetry disposition had no active retry observation.
+    #[error("full-progress snapshot PartialNeedsRetry disposition has no active retry observation")]
+    PartialNeedsRetryObservationMissing,
+    /// PartialNeedsRetry did not retain the required completed and pending work shape.
+    #[error("full-progress snapshot partial retry eligibility is invalid: {source}")]
+    PartialRetryEligibility {
+        #[source]
+        source: WorkProgressError,
+    },
     /// The snapshot retained a disposition that the current full-progress state machine does not
     /// yet produce or validate.
     #[error(

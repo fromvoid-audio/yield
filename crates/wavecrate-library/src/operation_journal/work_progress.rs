@@ -550,6 +550,8 @@ enum AuditSuspendedHold {
     None,
     /// A retry observation remains pending beneath the audit.
     RetryPending,
+    /// A justified partial-work retry observation remains pending beneath the audit.
+    PartialNeedsRetry,
     /// Cancellation was requested before publication beneath the audit.
     CancelRequestedBeforePublish,
     /// Cancellation was requested after publication beneath the audit.
@@ -1566,6 +1568,35 @@ impl WorkProgress {
         }
         self.validate_readiness_deferral_history()?;
         Ok(())
+    }
+
+    /// Validate whether retained progress justifies a partial-work retry disposition.
+    ///
+    /// Partial retry is an observational suspended state: at least one required non-source-read
+    /// unit must already have completed with retained evidence and context, while another
+    /// required unit remains pending.  Admission claims are required because an initial,
+    /// unadmitted progress value cannot establish a durable partial-work checkpoint.
+    pub(crate) fn validate_partial_retry_eligibility(&self) -> Result<(), WorkProgressError> {
+        if self.admission_claims.is_none() {
+            return Err(WorkProgressError::PartialRetryNotJustified);
+        }
+        self.validate_completion_history()?;
+        let has_completed_effect = self.steps.iter().any(|step| {
+            step.requirement == ParticipantRequirement::Required
+                && step.key.role() != WorkUnitRole::SourceRead
+                && step.status == ProgressStepStatus::Completed
+                && step.evidence.is_some()
+                && step.completion_context.is_some()
+        });
+        let has_pending_required = self.steps.iter().any(|step| {
+            step.requirement == ParticipantRequirement::Required
+                && step.status == ProgressStepStatus::Pending
+        });
+        if has_completed_effect && has_pending_required {
+            Ok(())
+        } else {
+            Err(WorkProgressError::PartialRetryNotJustified)
+        }
     }
 
     /// Validate compact accepted optional-artifact deferral history.
@@ -2844,6 +2875,12 @@ impl WorkProgress {
         if self.disposition.is_terminal() {
             return Err(WorkProgressError::TerminalTransitionForbidden);
         }
+        if self.disposition == FullProgressDisposition::PartialNeedsRetry {
+            return Err(WorkProgressError::RetryDispositionMismatch {
+                expected: FullProgressDisposition::RetryPending,
+                actual: self.disposition,
+            });
+        }
         if matches!(
             self.disposition,
             FullProgressDisposition::AuditRequired
@@ -2881,10 +2918,81 @@ impl WorkProgress {
         Ok(())
     }
 
+    /// Record a justified partial-work retry disposition without changing completed steps.
+    pub(crate) fn request_partial_retry(
+        &mut self,
+        observation: RetryObservation,
+    ) -> Result<(), WorkProgressError> {
+        observation.validate()?;
+        if observation.lease_expiry_unix_ms() <= observation.next_retry_unix_ms() {
+            return Err(WorkProgressError::EmptyRetryWindow);
+        }
+        if self.disposition.is_terminal() {
+            return Err(WorkProgressError::TerminalTransitionForbidden);
+        }
+        if matches!(
+            self.disposition,
+            FullProgressDisposition::AuditRequired
+                | FullProgressDisposition::CancelRequestedBeforePublish
+                | FullProgressDisposition::CancelRequestedAfterPublish
+                | FullProgressDisposition::CancelRequestedAfterObservedEffect
+        ) {
+            return Err(WorkProgressError::ProgressSuspended {
+                disposition: self.disposition,
+            });
+        }
+        if self.disposition == FullProgressDisposition::RetryPending {
+            return Err(WorkProgressError::RetryDispositionMismatch {
+                expected: FullProgressDisposition::PartialNeedsRetry,
+                actual: self.disposition,
+            });
+        }
+        if let Some(existing) = &self.retry_observation {
+            if existing == &observation {
+                return if self.disposition == FullProgressDisposition::PartialNeedsRetry {
+                    Ok(())
+                } else {
+                    Err(WorkProgressError::RetryDispositionMismatch {
+                        expected: FullProgressDisposition::PartialNeedsRetry,
+                        actual: self.disposition,
+                    })
+                };
+            }
+            if observation.attempt() <= existing.attempt() {
+                return Err(WorkProgressError::RetryReplayConflict {
+                    attempt: observation.attempt(),
+                });
+            }
+        }
+        if let Some(last) = &self.last_retry_observation {
+            if last == &observation
+                && self.disposition != FullProgressDisposition::PartialNeedsRetry
+            {
+                return Err(WorkProgressError::RetryDispositionMismatch {
+                    expected: FullProgressDisposition::PartialNeedsRetry,
+                    actual: self.disposition,
+                });
+            }
+            if observation.attempt() <= last.attempt() {
+                return Err(WorkProgressError::RetryReplayConflict {
+                    attempt: observation.attempt(),
+                });
+            }
+        }
+        self.validate_partial_retry_eligibility()?;
+        self.last_retry_observation = Some(observation.clone());
+        self.disposition = FullProgressDisposition::PartialNeedsRetry;
+        self.retry_observation = Some(observation);
+        Ok(())
+    }
+
     /// Resume a retry only after a private owner has reacquired its lease in the valid window.
     #[allow(dead_code)]
     fn resume_retry(&mut self, authority: VerifiedRetryResume) -> Result<(), WorkProgressError> {
-        if self.disposition != FullProgressDisposition::RetryPending {
+        if !matches!(
+            self.disposition,
+            FullProgressDisposition::RetryPending | FullProgressDisposition::PartialNeedsRetry
+        ) {
             return Err(WorkProgressError::RetryResumeNotPending);
         }
         let Some(observation) = &self.retry_observation else {
@@ -3040,6 +3148,7 @@ impl WorkProgress {
         let suspended_hold = match self.disposition {
             FullProgressDisposition::None => AuditSuspendedHold::None,
             FullProgressDisposition::RetryPending => AuditSuspendedHold::RetryPending,
+            FullProgressDisposition::PartialNeedsRetry => AuditSuspendedHold::PartialNeedsRetry,
             FullProgressDisposition::CancelRequestedBeforePublish => {
                 AuditSuspendedHold::CancelRequestedBeforePublish
             }
@@ -3103,6 +3212,9 @@ impl WorkProgress {
             AuditSuspendedHold::None => FullProgressDisposition::None,
             AuditSuspendedHold::RetryPending if self.retry_observation.is_some() => {
                 FullProgressDisposition::RetryPending
+            }
+            AuditSuspendedHold::PartialNeedsRetry if self.retry_observation.is_some() => {
+                FullProgressDisposition::PartialNeedsRetry
             }
             AuditSuspendedHold::CancelRequestedBeforePublish
                 if self.cancellation_request.is_some() =>
@@ -3412,13 +3524,17 @@ impl WorkProgress {
                 key: completion.key,
             });
         }
-        if self.disposition == FullProgressDisposition::RetryPending {
+        if matches!(
+            self.disposition,
+            FullProgressDisposition::RetryPending | FullProgressDisposition::PartialNeedsRetry
+        ) {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
             });
         }
         if self.disposition != FullProgressDisposition::None
             && self.disposition != FullProgressDisposition::RetryPending
+            && self.disposition != FullProgressDisposition::PartialNeedsRetry
         {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
@@ -3462,7 +3578,10 @@ impl WorkProgress {
         self.steps[index].status = ProgressStepStatus::Completed;
         self.steps[index].evidence = Some(completion.evidence);
         self.steps[index].completion_context = Some(completion_context);
-        if self.disposition == FullProgressDisposition::RetryPending {
+        if matches!(
+            self.disposition,
+            FullProgressDisposition::RetryPending | FullProgressDisposition::PartialNeedsRetry
+        ) {
             self.disposition = FullProgressDisposition::None;
             self.retry_observation = None;
         }
@@ -6067,6 +6186,19 @@ pub enum WorkProgressError {
         /// Attempt number rejected as a replay or regression.
         attempt: u32,
     },
+    /// A retry request attempted to change the retained retry disposition.
+    #[error("work progress retry disposition {actual:?} does not match requested {expected:?}")]
+    RetryDispositionMismatch {
+        /// Disposition requested by the retry API.
+        expected: FullProgressDisposition,
+        /// Disposition currently retained by progress.
+        actual: FullProgressDisposition,
+    },
+    /// Retained progress does not contain enough completed and pending work for a partial retry.
+    #[error(
+        "work progress partial retry requires completed required effect work and pending required work"
+    )]
+    PartialRetryNotJustified,
     /// Work was asked to resume without a pending retry observation.
     #[error("work progress retry is not pending")]
     RetryResumeNotPending,
@@ -23704,11 +23836,7 @@ mod tests {
             serde_json::from_value(unsupported).expect("unsupported disposition shape");
         assert!(matches!(
             unsupported.validate_base(),
-            Err(
-                FullProgressSnapshotObservationError::UnsupportedDisposition {
-                    disposition: FullProgressDisposition::PartialNeedsRetry,
-                }
-            )
+            Err(FullProgressSnapshotObservationError::PartialNeedsRetryObservationMissing)
         ));
 
         let mut retry = copy_progress_with_admission_claims();
@@ -24173,6 +24301,275 @@ mod tests {
             .expect("normal completion after retry resume")
             .validate_base()
             .expect("normal completion clears active retry");
+    }
+
+    #[test]
+    fn partial_retry_requires_completed_effect_and_pending_required_work() {
+        let observation = || {
+            RetryObservation::new(
+                1,
+                100,
+                200,
+                RetryLeaseId::new("partial-eligibility").expect("retry lease"),
+                300,
+                RetryErrorClass::TransientAvailability,
+                "partial checkpoint",
+                None,
+            )
+            .expect("retry observation")
+        };
+
+        let mut initial = copy_progress_with_admission_claims();
+        let before_initial = initial.clone();
+        assert_eq!(
+            initial.request_partial_retry(observation()),
+            Err(WorkProgressError::PartialRetryNotJustified)
+        );
+        assert_eq!(initial, before_initial);
+
+        let mut source_only = copy_progress_with_admission_claims();
+        apply_role(&mut source_only, 0, WorkUnitRole::SourceRead);
+        let before_source_only = source_only.clone();
+        assert_eq!(
+            source_only.request_partial_retry(observation()),
+            Err(WorkProgressError::PartialRetryNotJustified)
+        );
+        assert_eq!(source_only, before_source_only);
+
+        let mut complete = copy_progress_with_admission_claims();
+        complete_required(&mut complete);
+        let before_complete = complete.clone();
+        assert_eq!(
+            complete.request_partial_retry(observation()),
+            Err(WorkProgressError::PartialRetryNotJustified)
+        );
+        assert_eq!(complete, before_complete);
+
+        let mut unadmitted = copy_progress(false);
+        publish_prefix(&mut unadmitted);
+        let before_unadmitted = unadmitted.clone();
+        assert_eq!(
+            unadmitted.request_partial_retry(observation()),
+            Err(WorkProgressError::PartialRetryNotJustified)
+        );
+        assert_eq!(unadmitted, before_unadmitted);
+    }
+
+    #[test]
+    fn partial_retry_replays_suspends_work_and_resumes_without_mutating_steps() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        let steps_before = progress.steps.clone();
+        let phase_before = progress.phase();
+        let observation = RetryObservation::new(
+            1,
+            100,
+            200,
+            RetryLeaseId::new("partial-transition").expect("retry lease"),
+            300,
+            RetryErrorClass::TransientAvailability,
+            "partial transition",
+            None,
+        )
+        .expect("retry observation");
+        progress
+            .request_partial_retry(observation.clone())
+            .expect("partial retry request");
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::PartialNeedsRetry
+        );
+        assert_eq!(progress.retry_observation(), Some(&observation));
+        assert_eq!(progress.steps, steps_before);
+        assert_eq!(progress.phase(), phase_before);
+
+        let exact_replay = progress.clone();
+        progress
+            .request_partial_retry(observation.clone())
+            .expect("exact partial replay");
+        assert_eq!(progress, exact_replay);
+
+        let conflicting = RetryObservation::new(
+            1,
+            100,
+            200,
+            RetryLeaseId::new("partial-conflict").expect("retry lease"),
+            300,
+            RetryErrorClass::TransientAvailability,
+            "partial conflict",
+            None,
+        )
+        .expect("conflicting observation");
+        let before_conflict = progress.clone();
+        assert_eq!(
+            progress.request_partial_retry(conflicting),
+            Err(WorkProgressError::RetryReplayConflict { attempt: 1 })
+        );
+        assert_eq!(progress, before_conflict);
+        let before_conversion = progress.clone();
+        assert_eq!(
+            progress.request_retry(observation.clone()),
+            Err(WorkProgressError::RetryDispositionMismatch {
+                expected: FullProgressDisposition::RetryPending,
+                actual: FullProgressDisposition::PartialNeedsRetry,
+            })
+        );
+        assert_eq!(progress, before_conversion);
+
+        let pending_key = key_for(&progress, 0, WorkUnitRole::SourceAffect);
+        let before_completion = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                pending_key,
+                evidence_for(&progress, pending_key, 7),
+            )),
+            Err(WorkProgressError::ProgressSuspended {
+                disposition: FullProgressDisposition::PartialNeedsRetry
+            })
+        ));
+        assert_eq!(progress, before_completion);
+
+        let before_stale_resume = progress.clone();
+        assert_eq!(
+            progress.resume_retry(VerifiedRetryResume {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                retry_observation: observation.clone(),
+                now_unix_ms: 200,
+                expected_execution_epoch: 1,
+            }),
+            Err(WorkProgressError::RetryResumeEpochMismatch {
+                expected: 0,
+                actual: 1,
+            })
+        );
+        assert_eq!(progress, before_stale_resume);
+
+        progress
+            .resume_retry(VerifiedRetryResume {
+                operation_id: progress.operation_id,
+                plan: progress.plan.clone(),
+                retry_observation: observation,
+                now_unix_ms: 200,
+                expected_execution_epoch: 0,
+            })
+            .expect("resume partial retry");
+        assert_eq!(progress.execution_epoch(), 1);
+        assert_eq!(progress.disposition(), FullProgressDisposition::None);
+        assert!(progress.retry_observation().is_none());
+        assert_eq!(progress.last_retry_observation().unwrap().attempt(), 1);
+        assert_eq!(progress.steps, steps_before);
+        assert_eq!(progress.phase(), phase_before);
+    }
+
+    #[test]
+    fn partial_retry_snapshot_roundtrip_and_audit_cancellation_retention() {
+        let observation = RetryObservation::new(
+            1,
+            100,
+            200,
+            RetryLeaseId::new("partial-snapshot").expect("retry lease"),
+            300,
+            RetryErrorClass::TransientAvailability,
+            "partial snapshot",
+            None,
+        )
+        .expect("retry observation");
+        let mut partial = copy_progress_with_admission_claims();
+        publish_prefix(&mut partial);
+        partial
+            .request_partial_retry(observation.clone())
+            .expect("partial retry");
+        let snapshot = partial
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&partial))
+            .expect("partial snapshot");
+        snapshot
+            .validate_base()
+            .expect("partial snapshot validates");
+        let record =
+            super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot.clone())
+                .expect("partial full-progress record");
+        let bytes = super::super::full_progress_codec::encode(&record).expect("partial encode");
+        let decoded = super::super::full_progress_codec::decode(&bytes).expect("partial decode");
+        assert_eq!(decoded.snapshot(), &snapshot);
+
+        let mut audit = copy_progress_with_admission_claims();
+        publish_prefix(&mut audit);
+        audit
+            .request_partial_retry(observation.clone())
+            .expect("partial retry for audit");
+        audit
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("audit over partial retry");
+        audit
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&audit))
+            .expect("partial audit snapshot")
+            .validate_base()
+            .expect("partial audit retention validates");
+
+        let mut resolved = copy_progress_with_admission_claims();
+        publish_prefix(&mut resolved);
+        resolved
+            .request_partial_retry(observation.clone())
+            .expect("partial retry for audit resolution");
+        resolved
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("audit over partial retry for resolution");
+        resolved
+            .resolve_audit(audit_resolution_authority(&resolved, 1, 0))
+            .expect("resolve partial audit");
+        assert_eq!(
+            resolved.disposition(),
+            FullProgressDisposition::PartialNeedsRetry
+        );
+        resolved
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&resolved))
+            .expect("resolved partial snapshot")
+            .validate_base()
+            .expect("resolved partial retention validates");
+
+        audit
+            .request_cancellation(CancellationRequestObservation::new(18135).expect("cancel"))
+            .expect("cancellation under partial audit");
+        audit
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&audit))
+            .expect("partial cancellation snapshot")
+            .validate_base()
+            .expect("partial cancellation retention validates");
+
+        let mut missing = serde_json::to_value(&snapshot).expect("snapshot value");
+        missing["retry_observation"] = serde_json::Value::Null;
+        missing["last_retry_observation"] = serde_json::Value::Null;
+        let missing: FullProgressSnapshotObservation =
+            serde_json::from_value(missing).expect("missing partial retry shape");
+        assert!(matches!(
+            missing.validate_base(),
+            Err(FullProgressSnapshotObservationError::PartialNeedsRetryObservationMissing)
+        ));
+
+        let initial_progress = copy_progress_with_admission_claims();
+        let initial_snapshot = initial_progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&initial_progress))
+            .expect("initial snapshot");
+        let mut unjustified = serde_json::to_value(&initial_snapshot).expect("snapshot value");
+        unjustified["disposition"] = json!("PartialNeedsRetry");
+        unjustified["retry_observation"] = serde_json::to_value(&observation).expect("retry");
+        unjustified["last_retry_observation"] = serde_json::to_value(&observation).expect("retry");
+        let unjustified: FullProgressSnapshotObservation =
+            serde_json::from_value(unjustified).expect("unjustified partial shape");
+        assert!(matches!(
+            unjustified.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::PartialRetryEligibility {
+                    source: WorkProgressError::PartialRetryNotJustified,
+                }
+            )
+        ));
     }
 
     #[test]
