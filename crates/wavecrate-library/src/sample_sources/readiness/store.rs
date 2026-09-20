@@ -236,6 +236,64 @@ impl ReadinessWakeObservation {
     }
 }
 
+/// A source-owned, read-time qualification of one durable readiness wake.
+///
+/// This is deliberately not serializable or clonable. It records the exact wake and source
+/// revision observed by one coherent SQLite read, together with the physical source fence that
+/// was live at that boundary. The physical root/database identities and persisted readiness
+/// namespace are the source identity available at this layer; this value does not establish an
+/// independent catalog source ID or lifecycle authority. An operation consumer must compare those
+/// identities, the namespace and revision, its current execution epoch, and separately established
+/// lifecycle context before using the observation. Fence revalidation proves only lease liveness;
+/// it does not refresh or establish currentness of the wake, targets, or revision.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ReadinessWakeQualification {
+    observation: ReadinessWakeObservation,
+    publication_fence: SourcePublicationFence,
+    source_revision: u64,
+    root_identity: String,
+    database_identity: String,
+}
+
+#[allow(dead_code)]
+impl ReadinessWakeQualification {
+    /// Wake metadata observed in the source transaction.
+    pub(crate) fn observation(&self) -> &ReadinessWakeObservation {
+        &self.observation
+    }
+
+    /// Physical-source fence retained for a later liveness check.
+    pub(crate) fn publication_fence(&self) -> &SourcePublicationFence {
+        &self.publication_fence
+    }
+
+    /// Source metadata revision observed in the same transaction as the wake.
+    pub(crate) fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    /// Verified database-root identity retained by the owned source database.
+    pub(crate) fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    /// Verified SQLite database-file identity retained by the owned source database.
+    pub(crate) fn database_identity(&self) -> &str {
+        &self.database_identity
+    }
+
+    /// Revalidate only the retained source lease/fence liveness.
+    ///
+    /// This does not re-read the wake or target set and therefore does not establish currentness
+    /// of any source observation after the original qualification boundary.
+    pub(crate) fn validate_source_liveness(&self) -> Result<(), ReadinessError> {
+        self.publication_fence
+            .validate()
+            .map_err(ReadinessError::from)
+    }
+}
+
 impl<'connection> ReadinessStore<'connection> {
     /// Bind readiness persistence to one caller-selected source database connection.
     ///
@@ -686,6 +744,44 @@ impl<'connection> ReadinessStore<'connection> {
         source_id: &str,
     ) -> Result<Option<ReadinessWakeObservation>, ReadinessError> {
         persistence::read_readiness_wake(self.connection, source_id)
+    }
+
+    /// Qualify one committed readiness wake from a fully owned source database.
+    ///
+    /// The wake, source revision, source readiness state, and complete target digest are read in
+    /// one transaction. The retained profile, database binding, and source lease are checked both
+    /// before and after that read. This produces a read-time source observation only, bound to the
+    /// persisted readiness namespace and physical identities available here. Consumers must add
+    /// exact operation namespace, revision, current-epoch, and lifecycle comparisons; the retained
+    /// fence can only revalidate lease liveness and does not refresh this wake.
+    #[allow(dead_code)]
+    pub(crate) fn qualify_readiness_wake(
+        &mut self,
+        source_id: &str,
+    ) -> Result<ReadinessWakeQualification, ReadinessError> {
+        self.ownership.validate_read_only(&*self.connection)?;
+        let publication_fence = self
+            .ownership
+            .publication_fence()?
+            .ok_or(ReadinessError::OwnershipRequired)?;
+        let (root_identity, database_identity) = self.ownership.verified_binding_identities()?;
+        let observation_and_revision =
+            persistence::read_readiness_wake_with_source_revision(self.connection, source_id)?;
+        let Some((observation, source_revision)) = observation_and_revision else {
+            return Err(ReadinessError::ReadinessWakeMissing {
+                source_id: source_id.to_string(),
+            });
+        };
+        self.ownership.validate_read_only(&*self.connection)?;
+        self.ownership
+            .validate_publication_fence(Some(&publication_fence))?;
+        Ok(ReadinessWakeQualification {
+            observation,
+            publication_fence,
+            source_revision,
+            root_identity,
+            database_identity,
+        })
     }
 
     /// Mark a source offline without modifying its generation or target set.

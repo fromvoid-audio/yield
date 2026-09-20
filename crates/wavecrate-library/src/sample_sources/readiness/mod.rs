@@ -20,6 +20,8 @@ pub use snapshot::{
     ReadinessEntry, ReadinessProgress, ReadinessSnapshot, ReadinessStageCounts,
 };
 #[cfg(test)]
+pub(crate) use store::ReadinessWakeQualification;
+#[cfg(test)]
 pub(crate) use store::reconcile_readiness_with_hook;
 pub use store::{
     ReadinessCompatibilityCleanup, ReadinessDeltaPublicationOutcome,

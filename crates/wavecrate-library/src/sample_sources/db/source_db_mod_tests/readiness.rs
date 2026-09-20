@@ -12,7 +12,7 @@ use crate::{
             ArtifactPublishOutcome, ClaimedReadinessWork, ReadinessArtifact, ReadinessError,
             ReadinessFailureClassification, ReadinessRetryPolicy, ReadinessStage, ReadinessStore,
             ReadinessTarget, ReadinessTargetDeltaPublication, ReadinessTargetPublication,
-            SourceAvailability,
+            ReadinessWakeQualification, SourceAvailability,
         },
     },
 };
@@ -54,6 +54,145 @@ fn publication<'a>(targets: &'a [ReadinessTarget]) -> ReadinessTargetPublication
         targets,
         1,
     )
+}
+
+#[test]
+fn owned_readiness_wake_qualification_requires_coherent_owned_state() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let mut database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "readiness-wake-qualification",
+    )
+    .expect("profile-owned source database");
+    database
+        .connection
+        .execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('revision', '41')",
+            [],
+        )
+        .expect("seed source revision");
+    let target = ReadinessTarget::source(
+        "readiness-owned-source",
+        ReadinessStage::SimilarityLayout,
+        "layout-v1",
+        1,
+        "membership-v1",
+    );
+    let targets = [target];
+    let qualification: ReadinessWakeQualification = {
+        let mut store = database.readiness_store().expect("owned readiness store");
+        let origin = store
+            .capture_publication_origin()
+            .expect("readiness publication origin");
+        store
+            .publish_targets(&origin, &publication(&targets))
+            .expect("publish readiness target");
+        drop(store);
+        let mut store = database
+            .readiness_store_read_only()
+            .expect("owned read-only readiness store");
+        let qualification = store
+            .qualify_readiness_wake("readiness-owned-source")
+            .expect("qualify owned readiness wake");
+        assert_eq!(
+            qualification.observation().source_id(),
+            "readiness-owned-source"
+        );
+        assert_eq!(qualification.source_revision(), 41);
+        assert!(!qualification.root_identity().is_empty());
+        assert!(!qualification.database_identity().is_empty());
+        assert!(qualification.publication_fence().is_live());
+        qualification
+    };
+
+    let error = ReadinessStore::new(&mut database.connection)
+        .qualify_readiness_wake("readiness-owned-source")
+        .expect_err("unowned readiness connection must not mint qualification");
+    assert!(matches!(error, ReadinessError::OwnershipRequired));
+
+    let error = {
+        let mut store = database
+            .readiness_store_read_only()
+            .expect("owned read-only readiness store");
+        store
+            .qualify_readiness_wake("different-source")
+            .expect_err("missing readiness namespace must fail closed")
+    };
+    assert!(matches!(
+        error,
+        ReadinessError::ReadinessWakeMissing { source_id } if source_id == "different-source"
+    ));
+
+    database
+        .connection
+        .execute(
+            "UPDATE source_readiness_sources
+             SET readiness_revision = readiness_revision + 1
+             WHERE source_id = 'readiness-owned-source'",
+            [],
+        )
+        .expect("change source readiness metadata");
+    let error = {
+        let mut store = database
+            .readiness_store_read_only()
+            .expect("owned read-only readiness store");
+        store
+            .qualify_readiness_wake("readiness-owned-source")
+            .expect_err("changed source metadata must reject stale wake")
+    };
+    assert!(matches!(
+        error,
+        ReadinessError::ReadinessWakeMismatch {
+            field: "readiness_revision"
+        }
+    ));
+
+    database
+        .connection
+        .execute(
+            "UPDATE source_readiness_sources
+             SET readiness_revision = 1
+             WHERE source_id = 'readiness-owned-source'",
+            [],
+        )
+        .expect("restore source readiness metadata");
+    database
+        .connection
+        .execute(
+            "UPDATE source_readiness_targets
+             SET required_version = 'layout-v2'
+             WHERE source_id = 'readiness-owned-source'",
+            [],
+        )
+        .expect("change target metadata");
+    let error = {
+        let mut store = database
+            .readiness_store_read_only()
+            .expect("owned read-only readiness store");
+        store
+            .qualify_readiness_wake("readiness-owned-source")
+            .expect_err("changed target metadata must reject stale wake")
+    };
+    assert!(matches!(
+        error,
+        ReadinessError::ReadinessWakeMismatch {
+            field: "target_digest"
+        }
+    ));
+
+    drop(database);
+    let error = qualification
+        .validate_source_liveness()
+        .expect_err("released source lease invalidates retained qualification fence");
+    assert!(matches!(
+        error,
+        ReadinessError::SourcePublicationFence(SourcePublicationFenceError::LeaseDropped)
+    ));
 }
 
 #[test]

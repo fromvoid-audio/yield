@@ -63,6 +63,12 @@ pub enum ReadinessError {
         /// Wake field whose current-state comparison failed.
         field: &'static str,
     },
+    /// No durable wake exists for the requested source.
+    #[error("No durable readiness wake exists for source {source_id}")]
+    ReadinessWakeMissing {
+        /// Source identity requested by the read-only qualification.
+        source_id: String,
+    },
     /// A stored enum value is not part of the versioned readiness contract.
     #[error("Unknown stored readiness value for {field}: {value}")]
     UnknownStoredValue {

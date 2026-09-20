@@ -412,6 +412,59 @@ impl<'a> ReadinessOwnership<'a> {
             _ => Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired),
         }
     }
+
+    /// Validate retained ownership without renewing the source lease.
+    ///
+    /// Read-only source qualifications must use this strict path even in test builds. The
+    /// mutation validator above intentionally permits unowned fixtures and may renew a lease;
+    /// neither behavior is suitable for minting a source-side read-time qualification.
+    #[allow(dead_code)]
+    pub(crate) fn validate_read_only(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), crate::sample_sources::readiness::ReadinessError> {
+        let (
+            Some(profile_guard),
+            Some(database_root_binding),
+            Some(database_file_binding),
+            Some(source_lease),
+        ) = (
+            self.profile_guard,
+            self.database_root_binding,
+            self.database_file_binding,
+            self.source_lease,
+        )
+        else {
+            return Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired);
+        };
+        database_root_binding
+            .validate_profile_guard(profile_guard)
+            .map_err(map_readiness_database_root_error)?;
+        database_file_binding
+            .validate(connection)
+            .map_err(|error| {
+                crate::sample_sources::readiness::ReadinessError::DatabaseIdentity(
+                    source_database_identity_error(error),
+                )
+            })?;
+        source_lease
+            .validate_current(connection)
+            .map_err(crate::sample_sources::readiness::ReadinessError::from)
+    }
+
+    /// Return the physical root and database identities held by the retained file binding.
+    #[allow(dead_code)]
+    pub(crate) fn verified_binding_identities(
+        &self,
+    ) -> Result<(String, String), crate::sample_sources::readiness::ReadinessError> {
+        let Some(database_file_binding) = self.database_file_binding else {
+            return Err(crate::sample_sources::readiness::ReadinessError::OwnershipRequired);
+        };
+        Ok((
+            database_file_binding.root().identity().to_owned(),
+            database_file_binding.identity().to_owned(),
+        ))
+    }
 }
 
 /// SQLite wrapper that stores wav metadata for a single source folder.
@@ -592,6 +645,33 @@ impl SourceDatabase {
         &mut self,
     ) -> Result<crate::sample_sources::readiness::ReadinessStore<'_>, SourceDbError> {
         self.validate_profile_owned_mutation()?;
+        let ownership = ReadinessOwnership::new(
+            self.profile_guard.as_ref(),
+            self.database_root_binding.as_deref(),
+            self.database_file_binding.as_deref(),
+            self.source_lease.as_ref(),
+        );
+        Ok(
+            crate::sample_sources::readiness::ReadinessStore::from_owned_connection(
+                &mut self.connection,
+                ownership,
+            ),
+        )
+    }
+
+    /// Borrow an owned readiness store for read-only source qualification.
+    ///
+    /// Unlike [`Self::readiness_store`], this path performs only retained profile, database-file,
+    /// and lease validation. It does not renew the lease or authorize any readiness mutation.
+    #[allow(dead_code)]
+    pub(crate) fn readiness_store_read_only(
+        &mut self,
+    ) -> Result<crate::sample_sources::readiness::ReadinessStore<'_>, SourceDbError> {
+        let profile_guard = self
+            .profile_guard
+            .as_ref()
+            .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        self.validate_profile_owned_open(profile_guard)?;
         let ownership = ReadinessOwnership::new(
             self.profile_guard.as_ref(),
             self.database_root_binding.as_deref(),

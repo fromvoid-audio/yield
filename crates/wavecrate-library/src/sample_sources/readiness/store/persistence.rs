@@ -1736,6 +1736,10 @@ fn read_readiness_wake_row(
 ) -> Result<Option<super::ReadinessWakeObservation>, ReadinessError> {
     let mut statement = tx.prepare(
         "SELECT
+             typeof(source_id), length(CAST(source_id AS BLOB)),
+             CASE WHEN typeof(source_id) = 'text'
+                       AND length(CAST(source_id AS BLOB)) <= ?2
+                  THEN source_id END,
              typeof(wake_id), length(CAST(wake_id AS BLOB)),
              CASE WHEN typeof(wake_id) = 'text'
                        AND length(CAST(wake_id AS BLOB)) <= ?2
@@ -1763,21 +1767,26 @@ fn read_readiness_wake_row(
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
+    let stored_source_id =
+        read_required_bounded_text(row, 0, 1, 2, "source_id", MAX_READINESS_TARGET_TEXT_BYTES)?;
+    if stored_source_id != source_id {
+        return Err(ReadinessError::ReadinessWakeMismatch { field: "source_id" });
+    }
     let wake_id =
-        read_required_bounded_text(row, 0, 1, 2, "wake_id", MAX_READINESS_TARGET_TEXT_BYTES)?;
-    let owner_revision = read_stored_i64(row, 3, 4, "owner_revision")?;
-    let source_generation = read_stored_i64(row, 5, 6, "source_generation")?;
-    let readiness_revision = read_stored_i64(row, 7, 8, "readiness_revision")?;
+        read_required_bounded_text(row, 3, 4, 5, "wake_id", MAX_READINESS_TARGET_TEXT_BYTES)?;
+    let owner_revision = read_stored_i64(row, 6, 7, "owner_revision")?;
+    let source_generation = read_stored_i64(row, 8, 9, "source_generation")?;
+    let readiness_revision = read_stored_i64(row, 10, 11, "readiness_revision")?;
     let contract_version = read_required_bounded_text(
         row,
-        9,
-        10,
-        11,
+        12,
+        13,
+        14,
         "contract_version",
         MAX_READINESS_CONTRACT_VERSION_BYTES,
     )?;
-    let target_digest = read_bounded_digest(row, 12, 13, 14)?;
-    let target_count = read_stored_i64(row, 15, 16, "target_count")?;
+    let target_digest = read_bounded_digest(row, 15, 16, 17)?;
+    let target_count = read_stored_i64(row, 18, 19, "target_count")?;
     if Uuid::parse_str(&wake_id).is_err() || Uuid::parse_str(&wake_id).is_ok_and(|id| id.is_nil()) {
         return Err(invalid_persisted_value("wake_id", "must be a non-nil UUID"));
     }
@@ -1815,7 +1824,7 @@ fn read_readiness_wake_row(
         return Err(invalid_persisted_value("source_id", "duplicate wake row"));
     }
     Ok(Some(super::ReadinessWakeObservation {
-        source_id: source_id.to_string(),
+        source_id: stored_source_id,
         wake_id,
         owner_revision,
         source_generation,
@@ -1830,6 +1839,30 @@ pub(super) fn read_readiness_wake(
     connection: &mut Connection,
     source_id: &str,
 ) -> Result<Option<super::ReadinessWakeObservation>, ReadinessError> {
+    Ok(read_readiness_wake_inner(connection, source_id, false)?
+        .map(|(wake, _source_revision)| wake))
+}
+
+#[allow(dead_code)]
+pub(super) fn read_readiness_wake_with_source_revision(
+    connection: &mut Connection,
+    source_id: &str,
+) -> Result<Option<(super::ReadinessWakeObservation, u64)>, ReadinessError> {
+    let Some((wake, source_revision)) = read_readiness_wake_inner(connection, source_id, true)?
+    else {
+        return Ok(None);
+    };
+    let source_revision = source_revision.ok_or_else(|| {
+        invalid_persisted_value("source_revision", "missing qualification revision")
+    })?;
+    Ok(Some((wake, source_revision)))
+}
+
+fn read_readiness_wake_inner(
+    connection: &mut Connection,
+    source_id: &str,
+    include_source_revision: bool,
+) -> Result<Option<(super::ReadinessWakeObservation, Option<u64>)>, ReadinessError> {
     validate_target_text_bound("source_id", source_id)?;
     let tx = connection.transaction()?;
     let Some(wake) = read_readiness_wake_row(&tx, source_id)? else {
@@ -1870,8 +1903,44 @@ pub(super) fn read_readiness_wake(
             field: "target_count",
         });
     }
+    let source_revision = include_source_revision
+        .then(|| read_source_revision(&tx))
+        .transpose()?;
     tx.commit()?;
-    Ok(Some(wake))
+    Ok(Some((wake, source_revision)))
+}
+
+fn read_source_revision(tx: &Transaction<'_>) -> Result<u64, ReadinessError> {
+    let mut statement = tx.prepare(
+        "SELECT
+             typeof(value), length(CAST(value AS BLOB)),
+             CASE WHEN typeof(value) = 'text'
+                       AND length(CAST(value AS BLOB)) <= ?1
+                  THEN value END
+         FROM metadata
+         WHERE key = 'revision'",
+    )?;
+    let mut rows = statement.query([MAX_READINESS_TARGET_TEXT_BYTES as i64])?;
+    let Some(row) = rows.next()? else {
+        return Ok(0);
+    };
+    let raw_revision = read_required_bounded_text(
+        row,
+        0,
+        1,
+        2,
+        "source_revision",
+        MAX_READINESS_TARGET_TEXT_BYTES,
+    )?;
+    if rows.next()?.is_some() {
+        return Err(invalid_persisted_value(
+            "source_revision",
+            "duplicate metadata row",
+        ));
+    }
+    raw_revision
+        .parse::<u64>()
+        .map_err(|_| invalid_persisted_value("source_revision", "invalid unsigned integer"))
 }
 
 fn read_current_wake_source_state(
