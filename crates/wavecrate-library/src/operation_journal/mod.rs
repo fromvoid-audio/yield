@@ -13,6 +13,7 @@ pub mod cancellation_reconciliation;
 pub mod cancellation_recovery;
 pub mod codec;
 pub mod coordinator;
+pub mod decoded_edit_commands;
 pub mod evidence;
 pub mod external_commands;
 pub mod full_capacity;
@@ -117,6 +118,10 @@ pub use coordinator::{
     WaveformEditIntentArgs, WaveformEditOperationArgs, WaveformEditSettingsArgs,
     WaveformEditValidationError, WaveformFileRevisionObservation, WaveformOutputEncoding,
     WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+};
+pub use decoded_edit_commands::{
+    DecodedEditIntentArgs, DecodedEditOperation, DecodedEditOperationArgs,
+    DecodedEditValidationError, MAX_DECODED_EDIT_RANGES,
 };
 
 pub use removal_commands::{

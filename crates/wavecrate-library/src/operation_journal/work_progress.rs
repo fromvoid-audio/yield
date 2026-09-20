@@ -6661,13 +6661,13 @@ mod tests {
         CancellationSourceClosureOutcome, CoordinatorClosureManifest,
         CoordinatorClosureManifestError, CoordinatorClosureManifestValidationError,
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        CreateFolderIntentArgs, DurableReadinessWakeObservation, EvidenceBatchId,
-        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
-        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
-        ExternalRawObservationLimits, ExternalRawObservationMetadata,
-        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
-        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
-        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+        CreateFolderIntentArgs, DecodedEditIntentArgs, DecodedEditOperationArgs,
+        DurableReadinessWakeObservation, EvidenceBatchId, ExternalCaptureBoundary,
+        ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
+        ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
+        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
+        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
+        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
         FullProgressIntentObservation, HistoryAction, HistoryDirection,
         HistoryExtractedFileObservation, HistoryFolderMove, HistoryFolderRelocation,
         HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
@@ -7239,6 +7239,43 @@ mod tests {
             admission_claims(12),
         )
         .expect("copy progress with claim observation")
+    }
+
+    fn decoded_edit_progress(
+        operation: DecodedEditOperationArgs,
+    ) -> (WorkProgress, ParticipantSet, UniversalCommandArgs) {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("decoded source endpoint");
+        let args = UniversalCommandArgs::DecodedEdit(
+            DecodedEditIntentArgs::new(
+                source_endpoint,
+                WaveformFileRevisionObservation::new("file-id", "change-marker", 1024, Some(3))
+                    .expect("decoded file revision"),
+                WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                    .expect("decoded source spec"),
+                100,
+                operation,
+                WaveformOutputSpec::float32(2, 48_000),
+            )
+            .expect("decoded edit arguments"),
+        );
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("decoded edit work plan");
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(207)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("decoded edit progress");
+        (progress, participants, args)
     }
 
     fn copy_progress_with_admission_claims_and_optional() -> WorkProgress {
@@ -21697,6 +21734,56 @@ mod tests {
                 .capture_full_progress_snapshot(&snapshot_intent_for(&deferred, args, participants))
                 .expect("deferred snapshot"),
         );
+
+        let (decoded_edit, participants, args) =
+            decoded_edit_progress(DecodedEditOperationArgs::click_repair(
+                WaveformEditFrameRange::new(1, 99).expect("decoded repair range"),
+            ));
+        roundtrip(
+            decoded_edit
+                .capture_full_progress_snapshot(&snapshot_intent_for(
+                    &decoded_edit,
+                    args,
+                    participants,
+                ))
+                .expect("decoded edit snapshot"),
+        );
+    }
+
+    #[test]
+    fn full_progress_codec_roundtrips_duplicate_cleanup_and_rejects_noncanonical_ranges() {
+        let (progress, participants, args) = decoded_edit_progress(
+            DecodedEditOperationArgs::duplicate_cleanup(vec![
+                WaveformEditFrameRange::new(10, 20).expect("first cleanup range"),
+                WaveformEditFrameRange::new(40, 50).expect("second cleanup range"),
+            ])
+            .expect("canonical cleanup operation"),
+        );
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("duplicate cleanup snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("duplicate cleanup record");
+        let bytes = super::super::full_progress_codec::encode(&record).expect("encode");
+        let decoded = super::super::full_progress_codec::decode(&bytes).expect("roundtrip");
+        assert_eq!(decoded.snapshot(), record.snapshot());
+
+        let mut noncanonical: serde_json::Value = serde_json::from_slice(&bytes).expect("value");
+        noncanonical["snapshot"]["intent"]["args"]["DecodedEdit"]["operation"] = serde_json::json!({
+            "DuplicateCleanup": {
+                "ranges": [
+                    {"start_frame": 10, "end_frame": 30},
+                    {"start_frame": 20, "end_frame": 40}
+                ]
+            }
+        });
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&noncanonical).expect("noncanonical bytes")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+                | Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use super::coordinator::{
     validate_persisted_retry_observation_value, validate_persisted_universal_command_args_value,
     validate_persisted_waveform_edit_value,
 };
+use super::decoded_edit_commands::validate_persisted_decoded_edit_value;
 use super::evidence::{
     AbsentFinalAdoptionEvidence, AbsentFinalRecoveryObservation, AbsentFinalTransactionOwnedProof,
     FilesystemPublishedWaveformRestore, FilesystemStagedWaveformRestore, FinalNamespaceClaim,
@@ -2888,6 +2889,7 @@ fn validate_persisted_tagged_command_args_value(
         "Copy" | "DuplicateSame" => validate_persisted_copy_intent_value(arguments),
         "Import" => validate_persisted_import_intent_value(arguments),
         "WaveformEdit" => validate_persisted_waveform_edit_value(arguments),
+        "DecodedEdit" => validate_persisted_decoded_edit_value(arguments),
         "Namespace" => validate_persisted_namespace_command_args_value(arguments),
         "Render" => validate_persisted_render_command_args_value(arguments),
         "Removal" => validate_persisted_removal_command_args_value(arguments),
@@ -3239,6 +3241,11 @@ pub(crate) fn validate_v6_coordinator_shape(record: &StoredOperationRecord) -> R
                 "schema-v6 cannot carry schema-v7 waveform edit arguments",
             ));
         }
+        UniversalCommandArgs::DecodedEdit(_) => {
+            return Err(String::from(
+                "schema-v6 cannot carry full-progress-only DecodedEdit arguments",
+            ));
+        }
         UniversalCommandArgs::Namespace(_) => {
             return Err(String::from(
                 "schema-v6 cannot carry schema-v8 namespace arguments",
@@ -3579,6 +3586,7 @@ fn validate_tagged_coordinator_shape(
         UniversalCommandArgs::Import(_) => "Import",
         UniversalCommandArgs::DuplicateSame(_) => "DuplicateSame",
         UniversalCommandArgs::WaveformEdit(_) => "WaveformEdit",
+        UniversalCommandArgs::DecodedEdit(_) => "DecodedEdit",
         UniversalCommandArgs::Namespace(_) => "Namespace",
         UniversalCommandArgs::Render(_) => "Render",
         UniversalCommandArgs::Removal(_) => "Removal",
@@ -3609,6 +3617,9 @@ fn validate_tagged_coordinator_shape(
             }
             "ExternalReconciliation" => {
                 format!("{schema_name} cannot carry schema-v15 external reconciliation arguments")
+            }
+            "DecodedEdit" => {
+                format!("{schema_name} cannot carry full-progress-only DecodedEdit arguments")
             }
             _ => format!("{schema_name} cannot carry {variant} arguments"),
         });
@@ -3719,7 +3730,7 @@ pub(super) fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation_journal::UniversalCommandKind;
+    use crate::operation_journal::{DecodedEditIntentArgs, UniversalCommandKind};
     use crate::operation_journal::{RecordConsistency, classify_record};
 
     const V1_FIXTURE: &[u8] = br#"{
@@ -4932,6 +4943,66 @@ mod tests {
                 fixture
             );
         }
+    }
+
+    #[test]
+    fn decoded_edit_is_rejected_by_legacy_v7_and_v15_encode_and_decode() {
+        let mut waveform = v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8));
+        let mut decoded_arguments = waveform["universal_command_args"]["WaveformEdit"].clone();
+        let object = decoded_arguments
+            .as_object_mut()
+            .expect("waveform arguments object");
+        object.remove("range");
+        object.insert(
+            "operation".to_owned(),
+            serde_json::json!({
+                "ClickRepair": {
+                    "range": {"start_frame": 1, "end_frame": 9}
+                }
+            }),
+        );
+        let tagged_decoded = serde_json::json!({"DecodedEdit": decoded_arguments});
+
+        waveform["universal_command_args"] = tagged_decoded.clone();
+        assert!(matches!(
+            decode(&serde_json::to_vec(&waveform).expect("V7 decoded-edit bytes")),
+            Err(DecodeError::Malformed { ref reason })
+                if reason.contains("full-progress-only")
+        ));
+
+        let mut v7_record = decode(
+            &serde_json::to_vec(&v7_waveform_edit_fixture(Value::from("Reverse"), (2, 8)))
+                .expect("V7 waveform bytes"),
+        )
+        .expect("V7 waveform record");
+        let decoded_args: DecodedEditIntentArgs =
+            serde_json::from_value(tagged_decoded["DecodedEdit"].clone())
+                .expect("decoded-edit typed arguments");
+        v7_record.universal_command_args =
+            Some(UniversalCommandArgs::DecodedEdit(decoded_args.clone()));
+        assert!(matches!(
+            encode(&v7_record),
+            Err(EncodeError::InvalidV7Record { ref reason })
+                if reason.contains("full-progress-only")
+        ));
+
+        let mut v15 = v15_external_reconciliation_fixture();
+        v15["universal_command_args"] = tagged_decoded;
+        assert!(matches!(
+            decode(&serde_json::to_vec(&v15).expect("V15 decoded-edit bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut v15_record = decode(
+            &serde_json::to_vec(&v15_external_reconciliation_fixture())
+                .expect("V15 external reconciliation bytes"),
+        )
+        .expect("V15 external reconciliation record");
+        v15_record.universal_command_args = Some(UniversalCommandArgs::DecodedEdit(decoded_args));
+        assert!(matches!(
+            encode(&v15_record),
+            Err(EncodeError::InvalidV15Record { .. })
+        ));
     }
 
     #[test]

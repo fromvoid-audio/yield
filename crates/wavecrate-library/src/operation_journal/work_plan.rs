@@ -951,6 +951,9 @@ fn collect_topology(
         UniversalCommandArgs::WaveformEdit(command) => {
             collect_copy_endpoint(collected, command.source(), true, true)?;
         }
+        UniversalCommandArgs::DecodedEdit(command) => {
+            collect_copy_endpoint(collected, command.source(), true, true)?;
+        }
         UniversalCommandArgs::Namespace(command) => match command {
             NamespaceCommandArgs::Rename(command) => {
                 collect_namespace_entry(collected, command.source(), true, true)?;
@@ -1248,6 +1251,20 @@ fn derive_actions(
             action_spans.push(span);
         }
         UniversalCommandArgs::WaveformEdit(command) => {
+            let mut span = ActionSpan::default();
+            let source = required_source(topology, command.source().participant_id())?;
+            add_staged_mutation_with_recovery(
+                builder,
+                &mut span,
+                0,
+                0,
+                topology.filesystem,
+                source,
+                source.participant_id,
+            )?;
+            action_spans.push(span);
+        }
+        UniversalCommandArgs::DecodedEdit(command) => {
             let mut span = ActionSpan::default();
             let source = required_source(topology, command.source().participant_id())?;
             add_staged_mutation_with_recovery(
@@ -2491,11 +2508,12 @@ fn add_global_obligations(
 mod tests {
     use super::*;
     use crate::operation_journal::{
-        CopyCollisionPolicy, CopyIntentArgs, CopySourceExpectation, ExternalRootBindingId,
-        FiniteF32Bits, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
-        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
-        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
-        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
+        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
+        DecodedEditIntentArgs, DecodedEditOperationArgs, ExternalRootBindingId, FiniteF32Bits,
+        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
+        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
+        NamespaceFileExpectation, NamespaceLeafName, NamespaceMoveIntentArgs,
+        NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
         ParticipantCheckpointState, ParticipantDescriptor, RawWavExtractionRecipe,
         RemovalCommandArgs, RetainedDeleteId, RetainedFolderObservation, RetainedPurgeDecision,
         RetainedPurgeIntentArgs, RetainedRecoveryRootKind, RetainedResolutionCommandArgs,
@@ -3519,6 +3537,49 @@ mod tests {
                     filesystem,
                     WorkUnitRole::RecoveryMaterialRetained,
                 )
+        }));
+    }
+
+    #[test]
+    fn decoded_edit_uses_the_in_place_recovery_recipe() {
+        let (participants, source, filesystem, source_id) = valid_topology();
+        let endpoint = CopyEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("source endpoint");
+        let args = UniversalCommandArgs::DecodedEdit(
+            DecodedEditIntentArgs::new(
+                endpoint,
+                WaveformFileRevisionObservation::new("file", "change", 256, Some(3))
+                    .expect("file revision"),
+                WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                    .expect("source spec"),
+                100,
+                DecodedEditOperationArgs::click_repair(
+                    WaveformEditFrameRange::new(1, 99).expect("repair range"),
+                ),
+                WaveformOutputSpec::float32(2, 48_000),
+            )
+            .expect("decoded edit args"),
+        );
+        let plan = derive_work_plan(&args, &participants).expect("decoded edit plan");
+        plan.validate().expect("decoded edit plan validates");
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::RecoveryMaterialRetained,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::SourceAffect,
+        ] {
+            assert!(plan.units().iter().any(|unit| unit.key().role() == role));
+        }
+        assert!(plan.units().iter().any(|unit| {
+            unit.key().role() == WorkUnitRole::RecoveryMaterialRetained
+                && unit.key().participant_id() == filesystem
         }));
     }
 }

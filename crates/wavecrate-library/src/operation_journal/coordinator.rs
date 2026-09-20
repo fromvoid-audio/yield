@@ -11,6 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::decoded_edit_commands::DecodedEditIntentArgs;
 use super::external_commands::{
     ExternalReconciliationIntentArgs, ExternalReconciliationValidationError,
 };
@@ -411,7 +412,7 @@ impl CopyIntentArgs {
         Ok(())
     }
 
-    fn validate_endpoint<'a>(
+    pub(crate) fn validate_endpoint<'a>(
         participants: &'a ParticipantSet,
         role: CopyEndpointRole,
         endpoint: &CopyEndpoint,
@@ -1477,6 +1478,8 @@ pub enum UniversalCommandArgs {
     DuplicateSame(CopyIntentArgs),
     /// Apply one bounded in-place WAV edit to a source-database file.
     WaveformEdit(WaveformEditIntentArgs),
+    /// Apply one reviewed click-repair or duplicate-cleanup edit in the full-progress model.
+    DecodedEdit(DecodedEditIntentArgs),
     /// Rename, move, or create one bounded namespace entry.
     Namespace(NamespaceCommandArgs),
     /// Observe one whole-file render command without executing it.
@@ -1503,6 +1506,7 @@ impl UniversalCommandArgs {
             Self::Import(_) => super::model::UniversalCommandKind::Import,
             Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
             Self::WaveformEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
+            Self::DecodedEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
             Self::Namespace(args) => args.command_kind(),
             Self::Render(args) => args.command_kind(),
             Self::Removal(args) => args.command_kind(),
@@ -1532,6 +1536,9 @@ impl UniversalCommandArgs {
             Self::WaveformEdit(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::WaveformEdit),
+            Self::DecodedEdit(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::DecodedEdit),
             Self::Namespace(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Namespace),
@@ -1575,6 +1582,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A bounded in-place waveform edit argument failed validation.
     #[error("invalid WaveformEdit command arguments: {0}")]
     WaveformEdit(#[source] WaveformEditValidationError),
+    /// A full-progress-only decoded click-repair or duplicate-cleanup argument failed validation.
+    #[error("invalid DecodedEdit command arguments: {0}")]
+    DecodedEdit(#[source] super::decoded_edit_commands::DecodedEditValidationError),
     /// A bounded namespace mutation argument failed validation.
     #[error("invalid namespace command arguments: {0}")]
     Namespace(#[source] NamespaceCommandValidationError),
@@ -1778,7 +1788,7 @@ pub enum RetryObservationValidationError {
     InvalidContext,
 }
 
-fn validate_source_id(source_id: &SourceId) -> Result<(), CopyIntentValidationError> {
+pub(crate) fn validate_source_id(source_id: &SourceId) -> Result<(), CopyIntentValidationError> {
     validate_bounded_text(
         source_id.as_str(),
         super::participants::MAX_SOURCE_IDENTITY_BYTES,
@@ -1879,6 +1889,9 @@ pub(crate) fn validate_persisted_universal_command_args_value(
         "Copy" | "DuplicateSame" => validate_persisted_copy_intent_value(arguments),
         "Import" => validate_persisted_import_intent_value(arguments),
         "WaveformEdit" => validate_persisted_waveform_edit_value(arguments),
+        "DecodedEdit" => {
+            super::decoded_edit_commands::validate_persisted_decoded_edit_value(arguments)
+        }
         _ => Err("persisted command arguments contain an unknown variant"),
     }
 }
