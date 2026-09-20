@@ -954,6 +954,10 @@ fn collect_topology(
         UniversalCommandArgs::DecodedEdit(command) => {
             collect_copy_endpoint(collected, command.source(), true, true)?;
         }
+        UniversalCommandArgs::DecodedExport(command) => {
+            collect_copy_endpoint(collected, command.source(), true, true)?;
+            collect_copy_endpoint(collected, command.destination(), false, true)?;
+        }
         UniversalCommandArgs::Namespace(command) => match command {
             NamespaceCommandArgs::Rename(command) => {
                 collect_namespace_entry(collected, command.source(), true, true)?;
@@ -1275,6 +1279,21 @@ fn derive_actions(
                 topology.filesystem,
                 source,
                 source.participant_id,
+            )?;
+            action_spans.push(span);
+        }
+        UniversalCommandArgs::DecodedExport(command) => {
+            let mut span = ActionSpan::default();
+            let source = required_source(topology, command.source().participant_id())?;
+            let destination = required_source(topology, command.destination().participant_id())?;
+            add_staged_mutation(
+                builder,
+                &mut span,
+                0,
+                0,
+                topology.filesystem,
+                source,
+                destination.participant_id,
             )?;
             action_spans.push(span);
         }
@@ -2509,11 +2528,13 @@ mod tests {
     use super::*;
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
-        DecodedEditIntentArgs, DecodedEditOperationArgs, ExternalRootBindingId, FiniteF32Bits,
-        NamespaceCommandArgs, NamespaceDirectoryEndpoint, NamespaceDirectoryExpectation,
-        NamespaceDirectoryLocator, NamespaceEntryEndpoint, NamespaceEntryExpectation,
-        NamespaceFileExpectation, NamespaceLeafName, NamespaceMoveIntentArgs,
-        NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
+        DecodedEditIntentArgs, DecodedEditOperationArgs, DecodedExportChannelBehavior,
+        DecodedExportDither, DecodedExportIntentArgs, DecodedExportOutputPolicy,
+        DecodedExportRegistrationMetadata, DecodedExportSampleFormat, DecodedExportSampleRate,
+        ExternalRootBindingId, FiniteF32Bits, NamespaceCommandArgs, NamespaceDirectoryEndpoint,
+        NamespaceDirectoryExpectation, NamespaceDirectoryLocator, NamespaceEntryEndpoint,
+        NamespaceEntryExpectation, NamespaceFileExpectation, NamespaceLeafName,
+        NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget, ParticipantCheckpoint,
         ParticipantCheckpointState, ParticipantDescriptor, RawWavExtractionRecipe,
         RemovalCommandArgs, RetainedDeleteId, RetainedFolderObservation, RetainedPurgeDecision,
         RetainedPurgeIntentArgs, RetainedRecoveryRootKind, RetainedResolutionCommandArgs,
@@ -3580,6 +3601,74 @@ mod tests {
         assert!(plan.units().iter().any(|unit| {
             unit.key().role() == WorkUnitRole::RecoveryMaterialRetained
                 && unit.key().participant_id() == filesystem
+        }));
+    }
+
+    #[test]
+    fn decoded_export_uses_the_selection_extract_recipe() {
+        let (participants, source, filesystem, source_id) = valid_topology();
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("source endpoint");
+        let destination_endpoint = CopyEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("selection.wav").expect("destination path"),
+        )
+        .expect("destination endpoint");
+        let args = UniversalCommandArgs::DecodedExport(
+            DecodedExportIntentArgs::new(
+                source_endpoint,
+                destination_endpoint,
+                7,
+                WaveformFileRevisionObservation::new("file", "change", 256, Some(3))
+                    .expect("file revision"),
+                WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                    .expect("source spec"),
+                100,
+                WaveformEditFrameRange::new(10, 40).expect("selection range"),
+                DecodedExportOutputPolicy::new(
+                    DecodedExportSampleRate::Hz(44_100),
+                    DecodedExportSampleFormat::Pcm24,
+                    DecodedExportChannelBehavior::PreserveMonoStereo,
+                    DecodedExportDither::None,
+                ),
+                2,
+                DecodedExportRegistrationMetadata::from_reference(Some(-2), true, Some(123.25))
+                    .expect("registration"),
+                CopyCollisionPolicy::NoReplace,
+            )
+            .expect("decoded export arguments"),
+        );
+        let plan = derive_work_plan(&args, &participants).expect("decoded export plan");
+        plan.validate().expect("decoded export plan validates");
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::GlobalLibrary,
+            WorkUnitRole::Harvest,
+            WorkUnitRole::Projection,
+            WorkUnitRole::Readiness,
+        ] {
+            assert!(plan.units().iter().any(|unit| unit.key().role() == role));
+        }
+        assert!(
+            !plan
+                .units()
+                .iter()
+                .any(|unit| { unit.key().role() == WorkUnitRole::RecoveryMaterialRetained })
+        );
+        assert!(plan.units().iter().any(|unit| {
+            unit.key().role() == WorkUnitRole::Publish && unit.key().participant_id() == filesystem
+        }));
+        assert!(plan.units().iter().any(|unit| {
+            unit.key().role() == WorkUnitRole::SourceAffect && unit.key().participant_id() == source
         }));
     }
 }

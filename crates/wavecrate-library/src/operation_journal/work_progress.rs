@@ -6662,12 +6662,14 @@ mod tests {
         CoordinatorClosureManifestError, CoordinatorClosureManifestValidationError,
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         CreateFolderIntentArgs, DecodedEditIntentArgs, DecodedEditOperationArgs,
-        DurableReadinessWakeObservation, EvidenceBatchId, ExternalCaptureBoundary,
-        ExternalNativeString, ExternalRawEventKind, ExternalRawNativeAccounting,
-        ExternalRawObservation, ExternalRawObservationEnvelope, ExternalRawObservationLimits,
-        ExternalRawObservationMetadata, ExternalRawObservationProvenance, ExternalRawObservedPath,
-        ExternalRawPathRole, ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs,
-        FiniteF32Bits, FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
+        DecodedExportIntentArgs, DecodedExportOutputPolicy, DecodedExportRegistrationMetadata,
+        DecodedExportSampleFormat, DecodedExportSampleRate, DurableReadinessWakeObservation,
+        EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
+        ExternalRawObservationLimits, ExternalRawObservationMetadata,
+        ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
+        ExternalReconciliationIntentArgs, ExtractAndTrimIntentArgs, FiniteF32Bits,
+        FullCapacityAllocation, FullCapacityAllocationClass, FullCapacityPlan,
         FullProgressIntentObservation, HistoryAction, HistoryDirection,
         HistoryExtractedFileObservation, HistoryFolderMove, HistoryFolderRelocation,
         HistoryRecoveryBackupObservation, HistoryRecoveryLeafObservation,
@@ -7275,6 +7277,61 @@ mod tests {
             admission_claims(12),
         )
         .expect("decoded edit progress");
+        (progress, participants, args)
+    }
+
+    fn decoded_export_progress() -> (WorkProgress, ParticipantSet, UniversalCommandArgs) {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("source path"),
+        )
+        .expect("decoded export source endpoint");
+        let destination_endpoint = CopyEndpoint::new(
+            source,
+            source_id,
+            StoredRelativePath::new("selection.wav").expect("destination path"),
+        )
+        .expect("decoded export destination endpoint");
+        let registration =
+            DecodedExportRegistrationMetadata::from_reference(Some(-2), true, Some(123.25))
+                .expect("decoded export registration");
+        let output_policy = DecodedExportOutputPolicy::new(
+            DecodedExportSampleRate::Hz(44_100),
+            DecodedExportSampleFormat::Pcm24,
+            super::super::decoded_export_commands::DecodedExportChannelBehavior::PreserveMonoStereo,
+            super::super::decoded_export_commands::DecodedExportDither::None,
+        );
+        let args = UniversalCommandArgs::DecodedExport(
+            DecodedExportIntentArgs::new(
+                source_endpoint,
+                destination_endpoint,
+                7,
+                WaveformFileRevisionObservation::new("file-id", "change-marker", 1024, Some(3))
+                    .expect("decoded export file revision"),
+                WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                    .expect("decoded export source spec"),
+                100,
+                WaveformEditFrameRange::new(10, 40).expect("decoded export range"),
+                output_policy,
+                2,
+                registration,
+                CopyCollisionPolicy::NoReplace,
+            )
+            .expect("decoded export arguments"),
+        );
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("decoded export work plan");
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(208)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("decoded export progress");
         (progress, participants, args)
     }
 
@@ -21748,6 +21805,17 @@ mod tests {
                 ))
                 .expect("decoded edit snapshot"),
         );
+
+        let (decoded_export, participants, args) = decoded_export_progress();
+        roundtrip(
+            decoded_export
+                .capture_full_progress_snapshot(&snapshot_intent_for(
+                    &decoded_export,
+                    args,
+                    participants,
+                ))
+                .expect("decoded export snapshot"),
+        );
     }
 
     #[test]
@@ -21780,6 +21848,43 @@ mod tests {
         assert!(matches!(
             super::super::full_progress_codec::decode(
                 &serde_json::to_vec(&noncanonical).expect("noncanonical bytes")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+                | Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn full_progress_codec_rejects_decoded_export_policy_and_registration_corruption() {
+        let (progress, participants, args) = decoded_export_progress();
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("decoded export snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("decoded export record");
+        let bytes = super::super::full_progress_codec::encode(&record).expect("encode");
+
+        let mut invalid_policy: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("policy value");
+        invalid_policy["snapshot"]["intent"]["args"]["DecodedExport"]["output_policy"]["sample_format"] =
+            serde_json::Value::from("resampled");
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&invalid_policy).expect("invalid policy bytes")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+                | Err(
+                    super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. }
+                )
+        ));
+
+        let mut invalid_registration: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("registration value");
+        invalid_registration["snapshot"]["intent"]["args"]["DecodedExport"]["registration"]["rating"] =
+            serde_json::Value::from(4_i64);
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&invalid_registration).expect("invalid registration bytes")
             ),
             Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
                 | Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })

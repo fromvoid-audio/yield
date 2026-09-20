@@ -1480,6 +1480,8 @@ pub enum UniversalCommandArgs {
     WaveformEdit(WaveformEditIntentArgs),
     /// Apply one reviewed click-repair or duplicate-cleanup edit in the full-progress model.
     DecodedEdit(DecodedEditIntentArgs),
+    /// Observe one full-progress-only decoded selection export.
+    DecodedExport(super::decoded_export_commands::DecodedExportIntentArgs),
     /// Rename, move, or create one bounded namespace entry.
     Namespace(NamespaceCommandArgs),
     /// Observe one whole-file render command without executing it.
@@ -1507,6 +1509,7 @@ impl UniversalCommandArgs {
             Self::DuplicateSame(_) => super::model::UniversalCommandKind::Duplicate,
             Self::WaveformEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
             Self::DecodedEdit(_) => super::model::UniversalCommandKind::DestructiveEdit,
+            Self::DecodedExport(_) => super::model::UniversalCommandKind::Export,
             Self::Namespace(args) => args.command_kind(),
             Self::Render(args) => args.command_kind(),
             Self::Removal(args) => args.command_kind(),
@@ -1539,6 +1542,9 @@ impl UniversalCommandArgs {
             Self::DecodedEdit(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::DecodedEdit),
+            Self::DecodedExport(args) => args
+                .validate_against_participants(participants)
+                .map_err(UniversalCommandArgsValidationError::DecodedExport),
             Self::Namespace(args) => args
                 .validate_against_participants(participants)
                 .map_err(UniversalCommandArgsValidationError::Namespace),
@@ -1585,6 +1591,9 @@ pub enum UniversalCommandArgsValidationError {
     /// A full-progress-only decoded click-repair or duplicate-cleanup argument failed validation.
     #[error("invalid DecodedEdit command arguments: {0}")]
     DecodedEdit(#[source] super::decoded_edit_commands::DecodedEditValidationError),
+    /// A full-progress-only decoded selection-export argument failed validation.
+    #[error("invalid DecodedExport command arguments: {0}")]
+    DecodedExport(#[source] super::decoded_export_commands::DecodedExportValidationError),
     /// A bounded namespace mutation argument failed validation.
     #[error("invalid namespace command arguments: {0}")]
     Namespace(#[source] NamespaceCommandValidationError),
