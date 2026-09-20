@@ -20887,6 +20887,418 @@ mod tests {
     }
 
     #[test]
+    fn full_progress_snapshot_requires_complete_held_settlement_and_retains_it() {
+        let incomplete = copy_progress_with_admission_claims();
+        let incomplete_snapshot = incomplete
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&incomplete))
+            .expect("incomplete snapshot");
+        let mut premature_held = serde_json::to_value(&incomplete_snapshot).expect("snapshot");
+        premature_held["claim_settlement"] = serde_json::to_value(settlement_inventory(
+            &incomplete,
+            AdmissionClaimSettlementOutcome::Held,
+        ))
+        .expect("held settlement");
+        let premature_held: FullProgressSnapshotObservation =
+            serde_json::from_value(premature_held).expect("premature held snapshot");
+        assert!(matches!(
+            premature_held.validate_base(),
+            Err(FullProgressSnapshotObservationError::ClaimSettlementProgressIncomplete)
+        ));
+
+        let mut retained = copy_progress_with_admission_claims();
+        complete_required(&mut retained);
+        retained
+            .apply_verified_claim_settlement(settlement_authority(
+                &retained,
+                settlement_inventory(&retained, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("held settlement applies after complete progress");
+        retained
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retained))
+            .expect("held settlement snapshot")
+            .validate_base()
+            .expect("held settlement remains valid");
+
+        let mut held_audit = copy_progress_with_admission_claims();
+        complete_required(&mut held_audit);
+        held_audit
+            .apply_verified_claim_settlement(settlement_authority(
+                &held_audit,
+                settlement_inventory(&held_audit, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("held settlement for audit");
+        held_audit
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("audit retains held settlement");
+        held_audit
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&held_audit))
+            .expect("held audit snapshot")
+            .validate_base()
+            .expect("held settlement remains valid under audit");
+
+        let retry_observation = RetryObservation::new(
+            1,
+            100,
+            200,
+            RetryLeaseId::new("snapshot-held-transition").expect("retry lease"),
+            300,
+            RetryErrorClass::TransientAvailability,
+            "held settlement retry",
+            None,
+        )
+        .expect("retry observation");
+        retained
+            .request_retry(retry_observation.clone())
+            .expect("retry with held settlement");
+        retained
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retained))
+            .expect("held retry snapshot")
+            .validate_base()
+            .expect("held settlement remains valid during retry");
+        retained
+            .resume_retry(VerifiedRetryResume {
+                operation_id: retained.operation_id,
+                plan: retained.plan.clone(),
+                retry_observation,
+                now_unix_ms: 200,
+                expected_execution_epoch: 0,
+            })
+            .expect("resume held settlement retry");
+        retained
+            .request_cancellation(
+                CancellationRequestObservation::new(18131).expect("cancel held settlement"),
+            )
+            .expect("cancel after held settlement retry");
+        let source_key = key_for(&retained, 0, WorkUnitRole::SourceRead);
+        retained
+            .reacquire_source(source_reacquisition_authority(
+                &retained,
+                source_key.participant_id(),
+                7,
+                2,
+                retained.execution_epoch(),
+            ))
+            .expect("reacquire after held settlement cancellation");
+        retained
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retained))
+            .expect("held settlement historical snapshot")
+            .validate_base()
+            .expect("held settlement remains valid after cancellation and reacquisition");
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_success_and_deferred_settlement_lifecycle() {
+        let mut success = copy_progress_with_admission_claims();
+        complete_required(&mut success);
+        success
+            .apply_verified_claim_settlement(settlement_authority(
+                &success,
+                settlement_inventory(&success, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("normal success settlement");
+        let success_snapshot = success
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&success))
+            .expect("normal success snapshot");
+        assert_eq!(
+            success_snapshot.disposition(),
+            FullProgressDisposition::Succeeded
+        );
+        assert_eq!(success_snapshot.phase(), OperationPhase::Terminal);
+        success_snapshot
+            .validate_base()
+            .expect("normal success lifecycle");
+
+        let mut missing_settlement = serde_json::to_value(&success_snapshot).expect("snapshot");
+        missing_settlement["claim_settlement"] = serde_json::Value::Null;
+        let missing_settlement: FullProgressSnapshotObservation =
+            serde_json::from_value(missing_settlement).expect("missing settlement shape");
+        assert!(matches!(
+            missing_settlement.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ClaimSettlementMissingForSuccess {
+                    disposition: FullProgressDisposition::Succeeded,
+                }
+            )
+        ));
+
+        let mut held_settlement = serde_json::to_value(&success_snapshot).expect("snapshot");
+        held_settlement["claim_settlement"] = serde_json::to_value(settlement_inventory(
+            &success,
+            AdmissionClaimSettlementOutcome::Held,
+        ))
+        .expect("held settlement");
+        let held_settlement: FullProgressSnapshotObservation =
+            serde_json::from_value(held_settlement).expect("held settlement shape");
+        assert!(matches!(
+            held_settlement.validate_base(),
+            Err(FullProgressSnapshotObservationError::ClaimSettlementIncompleteForSuccess)
+        ));
+
+        let mut unknown_settlement_claim =
+            serde_json::to_value(&success_snapshot).expect("snapshot");
+        unknown_settlement_claim["claim_settlement"]["settlements"][0]["claim_id"] =
+            json!(Uuid::from_u128(299).to_string());
+        let unknown_settlement_claim: FullProgressSnapshotObservation =
+            serde_json::from_value(unknown_settlement_claim).expect("unknown claim shape");
+        assert!(matches!(
+            unknown_settlement_claim.validate_base(),
+            Err(FullProgressSnapshotObservationError::ClaimSettlement(
+                AdmissionClaimValidationError::UnknownSettlementClaim { .. }
+            ))
+        ));
+
+        let mut retained_success =
+            copy_progress_with_claim_class(FullCapacityAllocationClass::JournalRecord, 2121);
+        complete_required(&mut retained_success);
+        retained_success
+            .apply_verified_claim_settlement(settlement_authority(
+                &retained_success,
+                settlement_inventory(
+                    &retained_success,
+                    AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+                ),
+            ))
+            .expect("retained-charge success settlement");
+        let retained_capacity = FullCapacityPlan::new(vec![
+            FullCapacityAllocation::new(
+                VolumeIdentity { device: 1 },
+                1,
+                FullCapacityAllocationClass::JournalRecord,
+                12,
+                12,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("retained capacity allocation"),
+        ])
+        .expect("retained capacity plan");
+        let retained_success_snapshot = retained_success
+            .capture_full_progress_snapshot(&copy_snapshot_intent_with_capacity(
+                &retained_success,
+                retained_capacity,
+            ))
+            .expect("retained-charge success snapshot");
+        let mut released_retained_charge =
+            serde_json::to_value(&retained_success_snapshot).expect("snapshot");
+        released_retained_charge["claim_settlement"]["settlements"][0]["outcome"] =
+            json!("Released");
+        let released_retained_charge: FullProgressSnapshotObservation =
+            serde_json::from_value(released_retained_charge)
+                .expect("released retained-charge shape");
+        assert!(matches!(
+            released_retained_charge.validate_base(),
+            Err(FullProgressSnapshotObservationError::ClaimSettlement(
+                AdmissionClaimValidationError::NormalSuccessRetainedChargeReleased {
+                    allocation_class: FullCapacityAllocationClass::JournalRecord,
+                    ..
+                }
+            ))
+        ));
+
+        let mut deferred = copy_progress_with_admission_claims_and_optional();
+        complete_required(&mut deferred);
+        let artifact_key = deferred
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        deferred
+            .defer_optional_artifact(artifact_key)
+            .expect("defer optional artifact");
+        deferred
+            .apply_verified_claim_settlement(settlement_authority(
+                &deferred,
+                settlement_inventory(&deferred, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("deferred success settlement");
+        let (participants, source, _filesystem, source_id) = valid_topology(true);
+        let deferred_snapshot = deferred
+            .capture_full_progress_snapshot(&snapshot_intent_for(
+                &deferred,
+                copy_args_at(source, source_id, "copy.wav"),
+                participants,
+            ))
+            .expect("deferred success snapshot");
+        assert_eq!(
+            deferred_snapshot.disposition(),
+            FullProgressDisposition::SucceededWithDeferredArtifacts
+        );
+        assert_eq!(deferred_snapshot.phase(), OperationPhase::Terminal);
+        deferred_snapshot
+            .validate_base()
+            .expect("deferred success lifecycle");
+    }
+
+    #[test]
+    fn full_progress_snapshot_rejects_lifecycle_phase_retry_audit_and_generation_corruption() {
+        let initial = copy_progress_with_admission_claims();
+        let initial_snapshot = initial
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&initial))
+            .expect("initial snapshot");
+        initial_snapshot
+            .validate_base()
+            .expect("initial no-completed lifecycle");
+
+        let mut phase_ahead = serde_json::to_value(&initial_snapshot).expect("snapshot");
+        phase_ahead["phase"] = json!("ReadinessScheduled");
+        let phase_ahead: FullProgressSnapshotObservation =
+            serde_json::from_value(phase_ahead).expect("phase-ahead shape");
+        assert!(matches!(
+            phase_ahead.validate_base(),
+            Err(FullProgressSnapshotObservationError::DerivedPhaseMismatch {
+                expected: OperationPhase::IntentDurable,
+                actual: OperationPhase::ReadinessScheduled,
+            })
+        ));
+
+        let mut completed = copy_progress_with_admission_claims();
+        complete_required(&mut completed);
+        let completed_snapshot = completed
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&completed))
+            .expect("completed unsolved snapshot");
+        completed_snapshot
+            .validate_base()
+            .expect("completed unsolved lifecycle");
+        let mut phase_behind = serde_json::to_value(&completed_snapshot).expect("snapshot");
+        phase_behind["phase"] = json!("IntentDurable");
+        let phase_behind: FullProgressSnapshotObservation =
+            serde_json::from_value(phase_behind).expect("phase-behind shape");
+        assert!(matches!(
+            phase_behind.validate_base(),
+            Err(FullProgressSnapshotObservationError::DerivedPhaseMismatch {
+                expected: OperationPhase::ReadinessScheduled,
+                actual: OperationPhase::IntentDurable,
+            })
+        ));
+
+        let mut unsupported = serde_json::to_value(&initial_snapshot).expect("snapshot");
+        unsupported["disposition"] = json!("PartialNeedsRetry");
+        let unsupported: FullProgressSnapshotObservation =
+            serde_json::from_value(unsupported).expect("unsupported disposition shape");
+        assert!(matches!(
+            unsupported.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::UnsupportedDisposition {
+                    disposition: FullProgressDisposition::PartialNeedsRetry,
+                }
+            )
+        ));
+
+        let mut retry = copy_progress_with_admission_claims();
+        let retry_observation = RetryObservation::new(
+            1,
+            100,
+            200,
+            RetryLeaseId::new("snapshot-lifecycle-retry").expect("retry lease"),
+            300,
+            RetryErrorClass::TransientAvailability,
+            "snapshot lifecycle retry",
+            None,
+        )
+        .expect("retry observation");
+        retry
+            .request_retry(retry_observation.clone())
+            .expect("request retry");
+        let retry_snapshot = retry
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&retry))
+            .expect("retry snapshot");
+        let mut retry_under_none = serde_json::to_value(&retry_snapshot).expect("snapshot");
+        retry_under_none["disposition"] = json!("None");
+        let retry_under_none: FullProgressSnapshotObservation =
+            serde_json::from_value(retry_under_none).expect("retry-under-none shape");
+        assert!(matches!(
+            retry_under_none.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::RetryDispositionMismatch {
+                    disposition: FullProgressDisposition::None,
+                }
+            )
+        ));
+
+        let mut published_audit = copy_progress_with_admission_claims();
+        publish_prefix(&mut published_audit);
+        published_audit
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("published audit");
+        let published_audit_snapshot = published_audit
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&published_audit))
+            .expect("published audit snapshot");
+        let mut audit_retry_none =
+            serde_json::to_value(&published_audit_snapshot).expect("snapshot");
+        audit_retry_none["retry_observation"] =
+            serde_json::to_value(&retry_observation).expect("retry observation");
+        audit_retry_none["last_retry_observation"] =
+            serde_json::to_value(&retry_observation).expect("retry observation");
+        let audit_retry_none: FullProgressSnapshotObservation =
+            serde_json::from_value(audit_retry_none).expect("audit hold shape");
+        assert!(matches!(
+            audit_retry_none.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::RetryDispositionMismatch {
+                    disposition: FullProgressDisposition::AuditRequired,
+                }
+            )
+        ));
+
+        let mut audit_before_publish = serde_json::to_value(&initial_snapshot).expect("snapshot");
+        let published_audit_value =
+            serde_json::to_value(&published_audit_snapshot).expect("snapshot");
+        audit_before_publish["disposition"] = json!("AuditRequired");
+        audit_before_publish["active_audit"] = published_audit_value["active_audit"].clone();
+        audit_before_publish["audit_generation"] = json!(1);
+        let audit_before_publish: FullProgressSnapshotObservation =
+            serde_json::from_value(audit_before_publish).expect("prepublication audit shape");
+        assert!(matches!(
+            audit_before_publish.validate_base(),
+            Err(FullProgressSnapshotObservationError::AuditPhaseInvalid {
+                phase: OperationPhase::IntentDurable,
+            })
+        ));
+
+        let mut fabricated_generation = serde_json::to_value(&initial_snapshot).expect("snapshot");
+        fabricated_generation["recovery_generation"] = json!(1);
+        let fabricated_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(fabricated_generation).expect("fabricated generation shape");
+        assert!(matches!(
+            fabricated_generation.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::RecoveryGenerationMismatch {
+                    expected: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let mut accepted_cleanup = copy_progress_with_admission_claims();
+        accepted_cleanup
+            .request_cancellation(CancellationRequestObservation::new(18132).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut accepted_cleanup);
+        accept_pending_cleanup_observations(&mut accepted_cleanup);
+        let accepted_cleanup_snapshot = accepted_cleanup
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&accepted_cleanup))
+            .expect("after-effect and cleanup snapshot");
+        let mut wrong_global_generation =
+            serde_json::to_value(&accepted_cleanup_snapshot).expect("snapshot");
+        wrong_global_generation["recovery_generation"] = json!(3);
+        let wrong_global_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_global_generation).expect("wrong global generation shape");
+        assert!(matches!(
+            wrong_global_generation.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::RecoveryGenerationMismatch {
+                    expected: 2,
+                    actual: 3,
+                }
+            )
+        ));
+    }
+
+    #[test]
     fn full_progress_snapshot_rejects_cancellation_envelope_corruption() {
         let mut progress = copy_progress_with_admission_claims();
         progress

@@ -19,12 +19,12 @@ use super::super::full_progress_record::{
 use super::super::participants::ParticipantValidationError;
 use super::super::work_plan::{WorkUnitApplicability, WorkUnitKey, WorkUnitRole};
 use super::{
-    ActiveAudit, AdmissionClaimSettlementInventory, AfterEffectReconciliationObservation,
-    AuditTargetValidationError, CancellationCleanupObservation,
-    CancellationDispatchOutcomeRecordError, CancellationInventory, CancellationInventoryError,
-    CancellationRequestObservation, CancellationRequestValidationError, CancellationRoute,
-    FullProgressDisposition, OperationPhase, ParticipantRequirement, ParticipantScope,
-    PrePublishCancellationObservation, ProgressStepStatus, RetryObservation,
+    ActiveAudit, AdmissionClaimSettlementInventory, AdmissionClaimValidationError,
+    AfterEffectReconciliationObservation, AuditTargetValidationError,
+    CancellationCleanupObservation, CancellationDispatchOutcomeRecordError, CancellationInventory,
+    CancellationInventoryError, CancellationRequestObservation, CancellationRequestValidationError,
+    CancellationRoute, FullProgressDisposition, OperationPhase, ParticipantRequirement,
+    ParticipantScope, PrePublishCancellationObservation, ProgressStepStatus, RetryObservation,
     RetryObservationValidationError, WorkProgress, WorkProgressError, WorkProgressStep,
     historical_scope_matches_current, same_stable_source_identity,
 };
@@ -164,6 +164,7 @@ impl FullProgressSnapshotObservation {
         self.validate_after_effect_reconciliation(&validation_progress)?;
         self.validate_cancellation_cleanup_observations(&validation_progress)?;
         self.validate_pre_publish_cancellation(&validation_progress)?;
+        self.validate_lifecycle_consistency(&validation_progress)?;
         Ok(())
     }
 
@@ -584,6 +585,194 @@ impl FullProgressSnapshotObservation {
             }
         }
         Ok(())
+    }
+
+    fn validate_lifecycle_consistency(
+        &self,
+        progress: &WorkProgress,
+    ) -> Result<(), FullProgressSnapshotObservationError> {
+        let supported = matches!(
+            self.disposition,
+            FullProgressDisposition::None
+                | FullProgressDisposition::RetryPending
+                | FullProgressDisposition::AuditRequired
+                | FullProgressDisposition::CancelRequestedBeforePublish
+                | FullProgressDisposition::CancelRequestedAfterPublish
+                | FullProgressDisposition::CancelRequestedAfterObservedEffect
+                | FullProgressDisposition::Succeeded
+                | FullProgressDisposition::SucceededWithDeferredArtifacts
+                | FullProgressDisposition::CancelledBeforePublish
+        );
+        if !supported {
+            return Err(
+                FullProgressSnapshotObservationError::UnsupportedDisposition {
+                    disposition: self.disposition,
+                },
+            );
+        }
+
+        let terminal = matches!(
+            self.disposition,
+            FullProgressDisposition::Succeeded
+                | FullProgressDisposition::SucceededWithDeferredArtifacts
+                | FullProgressDisposition::CancelledBeforePublish
+        );
+        if terminal {
+            if self.phase != OperationPhase::Terminal {
+                return Err(
+                    FullProgressSnapshotObservationError::TerminalPhaseMismatch {
+                        disposition: self.disposition,
+                        actual: self.phase,
+                    },
+                );
+            }
+        } else {
+            let has_completed_or_deferred = self.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    ProgressStepStatus::Completed | ProgressStepStatus::Deferred
+                )
+            });
+            let expected = if has_completed_or_deferred {
+                progress.derived_phase()
+            } else {
+                OperationPhase::IntentDurable
+            };
+            if self.phase != expected {
+                return Err(FullProgressSnapshotObservationError::DerivedPhaseMismatch {
+                    expected,
+                    actual: self.phase,
+                });
+            }
+        }
+
+        if self.retry_observation.is_some() {
+            let retry_allowed = match self.disposition {
+                FullProgressDisposition::RetryPending
+                | FullProgressDisposition::CancelRequestedBeforePublish
+                | FullProgressDisposition::CancelRequestedAfterPublish
+                | FullProgressDisposition::CancelRequestedAfterObservedEffect
+                | FullProgressDisposition::CancelledBeforePublish => true,
+                FullProgressDisposition::AuditRequired => {
+                    self.active_audit.as_ref().is_some_and(|active| {
+                        matches!(
+                            active.suspended_hold,
+                            super::AuditSuspendedHold::RetryPending
+                                | super::AuditSuspendedHold::CancelRequestedBeforePublish
+                                | super::AuditSuspendedHold::CancelRequestedAfterPublish
+                                | super::AuditSuspendedHold::CancelRequestedAfterObservedEffect
+                        )
+                    })
+                }
+                _ => false,
+            };
+            if !retry_allowed {
+                return Err(
+                    FullProgressSnapshotObservationError::RetryDispositionMismatch {
+                        disposition: self.disposition,
+                    },
+                );
+            }
+        }
+
+        if let Some(active) = self.active_audit.as_ref() {
+            if self.phase.is_pre_publication() {
+                let observed_effect_cancellation = active.suspended_hold
+                    == super::AuditSuspendedHold::CancelRequestedAfterObservedEffect
+                    && self
+                        .cancellation_inventory
+                        .as_ref()
+                        .is_some_and(|inventory| {
+                            inventory.route() == CancellationRoute::AfterObservedEffect
+                        });
+                if !observed_effect_cancellation {
+                    return Err(FullProgressSnapshotObservationError::AuditPhaseInvalid {
+                        phase: self.phase,
+                    });
+                }
+            }
+        }
+
+        let claims = self.intent.admission_claims();
+        let success_disposition = matches!(
+            self.disposition,
+            FullProgressDisposition::Succeeded
+                | FullProgressDisposition::SucceededWithDeferredArtifacts
+        );
+        match self.claim_settlement.as_ref() {
+            Some(settlement) => {
+                settlement
+                    .validate_normal_success_settlement(claims)
+                    .map_err(FullProgressSnapshotObservationError::ClaimSettlement)?;
+                let settled = settlement.all_settled_without_held();
+                if !progress.all_required_complete() || !progress.optional_artifacts_resolved() {
+                    return Err(
+                        FullProgressSnapshotObservationError::ClaimSettlementProgressIncomplete,
+                    );
+                }
+                if settled {
+                    let expected_disposition = if progress.has_deferred_optional_artifact() {
+                        FullProgressDisposition::SucceededWithDeferredArtifacts
+                    } else {
+                        FullProgressDisposition::Succeeded
+                    };
+                    if self.disposition != expected_disposition
+                        || self.phase != OperationPhase::Terminal
+                    {
+                        return Err(
+                            FullProgressSnapshotObservationError::ClaimSettlementTerminalMismatch {
+                                actual_disposition: self.disposition,
+                                phase: self.phase,
+                            },
+                        );
+                    }
+                } else if success_disposition {
+                    return Err(
+                        FullProgressSnapshotObservationError::ClaimSettlementIncompleteForSuccess,
+                    );
+                }
+            }
+            None if success_disposition => {
+                return Err(
+                    FullProgressSnapshotObservationError::ClaimSettlementMissingForSuccess {
+                        disposition: self.disposition,
+                    },
+                );
+            }
+            None => {}
+        }
+
+        let expected_recovery_generation =
+            self.after_effect_reconciliation
+                .as_ref()
+                .map(|after_effect| {
+                    let cleanup_generation = self
+                        .cancellation_cleanup_observations
+                        .as_ref()
+                        .map(CancellationCleanupObservation::recovery_generation)
+                        .unwrap_or(0);
+                    after_effect.recovery_generation().max(cleanup_generation)
+                });
+        match expected_recovery_generation {
+            Some(expected) if self.recovery_generation != expected => Err(
+                FullProgressSnapshotObservationError::RecoveryGenerationMismatch {
+                    expected,
+                    actual: self.recovery_generation,
+                },
+            ),
+            None if self.pre_publish_cancellation.is_none()
+                && self.cancellation_cleanup_observations.is_none()
+                && self.recovery_generation != 0 =>
+            {
+                Err(
+                    FullProgressSnapshotObservationError::RecoveryGenerationMismatch {
+                        expected: 0,
+                        actual: self.recovery_generation,
+                    },
+                )
+            }
+            _ => Ok(()),
+        }
     }
 
     fn validate_retry_state(&self) -> Result<(), FullProgressSnapshotObservationError> {
@@ -1268,6 +1457,61 @@ pub enum FullProgressSnapshotObservationError {
     /// RetryPending disposition had no active retry observation.
     #[error("full-progress snapshot RetryPending disposition has no active retry observation")]
     RetryPendingObservationMissing,
+    /// The snapshot retained a disposition that the current full-progress state machine does not
+    /// yet produce or validate.
+    #[error(
+        "full-progress snapshot disposition {disposition:?} is unsupported in the current state model"
+    )]
+    UnsupportedDisposition {
+        disposition: FullProgressDisposition,
+    },
+    /// A terminal disposition was retained before the terminal phase.
+    #[error(
+        "full-progress snapshot terminal disposition {disposition:?} has phase {actual:?}, expected Terminal"
+    )]
+    TerminalPhaseMismatch {
+        disposition: FullProgressDisposition,
+        actual: OperationPhase,
+    },
+    /// A nonterminal snapshot phase did not match the exact phase derived from its retained rows.
+    #[error("full-progress snapshot phase {actual:?} does not match derived phase {expected:?}")]
+    DerivedPhaseMismatch {
+        expected: OperationPhase,
+        actual: OperationPhase,
+    },
+    /// An active retry observation was retained under a disposition that cannot suspend it.
+    #[error(
+        "full-progress snapshot active retry observation is incompatible with disposition {disposition:?}"
+    )]
+    RetryDispositionMismatch {
+        disposition: FullProgressDisposition,
+    },
+    /// An audit overlay was retained before publication without the one supported observed-effect
+    /// cancellation hold.
+    #[error("full-progress snapshot audit overlay is invalid in prepublication phase {phase:?}")]
+    AuditPhaseInvalid { phase: OperationPhase },
+    /// The retained normal claim settlement failed exact coverage or retained-charge validation.
+    #[error("invalid full-progress snapshot normal claim settlement: {0}")]
+    ClaimSettlement(#[source] AdmissionClaimValidationError),
+    /// A normal success disposition did not retain a claim settlement observation.
+    #[error("full-progress snapshot success disposition {disposition:?} has no claim settlement")]
+    ClaimSettlementMissingForSuccess {
+        disposition: FullProgressDisposition,
+    },
+    /// A normal success disposition retained a held claim settlement.
+    #[error("full-progress snapshot success disposition has an unsettled claim")]
+    ClaimSettlementIncompleteForSuccess,
+    /// All retained claims were settled while required work or optional-artifact decisions remain.
+    #[error("full-progress snapshot claim settlement is ahead of retained work progress")]
+    ClaimSettlementProgressIncomplete,
+    /// A fully settled normal claim inventory did not match the exact normal terminal disposition.
+    #[error(
+        "full-progress snapshot settled claims require a normal success disposition and Terminal phase, found {actual_disposition:?} and {phase:?}"
+    )]
+    ClaimSettlementTerminalMismatch {
+        actual_disposition: FullProgressDisposition,
+        phase: OperationPhase,
+    },
     /// A retained audit observation failed its bounded target validation.
     #[error("invalid full-progress snapshot audit observation: {0}")]
     AuditObservation(#[source] AuditTargetValidationError),
@@ -1369,6 +1613,11 @@ pub enum FullProgressSnapshotObservationError {
         "full-progress snapshot terminal before-publication cancellation retains after-effect or cleanup observations"
     )]
     CancellationPrePublishTerminalFollowup,
+    /// The global recovery counter did not match the accepted after-effect/cleanup generations.
+    #[error(
+        "full-progress snapshot recovery generation {actual} does not match expected generation {expected}"
+    )]
+    RecoveryGenerationMismatch { expected: u64, actual: u64 },
     /// Cleanup observations require a retained after-effect observation.
     #[error(
         "full-progress snapshot cleanup observations have no retained after-effect observation"
