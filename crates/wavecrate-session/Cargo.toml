@@ -17,5 +17,6 @@ wavecrate-design.workspace = true
 wavecrate-library.workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.37.0" }
 tempfile.workspace = true
 wavecrate-library = { workspace = true, features = ["test-support"] }

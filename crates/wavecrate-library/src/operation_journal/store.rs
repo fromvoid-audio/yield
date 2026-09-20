@@ -591,6 +591,16 @@ impl OperationJournalStore {
         recovery::scan_coordinator_page(self, cursor)
     }
 
+    /// Return a bounded read-only startup projection over both journal families.
+    ///
+    /// A blocked result is conservative: it does not restore a record, grant recovery authority,
+    /// or permit writable startup to proceed.
+    pub fn recovery_readiness(
+        &self,
+    ) -> Result<recovery::OperationJournalRecoveryReadiness, recovery::RecoveryScanError> {
+        recovery::recovery_readiness(self)
+    }
+
     /// Validate the profile-owned journal boundary before a future admission decision.
     ///
     /// This intentionally performs no operation-ID allocation, persistence, capacity

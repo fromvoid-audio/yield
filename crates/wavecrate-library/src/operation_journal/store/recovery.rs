@@ -93,6 +93,22 @@ pub(crate) struct CoordinatorRecoveryPage {
     encoded_bytes: usize,
 }
 
+/// Read-only startup projection for the profile-owned operation journal.
+///
+/// `Clear` means the bounded combined scan observed no rows at the instant of the scan. `Blocked`
+/// retains only a bounded actionable reason; it never exposes a raw full-progress record or grants
+/// recovery, admission, or execution authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationJournalRecoveryReadiness {
+    /// No legacy or full-progress observation was found by the combined scan.
+    Clear,
+    /// At least one retained observation requires coordinator recovery before writable startup.
+    Blocked {
+        /// Bounded family, sequence, identity, and retained-status context.
+        reason: String,
+    },
+}
+
 #[allow(dead_code)]
 impl CoordinatorRecoveryPage {
     pub(crate) fn entries(&self) -> &[CoordinatorRecoveryEntry] {
@@ -339,6 +355,75 @@ pub(super) fn scan_coordinator_page(
             let _ = store.connection.execute_batch("ROLLBACK");
             Err(error)
         }
+    }
+}
+
+pub(super) fn recovery_readiness(
+    store: &OperationJournalStore,
+) -> Result<OperationJournalRecoveryReadiness, RecoveryScanError> {
+    let page = scan_coordinator_page(store, None)?;
+    let Some(entry) = page.entries.first() else {
+        return Ok(OperationJournalRecoveryReadiness::Clear);
+    };
+    Ok(OperationJournalRecoveryReadiness::Blocked {
+        reason: bounded_reason(format_readiness_reason(entry)),
+    })
+}
+
+fn format_readiness_reason(entry: &CoordinatorRecoveryEntry) -> String {
+    let family = match entry.family {
+        RecoveryFamily::Legacy => "legacy",
+        RecoveryFamily::FullProgress => "full-progress",
+    };
+    let key = match &entry.key {
+        RecoveryKey::OperationId(operation_id) => format!("operation {operation_id}"),
+        RecoveryKey::Text(_) => String::from("noncanonical operation key"),
+        RecoveryKey::Invalid { sql_type, .. } => {
+            format!("invalid operation key type {sql_type}")
+        }
+    };
+    let status = match &entry.outcome {
+        CoordinatorRecoveryRowOutcome::Consistent(_) => {
+            String::from("consistent observation requires coordinator recovery")
+        }
+        CoordinatorRecoveryRowOutcome::Retained(reason) => {
+            format!("retained audit evidence: {}", retention_reason(reason))
+        }
+    };
+    format!("{family} {key} at sequence {}: {status}", entry.sequence)
+}
+
+fn retention_reason(reason: &RecoveryRetentionReason) -> String {
+    match reason {
+        RecoveryRetentionReason::LegacyMissingPublicationEvidence => {
+            String::from("legacy publication evidence is missing")
+        }
+        RecoveryRetentionReason::UnsupportedCodec { version } => {
+            format!("unsupported codec schema version {version}")
+        }
+        RecoveryRetentionReason::Malformed { reason } => {
+            format!("malformed record ({})", bounded_reason(reason))
+        }
+        RecoveryRetentionReason::KeyMismatch {
+            record_operation_id,
+        } => {
+            format!("record identity mismatches SQL key ({record_operation_id})")
+        }
+        RecoveryRetentionReason::SizeInvalid { declared, reason } => {
+            format!(
+                "invalid record size {:?} ({})",
+                declared,
+                bounded_reason(reason)
+            )
+        }
+        RecoveryRetentionReason::TypeInvalid {
+            field,
+            sql_type,
+            reason,
+        } => format!(
+            "invalid {field:?} SQL type {sql_type} ({})",
+            bounded_reason(reason)
+        ),
     }
 }
 
@@ -1382,6 +1467,67 @@ mod tests {
         assert!(page.is_done());
         assert_eq!(page.next_cursor(), None);
         assert_eq!(page.encoded_bytes(), 0);
+    }
+
+    #[test]
+    fn recovery_readiness_is_clear_for_an_empty_combined_journal() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        assert_eq!(
+            store.recovery_readiness().expect("empty readiness"),
+            OperationJournalRecoveryReadiness::Clear
+        );
+    }
+
+    #[test]
+    fn recovery_readiness_blocks_a_consistent_full_progress_row() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let full = full_progress_fixture();
+        let operation_id = full.snapshot().intent().operation_id();
+        let encoded = encode_full_progress(&full).expect("full-progress fixture bytes");
+        insert_full_raw(&store, &operation_id.to_string(), 1, &encoded);
+
+        let readiness = store.recovery_readiness().expect("full readiness");
+        let OperationJournalRecoveryReadiness::Blocked { reason } = readiness else {
+            panic!("full-progress row must block startup");
+        };
+        assert!(reason.contains("full-progress"));
+        assert!(reason.contains(&operation_id.to_string()));
+        assert!(reason.contains("sequence 1"));
+        assert!(reason.contains("consistent observation requires coordinator recovery"));
+    }
+
+    #[test]
+    fn recovery_readiness_blocks_and_bounds_a_retained_full_progress_row() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let full = full_progress_fixture();
+        let operation_id = full.snapshot().intent().operation_id();
+        insert_full_raw(&store, &operation_id.to_string(), 1, b"not-json");
+
+        let readiness = store.recovery_readiness().expect("retained readiness");
+        let OperationJournalRecoveryReadiness::Blocked { reason } = readiness else {
+            panic!("retained full-progress row must block startup");
+        };
+        assert!(reason.contains("full-progress"));
+        assert!(reason.contains(&operation_id.to_string()));
+        assert!(reason.contains("sequence 1"));
+        assert!(reason.contains("retained audit evidence"));
+        assert!(reason.contains("malformed"));
+        assert!(reason.len() <= 256);
+    }
+
+    #[test]
+    fn checked_full_progress_test_fixture_decodes_and_validates() {
+        let encoded = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/full_progress_record.json"
+        ));
+        let full = decode_full_progress(encoded).expect("full-progress test fixture");
+        full.snapshot()
+            .validate_base()
+            .expect("full-progress test fixture validates");
     }
 
     #[test]

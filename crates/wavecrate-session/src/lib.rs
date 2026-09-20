@@ -20,7 +20,8 @@ use wavecrate_library::app_dirs::{
     AppRootGuard, PersistenceProfileGuard, ProfileOwnershipError, WritableProfileGuard,
 };
 use wavecrate_library::operation_journal::{
-    OperationJournalOwner, OperationJournalOwnerStatus, OperationJournalStore,
+    OperationJournalOwner, OperationJournalOwnerStatus, OperationJournalRecoveryReadiness,
+    OperationJournalStore,
 };
 use wavecrate_library::sample_sources::{
     GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
@@ -1081,23 +1082,19 @@ fn open_session_journal(
     let journal = OperationJournalStore::open(writable).map_err(|error| {
         SessionError::Persistence(format!("operation journal unavailable: {error}"))
     })?;
-    let page = journal
-        .scan_recovery_page(None)
-        .map_err(|error| match error {
-            wavecrate_library::operation_journal::RecoveryScanError::Store(store_error) => {
-                SessionError::RecoveryUnavailable(format!(
-                    "operation journal audit required: {store_error}"
-                ))
-            }
-            wavecrate_library::operation_journal::RecoveryScanError::RequiresAudit { reason } => {
-                SessionError::RecoveryUnavailable(format!(
-                    "operation journal audit required: {reason}"
-                ))
-            }
-        })?;
-    if !page.entries().is_empty() {
-        return Err(SessionError::RecoveryUnavailable(String::from(
-            "this profile contains operations that require recovery before writable access can resume",
+    let readiness = journal.recovery_readiness().map_err(|error| match error {
+        wavecrate_library::operation_journal::RecoveryScanError::Store(store_error) => {
+            SessionError::RecoveryUnavailable(format!(
+                "operation journal audit required: {store_error}"
+            ))
+        }
+        wavecrate_library::operation_journal::RecoveryScanError::RequiresAudit { reason } => {
+            SessionError::RecoveryUnavailable(format!("operation journal audit required: {reason}"))
+        }
+    })?;
+    if let OperationJournalRecoveryReadiness::Blocked { reason } = readiness {
+        return Err(SessionError::RecoveryUnavailable(format!(
+            "operation journal entries require recovery before writable access can resume: {reason}"
         )));
     }
     Ok(journal)
@@ -2446,6 +2443,7 @@ fn drain_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::{
         fs,
         io::{self, BufRead, BufReader, Write},
@@ -2465,6 +2463,11 @@ mod tests {
     use wavecrate_library::sample_sources::{SourceId, SourceMetadataStorage};
 
     const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "WAVECRATE_SESSION_OWNER_PROFILE_ROOT";
+    const FULL_PROGRESS_FIXTURE_OPERATION_ID: &str = "00000000-0000-0000-0000-0000000000cd";
+    const FULL_PROGRESS_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/full_progress_record.json"
+    ));
 
     struct SessionOwnerHelperProcess {
         child: Child,
@@ -2656,6 +2659,40 @@ mod tests {
         drop(profile_guard);
         drop(app_root_guard);
         operation_id
+    }
+
+    fn seed_full_progress_raw(
+        profile_root: &Path,
+        operation_id: &str,
+        sequence: i64,
+        record: &[u8],
+    ) {
+        let app_root_guard = AppRootGuard::set(profile_root.to_path_buf()).expect("app root");
+        let profile_guard =
+            WritableProfileGuard::acquire_current().expect("fixture profile ownership");
+        let journal = OperationJournalStore::open(&profile_guard).expect("fixture journal open");
+        drop(journal);
+        drop(profile_guard);
+        drop(app_root_guard);
+
+        let connection =
+            Connection::open(journal_database_path(profile_root)).expect("open fixture database");
+        connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![operation_id, sequence, record],
+            )
+            .expect("insert full-progress fixture row");
+    }
+
+    fn seed_full_progress_fixture(profile_root: &Path) {
+        seed_full_progress_raw(
+            profile_root,
+            FULL_PROGRESS_FIXTURE_OPERATION_ID,
+            1,
+            FULL_PROGRESS_FIXTURE,
+        );
     }
 
     fn write_test_wav(path: &Path) {
@@ -3082,6 +3119,116 @@ mod tests {
         drop(journal);
         drop(profile_guard);
         drop(app_root_guard);
+    }
+
+    #[test]
+    fn full_progress_only_operation_journal_blocks_ordinary_writers() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        seed_full_progress_fixture(&profile_root);
+        let journal_path = journal_database_path(&profile_root);
+        let retained_database = fs::read(&journal_path).expect("journal bytes");
+
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::RecoveryUnavailable(reason),
+                    ..
+                } if reason.contains("full-progress")
+                    && reason.contains("consistent observation requires coordinator recovery")
+            )
+        });
+        assert!(!profile_root.join("library.db").exists());
+        assert_eq!(
+            fs::read(&journal_path).expect("retained journal bytes"),
+            retained_database
+        );
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::RecoveryUnavailable(reason)))
+                if reason.contains("full-progress")
+        ));
+    }
+
+    #[test]
+    fn malformed_full_progress_operation_journal_blocks_and_preserves_bytes() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        seed_full_progress_raw(
+            &profile_root,
+            FULL_PROGRESS_FIXTURE_OPERATION_ID,
+            1,
+            b"not-json",
+        );
+        let journal_path = journal_database_path(&profile_root);
+        let retained_database = fs::read(&journal_path).expect("journal bytes");
+
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::RecoveryUnavailable(reason),
+                    ..
+                } if reason.contains("full-progress")
+                    && reason.contains("retained audit evidence")
+                    && reason.contains("malformed")
+            )
+        });
+        assert!(!profile_root.join("library.db").exists());
+        assert_eq!(
+            fs::read(&journal_path).expect("retained journal bytes"),
+            retained_database
+        );
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::RecoveryUnavailable(reason)))
+                if reason.contains("malformed")
+        ));
+    }
+
+    #[test]
+    fn mixed_legacy_and_full_progress_ambiguity_blocks_and_preserves_rows() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile_root = profile_root(&temp);
+        let operation_id = seed_pending_journal(&profile_root);
+        seed_full_progress_raw(
+            &profile_root,
+            &operation_id.to_string(),
+            2,
+            FULL_PROGRESS_FIXTURE,
+        );
+        let journal_path = journal_database_path(&profile_root);
+        let retained_database = fs::read(&journal_path).expect("journal bytes");
+
+        let mut service =
+            SourceRegistryService::start_inner(Some(profile_root.clone())).expect("service start");
+        wait_for_event(&service, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::RecoveryUnavailable(reason),
+                    ..
+                } if reason.contains("both journal families")
+            )
+        });
+        assert!(!profile_root.join("library.db").exists());
+        assert_eq!(
+            fs::read(&journal_path).expect("retained journal bytes"),
+            retained_database
+        );
+        assert!(matches!(
+            service.shutdown(),
+            Err(ShutdownError::Session(SessionError::RecoveryUnavailable(reason)))
+                if reason.contains("both journal families")
+        ));
     }
 
     #[test]
