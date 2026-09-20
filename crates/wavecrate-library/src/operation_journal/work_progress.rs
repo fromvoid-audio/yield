@@ -21092,6 +21092,280 @@ mod tests {
     }
 
     #[test]
+    fn full_progress_codec_roundtrips_representative_snapshot_states() {
+        let roundtrip = |snapshot: FullProgressSnapshotObservation| {
+            let record =
+                super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot.clone())
+                    .expect("validated full-progress record");
+            assert_eq!(record.record_kind(), "full_progress");
+            assert_eq!(record.schema_version(), 1);
+            let bytes = super::super::full_progress_codec::encode(&record)
+                .expect("full-progress record encodes");
+            assert!(
+                bytes.len() <= super::super::full_progress_codec::FULL_PROGRESS_MAX_RECORD_BYTES
+            );
+            let decoded = super::super::full_progress_codec::decode(&bytes)
+                .expect("full-progress record decodes");
+            assert_eq!(decoded.snapshot(), &snapshot);
+            decoded
+        };
+
+        let initial = copy_progress_with_admission_claims();
+        let initial_snapshot = initial
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&initial))
+            .expect("initial snapshot");
+        roundtrip(initial_snapshot);
+
+        let mut reacquired = copy_progress_with_admission_claims();
+        let source_key = key_for(&reacquired, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut reacquired, 0, WorkUnitRole::SourceRead);
+        reacquired
+            .reacquire_source(source_reacquisition_authority(
+                &reacquired,
+                source_key.participant_id(),
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        let reacquired_snapshot = reacquired
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&reacquired))
+            .expect("reacquired snapshot");
+        roundtrip(reacquired_snapshot);
+
+        let mut retry = copy_progress_with_admission_claims();
+        retry
+            .request_retry(
+                RetryObservation::new(
+                    1,
+                    100,
+                    200,
+                    RetryLeaseId::new("codec-retry").expect("retry lease"),
+                    300,
+                    RetryErrorClass::TransientAvailability,
+                    "codec-test",
+                    None,
+                )
+                .expect("retry observation"),
+            )
+            .expect("retry request");
+        roundtrip(
+            retry
+                .capture_full_progress_snapshot(&copy_snapshot_intent(&retry))
+                .expect("retry snapshot"),
+        );
+
+        let mut audited = copy_progress_with_admission_claims();
+        publish_prefix(&mut audited);
+        audited
+            .require_audit(ProgressAuditObservation::new(
+                ProgressAuditReason::RevisionGap,
+            ))
+            .expect("audit request");
+        roundtrip(
+            audited
+                .capture_full_progress_snapshot(&copy_snapshot_intent(&audited))
+                .expect("audit snapshot"),
+        );
+
+        let mut cancelled = copy_progress_with_admission_claims();
+        cancelled
+            .request_cancellation(CancellationRequestObservation::new(18121).expect("cancel"))
+            .expect("cancellation request");
+        accept_empty_after_effect_reconciliation(&mut cancelled);
+        accept_pending_cleanup_observations(&mut cancelled);
+        roundtrip(
+            cancelled
+                .capture_full_progress_snapshot(&copy_snapshot_intent(&cancelled))
+                .expect("cancellation and cleanup snapshot"),
+        );
+
+        let mut deferred = copy_progress_with_admission_claims_and_optional();
+        complete_required(&mut deferred);
+        let artifact = deferred
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        apply_readiness_deferral(&mut deferred, &[artifact], 1);
+        let (participants, source, _filesystem, source_id) = valid_topology(true);
+        let args = copy_args_at(source, source_id, "copy.wav");
+        roundtrip(
+            deferred
+                .capture_full_progress_snapshot(&snapshot_intent_for(&deferred, args, participants))
+                .expect("deferred snapshot"),
+        );
+    }
+
+    #[test]
+    fn full_progress_codec_rejects_malformed_headers_nested_data_and_tampering() {
+        let progress = copy_progress_with_admission_claims();
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("record");
+        let encoded = super::super::full_progress_codec::encode(&record).expect("encode");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("value");
+
+        let mut wrong_kind = value.clone();
+        wrong_kind["record_kind"] = json!("legacy");
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&wrong_kind).expect("wrong kind")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::WrongRecordKind { .. })
+        ));
+
+        let mut unsupported = value.clone();
+        unsupported["schema_version"] = json!(99);
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&unsupported).expect("unsupported version")
+            ),
+            Err(
+                super::super::full_progress_codec::FullProgressCodecError::UnsupportedVersion {
+                    version: 99
+                }
+            )
+        ));
+
+        let mut missing_kind = value.clone();
+        missing_kind
+            .as_object_mut()
+            .expect("envelope object")
+            .remove("record_kind");
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&missing_kind).expect("missing kind")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
+
+        let mut unknown_nested = value.clone();
+        unknown_nested["snapshot"]["intent"]["unexpected"] = json!(true);
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&unknown_nested).expect("unknown nested")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
+
+        let mut unknown_root = value.clone();
+        unknown_root["unexpected"] = json!(true);
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&unknown_root).expect("unknown root")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
+
+        let mut tampered = value.clone();
+        tampered["snapshot"]["phase"] = json!("Terminal");
+        let tampered_record = serde_json::from_value::<
+            super::super::full_progress_codec::StoredFullProgressRecord,
+        >(tampered.clone())
+        .expect("tampered envelope shape");
+        assert!(matches!(
+            super::super::full_progress_codec::encode(&tampered_record),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+        ));
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&tampered).expect("tampered snapshot")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+        ));
+
+        let mut trailing = encoded.clone();
+        trailing.extend_from_slice(b" {}");
+        assert!(matches!(
+            super::super::full_progress_codec::decode(&trailing),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
+
+        let duplicate_root = br#"{"record_kind":"full_progress","record_kind":"full_progress","schema_version":1,"snapshot":{}}"#;
+        assert!(matches!(
+            super::super::full_progress_codec::decode(duplicate_root),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { ref reason })
+                if reason.contains("duplicate")
+        ));
+        let duplicate_nested = br#"{"record_kind":"full_progress","schema_version":1,"snapshot":{"intent":{},"intent":{}}}"#;
+        assert!(matches!(
+            super::super::full_progress_codec::decode(duplicate_nested),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { ref reason })
+                if reason.contains("duplicate")
+        ));
+
+        let mut deep = String::from("{}");
+        for _ in 0..=super::super::full_progress_codec::FULL_PROGRESS_MAX_JSON_DEPTH {
+            deep = format!("[{deep}]");
+        }
+        let deep = format!(
+            "{{\"record_kind\":\"full_progress\",\"schema_version\":1,\"snapshot\":{deep}}}"
+        );
+        assert!(matches!(
+            super::super::full_progress_codec::decode(deep.as_bytes()),
+            Err(
+                super::super::full_progress_codec::FullProgressCodecError::JsonDepthExceeded { .. }
+            )
+        ));
+
+        let oversized =
+            vec![b'{'; super::super::full_progress_codec::FULL_PROGRESS_MAX_RECORD_BYTES + 1];
+        assert!(matches!(
+            super::super::full_progress_codec::decode(&oversized),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InputOversize { .. })
+        ));
+    }
+
+    #[test]
+    fn full_progress_codec_is_separate_from_legacy_codec_and_caps_writes() {
+        let progress = copy_progress_with_admission_claims();
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("record");
+        let full_bytes = super::super::full_progress_codec::encode(&record).expect("encode");
+        assert!(matches!(
+            super::super::codec::decode(&full_bytes),
+            Err(super::super::codec::DecodeError::Malformed { .. })
+        ));
+
+        let legacy_bytes = br#"{
+  "schema_version": 1,
+  "operation_id": "01234567-89ab-cdef-0123-456789abcdef",
+  "intent": {"actor": "User", "kind": "FileHistory", "label": "legacy fixture"},
+  "phase": "IntentDurable",
+  "disposition": "RetryPending",
+  "payload": {"legacy": true},
+  "capacity_plan": null,
+  "prepared": null,
+  "staged": null,
+  "published": null,
+  "replacement_qualification": null,
+  "created_unix_ms": 11,
+  "updated_unix_ms": 12
+}"#;
+        assert!(matches!(
+            super::super::full_progress_codec::decode(legacy_bytes),
+            Err(super::super::full_progress_codec::FullProgressCodecError::Malformed { .. })
+        ));
+
+        assert!(matches!(
+            super::super::full_progress_codec::encode_for_test_with_limit(&record, 16),
+            Err(
+                super::super::full_progress_codec::FullProgressCodecError::OutputOversize {
+                    maximum: 16,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
     fn full_progress_snapshot_validates_completed_history_after_reacquisition() {
         let mut progress = copy_progress_with_admission_claims();
         let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);

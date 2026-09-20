@@ -16,6 +16,8 @@ pub mod coordinator;
 pub mod evidence;
 pub mod external_commands;
 pub mod full_capacity;
+#[allow(dead_code)]
+pub(crate) mod full_progress_codec;
 pub mod full_progress_record;
 pub mod full_status;
 pub mod history_commands;

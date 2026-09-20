@@ -1598,7 +1598,7 @@ fn malformed(reason: impl Into<String>) -> DecodeError {
     }
 }
 
-fn parse_unique_value(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+pub(super) fn parse_unique_value(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = UniqueValueSeed.deserialize(&mut deserializer)?;
     deserializer.end()?;
@@ -1790,7 +1790,7 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
     }
 }
 
-struct CappedWriter {
+pub(super) struct CappedWriter {
     bytes: Vec<u8>,
     attempted: usize,
     limit: usize,
@@ -1798,7 +1798,7 @@ struct CappedWriter {
 }
 
 impl CappedWriter {
-    fn new(limit: usize) -> Self {
+    pub(super) fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(limit.min(4096)),
             attempted: 0,
@@ -1807,8 +1807,23 @@ impl CappedWriter {
         }
     }
 
-    fn finish(self) -> Vec<u8> {
+    pub(super) fn finish(self) -> Vec<u8> {
         self.bytes
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn attempted(&self) -> usize {
+        self.attempted
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn exceeded(&self) -> bool {
+        self.exceeded
     }
 }
 
@@ -3667,7 +3682,7 @@ fn validate_tagged_coordinator_shape(
     Ok(())
 }
 
-fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &'static str> {
+pub(super) fn validate_json_depth(value: &Value, maximum: usize) -> Result<(), &'static str> {
     fn visit(
         value: &Value,
         depth: usize,
