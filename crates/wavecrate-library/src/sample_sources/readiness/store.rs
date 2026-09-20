@@ -273,6 +273,11 @@ impl ReadinessWakeQualification {
         self.source_revision
     }
 
+    /// Lease epoch captured with the coherent source-side read.
+    pub(crate) fn lease_epoch(&self) -> i64 {
+        self.publication_fence.lease_epoch()
+    }
+
     /// Verified database-root identity retained by the owned source database.
     pub(crate) fn root_identity(&self) -> &str {
         &self.root_identity

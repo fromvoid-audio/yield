@@ -19,7 +19,6 @@ pub use snapshot::{
     ArtifactPublishOutcome, ReadinessActivity, ReadinessClassification, ReadinessDeficit,
     ReadinessEntry, ReadinessProgress, ReadinessSnapshot, ReadinessStageCounts,
 };
-#[cfg(test)]
 pub(crate) use store::ReadinessWakeQualification;
 #[cfg(test)]
 pub(crate) use store::reconcile_readiness_with_hook;

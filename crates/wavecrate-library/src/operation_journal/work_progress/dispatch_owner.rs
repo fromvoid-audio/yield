@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::operation_journal::CancellationDispatchOutcomeRow;
+use crate::sample_sources::{SourceDatabase, readiness::ReadinessError};
 
 use super::{
     CancellationCoordinatorClosureObservationRecord, CancellationDispatchOutcome,
@@ -25,8 +26,9 @@ use super::{
     CancellationNamespaceCleanupObservationRecord, CancellationRequestObservation,
     CancellationResourceCleanupObservationRecord, CancellationSourceClosureObservationRecord,
     CompletionContext, FullProgressDisposition, OperationId, OperationPhase, ParticipantScope,
-    ProgressApplyOutcome, ProgressStepStatus, StoredStepEvidence, WorkPlan, WorkProgress,
-    WorkProgressError, WorkUnitApplicability, WorkUnitKey,
+    ProgressApplyOutcome, ProgressStepStatus, ReadinessSchedulingObservationRow,
+    StoredStepEvidence, WorkPlan, WorkProgress, WorkProgressError, WorkUnitApplicability,
+    WorkUnitKey,
 };
 
 static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -133,6 +135,18 @@ pub(super) enum DispatchOwnerError {
     /// The underlying progress guard rejected an owner operation.
     #[error(transparent)]
     Progress(#[from] WorkProgressError),
+    /// The source-side readiness qualification could not be obtained from the owned database.
+    #[error("live readiness qualification was unavailable")]
+    ReadinessQualificationUnavailable,
+    /// Readiness completion must use the live source-qualified owner boundary.
+    #[error("readiness completion requires live source qualification")]
+    ReadinessQualificationRequired,
+    /// The freshly qualified wake did not match the operation's exact readiness observation.
+    #[error("live readiness qualification mismatched {field}")]
+    ReadinessQualificationMismatch {
+        /// Exact field whose source-side observation differed.
+        field: &'static str,
+    },
     /// The frozen dispatch manifest could not be derived.
     #[error(transparent)]
     DispatchManifest(#[from] super::CancellationDispatchManifestError),
@@ -579,6 +593,12 @@ impl LiveDispatchOwner {
         ) {
             return Err(PermitFailure::new(error, permit));
         }
+        if permit.key().role() == super::WorkUnitRole::Readiness {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::ReadinessQualificationRequired,
+                permit,
+            ));
+        }
         let outcome = match self
             .progress
             .apply_verified_completion(super::VerifiedStepCompletion {
@@ -588,6 +608,131 @@ impl LiveDispatchOwner {
                 scope: permit.binding.scope.clone(),
                 execution_epoch: permit.binding.execution_epoch,
                 evidence,
+            }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(PermitFailure::new(
+                    DispatchOwnerError::Progress(error),
+                    permit,
+                ));
+            }
+        };
+        self.ledger.insert(
+            permit.key(),
+            DispatchLedgerEntry::CompletedNormally {
+                attempt_id: permit.attempt_id(),
+            },
+        );
+        Ok(outcome)
+    }
+
+    /// Complete one entered Readiness unit only after a fresh source-side wake qualification.
+    ///
+    /// The caller supplies the expected row as an untrusted observation. The owned source
+    /// database is read immediately before the normal completion authority is constructed; the
+    /// raw row therefore cannot mint a completion by itself. The existing completion path keeps
+    /// prerequisite, epoch, source-fence, retry/audit, and cancellation guards in one place.
+    pub(super) fn complete_readiness_scheduled(
+        &mut self,
+        permit: EnteredDispatchPermit,
+        source_database: &mut SourceDatabase,
+        expected_row: &ReadinessSchedulingObservationRow,
+    ) -> Result<ProgressApplyOutcome, PermitFailure<EnteredDispatchPermit>> {
+        if self.lifecycle != DispatchOwnerLifecycle::Open {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::NormalCompletionClosed,
+                permit,
+            ));
+        }
+        if let Err(error) = self.validate_binding(&permit.binding) {
+            return Err(PermitFailure::new(error, permit));
+        }
+        if let Err(error) = self.require_ledger_state(
+            permit.key(),
+            permit.attempt_id(),
+            DispatchLedgerState::Entered,
+        ) {
+            return Err(PermitFailure::new(error, permit));
+        }
+        if permit.key().role() != super::WorkUnitRole::Readiness
+            || expected_row.readiness_key() != permit.key()
+        {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::ReadinessQualificationMismatch { field: "work_unit" },
+                permit,
+            ));
+        }
+        if let Err(error) = expected_row
+            .validate_for_stored_step_evidence()
+            .map_err(|error| {
+                DispatchOwnerError::Progress(WorkProgressError::ReadinessSchedulingObservation(
+                    error,
+                ))
+            })
+        {
+            return Err(PermitFailure::new(error, permit));
+        }
+        let expected_context = super::CompletionContext::new(
+            permit.binding.execution_epoch,
+            permit.binding.scope.clone(),
+        );
+        if expected_row.context() != &expected_context {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::ReadinessQualificationMismatch { field: "context" },
+                permit,
+            ));
+        }
+        let Some(expected_fence) = permit.binding.scope.source_fence() else {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::Progress(WorkProgressError::SourceFenceMissing {
+                    role: super::WorkUnitRole::Readiness,
+                }),
+                permit,
+            ));
+        };
+        if expected_row.source_observation().source_id() != expected_fence.source_id() {
+            return Err(PermitFailure::new(
+                DispatchOwnerError::ReadinessQualificationMismatch { field: "source_id" },
+                permit,
+            ));
+        }
+
+        let mut readiness_store = match source_database.readiness_store_read_only() {
+            Ok(store) => store,
+            Err(_) => {
+                return Err(PermitFailure::new(
+                    DispatchOwnerError::ReadinessQualificationUnavailable,
+                    permit,
+                ));
+            }
+        };
+        let qualification =
+            match readiness_store.qualify_readiness_wake(expected_fence.source_id().as_str()) {
+                Ok(qualification) => qualification,
+                Err(error) => {
+                    return Err(PermitFailure::new(
+                        map_readiness_qualification_error(error),
+                        permit,
+                    ));
+                }
+            };
+        drop(readiness_store);
+
+        if let Err(error) = validate_live_readiness_row(expected_row, &qualification) {
+            return Err(PermitFailure::new(error, permit));
+        }
+
+        let outcome = match self
+            .progress
+            .apply_verified_completion(super::VerifiedStepCompletion {
+                operation_id: permit.binding.operation_id,
+                plan: self.progress.plan.clone(),
+                key: permit.binding.key,
+                scope: permit.binding.scope.clone(),
+                execution_epoch: permit.binding.execution_epoch,
+                evidence: StoredStepEvidence::ReadinessScheduled {
+                    observation: expected_row.clone(),
+                },
             }) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1067,4 +1212,86 @@ impl LiveDispatchOwner {
         }
         Ok(())
     }
+}
+
+fn map_readiness_qualification_error(error: ReadinessError) -> DispatchOwnerError {
+    match error {
+        ReadinessError::ReadinessWakeMissing { .. } => {
+            DispatchOwnerError::ReadinessQualificationMismatch { field: "wake" }
+        }
+        ReadinessError::ReadinessWakeMismatch { field } => {
+            DispatchOwnerError::ReadinessQualificationMismatch { field }
+        }
+        _ => DispatchOwnerError::ReadinessQualificationUnavailable,
+    }
+}
+
+fn validate_live_readiness_row(
+    row: &ReadinessSchedulingObservationRow,
+    qualification: &crate::sample_sources::readiness::ReadinessWakeQualification,
+) -> Result<(), DispatchOwnerError> {
+    let source_observation = row.source_observation();
+    let wake = qualification.observation();
+    if wake.source_id() != source_observation.source_id().as_str() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch { field: "source_id" });
+    }
+    if qualification.root_identity() != source_observation.root_identity() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "root_identity",
+        });
+    }
+    if qualification.database_identity() != source_observation.database_identity() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "database_identity",
+        });
+    }
+    if i64::try_from(source_observation.lease_epoch()).ok() != Some(qualification.lease_epoch()) {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "lease_epoch",
+        });
+    }
+    if qualification.source_revision() != source_observation.revision() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "source_revision",
+        });
+    }
+    if wake.wake_id() != row.wake().wake_id().to_string() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch { field: "wake_id" });
+    }
+    let owner_revision = i64::try_from(row.wake().owner_revision()).map_err(|_| {
+        DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "owner_revision",
+        }
+    })?;
+    if wake.owner_revision() != owner_revision {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "owner_revision",
+        });
+    }
+    if wake.source_generation() != row.source_generation() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "source_generation",
+        });
+    }
+    if wake.readiness_revision() != row.readiness_revision() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "readiness_revision",
+        });
+    }
+    if wake.contract_version() != row.contract_version() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "contract_version",
+        });
+    }
+    if wake.target_digest() != row.target_set().membership_digest().as_ref() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "target_digest",
+        });
+    }
+    if wake.target_count() != row.target_set().membership_count() {
+        return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+            field: "target_count",
+        });
+    }
+    Ok(())
 }

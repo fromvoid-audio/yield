@@ -7525,6 +7525,7 @@ impl From<CancellationRequestValidationError> for WorkProgressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_dirs::{AppRootGuard, WritableProfileGuard};
     use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity};
     use crate::operation_journal::MAX_CANCELLATION_STEPS;
     use crate::operation_journal::{
@@ -7582,8 +7583,12 @@ mod tests {
         WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
         fingerprint_selected_entry_json,
     };
-    use crate::sample_sources::{SourceId, SourcePlaybackType};
+    use crate::sample_sources::readiness::{
+        ReadinessStage, ReadinessTarget, ReadinessTargetPublication, SourceAvailability,
+    };
+    use crate::sample_sources::{SourceDatabase, SourceId, SourcePlaybackType};
     use serde_json::json;
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     fn participant_id(value: u128) -> ParticipantId {
@@ -7593,6 +7598,16 @@ mod tests {
     fn valid_topology(
         with_optional_artifact: bool,
     ) -> (ParticipantSet, ParticipantId, ParticipantId, SourceId) {
+        let source_id = SourceId::from_string("source-a");
+        let fence =
+            StoredSourceFence::new(source_id, "root-a", "db-a", 1, 7, 1).expect("source fence");
+        topology_with_source_fence(with_optional_artifact, fence)
+    }
+
+    fn topology_with_source_fence(
+        with_optional_artifact: bool,
+        fence: StoredSourceFence,
+    ) -> (ParticipantSet, ParticipantId, ParticipantId, SourceId) {
         let source = participant_id(1);
         let filesystem = participant_id(2);
         let global = participant_id(3);
@@ -7600,9 +7615,7 @@ mod tests {
         let projection = participant_id(5);
         let readiness = participant_id(6);
         let artifact = participant_id(7);
-        let source_id = SourceId::from_string("source-a");
-        let fence = StoredSourceFence::new(source_id.clone(), "root-a", "db-a", 1, 7, 1)
-            .expect("source fence");
+        let source_id = fence.source_id().clone();
         let mut descriptors = vec![
             ParticipantDescriptor::new(
                 source,
@@ -7690,6 +7703,15 @@ mod tests {
         source_id: SourceId,
         destination_path: &str,
     ) -> UniversalCommandArgs {
+        copy_args_at_with_source_revision(source, source_id, destination_path, 7)
+    }
+
+    fn copy_args_at_with_source_revision(
+        source: ParticipantId,
+        source_id: SourceId,
+        destination_path: &str,
+        source_revision: u64,
+    ) -> UniversalCommandArgs {
         let source_endpoint = CopyEndpoint::new(
             source,
             source_id.clone(),
@@ -7706,7 +7728,8 @@ mod tests {
             CopyIntentArgs::new(
                 source_endpoint,
                 destination_endpoint,
-                CopySourceExpectation::new(7, "file-id", 12, 13).expect("source expectation"),
+                CopySourceExpectation::new(source_revision, "file-id", 12, 13)
+                    .expect("source expectation"),
                 CopyCollisionPolicy::NoReplace,
                 None,
             )
@@ -7898,6 +7921,31 @@ mod tests {
             &participants,
         )
         .expect("copy progress")
+    }
+
+    fn copy_progress_with_source_fence(fence: StoredSourceFence) -> WorkProgress {
+        let (participants, source, _filesystem, source_id) =
+            topology_with_source_fence(false, fence);
+        let source_revision = participants
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ParticipantKind::SourceDatabase)
+            .and_then(|descriptor| descriptor.source_fence())
+            .expect("owned source fence")
+            .source_revision();
+        let args =
+            copy_args_at_with_source_revision(source, source_id, "copy.wav", source_revision);
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("owned readiness work plan");
+        WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(2401)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("owned readiness progress")
     }
 
     fn copy_plan_inputs() -> (ParticipantSet, UniversalCommandArgs, WorkPlan) {
@@ -10186,6 +10234,214 @@ mod tests {
                 .complete(entered, evidence_for(owner.progress(), key, 7))
                 .expect("owner work completion");
         }
+    }
+
+    fn owner_complete_before_readiness(
+        owner: &mut dispatch_owner::LiveDispatchOwner,
+        readiness: WorkUnitKey,
+    ) {
+        loop {
+            let pending = owner
+                .progress()
+                .steps()
+                .iter()
+                .filter(|step| {
+                    step.key() != readiness
+                        && step.status() == ProgressStepStatus::Pending
+                        && step.requirement() == ParticipantRequirement::Required
+                })
+                .map(WorkProgressStep::key)
+                .collect::<Vec<_>>();
+            let mut advanced = false;
+            for key in pending {
+                let reserved = match owner.issue(key) {
+                    Ok(reserved) => reserved,
+                    Err(dispatch_owner::DispatchOwnerError::PrerequisiteIncomplete { .. }) => {
+                        continue;
+                    }
+                    Err(error) => {
+                        panic!("unexpected readiness prerequisite issue error: {error:?}")
+                    }
+                };
+                let entered = owner.enter(reserved).expect("readiness prerequisite entry");
+                owner
+                    .complete(entered, evidence_for(owner.progress(), key, 0))
+                    .expect("readiness prerequisite completion");
+                advanced = true;
+                break;
+            }
+            if !advanced {
+                break;
+            }
+        }
+        assert_eq!(
+            owner
+                .progress()
+                .step_for(readiness)
+                .expect("readiness step")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+    }
+
+    fn owned_readiness_row(
+        owner: &dispatch_owner::LiveDispatchOwner,
+        key: WorkUnitKey,
+        qualification: &crate::sample_sources::readiness::ReadinessWakeQualification,
+    ) -> ReadinessSchedulingObservationRow {
+        let scope = owner
+            .progress()
+            .scope_for(key)
+            .expect("owned readiness scope")
+            .clone();
+        let wake = qualification.observation();
+        let source_observation = SourceRevisionObservation::new(
+            SourceId::from_string(wake.source_id()),
+            qualification.root_identity(),
+            qualification.database_identity(),
+            scope
+                .source_fence()
+                .expect("owned readiness fence")
+                .lifecycle_generation(),
+            u64::try_from(qualification.lease_epoch()).expect("lease epoch"),
+            qualification.source_revision(),
+        )
+        .expect("owned source observation");
+        owned_readiness_row_with_source_observation(owner, key, qualification, source_observation)
+    }
+
+    fn owned_readiness_row_with_source_observation(
+        owner: &dispatch_owner::LiveDispatchOwner,
+        key: WorkUnitKey,
+        qualification: &crate::sample_sources::readiness::ReadinessWakeQualification,
+        source_observation: SourceRevisionObservation,
+    ) -> ReadinessSchedulingObservationRow {
+        let scope = owner
+            .progress()
+            .scope_for(key)
+            .expect("owned readiness scope")
+            .clone();
+        let wake = qualification.observation();
+        let wake_id = Uuid::parse_str(wake.wake_id()).expect("durable wake id");
+        let owner_revision = u64::try_from(wake.owner_revision()).expect("wake owner revision");
+        ReadinessSchedulingObservationRow::new(
+            key,
+            CompletionContext::new(owner.progress().execution_epoch(), scope),
+            source_observation,
+            wake.source_generation(),
+            wake.readiness_revision(),
+            wake.contract_version(),
+            ReadinessTargetSetSummary::new(*wake.target_digest(), wake.target_count())
+                .expect("owned target summary"),
+            DurableReadinessWakeObservation::new(wake_id, owner_revision)
+                .expect("owned wake observation"),
+        )
+        .expect("owned readiness row")
+    }
+
+    fn owned_readiness_source() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        AppRootGuard,
+        WritableProfileGuard,
+        SourceDatabase,
+        crate::sample_sources::readiness::ReadinessWakeQualification,
+        StoredSourceFence,
+    ) {
+        let app_root = tempdir().expect("app root");
+        let source_root = tempdir().expect("source root");
+        let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+        let app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+        let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+        let mut database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &profile_guard,
+            "owner-readiness-completion",
+        )
+        .expect("profile-owned source database");
+        let source_id = "owner-readiness-source";
+        let target = ReadinessTarget::source(
+            source_id,
+            ReadinessStage::SimilarityLayout,
+            "layout-v1",
+            1,
+            "membership-v1",
+        );
+        let targets = [target];
+        let qualification = {
+            let mut store = database.readiness_store().expect("owned readiness store");
+            let origin = store
+                .capture_publication_origin()
+                .expect("readiness publication origin");
+            store
+                .publish_targets(
+                    &origin,
+                    &ReadinessTargetPublication::new(
+                        source_id,
+                        1,
+                        1,
+                        SourceAvailability::Active,
+                        "readiness-contract-v1",
+                        &targets,
+                        1,
+                    ),
+                )
+                .expect("publish readiness target");
+            drop(store);
+            let mut store = database
+                .readiness_store_read_only()
+                .expect("owned read-only readiness store");
+            store
+                .qualify_readiness_wake(source_id)
+                .expect("qualify owned readiness wake")
+        };
+        let fence = StoredSourceFence::new(
+            SourceId::from_string(qualification.observation().source_id()),
+            qualification.root_identity(),
+            qualification.database_identity(),
+            1,
+            qualification.source_revision(),
+            u64::try_from(qualification.lease_epoch()).expect("lease epoch"),
+        )
+        .expect("owned operation source fence");
+        (
+            app_root,
+            source_root,
+            app_root_guard,
+            profile_guard,
+            database,
+            qualification,
+            fence,
+        )
+    }
+
+    fn owned_readiness_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        AppRootGuard,
+        WritableProfileGuard,
+        SourceDatabase,
+        dispatch_owner::LiveDispatchOwner,
+        WorkUnitKey,
+        crate::sample_sources::readiness::ReadinessWakeQualification,
+    ) {
+        let (app_root, source_root, app_root_guard, profile_guard, database, qualification, fence) =
+            owned_readiness_source();
+        let mut owner =
+            dispatch_owner::LiveDispatchOwner::new_for_test(copy_progress_with_source_fence(fence))
+                .expect("owned readiness owner");
+        let readiness = global_key(owner.progress(), WorkUnitRole::Readiness);
+        owner_complete_before_readiness(&mut owner, readiness);
+        (
+            app_root,
+            source_root,
+            app_root_guard,
+            profile_guard,
+            database,
+            owner,
+            readiness,
+            qualification,
+        )
     }
 
     fn owner_pending_cleanup_observation_records(
@@ -22526,6 +22782,217 @@ mod tests {
     }
 
     #[test]
+    fn live_dispatch_owner_qualifies_owned_wake_before_readiness_completion() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            readiness,
+            qualification,
+        ) = owned_readiness_fixture();
+        let reserved = owner.issue(readiness).expect("readiness reservation");
+        let entered = owner.enter(reserved).expect("readiness entry");
+        let row = owned_readiness_row(&owner, readiness, &qualification);
+        let before = owner.progress().clone();
+
+        let failure = owner
+            .complete(
+                entered,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: row.clone(),
+                },
+            )
+            .expect_err("raw readiness row cannot mint completion authority");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::ReadinessQualificationRequired
+        );
+        let (_error, entered) = failure.into_parts();
+        assert_eq!(owner.progress(), &before);
+        assert_eq!(
+            owner.ledger_state(readiness),
+            Some(dispatch_owner::DispatchLedgerState::Entered)
+        );
+
+        assert_eq!(
+            owner
+                .complete_readiness_scheduled(entered, &mut database, &row)
+                .expect("owned readiness completion"),
+            ProgressApplyOutcome::Applied
+        );
+        for step in before.steps().iter().filter(|step| step.key() != readiness) {
+            assert_eq!(owner.progress().step_for(step.key()), Some(step));
+        }
+        assert_eq!(
+            owner
+                .progress()
+                .step_for(readiness)
+                .expect("readiness step")
+                .status(),
+            ProgressStepStatus::Completed
+        );
+        assert_eq!(
+            owner.ledger_state(readiness),
+            Some(dispatch_owner::DispatchLedgerState::CompletedNormally)
+        );
+    }
+
+    #[test]
+    fn live_dispatch_owner_rejects_mismatched_owned_readiness_atomically() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            readiness,
+            qualification,
+        ) = owned_readiness_fixture();
+        let reserved = owner.issue(readiness).expect("readiness reservation");
+        let entered = owner.enter(reserved).expect("readiness entry");
+        let row = owned_readiness_row(&owner, readiness, &qualification);
+        let mismatched = ReadinessSchedulingObservationRow::new(
+            readiness,
+            row.context().clone(),
+            SourceRevisionObservation::new(
+                row.source_observation().source_id().clone(),
+                row.source_observation().root_identity(),
+                row.source_observation().database_identity(),
+                row.source_observation().lifecycle_generation(),
+                row.source_observation().lease_epoch(),
+                row.source_observation().revision() + 1,
+            )
+            .expect("mismatched source observation"),
+            row.source_generation(),
+            row.readiness_revision(),
+            row.contract_version(),
+            ReadinessTargetSetSummary::new(
+                row.target_set().membership_digest(),
+                row.target_set().membership_count(),
+            )
+            .expect("target summary"),
+            row.wake().clone(),
+        )
+        .expect("mismatched readiness row");
+        let before = owner.progress().clone();
+
+        let failure = owner
+            .complete_readiness_scheduled(entered, &mut database, &mismatched)
+            .expect_err("source revision mismatch must reject");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                field: "source_revision"
+            }
+        );
+        let (_error, entered) = failure.into_parts();
+        assert_eq!(owner.progress(), &before);
+        assert_eq!(
+            owner.ledger_state(readiness),
+            Some(dispatch_owner::DispatchLedgerState::Entered)
+        );
+
+        owner
+            .complete_readiness_scheduled(entered, &mut database, &row)
+            .expect("corrected readiness row remains retryable");
+    }
+
+    #[test]
+    fn live_dispatch_owner_readiness_completion_respects_cancellation() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            readiness,
+            qualification,
+        ) = owned_readiness_fixture();
+        let reserved = owner.issue(readiness).expect("readiness reservation");
+        let entered = owner.enter(reserved).expect("readiness entry");
+        let row = owned_readiness_row(&owner, readiness, &qualification);
+        owner
+            .request_cancellation(CancellationRequestObservation::new(2402).expect("cancel"))
+            .expect("request cancellation");
+        let before = owner.progress().clone();
+
+        let failure = owner
+            .complete_readiness_scheduled(entered, &mut database, &row)
+            .expect_err("cancelled owner must reject readiness completion");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::NormalCompletionClosed
+        );
+        let (_error, entered) = failure.into_parts();
+        assert_eq!(owner.progress(), &before);
+        assert_eq!(
+            owner.ledger_state(readiness),
+            Some(dispatch_owner::DispatchLedgerState::Entered)
+        );
+        owner
+            .retire_entered_uncertain(entered)
+            .expect("cancelled readiness can retire explicitly");
+    }
+
+    #[test]
+    fn live_dispatch_owner_rejects_foreign_readiness_physical_identity_atomically() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            readiness,
+            qualification,
+        ) = owned_readiness_fixture();
+        let reserved = owner.issue(readiness).expect("readiness reservation");
+        let entered = owner.enter(reserved).expect("readiness entry");
+        let row = owned_readiness_row(&owner, readiness, &qualification);
+        let source = row.source_observation();
+        let foreign_observation = SourceRevisionObservation::new(
+            source.source_id().clone(),
+            "foreign-root",
+            source.database_identity(),
+            source.lifecycle_generation(),
+            source.lease_epoch(),
+            source.revision(),
+        )
+        .expect("foreign source observation");
+        let mismatched = owned_readiness_row_with_source_observation(
+            &owner,
+            readiness,
+            &qualification,
+            foreign_observation,
+        );
+        let before = owner.progress().clone();
+
+        let failure = owner
+            .complete_readiness_scheduled(entered, &mut database, &mismatched)
+            .expect_err("foreign physical identity must reject");
+        assert_eq!(
+            failure.error(),
+            &dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                field: "root_identity"
+            }
+        );
+        let (_error, entered) = failure.into_parts();
+        assert_eq!(owner.progress(), &before);
+        assert_eq!(
+            owner.ledger_state(readiness),
+            Some(dispatch_owner::DispatchLedgerState::Entered)
+        );
+        owner
+            .complete_readiness_scheduled(entered, &mut database, &row)
+            .expect("corrected physical identity remains retryable");
+    }
+
+    #[test]
     fn live_dispatch_owner_rejects_resumed_progress_as_a_fresh_fixture() {
         let mut progress = copy_progress_with_admission_claims();
         progress
@@ -23066,7 +23533,16 @@ mod tests {
 
     #[test]
     fn live_dispatch_owner_late_refinements_reuse_prospective_generation_then_advance() {
-        let (base, source, _filesystem, source_id) = valid_topology(true);
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            qualification,
+            fence,
+        ) = owned_readiness_source();
+        let (base, source, _filesystem, source_id) = topology_with_source_fence(true, fence);
         let mut descriptors = base.descriptors().to_vec();
         let artifact_fence = descriptors
             .iter()
@@ -23101,7 +23577,12 @@ mod tests {
             })
             .collect();
         let participants = ParticipantSet::new(descriptors, checkpoints).expect("participants");
-        let args = copy_args_at(source, source_id, "copy.wav");
+        let args = copy_args_at_with_source_revision(
+            source,
+            source_id,
+            "copy.wav",
+            qualification.source_revision(),
+        );
         let plan = super::super::work_plan::derive_work_plan(&args, &participants)
             .expect("three-artifact work plan");
         let progress = WorkProgress::from_plan_with_admission_observations(
@@ -23145,9 +23626,16 @@ mod tests {
                 match owner.issue(key) {
                     Ok(reserved) => {
                         let entered = owner.enter(reserved).expect("ready entry");
-                        owner
-                            .complete(entered, evidence_for(owner.progress(), key, 7))
-                            .expect("ready completion");
+                        if key.role() == WorkUnitRole::Readiness {
+                            let row = owned_readiness_row(&owner, key, &qualification);
+                            owner
+                                .complete_readiness_scheduled(entered, &mut database, &row)
+                                .expect("ready completion");
+                        } else {
+                            owner
+                                .complete(entered, evidence_for(owner.progress(), key, 0))
+                                .expect("ready completion");
+                        }
                         advanced = true;
                     }
                     Err(dispatch_owner::DispatchOwnerError::PrerequisiteIncomplete { .. }) => {}

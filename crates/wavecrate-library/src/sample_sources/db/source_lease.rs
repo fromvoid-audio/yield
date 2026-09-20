@@ -322,6 +322,11 @@ impl std::fmt::Debug for SourcePublicationFence {
 }
 
 impl SourcePublicationFence {
+    /// Return the durable lease epoch captured by this fence.
+    pub(crate) const fn lease_epoch(&self) -> i64 {
+        self.lease_epoch
+    }
+
     /// Return whether two fences identify the same retained source owner and epoch.
     pub(crate) fn same_claim_identity(&self, other: &Self) -> bool {
         self.owner_identity == other.owner_identity
