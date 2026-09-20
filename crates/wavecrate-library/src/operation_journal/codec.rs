@@ -1790,7 +1790,7 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
     }
 }
 
-pub(super) struct CappedWriter {
+pub(crate) struct CappedWriter {
     bytes: Vec<u8>,
     attempted: usize,
     limit: usize,
@@ -1798,7 +1798,7 @@ pub(super) struct CappedWriter {
 }
 
 impl CappedWriter {
-    pub(super) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(limit.min(4096)),
             attempted: 0,
@@ -1807,22 +1807,22 @@ impl CappedWriter {
         }
     }
 
-    pub(super) fn finish(self) -> Vec<u8> {
+    pub(crate) fn finish(self) -> Vec<u8> {
         self.bytes
     }
 
     #[allow(dead_code)]
-    pub(super) const fn attempted(&self) -> usize {
+    pub(crate) const fn attempted(&self) -> usize {
         self.attempted
     }
 
     #[allow(dead_code)]
-    pub(super) const fn limit(&self) -> usize {
+    pub(crate) const fn limit(&self) -> usize {
         self.limit
     }
 
     #[allow(dead_code)]
-    pub(super) const fn exceeded(&self) -> bool {
+    pub(crate) const fn exceeded(&self) -> bool {
         self.exceeded
     }
 }

@@ -591,6 +591,15 @@ impl OperationJournalStore {
         recovery::scan_coordinator_page(self, cursor)
     }
 
+    /// Validate the profile-owned journal boundary before a future admission decision.
+    ///
+    /// This intentionally performs no operation-ID allocation, persistence, capacity
+    /// reservation, or authority construction. It only confirms that the actor still owns the
+    /// expected journal namespace.
+    pub(crate) fn validate_for_admission(&self) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace()
+    }
+
     fn open_inner(
         profile_guard: &WritableProfileGuard,
         #[cfg(test)] before_sqlite_open: Option<&dyn Fn(&Path)>,

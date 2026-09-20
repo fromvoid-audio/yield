@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
-use super::coordinator::RetryObservation;
+use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
+use super::coordinator::{RetryObservation, UniversalCommandArgs};
 use super::full_progress_codec::StoredFullProgressRecord;
 use super::model::{CancellationRequestObservation, MAX_RECORD_BYTES, OperationId};
+use super::participants::ParticipantSet;
 use super::store::recovery::{
     CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
 };
@@ -27,6 +28,7 @@ use super::store::{
     JournalCancelRequestReceipt, JournalInsertOutcome, JournalRetryReceipt, OperationJournalStore,
     OperationJournalStoreError,
 };
+use super::work_plan::derive_work_plan;
 
 const CONTROL_INPUT_BYTES: usize = 1;
 
@@ -136,6 +138,9 @@ pub enum OperationJournalOwnerError {
         /// Bounded decoder diagnostic.
         reason: String,
     },
+    /// Full-operation admission remains fail-closed until the capacity provider is integrated.
+    #[error("full-operation admission is unavailable until the capacity provider is integrated")]
+    CapacityProviderUnavailable,
     /// The worker panicked while executing the command.
     #[error("operation journal owner worker panicked")]
     WorkerPanicked,
@@ -454,6 +459,38 @@ impl OperationJournalClient {
         })
     }
 
+    /// Queue one bounded full-operation admission request.
+    ///
+    /// The request deliberately remains fail-closed until the capacity provider is integrated.
+    /// A successful queue submission only admits the typed request to the journal owner; it does
+    /// not allocate an operation ID, create progress, reserve capacity, or grant dispatch
+    /// authority.
+    #[allow(dead_code)]
+    pub(crate) fn admit_full(
+        &self,
+        args: UniversalCommandArgs,
+        participants: ParticipantSet,
+    ) -> Result<OperationJournalRequest<OperationId>, OperationJournalOwnerQueueError> {
+        let encoded_len = bounded_admission_input(&args, &participants)?;
+        participants.validate_for_new_intent().map_err(|error| {
+            OperationJournalOwnerQueueError::InvalidInput {
+                reason: error.to_string(),
+            }
+        })?;
+        args.validate_against_participants(&participants)
+            .map_err(|error| OperationJournalOwnerQueueError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        self.submit(encoded_len, move |input, result| {
+            JournalCommand::AdmitFull {
+                args,
+                participants,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one bounded point lookup.
     pub fn get(
         &self,
@@ -598,6 +635,24 @@ fn bounded_retry_input(
             reason: error.to_string(),
         })?;
     bounded_json_input(observation)
+}
+
+#[allow(dead_code)]
+fn bounded_admission_input(
+    args: &UniversalCommandArgs,
+    participants: &ParticipantSet,
+) -> Result<usize, OperationJournalOwnerQueueError> {
+    let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
+    match serde_json::to_writer(&mut writer, &(args, participants)) {
+        Ok(()) => Ok(writer.finish().len()),
+        Err(_error) if writer.exceeded() => Err(OperationJournalOwnerQueueError::RecordTooLarge {
+            actual: writer.attempted(),
+            maximum: writer.limit(),
+        }),
+        Err(error) => Err(OperationJournalOwnerQueueError::InvalidInput {
+            reason: error.to_string(),
+        }),
+    }
 }
 
 fn bounded_json_input<T: serde::Serialize>(
@@ -798,6 +853,12 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<JournalRetryReceipt, OperationJournalOwnerError>>,
     },
+    AdmitFull {
+        args: UniversalCommandArgs,
+        participants: ParticipantSet,
+        input: InputPermit,
+        result: SyncSender<Result<OperationId, OperationJournalOwnerError>>,
+    },
     Get {
         operation_id: OperationId,
         input: InputPermit,
@@ -944,6 +1005,23 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
                     .map_err(OperationJournalOwnerError::from)
             })
         }
+        JournalCommand::AdmitFull {
+            args,
+            participants,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                store.validate_for_admission()?;
+                derive_work_plan(&args, &participants).map_err(|error| {
+                    OperationJournalOwnerError::InvalidInput {
+                        reason: error.to_string(),
+                    }
+                })?;
+                Err(OperationJournalOwnerError::CapacityProviderUnavailable)
+            })
+        }
         JournalCommand::Get {
             operation_id,
             input,
@@ -1023,6 +1101,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::Retry { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::AdmitFull { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -1183,6 +1265,207 @@ mod tests {
         drop(fixture);
     }
 
+    #[test]
+    fn full_admission_fails_closed_without_mutating_either_journal_family() {
+        let fixture = fixture("journal-owner-full-admission");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let legacy = intent_record(OperationId::new());
+        store.insert_intent(&legacy).expect("legacy seed");
+        let (snapshot, _) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        let full = StoredFullProgressRecord::new(snapshot).expect("full seed");
+        store.persist_full(&full, None).expect("full seed");
+        let before = store
+            .scan_coordinator_recovery_page(None)
+            .expect("initial recovery page");
+        let before_sequences: Vec<_> = before
+            .entries()
+            .iter()
+            .map(|entry| entry.sequence())
+            .collect();
+
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        let (args, participants) = valid_full_admission_request();
+        let mut request = owner
+            .client()
+            .admit_full(args, participants)
+            .expect("admission request queues");
+        let result = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("admission result")
+            .expect_err("provider remains fail-closed");
+        assert!(
+            matches!(
+                result,
+                OperationJournalOwnerError::CapacityProviderUnavailable
+            ),
+            "unexpected admission result: {result:?}"
+        );
+        assert!(owner.shutdown());
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
+        let after = reopened
+            .scan_coordinator_recovery_page(None)
+            .expect("final recovery page");
+        let after_sequences: Vec<_> = after
+            .entries()
+            .iter()
+            .map(|entry| entry.sequence())
+            .collect();
+        assert_eq!(after_sequences, before_sequences);
+        assert!(matches!(
+            after.entries()[0].outcome(),
+            super::super::store::recovery::CoordinatorRecoveryRowOutcome::Consistent(
+                super::super::store::recovery::CoordinatorRecoveryRecord::Legacy(_)
+            )
+        ));
+        assert!(matches!(
+            after.entries()[1].outcome(),
+            super::super::store::recovery::CoordinatorRecoveryRowOutcome::Consistent(
+                super::super::store::recovery::CoordinatorRecoveryRecord::FullProgress(_)
+            )
+        ));
+        drop(fixture);
+    }
+
+    #[test]
+    fn full_admission_rejects_invalid_typed_input_before_queueing() {
+        let (_fixture, mut owner) = open_owner("journal-owner-full-admission-input");
+        let client = owner.client();
+        let (args, participants) = valid_full_admission_request();
+        let invalid_participants: ParticipantSet = serde_json::from_value(serde_json::json!({
+            "descriptors": [],
+            "checkpoints": []
+        }))
+        .expect("decode invalid participant fixture");
+        assert!(matches!(
+            client.admit_full(args.clone(), invalid_participants),
+            Err(OperationJournalOwnerQueueError::InvalidInput { .. })
+        ));
+
+        let UniversalCommandArgs::Copy(copy_args) = args else {
+            panic!("copy fixture");
+        };
+        let mismatched_source = CopySourceExpectation::new(8, "owner-file", 10, 11)
+            .expect("mismatched source expectation shape");
+        let invalid_args = CopyIntentArgs::new(
+            copy_args.source().clone(),
+            copy_args.destination().clone(),
+            mismatched_source,
+            copy_args.collision_policy(),
+            copy_args.inherited_metadata_reference().map(String::from),
+        )
+        .expect("invalid participant binding still has valid shape");
+        assert!(matches!(
+            client.admit_full(UniversalCommandArgs::Copy(invalid_args), participants),
+            Err(OperationJournalOwnerQueueError::InvalidInput { .. })
+        ));
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn full_admission_oversized_input_is_rejected_before_queue_credits() {
+        let (_fixture, mut owner) = open_owner("journal-owner-full-admission-bounds");
+        let client = owner.client();
+        let (args, participants) = valid_full_admission_request();
+        let mut value = serde_json::to_value(&participants).expect("participants JSON");
+        value["checkpoints"][0]["diagnostic_code"] =
+            serde_json::Value::String("x".repeat(MAX_RECORD_BYTES + 1));
+        let oversized: ParticipantSet =
+            serde_json::from_value(value).expect("decode oversized participant fixture");
+        assert!(matches!(
+            client.admit_full(args, oversized),
+            Err(OperationJournalOwnerQueueError::RecordTooLarge { .. })
+        ));
+        assert!(owner.shutdown());
+    }
+
+    #[test]
+    fn full_admission_reports_store_guard_failure_before_provider_result() {
+        let fixture = fixture("journal-owner-full-admission-guard");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        let sidecar = fixture
+            .owner
+            .profile_root()
+            .join(super::super::store::JOURNAL_DATABASE_ROOT_NAME)
+            .join(format!(
+                "{}-wal",
+                super::super::store::JOURNAL_DATABASE_FILE_NAME
+            ));
+        fs::write(&sidecar, b"unexpected owner admission sidecar").expect("inject sidecar");
+
+        let (args, participants) = valid_full_admission_request();
+        let mut request = owner
+            .client()
+            .admit_full(args, participants)
+            .expect("admission request queues");
+        let result = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("admission result")
+            .expect_err("sidecar must fail the store guard");
+        assert!(matches!(result, OperationJournalOwnerError::Store(_)));
+        assert!(format!("{result}").contains("sidecar"));
+
+        fs::remove_file(sidecar).expect("remove injected sidecar");
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[test]
+    fn full_admission_dropped_request_releases_shared_owner_permits() {
+        let fixture = fixture("journal-owner-full-admission-drop");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let (mut owner, ready, release) =
+            OperationJournalOwner::start_with_command_gate_for_test(store);
+        wait_until_available(&owner);
+        let client = owner.client();
+        let (args, participants) = valid_full_admission_request();
+        let mut first = client
+            .admit_full(args.clone(), participants.clone())
+            .expect("first admission request");
+        ready.wait();
+        let dropped = client
+            .admit_full(args.clone(), participants.clone())
+            .expect("second admission request");
+        drop(dropped);
+        release.wait();
+        let first_result = first
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first admission result")
+            .expect_err("provider remains fail-closed");
+        assert!(
+            matches!(
+                first_result,
+                OperationJournalOwnerError::CapacityProviderUnavailable
+            ),
+            "unexpected first admission result: {first_result:?}"
+        );
+        let mut replacement = client
+            .admit_full(args, participants)
+            .expect("replacement request after dropped request");
+        let replacement_result = replacement
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement result")
+            .expect_err("provider remains fail-closed");
+        assert!(
+            matches!(
+                replacement_result,
+                OperationJournalOwnerError::CapacityProviderUnavailable
+            ),
+            "unexpected replacement result: {replacement_result:?}"
+        );
+        assert!(owner.shutdown());
+        let (closed_args, closed_participants) = valid_full_admission_request();
+        assert!(matches!(
+            client.admit_full(closed_args, closed_participants),
+            Err(OperationJournalOwnerQueueError::Closed)
+        ));
+        drop(fixture);
+    }
+
     fn intent_record(operation_id: OperationId) -> StoredOperationRecord {
         let value = serde_json::json!({
             "schema_version": 1,
@@ -1314,6 +1597,15 @@ mod tests {
                 50,
             ),
             command_args,
+        )
+    }
+
+    fn valid_full_admission_request() -> (UniversalCommandArgs, ParticipantSet) {
+        let (snapshot, _) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        (
+            snapshot.intent().args().clone(),
+            snapshot.intent().participants().clone(),
         )
     }
 
