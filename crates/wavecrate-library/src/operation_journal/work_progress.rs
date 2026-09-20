@@ -6396,6 +6396,13 @@ mod tests {
     }
 
     fn copy_snapshot_intent(progress: &WorkProgress) -> FullProgressIntentObservation {
+        copy_snapshot_intent_with_capacity(progress, admission_capacity_plan())
+    }
+
+    fn copy_snapshot_intent_with_capacity(
+        progress: &WorkProgress,
+        capacity_plan: FullCapacityPlan,
+    ) -> FullProgressIntentObservation {
         let (participants, args, plan) = copy_plan_inputs();
         assert_eq!(progress.plan(), &plan);
         FullProgressIntentObservation::new(
@@ -6403,7 +6410,7 @@ mod tests {
             args,
             participants,
             plan,
-            admission_capacity_plan(),
+            capacity_plan,
             progress
                 .admission_claims()
                 .expect("admission claims")
@@ -20605,6 +20612,278 @@ mod tests {
             .expect("terminal cancellation snapshot")
             .validate_base()
             .expect("terminal cancellation envelope");
+    }
+
+    #[test]
+    fn full_progress_snapshot_validates_retained_pre_publish_proof_and_corruption() {
+        let mut partial = copy_progress_with_admission_claims();
+        apply_role(&mut partial, 0, WorkUnitRole::SourceRead);
+        apply_role(&mut partial, 0, WorkUnitRole::Prepare);
+        partial
+            .request_cancellation(CancellationRequestObservation::new(18127).expect("cancel"))
+            .expect("partial cancellation");
+        let partial_cleanup =
+            PrePublishCleanupObservation::new(vec![PrePublishActionCleanup::new(
+                0,
+                Some(PrePublishFinalClaimObservation::NoFinalClaim),
+                Some(PrePublishOriginalStateObservation::Preserved),
+                Some(PrePublishAbsenceObservation::Preserved),
+                None,
+            )])
+            .expect("partial cleanup");
+        partial
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &partial,
+                partial_cleanup,
+                settlement_inventory(&partial, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("retain incomplete prepublication proof");
+        let partial_snapshot = partial
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&partial))
+            .expect("partial prepublication snapshot");
+        partial_snapshot
+            .validate_base()
+            .expect("incomplete held prepublication proof validates");
+
+        let mut wrong_origin = serde_json::to_value(&partial_snapshot).expect("snapshot value");
+        wrong_origin["pre_publish_cancellation"]["cleanup"]["actions"][0]["original_state"] =
+            json!("NoOriginalObject");
+        let wrong_origin: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_origin).expect("wrong origin shape");
+        assert!(matches!(
+            wrong_origin.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                    source: WorkProgressError::PrePublishCleanupOriginalStateMismatch {
+                        action_ordinal: 0,
+                    },
+                }
+            )
+        ));
+
+        let mut uncertain = copy_progress_with_two_admission_claims();
+        apply_role(&mut uncertain, 0, WorkUnitRole::SourceRead);
+        uncertain
+            .request_cancellation(CancellationRequestObservation::new(18128).expect("cancel"))
+            .expect("uncertain cancellation");
+        let quiescence = unstarted_quiescence_for_action(
+            &uncertain,
+            0,
+            PrePublishUnstartedQuiescenceResult::Uncertain,
+            Some(PrePublishAbsenceObservation::Preserved),
+            Some(PrePublishAbsenceObservation::Preserved),
+        );
+        uncertain
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority_with_quiescence(
+                &uncertain,
+                quiescence,
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&uncertain, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("retain uncertain quiescence");
+        let uncertain_snapshot = uncertain
+            .capture_full_progress_snapshot(&copy_snapshot_intent_with_capacity(
+                &uncertain,
+                two_claim_capacity_plan(),
+            ))
+            .expect("uncertain quiescence snapshot");
+        uncertain_snapshot
+            .validate_base()
+            .expect("uncertain quiescence validates");
+        let mut wrong_quiescence =
+            serde_json::to_value(&uncertain_snapshot).expect("snapshot value");
+        wrong_quiescence["pre_publish_cancellation"]["unstarted_quiescence"]["actions"][0]["eligible_pending_keys"] =
+            json!([]);
+        let wrong_quiescence: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_quiescence).expect("wrong quiescence shape");
+        assert!(matches!(
+            wrong_quiescence.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                    source: WorkProgressError::PrePublishUnstartedQuiescenceKeySetMismatch { .. },
+                }
+            )
+        ));
+
+        let mut historical = copy_progress_with_admission_claims();
+        historical
+            .request_cancellation(CancellationRequestObservation::new(18129).expect("cancel"))
+            .expect("historical cancellation");
+        historical
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &historical,
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&historical, AdmissionClaimSettlementOutcome::Held),
+            ))
+            .expect("retain historical prepublication proof");
+        let source_key = key_for(&historical, 0, WorkUnitRole::SourceRead);
+        historical
+            .reacquire_source(source_reacquisition_authority(
+                &historical,
+                source_key.participant_id(),
+                7,
+                2,
+                historical.execution_epoch(),
+            ))
+            .expect("source reacquisition");
+        let historical_snapshot = historical
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&historical))
+            .expect("historical prepublication snapshot");
+        historical_snapshot
+            .validate_base()
+            .expect("historical dispatch remains valid after reacquisition");
+        assert_eq!(
+            historical_snapshot
+                .pre_publish_cancellation()
+                .expect("historical prepublication")
+                .dispatch_outcome()
+                .expect("historical dispatch")
+                .observation_epoch(),
+            0
+        );
+
+        let mut terminal = copy_progress_with_admission_claims();
+        terminal
+            .request_cancellation(CancellationRequestObservation::new(18130).expect("cancel"))
+            .expect("terminal cancellation");
+        terminal
+            .finish_pre_publish_cancellation(pre_publish_cleanup_authority(
+                &terminal,
+                PrePublishCleanupObservation::new(Vec::new()).expect("empty cleanup"),
+                settlement_inventory(&terminal, AdmissionClaimSettlementOutcome::Released),
+            ))
+            .expect("terminal cancellation");
+        let terminal_snapshot = terminal
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&terminal))
+            .expect("terminal snapshot");
+        terminal_snapshot
+            .validate_base()
+            .expect("complete terminal proof validates");
+
+        let mut missing_dispatch =
+            serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        missing_dispatch["pre_publish_cancellation"]["dispatch_outcome"] = serde_json::Value::Null;
+        let missing_dispatch: FullProgressSnapshotObservation =
+            serde_json::from_value(missing_dispatch).expect("missing dispatch shape");
+        assert!(matches!(
+            missing_dispatch.validate_base(),
+            Err(FullProgressSnapshotObservationError::CancellationPrePublishDispatchMissing)
+        ));
+
+        let mut dispatch_future = serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        dispatch_future["pre_publish_cancellation"]["dispatch_outcome"]["recovery_generation"] =
+            json!(2);
+        let dispatch_future: FullProgressSnapshotObservation =
+            serde_json::from_value(dispatch_future).expect("future dispatch shape");
+        assert!(matches!(
+            dispatch_future.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishDispatchGenerationFuture {
+                    dispatch: 2,
+                    current: 1,
+                }
+            )
+        ));
+
+        let mut incomplete_terminal =
+            serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        assert!(
+            incomplete_terminal["pre_publish_cancellation"]["dispatch_outcome"]["rows"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+        );
+        incomplete_terminal["pre_publish_cancellation"]["dispatch_outcome"]["rows"][0]["outcome"] =
+            json!("EntryUncertain");
+        let incomplete_terminal: FullProgressSnapshotObservation =
+            serde_json::from_value(incomplete_terminal).expect("incomplete terminal shape");
+        assert!(
+            matches!(
+                incomplete_terminal.validate_base(),
+                Err(
+                    FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                        source: WorkProgressError::PrePublishCancellationDispatchIncomplete,
+                    }
+                )
+            ),
+            "incomplete dispatch must be rejected before terminal proof"
+        );
+
+        let mut unsettled_terminal =
+            serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        unsettled_terminal["pre_publish_cancellation"]["settlement"]["settlements"][0]["outcome"] =
+            json!("Held");
+        let unsettled_terminal: FullProgressSnapshotObservation =
+            serde_json::from_value(unsettled_terminal).expect("unsettled terminal shape");
+        assert!(matches!(
+            unsettled_terminal.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishTerminalProofIncomplete
+            )
+        ));
+
+        let mut incompatible_settlement =
+            serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        incompatible_settlement["pre_publish_cancellation"]["settlement"]["settlements"][0]["outcome"] =
+            json!("ConsumedOrTransferred");
+        let incompatible_settlement: FullProgressSnapshotObservation =
+            serde_json::from_value(incompatible_settlement).expect("incompatible settlement shape");
+        assert!(matches!(
+            incompatible_settlement.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                    source: WorkProgressError::PrePublishCancellationSettlementClassMismatch {
+                        allocation_class: FullCapacityAllocationClass::DestinationStaging,
+                        outcome: AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+                        ..
+                    },
+                }
+            )
+        ));
+
+        let mut early_nonheld = serde_json::to_value(&uncertain_snapshot).expect("snapshot value");
+        early_nonheld["pre_publish_cancellation"]["settlement"]["settlements"][0]["outcome"] =
+            json!("Released");
+        let early_nonheld: FullProgressSnapshotObservation =
+            serde_json::from_value(early_nonheld).expect("early non-held settlement shape");
+        assert!(matches!(
+            early_nonheld.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                    source: WorkProgressError::PrePublishCancellationSettlementGateIncomplete,
+                }
+            )
+        ));
+
+        let mut wrong_terminal_phase =
+            serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        wrong_terminal_phase["phase"] = json!("Prepared");
+        let wrong_terminal_phase: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_terminal_phase).expect("wrong terminal phase shape");
+        assert!(matches!(
+            wrong_terminal_phase.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishTerminalStateMismatch {
+                    phase: OperationPhase::Prepared,
+                    disposition: FullProgressDisposition::CancelledBeforePublish,
+                }
+            )
+        ));
+
+        let mut wrong_terminal_disposition =
+            serde_json::to_value(&terminal_snapshot).expect("snapshot value");
+        wrong_terminal_disposition["disposition"] = json!("CancelRequestedBeforePublish");
+        let wrong_terminal_disposition: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_terminal_disposition)
+                .expect("wrong terminal disposition shape");
+        assert!(matches!(
+            wrong_terminal_disposition.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishTerminalStateMismatch {
+                    phase: OperationPhase::Terminal,
+                    disposition: FullProgressDisposition::CancelRequestedBeforePublish,
+                }
+            )
+        ));
     }
 
     #[test]

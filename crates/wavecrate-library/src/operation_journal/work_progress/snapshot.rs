@@ -163,6 +163,7 @@ impl FullProgressSnapshotObservation {
         self.validate_steps(&validation_progress)?;
         self.validate_after_effect_reconciliation(&validation_progress)?;
         self.validate_cancellation_cleanup_observations(&validation_progress)?;
+        self.validate_pre_publish_cancellation(&validation_progress)?;
         Ok(())
     }
 
@@ -448,6 +449,139 @@ impl FullProgressSnapshotObservation {
                         source,
                     }
                 })?;
+        }
+        Ok(())
+    }
+
+    fn validate_pre_publish_cancellation(
+        &self,
+        progress: &WorkProgress,
+    ) -> Result<(), FullProgressSnapshotObservationError> {
+        let Some(pre_publish) = self.pre_publish_cancellation.as_ref() else {
+            if self.disposition == FullProgressDisposition::CancelledBeforePublish {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationPrePublishTerminalMissing,
+                );
+            }
+            return Ok(());
+        };
+        let Some(dispatch) = pre_publish.dispatch_outcome() else {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishDispatchMissing,
+            );
+        };
+        let inventory = self.cancellation_inventory.as_ref().ok_or_else(|| {
+            FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                source: WorkProgressError::CancellationInventoryMissing,
+            }
+        })?;
+        let admission_claims = progress.admission_claims.as_ref().ok_or_else(|| {
+            FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                source: WorkProgressError::PrePublishCancellationAdmissionClaimsMissing,
+            }
+        })?;
+
+        progress
+            .validate_cancellation_dispatch_record(dispatch)
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation { source }
+            })?;
+        if dispatch.recovery_generation() > self.recovery_generation {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishDispatchGenerationFuture {
+                    dispatch: dispatch.recovery_generation(),
+                    current: self.recovery_generation,
+                },
+            );
+        }
+        pre_publish.cleanup().validate().map_err(|source| {
+            FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                source: WorkProgressError::PrePublishCleanup(source),
+            }
+        })?;
+        pre_publish
+            .unstarted_quiescence()
+            .validate()
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                    source: WorkProgressError::PrePublishUnstartedQuiescence(source),
+                }
+            })?;
+
+        let eligible_keys = progress.uncheckpointed_first_effect_keys(inventory);
+        let unstarted_quiescence_complete = progress
+            .validate_pre_publish_unstarted_quiescence(
+                inventory,
+                pre_publish.unstarted_quiescence(),
+                &eligible_keys,
+                admission_claims,
+            )
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation { source }
+            })?;
+        let dispatch_complete = dispatch.rows().iter().all(|row| {
+            matches!(
+                row.outcome(),
+                super::CancellationDispatchOutcome::NeverEntered
+            )
+        });
+        let cleanup_complete = progress
+            .validate_pre_publish_cleanup(
+                inventory,
+                pre_publish.cleanup(),
+                admission_claims,
+                unstarted_quiescence_complete && dispatch_complete,
+            )
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation { source }
+            })?;
+        progress
+            .validate_pre_publish_settlement(
+                inventory,
+                admission_claims,
+                pre_publish.cleanup(),
+                pre_publish.settlement(),
+                unstarted_quiescence_complete,
+                dispatch_complete,
+            )
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation { source }
+            })?;
+        let settled = pre_publish
+            .settlement()
+            .satisfies_prepublication_cancellation(admission_claims)
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::CancellationPrePublishValidation {
+                    source: WorkProgressError::PrePublishCancellationSettlement(source),
+                }
+            })?;
+        let terminal_ready =
+            cleanup_complete && dispatch_complete && unstarted_quiescence_complete && settled;
+
+        if terminal_ready
+            && (self.disposition != FullProgressDisposition::CancelledBeforePublish
+                || self.phase != super::OperationPhase::Terminal)
+        {
+            return Err(
+                FullProgressSnapshotObservationError::CancellationPrePublishTerminalStateMismatch {
+                    phase: self.phase,
+                    disposition: self.disposition,
+                },
+            );
+        }
+        if self.disposition == FullProgressDisposition::CancelledBeforePublish {
+            if !terminal_ready {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationPrePublishTerminalProofIncomplete,
+                );
+            }
+            if self.after_effect_reconciliation.is_some()
+                || self.cancellation_cleanup_observations.is_some()
+            {
+                return Err(
+                    FullProgressSnapshotObservationError::CancellationPrePublishTerminalFollowup,
+                );
+            }
         }
         Ok(())
     }
@@ -1200,6 +1334,41 @@ pub enum FullProgressSnapshotObservationError {
         "full-progress snapshot prepublication cancellation observation is invalid for route {route:?}"
     )]
     CancellationPrePublishRouteInvalid { route: CancellationRoute },
+    /// A retained terminal before-publication cancellation had no stored prepublication record.
+    #[error(
+        "full-progress snapshot terminal before-publication cancellation has no prepublication observation"
+    )]
+    CancellationPrePublishTerminalMissing,
+    /// A retained prepublication cancellation was decoded from a legacy value without dispatch.
+    #[error("full-progress snapshot prepublication cancellation has no dispatch outcome")]
+    CancellationPrePublishDispatchMissing,
+    /// A nested prepublication cancellation validator rejected the retained observations.
+    #[error("invalid full-progress snapshot prepublication cancellation: {source}")]
+    CancellationPrePublishValidation {
+        #[source]
+        source: WorkProgressError,
+    },
+    /// The retained prepublication dispatch generation exceeds the snapshot generation.
+    #[error(
+        "full-progress snapshot prepublication dispatch generation {dispatch} is newer than recovery generation {current}"
+    )]
+    CancellationPrePublishDispatchGenerationFuture { dispatch: u64, current: u64 },
+    /// Complete prepublication evidence was retained under a nonterminal phase/disposition.
+    #[error(
+        "full-progress snapshot prepublication cancellation is complete but phase {phase:?} and disposition {disposition:?} are not terminal before-publish"
+    )]
+    CancellationPrePublishTerminalStateMismatch {
+        phase: OperationPhase,
+        disposition: FullProgressDisposition,
+    },
+    /// A terminal before-publication cancellation retained incomplete proof.
+    #[error("full-progress snapshot terminal before-publication cancellation lacks complete proof")]
+    CancellationPrePublishTerminalProofIncomplete,
+    /// Terminal before-publication cancellation advanced into later observations.
+    #[error(
+        "full-progress snapshot terminal before-publication cancellation retains after-effect or cleanup observations"
+    )]
+    CancellationPrePublishTerminalFollowup,
     /// Cleanup observations require a retained after-effect observation.
     #[error(
         "full-progress snapshot cleanup observations have no retained after-effect observation"
