@@ -18,15 +18,18 @@ use thiserror::Error;
 
 use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{RetryObservation, UniversalCommandArgs};
-use super::full_progress_codec::StoredFullProgressRecord;
+use super::full_progress_codec::{
+    FullProgressCodecError, StoredFullProgressRecord, decode as decode_full_progress,
+    encode as encode_full_progress,
+};
 use super::model::{CancellationRequestObservation, MAX_RECORD_BYTES, OperationId};
 use super::participants::ParticipantSet;
 use super::store::recovery::{
     CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
 };
 use super::store::{
-    JournalCancelRequestReceipt, JournalInsertOutcome, JournalRetryReceipt, OperationJournalStore,
-    OperationJournalStoreError,
+    FullProgressWriteOutcome, JournalCancelRequestReceipt, JournalInsertOutcome,
+    JournalRetryReceipt, OperationJournalStore, OperationJournalStoreError,
 };
 use super::work_plan::derive_work_plan;
 
@@ -540,6 +543,29 @@ impl OperationJournalClient {
         })
     }
 
+    /// Queue one crate-internal full-progress observation write.
+    ///
+    /// The record is bounded and validated before it enters the owner queue. The worker decodes
+    /// the same bytes and delegates the expected-sequence CAS to the profile-owned store; this
+    /// command persists an observation only and never reconstructs execution authority.
+    #[allow(dead_code)]
+    pub(crate) fn persist_full(
+        &self,
+        record: StoredFullProgressRecord,
+        expected_sequence: Option<i64>,
+    ) -> Result<OperationJournalRequest<FullProgressWriteOutcome>, OperationJournalOwnerQueueError>
+    {
+        let encoded = bounded_full_progress_record(&record)?;
+        self.submit(encoded.len(), move |input, result| {
+            JournalCommand::PersistFull {
+                expected_sequence,
+                encoded,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one crate-internal combined legacy/full recovery page.
     #[allow(dead_code)]
     pub(crate) fn scan_coordinator_recovery_page(
@@ -607,6 +633,20 @@ fn bounded_encoded_record(
     match encode(record) {
         Ok(encoded) => Ok(encoded),
         Err(EncodeError::Oversize { actual, maximum }) => {
+            Err(OperationJournalOwnerQueueError::RecordTooLarge { actual, maximum })
+        }
+        Err(error) => Err(OperationJournalOwnerQueueError::InvalidRecord {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+fn bounded_full_progress_record(
+    record: &StoredFullProgressRecord,
+) -> Result<Vec<u8>, OperationJournalOwnerQueueError> {
+    match encode_full_progress(record) {
+        Ok(encoded) => Ok(encoded),
+        Err(FullProgressCodecError::OutputOversize { actual, maximum }) => {
             Err(OperationJournalOwnerQueueError::RecordTooLarge { actual, maximum })
         }
         Err(error) => Err(OperationJournalOwnerQueueError::InvalidRecord {
@@ -839,6 +879,12 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<JournalInsertOutcome, OperationJournalOwnerError>>,
     },
+    PersistFull {
+        expected_sequence: Option<i64>,
+        encoded: Vec<u8>,
+        input: InputPermit,
+        result: SyncSender<Result<FullProgressWriteOutcome, OperationJournalOwnerError>>,
+    },
     Cancel {
         operation_id: OperationId,
         expected_sequence: i64,
@@ -975,6 +1021,24 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
                 Ok::<JournalInsertOutcome, DecodeError>(store.insert_intent_with_outcome(&record))
             })
         }
+        JournalCommand::PersistFull {
+            expected_sequence,
+            encoded,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                let record = decode_full_progress(&encoded).map_err(|error| {
+                    OperationJournalOwnerError::InvalidInput {
+                        reason: error.to_string(),
+                    }
+                })?;
+                store
+                    .persist_full(&record, expected_sequence)
+                    .map_err(OperationJournalOwnerError::from)
+            })
+        }
         JournalCommand::Cancel {
             operation_id,
             expected_sequence,
@@ -1093,6 +1157,10 @@ where
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match command {
         JournalCommand::PersistIntent { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::PersistFull { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -1261,6 +1329,204 @@ mod tests {
                 super::super::store::recovery::CoordinatorRecoveryRecord::FullProgress(observed)
             ) if observed == &full
         ));
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[test]
+    fn owner_persists_full_progress_with_cas_replay_and_observation_reopen() {
+        let fixture = fixture("journal-owner-full-progress-write");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let (initial_snapshot, progressed_snapshot) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        let initial = StoredFullProgressRecord::new(initial_snapshot).expect("initial full record");
+        let progressed =
+            StoredFullProgressRecord::new(progressed_snapshot).expect("progressed full record");
+        let operation_id = initial.snapshot().intent().operation_id();
+        assert_eq!(progressed.snapshot().intent().operation_id(), operation_id);
+
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        let client = owner.client();
+
+        let mut insert = client
+            .persist_full(initial.clone(), None)
+            .expect("initial full observation queues");
+        assert_eq!(
+            insert
+                .recv_timeout(Duration::from_secs(2))
+                .expect("initial full result")
+                .expect("initial full worker"),
+            FullProgressWriteOutcome::Applied { sequence: 1 }
+        );
+
+        let mut initial_replay = client
+            .persist_full(initial.clone(), None)
+            .expect("initial replay queues");
+        assert_eq!(
+            initial_replay
+                .recv_timeout(Duration::from_secs(2))
+                .expect("initial replay result")
+                .expect("initial replay worker"),
+            FullProgressWriteOutcome::Replay { sequence: 1 }
+        );
+
+        let mut update = client
+            .persist_full(progressed.clone(), Some(1))
+            .expect("full observation update queues");
+        assert_eq!(
+            update
+                .recv_timeout(Duration::from_secs(2))
+                .expect("full update result")
+                .expect("full update worker"),
+            FullProgressWriteOutcome::Applied { sequence: 2 }
+        );
+
+        let mut update_replay = client
+            .persist_full(progressed.clone(), Some(1))
+            .expect("stale acknowledgement replay queues");
+        assert_eq!(
+            update_replay
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale replay result")
+                .expect("stale replay worker"),
+            FullProgressWriteOutcome::Replay { sequence: 2 }
+        );
+
+        let mut stale_update = client
+            .persist_full(initial.clone(), Some(1))
+            .expect("stale conflict queues");
+        assert!(matches!(
+            stale_update
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale conflict result")
+                .expect_err("changed stale record must conflict"),
+            OperationJournalOwnerError::Store(
+                OperationJournalStoreError::FullProgressSequenceConflict {
+                    expected: Some(1),
+                    actual: Some(2),
+                    ..
+                }
+            )
+        ));
+
+        let mut observed = client
+            .get_full(operation_id)
+            .expect("full observation lookup queues");
+        let observed = observed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("full observation lookup result")
+            .expect("full observation lookup worker")
+            .expect("full observation remains present");
+        assert_eq!(observed, progressed);
+        let rehydrated = observed
+            .snapshot()
+            .rehydrate_observation()
+            .expect("stored observation rehydrates");
+        let recaptured = rehydrated
+            .capture_full_progress_snapshot(observed.snapshot().intent())
+            .expect("rehydrated observation recaptures");
+        assert_eq!(&recaptured, observed.snapshot());
+        assert!(owner.shutdown());
+
+        let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let mut reopened_owner =
+            OperationJournalOwner::start(reopened_store).expect("reopen owner");
+        wait_until_available(&reopened_owner);
+        let mut reopened = reopened_owner
+            .client()
+            .get_full(operation_id)
+            .expect("reopened full lookup queues");
+        assert_eq!(
+            reopened
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reopened full lookup result")
+                .expect("reopened full lookup worker")
+                .expect("reopened full observation"),
+            progressed
+        );
+        assert!(reopened_owner.shutdown());
+        drop(fixture);
+    }
+
+    #[test]
+    fn owner_full_progress_commit_survives_dropped_ack() {
+        let fixture = fixture("journal-owner-full-progress-drop");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let (initial_snapshot, progressed_snapshot) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        let initial = StoredFullProgressRecord::new(initial_snapshot).expect("initial full record");
+        let progressed =
+            StoredFullProgressRecord::new(progressed_snapshot).expect("progressed full record");
+        let operation_id = initial.snapshot().intent().operation_id();
+
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        let client = owner.client();
+        let dropped = client
+            .persist_full(initial, None)
+            .expect("full observation queues before dropped ack");
+        drop(dropped);
+
+        let mut update = client
+            .persist_full(progressed.clone(), Some(1))
+            .expect("full update queues after dropped ack");
+        assert_eq!(
+            update
+                .recv_timeout(Duration::from_secs(2))
+                .expect("full update result")
+                .expect("full update worker"),
+            FullProgressWriteOutcome::Applied { sequence: 2 }
+        );
+        let mut observed = client
+            .get_full(operation_id)
+            .expect("full observation lookup queues");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("full observation lookup result")
+                .expect("full observation lookup worker")
+                .expect("full observation remains present"),
+            progressed
+        );
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[test]
+    fn owner_rejects_oversized_full_progress_before_queue_or_storage() {
+        let fixture = fixture("journal-owner-full-progress-bounds");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let oversized =
+            crate::operation_journal::work_progress::test_oversized_full_progress_store_record();
+        let operation_id = oversized.snapshot().intent().operation_id();
+
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        let client = owner.client();
+        assert!(matches!(
+            client.persist_full(oversized, None),
+            Err(OperationJournalOwnerQueueError::RecordTooLarge { .. })
+        ));
+
+        let mut lookup = client
+            .get_full(operation_id)
+            .expect("full lookup after rejected input queues");
+        assert!(
+            lookup
+                .recv_timeout(Duration::from_secs(2))
+                .expect("full lookup result")
+                .expect("full lookup worker")
+                .is_none()
+        );
+        let mut recovery = client
+            .scan_coordinator_recovery_page(None)
+            .expect("recovery lookup after rejected input queues");
+        let page = recovery
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery result")
+            .expect("recovery worker");
+        assert!(page.entries().is_empty());
         assert!(owner.shutdown());
         drop(fixture);
     }

@@ -8369,6 +8369,69 @@ mod tests {
         (progress, participants, args)
     }
 
+    #[cfg(test)]
+    pub(crate) fn oversized_full_progress_store_record()
+    -> super::super::full_progress_codec::StoredFullProgressRecord {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let source_endpoint = CopyEndpoint::new(
+            source,
+            source_id.clone(),
+            StoredRelativePath::new("source.wav").expect("oversized source path"),
+        )
+        .expect("oversized source endpoint");
+        let outputs = (0..256_u64)
+            .map(|index| {
+                let destination_path = format!("o{index:03}{}", "x".repeat(4090));
+                DecodedExportBatchOutput::new(
+                    WaveformEditFrameRange::new(10 + index, 40 + index)
+                        .expect("oversized output range"),
+                    CopyEndpoint::new(
+                        source,
+                        source_id.clone(),
+                        StoredRelativePath::new(destination_path)
+                            .expect("oversized destination path"),
+                    )
+                    .expect("oversized destination endpoint"),
+                )
+                .expect("oversized batch output")
+            })
+            .collect();
+        let batch = DecodedExportBatchIntentArgs::from_reference(
+            source_endpoint,
+            7,
+            WaveformFileRevisionObservation::new("file-id", "change-marker", 1024, Some(3))
+                .expect("oversized file revision"),
+            WaveformSourceSpec::new(2, 48_000, 32, WaveformSampleFormat::Float)
+                .expect("oversized source spec"),
+            1_000,
+            outputs,
+            DecodedExportOutputPolicy::default(),
+            Some(0),
+            0,
+        )
+        .expect("oversized batch arguments");
+        let args = UniversalCommandArgs::DecodedExportBatch(batch);
+        let plan = super::super::work_plan::derive_work_plan(&args, &participants)
+            .expect("oversized batch work plan");
+        let progress = WorkProgress::from_plan_with_admission_observations(
+            OperationId::from_uuid(Uuid::from_u128(210)),
+            &plan,
+            &args,
+            &participants,
+            &admission_capacity_plan(),
+            admission_claims(12),
+        )
+        .expect("oversized batch progress");
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("oversized batch snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("oversized batch record");
+        let encoded = serde_json::to_vec(&record).expect("oversized batch serializes");
+        assert!(encoded.len() > super::super::full_progress_codec::FULL_PROGRESS_MAX_RECORD_BYTES);
+        record
+    }
+
     fn copy_progress_with_admission_claims_and_optional() -> WorkProgress {
         let (participants, source, _filesystem, source_id) = valid_topology(true);
         let args = copy_args_at(source, source_id, "copy.wav");
@@ -27749,4 +27812,10 @@ pub(crate) fn test_full_progress_store_snapshots() -> (
     FullProgressSnapshotObservation,
 ) {
     tests::full_progress_store_snapshots()
+}
+
+#[cfg(test)]
+pub(crate) fn test_oversized_full_progress_store_record()
+-> super::full_progress_codec::StoredFullProgressRecord {
+    tests::oversized_full_progress_store_record()
 }

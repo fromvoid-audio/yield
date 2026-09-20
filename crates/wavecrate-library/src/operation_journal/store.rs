@@ -53,6 +53,7 @@ use super::validation::{RecordConsistency, classify_record};
 
 #[allow(dead_code)]
 mod full_progress;
+pub(crate) use full_progress::FullProgressWriteOutcome;
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
 
