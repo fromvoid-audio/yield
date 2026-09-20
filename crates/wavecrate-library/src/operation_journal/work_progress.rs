@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use super::admission_claims::{
-    AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlementInventory,
+    AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimSettlementInventory,
     AdmissionClaimSettlementOutcome, AdmissionClaimValidationError,
 };
 use super::cancellation_cleanup::{
@@ -38,8 +38,8 @@ use super::cancellation_dispatch::{
 };
 use super::cancellation_effects::{
     CancellationCleanupManifest, CancellationCleanupManifestError, CancellationEffectInventory,
-    CancellationEffectInventoryError, CancellationEffectRecoveryInventory,
-    derive_cancellation_cleanup_manifest,
+    CancellationEffectInventoryError, CancellationEffectRecipe,
+    CancellationEffectRecoveryInventory, derive_cancellation_cleanup_manifest,
     derive_cancellation_effect_inventory as derive_effect_inventory,
     derive_cancellation_effect_recovery_inventory as derive_effect_recovery_inventory,
 };
@@ -1382,17 +1382,210 @@ struct PrePublishActionPolicy {
     origin: PrePublishOriginPolicy,
 }
 
-/// Legacy placeholder for the not-yet-implemented post-publication cancellation outcome.
+/// A bounded, serializable observation of a qualified forward cancellation outcome.
+///
+/// This is deliberately an untrusted snapshot value.  It records the exact accepted
+/// after-effect and cleanup generations together with the owner-issued qualification rows, but
+/// it never creates a filesystem capability, releases a claim, or proves that a live owner
+/// performed the work.  The private authority below is the only value accepted by the terminal
+/// transition.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ForwardCancellationObservation {
+    route: CancellationRoute,
+    execution_epoch: u64,
+    recovery_generation: u64,
+    after_effect_generation: u64,
+    cleanup_generation: u64,
+    effect_qualifications: Vec<ForwardEffectQualificationObservation>,
+    resource_qualifications: Vec<ForwardResourceQualificationObservation>,
+    namespace_qualifications: Vec<ForwardNamespaceQualificationObservation>,
+    claim_qualifications: Vec<ForwardClaimQualificationObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardEffectQualificationObservation {
+    action_ordinal: u8,
+    step_segment: u16,
+    recipe: CancellationEffectRecipe,
+    receipt_keys: Vec<WorkUnitKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+enum ForwardResourceQualificationOutcome {
+    /// The owner qualified this resource as absent and releasable for its class-wide claim.
+    Absent,
+    /// The owner qualified this resource as retained/adopted and transferred with its claim.
+    Retained,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardResourceQualificationObservation {
+    key: WorkUnitKey,
+    outcome: ForwardResourceQualificationOutcome,
+    owner_revision: u64,
+    context: CompletionContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+enum ForwardNamespaceQualificationOutcome {
+    /// The owner qualified that no operation-owned namespace claim remains.
+    NoOperationClaim,
+    /// The owner qualified a retained namespace/disposition for transfer.
+    Retained,
+    /// The owner qualified the namespace/disposition as absent.
+    Absent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardNamespaceQualificationObservation {
+    key: WorkUnitKey,
+    outcome: ForwardNamespaceQualificationOutcome,
+    owner_revision: u64,
+    context: CompletionContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardClaimQualificationObservation {
+    claim: AdmissionClaim,
+    outcome: AdmissionClaimSettlementOutcome,
+}
+
+impl ForwardCancellationObservation {
+    fn from_authority(authority: &PostPublishCancellationAuthority) -> Self {
+        let mut claim_qualifications = authority
+            .claim_proofs
+            .iter()
+            .map(ForwardClaimQualificationProof::observation)
+            .collect::<Vec<_>>();
+        claim_qualifications.sort_by_key(|row| row.claim.claim_id());
+        Self {
+            route: authority.cancellation_inventory.route(),
+            execution_epoch: authority.execution_epoch,
+            recovery_generation: authority.next_recovery_generation,
+            after_effect_generation: authority.after_effect_reconciliation.recovery_generation(),
+            cleanup_generation: authority.cleanup_observations.recovery_generation(),
+            effect_qualifications: authority
+                .effect_proofs
+                .iter()
+                .map(ForwardEffectQualificationProof::observation)
+                .collect(),
+            resource_qualifications: authority
+                .resource_proofs
+                .iter()
+                .map(ForwardResourceQualificationProof::observation)
+                .collect(),
+            namespace_qualifications: authority
+                .namespace_proofs
+                .iter()
+                .map(ForwardNamespaceQualificationProof::observation)
+                .collect(),
+            claim_qualifications,
+        }
+    }
+}
+
+/// Private proof that one exact effect bundle has been qualified by a future owner.
+///
+/// The enum is intentionally not serializable.  Its variants keep the recipe-specific proof
+/// boundary explicit; decoded observations can never be converted into these values.
 #[allow(dead_code)]
+#[derive(Clone)]
+enum ForwardEffectQualificationProof {
+    StagedPublish(ForwardEffectQualificationObservation),
+    StagedMove(ForwardEffectQualificationObservation),
+    QualifiedRelocation(ForwardEffectQualificationObservation),
+    RetainedMerge(ForwardEffectQualificationObservation),
+    RetainedDisposition(ForwardEffectQualificationObservation),
+    ExternalAudit(ForwardEffectQualificationObservation),
+    HistoryUndoExtractedRemoval(ForwardEffectQualificationObservation),
+}
+
+impl ForwardEffectQualificationProof {
+    fn observation(&self) -> ForwardEffectQualificationObservation {
+        match self {
+            Self::StagedPublish(observation)
+            | Self::StagedMove(observation)
+            | Self::QualifiedRelocation(observation)
+            | Self::RetainedMerge(observation)
+            | Self::RetainedDisposition(observation)
+            | Self::ExternalAudit(observation)
+            | Self::HistoryUndoExtractedRemoval(observation) => observation.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn recipe(&self) -> CancellationEffectRecipe {
+        match self {
+            Self::StagedPublish(_) => CancellationEffectRecipe::StagedPublish,
+            Self::StagedMove(_) => CancellationEffectRecipe::StagedMove,
+            Self::QualifiedRelocation(_) => CancellationEffectRecipe::QualifiedRelocation,
+            Self::RetainedMerge(_) => CancellationEffectRecipe::RetainedMerge,
+            Self::RetainedDisposition(_) => CancellationEffectRecipe::RetainedDisposition,
+            Self::ExternalAudit(_) => CancellationEffectRecipe::ExternalAudit,
+            Self::HistoryUndoExtractedRemoval(_) => {
+                CancellationEffectRecipe::HistoryUndoExtractedRemoval
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ForwardResourceQualificationProof(ForwardResourceQualificationObservation);
+#[derive(Clone)]
+struct ForwardNamespaceQualificationProof(ForwardNamespaceQualificationObservation);
+#[derive(Clone)]
+struct ForwardClaimQualificationProof(ForwardClaimQualificationObservation);
+
+impl ForwardResourceQualificationProof {
+    fn observation(&self) -> ForwardResourceQualificationObservation {
+        self.0.clone()
+    }
+}
+
+impl ForwardNamespaceQualificationProof {
+    fn observation(&self) -> ForwardNamespaceQualificationObservation {
+        self.0.clone()
+    }
+}
+
+impl ForwardClaimQualificationProof {
+    fn observation(&self) -> ForwardClaimQualificationObservation {
+        self.0.clone()
+    }
+}
+
+/// Private owner-issued authority for a forward cancellation terminal transition.
+///
+/// All proof values are non-serializable and have no production constructor in this module.  A
+/// future live owner must establish the exact current receipts and capacity-owner outcomes before
+/// constructing this authority.  The stored observation counterpart is never sufficient to mint
+/// these proofs.
+#[allow(dead_code)]
+#[derive(Clone)]
 struct PostPublishCancellationAuthority {
     operation_id: OperationId,
     plan: WorkPlan,
-    _recovery: VerifiedPostPublishRecovery,
+    execution_epoch: u64,
+    cancellation_inventory: CancellationInventory,
+    after_effect_reconciliation: AfterEffectReconciliationObservation,
+    cleanup_observations: CancellationCleanupObservation,
+    expected_recovery_generation: u64,
+    next_recovery_generation: u64,
+    claim_inventory: AdmissionClaimInventory,
+    claim_settlement: AdmissionClaimSettlementInventory,
+    dispatch_outcome: CancellationDispatchOutcomeRecord,
+    effect_proofs: Vec<ForwardEffectQualificationProof>,
+    resource_proofs: Vec<ForwardResourceQualificationProof>,
+    namespace_proofs: Vec<ForwardNamespaceQualificationProof>,
+    claim_proofs: Vec<ForwardClaimQualificationProof>,
 }
-
-/// Placeholder marker retained until the cancellation outcome gate is implemented.
-#[allow(dead_code)]
-struct VerifiedPostPublishRecovery;
 
 /// Pure guarded progress over one exact frozen work plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1417,6 +1610,7 @@ pub struct WorkProgress {
     pre_publish_cancellation: Option<PrePublishCancellationObservation>,
     after_effect_reconciliation: Option<AfterEffectReconciliationObservation>,
     cancellation_cleanup_observations: Option<CancellationCleanupObservation>,
+    forward_cancellation_observation: Option<ForwardCancellationObservation>,
     readiness_deferral_batches: Vec<ReadinessDeferralBatchObservation>,
 }
 
@@ -1480,6 +1674,7 @@ impl WorkProgress {
             pre_publish_cancellation: None,
             after_effect_reconciliation: None,
             cancellation_cleanup_observations: None,
+            forward_cancellation_observation: None,
             readiness_deferral_batches: Vec::new(),
         })
     }
@@ -2861,6 +3056,13 @@ impl WorkProgress {
     /// Borrow the accepted nonterminal cleanup observations, when present.
     pub fn cancellation_cleanup_observations(&self) -> Option<&CancellationCleanupObservation> {
         self.cancellation_cleanup_observations.as_ref()
+    }
+
+    /// Borrow the accepted forward-cancellation terminal observation, when present.
+    pub(crate) fn forward_cancellation_observation(
+        &self,
+    ) -> Option<&ForwardCancellationObservation> {
+        self.forward_cancellation_observation.as_ref()
     }
 
     /// Record a bounded retry disposition without changing any step completion.
@@ -4301,14 +4503,484 @@ impl WorkProgress {
         })
     }
 
-    /// Cancellation outcomes remain unavailable until recovery and settlement authorities are
-    /// implemented.  The placeholder authority cannot advance progress.
+    fn validate_forward_cancellation_observation(
+        &self,
+        observation: &ForwardCancellationObservation,
+        after_effect: &AfterEffectReconciliationObservation,
+        cleanup: &CancellationCleanupObservation,
+        admission_claims: &AdmissionClaimInventory,
+        candidate_settlement: Option<&AdmissionClaimSettlementInventory>,
+        expected_recovery_generation: u64,
+    ) -> Result<(), WorkProgressError> {
+        let route = observation.route;
+        if !matches!(
+            route,
+            CancellationRoute::AfterPublish | CancellationRoute::AfterObservedEffect
+        ) {
+            return Err(WorkProgressError::ForwardCancellationRouteInvalid { route });
+        }
+        let Some(inventory) = self.cancellation_inventory.as_ref() else {
+            return Err(WorkProgressError::CancellationInventoryMissing);
+        };
+        if inventory.route() != route {
+            return Err(WorkProgressError::ForwardCancellationStateInvalid);
+        }
+        if observation.execution_epoch != self.execution_epoch
+            || observation.execution_epoch != after_effect.execution_epoch()
+            || observation.execution_epoch != cleanup.execution_epoch()
+        {
+            return Err(WorkProgressError::ForwardCancellationEpochMismatch {
+                expected: self.execution_epoch,
+                actual: observation.execution_epoch,
+            });
+        }
+        if observation.after_effect_generation != after_effect.recovery_generation()
+            || observation.cleanup_generation != cleanup.recovery_generation()
+            || cleanup.after_effect_generation() != observation.after_effect_generation
+            || observation.recovery_generation != expected_recovery_generation
+        {
+            return Err(WorkProgressError::ForwardCancellationGenerationMismatch);
+        }
+        if after_effect.recovery_inventory().dispatch_outcome()
+            != self
+                .after_effect_reconciliation
+                .as_ref()
+                .expect("validated after-effect state")
+                .recovery_inventory()
+                .dispatch_outcome()
+        {
+            return Err(WorkProgressError::ForwardCancellationEvidenceIncomplete);
+        }
+        if cleanup
+            .resource_cleanup_observation()
+            .manifest()
+            .cleanup_manifest()
+            != cleanup
+                .namespace_cleanup_observation()
+                .manifest()
+                .cleanup_manifest()
+        {
+            return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+        }
+        if after_effect
+            .recovery_inventory()
+            .dispatch_outcome()
+            .rows()
+            .iter()
+            .any(|row| matches!(row.outcome(), CancellationDispatchOutcome::EntryUncertain))
+        {
+            return Err(WorkProgressError::ForwardCancellationEvidenceIncomplete);
+        }
+        validate_after_effect_phase_gates(
+            after_effect.recovery_inventory().dispatch_outcome(),
+            after_effect.source_closure_observation(),
+            after_effect.coordinator_closure_observation(),
+        )
+        .map_err(|_| WorkProgressError::ForwardCancellationEvidenceIncomplete)?;
+        if after_effect
+            .source_closure_observation()
+            .rows()
+            .iter()
+            .any(|row| {
+                !matches!(
+                    row.outcome(),
+                    CancellationSourceClosureOutcome::Observed { .. }
+                )
+            })
+            || after_effect
+                .coordinator_closure_observation()
+                .rows()
+                .iter()
+                .any(|row| {
+                    !matches!(
+                        row.outcome(),
+                        CancellationCoordinatorClosureOutcome::Observed { .. }
+                    )
+                })
+        {
+            return Err(WorkProgressError::ForwardCancellationEvidenceIncomplete);
+        }
+
+        let bundles = after_effect.recovery_inventory().bundles();
+        if bundles.is_empty() {
+            return Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch);
+        }
+        if observation.effect_qualifications.len() != bundles.len() {
+            return Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch);
+        }
+        for (index, (bundle, qualification)) in bundles
+            .iter()
+            .zip(&observation.effect_qualifications)
+            .enumerate()
+        {
+            if index > 0 {
+                let previous = &observation.effect_qualifications[index - 1];
+                if (previous.action_ordinal, previous.step_segment)
+                    >= (qualification.action_ordinal, qualification.step_segment)
+                {
+                    return Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch);
+                }
+            }
+            if qualification.action_ordinal != bundle.action_ordinal()
+                || qualification.step_segment != bundle.step_segment()
+                || qualification.recipe != bundle.recipe()
+                || !forward_effect_outcome_qualified(bundle.recipe(), bundle.outcome())
+            {
+                return Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch);
+            }
+            let mut expected_receipt_keys = bundle
+                .facts()
+                .iter()
+                .map(|fact| fact.key())
+                .chain(bundle.source_closure().iter().map(|row| row.key()))
+                .collect::<Vec<_>>();
+            expected_receipt_keys.sort_unstable();
+            expected_receipt_keys.dedup();
+            if qualification.receipt_keys != expected_receipt_keys {
+                return Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch);
+            }
+        }
+
+        let resource_rows = cleanup.resource_cleanup_observation().rows();
+        if resource_rows
+            .iter()
+            .any(|row| matches!(row.outcome(), CancellationResourceCleanupOutcome::Pending))
+        {
+            return Err(WorkProgressError::ForwardCancellationCleanupIncomplete);
+        }
+        if observation.resource_qualifications.len() != resource_rows.len() {
+            return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+        }
+        let mut resource_class_state = BTreeMap::<FullCapacityAllocationClass, (bool, bool)>::new();
+        for (index, (row, qualification)) in resource_rows
+            .iter()
+            .zip(&observation.resource_qualifications)
+            .enumerate()
+        {
+            if qualification.key != row.key()
+                || index > 0
+                    && observation.resource_qualifications[index - 1].key >= qualification.key
+            {
+                return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+            }
+            let (owner_revision, context) = match row.outcome() {
+                CancellationResourceCleanupOutcome::Pending => unreachable!(),
+                CancellationResourceCleanupOutcome::Preserved {
+                    owner_revision,
+                    context,
+                }
+                | CancellationResourceCleanupOutcome::Absent {
+                    owner_revision,
+                    context,
+                } => (*owner_revision, context),
+            };
+            if qualification.owner_revision != owner_revision || &qualification.context != context {
+                return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+            }
+            let outcome = match (&qualification.outcome, row.outcome()) {
+                (
+                    ForwardResourceQualificationOutcome::Absent,
+                    CancellationResourceCleanupOutcome::Absent { .. },
+                ) => true,
+                (
+                    ForwardResourceQualificationOutcome::Retained,
+                    CancellationResourceCleanupOutcome::Preserved { .. },
+                ) => false,
+                _ => {
+                    return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+                }
+            };
+            let class = match row.key().role() {
+                WorkUnitRole::Stage => FullCapacityAllocationClass::DestinationStaging,
+                WorkUnitRole::RecoveryMaterialRetained => {
+                    FullCapacityAllocationClass::OperationRecoveryPayload
+                }
+                _ => {
+                    return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+                }
+            };
+            let state = resource_class_state.entry(class).or_insert((false, true));
+            state.0 = true;
+            state.1 &= outcome;
+        }
+
+        let namespace_rows = cleanup.namespace_cleanup_observation().rows();
+        if namespace_rows
+            .iter()
+            .any(|row| matches!(row.outcome(), CancellationNamespaceCleanupOutcome::Pending))
+        {
+            return Err(WorkProgressError::ForwardCancellationCleanupIncomplete);
+        }
+        if observation.namespace_qualifications.len() != namespace_rows.len() {
+            return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+        }
+        for (index, (row, qualification)) in namespace_rows
+            .iter()
+            .zip(&observation.namespace_qualifications)
+            .enumerate()
+        {
+            if qualification.key != row.key()
+                || index > 0
+                    && observation.namespace_qualifications[index - 1].key >= qualification.key
+            {
+                return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+            }
+            let (owner_revision, context) = match row.outcome() {
+                CancellationNamespaceCleanupOutcome::Pending => unreachable!(),
+                CancellationNamespaceCleanupOutcome::NoOperationClaim {
+                    owner_revision,
+                    context,
+                }
+                | CancellationNamespaceCleanupOutcome::Preserved {
+                    owner_revision,
+                    context,
+                }
+                | CancellationNamespaceCleanupOutcome::Absent {
+                    owner_revision,
+                    context,
+                } => (*owner_revision, context),
+            };
+            if qualification.owner_revision != owner_revision || &qualification.context != context {
+                return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+            }
+            let valid = match (&qualification.outcome, row.outcome()) {
+                (
+                    ForwardNamespaceQualificationOutcome::NoOperationClaim,
+                    CancellationNamespaceCleanupOutcome::NoOperationClaim { .. },
+                )
+                | (
+                    ForwardNamespaceQualificationOutcome::Retained,
+                    CancellationNamespaceCleanupOutcome::Preserved { .. },
+                )
+                | (
+                    ForwardNamespaceQualificationOutcome::Absent,
+                    CancellationNamespaceCleanupOutcome::Absent { .. },
+                ) => true,
+                _ => false,
+            };
+            if !valid {
+                return Err(WorkProgressError::ForwardCancellationCleanupQualificationMismatch);
+            }
+        }
+
+        admission_claims.validate()?;
+        let settlement = candidate_settlement.or(self.claim_settlement.as_ref());
+        if settlement.is_some_and(|value| {
+            value
+                .settlements()
+                .iter()
+                .any(|row| row.outcome() == AdmissionClaimSettlementOutcome::Held)
+        }) {
+            return Err(WorkProgressError::ForwardCancellationHeldClaim);
+        }
+        if observation.claim_qualifications.len() != admission_claims.claims().len() {
+            return Err(WorkProgressError::ForwardCancellationClaimQualificationMismatch);
+        }
+        let mut sorted_claims = admission_claims.claims().iter().collect::<Vec<_>>();
+        sorted_claims.sort_by_key(|claim| claim.claim_id());
+        for (index, (claim, qualification)) in sorted_claims
+            .into_iter()
+            .zip(&observation.claim_qualifications)
+            .enumerate()
+        {
+            if qualification.claim != *claim
+                || qualification.outcome == AdmissionClaimSettlementOutcome::Held
+                || index > 0
+                    && observation.claim_qualifications[index - 1].claim.claim_id()
+                        >= qualification.claim.claim_id()
+            {
+                return Err(WorkProgressError::ForwardCancellationClaimQualificationMismatch);
+            }
+            let class = claim.allocation_class();
+            match class {
+                FullCapacityAllocationClass::JournalRecord
+                | FullCapacityAllocationClass::ExistingDestination
+                | FullCapacityAllocationClass::ExistingRecoveryPayload => {
+                    if qualification.outcome
+                        != AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                    {
+                        return Err(
+                            WorkProgressError::ForwardCancellationClaimQualificationMismatch,
+                        );
+                    }
+                }
+                FullCapacityAllocationClass::DestinationStaging
+                | FullCapacityAllocationClass::OperationRecoveryPayload => {
+                    let all_absent = resource_class_state
+                        .get(&class)
+                        .map(|(has_any, all_absent)| *has_any && *all_absent)
+                        .unwrap_or(false);
+                    let expected = if all_absent {
+                        AdmissionClaimSettlementOutcome::Released
+                    } else {
+                        AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                    };
+                    if qualification.outcome != expected {
+                        return Err(
+                            WorkProgressError::ForwardCancellationClaimQualificationMismatch,
+                        );
+                    }
+                }
+                FullCapacityAllocationClass::SourceDatabaseCommit
+                | FullCapacityAllocationClass::SourceWalShm
+                | FullCapacityAllocationClass::GlobalDatabaseCommit
+                | FullCapacityAllocationClass::GlobalWalShm => {
+                    if !matches!(
+                        qualification.outcome,
+                        AdmissionClaimSettlementOutcome::Released
+                            | AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                    ) {
+                        return Err(
+                            WorkProgressError::ForwardCancellationClaimQualificationMismatch,
+                        );
+                    }
+                }
+            }
+            if let Some(settlement) = settlement {
+                let Some(row) = settlement
+                    .settlements()
+                    .iter()
+                    .find(|row| row.claim_id() == claim.claim_id())
+                else {
+                    return Err(WorkProgressError::ForwardCancellationClaimQualificationMismatch);
+                };
+                if row.outcome() != qualification.outcome {
+                    return Err(WorkProgressError::ForwardCancellationClaimQualificationMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish a post-publication cancellation from a private, proof-bearing owner authority.
     #[allow(dead_code)]
     fn finish_post_publish_cancellation(
         &mut self,
-        _authority: PostPublishCancellationAuthority,
-    ) -> Result<(), WorkProgressError> {
-        Err(WorkProgressError::CancellationOutcomeUnavailable)
+        authority: PostPublishCancellationAuthority,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::ForwardCancellationAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::ForwardCancellationEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        let route = authority.cancellation_inventory.route();
+        if !matches!(
+            route,
+            CancellationRoute::AfterPublish | CancellationRoute::AfterObservedEffect
+        ) {
+            return Err(WorkProgressError::ForwardCancellationRouteInvalid { route });
+        }
+        let expected_disposition = match route {
+            CancellationRoute::AfterPublish => FullProgressDisposition::CancelRequestedAfterPublish,
+            CancellationRoute::AfterObservedEffect => {
+                FullProgressDisposition::CancelRequestedAfterObservedEffect
+            }
+            CancellationRoute::BeforePublish => unreachable!(),
+        };
+        let terminal_disposition = match route {
+            CancellationRoute::AfterPublish => FullProgressDisposition::CancelledAfterPublish,
+            CancellationRoute::AfterObservedEffect => {
+                FullProgressDisposition::CancelledAfterObservedEffect
+            }
+            CancellationRoute::BeforePublish => unreachable!(),
+        };
+        if (self.disposition != expected_disposition && self.disposition != terminal_disposition)
+            || self.active_audit.is_some()
+            || self.disposition == FullProgressDisposition::AuditRequired
+        {
+            return Err(WorkProgressError::ForwardCancellationStateInvalid);
+        }
+        let Some(current_inventory) = self.cancellation_inventory.as_ref() else {
+            return Err(WorkProgressError::CancellationInventoryMissing);
+        };
+        if authority.cancellation_inventory != *current_inventory {
+            return Err(WorkProgressError::ForwardCancellationAuthorityMismatch);
+        }
+        let Some(current_after_effect) = self.after_effect_reconciliation.as_ref() else {
+            return Err(WorkProgressError::ForwardCancellationAfterEffectMissing);
+        };
+        let Some(current_cleanup) = self.cancellation_cleanup_observations.as_ref() else {
+            return Err(WorkProgressError::ForwardCancellationCleanupMissing);
+        };
+        if authority.after_effect_reconciliation != *current_after_effect
+            || authority.cleanup_observations != *current_cleanup
+        {
+            return Err(WorkProgressError::ForwardCancellationAuthorityMismatch);
+        }
+        let Some(admission_claims) = self.admission_claims.as_ref() else {
+            return Err(WorkProgressError::CancellationAdmissionClaimsMissing);
+        };
+        if authority.claim_inventory != *admission_claims
+            || authority.dispatch_outcome
+                != *current_after_effect.recovery_inventory().dispatch_outcome()
+        {
+            return Err(WorkProgressError::ForwardCancellationAuthorityMismatch);
+        }
+        authority
+            .claim_settlement
+            .validate_against(&authority.claim_inventory)
+            .map_err(WorkProgressError::ClaimSettlement)?;
+        if authority
+            .claim_settlement
+            .settlements()
+            .iter()
+            .any(|row| row.outcome() == AdmissionClaimSettlementOutcome::Held)
+        {
+            return Err(WorkProgressError::ForwardCancellationHeldClaim);
+        }
+        let next = authority
+            .expected_recovery_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::ForwardCancellationGenerationOverflow)?;
+        if next != authority.next_recovery_generation {
+            return Err(WorkProgressError::ForwardCancellationGenerationMismatch);
+        }
+        for proof in &authority.effect_proofs {
+            if proof.recipe() != proof.observation().recipe {
+                return Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch);
+            }
+        }
+        let observation = ForwardCancellationObservation::from_authority(&authority);
+        if observation.recovery_generation != next {
+            return Err(WorkProgressError::ForwardCancellationGenerationMismatch);
+        }
+        self.validate_forward_cancellation_observation(
+            &observation,
+            &authority.after_effect_reconciliation,
+            &authority.cleanup_observations,
+            admission_claims,
+            Some(&authority.claim_settlement),
+            next,
+        )?;
+        if let Some(existing) = self.forward_cancellation_observation.as_ref() {
+            if existing == &observation
+                && self.disposition == terminal_disposition
+                && authority.expected_recovery_generation.checked_add(1)
+                    == Some(self.recovery_generation)
+            {
+                return Ok(ProgressApplyOutcome::Replay);
+            }
+            return Err(WorkProgressError::ForwardCancellationReplayConflict);
+        }
+        if authority.expected_recovery_generation != self.recovery_generation {
+            return Err(WorkProgressError::ForwardCancellationGenerationMismatch);
+        }
+        self.forward_cancellation_observation = Some(observation);
+        self.claim_settlement = Some(authority.claim_settlement);
+        self.recovery_generation = next;
+        self.phase = OperationPhase::Terminal;
+        self.disposition = match route {
+            CancellationRoute::AfterPublish => FullProgressDisposition::CancelledAfterPublish,
+            CancellationRoute::AfterObservedEffect => {
+                FullProgressDisposition::CancelledAfterObservedEffect
+            }
+            CancellationRoute::BeforePublish => unreachable!(),
+        };
+        Ok(ProgressApplyOutcome::Applied)
     }
 
     fn derive_cancellation_coordinator_closure_keys(
@@ -4880,6 +5552,38 @@ fn derive_origin_policies(
         previous = Some(action_ordinal);
     }
     policies
+}
+
+fn forward_effect_outcome_qualified(
+    recipe: CancellationEffectRecipe,
+    outcome: super::cancellation_effects::CancellationEffectOutcome,
+) -> bool {
+    use super::cancellation_effects::{CancellationEffectOutcome, CancellationEffectRecipe};
+    matches!(
+        (recipe, outcome),
+        (
+            CancellationEffectRecipe::StagedPublish,
+            CancellationEffectOutcome::Published
+        ) | (
+            CancellationEffectRecipe::StagedMove,
+            CancellationEffectOutcome::RemovalConfirmed
+        ) | (
+            CancellationEffectRecipe::QualifiedRelocation,
+            CancellationEffectOutcome::QualifiedRelocationCompleted
+        ) | (
+            CancellationEffectRecipe::RetainedMerge,
+            CancellationEffectOutcome::RetainedMergeCompleted
+        ) | (
+            CancellationEffectRecipe::RetainedDisposition,
+            CancellationEffectOutcome::RetainedDispositionConfirmed
+        ) | (
+            CancellationEffectRecipe::ExternalAudit,
+            CancellationEffectOutcome::ExternalAuditCompleted
+        ) | (
+            CancellationEffectRecipe::HistoryUndoExtractedRemoval,
+            CancellationEffectOutcome::RemovalConfirmed
+        )
+    )
 }
 
 fn action_has_required_role(plan: &WorkPlan, action_ordinal: u8, role: WorkUnitRole) -> bool {
@@ -6555,6 +7259,61 @@ pub enum WorkProgressError {
     /// are available.
     #[error("work progress cancellation outcome authority is not yet available")]
     CancellationOutcomeUnavailable,
+    /// A forward-cancellation authority did not bind this operation or frozen plan.
+    #[error("work progress forward cancellation authority does not match")]
+    ForwardCancellationAuthorityMismatch,
+    /// A forward-cancellation authority was issued for another execution epoch.
+    #[error(
+        "work progress forward cancellation epoch {actual} does not match expected epoch {expected}"
+    )]
+    ForwardCancellationEpochMismatch {
+        /// Current progress epoch.
+        expected: u64,
+        /// Authority or observation epoch.
+        actual: u64,
+    },
+    /// The forward cancellation route is not one of the supported post-publication routes.
+    #[error("work progress forward cancellation route is invalid: {route:?}")]
+    ForwardCancellationRouteInvalid {
+        /// Route carried by the candidate authority.
+        route: CancellationRoute,
+    },
+    /// The current disposition does not match the forward cancellation route.
+    #[error("work progress forward cancellation state is invalid")]
+    ForwardCancellationStateInvalid,
+    /// Forward cancellation requires an accepted after-effect reconciliation record.
+    #[error("work progress forward cancellation after-effect reconciliation is missing")]
+    ForwardCancellationAfterEffectMissing,
+    /// Forward cancellation requires accepted cleanup observations.
+    #[error("work progress forward cancellation cleanup observations are missing")]
+    ForwardCancellationCleanupMissing,
+    /// The accepted dispatch record contains an unresolved entry or incomplete closure.
+    #[error("work progress forward cancellation dispatch or closure is incomplete")]
+    ForwardCancellationEvidenceIncomplete,
+    /// Forward cancellation cleanup contains a pending row.
+    #[error("work progress forward cancellation cleanup is incomplete")]
+    ForwardCancellationCleanupIncomplete,
+    /// A recipe-specific forward proof did not match the exact accepted bundle.
+    #[error("work progress forward cancellation effect qualification does not match")]
+    ForwardCancellationEffectQualificationMismatch,
+    /// A resource or namespace qualification did not match its exact accepted cleanup row.
+    #[error("work progress forward cancellation cleanup qualification does not match")]
+    ForwardCancellationCleanupQualificationMismatch,
+    /// A whole-claim qualification did not match the exact admitted claim and settlement.
+    #[error("work progress forward cancellation claim qualification does not match")]
+    ForwardCancellationClaimQualificationMismatch,
+    /// A held claim cannot satisfy a forward cancellation terminal proof.
+    #[error("work progress forward cancellation retains a held claim")]
+    ForwardCancellationHeldClaim,
+    /// A forward cancellation generation did not match the current accepted generation.
+    #[error("work progress forward cancellation generation mismatch")]
+    ForwardCancellationGenerationMismatch,
+    /// The forward cancellation generation could not advance without wrapping.
+    #[error("work progress forward cancellation generation overflowed")]
+    ForwardCancellationGenerationOverflow,
+    /// A forward cancellation replay changed the accepted terminal observation.
+    #[error("work progress forward cancellation replay conflicts")]
+    ForwardCancellationReplayConflict,
     /// Cancellation requires an exact retained admission-claim observation.
     #[error("work progress cancellation admission claims are missing")]
     CancellationAdmissionClaimsMissing,
@@ -8020,6 +8779,449 @@ mod tests {
         (resource, namespace)
     }
 
+    fn accept_qualified_cleanup_observations(
+        progress: &mut WorkProgress,
+    ) -> (
+        CancellationResourceCleanupObservationRecord,
+        CancellationNamespaceCleanupObservationRecord,
+    ) {
+        accept_qualified_cleanup_observations_with_retained_resource(progress, false)
+    }
+
+    fn accept_qualified_cleanup_observations_with_retained_resource(
+        progress: &mut WorkProgress,
+        retain_resource: bool,
+    ) -> (
+        CancellationResourceCleanupObservationRecord,
+        CancellationNamespaceCleanupObservationRecord,
+    ) {
+        let after_effect = progress
+            .after_effect_reconciliation()
+            .expect("accepted after-effect reconciliation")
+            .clone();
+        let recovery = after_effect.recovery_inventory();
+        let dispatch = recovery.dispatch_outcome();
+        let cleanup = progress
+            .cancellation_cleanup_manifest(recovery, dispatch)
+            .expect("cleanup manifest");
+        let resource_manifest = progress
+            .cancellation_resource_cleanup_manifest(&cleanup, recovery, dispatch)
+            .expect("resource manifest");
+        let namespace_manifest = progress
+            .cancellation_namespace_cleanup_manifest(&cleanup, recovery, dispatch)
+            .expect("namespace manifest");
+        let resource_rows = resource_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let context = CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(*key).expect("resource scope").clone(),
+                );
+                let outcome = if retain_resource && key.role() == WorkUnitRole::Stage {
+                    CancellationResourceCleanupOutcome::Preserved {
+                        owner_revision: 1,
+                        context,
+                    }
+                } else {
+                    CancellationResourceCleanupOutcome::Absent {
+                        owner_revision: 1,
+                        context,
+                    }
+                };
+                CancellationResourceCleanupObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let namespace_rows = namespace_manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let context = CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress.scope_for(*key).expect("namespace scope").clone(),
+                );
+                let outcome = match key.role() {
+                    WorkUnitRole::Publish
+                    | WorkUnitRole::QualifiedRelocation
+                    | WorkUnitRole::RetainedMerge => {
+                        CancellationNamespaceCleanupOutcome::NoOperationClaim {
+                            owner_revision: 1,
+                            context,
+                        }
+                    }
+                    _ => CancellationNamespaceCleanupOutcome::Absent {
+                        owner_revision: 1,
+                        context,
+                    },
+                };
+                CancellationNamespaceCleanupObservationRow::new(*key, outcome)
+            })
+            .collect();
+        let resource = CancellationResourceCleanupObservationRecord::new(
+            resource_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            resource_rows,
+        )
+        .expect("qualified resource observations");
+        let namespace = CancellationNamespaceCleanupObservationRecord::new(
+            namespace_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            namespace_rows,
+        )
+        .expect("qualified namespace observations");
+        progress
+            .accept_cancellation_cleanup_observations(cleanup_observation_authority(
+                progress,
+                resource.clone(),
+                namespace.clone(),
+                progress.recovery_generation(),
+            ))
+            .expect("accept qualified cleanup observations");
+        (resource, namespace)
+    }
+
+    fn forward_cancellation_authority(
+        progress: &WorkProgress,
+        claim_outcome: AdmissionClaimSettlementOutcome,
+    ) -> PostPublishCancellationAuthority {
+        let after_effect = progress
+            .after_effect_reconciliation()
+            .expect("after-effect observation")
+            .clone();
+        let cleanup = progress
+            .cancellation_cleanup_observations()
+            .expect("cleanup observation")
+            .clone();
+        let dispatch = after_effect.recovery_inventory().dispatch_outcome().clone();
+        let effect_proofs = after_effect
+            .recovery_inventory()
+            .bundles()
+            .iter()
+            .map(|bundle| {
+                let mut receipt_keys = bundle
+                    .facts()
+                    .iter()
+                    .map(|fact| fact.key())
+                    .chain(bundle.source_closure().iter().map(|row| row.key()))
+                    .collect::<Vec<_>>();
+                receipt_keys.sort_unstable();
+                receipt_keys.dedup();
+                let observation = ForwardEffectQualificationObservation {
+                    action_ordinal: bundle.action_ordinal(),
+                    step_segment: bundle.step_segment(),
+                    recipe: bundle.recipe(),
+                    receipt_keys,
+                };
+                match bundle.recipe() {
+                    CancellationEffectRecipe::StagedPublish => {
+                        ForwardEffectQualificationProof::StagedPublish(observation)
+                    }
+                    CancellationEffectRecipe::StagedMove => {
+                        ForwardEffectQualificationProof::StagedMove(observation)
+                    }
+                    CancellationEffectRecipe::QualifiedRelocation => {
+                        ForwardEffectQualificationProof::QualifiedRelocation(observation)
+                    }
+                    CancellationEffectRecipe::RetainedMerge => {
+                        ForwardEffectQualificationProof::RetainedMerge(observation)
+                    }
+                    CancellationEffectRecipe::RetainedDisposition => {
+                        ForwardEffectQualificationProof::RetainedDisposition(observation)
+                    }
+                    CancellationEffectRecipe::ExternalAudit => {
+                        ForwardEffectQualificationProof::ExternalAudit(observation)
+                    }
+                    CancellationEffectRecipe::HistoryUndoExtractedRemoval => {
+                        ForwardEffectQualificationProof::HistoryUndoExtractedRemoval(observation)
+                    }
+                }
+            })
+            .collect();
+        let resource_proofs = cleanup
+            .resource_cleanup_observation()
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                let (owner_revision, context) = match row.outcome() {
+                    CancellationResourceCleanupOutcome::Absent {
+                        owner_revision,
+                        context,
+                    }
+                    | CancellationResourceCleanupOutcome::Preserved {
+                        owner_revision,
+                        context,
+                    } => (*owner_revision, context.clone()),
+                    CancellationResourceCleanupOutcome::Pending => return None,
+                };
+                Some(ForwardResourceQualificationProof(
+                    ForwardResourceQualificationObservation {
+                        key: row.key(),
+                        outcome: match row.outcome() {
+                            CancellationResourceCleanupOutcome::Absent { .. } => {
+                                ForwardResourceQualificationOutcome::Absent
+                            }
+                            CancellationResourceCleanupOutcome::Preserved { .. } => {
+                                ForwardResourceQualificationOutcome::Retained
+                            }
+                            CancellationResourceCleanupOutcome::Pending => unreachable!(),
+                        },
+                        owner_revision,
+                        context,
+                    },
+                ))
+            })
+            .collect();
+        let namespace_proofs = cleanup
+            .namespace_cleanup_observation()
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                let (owner_revision, context) = match row.outcome() {
+                    CancellationNamespaceCleanupOutcome::NoOperationClaim {
+                        owner_revision,
+                        context,
+                    }
+                    | CancellationNamespaceCleanupOutcome::Preserved {
+                        owner_revision,
+                        context,
+                    }
+                    | CancellationNamespaceCleanupOutcome::Absent {
+                        owner_revision,
+                        context,
+                    } => (*owner_revision, context.clone()),
+                    CancellationNamespaceCleanupOutcome::Pending => return None,
+                };
+                Some(ForwardNamespaceQualificationProof(
+                    ForwardNamespaceQualificationObservation {
+                        key: row.key(),
+                        outcome: match row.outcome() {
+                            CancellationNamespaceCleanupOutcome::NoOperationClaim { .. } => {
+                                ForwardNamespaceQualificationOutcome::NoOperationClaim
+                            }
+                            CancellationNamespaceCleanupOutcome::Preserved { .. } => {
+                                ForwardNamespaceQualificationOutcome::Retained
+                            }
+                            CancellationNamespaceCleanupOutcome::Absent { .. } => {
+                                ForwardNamespaceQualificationOutcome::Absent
+                            }
+                            CancellationNamespaceCleanupOutcome::Pending => unreachable!(),
+                        },
+                        owner_revision,
+                        context,
+                    },
+                ))
+            })
+            .collect();
+        let claim_inventory = progress
+            .admission_claims()
+            .expect("claim inventory")
+            .clone();
+        let claim_settlement = AdmissionClaimSettlementInventory::new(
+            claim_inventory
+                .claims()
+                .iter()
+                .map(|claim| {
+                    AdmissionClaimSettlement::new(claim.claim_id(), claim_outcome)
+                        .expect("claim settlement")
+                })
+                .collect(),
+        )
+        .expect("claim settlement inventory");
+        let claim_proofs = claim_inventory
+            .claims()
+            .iter()
+            .map(|claim| {
+                ForwardClaimQualificationProof(ForwardClaimQualificationObservation {
+                    claim: claim.clone(),
+                    outcome: claim_outcome,
+                })
+            })
+            .collect();
+        let expected_recovery_generation = progress.recovery_generation();
+        PostPublishCancellationAuthority {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch,
+            cancellation_inventory: progress
+                .cancellation_inventory
+                .as_ref()
+                .expect("cancellation inventory")
+                .clone(),
+            after_effect_reconciliation: after_effect,
+            cleanup_observations: cleanup,
+            expected_recovery_generation,
+            next_recovery_generation: expected_recovery_generation + 1,
+            claim_inventory,
+            claim_settlement,
+            dispatch_outcome: dispatch,
+            effect_proofs,
+            resource_proofs,
+            namespace_proofs,
+            claim_proofs,
+        }
+    }
+
+    fn forward_cancellation_authority_with_class_policy(
+        progress: &WorkProgress,
+    ) -> PostPublishCancellationAuthority {
+        let mut authority =
+            forward_cancellation_authority(progress, AdmissionClaimSettlementOutcome::Released);
+        let mut resource_classes = BTreeMap::<FullCapacityAllocationClass, (bool, bool)>::new();
+        if let Some(cleanup) = progress.cancellation_cleanup_observations() {
+            for row in cleanup.resource_cleanup_observation().rows() {
+                let class = match row.key().role() {
+                    WorkUnitRole::Stage => FullCapacityAllocationClass::DestinationStaging,
+                    WorkUnitRole::RecoveryMaterialRetained => {
+                        FullCapacityAllocationClass::OperationRecoveryPayload
+                    }
+                    _ => continue,
+                };
+                let state = resource_classes.entry(class).or_insert((false, true));
+                state.0 = true;
+                state.1 &= matches!(
+                    row.outcome(),
+                    CancellationResourceCleanupOutcome::Absent { .. }
+                );
+            }
+        }
+        let claim_outcome = |claim: &AdmissionClaim| match claim.allocation_class() {
+            FullCapacityAllocationClass::DestinationStaging
+            | FullCapacityAllocationClass::OperationRecoveryPayload => {
+                if resource_classes
+                    .get(&claim.allocation_class())
+                    .is_some_and(|(has_any, all_absent)| *has_any && *all_absent)
+                {
+                    AdmissionClaimSettlementOutcome::Released
+                } else {
+                    AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+                }
+            }
+            FullCapacityAllocationClass::JournalRecord
+            | FullCapacityAllocationClass::ExistingDestination
+            | FullCapacityAllocationClass::ExistingRecoveryPayload => {
+                AdmissionClaimSettlementOutcome::ConsumedOrTransferred
+            }
+            FullCapacityAllocationClass::SourceDatabaseCommit
+            | FullCapacityAllocationClass::SourceWalShm
+            | FullCapacityAllocationClass::GlobalDatabaseCommit
+            | FullCapacityAllocationClass::GlobalWalShm => {
+                AdmissionClaimSettlementOutcome::Released
+            }
+        };
+        let outcomes = authority
+            .claim_inventory
+            .claims()
+            .iter()
+            .map(|claim| {
+                AdmissionClaimSettlement::new(claim.claim_id(), claim_outcome(claim))
+                    .expect("class policy settlement")
+            })
+            .collect();
+        authority.claim_settlement = AdmissionClaimSettlementInventory::new(outcomes)
+            .expect("class policy settlement inventory");
+        for proof in &mut authority.claim_proofs {
+            if let Some(claim) = authority
+                .claim_inventory
+                .claims()
+                .iter()
+                .find(|claim| claim.claim_id() == proof.0.claim.claim_id())
+            {
+                proof.0.outcome = claim_outcome(claim);
+            }
+        }
+        authority
+    }
+
+    fn terminalize_forward_recipe(
+        mut progress: WorkProgress,
+        args: UniversalCommandArgs,
+        participants: ParticipantSet,
+        request_value: i64,
+        expected_route: CancellationRoute,
+        expected_recipe: CancellationEffectRecipe,
+    ) {
+        progress
+            .request_cancellation(
+                CancellationRequestObservation::new(request_value).expect("cancel"),
+            )
+            .expect("recipe cancellation");
+        assert_eq!(
+            progress
+                .cancellation_inventory()
+                .expect("cancellation inventory")
+                .route(),
+            expected_route,
+            "recipe {:?} produced unexpected cancellation route",
+            expected_recipe
+        );
+        accept_observed_after_effect_reconciliation(&mut progress);
+        let recovery = &progress
+            .after_effect_reconciliation()
+            .expect("after-effect observation")
+            .recovery_inventory();
+        assert!(!recovery.bundles().is_empty());
+        let bundle = recovery
+            .bundles()
+            .iter()
+            .find(|bundle| bundle.recipe() == expected_recipe)
+            .expect("expected nonempty recipe bundle");
+        if expected_recipe == CancellationEffectRecipe::StagedMove {
+            assert!(
+                bundle
+                    .facts()
+                    .iter()
+                    .any(|fact| { fact.kind() == CancellationEffectFactKind::Publish })
+            );
+            assert!(
+                bundle
+                    .facts()
+                    .iter()
+                    .any(|fact| { fact.kind() == CancellationEffectFactKind::OriginRemovalStart })
+            );
+            assert!(
+                bundle
+                    .facts()
+                    .iter()
+                    .any(|fact| { fact.kind() == CancellationEffectFactKind::OriginAbsence })
+            );
+            assert!(bundle.source_closure().iter().any(|closure| {
+                closure.key().role() == WorkUnitRole::DestinationSourceReconcile
+                    && closure.status() == ProgressStepStatus::Completed
+            }));
+            assert!(bundle.source_closure().iter().any(|closure| {
+                closure.key().role() == WorkUnitRole::OriginSourceReconcile
+                    && closure.status() == ProgressStepStatus::Completed
+            }));
+        }
+        accept_qualified_cleanup_observations(&mut progress);
+        let before_steps = progress.steps().to_vec();
+        let before_plan = progress.plan.clone();
+        let before_inventory = progress.cancellation_inventory().cloned();
+        assert_eq!(
+            progress.finish_post_publish_cancellation(
+                forward_cancellation_authority_with_class_policy(&progress),
+            ),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(progress.phase(), OperationPhase::Terminal);
+        assert_eq!(progress.steps(), before_steps.as_slice());
+        assert_eq!(progress.plan, before_plan);
+        assert_eq!(progress.cancellation_inventory(), before_inventory.as_ref());
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("recipe terminal snapshot");
+        snapshot
+            .validate_base()
+            .expect("recipe terminal validation");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("recipe terminal record");
+        let bytes =
+            super::super::full_progress_codec::encode(&record).expect("recipe terminal encoding");
+        super::super::full_progress_codec::decode(&bytes).expect("recipe terminal decoding");
+    }
+
     fn dispatch_outcome_for_authority(
         progress: &WorkProgress,
     ) -> CancellationDispatchOutcomeRecord {
@@ -8627,6 +9829,32 @@ mod tests {
             .collect()
     }
 
+    fn observed_source_closure_rows(
+        progress: &WorkProgress,
+        manifest: &SourceClosureManifest,
+    ) -> Vec<CancellationSourceClosureObservationRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let context = CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(*key)
+                        .expect("source closure scope")
+                        .clone(),
+                );
+                CancellationSourceClosureObservationRow::new(
+                    *key,
+                    CancellationSourceClosureOutcome::Observed {
+                        evidence: evidence_for(progress, *key, 7),
+                        context,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn coordinator_closure_rows(
         manifest: &CoordinatorClosureManifest,
     ) -> Vec<CancellationCoordinatorClosureObservationRow> {
@@ -8654,6 +9882,68 @@ mod tests {
             coordinator_closure_rows(&manifest),
         )
         .expect("coordinator closure record")
+    }
+
+    fn observed_coordinator_closure_rows(
+        progress: &WorkProgress,
+        manifest: &CoordinatorClosureManifest,
+    ) -> Vec<CancellationCoordinatorClosureObservationRow> {
+        manifest
+            .keys()
+            .iter()
+            .map(|key| {
+                let context = CompletionContext::new(
+                    progress.execution_epoch(),
+                    progress
+                        .scope_for(*key)
+                        .expect("coordinator closure scope")
+                        .clone(),
+                );
+                CancellationCoordinatorClosureObservationRow::new(
+                    *key,
+                    CancellationCoordinatorClosureOutcome::Observed {
+                        evidence: generic_coordinator_evidence_for(progress, *key, 7),
+                        context,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn accept_observed_after_effect_reconciliation(progress: &mut WorkProgress) {
+        let dispatch = all_never_dispatch_record(progress);
+        let recovery = progress
+            .cancellation_effect_recovery_inventory(&dispatch)
+            .expect("recovery inventory");
+        let source_manifest = progress
+            .cancellation_source_closure_manifest(&recovery, &dispatch)
+            .expect("source closure manifest");
+        let source = CancellationSourceClosureObservationRecord::new(
+            source_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            observed_source_closure_rows(progress, &source_manifest),
+        )
+        .expect("observed source closure record");
+        let coordinator_manifest = progress
+            .cancellation_coordinator_closure_manifest(&source, &recovery, &dispatch)
+            .expect("coordinator closure manifest");
+        let coordinator = CancellationCoordinatorClosureObservationRecord::new(
+            coordinator_manifest.clone(),
+            progress.execution_epoch(),
+            1,
+            observed_coordinator_closure_rows(progress, &coordinator_manifest),
+        )
+        .expect("observed coordinator closure record");
+        progress
+            .accept_after_effect_reconciliation(after_effect_authority(
+                progress,
+                recovery,
+                source,
+                coordinator,
+                progress.recovery_generation(),
+            ))
+            .expect("accept observed after-effect reconciliation");
     }
 
     fn after_effect_authority(
@@ -19672,6 +20962,622 @@ mod tests {
             after_effect.disposition(),
             FullProgressDisposition::CancelRequestedAfterObservedEffect
         );
+    }
+
+    #[test]
+    fn forward_cancellation_qualifies_publish_and_persists_terminal_observation() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1605).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+        let before_steps = progress.steps().to_vec();
+        let before_plan = progress.plan.clone();
+        let before_inventory = progress.cancellation_inventory().cloned();
+        let authority = forward_cancellation_authority_with_class_policy(&progress);
+        let replay = authority.clone();
+        assert_eq!(
+            progress.finish_post_publish_cancellation(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledAfterPublish
+        );
+        assert_eq!(progress.phase(), OperationPhase::Terminal);
+        assert_eq!(progress.steps(), before_steps.as_slice());
+        assert_eq!(progress.plan, before_plan);
+        assert_eq!(progress.cancellation_inventory(), before_inventory.as_ref());
+        assert!(
+            !progress
+                .after_effect_reconciliation()
+                .expect("after-effect observation")
+                .recovery_inventory()
+                .bundles()
+                .is_empty()
+        );
+        let snapshot_intent = copy_snapshot_intent(&progress);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent)
+            .expect("terminal forward snapshot");
+        assert!(snapshot.forward_cancellation_observation().is_some());
+        let encoded = serde_json::to_vec(&snapshot).expect("snapshot encoding");
+        let decoded: FullProgressSnapshotObservation =
+            serde_json::from_slice(&encoded).expect("snapshot decoding");
+        decoded
+            .validate_base()
+            .expect("terminal snapshot validation");
+        assert_eq!(decoded, snapshot);
+        let record =
+            super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot.clone())
+                .expect("terminal full-progress record");
+        let record_bytes = super::super::full_progress_codec::encode(&record)
+            .expect("terminal full-progress encoding");
+        let decoded_record = super::super::full_progress_codec::decode(&record_bytes)
+            .expect("terminal full-progress decoding");
+        assert_eq!(decoded_record.snapshot(), &snapshot);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledAfterPublish
+        );
+    }
+
+    #[test]
+    fn forward_cancellation_terminalizes_each_nonempty_recipe_bundle() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let copy_args = copy_args_at(source, source_id.clone(), "copy.wav");
+        let mut copy = claimed_progress(participants.clone(), copy_args.clone(), 1620);
+        publish_prefix(&mut copy);
+        terminalize_forward_recipe(
+            copy,
+            copy_args,
+            participants.clone(),
+            1620,
+            CancellationRoute::AfterPublish,
+            CancellationEffectRecipe::StagedPublish,
+        );
+
+        let move_args = namespace_file_move_args(source, source_id.clone());
+        let mut staged_move = claimed_progress(participants.clone(), move_args.clone(), 1621);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::DestinationSourceReconcile,
+            WorkUnitRole::OriginRemovalStart,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::OriginSourceReconcile,
+        ] {
+            apply_role(&mut staged_move, 0, role);
+        }
+        terminalize_forward_recipe(
+            staged_move,
+            move_args,
+            participants.clone(),
+            1621,
+            CancellationRoute::AfterPublish,
+            CancellationEffectRecipe::StagedMove,
+        );
+
+        let relocation_args = history_folder_args(source, source_id.clone());
+        let mut relocation = claimed_progress(participants.clone(), relocation_args.clone(), 1622);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::EnsureContainedParentDirectories,
+            WorkUnitRole::QualifiedRelocation,
+            WorkUnitRole::OriginAbsence,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut relocation, 0, 0, role);
+        }
+        terminalize_forward_recipe(
+            relocation,
+            relocation_args,
+            participants.clone(),
+            1622,
+            CancellationRoute::AfterPublish,
+            CancellationEffectRecipe::QualifiedRelocation,
+        );
+
+        let merge_args = retained_resolution_args(source, source_id.clone(), true);
+        let mut retained_merge = claimed_progress(participants.clone(), merge_args.clone(), 1623);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::RetainedMerge,
+        ] {
+            apply_role(&mut retained_merge, 0, role);
+        }
+        terminalize_forward_recipe(
+            retained_merge,
+            merge_args,
+            participants.clone(),
+            1623,
+            CancellationRoute::AfterObservedEffect,
+            CancellationEffectRecipe::RetainedMerge,
+        );
+
+        let disposition_args = retained_resolution_args(source, source_id.clone(), false);
+        let mut retained_disposition =
+            claimed_progress(participants.clone(), disposition_args.clone(), 1624);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::SelectedRetainedObjectDisposition,
+            WorkUnitRole::RetainedObjectAbsence,
+        ] {
+            apply_role(&mut retained_disposition, 0, role);
+        }
+        terminalize_forward_recipe(
+            retained_disposition,
+            disposition_args,
+            participants.clone(),
+            1624,
+            CancellationRoute::AfterObservedEffect,
+            CancellationEffectRecipe::RetainedDisposition,
+        );
+
+        let external_args =
+            external_reconciliation_args(source, participant_id(2), source_id.clone());
+        let mut external = claimed_progress(participants.clone(), external_args.clone(), 1625);
+        for role in [WorkUnitRole::SourceRead, WorkUnitRole::ExternalAudit] {
+            apply_role(&mut external, 0, role);
+        }
+        terminalize_forward_recipe(
+            external,
+            external_args,
+            participants.clone(),
+            1625,
+            CancellationRoute::AfterObservedEffect,
+            CancellationEffectRecipe::ExternalAudit,
+        );
+
+        let history_args =
+            history_restore_with_extracted_args(source, participant_id(2), source_id);
+        let mut history = claimed_progress(participants.clone(), history_args.clone(), 1626);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::RecoveryMaterialRetained,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::SourceAffect,
+        ] {
+            apply_step(&mut history, 0, 0, role);
+        }
+        for role in [
+            WorkUnitRole::OriginRemovalStart,
+            WorkUnitRole::OriginAbsence,
+        ] {
+            apply_step(&mut history, 0, 1, role);
+        }
+        terminalize_forward_recipe(
+            history,
+            history_args,
+            participants,
+            1626,
+            CancellationRoute::AfterPublish,
+            CancellationEffectRecipe::HistoryUndoExtractedRemoval,
+        );
+    }
+
+    #[test]
+    fn forward_cancellation_rejects_unresolved_staged_move_proof() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let args = namespace_file_move_args(source, source_id);
+        let mut progress = claimed_progress(participants, args, 1627);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::Stage,
+            WorkUnitRole::CopyValidated,
+            WorkUnitRole::Publish,
+            WorkUnitRole::DestinationSourceReconcile,
+            WorkUnitRole::OriginRemovalStart,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1627).expect("cancel"))
+            .expect("staged-move cancellation");
+        assert_eq!(
+            progress
+                .cancellation_inventory()
+                .expect("cancellation inventory")
+                .route(),
+            CancellationRoute::AfterPublish
+        );
+        accept_observed_after_effect_reconciliation(&mut progress);
+        let bundle = progress
+            .after_effect_reconciliation()
+            .expect("after-effect observation")
+            .recovery_inventory()
+            .bundles()
+            .iter()
+            .find(|bundle| bundle.recipe() == CancellationEffectRecipe::StagedMove)
+            .expect("staged-move bundle");
+        assert_eq!(
+            bundle.outcome(),
+            CancellationEffectOutcome::RemovalUnresolved
+        );
+        accept_qualified_cleanup_observations(&mut progress);
+        let before = progress.clone();
+        assert_eq!(
+            progress.finish_post_publish_cancellation(
+                forward_cancellation_authority_with_class_policy(&progress),
+            ),
+            Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch)
+        );
+        assert_eq!(progress, before);
+    }
+
+    #[test]
+    fn forward_cancellation_rejects_empty_bundle_terminal_authority() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1628).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+
+        let accepted = progress
+            .after_effect_reconciliation()
+            .expect("accepted after-effect observation")
+            .clone();
+        let dispatch = accepted.recovery_inventory().dispatch_outcome().clone();
+        let empty_recovery = CancellationEffectRecoveryInventory::new(
+            accepted.recovery_inventory().frozen_inventory().clone(),
+            dispatch.clone(),
+            Vec::new(),
+        )
+        .expect("empty recovery observation");
+        progress.after_effect_reconciliation = Some(AfterEffectReconciliationObservation::new(
+            empty_recovery,
+            accepted.source_closure_observation().clone(),
+            accepted.coordinator_closure_observation().clone(),
+            accepted.execution_epoch(),
+            accepted.recovery_generation(),
+        ));
+        let before = progress.clone();
+        assert_eq!(
+            progress.finish_post_publish_cancellation(
+                forward_cancellation_authority_with_class_policy(&progress),
+            ),
+            Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch)
+        );
+        assert_eq!(progress, before);
+    }
+
+    #[test]
+    fn forward_cancellation_full_record_rejects_mutated_qualifications_and_links() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1611).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+        progress
+            .finish_post_publish_cancellation(forward_cancellation_authority_with_class_policy(
+                &progress,
+            ))
+            .expect("forward terminal transition");
+        let snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("terminal forward snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("terminal record");
+        let value = serde_json::to_value(&record).expect("record value");
+
+        let mut held_claim = value.clone();
+        held_claim["snapshot"]["forward_cancellation_observation"]["claim_qualifications"][0]["outcome"] =
+            serde_json::Value::String(String::from("Held"));
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&held_claim).expect("held mutation")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+        ));
+
+        let mut stale_link = value.clone();
+        let old_after_effect_generation =
+            stale_link["snapshot"]["forward_cancellation_observation"]["after_effect_generation"]
+                .as_u64()
+                .expect("after-effect generation");
+        stale_link["snapshot"]["forward_cancellation_observation"]["after_effect_generation"] =
+            serde_json::Value::from(old_after_effect_generation + 1);
+        assert!(matches!(
+            super::super::full_progress_codec::decode(
+                &serde_json::to_vec(&stale_link).expect("stale link mutation")
+            ),
+            Err(super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. })
+        ));
+
+        for disposition in [
+            FullProgressDisposition::Succeeded,
+            FullProgressDisposition::None,
+        ] {
+            let mut incompatible_disposition = value.clone();
+            incompatible_disposition["snapshot"]["disposition"] =
+                serde_json::to_value(disposition).expect("disposition encoding");
+            assert!(matches!(
+                super::super::full_progress_codec::decode(
+                    &serde_json::to_vec(&incompatible_disposition)
+                        .expect("incompatible disposition mutation")
+                ),
+                Err(
+                    super::super::full_progress_codec::FullProgressCodecError::InvalidSnapshot { .. }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn forward_cancellation_qualifies_observed_effect_route() {
+        let (participants, source, _filesystem, source_id) = valid_topology(false);
+        let args = retained_resolution_args(source, source_id, false);
+        let mut progress = claimed_progress(participants.clone(), args.clone(), 1606);
+        for role in [
+            WorkUnitRole::SourceRead,
+            WorkUnitRole::Prepare,
+            WorkUnitRole::SelectedRetainedObjectDisposition,
+            WorkUnitRole::RetainedObjectAbsence,
+        ] {
+            apply_role(&mut progress, 0, role);
+        }
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1606).expect("cancel"))
+            .expect("after-observed-effect cancellation");
+        assert_eq!(
+            progress
+                .cancellation_inventory()
+                .expect("cancellation inventory")
+                .route(),
+            CancellationRoute::AfterObservedEffect
+        );
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+        assert!(
+            !progress
+                .after_effect_reconciliation()
+                .expect("after-effect observation")
+                .recovery_inventory()
+                .bundles()
+                .is_empty()
+        );
+        let authority = forward_cancellation_authority_with_class_policy(&progress);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(
+            progress.disposition(),
+            FullProgressDisposition::CancelledAfterObservedEffect
+        );
+        assert_eq!(progress.phase(), OperationPhase::Terminal);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(&progress, args, participants))
+            .expect("observed-effect forward snapshot");
+        let record = super::super::full_progress_codec::StoredFullProgressRecord::new(snapshot)
+            .expect("observed-effect terminal record");
+        let record_bytes = super::super::full_progress_codec::encode(&record)
+            .expect("observed-effect terminal encoding");
+        let decoded_record = super::super::full_progress_codec::decode(&record_bytes)
+            .expect("observed-effect terminal decoding");
+        decoded_record
+            .snapshot()
+            .validate_base()
+            .expect("observed-effect terminal snapshot validation");
+    }
+
+    #[test]
+    fn forward_cancellation_requires_class_transfer_and_exact_claim_proofs() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1607).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations_with_retained_resource(&mut progress, true);
+
+        let before_mixed = progress.clone();
+        let release_authority =
+            forward_cancellation_authority(&progress, AdmissionClaimSettlementOutcome::Released);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(release_authority),
+            Err(WorkProgressError::ForwardCancellationClaimQualificationMismatch)
+        );
+        assert_eq!(progress, before_mixed);
+
+        let before_claim = progress.clone();
+        let mut mismatched = forward_cancellation_authority(
+            &progress,
+            AdmissionClaimSettlementOutcome::ConsumedOrTransferred,
+        );
+        mismatched.claim_proofs[0].0.outcome = AdmissionClaimSettlementOutcome::Held;
+        assert_eq!(
+            progress.finish_post_publish_cancellation(mismatched),
+            Err(WorkProgressError::ForwardCancellationClaimQualificationMismatch)
+        );
+        assert_eq!(progress, before_claim);
+    }
+
+    #[test]
+    fn forward_cancellation_rejections_are_atomic_and_bounded() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1608).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+
+        let before_foreign = progress.clone();
+        let mut foreign =
+            forward_cancellation_authority(&progress, AdmissionClaimSettlementOutcome::Released);
+        foreign.operation_id = OperationId::from_uuid(Uuid::from_u128(1609));
+        assert_eq!(
+            progress.finish_post_publish_cancellation(foreign),
+            Err(WorkProgressError::ForwardCancellationAuthorityMismatch)
+        );
+        assert_eq!(progress, before_foreign);
+
+        let before_epoch = progress.clone();
+        let mut stale =
+            forward_cancellation_authority(&progress, AdmissionClaimSettlementOutcome::Released);
+        stale.execution_epoch = stale.execution_epoch.saturating_add(1);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(stale),
+            Err(WorkProgressError::ForwardCancellationEpochMismatch {
+                expected: progress.execution_epoch(),
+                actual: 1,
+            })
+        );
+        assert_eq!(progress, before_epoch);
+
+        let before_missing_proof = progress.clone();
+        let mut missing_proof =
+            forward_cancellation_authority(&progress, AdmissionClaimSettlementOutcome::Released);
+        missing_proof.effect_proofs.pop();
+        assert_eq!(
+            progress.finish_post_publish_cancellation(missing_proof),
+            Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch)
+        );
+        assert_eq!(progress, before_missing_proof);
+
+        let before_wrong_recipe = progress.clone();
+        let mut wrong_recipe = forward_cancellation_authority_with_class_policy(&progress);
+        let wrong_recipe_observation = wrong_recipe.effect_proofs[0].observation();
+        wrong_recipe.effect_proofs[0] =
+            ForwardEffectQualificationProof::StagedMove(wrong_recipe_observation);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(wrong_recipe),
+            Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch)
+        );
+        assert_eq!(progress, before_wrong_recipe);
+
+        let before_wrong_receipts = progress.clone();
+        let mut wrong_receipts = forward_cancellation_authority_with_class_policy(&progress);
+        match &mut wrong_receipts.effect_proofs[0] {
+            ForwardEffectQualificationProof::StagedPublish(observation) => {
+                observation.receipt_keys.pop();
+            }
+            _ => panic!("copy fixture must produce a staged-publish proof"),
+        }
+        assert_eq!(
+            progress.finish_post_publish_cancellation(wrong_receipts),
+            Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch)
+        );
+        assert_eq!(progress, before_wrong_receipts);
+
+        let before_duplicate_proof = progress.clone();
+        let mut duplicate_proof = forward_cancellation_authority_with_class_policy(&progress);
+        let duplicate = duplicate_proof
+            .effect_proofs
+            .first()
+            .cloned()
+            .expect("copy effect proof");
+        duplicate_proof.effect_proofs.push(duplicate);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(duplicate_proof),
+            Err(WorkProgressError::ForwardCancellationEffectQualificationMismatch)
+        );
+        assert_eq!(progress, before_duplicate_proof);
+
+        let before_held = progress.clone();
+        let held = forward_cancellation_authority(&progress, AdmissionClaimSettlementOutcome::Held);
+        assert_eq!(
+            progress.finish_post_publish_cancellation(held),
+            Err(WorkProgressError::ForwardCancellationHeldClaim)
+        );
+        assert_eq!(progress, before_held);
+
+        let mut pending = copy_progress_with_admission_claims();
+        publish_prefix(&mut pending);
+        pending
+            .request_cancellation(CancellationRequestObservation::new(1610).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_observed_after_effect_reconciliation(&mut pending);
+        accept_pending_cleanup_observations(&mut pending);
+        let before_pending = pending.clone();
+        let pending_authority =
+            forward_cancellation_authority(&pending, AdmissionClaimSettlementOutcome::Released);
+        assert_eq!(
+            pending.finish_post_publish_cancellation(pending_authority),
+            Err(WorkProgressError::ForwardCancellationCleanupIncomplete)
+        );
+        assert_eq!(pending, before_pending);
+
+        let mut overflow = progress.clone();
+        let mut overflow_authority =
+            forward_cancellation_authority(&overflow, AdmissionClaimSettlementOutcome::Released);
+        overflow.recovery_generation = u64::MAX;
+        overflow_authority.expected_recovery_generation = u64::MAX;
+        overflow_authority.next_recovery_generation = u64::MAX;
+        let before_overflow = overflow.clone();
+        assert_eq!(
+            overflow.finish_post_publish_cancellation(overflow_authority),
+            Err(WorkProgressError::ForwardCancellationGenerationOverflow)
+        );
+        assert_eq!(overflow, before_overflow);
+
+        let mut pending_closure = copy_progress_with_admission_claims();
+        publish_prefix(&mut pending_closure);
+        pending_closure
+            .request_cancellation(CancellationRequestObservation::new(1629).expect("cancel"))
+            .expect("pending-closure cancellation");
+        accept_empty_after_effect_reconciliation(&mut pending_closure);
+        accept_qualified_cleanup_observations(&mut pending_closure);
+        let before_pending_closure = pending_closure.clone();
+        assert_eq!(
+            pending_closure.finish_post_publish_cancellation(
+                forward_cancellation_authority_with_class_policy(&pending_closure),
+            ),
+            Err(WorkProgressError::ForwardCancellationEvidenceIncomplete)
+        );
+        assert_eq!(pending_closure, before_pending_closure);
+    }
+
+    #[test]
+    fn forward_cancellation_authority_is_invalidated_by_source_reacquisition() {
+        let mut progress = copy_progress_with_admission_claims();
+        publish_prefix(&mut progress);
+        progress
+            .request_cancellation(CancellationRequestObservation::new(1612).expect("cancel"))
+            .expect("after-publish cancellation");
+        accept_empty_after_effect_reconciliation(&mut progress);
+        accept_qualified_cleanup_observations(&mut progress);
+        let authority = forward_cancellation_authority_with_class_policy(&progress);
+        let source_key = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_key.participant_id(),
+                7,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        let before = progress.clone();
+        assert_eq!(
+            progress.finish_post_publish_cancellation(authority),
+            Err(WorkProgressError::ForwardCancellationEpochMismatch {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(progress, before);
     }
 
     #[test]
