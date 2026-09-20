@@ -7608,13 +7608,24 @@ mod tests {
         with_optional_artifact: bool,
         fence: StoredSourceFence,
     ) -> (ParticipantSet, ParticipantId, ParticipantId, SourceId) {
+        let artifact_keys = if with_optional_artifact {
+            vec!["waveform"]
+        } else {
+            Vec::new()
+        };
+        topology_with_source_fence_and_artifacts(fence, &artifact_keys)
+    }
+
+    fn topology_with_source_fence_and_artifacts(
+        fence: StoredSourceFence,
+        artifact_keys: &[&str],
+    ) -> (ParticipantSet, ParticipantId, ParticipantId, SourceId) {
         let source = participant_id(1);
         let filesystem = participant_id(2);
         let global = participant_id(3);
         let harvest = participant_id(4);
         let projection = participant_id(5);
         let readiness = participant_id(6);
-        let artifact = participant_id(7);
         let source_id = fence.source_id().clone();
         let mut descriptors = vec![
             ParticipantDescriptor::new(
@@ -7666,14 +7677,14 @@ mod tests {
             )
             .expect("readiness descriptor"),
         ];
-        if with_optional_artifact {
+        for (index, artifact_key) in artifact_keys.iter().enumerate() {
             descriptors.push(
                 ParticipantDescriptor::new(
-                    artifact,
+                    participant_id(7 + index as u128),
                     ParticipantKind::Artifact,
                     ParticipantRequirement::OptionalRebuildable,
-                    Some(fence),
-                    Some("waveform".to_owned()),
+                    Some(fence.clone()),
+                    Some((*artifact_key).to_owned()),
                 )
                 .expect("artifact descriptor"),
             );
@@ -7924,8 +7935,27 @@ mod tests {
     }
 
     fn copy_progress_with_source_fence(fence: StoredSourceFence) -> WorkProgress {
+        copy_progress_with_source_fence_and_optional(fence, false)
+    }
+
+    fn copy_progress_with_source_fence_and_optional(
+        fence: StoredSourceFence,
+        with_optional_artifact: bool,
+    ) -> WorkProgress {
+        let artifact_keys = if with_optional_artifact {
+            vec!["waveform"]
+        } else {
+            Vec::new()
+        };
+        copy_progress_with_source_fence_and_artifacts(fence, &artifact_keys)
+    }
+
+    fn copy_progress_with_source_fence_and_artifacts(
+        fence: StoredSourceFence,
+        artifact_keys: &[&str],
+    ) -> WorkProgress {
         let (participants, source, _filesystem, source_id) =
-            topology_with_source_fence(false, fence);
+            topology_with_source_fence_and_artifacts(fence, artifact_keys);
         let source_revision = participants
             .descriptors()
             .iter()
@@ -10440,6 +10470,63 @@ mod tests {
             database,
             owner,
             readiness,
+            qualification,
+        )
+    }
+
+    fn owned_readiness_deferral_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        AppRootGuard,
+        WritableProfileGuard,
+        SourceDatabase,
+        dispatch_owner::LiveDispatchOwner,
+        WorkUnitKey,
+        WorkUnitKey,
+        WorkUnitKey,
+        crate::sample_sources::readiness::ReadinessWakeQualification,
+    ) {
+        let (
+            app_root,
+            source_root,
+            app_root_guard,
+            profile_guard,
+            mut database,
+            qualification,
+            fence,
+        ) = owned_readiness_source();
+        let mut owner = dispatch_owner::LiveDispatchOwner::new_for_test(
+            copy_progress_with_source_fence_and_artifacts(fence, &["waveform-a", "waveform-b"]),
+        )
+        .expect("owned readiness deferral owner");
+        let readiness = global_key(owner.progress(), WorkUnitRole::Readiness);
+        owner_complete_before_readiness(&mut owner, readiness);
+        let reserved = owner.issue(readiness).expect("readiness reservation");
+        let entered = owner.enter(reserved).expect("readiness entry");
+        let row = owned_readiness_row(&owner, readiness, &qualification);
+        owner
+            .complete_readiness_scheduled(entered, &mut database, &row)
+            .expect("owned readiness completion");
+        let mut artifacts = owner
+            .progress()
+            .steps()
+            .iter()
+            .filter(|step| step.key().role() == WorkUnitRole::Artifact)
+            .map(WorkProgressStep::key)
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 2);
+        let artifact = artifacts.remove(0);
+        let unlisted_artifact = artifacts.remove(0);
+        (
+            app_root,
+            source_root,
+            app_root_guard,
+            profile_guard,
+            database,
+            owner,
+            readiness,
+            artifact,
+            unlisted_artifact,
             qualification,
         )
     }
@@ -22990,6 +23077,337 @@ mod tests {
         owner
             .complete_readiness_scheduled(entered, &mut database, &row)
             .expect("corrected physical identity remains retryable");
+    }
+
+    #[test]
+    fn live_dispatch_owner_defers_owned_subset_and_replays_without_reviving() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            _readiness,
+            artifact,
+            unlisted_artifact,
+            qualification,
+        ) = owned_readiness_deferral_fixture();
+        let source_id = SourceId::from_string(qualification.observation().source_id());
+        let observation = readiness_deferral_observation(owner.progress(), &[artifact], 1);
+        let before = owner.progress().clone();
+        let mut source_databases = [(&source_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation.clone(), &mut source_databases),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(
+            owner
+                .progress()
+                .step_for(artifact)
+                .expect("selected artifact")
+                .status(),
+            ProgressStepStatus::Deferred
+        );
+        assert_eq!(
+            owner
+                .progress()
+                .step_for(unlisted_artifact)
+                .expect("unlisted artifact")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+        assert_ne!(owner.progress(), &before);
+        let after = owner.progress().clone();
+
+        let mut source_databases = [(&source_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation, &mut source_databases),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+        assert_eq!(owner.progress(), &after);
+        assert!(matches!(
+            owner.issue(artifact),
+            Err(dispatch_owner::DispatchOwnerError::NotPending { key }) if key == artifact
+        ));
+    }
+
+    #[test]
+    fn live_dispatch_owner_deferral_requires_exact_sources_and_generation() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            _readiness,
+            artifact,
+            _unlisted_artifact,
+            qualification,
+        ) = owned_readiness_deferral_fixture();
+        let source_id = SourceId::from_string(qualification.observation().source_id());
+        let observation = readiness_deferral_observation(owner.progress(), &[artifact], 1);
+
+        let before_missing = owner.progress().clone();
+        let mut missing: [(&SourceId, &mut SourceDatabase); 0] = [];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation.clone(), &mut missing),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "source_database_mapping"
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before_missing);
+
+        let extra_id = SourceId::from_string("extra-readiness-source");
+        let before_extra = owner.progress().clone();
+        let mut extra = [(&extra_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation.clone(), &mut extra),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "source_database_mapping"
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before_extra);
+
+        let before_epoch = owner.progress().clone();
+        let mut source_databases = [(&source_id, &mut database)];
+        assert!(matches!(
+            owner.defer_readiness_scheduled(1, 0, observation.clone(), &mut source_databases),
+            Err(dispatch_owner::DispatchOwnerError::Progress(
+                WorkProgressError::ReadinessDeferralEpochMismatch {
+                    expected: 0,
+                    actual: 1
+                }
+            ))
+        ));
+        assert_eq!(owner.progress(), &before_epoch);
+
+        let before_generation = owner.progress().clone();
+        let mut source_databases = [(&source_id, &mut database)];
+        assert!(matches!(
+            owner.defer_readiness_scheduled(0, 1, observation.clone(), &mut source_databases),
+            Err(dispatch_owner::DispatchOwnerError::Progress(
+                WorkProgressError::ReadinessDeferralGenerationMismatch {
+                    expected: 2,
+                    actual: 1
+                }
+            ))
+        ));
+        assert_eq!(owner.progress(), &before_generation);
+
+        let mut changed_json = serde_json::to_value(&observation).expect("observation JSON");
+        changed_json["rows"][0]["wake"]["owner_revision"] = serde_json::json!(2);
+        let changed: ReadinessSchedulingObservationRecord =
+            serde_json::from_value(changed_json).expect("changed wake observation");
+        let before_wake = owner.progress().clone();
+        let mut source_databases = [(&source_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, changed, &mut source_databases),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "owner_revision"
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before_wake);
+    }
+
+    #[test]
+    fn live_dispatch_owner_deferral_rejects_foreign_database_atomically() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            profile_guard,
+            mut database,
+            mut owner,
+            _readiness,
+            artifact,
+            _unlisted_artifact,
+            qualification,
+        ) = owned_readiness_deferral_fixture();
+        let source_id = SourceId::from_string(qualification.observation().source_id());
+        let foreign_root = tempdir().expect("foreign source root");
+        let mut foreign_database = SourceDatabase::open_for_catalog_with_profile_guard(
+            foreign_root.path(),
+            &profile_guard,
+            "foreign-readiness-source",
+        )
+        .expect("foreign source database");
+        let target = ReadinessTarget::source(
+            source_id.as_str(),
+            ReadinessStage::SimilarityLayout,
+            "layout-v1",
+            1,
+            "membership-v1",
+        );
+        let targets = [target];
+        {
+            let mut store = foreign_database
+                .readiness_store()
+                .expect("foreign readiness store");
+            let origin = store
+                .capture_publication_origin()
+                .expect("foreign publication origin");
+            store
+                .publish_targets(
+                    &origin,
+                    &ReadinessTargetPublication::new(
+                        source_id.as_str(),
+                        1,
+                        1,
+                        SourceAvailability::Active,
+                        "readiness-contract-v1",
+                        &targets,
+                        1,
+                    ),
+                )
+                .expect("foreign readiness publication");
+        }
+        let observation = readiness_deferral_observation(owner.progress(), &[artifact], 1);
+        let before = owner.progress().clone();
+        let mut duplicate_sources = [
+            (&source_id, &mut database),
+            (&source_id, &mut foreign_database),
+        ];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation.clone(), &mut duplicate_sources),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "source_database_mapping"
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before);
+        let mut source_databases = [(&source_id, &mut foreign_database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation, &mut source_databases),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "root_identity"
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before);
+    }
+
+    #[test]
+    fn live_dispatch_owner_deferral_respects_selected_permit_states() {
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            _readiness,
+            artifact,
+            _unlisted_artifact,
+            qualification,
+        ) = owned_readiness_deferral_fixture();
+        let source_id = SourceId::from_string(qualification.observation().source_id());
+        let observation = readiness_deferral_observation(owner.progress(), &[artifact], 1);
+        let reserved = owner.issue(artifact).expect("selected reservation");
+        let before_reserved = owner.progress().clone();
+        let mut source_databases = [(&source_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation.clone(), &mut source_databases),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessDeferralPermitOutstanding {
+                    key: artifact,
+                    state: dispatch_owner::DispatchLedgerState::Reserved
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before_reserved);
+        let entered = owner.enter(reserved).expect("selected entry");
+        let before_entered = owner.progress().clone();
+        let mut source_databases = [(&source_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation.clone(), &mut source_databases),
+            Err(
+                dispatch_owner::DispatchOwnerError::ReadinessDeferralPermitOutstanding {
+                    key: artifact,
+                    state: dispatch_owner::DispatchLedgerState::Entered
+                }
+            )
+        );
+        assert_eq!(owner.progress(), &before_entered);
+        drop(entered);
+
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            mut database,
+            mut owner,
+            _readiness,
+            artifact,
+            _unlisted_artifact,
+            qualification,
+        ) = owned_readiness_deferral_fixture();
+        let source_id = SourceId::from_string(qualification.observation().source_id());
+        let observation = readiness_deferral_observation(owner.progress(), &[artifact], 1);
+        let reserved = owner.issue(artifact).expect("selected reservation");
+        owner
+            .return_reserved(reserved)
+            .expect("explicit never-entered return");
+        let mut source_databases = [(&source_id, &mut database)];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation, &mut source_databases),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(
+            owner.ledger_state(artifact),
+            Some(dispatch_owner::DispatchLedgerState::ReturnedNeverEntered)
+        );
+        assert_eq!(
+            owner
+                .progress()
+                .step_for(artifact)
+                .expect("deferred artifact")
+                .status(),
+            ProgressStepStatus::Deferred
+        );
+
+        let (
+            _app_root,
+            _source_root,
+            _app_root_guard,
+            _profile_guard,
+            _database,
+            mut owner,
+            _readiness,
+            artifact,
+            _unlisted_artifact,
+            _qualification,
+        ) = owned_readiness_deferral_fixture();
+        let observation = readiness_deferral_observation(owner.progress(), &[artifact], 1);
+        let reserved = owner.issue(artifact).expect("selected reservation");
+        owner
+            .request_cancellation(CancellationRequestObservation::new(26001).expect("cancel"))
+            .expect("cancellation closes issuance");
+        let late = owner
+            .retire_reserved_uncertain(reserved)
+            .expect("uncertain retirement");
+        let before_uncertain = owner.progress().clone();
+        let mut source_databases: [(&SourceId, &mut SourceDatabase); 0] = [];
+        assert_eq!(
+            owner.defer_readiness_scheduled(0, 0, observation, &mut source_databases),
+            Err(dispatch_owner::DispatchOwnerError::IssuanceClosed)
+        );
+        assert_eq!(owner.progress(), &before_uncertain);
+        assert_eq!(
+            owner.ledger_state(artifact),
+            Some(dispatch_owner::DispatchLedgerState::ReturnedUncertain)
+        );
+        drop(late);
     }
 
     #[test]

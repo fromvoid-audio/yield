@@ -12,13 +12,13 @@
 //! an in-memory observation binding and is not wired to settlement, terminal progress, or
 //! filesystem execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
 use crate::operation_journal::CancellationDispatchOutcomeRow;
-use crate::sample_sources::{SourceDatabase, readiness::ReadinessError};
+use crate::sample_sources::{SourceDatabase, SourceId, readiness::ReadinessError};
 
 use super::{
     CancellationCoordinatorClosureObservationRecord, CancellationDispatchOutcome,
@@ -26,9 +26,9 @@ use super::{
     CancellationNamespaceCleanupObservationRecord, CancellationRequestObservation,
     CancellationResourceCleanupObservationRecord, CancellationSourceClosureObservationRecord,
     CompletionContext, FullProgressDisposition, OperationId, OperationPhase, ParticipantScope,
-    ProgressApplyOutcome, ProgressStepStatus, ReadinessSchedulingObservationRow,
-    StoredStepEvidence, WorkPlan, WorkProgress, WorkProgressError, WorkUnitApplicability,
-    WorkUnitKey,
+    ProgressApplyOutcome, ProgressStepStatus, ReadinessSchedulingObservationRecord,
+    ReadinessSchedulingObservationRow, StoredStepEvidence, WorkPlan, WorkProgress,
+    WorkProgressError, WorkUnitApplicability, WorkUnitKey,
 };
 
 static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -146,6 +146,14 @@ pub(super) enum DispatchOwnerError {
     ReadinessQualificationMismatch {
         /// Exact field whose source-side observation differed.
         field: &'static str,
+    },
+    /// A selected optional artifact still has an issued or unresolved dispatch permit.
+    #[error("readiness deferral has an unresolved dispatch permit for {key:?}: {state:?}")]
+    ReadinessDeferralPermitOutstanding {
+        /// Artifact whose permit must be explicitly retired or completed first.
+        key: WorkUnitKey,
+        /// Existing owner ledger state that prevents deferral.
+        state: DispatchLedgerState,
     },
     /// The frozen dispatch manifest could not be derived.
     #[error(transparent)]
@@ -749,6 +757,105 @@ impl LiveDispatchOwner {
             },
         );
         Ok(outcome)
+    }
+
+    /// Defer an exact optional-artifact subset after freshly qualifying every readiness row
+    /// against its owned source database.
+    ///
+    /// The source mapping is explicit and bounded by the candidate rows.  It must contain each
+    /// distinct persisted source namespace exactly once, with no extra database.  Qualification
+    /// is performed immediately before constructing the private deferral authority; the raw
+    /// scheduling observation cannot authorize a deferral by itself.
+    pub(super) fn defer_readiness_scheduled(
+        &mut self,
+        expected_execution_epoch: u64,
+        expected_previous_generation: u64,
+        observation: ReadinessSchedulingObservationRecord,
+        source_databases: &mut [(&SourceId, &mut SourceDatabase)],
+    ) -> Result<ProgressApplyOutcome, DispatchOwnerError> {
+        if self.lifecycle != DispatchOwnerLifecycle::Open {
+            return Err(DispatchOwnerError::IssuanceClosed);
+        }
+        if expected_execution_epoch != self.progress.execution_epoch() {
+            return Err(DispatchOwnerError::Progress(
+                WorkProgressError::ReadinessDeferralEpochMismatch {
+                    expected: self.progress.execution_epoch(),
+                    actual: expected_execution_epoch,
+                },
+            ));
+        }
+
+        let selected_artifact_keys = observation.manifest().artifact_keys();
+        self.progress
+            .validate_readiness_scheduling_observation_record(&observation, selected_artifact_keys)
+            .map_err(DispatchOwnerError::Progress)?;
+
+        for artifact in selected_artifact_keys {
+            if let Some(entry) = self.ledger.get(artifact) {
+                let state = entry.state();
+                if matches!(
+                    state,
+                    DispatchLedgerState::Reserved
+                        | DispatchLedgerState::Entered
+                        | DispatchLedgerState::ReturnedUncertain
+                ) {
+                    return Err(DispatchOwnerError::ReadinessDeferralPermitOutstanding {
+                        key: *artifact,
+                        state,
+                    });
+                }
+            }
+        }
+
+        let required_sources = observation
+            .rows()
+            .iter()
+            .map(|row| row.source_observation().source_id().clone())
+            .collect::<HashSet<_>>();
+        let mut supplied_sources = HashSet::new();
+        for (source_id, _) in source_databases.iter() {
+            if !supplied_sources.insert((*source_id).clone()) {
+                return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "source_database_mapping",
+                });
+            }
+        }
+        if supplied_sources != required_sources {
+            return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+                field: "source_database_mapping",
+            });
+        }
+
+        for row in observation.rows() {
+            let source_id = row.source_observation().source_id();
+            let Some((_, source_database)) = source_databases
+                .iter_mut()
+                .find(|(mapped_id, _)| mapped_id.as_str() == source_id.as_str())
+            else {
+                return Err(DispatchOwnerError::ReadinessQualificationMismatch {
+                    field: "source_database_mapping",
+                });
+            };
+            let mut readiness_store = source_database
+                .readiness_store_read_only()
+                .map_err(|_| DispatchOwnerError::ReadinessQualificationUnavailable)?;
+            let qualification = readiness_store
+                .qualify_readiness_wake(source_id.as_str())
+                .map_err(map_readiness_qualification_error)?;
+            drop(readiness_store);
+            validate_live_readiness_row(row, &qualification)?;
+        }
+
+        let authority = super::VerifiedReadinessDeferral {
+            operation_id: self.progress.operation_id,
+            plan: self.progress.plan.clone(),
+            execution_epoch: expected_execution_epoch,
+            expected_previous_generation,
+            observation,
+        };
+        self.progress
+            .apply_verified_readiness_deferral(authority)
+            .map_err(DispatchOwnerError::Progress)
     }
 
     /// Explicitly return a reserved permit that never entered work.
