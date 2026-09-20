@@ -580,6 +580,17 @@ impl OperationJournalStore {
         recovery::scan_page(self, cursor)
     }
 
+    /// Read one bounded combined recovery page from the legacy and full-progress families.
+    ///
+    /// This crate-internal observation path never restores a live progress value or grants any
+    /// owner, permit, admission, or filesystem authority.
+    pub(crate) fn scan_coordinator_recovery_page(
+        &self,
+        cursor: Option<recovery::RecoveryCursor>,
+    ) -> Result<recovery::CoordinatorRecoveryPage, recovery::RecoveryScanError> {
+        recovery::scan_coordinator_page(self, cursor)
+    }
+
     fn open_inner(
         profile_guard: &WritableProfileGuard,
         #[cfg(test)] before_sqlite_open: Option<&dyn Fn(&Path)>,

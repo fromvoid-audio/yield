@@ -11,8 +11,13 @@ use thiserror::Error;
 
 use super::{JOURNAL_TABLE_NAME, OperationJournalStore, OperationJournalStoreError};
 use crate::operation_journal::codec::{DecodeError, StoredOperationRecord, decode};
+use crate::operation_journal::full_progress_codec::{
+    FullProgressCodecError, StoredFullProgressRecord, decode as decode_full_progress,
+};
 use crate::operation_journal::model::{MAX_RECORD_BYTES, OperationId};
 use crate::operation_journal::validation::RecordConsistency;
+
+use super::FULL_PROGRESS_TABLE_NAME;
 
 /// Maximum number of rows returned by one recovery page.
 pub const MAX_RECOVERY_ROWS_PER_PAGE: usize = 16;
@@ -23,6 +28,89 @@ const PAGE_QUERY_LIMIT: i64 = (MAX_RECOVERY_ROWS_PER_PAGE + 1) as i64;
 const MAX_OPERATION_KEY_BYTES: i64 = 128;
 const MAX_OPERATION_KEY_PREVIEW_BYTES: i64 = MAX_OPERATION_KEY_BYTES + 1;
 const MAX_DIAGNOSTIC_CHARS: usize = 256;
+
+/// The journal family that owns one combined-recovery row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryFamily {
+    /// The legacy operation-journal record family.
+    Legacy,
+    /// The internal full-progress observation family.
+    FullProgress,
+}
+
+/// A decoded record retained by the combined recovery scanner.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CoordinatorRecoveryRecord {
+    /// A validated legacy operation record.
+    Legacy(StoredOperationRecord),
+    /// A validated full-progress observation record.
+    FullProgress(StoredFullProgressRecord),
+}
+
+/// One family-aware combined recovery row outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CoordinatorRecoveryRowOutcome {
+    /// The stored observation passed its family-specific validation.
+    Consistent(CoordinatorRecoveryRecord),
+    /// The source row remains retained with a bounded audit reason.
+    Retained(RecoveryRetentionReason),
+}
+
+/// One bounded row from the combined legacy/full recovery page.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CoordinatorRecoveryEntry {
+    family: RecoveryFamily,
+    key: RecoveryKey,
+    sequence: i64,
+    outcome: CoordinatorRecoveryRowOutcome,
+}
+
+#[allow(dead_code)]
+impl CoordinatorRecoveryEntry {
+    pub(crate) const fn family(&self) -> RecoveryFamily {
+        self.family
+    }
+
+    pub(crate) fn key(&self) -> &RecoveryKey {
+        &self.key
+    }
+
+    pub(crate) const fn sequence(&self) -> i64 {
+        self.sequence
+    }
+
+    pub(crate) fn outcome(&self) -> &CoordinatorRecoveryRowOutcome {
+        &self.outcome
+    }
+}
+
+/// One bounded combined recovery page.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CoordinatorRecoveryPage {
+    entries: Vec<CoordinatorRecoveryEntry>,
+    next_cursor: Option<RecoveryCursor>,
+    done: bool,
+    encoded_bytes: usize,
+}
+
+#[allow(dead_code)]
+impl CoordinatorRecoveryPage {
+    pub(crate) fn entries(&self) -> &[CoordinatorRecoveryEntry] {
+        &self.entries
+    }
+
+    pub(crate) const fn next_cursor(&self) -> Option<RecoveryCursor> {
+        self.next_cursor
+    }
+
+    pub(crate) const fn is_done(&self) -> bool {
+        self.done
+    }
+
+    pub(crate) const fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+}
 
 /// An opaque positive journal-observation cursor returned by a recovery page.
 ///
@@ -209,6 +297,429 @@ pub(super) fn scan_page(
     match post_validation {
         Err(error) => Err(error),
         Ok(()) => result,
+    }
+}
+
+pub(super) fn scan_coordinator_page(
+    store: &OperationJournalStore,
+    cursor: Option<RecoveryCursor>,
+) -> Result<CoordinatorRecoveryPage, RecoveryScanError> {
+    store
+        .validate_namespace()
+        .map_err(RecoveryScanError::Store)?;
+    store
+        .connection
+        .execute_batch("BEGIN")
+        .map_err(store_error)?;
+    let result = (|| {
+        store
+            .validate_namespace_for_precommit()
+            .map_err(RecoveryScanError::Store)?;
+        scan_coordinator_page_inner(store, cursor)
+    })();
+    match result {
+        Ok(page) => {
+            #[cfg(test)]
+            let _ =
+                store.insert_test_directive(super::InsertTestBoundary::BeforePrecommitValidation);
+            if let Err(error) = store.validate_namespace_for_precommit() {
+                let _ = store.connection.execute_batch("ROLLBACK");
+                return Err(RecoveryScanError::Store(error));
+            }
+            if let Err(error) = store.connection.execute_batch("COMMIT") {
+                let _ = store.connection.execute_batch("ROLLBACK");
+                return Err(store_error(error));
+            }
+            store
+                .validate_namespace()
+                .map_err(RecoveryScanError::Store)?;
+            Ok(page)
+        }
+        Err(error) => {
+            let _ = store.connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn scan_coordinator_page_inner(
+    store: &OperationJournalStore,
+    cursor: Option<RecoveryCursor>,
+) -> Result<CoordinatorRecoveryPage, RecoveryScanError> {
+    let statement = match cursor {
+        Some(_) => format!(
+            "SELECT family, rowid,
+                    typeof(operation_id), length(CAST(operation_id AS BLOB)),
+                    CASE WHEN typeof(operation_id) = 'text'
+                         THEN substr(CAST(operation_id AS BLOB), 1, ?3)
+                         ELSE NULL END,
+                    sequence, typeof(sequence),
+                    typeof(record), length(record)
+             FROM (
+                 SELECT 0 AS family, rowid, operation_id, sequence, record
+                 FROM operation_journal WHERE sequence > ?1
+                 UNION ALL
+                 SELECT 1 AS family, rowid, operation_id, sequence, record
+                 FROM operation_journal_full_progress WHERE sequence > ?1
+             )
+             ORDER BY sequence ASC, rowid ASC, family ASC
+             LIMIT ?2"
+        ),
+        None => format!(
+            "SELECT family, rowid,
+                    typeof(operation_id), length(CAST(operation_id AS BLOB)),
+                    CASE WHEN typeof(operation_id) = 'text'
+                         THEN substr(CAST(operation_id AS BLOB), 1, ?2)
+                         ELSE NULL END,
+                    sequence, typeof(sequence),
+                    typeof(record), length(record)
+             FROM (
+                 SELECT 0 AS family, rowid, operation_id, sequence, record
+                 FROM operation_journal
+                 UNION ALL
+                 SELECT 1 AS family, rowid, operation_id, sequence, record
+                 FROM operation_journal_full_progress
+             )
+             ORDER BY sequence ASC, rowid ASC, family ASC
+             LIMIT ?1"
+        ),
+    };
+    let mut statement = store.connection.prepare(&statement).map_err(store_error)?;
+    let mut query_rows = match cursor {
+        Some(cursor) => statement
+            .query(params![
+                cursor.sequence(),
+                PAGE_QUERY_LIMIT,
+                MAX_OPERATION_KEY_PREVIEW_BYTES,
+            ])
+            .map_err(store_error)?,
+        None => statement
+            .query(params![PAGE_QUERY_LIMIT, MAX_OPERATION_KEY_PREVIEW_BYTES])
+            .map_err(store_error)?,
+    };
+    let mut candidates = Vec::with_capacity(MAX_RECOVERY_ROWS_PER_PAGE + 1);
+    while let Some(row) = query_rows.next().map_err(store_error)? {
+        candidates.push(read_coordinator_candidate(row)?);
+    }
+    drop(query_rows);
+    drop(statement);
+
+    let mut previous_sequence = cursor.map(RecoveryCursor::sequence);
+    for candidate in &candidates {
+        if previous_sequence.is_some_and(|previous| candidate.sequence <= previous) {
+            return Err(RecoveryScanError::RequiresAudit {
+                reason: bounded_reason(format!(
+                    "recovery sequence {} did not advance past cursor or prior row",
+                    candidate.sequence
+                )),
+            });
+        }
+        ensure_sequence_unique(store, candidate.sequence)?;
+        previous_sequence = Some(candidate.sequence);
+    }
+    if candidates.is_empty() {
+        return Ok(CoordinatorRecoveryPage {
+            entries: Vec::new(),
+            next_cursor: None,
+            done: true,
+            encoded_bytes: 0,
+        });
+    }
+
+    let mut entries = Vec::with_capacity(MAX_RECOVERY_ROWS_PER_PAGE);
+    let mut encoded_bytes = 0_usize;
+    let mut deferred = false;
+    let mut last_sequence = cursor.map(RecoveryCursor::sequence);
+
+    for candidate in &candidates {
+        if entries.len() >= MAX_RECOVERY_ROWS_PER_PAGE {
+            deferred = true;
+            break;
+        }
+
+        let mut entry = CoordinatorRecoveryEntry {
+            family: candidate.family,
+            key: candidate.key.clone(),
+            sequence: candidate.sequence,
+            outcome: CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::Malformed {
+                reason: String::from("combined recovery row was not classified"),
+            }),
+        };
+
+        if let Some(reason) = candidate.key_issue.as_ref() {
+            entry.outcome = CoordinatorRecoveryRowOutcome::Retained(reason.clone());
+            entries.push(entry);
+            last_sequence = Some(candidate.sequence);
+            continue;
+        }
+
+        if let RecoveryKey::OperationId(operation_id) = candidate.key {
+            let (legacy_present, full_progress_present) = store
+                .operation_family_presence(operation_id)
+                .map_err(RecoveryScanError::Store)?;
+            if legacy_present && full_progress_present {
+                entry.outcome =
+                    CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::Malformed {
+                        reason: bounded_reason(format!(
+                            "operation id {operation_id} is present in both journal families"
+                        )),
+                    });
+                entries.push(entry);
+                last_sequence = Some(candidate.sequence);
+                continue;
+            }
+        }
+
+        if candidate.record_type != "blob" {
+            entry.outcome =
+                CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::TypeInvalid {
+                    field: RecoveryField::Record,
+                    sql_type: candidate.record_type.clone(),
+                    reason: String::from("record column must contain a SQLite BLOB"),
+                });
+            entries.push(entry);
+            last_sequence = Some(candidate.sequence);
+            continue;
+        }
+
+        let Some(declared_length) = candidate.record_length else {
+            entry.outcome =
+                CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::SizeInvalid {
+                    declared: None,
+                    reason: String::from("record length is NULL"),
+                });
+            entries.push(entry);
+            last_sequence = Some(candidate.sequence);
+            continue;
+        };
+        if declared_length < 0 || declared_length as usize > MAX_RECORD_BYTES {
+            entry.outcome =
+                CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::SizeInvalid {
+                    declared: Some(declared_length),
+                    reason: String::from("record length exceeds the bounded record size"),
+                });
+            entries.push(entry);
+            last_sequence = Some(candidate.sequence);
+            continue;
+        }
+        let declared_length = declared_length as usize;
+        if encoded_bytes.saturating_add(declared_length) > MAX_RECOVERY_BYTES_PER_PAGE {
+            deferred = true;
+            break;
+        }
+
+        let Some(encoded) = load_coordinator_record_bytes(store, candidate)? else {
+            entry.outcome =
+                CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::SizeInvalid {
+                    declared: Some(declared_length as i64),
+                    reason: String::from(
+                        "record disappeared before its bounded value could be read",
+                    ),
+                });
+            entries.push(entry);
+            last_sequence = Some(candidate.sequence);
+            continue;
+        };
+        if encoded.len() != declared_length {
+            return Err(RecoveryScanError::RequiresAudit {
+                reason: String::from("record length changed during bounded recovery read"),
+            });
+        }
+        encoded_bytes = encoded_bytes.saturating_add(encoded.len());
+        entry.outcome = decode_coordinator_outcome(candidate, &encoded);
+        entries.push(entry);
+        last_sequence = Some(candidate.sequence);
+    }
+
+    let Some(last_sequence) = last_sequence else {
+        return Err(RecoveryScanError::RequiresAudit {
+            reason: String::from("the first recovery row could not advance a positive cursor"),
+        });
+    };
+    if entries.is_empty() && deferred {
+        return Err(RecoveryScanError::RequiresAudit {
+            reason: String::from("the first recovery row cannot fit within the page bound"),
+        });
+    }
+
+    let done = !deferred && candidates.len() <= MAX_RECOVERY_ROWS_PER_PAGE;
+    Ok(CoordinatorRecoveryPage {
+        entries,
+        next_cursor: (!done).then_some(RecoveryCursor(last_sequence)),
+        done,
+        encoded_bytes,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CoordinatorRecoveryCandidate {
+    family: RecoveryFamily,
+    rowid: i64,
+    key: RecoveryKey,
+    key_issue: Option<RecoveryRetentionReason>,
+    sequence: i64,
+    record_type: String,
+    record_length: Option<i64>,
+}
+
+fn read_coordinator_candidate(
+    row: &rusqlite::Row<'_>,
+) -> Result<CoordinatorRecoveryCandidate, RecoveryScanError> {
+    let family = match row.get::<_, i64>(0).map_err(store_error)? {
+        0 => RecoveryFamily::Legacy,
+        1 => RecoveryFamily::FullProgress,
+        other => {
+            return Err(RecoveryScanError::RequiresAudit {
+                reason: bounded_reason(format!("unknown recovery row family {other}")),
+            });
+        }
+    };
+    let rowid = row.get(1).map_err(store_error)?;
+    let key_type: String = row.get(2).map_err(store_error)?;
+    let key_length: Option<i64> = row.get(3).map_err(store_error)?;
+    let key_preview = match row.get_ref(4).map_err(store_error)? {
+        ValueRef::Null => None,
+        ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+        _ => {
+            return Err(RecoveryScanError::RequiresAudit {
+                reason: String::from("SQLite key preview returned an unexpected type"),
+            });
+        }
+    };
+    let sequence_type: String = row.get(6).map_err(store_error)?;
+    if sequence_type != "integer" {
+        return Err(RecoveryScanError::RequiresAudit {
+            reason: bounded_reason(format!(
+                "combined recovery row {rowid} has sequence SQL type {sequence_type}"
+            )),
+        });
+    }
+    let sequence: i64 = row.get(5).map_err(store_error)?;
+    if sequence <= 0 {
+        return Err(RecoveryScanError::RequiresAudit {
+            reason: bounded_reason(format!(
+                "combined recovery row {rowid} has non-positive observation sequence {sequence}"
+            )),
+        });
+    }
+    let (key, key_issue) = read_key(key_type, key_length, key_preview);
+    let record_type: String = row.get(7).map_err(store_error)?;
+    let record_length: Option<i64> = row.get(8).map_err(store_error)?;
+    Ok(CoordinatorRecoveryCandidate {
+        family,
+        rowid,
+        key,
+        key_issue,
+        sequence,
+        record_type,
+        record_length,
+    })
+}
+
+fn load_coordinator_record_bytes(
+    store: &OperationJournalStore,
+    candidate: &CoordinatorRecoveryCandidate,
+) -> Result<Option<Vec<u8>>, RecoveryScanError> {
+    let table = match candidate.family {
+        RecoveryFamily::Legacy => JOURNAL_TABLE_NAME,
+        RecoveryFamily::FullProgress => FULL_PROGRESS_TABLE_NAME,
+    };
+    let statement = format!(
+        "SELECT typeof(record), length(record),\n                CASE WHEN typeof(record) = 'blob'\n                          AND length(record) BETWEEN 0 AND ?2\n                     THEN record ELSE NULL END\n         FROM {table} WHERE rowid = ?1"
+    );
+    let metadata: Option<(String, Option<i64>, Option<Vec<u8>>)> = store
+        .connection
+        .query_row(
+            &statement,
+            params![candidate.rowid, MAX_RECORD_BYTES as i64],
+            |row| {
+                let encoded = match row.get_ref(2)? {
+                    ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+                    ValueRef::Null => None,
+                    _ => None,
+                };
+                Ok((row.get(0)?, row.get(1)?, encoded))
+            },
+        )
+        .optional()
+        .map_err(store_error)?;
+    let Some((record_type, record_length, encoded)) = metadata else {
+        return Ok(None);
+    };
+    if record_type != candidate.record_type || record_length != candidate.record_length {
+        return Err(RecoveryScanError::RequiresAudit {
+            reason: bounded_reason(format!(
+                "combined recovery row {} changed while its bounded payload was read",
+                candidate.rowid
+            )),
+        });
+    }
+    Ok(encoded)
+}
+
+fn decode_coordinator_outcome(
+    candidate: &CoordinatorRecoveryCandidate,
+    encoded: &[u8],
+) -> CoordinatorRecoveryRowOutcome {
+    match candidate.family {
+        RecoveryFamily::Legacy => match decode_outcome(
+            &RecoveryCandidate {
+                rowid: candidate.rowid,
+                key: candidate.key.clone(),
+                key_issue: candidate.key_issue.clone(),
+                sequence: candidate.sequence,
+                record_type: candidate.record_type.clone(),
+                record_length: candidate.record_length,
+            },
+            encoded,
+        ) {
+            RecoveryRowOutcome::Consistent(record) => {
+                CoordinatorRecoveryRowOutcome::Consistent(CoordinatorRecoveryRecord::Legacy(record))
+            }
+            RecoveryRowOutcome::Retained(reason) => CoordinatorRecoveryRowOutcome::Retained(reason),
+        },
+        RecoveryFamily::FullProgress => {
+            let record = match decode_full_progress(encoded) {
+                Ok(record) => record,
+                Err(FullProgressCodecError::UnsupportedVersion { version }) => {
+                    return CoordinatorRecoveryRowOutcome::Retained(
+                        RecoveryRetentionReason::UnsupportedCodec {
+                            version: u32::try_from(version).unwrap_or(u32::MAX),
+                        },
+                    );
+                }
+                Err(FullProgressCodecError::InputOversize { actual, maximum })
+                | Err(FullProgressCodecError::OutputOversize { actual, maximum }) => {
+                    return CoordinatorRecoveryRowOutcome::Retained(
+                        RecoveryRetentionReason::SizeInvalid {
+                            declared: Some(actual as i64),
+                            reason: bounded_reason(format!(
+                                "full-progress record size {actual} exceeds maximum {maximum}"
+                            )),
+                        },
+                    );
+                }
+                Err(error) => {
+                    return CoordinatorRecoveryRowOutcome::Retained(
+                        RecoveryRetentionReason::Malformed {
+                            reason: bounded_reason(error),
+                        },
+                    );
+                }
+            };
+            if let RecoveryKey::OperationId(operation_id) = candidate.key {
+                if record.snapshot().intent().operation_id() != operation_id {
+                    return CoordinatorRecoveryRowOutcome::Retained(
+                        RecoveryRetentionReason::KeyMismatch {
+                            record_operation_id: record.snapshot().intent().operation_id(),
+                        },
+                    );
+                }
+            }
+            CoordinatorRecoveryRowOutcome::Consistent(CoordinatorRecoveryRecord::FullProgress(
+                record,
+            ))
+        }
     }
 }
 
@@ -711,6 +1222,9 @@ mod tests {
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use crate::operation_journal::codec::{decode, encode};
+    use crate::operation_journal::full_progress_codec::{
+        StoredFullProgressRecord, encode as encode_full_progress,
+    };
     use crate::operation_journal::{
         CancellationRequestObservation, MAX_STATUS_DIAGNOSTIC_BYTES, OperationDisposition,
         OperationPhase, RetainedJournalStatus, SCHEMA_V4,
@@ -835,11 +1349,28 @@ mod tests {
             .expect("insert recovery fixture row");
     }
 
+    fn insert_full_raw(store: &OperationJournalStore, key: &str, sequence: i64, record: &[u8]) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![key, sequence, record],
+            )
+            .expect("insert full-progress recovery fixture row");
+    }
+
     fn recovery_key(entry: &RecoveryEntry) -> OperationId {
         match entry.key() {
             RecoveryKey::OperationId(operation_id) => *operation_id,
             other => panic!("expected operation key, found {other:?}"),
         }
+    }
+
+    fn full_progress_fixture() -> StoredFullProgressRecord {
+        let (snapshot, _) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        StoredFullProgressRecord::new(snapshot).expect("full-progress recovery fixture")
     }
 
     #[test]
@@ -967,6 +1498,418 @@ mod tests {
         assert_eq!(second.next_cursor(), None);
         assert_eq!(second.entries()[0].sequence(), 17);
         assert_eq!(recovery_key(&second.entries()[0]), operation_ids[16]);
+    }
+
+    #[test]
+    fn combined_recovery_orders_legacy_and_full_rows_across_cursor_pages() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        for _ in 0..16 {
+            store
+                .insert_intent(&intent_record(OperationId::new()))
+                .expect("insert legacy page row");
+        }
+        let full = full_progress_fixture();
+        let full_id = full.snapshot().intent().operation_id();
+        assert_eq!(
+            store
+                .persist_full(&full, None)
+                .expect("insert full page row")
+                .sequence(),
+            17
+        );
+
+        let first = store
+            .scan_coordinator_recovery_page(None)
+            .expect("scan combined first page");
+        assert_eq!(first.entries().len(), MAX_RECOVERY_ROWS_PER_PAGE);
+        assert!(!first.is_done());
+        assert_eq!(first.next_cursor().map(RecoveryCursor::sequence), Some(16));
+        assert!(
+            first
+                .entries()
+                .iter()
+                .all(|entry| entry.family() == RecoveryFamily::Legacy)
+        );
+
+        let second = store
+            .scan_coordinator_recovery_page(first.next_cursor())
+            .expect("scan combined second page");
+        assert!(second.is_done());
+        assert_eq!(second.entries().len(), 1);
+        assert_eq!(second.entries()[0].family(), RecoveryFamily::FullProgress);
+        assert_eq!(second.entries()[0].sequence(), 17);
+        assert!(matches!(
+            second.entries()[0].outcome(),
+            CoordinatorRecoveryRowOutcome::Consistent(
+                CoordinatorRecoveryRecord::FullProgress(record)
+            ) if record.snapshot().intent().operation_id() == full_id
+        ));
+    }
+
+    #[test]
+    fn combined_recovery_retains_full_corruption_and_cross_family_ambiguity() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let malformed_id = OperationId::new();
+        insert_full_raw(&store, &malformed_id.to_string(), 1, b"not-json");
+
+        let ambiguous = full_progress_fixture();
+        let ambiguous_id = ambiguous.snapshot().intent().operation_id();
+        let encoded = encode_full_progress(&ambiguous).expect("encode ambiguous full row");
+        insert_raw(
+            &store,
+            &ambiguous_id.to_string(),
+            2,
+            &encode(&intent_record(ambiguous_id)).expect("encode ambiguous legacy row"),
+        );
+        insert_full_raw(&store, &ambiguous_id.to_string(), 3, &encoded);
+
+        let page = store
+            .scan_coordinator_recovery_page(None)
+            .expect("scan retained combined rows");
+        assert_eq!(page.entries().len(), 3);
+        assert!(matches!(
+            page.entries()[0].outcome(),
+            CoordinatorRecoveryRowOutcome::Retained(
+                RecoveryRetentionReason::Malformed { reason }
+            ) if reason.contains("malformed full-progress")
+        ));
+        for entry in &page.entries()[1..] {
+            assert!(matches!(
+                entry.outcome(),
+                CoordinatorRecoveryRowOutcome::Retained(
+                    RecoveryRetentionReason::Malformed { reason }
+                ) if reason.contains("both journal families")
+            ));
+        }
+        assert!(page.entries()[0].family() == RecoveryFamily::FullProgress);
+        assert!(page.entries()[1].family() == RecoveryFamily::Legacy);
+        assert!(page.entries()[2].family() == RecoveryFamily::FullProgress);
+    }
+
+    #[test]
+    fn combined_recovery_rejects_duplicate_sequence_beyond_first_page() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        for sequence in 1..=17_i64 {
+            let record = intent_record(OperationId::new());
+            insert_raw(
+                &store,
+                &record.operation_id.to_string(),
+                sequence,
+                &encode(&record).expect("encode duplicate-page legacy row"),
+            );
+        }
+        let full = full_progress_fixture();
+        insert_full_raw(
+            &store,
+            &full.snapshot().intent().operation_id().to_string(),
+            17,
+            &encode_full_progress(&full).expect("encode duplicate-page full row"),
+        );
+
+        let error = store
+            .scan_coordinator_recovery_page(None)
+            .expect_err("duplicate sequence must stop combined scan");
+        assert!(matches!(
+            error,
+            RecoveryScanError::RequiresAudit { reason }
+                if reason.contains("duplicate recovery observation sequence 17")
+        ));
+    }
+
+    #[test]
+    fn combined_recovery_rejects_invalid_sequence_candidates_before_cursoring() {
+        let first_fixture = fixture();
+        let store = OperationJournalStore::open(&first_fixture.owner).expect("open store");
+        let text_id = OperationId::new();
+        let full = full_progress_fixture();
+        insert_full_raw(
+            &store,
+            &text_id.to_string(),
+            1,
+            &encode_full_progress(&full).expect("encode invalid-sequence full row"),
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_full_progress
+                 SET sequence = 'not-a-sequence' WHERE operation_id = ?1",
+                params![text_id.to_string()],
+            )
+            .expect("corrupt full sequence type");
+        let error = store
+            .scan_coordinator_recovery_page(None)
+            .expect_err("reject noninteger combined sequence");
+        assert!(matches!(
+            error,
+            RecoveryScanError::RequiresAudit { reason }
+                if reason.contains("sequence SQL type")
+        ));
+
+        let second_fixture = fixture();
+        let store = OperationJournalStore::open(&second_fixture.owner).expect("open second store");
+        let nonpositive_id = OperationId::new();
+        insert_full_raw(
+            &store,
+            &nonpositive_id.to_string(),
+            0,
+            &encode_full_progress(&full).expect("encode nonpositive full row"),
+        );
+        let error = store
+            .scan_coordinator_recovery_page(None)
+            .expect_err("reject nonpositive combined sequence");
+        assert!(matches!(
+            error,
+            RecoveryScanError::RequiresAudit { reason }
+                if reason.contains("non-positive observation sequence")
+        ));
+    }
+
+    #[test]
+    fn combined_recovery_retains_full_unsupported_type_oversize_and_key_mismatch_rows() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let unsupported_id = OperationId::new();
+        insert_full_raw(
+            &store,
+            &unsupported_id.to_string(),
+            1,
+            br#"{"record_kind":"full_progress","schema_version":999}"#,
+        );
+        let malformed_id = OperationId::new();
+        insert_full_raw(&store, &malformed_id.to_string(), 2, b"not-json");
+        let text_id = OperationId::new();
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, 3, 'not-a-blob')",
+                params![text_id.to_string()],
+            )
+            .expect("insert full text record");
+        let oversized_id = OperationId::new();
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable check constraints");
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, 4, zeroblob(?2))",
+                params![oversized_id.to_string(), (MAX_RECORD_BYTES + 1) as i64],
+            )
+            .expect("insert oversized full record");
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .expect("restore check constraints");
+        let mismatch = full_progress_fixture();
+        let mismatch_key = OperationId::new();
+        let mismatch_bytes = encode_full_progress(&mismatch).expect("encode mismatch full row");
+        insert_full_raw(&store, &mismatch_key.to_string(), 5, &mismatch_bytes);
+
+        let page = store
+            .scan_coordinator_recovery_page(None)
+            .expect("scan retained full rows");
+        assert_eq!(page.entries().len(), 5);
+        assert!(matches!(
+            page.entries()[0].outcome(),
+            CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::UnsupportedCodec {
+                version: 999
+            })
+        ));
+        assert!(matches!(
+            page.entries()[1].outcome(),
+            CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::Malformed { .. })
+        ));
+        assert!(matches!(
+            page.entries()[2].outcome(),
+            CoordinatorRecoveryRowOutcome::Retained(
+                RecoveryRetentionReason::TypeInvalid {
+                    field: RecoveryField::Record,
+                    sql_type,
+                    ..
+                }
+            ) if sql_type == "text"
+        ));
+        assert!(matches!(
+            page.entries()[3].outcome(),
+            CoordinatorRecoveryRowOutcome::Retained(RecoveryRetentionReason::SizeInvalid { .. })
+        ));
+        assert!(matches!(
+            page.entries()[4].outcome(),
+            CoordinatorRecoveryRowOutcome::Retained(
+                RecoveryRetentionReason::KeyMismatch { record_operation_id }
+            ) if *record_operation_id == mismatch.snapshot().intent().operation_id()
+        ));
+        assert!(
+            page.entries()
+                .iter()
+                .all(|entry| entry.family() == RecoveryFamily::FullProgress)
+        );
+    }
+
+    #[test]
+    fn combined_recovery_applies_encoded_byte_budget_across_both_families() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let legacy = intent_record(OperationId::new());
+        let mut legacy_bytes = encode(&legacy).expect("encode large legacy row");
+        legacy_bytes.resize(MAX_RECORD_BYTES, b' ');
+        insert_raw(&store, &legacy.operation_id.to_string(), 1, &legacy_bytes);
+        let full = full_progress_fixture();
+        let mut full_bytes = encode_full_progress(&full).expect("encode large full row");
+        full_bytes.resize(MAX_RECORD_BYTES, b' ');
+        insert_full_raw(
+            &store,
+            &full.snapshot().intent().operation_id().to_string(),
+            2,
+            &full_bytes,
+        );
+        let small = intent_record(OperationId::new());
+        store
+            .insert_intent(&small)
+            .expect("insert deferred small row");
+
+        let first = store
+            .scan_coordinator_recovery_page(None)
+            .expect("scan cross-family byte budget");
+        assert_eq!(first.entries().len(), 2);
+        assert!(!first.is_done());
+        assert_eq!(first.encoded_bytes(), MAX_RECOVERY_BYTES_PER_PAGE);
+        assert_eq!(first.next_cursor().map(RecoveryCursor::sequence), Some(2));
+        let second = store
+            .scan_coordinator_recovery_page(first.next_cursor())
+            .expect("scan deferred cross-family row");
+        assert!(second.is_done());
+        assert_eq!(second.entries().len(), 1);
+        assert_eq!(second.entries()[0].sequence(), 3);
+    }
+
+    #[test]
+    fn combined_recovery_reopens_with_the_same_mixed_observations() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let legacy = intent_record(OperationId::new());
+        store.insert_intent(&legacy).expect("insert legacy row");
+        let full = full_progress_fixture();
+        store.persist_full(&full, None).expect("insert full row");
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let page = reopened
+            .scan_coordinator_recovery_page(None)
+            .expect("scan reopened mixed rows");
+        assert_eq!(page.entries().len(), 2);
+        assert_eq!(page.entries()[0].family(), RecoveryFamily::Legacy);
+        assert_eq!(page.entries()[1].family(), RecoveryFamily::FullProgress);
+        assert!(matches!(
+            page.entries()[1].outcome(),
+            CoordinatorRecoveryRowOutcome::Consistent(
+                CoordinatorRecoveryRecord::FullProgress(observed)
+            ) if observed == &full
+        ));
+    }
+
+    #[test]
+    fn combined_recovery_guard_failure_releases_transaction_and_preserves_rows() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let legacy = intent_record(OperationId::new());
+        let legacy_id = legacy.operation_id;
+        store.insert_intent(&legacy).expect("insert legacy row");
+        let full = full_progress_fixture();
+        let full_id = full.snapshot().intent().operation_id();
+        store.persist_full(&full, None).expect("insert full row");
+
+        let legacy_raw: (String, i64, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record
+                 FROM operation_journal WHERE operation_id = ?1",
+                params![legacy_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read original legacy row");
+        let full_raw: (String, i64, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record
+                 FROM operation_journal_full_progress WHERE operation_id = ?1",
+                params![full_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read original full row");
+
+        let sidecar = fixture
+            .owner
+            .profile_root()
+            .join(super::super::JOURNAL_DATABASE_ROOT_NAME)
+            .join("journal.sqlite3-wal");
+        let marker = b"unexpected combined-recovery WAL".to_vec();
+        let sidecar_for_hook = sidecar.clone();
+        let marker_for_hook = marker.clone();
+        let mut injected = false;
+        store.set_insert_test_hook(move |boundary| {
+            if boundary == super::super::InsertTestBoundary::BeforePrecommitValidation && !injected
+            {
+                fs::write(&sidecar_for_hook, &marker_for_hook)
+                    .expect("inject combined-recovery WAL sidecar");
+                injected = true;
+            }
+            super::super::InsertTestDirective::Continue
+        });
+
+        let error = store
+            .scan_coordinator_recovery_page(None)
+            .expect_err("unexpected sidecar must reject combined recovery");
+        assert!(matches!(
+            error,
+            RecoveryScanError::Store(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("sidecar")
+        ));
+        assert!(
+            store.connection.is_autocommit(),
+            "combined recovery must release its read transaction on guard failure"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT operation_id, sequence, record
+                     FROM operation_journal WHERE operation_id = ?1",
+                    params![legacy_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read legacy row after rollback"),
+            legacy_raw
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT operation_id, sequence, record
+                     FROM operation_journal_full_progress WHERE operation_id = ?1",
+                    params![full_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read full row after rollback"),
+            full_raw
+        );
+        assert_eq!(
+            fs::read(&sidecar).expect("retain injected sidecar evidence"),
+            marker
+        );
+        fs::remove_file(&sidecar).expect("remove retained test sidecar");
+
+        let page = store
+            .scan_coordinator_recovery_page(None)
+            .expect("scan succeeds after guard evidence is removed");
+        assert_eq!(page.entries().len(), 2);
+        assert!(page.is_done());
     }
 
     #[test]

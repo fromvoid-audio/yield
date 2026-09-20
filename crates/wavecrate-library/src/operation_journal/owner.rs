@@ -18,8 +18,11 @@ use thiserror::Error;
 
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::RetryObservation;
+use super::full_progress_codec::StoredFullProgressRecord;
 use super::model::{CancellationRequestObservation, MAX_RECORD_BYTES, OperationId};
-use super::store::recovery::{RecoveryCursor, RecoveryPage, RecoveryScanError};
+use super::store::recovery::{
+    CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
+};
 use super::store::{
     JournalCancelRequestReceipt, JournalInsertOutcome, JournalRetryReceipt, OperationJournalStore,
     OperationJournalStoreError,
@@ -482,6 +485,40 @@ impl OperationJournalClient {
         })
     }
 
+    /// Queue one crate-internal bounded full-progress point lookup.
+    #[allow(dead_code)]
+    pub(crate) fn get_full(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<
+        OperationJournalRequest<Option<StoredFullProgressRecord>>,
+        OperationJournalOwnerQueueError,
+    > {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::GetFull {
+                operation_id,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue one crate-internal combined legacy/full recovery page.
+    #[allow(dead_code)]
+    pub(crate) fn scan_coordinator_recovery_page(
+        &self,
+        cursor: Option<RecoveryCursor>,
+    ) -> Result<OperationJournalRequest<CoordinatorRecoveryPage>, OperationJournalOwnerQueueError>
+    {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::CoordinatorRecovery {
+                cursor,
+                input,
+                result,
+            }
+        })
+    }
+
     fn submit<T, F>(
         &self,
         input_bytes: usize,
@@ -740,6 +777,7 @@ impl Drop for ResultPermit {
     }
 }
 
+#[allow(dead_code)]
 enum JournalCommand {
     PersistIntent {
         encoded: Vec<u8>,
@@ -769,6 +807,16 @@ enum JournalCommand {
         cursor: Option<RecoveryCursor>,
         input: InputPermit,
         result: SyncSender<Result<RecoveryPage, OperationJournalOwnerError>>,
+    },
+    GetFull {
+        operation_id: OperationId,
+        input: InputPermit,
+        result: SyncSender<Result<Option<StoredFullProgressRecord>, OperationJournalOwnerError>>,
+    },
+    CoordinatorRecovery {
+        cursor: Option<RecoveryCursor>,
+        input: InputPermit,
+        result: SyncSender<Result<CoordinatorRecoveryPage, OperationJournalOwnerError>>,
     },
 }
 
@@ -912,6 +960,26 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             drop(input);
             execute_store_result(result, || store.scan_recovery_page(cursor))
         }
+        JournalCommand::GetFull {
+            operation_id,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                store
+                    .get_full(operation_id)
+                    .map(|row| row.map(|row| row.into_record()))
+            })
+        }
+        JournalCommand::CoordinatorRecovery {
+            cursor,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || store.scan_coordinator_recovery_page(cursor))
+        }
     }
 }
 
@@ -966,6 +1034,14 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             drop(input);
             let _ = result.send(Err(error));
         }
+        JournalCommand::GetFull { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::CoordinatorRecovery { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
     }
 }
 
@@ -976,6 +1052,7 @@ mod tests {
     use crate::durable_capacity::{
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
     };
+    use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation, EvidenceBatchId,
         ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
@@ -1054,6 +1131,56 @@ mod tests {
                 _ => thread::sleep(Duration::from_millis(5)),
             }
         }
+    }
+
+    #[test]
+    fn owner_reads_full_progress_and_combined_recovery_through_one_queue() {
+        let fixture = fixture("journal-owner-combined-recovery");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let legacy = intent_record(OperationId::new());
+        store.insert_intent(&legacy).expect("legacy seed");
+        let (snapshot, _) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        let full = StoredFullProgressRecord::new(snapshot).expect("full seed");
+        let full_id = full.snapshot().intent().operation_id();
+        assert_eq!(
+            store
+                .persist_full(&full, None)
+                .expect("full seed")
+                .sequence(),
+            2
+        );
+
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        let client = owner.client();
+
+        let mut full_request = client.get_full(full_id).expect("full lookup admission");
+        let observed = full_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("full lookup result")
+            .expect("full lookup worker")
+            .expect("full observation");
+        assert_eq!(observed, full);
+
+        let mut recovery_request = client
+            .scan_coordinator_recovery_page(None)
+            .expect("combined recovery admission");
+        let page = recovery_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("combined recovery result")
+            .expect("combined recovery worker");
+        assert_eq!(page.entries().len(), 2);
+        assert_eq!(page.entries()[0].sequence(), 1);
+        assert_eq!(page.entries()[1].sequence(), 2);
+        assert!(matches!(
+            page.entries()[1].outcome(),
+            super::super::store::recovery::CoordinatorRecoveryRowOutcome::Consistent(
+                super::super::store::recovery::CoordinatorRecoveryRecord::FullProgress(observed)
+            ) if observed == &full
+        ));
+        assert!(owner.shutdown());
+        drop(fixture);
     }
 
     fn intent_record(operation_id: OperationId) -> StoredOperationRecord {

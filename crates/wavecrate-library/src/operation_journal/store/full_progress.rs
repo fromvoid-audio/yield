@@ -31,6 +31,10 @@ impl FullProgressRow {
     pub(crate) fn record(&self) -> &StoredFullProgressRecord {
         &self.record
     }
+
+    pub(crate) fn into_record(self) -> StoredFullProgressRecord {
+        self.record
+    }
 }
 
 /// Result of one full-progress expected-sequence write attempt.
