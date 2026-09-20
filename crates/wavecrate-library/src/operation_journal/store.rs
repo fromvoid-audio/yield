@@ -7789,6 +7789,15 @@ mod tests {
             .expect("full-progress row");
         assert_eq!(first.sequence(), 1);
         assert_eq!(first.record(), &initial);
+        let first_rehydrated = first
+            .record()
+            .snapshot()
+            .rehydrate_observation()
+            .expect("initial stored snapshot rehydrates");
+        let first_recaptured = first_rehydrated
+            .capture_full_progress_snapshot(first.record().snapshot().intent())
+            .expect("initial rehydrated snapshot captures identically");
+        assert_eq!(first_recaptured, *first.record().snapshot());
 
         let legacy = intent_record(OperationId::new());
         assert_eq!(
@@ -7819,6 +7828,15 @@ mod tests {
             .expect("reopened full-progress row");
         assert_eq!(persisted.sequence(), 3);
         assert_eq!(persisted.record(), &progressed);
+        let rehydrated = persisted
+            .record()
+            .snapshot()
+            .rehydrate_observation()
+            .expect("reopened stored snapshot rehydrates");
+        let recaptured = rehydrated
+            .capture_full_progress_snapshot(persisted.record().snapshot().intent())
+            .expect("reopened rehydrated snapshot captures identically");
+        assert_eq!(recaptured, *persisted.record().snapshot());
     }
 
     #[test]

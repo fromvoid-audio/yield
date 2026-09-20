@@ -7990,6 +7990,16 @@ mod tests {
         copy_snapshot_intent_with_capacity(progress, admission_capacity_plan())
     }
 
+    fn assert_rehydrates_snapshot(snapshot: &FullProgressSnapshotObservation) {
+        let rehydrated = snapshot
+            .rehydrate_observation()
+            .expect("validated snapshot rehydrates as observation");
+        let recaptured = rehydrated
+            .capture_full_progress_snapshot(snapshot.intent())
+            .expect("rehydrated observation captures identically");
+        assert_eq!(&recaptured, snapshot);
+    }
+
     fn copy_snapshot_intent_with_capacity(
         progress: &WorkProgress,
         capacity_plan: FullCapacityPlan,
@@ -21361,6 +21371,7 @@ mod tests {
         let decoded_record = super::super::full_progress_codec::decode(&record_bytes)
             .expect("terminal full-progress decoding");
         assert_eq!(decoded_record.snapshot(), &snapshot);
+        assert_rehydrates_snapshot(decoded_record.snapshot());
         assert_eq!(
             progress.finish_post_publish_cancellation(replay),
             Ok(ProgressApplyOutcome::Replay)
@@ -21722,6 +21733,7 @@ mod tests {
             .snapshot()
             .validate_base()
             .expect("observed-effect terminal snapshot validation");
+        assert_rehydrates_snapshot(decoded_record.snapshot());
     }
 
     #[test]
@@ -24701,6 +24713,7 @@ mod tests {
             let decoded = super::super::full_progress_codec::decode(&bytes)
                 .expect("full-progress record decodes");
             assert_eq!(decoded.snapshot(), &snapshot);
+            assert_rehydrates_snapshot(decoded.snapshot());
             decoded
         };
 
@@ -27305,6 +27318,7 @@ mod tests {
         let bytes = super::super::full_progress_codec::encode(&record).expect("partial encode");
         let decoded = super::super::full_progress_codec::decode(&bytes).expect("partial decode");
         assert_eq!(decoded.snapshot(), &snapshot);
+        assert_rehydrates_snapshot(decoded.snapshot());
 
         let mut audit = copy_progress_with_admission_claims();
         publish_prefix(&mut audit);
@@ -27725,6 +27739,7 @@ mod tests {
             dependency_hole.validate_base(),
             Err(FullProgressSnapshotObservationError::PrerequisiteIncomplete { .. })
         ));
+        assert!(dependency_hole.rehydrate_observation().is_err());
     }
 }
 

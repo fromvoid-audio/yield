@@ -192,6 +192,20 @@ impl FullProgressSnapshotObservation {
         Ok(())
     }
 
+    /// Rehydrate a validated snapshot into an observation-only progress value.
+    ///
+    /// This reconstructs the exact retained fields after running the complete standalone
+    /// snapshot validator.  The returned [`WorkProgress`] contains no live lease, capacity,
+    /// dispatch, or owner authority; a future execution owner must establish those guards
+    /// separately before using any operation-side capability.
+    #[allow(dead_code)]
+    pub(crate) fn rehydrate_observation(
+        &self,
+    ) -> Result<WorkProgress, FullProgressSnapshotObservationError> {
+        self.validate_base()?;
+        Ok(self.validation_progress())
+    }
+
     fn validate_readiness_deferral_bounds(
         &self,
     ) -> Result<(), FullProgressSnapshotObservationError> {
