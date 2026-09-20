@@ -14,7 +14,7 @@ pub use similarity::{
 use std::{collections::BTreeSet, sync::atomic::AtomicBool};
 pub use view::ReadinessView;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::{
     ClaimedReadinessWork, ReadinessArtifact, ReadinessDeficit, ReadinessFailureClassification,
@@ -176,6 +176,64 @@ pub struct ReadinessSourceState {
     pub contract_version: String,
     /// Incremental source similarity membership checkpoint.
     pub membership: ReadinessMembership,
+}
+
+/// Read-only metadata for the latest durably published readiness wake.
+///
+/// This value is an observation of committed source state. It is not a scheduler capability,
+/// durable acknowledgement, or proof that a consumer has claimed the publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessWakeObservation {
+    source_id: String,
+    wake_id: String,
+    owner_revision: i64,
+    source_generation: i64,
+    readiness_revision: i64,
+    contract_version: String,
+    target_digest: [u8; 32],
+    target_count: i64,
+}
+
+impl ReadinessWakeObservation {
+    /// Source identity covered by this wake.
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    /// Non-nil UUID identifying this accepted publication.
+    pub fn wake_id(&self) -> &str {
+        &self.wake_id
+    }
+
+    /// Monotonic source-local observation revision.
+    pub fn owner_revision(&self) -> i64 {
+        self.owner_revision
+    }
+
+    /// Source generation covered by the wake.
+    pub fn source_generation(&self) -> i64 {
+        self.source_generation
+    }
+
+    /// Readiness publication revision covered by the wake.
+    pub fn readiness_revision(&self) -> i64 {
+        self.readiness_revision
+    }
+
+    /// Readiness contract identity covered by the wake.
+    pub fn contract_version(&self) -> &str {
+        &self.contract_version
+    }
+
+    /// Canonical digest of every current target row.
+    pub fn target_digest(&self) -> &[u8; 32] {
+        &self.target_digest
+    }
+
+    /// Number of target rows covered by the digest.
+    pub fn target_count(&self) -> i64 {
+        self.target_count
+    }
 }
 
 impl<'connection> ReadinessStore<'connection> {
@@ -558,6 +616,19 @@ impl<'connection> ReadinessStore<'connection> {
                     "membership_count",
                 ][..],
             ),
+            (
+                "source_readiness_wakes",
+                &[
+                    "source_id",
+                    "wake_id",
+                    "owner_revision",
+                    "source_generation",
+                    "readiness_revision",
+                    "contract_version",
+                    "target_digest",
+                    "target_count",
+                ][..],
+            ),
         ] {
             let pragma = format!("PRAGMA table_info({table})");
             let mut statement = self.connection.prepare(&pragma)?;
@@ -602,43 +673,19 @@ impl<'connection> ReadinessStore<'connection> {
         &mut self,
         source_id: &str,
     ) -> Result<Option<ReadinessSourceState>, ReadinessError> {
-        self.connection
-            .query_row(
-                "SELECT source_generation, readiness_revision, availability, contract_version,
-                    membership_digest, membership_count
-             FROM source_readiness_sources
-             WHERE source_id = ?1",
-                [source_id],
-                |row| {
-                    let availability = row.get::<_, String>(2)?;
-                    let availability = SourceAvailability::from_stored(&availability)
-                        .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-                    let raw_digest = row.get::<_, Vec<u8>>(4)?;
-                    let raw_count = row.get::<_, i64>(5)?;
-                    let mut contract_version = row.get::<_, String>(3)?;
-                    let digest = match raw_digest.try_into() {
-                        Ok(digest) if raw_count >= 0 => digest,
-                        _ => {
-                            // A corrupt or legacy checkpoint must force the next probe through
-                            // complete publication instead of making the source unrecoverable.
-                            contract_version.clear();
-                            [0; 32]
-                        }
-                    };
-                    Ok(ReadinessSourceState {
-                        source_generation: row.get(0)?,
-                        readiness_revision: row.get(1)?,
-                        availability,
-                        contract_version,
-                        membership: ReadinessMembership::from_parts(
-                            digest,
-                            raw_count.max(0) as u64,
-                        ),
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+        persistence::read_source_state(self.connection, source_id)
+    }
+
+    /// Read and validate the latest committed readiness wake for one source.
+    ///
+    /// A missing wake is expected for sources migrated before wake publication was introduced.
+    /// Stored wake metadata and the complete current target set are validated together, so a
+    /// malformed or stale row remains an actionable error rather than becoming a capability.
+    pub fn readiness_wake(
+        &mut self,
+        source_id: &str,
+    ) -> Result<Option<ReadinessWakeObservation>, ReadinessError> {
+        persistence::read_readiness_wake(self.connection, source_id)
     }
 
     /// Mark a source offline without modifying its generation or target set.

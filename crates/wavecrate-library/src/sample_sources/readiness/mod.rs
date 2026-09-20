@@ -9,9 +9,10 @@ mod snapshot;
 mod store;
 
 pub use model::{
-    ClaimedReadinessWork, ReadinessArtifact, ReadinessClaimOrigin, ReadinessEligibility,
-    ReadinessFailureClassification, ReadinessFailureOutcome, ReadinessLeaseRenewalOutcome,
-    ReadinessMembership, ReadinessRetryPolicy, ReadinessScopeKind, ReadinessStage, ReadinessTarget,
+    ClaimedReadinessWork, MAX_READINESS_CONTRACT_VERSION_BYTES, MAX_READINESS_TARGET_TEXT_BYTES,
+    ReadinessArtifact, ReadinessClaimOrigin, ReadinessEligibility, ReadinessFailureClassification,
+    ReadinessFailureOutcome, ReadinessLeaseRenewalOutcome, ReadinessMembership,
+    ReadinessRetryPolicy, ReadinessScopeKind, ReadinessStage, ReadinessTarget,
     ReadinessWorkMutationOutcome, ReadinessWorkStats, SourceAvailability,
 };
 pub use snapshot::{
@@ -26,6 +27,7 @@ pub use store::{
     ReadinessSimilarityManifest, ReadinessSimilarityManifestRequest,
     ReadinessSimilarityManifestRow, ReadinessSimilarityPayloadContract, ReadinessSourceState,
     ReadinessStore, ReadinessTargetDeltaPublication, ReadinessTargetPublication, ReadinessView,
+    ReadinessWakeObservation,
 };
 #[cfg(test)]
 pub(crate) use store::{

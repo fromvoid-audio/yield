@@ -3,12 +3,15 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use blake3::Hasher;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use uuid::Uuid;
 
 use super::super::{
     model::{
-        ReadinessArtifact, ReadinessEligibility, ReadinessMembership, ReadinessScopeKind,
-        ReadinessStage, ReadinessTarget, SourceAvailability,
+        MAX_READINESS_CONTRACT_VERSION_BYTES, MAX_READINESS_TARGET_TEXT_BYTES, ReadinessArtifact,
+        ReadinessEligibility, ReadinessMembership, ReadinessScopeKind, ReadinessStage,
+        ReadinessTarget, SourceAvailability,
     },
     snapshot::{ArtifactPublishOutcome, ReadinessDeficit},
 };
@@ -99,6 +102,7 @@ pub(super) fn replace_readiness_targets_owned(
     cancel: Option<&AtomicBool>,
 ) -> Result<(), ReadinessError> {
     validate_publication_ownership(&*connection, ownership, origin)?;
+    validate_publication_text_bounds(source_id, contract_version, targets, &[])?;
     validate_contract_version(contract_version)?;
     validate_targets(source_id, source_generation, targets, cancel)?;
     let membership = membership_from_targets(targets);
@@ -189,6 +193,17 @@ pub(super) fn replace_readiness_targets_owned(
            )",
         [source_id],
     )?;
+    let (target_digest, target_count) =
+        digest_targets_in_transaction(&tx, source_id, Some(source_generation), cancel)?;
+    persist_readiness_wake(
+        &tx,
+        source_id,
+        source_generation,
+        readiness_revision,
+        contract_version,
+        target_digest,
+        target_count,
+    )?;
     validate_publication_ownership(&tx, ownership, origin)?;
     tx.commit()?;
     Ok(())
@@ -211,6 +226,13 @@ pub(super) fn apply_readiness_target_delta_owned(
     cancel: Option<&AtomicBool>,
 ) -> Result<ReadinessDeltaPublicationOutcome, ReadinessError> {
     validate_publication_ownership(&*connection, ownership, origin)?;
+    validate_publication_text_bounds(
+        source_id,
+        contract_version,
+        upsert_targets,
+        deleted_file_scope_ids,
+    )?;
+    validate_target_text_bound("required_version", similarity_artifact_version)?;
     validate_contract_version(contract_version)?;
     if similarity_artifact_version.trim().is_empty() {
         return Err(ReadinessError::InvalidArtifactVersion {
@@ -229,24 +251,7 @@ pub(super) fn apply_readiness_target_delta_owned(
         current_contract,
         raw_membership_digest,
         raw_membership_count,
-    )) = tx
-        .query_row(
-            "SELECT source_generation, readiness_revision, contract_version,
-                    membership_digest, membership_count
-             FROM source_readiness_sources
-             WHERE source_id = ?1",
-            [source_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )
-        .optional()?
+    )) = read_delta_source_state(&tx, source_id)?
     else {
         tx.rollback()?;
         return Ok(ReadinessDeltaPublicationOutcome::RequiresFullPublication);
@@ -430,6 +435,17 @@ pub(super) fn apply_readiness_target_delta_owned(
         ],
     )?);
     cancellation_checkpoint(cancel)?;
+    let (target_digest, target_count) =
+        digest_targets_in_transaction(&tx, source_id, Some(source_generation), cancel)?;
+    persist_readiness_wake(
+        &tx,
+        source_id,
+        source_generation,
+        readiness_revision,
+        contract_version,
+        target_digest,
+        target_count,
+    )?;
     validate_publication_ownership(&tx, ownership, origin)?;
     tx.commit()?;
     Ok(ReadinessDeltaPublicationOutcome::Applied {
@@ -1152,10 +1168,773 @@ fn validate_targets(
 
 fn validate_contract_version(contract_version: &str) -> Result<(), ReadinessError> {
     if contract_version.trim().is_empty() {
-        Err(ReadinessError::InvalidContractVersion)
+        return Err(ReadinessError::InvalidContractVersion);
+    }
+    if contract_version.len() > MAX_READINESS_CONTRACT_VERSION_BYTES {
+        return Err(ReadinessError::ContractVersionTooLong);
+    }
+    Ok(())
+}
+
+fn validate_target_text_bound(field: &'static str, value: &str) -> Result<(), ReadinessError> {
+    if value.len() > MAX_READINESS_TARGET_TEXT_BYTES {
+        Err(ReadinessError::ReadinessTextTooLong { field })
     } else {
         Ok(())
     }
+}
+
+fn validate_publication_text_bounds(
+    source_id: &str,
+    contract_version: &str,
+    targets: &[ReadinessTarget],
+    deleted_file_scope_ids: &[String],
+) -> Result<(), ReadinessError> {
+    validate_target_text_bound("source_id", source_id)?;
+    if contract_version.len() > MAX_READINESS_CONTRACT_VERSION_BYTES {
+        return Err(ReadinessError::ContractVersionTooLong);
+    }
+    for target in targets {
+        validate_target_text_bound("source_id", &target.source_id)?;
+        validate_target_text_bound("scope_id", &target.scope_id)?;
+        validate_target_text_bound("required_version", &target.required_version)?;
+        validate_target_text_bound("content_generation", &target.content_generation)?;
+        if let Some(relative_path) = target.relative_path.as_deref() {
+            validate_target_text_bound("relative_path", relative_path)?;
+        }
+    }
+    for scope_id in deleted_file_scope_ids {
+        validate_target_text_bound("scope_id", scope_id)?;
+    }
+    Ok(())
+}
+
+fn invalid_persisted_value(field: &'static str, reason: &'static str) -> ReadinessError {
+    ReadinessError::InvalidPersistedReadinessValue { field, reason }
+}
+
+pub(super) fn read_bounded_text(
+    row: &Row<'_>,
+    type_index: usize,
+    length_index: usize,
+    value_index: usize,
+    field: &'static str,
+    max_bytes: usize,
+    nullable: bool,
+) -> Result<Option<String>, ReadinessError> {
+    let type_name = row.get::<_, String>(type_index)?;
+    let raw_length = row.get::<_, Option<i64>>(length_index)?;
+    match type_name.as_str() {
+        "null" if nullable => {
+            if raw_length.is_some() {
+                return Err(invalid_persisted_value(field, "invalid NULL length"));
+            }
+            Ok(None)
+        }
+        "text" => {
+            let Some(raw_length) = raw_length else {
+                return Err(invalid_persisted_value(field, "missing text length"));
+            };
+            let Ok(length) = usize::try_from(raw_length) else {
+                return Err(invalid_persisted_value(field, "invalid text length"));
+            };
+            if length > max_bytes {
+                return Err(invalid_persisted_value(field, "text exceeds bound"));
+            }
+            let value = row
+                .get::<_, Option<String>>(value_index)
+                .map_err(|_| invalid_persisted_value(field, "invalid UTF-8 text"))?
+                .ok_or_else(|| invalid_persisted_value(field, "bounded text was not returned"))?;
+            if value.len() != length {
+                return Err(invalid_persisted_value(field, "text length changed"));
+            }
+            Ok(Some(value))
+        }
+        "null" => Err(invalid_persisted_value(field, "NULL is not allowed")),
+        _ => Err(invalid_persisted_value(field, "wrong SQLite storage class")),
+    }
+}
+
+pub(super) fn read_source_state(
+    connection: &Connection,
+    source_id: &str,
+) -> Result<Option<super::ReadinessSourceState>, ReadinessError> {
+    validate_target_text_bound("source_id", source_id)?;
+    let mut statement = connection.prepare(
+        "SELECT
+             typeof(source_generation), source_generation,
+             typeof(readiness_revision), readiness_revision,
+             typeof(availability), length(CAST(availability AS BLOB)),
+             CASE WHEN typeof(availability) = 'text'
+                       AND length(CAST(availability AS BLOB)) <= ?2
+                  THEN availability END,
+             typeof(contract_version), length(CAST(contract_version AS BLOB)),
+             CASE WHEN typeof(contract_version) = 'text'
+                       AND length(CAST(contract_version AS BLOB)) <= ?3
+                  THEN contract_version END,
+             typeof(membership_digest), length(CAST(membership_digest AS BLOB)),
+             CASE WHEN typeof(membership_digest) = 'blob'
+                       AND length(CAST(membership_digest AS BLOB)) = 32
+                  THEN membership_digest END,
+             typeof(membership_count), membership_count
+         FROM source_readiness_sources
+         WHERE source_id = ?1",
+    )?;
+    let mut rows = statement.query(params![
+        source_id,
+        MAX_READINESS_TARGET_TEXT_BYTES as i64,
+        MAX_READINESS_CONTRACT_VERSION_BYTES as i64,
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let source_generation = read_stored_i64(row, 0, 1, "source_generation")?;
+    let readiness_revision = read_stored_i64(row, 2, 3, "readiness_revision")?;
+    let availability = read_required_bounded_text(
+        row,
+        4,
+        5,
+        6,
+        "availability",
+        MAX_READINESS_TARGET_TEXT_BYTES,
+    )?;
+    let availability = SourceAvailability::from_stored(&availability)
+        .ok_or_else(|| invalid_persisted_value("availability", "unknown readiness availability"))?;
+    let mut contract_version = read_required_bounded_text(
+        row,
+        7,
+        8,
+        9,
+        "contract_version",
+        MAX_READINESS_CONTRACT_VERSION_BYTES,
+    )?;
+    let raw_count = read_stored_i64(row, 13, 14, "membership_count")?;
+    let raw_digest =
+        if row.get::<_, String>(10)? == "blob" && row.get::<_, Option<i64>>(11)? == Some(32) {
+            row.get::<_, Option<Vec<u8>>>(12)?
+        } else {
+            None
+        };
+    let digest = match raw_digest.and_then(|raw| raw.try_into().ok()) {
+        Some(digest) if raw_count >= 0 => digest,
+        _ => {
+            // Preserve the established fallback for a corrupt legacy checkpoint: the next probe
+            // must force complete publication instead of making the source unrecoverable.
+            contract_version.clear();
+            [0; 32]
+        }
+    };
+    if rows.next()?.is_some() {
+        return Err(invalid_persisted_value(
+            "source_id",
+            "duplicate source state row",
+        ));
+    }
+    Ok(Some(super::ReadinessSourceState {
+        source_generation,
+        readiness_revision,
+        availability,
+        contract_version,
+        membership: ReadinessMembership::from_parts(digest, raw_count.max(0) as u64),
+    }))
+}
+
+fn read_delta_source_state(
+    tx: &Transaction<'_>,
+    source_id: &str,
+) -> Result<Option<(i64, i64, String, Vec<u8>, i64)>, ReadinessError> {
+    let mut statement = tx.prepare(
+        "SELECT
+             typeof(source_generation), source_generation,
+             typeof(readiness_revision), readiness_revision,
+             typeof(contract_version), length(CAST(contract_version AS BLOB)),
+             CASE WHEN typeof(contract_version) = 'text'
+                       AND length(CAST(contract_version AS BLOB)) <= ?2
+                  THEN contract_version END,
+             typeof(membership_digest), length(CAST(membership_digest AS BLOB)),
+             CASE WHEN typeof(membership_digest) = 'blob'
+                       AND length(CAST(membership_digest AS BLOB)) <= 32
+                  THEN membership_digest END,
+             typeof(membership_count), membership_count
+         FROM source_readiness_sources
+         WHERE source_id = ?1",
+    )?;
+    let mut rows = statement.query(params![
+        source_id,
+        MAX_READINESS_CONTRACT_VERSION_BYTES as i64,
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let source_generation = read_stored_i64(row, 0, 1, "source_generation")?;
+    let readiness_revision = read_stored_i64(row, 2, 3, "readiness_revision")?;
+    let contract_version = read_required_bounded_text(
+        row,
+        4,
+        5,
+        6,
+        "contract_version",
+        MAX_READINESS_CONTRACT_VERSION_BYTES,
+    )?;
+    let digest_type = row.get::<_, String>(7)?;
+    let digest_length = row.get::<_, Option<i64>>(8)?;
+    if digest_type != "blob" || digest_length.is_none_or(|length| length > 32) {
+        return Err(ReadinessError::SimilarityMembershipMismatch);
+    }
+    let raw_membership_digest = row
+        .get::<_, Option<Vec<u8>>>(9)?
+        .ok_or(ReadinessError::SimilarityMembershipMismatch)?;
+    let raw_membership_count = read_stored_i64(row, 10, 11, "membership_count")?;
+    if rows.next()?.is_some() {
+        return Err(invalid_persisted_value(
+            "source_id",
+            "duplicate source state row",
+        ));
+    }
+    Ok(Some((
+        source_generation,
+        readiness_revision,
+        contract_version,
+        raw_membership_digest,
+        raw_membership_count,
+    )))
+}
+
+fn read_required_bounded_text(
+    row: &Row<'_>,
+    type_index: usize,
+    length_index: usize,
+    value_index: usize,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<String, ReadinessError> {
+    read_bounded_text(
+        row,
+        type_index,
+        length_index,
+        value_index,
+        field,
+        max_bytes,
+        false,
+    )?
+    .ok_or_else(|| invalid_persisted_value(field, "required text was NULL"))
+}
+
+fn read_stored_i64(
+    row: &Row<'_>,
+    type_index: usize,
+    value_index: usize,
+    field: &'static str,
+) -> Result<i64, ReadinessError> {
+    if row.get::<_, String>(type_index)? != "integer" {
+        return Err(invalid_persisted_value(field, "wrong SQLite storage class"));
+    }
+    row.get::<_, i64>(value_index)
+        .map_err(|_| invalid_persisted_value(field, "invalid integer"))
+}
+
+fn read_bounded_digest(
+    row: &Row<'_>,
+    type_index: usize,
+    length_index: usize,
+    value_index: usize,
+) -> Result<[u8; 32], ReadinessError> {
+    if row.get::<_, String>(type_index)? != "blob"
+        || row.get::<_, Option<i64>>(length_index)? != Some(32)
+    {
+        return Err(invalid_persisted_value(
+            "target_digest",
+            "digest must be a 32-byte BLOB",
+        ));
+    }
+    let value = row
+        .get::<_, Option<Vec<u8>>>(value_index)
+        .map_err(|_| invalid_persisted_value("target_digest", "invalid digest BLOB"))?
+        .ok_or_else(|| {
+            invalid_persisted_value("target_digest", "bounded digest was not returned")
+        })?;
+    value
+        .try_into()
+        .map_err(|_| invalid_persisted_value("target_digest", "digest must be a 32-byte BLOB"))
+}
+
+fn digest_targets_in_transaction(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    expected_source_generation: Option<i64>,
+    cancel: Option<&AtomicBool>,
+) -> Result<([u8; 32], i64), ReadinessError> {
+    let mut statement = tx.prepare(
+        "SELECT
+             typeof(source_id), length(CAST(source_id AS BLOB)),
+             CASE WHEN typeof(source_id) = 'text'
+                       AND length(CAST(source_id AS BLOB)) <= ?2
+                  THEN source_id END,
+             typeof(scope_kind), length(CAST(scope_kind AS BLOB)),
+             CASE WHEN typeof(scope_kind) = 'text'
+                       AND length(CAST(scope_kind AS BLOB)) <= ?2
+                  THEN scope_kind END,
+             typeof(scope_id), length(CAST(scope_id AS BLOB)),
+             CASE WHEN typeof(scope_id) = 'text'
+                       AND length(CAST(scope_id AS BLOB)) <= ?2
+                  THEN scope_id END,
+             typeof(relative_path), length(CAST(relative_path AS BLOB)),
+             CASE WHEN relative_path IS NULL THEN NULL
+                  WHEN typeof(relative_path) = 'text'
+                       AND length(CAST(relative_path AS BLOB)) <= ?2
+                  THEN relative_path END,
+             typeof(stage), length(CAST(stage AS BLOB)),
+             CASE WHEN typeof(stage) = 'text'
+                       AND length(CAST(stage AS BLOB)) <= ?2
+                  THEN stage END,
+             typeof(required_version), length(CAST(required_version AS BLOB)),
+             CASE WHEN typeof(required_version) = 'text'
+                       AND length(CAST(required_version AS BLOB)) <= ?2
+                  THEN required_version END,
+             typeof(source_generation), source_generation,
+             typeof(content_generation), length(CAST(content_generation AS BLOB)),
+             CASE WHEN typeof(content_generation) = 'text'
+                       AND length(CAST(content_generation AS BLOB)) <= ?2
+                  THEN content_generation END,
+             typeof(eligibility), length(CAST(eligibility AS BLOB)),
+             CASE WHEN typeof(eligibility) = 'text'
+                       AND length(CAST(eligibility AS BLOB)) <= ?2
+                  THEN eligibility END
+         FROM source_readiness_targets
+         WHERE source_id = ?1
+         ORDER BY scope_kind, scope_id, stage",
+    )?;
+    let mut rows = statement.query(params![source_id, MAX_READINESS_TARGET_TEXT_BYTES as i64])?;
+    let mut hasher = Hasher::new();
+    hash_bytes(&mut hasher, b"wavecrate-readiness-target-set-v1");
+    let mut target_count = 0_i64;
+    while let Some(row) = rows.next()? {
+        cancellation_checkpoint(cancel)?;
+        let row_source_id =
+            read_required_bounded_text(row, 0, 1, 2, "source_id", MAX_READINESS_TARGET_TEXT_BYTES)?;
+        let scope_kind_text = read_required_bounded_text(
+            row,
+            3,
+            4,
+            5,
+            "scope_kind",
+            MAX_READINESS_TARGET_TEXT_BYTES,
+        )?;
+        let scope_id =
+            read_required_bounded_text(row, 6, 7, 8, "scope_id", MAX_READINESS_TARGET_TEXT_BYTES)?;
+        let relative_path = read_bounded_text(
+            row,
+            9,
+            10,
+            11,
+            "relative_path",
+            MAX_READINESS_TARGET_TEXT_BYTES,
+            true,
+        )?;
+        let stage_text =
+            read_required_bounded_text(row, 12, 13, 14, "stage", MAX_READINESS_TARGET_TEXT_BYTES)?;
+        let required_version = read_required_bounded_text(
+            row,
+            15,
+            16,
+            17,
+            "required_version",
+            MAX_READINESS_TARGET_TEXT_BYTES,
+        )?;
+        let source_generation = read_stored_i64(row, 18, 19, "source_generation")?;
+        let content_generation = read_required_bounded_text(
+            row,
+            20,
+            21,
+            22,
+            "content_generation",
+            MAX_READINESS_TARGET_TEXT_BYTES,
+        )?;
+        let eligibility_text = read_required_bounded_text(
+            row,
+            23,
+            24,
+            25,
+            "eligibility",
+            MAX_READINESS_TARGET_TEXT_BYTES,
+        )?;
+
+        let scope_kind = ReadinessScopeKind::from_stored(&scope_kind_text)
+            .ok_or_else(|| invalid_persisted_value("scope_kind", "unknown readiness scope"))?;
+        let stage = ReadinessStage::from_stored(&stage_text)
+            .ok_or_else(|| invalid_persisted_value("stage", "unknown readiness stage"))?;
+        let eligibility =
+            ReadinessEligibility::from_stored(&eligibility_text).ok_or_else(|| {
+                invalid_persisted_value("eligibility", "unknown readiness eligibility")
+            })?;
+        if row_source_id != source_id {
+            return Err(invalid_persisted_value("source_id", "row source mismatch"));
+        }
+        if scope_kind == ReadinessScopeKind::Source
+            && expected_source_generation.is_some_and(|expected| source_generation != expected)
+        {
+            return Err(ReadinessError::ReadinessWakeMismatch {
+                field: "source_target_generation",
+            });
+        }
+        if source_generation < 0 {
+            return Err(invalid_persisted_value(
+                "source_generation",
+                "negative generation",
+            ));
+        }
+        if scope_id.trim().is_empty()
+            || required_version.trim().is_empty()
+            || content_generation.trim().is_empty()
+        {
+            return Err(invalid_persisted_value(
+                "target",
+                "empty required target text",
+            ));
+        }
+        match scope_kind {
+            ReadinessScopeKind::Source => {
+                if stage != ReadinessStage::SimilarityLayout
+                    || scope_id != source_id
+                    || relative_path.is_some()
+                {
+                    return Err(invalid_persisted_value(
+                        "target",
+                        "invalid source target shape",
+                    ));
+                }
+            }
+            ReadinessScopeKind::File => {
+                if stage == ReadinessStage::SimilarityLayout
+                    || (eligibility == ReadinessEligibility::Eligible
+                        && relative_path
+                            .as_deref()
+                            .is_none_or(|path| path.trim().is_empty()))
+                {
+                    return Err(invalid_persisted_value(
+                        "target",
+                        "invalid file target shape",
+                    ));
+                }
+            }
+        }
+        target_count = target_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_persisted_value("target_count", "target count overflow"))?;
+        hash_text_field(&mut hasher, "source_id", &row_source_id);
+        hash_text_field(&mut hasher, "scope_kind", scope_kind.as_str());
+        hash_text_field(&mut hasher, "scope_id", &scope_id);
+        hash_optional_text_field(&mut hasher, "relative_path", relative_path.as_deref());
+        hash_text_field(&mut hasher, "stage", stage.as_str());
+        hash_text_field(&mut hasher, "required_version", &required_version);
+        hash_i64_field(&mut hasher, "source_generation", source_generation);
+        hash_text_field(&mut hasher, "content_generation", &content_generation);
+        hash_text_field(&mut hasher, "eligibility", eligibility.as_str());
+    }
+    Ok((*hasher.finalize().as_bytes(), target_count))
+}
+
+fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_field_name(hasher: &mut Hasher, field: &str) {
+    hasher.update(&[0xf0]);
+    hash_bytes(hasher, field.as_bytes());
+}
+
+fn hash_text_field(hasher: &mut Hasher, field: &str, value: &str) {
+    hash_field_name(hasher, field);
+    hasher.update(&[0x01]);
+    hash_bytes(hasher, value.as_bytes());
+}
+
+fn hash_optional_text_field(hasher: &mut Hasher, field: &str, value: Option<&str>) {
+    hash_field_name(hasher, field);
+    match value {
+        Some(value) => {
+            hasher.update(&[0x01]);
+            hash_bytes(hasher, value.as_bytes());
+        }
+        None => {
+            hasher.update(&[0x00]);
+        }
+    }
+}
+
+fn hash_i64_field(hasher: &mut Hasher, field: &str, value: i64) {
+    hash_field_name(hasher, field);
+    hasher.update(&[0x02]);
+    hasher.update(&value.to_be_bytes());
+}
+
+fn persist_readiness_wake(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    source_generation: i64,
+    readiness_revision: i64,
+    contract_version: &str,
+    target_digest: [u8; 32],
+    target_count: i64,
+) -> Result<(), ReadinessError> {
+    if source_generation < 0 {
+        return Err(ReadinessError::InvalidReadinessCounter {
+            field: "source_generation",
+            reason: "must be nonnegative",
+        });
+    }
+    if readiness_revision <= 0 {
+        return Err(ReadinessError::InvalidReadinessCounter {
+            field: "readiness_revision",
+            reason: "must be positive",
+        });
+    }
+    if target_count < 0 {
+        return Err(ReadinessError::InvalidReadinessCounter {
+            field: "target_count",
+            reason: "must be nonnegative",
+        });
+    }
+    let previous_revision = read_readiness_wake_row(tx, source_id)?
+        .map(|wake| wake.owner_revision)
+        .unwrap_or(0);
+    let owner_revision = previous_revision
+        .checked_add(1)
+        .ok_or(ReadinessError::ReadinessWakeRevisionOverflow)?;
+    let wake_id = Uuid::new_v4();
+    tx.execute(
+        "INSERT INTO source_readiness_wakes (
+             source_id, wake_id, owner_revision, source_generation, readiness_revision,
+             contract_version, target_digest, target_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(source_id) DO UPDATE SET
+             wake_id = excluded.wake_id,
+             owner_revision = excluded.owner_revision,
+             source_generation = excluded.source_generation,
+             readiness_revision = excluded.readiness_revision,
+             contract_version = excluded.contract_version,
+             target_digest = excluded.target_digest,
+             target_count = excluded.target_count",
+        params![
+            source_id,
+            wake_id.to_string(),
+            owner_revision,
+            source_generation,
+            readiness_revision,
+            contract_version,
+            target_digest.as_slice(),
+            target_count,
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_readiness_wake_row(
+    tx: &Transaction<'_>,
+    source_id: &str,
+) -> Result<Option<super::ReadinessWakeObservation>, ReadinessError> {
+    let mut statement = tx.prepare(
+        "SELECT
+             typeof(wake_id), length(CAST(wake_id AS BLOB)),
+             CASE WHEN typeof(wake_id) = 'text'
+                       AND length(CAST(wake_id AS BLOB)) <= ?2
+                  THEN wake_id END,
+             typeof(owner_revision), owner_revision,
+             typeof(source_generation), source_generation,
+             typeof(readiness_revision), readiness_revision,
+             typeof(contract_version), length(CAST(contract_version AS BLOB)),
+             CASE WHEN typeof(contract_version) = 'text'
+                       AND length(CAST(contract_version AS BLOB)) <= ?3
+                  THEN contract_version END,
+             typeof(target_digest), length(CAST(target_digest AS BLOB)),
+             CASE WHEN typeof(target_digest) = 'blob'
+                       AND length(CAST(target_digest AS BLOB)) = 32
+                  THEN target_digest END,
+             typeof(target_count), target_count
+         FROM source_readiness_wakes
+         WHERE source_id = ?1",
+    )?;
+    let mut rows = statement.query(params![
+        source_id,
+        MAX_READINESS_TARGET_TEXT_BYTES as i64,
+        MAX_READINESS_CONTRACT_VERSION_BYTES as i64,
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let wake_id =
+        read_required_bounded_text(row, 0, 1, 2, "wake_id", MAX_READINESS_TARGET_TEXT_BYTES)?;
+    let owner_revision = read_stored_i64(row, 3, 4, "owner_revision")?;
+    let source_generation = read_stored_i64(row, 5, 6, "source_generation")?;
+    let readiness_revision = read_stored_i64(row, 7, 8, "readiness_revision")?;
+    let contract_version = read_required_bounded_text(
+        row,
+        9,
+        10,
+        11,
+        "contract_version",
+        MAX_READINESS_CONTRACT_VERSION_BYTES,
+    )?;
+    let target_digest = read_bounded_digest(row, 12, 13, 14)?;
+    let target_count = read_stored_i64(row, 15, 16, "target_count")?;
+    if Uuid::parse_str(&wake_id).is_err() || Uuid::parse_str(&wake_id).is_ok_and(|id| id.is_nil()) {
+        return Err(invalid_persisted_value("wake_id", "must be a non-nil UUID"));
+    }
+    if owner_revision <= 0 {
+        return Err(invalid_persisted_value(
+            "owner_revision",
+            "must be positive",
+        ));
+    }
+    if source_generation < 0 {
+        return Err(invalid_persisted_value(
+            "source_generation",
+            "must be nonnegative",
+        ));
+    }
+    if readiness_revision <= 0 {
+        return Err(invalid_persisted_value(
+            "readiness_revision",
+            "must be positive",
+        ));
+    }
+    if contract_version.trim().is_empty() {
+        return Err(invalid_persisted_value(
+            "contract_version",
+            "must be nonempty",
+        ));
+    }
+    if target_count < 0 {
+        return Err(invalid_persisted_value(
+            "target_count",
+            "must be nonnegative",
+        ));
+    }
+    if rows.next()?.is_some() {
+        return Err(invalid_persisted_value("source_id", "duplicate wake row"));
+    }
+    Ok(Some(super::ReadinessWakeObservation {
+        source_id: source_id.to_string(),
+        wake_id,
+        owner_revision,
+        source_generation,
+        readiness_revision,
+        contract_version,
+        target_digest,
+        target_count,
+    }))
+}
+
+pub(super) fn read_readiness_wake(
+    connection: &mut Connection,
+    source_id: &str,
+) -> Result<Option<super::ReadinessWakeObservation>, ReadinessError> {
+    validate_target_text_bound("source_id", source_id)?;
+    let tx = connection.transaction()?;
+    let Some(wake) = read_readiness_wake_row(&tx, source_id)? else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let Some((source_generation, readiness_revision, contract_version)) =
+        read_current_wake_source_state(&tx, source_id)?
+    else {
+        return Err(ReadinessError::ReadinessWakeMismatch {
+            field: "source_state",
+        });
+    };
+    if wake.source_generation != source_generation {
+        return Err(ReadinessError::ReadinessWakeMismatch {
+            field: "source_generation",
+        });
+    }
+    if wake.readiness_revision != readiness_revision {
+        return Err(ReadinessError::ReadinessWakeMismatch {
+            field: "readiness_revision",
+        });
+    }
+    if wake.contract_version != contract_version {
+        return Err(ReadinessError::ReadinessWakeMismatch {
+            field: "contract_version",
+        });
+    }
+    let (target_digest, target_count) =
+        digest_targets_in_transaction(&tx, source_id, Some(source_generation), None)?;
+    if wake.target_digest != target_digest {
+        return Err(ReadinessError::ReadinessWakeMismatch {
+            field: "target_digest",
+        });
+    }
+    if wake.target_count != target_count {
+        return Err(ReadinessError::ReadinessWakeMismatch {
+            field: "target_count",
+        });
+    }
+    tx.commit()?;
+    Ok(Some(wake))
+}
+
+fn read_current_wake_source_state(
+    tx: &Transaction<'_>,
+    source_id: &str,
+) -> Result<Option<(i64, i64, String)>, ReadinessError> {
+    let mut statement = tx.prepare(
+        "SELECT
+             typeof(source_generation), source_generation,
+             typeof(readiness_revision), readiness_revision,
+             typeof(contract_version), length(CAST(contract_version AS BLOB)),
+             CASE WHEN typeof(contract_version) = 'text'
+                       AND length(CAST(contract_version AS BLOB)) <= ?2
+                  THEN contract_version END
+         FROM source_readiness_sources
+         WHERE source_id = ?1",
+    )?;
+    let mut rows = statement.query(params![
+        source_id,
+        MAX_READINESS_CONTRACT_VERSION_BYTES as i64,
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let source_generation = read_stored_i64(row, 0, 1, "source_generation")?;
+    let readiness_revision = read_stored_i64(row, 2, 3, "readiness_revision")?;
+    let contract_version = read_required_bounded_text(
+        row,
+        4,
+        5,
+        6,
+        "contract_version",
+        MAX_READINESS_CONTRACT_VERSION_BYTES,
+    )?;
+    if source_generation < 0 {
+        return Err(invalid_persisted_value(
+            "source_generation",
+            "must be nonnegative",
+        ));
+    }
+    if readiness_revision <= 0 {
+        return Err(invalid_persisted_value(
+            "readiness_revision",
+            "must be positive",
+        ));
+    }
+    if contract_version.trim().is_empty() {
+        return Err(invalid_persisted_value(
+            "contract_version",
+            "must be nonempty",
+        ));
+    }
+    if rows.next()?.is_some() {
+        return Err(invalid_persisted_value(
+            "source_id",
+            "duplicate source state row",
+        ));
+    }
+    Ok(Some((
+        source_generation,
+        readiness_revision,
+        contract_version,
+    )))
 }
 
 fn membership_from_targets(targets: &[ReadinessTarget]) -> ReadinessMembership {

@@ -137,6 +137,16 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
         membership_count INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_readiness_wakes (
+        source_id TEXT PRIMARY KEY,
+        wake_id TEXT NOT NULL,
+        owner_revision INTEGER NOT NULL,
+        source_generation INTEGER NOT NULL,
+        readiness_revision INTEGER NOT NULL,
+        contract_version TEXT NOT NULL,
+        target_digest BLOB NOT NULL,
+        target_count INTEGER NOT NULL
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS source_readiness_targets (
         source_id TEXT NOT NULL,
         scope_kind TEXT NOT NULL,

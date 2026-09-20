@@ -113,6 +113,19 @@ pub(super) const SOURCE_DB_SCHEMA_CONTRACT: &[TableContract] = &[
         ],
     },
     TableContract {
+        name: "source_readiness_wakes",
+        columns: &[
+            "source_id",
+            "wake_id",
+            "owner_revision",
+            "source_generation",
+            "readiness_revision",
+            "contract_version",
+            "target_digest",
+            "target_count",
+        ],
+    },
+    TableContract {
         name: "source_readiness_targets",
         columns: &[
             "source_id",

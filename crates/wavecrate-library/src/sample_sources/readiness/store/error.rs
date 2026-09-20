@@ -29,6 +29,40 @@ pub enum ReadinessError {
     /// A readiness publication omitted its independently revisioned contract identity.
     #[error("Readiness contract version must be non-empty")]
     InvalidContractVersion,
+    /// A readiness text field exceeded its bounded durable representation.
+    #[error("Readiness text field exceeds its bound: {field}")]
+    ReadinessTextTooLong {
+        /// Field whose UTF-8 representation was too large.
+        field: &'static str,
+    },
+    /// A readiness contract identity exceeded its bounded durable representation.
+    #[error("Readiness contract version exceeds its bound")]
+    ContractVersionTooLong,
+    /// A persisted readiness value had an invalid storage class, shape, or range.
+    #[error("Invalid persisted readiness value for {field}: {reason}")]
+    InvalidPersistedReadinessValue {
+        /// Persisted field containing the invalid value.
+        field: &'static str,
+        /// Bounded reason that does not include untrusted raw payload.
+        reason: &'static str,
+    },
+    /// A publication counter was outside the range accepted by the wake contract.
+    #[error("Invalid readiness publication counter for {field}: {reason}")]
+    InvalidReadinessCounter {
+        /// Counter field containing the invalid value.
+        field: &'static str,
+        /// Bounded reason for the rejection.
+        reason: &'static str,
+    },
+    /// The durable wake owner revision could not advance without overflowing.
+    #[error("Readiness wake owner revision overflow")]
+    ReadinessWakeRevisionOverflow,
+    /// The durable wake did not match the current source readiness state.
+    #[error("Readiness wake does not match current source state: {field}")]
+    ReadinessWakeMismatch {
+        /// Wake field whose current-state comparison failed.
+        field: &'static str,
+    },
     /// A stored enum value is not part of the versioned readiness contract.
     #[error("Unknown stored readiness value for {field}: {value}")]
     UnknownStoredValue {

@@ -223,6 +223,10 @@ fn target_replacement_is_failure_atomic() {
     let (_root, mut connection) = open_fixture();
     let original = file_target("original", ReadinessStage::IndexedIdentity, 1);
     replace(&mut connection, 1, std::slice::from_ref(&original));
+    let original_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read original wake")
+        .expect("original wake");
     connection
         .execute_batch(
             "CREATE TRIGGER reject_broken_readiness_target
@@ -256,6 +260,11 @@ fn target_replacement_is_failure_atomic() {
     assert!(snapshot.entries.iter().all(|entry| {
         entry.target.scope_id == "original" || entry.target.scope_kind == ReadinessScopeKind::Source
     }));
+    let retained_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read retained wake")
+        .expect("retained wake");
+    assert_eq!(retained_wake, original_wake);
 }
 
 #[test]
@@ -908,6 +917,10 @@ fn one_identity_delta_preserves_unchanged_targets_and_running_work() {
         100,
     )
     .expect("publish initial targets");
+    let initial_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read initial delta wake")
+        .expect("initial delta wake");
     let initial_snapshot =
         reconcile_readiness(&connection, SOURCE_ID, 101).expect("initial deficits");
     persist_readiness_deficits(&mut connection, &initial_snapshot.deficits, 101)
@@ -966,6 +979,14 @@ fn one_identity_delta_preserves_unchanged_targets_and_running_work() {
         )
         .expect("publish readiness delta");
     drop(store);
+    let delta_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read delta wake")
+        .expect("delta wake");
+    assert_eq!(delta_wake.owner_revision(), 2);
+    assert_eq!(delta_wake.source_generation(), 2);
+    assert_eq!(delta_wake.readiness_revision(), 102);
+    assert_ne!(delta_wake.target_digest(), initial_wake.target_digest());
     membership.remove("change", "old-hash");
     membership.remove("delete", "delete-hash");
     membership.add("change", "new-hash");
@@ -1251,4 +1272,388 @@ fn legacy_read_only_source_reports_unavailable_readiness_schema() {
     let error = reconcile_readiness(&read_only, SOURCE_ID, 1).expect_err("schema unavailable");
 
     assert!(matches!(error, ReadinessError::SchemaUnavailable));
+}
+
+#[test]
+fn readiness_wake_is_absent_before_publication_and_roundtrips_after_reopen() {
+    let (root, mut connection) = open_fixture();
+    assert!(
+        ReadinessStore::new(&mut connection)
+            .readiness_wake(SOURCE_ID)
+            .expect("read missing readiness wake")
+            .is_none()
+    );
+
+    let target = file_target("wake", ReadinessStage::AnalysisFeatures, 1);
+    replace(&mut connection, 1, std::slice::from_ref(&target));
+    let first = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read readiness wake")
+        .expect("wake after publication");
+    assert_eq!(first.owner_revision(), 1);
+    assert_eq!(first.source_generation(), 1);
+    assert_eq!(first.readiness_revision(), 101);
+    assert_eq!(first.target_count(), 4);
+    assert_eq!(first.contract_version(), "readiness-test-contract-v1");
+    assert_ne!(first.wake_id(), "00000000-0000-0000-0000-000000000000");
+
+    drop(connection);
+    let mut reopened =
+        SourceDatabase::open_connection_for_background_job(root.path()).expect("reopen source db");
+    let reopened_wake = ReadinessStore::new(&mut reopened)
+        .readiness_wake(SOURCE_ID)
+        .expect("read reopened readiness wake")
+        .expect("reopened wake");
+    assert_eq!(reopened_wake, first);
+}
+
+#[test]
+fn readiness_wake_digest_is_order_independent_and_covers_nonmembership_fields() {
+    let (_root, mut connection) = open_fixture();
+    let seed = file_target("digest", ReadinessStage::AnalysisFeatures, 1);
+    let targets = complete_targets(1, std::slice::from_ref(&seed));
+    sync_manifest(&connection, &targets);
+    replace_readiness_targets(
+        &mut connection,
+        SOURCE_ID,
+        1,
+        101,
+        SourceAvailability::Active,
+        &targets,
+        1,
+    )
+    .expect("publish first digest");
+    let first = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read first wake")
+        .expect("first wake");
+
+    let mut reversed = targets.clone();
+    reversed.reverse();
+    sync_manifest(&connection, &reversed);
+    replace_readiness_targets(
+        &mut connection,
+        SOURCE_ID,
+        1,
+        102,
+        SourceAvailability::Active,
+        &reversed,
+        2,
+    )
+    .expect("republish reordered targets");
+    let reordered = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read reordered wake")
+        .expect("reordered wake");
+    assert_eq!(reordered.owner_revision(), 2);
+    assert_eq!(reordered.target_digest(), first.target_digest());
+
+    let mut changed = reversed;
+    changed
+        .iter_mut()
+        .find(|target| target.stage == ReadinessStage::SimilarityLayout)
+        .expect("source target")
+        .required_version = "layout-v2".to_string();
+    sync_manifest(&connection, &changed);
+    replace_readiness_targets(
+        &mut connection,
+        SOURCE_ID,
+        1,
+        103,
+        SourceAvailability::Active,
+        &changed,
+        3,
+    )
+    .expect("publish changed target metadata");
+    let changed_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read changed wake")
+        .expect("changed wake");
+    assert_eq!(changed_wake.owner_revision(), 3);
+    assert_ne!(changed_wake.target_digest(), first.target_digest());
+}
+
+#[test]
+fn readiness_wake_text_bounds_are_checked_before_publication() {
+    let (_root, mut connection) = open_fixture();
+    let exact = ReadinessTarget::source(
+        SOURCE_ID,
+        ReadinessStage::SimilarityLayout,
+        "v".repeat(MAX_READINESS_TARGET_TEXT_BYTES),
+        1,
+        "g".repeat(MAX_READINESS_TARGET_TEXT_BYTES),
+    );
+    let targets = [exact];
+    let contract_version = "c".repeat(MAX_READINESS_CONTRACT_VERSION_BYTES);
+    let publication = ReadinessTargetPublication::new(
+        SOURCE_ID,
+        1,
+        1,
+        SourceAvailability::Active,
+        &contract_version,
+        &targets,
+        1,
+    );
+    let mut store = ReadinessStore::new(&mut connection);
+    let origin = store
+        .capture_publication_origin()
+        .expect("publication origin");
+    store
+        .publish_targets(&origin, &publication)
+        .expect("exact text bounds are accepted");
+    drop(store);
+    assert!(
+        ReadinessStore::new(&mut connection)
+            .readiness_wake(SOURCE_ID)
+            .expect("read exact-bound wake")
+            .is_some()
+    );
+
+    let oversized = ReadinessTarget::source(
+        SOURCE_ID,
+        ReadinessStage::SimilarityLayout,
+        "x".repeat(MAX_READINESS_TARGET_TEXT_BYTES + 1),
+        2,
+        "next-generation",
+    );
+    let oversized_publication = ReadinessTargetPublication::new(
+        SOURCE_ID,
+        2,
+        2,
+        SourceAvailability::Active,
+        "contract-v2",
+        std::slice::from_ref(&oversized),
+        2,
+    );
+    let mut store = ReadinessStore::new(&mut connection);
+    let origin = store
+        .capture_publication_origin()
+        .expect("publication origin");
+    let error = store
+        .publish_targets(&origin, &oversized_publication)
+        .expect_err("oversized publication");
+    assert!(matches!(
+        error,
+        ReadinessError::ReadinessTextTooLong {
+            field: "required_version"
+        }
+    ));
+    drop(store);
+    let state = ReadinessStore::new(&mut connection)
+        .source_state(SOURCE_ID)
+        .expect("read source state")
+        .expect("source state");
+    assert_eq!(state.source_generation, 1);
+    assert_eq!(state.readiness_revision, 1);
+}
+
+#[test]
+fn readiness_wake_rejects_malformed_persisted_values_without_rewriting_evidence() {
+    let (_root, mut connection) = open_fixture();
+    let target = file_target("malformed-wake", ReadinessStage::AnalysisFeatures, 1);
+    replace(&mut connection, 1, std::slice::from_ref(&target));
+    let original_digest: Vec<u8> = connection
+        .query_row(
+            "SELECT target_digest FROM source_readiness_wakes WHERE source_id = ?1",
+            [SOURCE_ID],
+            |row| row.get(0),
+        )
+        .expect("read original wake digest");
+    connection
+        .execute(
+            "UPDATE source_readiness_targets
+             SET required_version = ?1
+             WHERE source_id = ?2 AND scope_id = 'malformed-wake'
+               AND stage = 'analysis_features'",
+            rusqlite::params!["x".repeat(MAX_READINESS_TARGET_TEXT_BYTES + 1), SOURCE_ID],
+        )
+        .expect("inject oversized target");
+    let error = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect_err("oversized persisted target");
+    assert!(matches!(
+        error,
+        ReadinessError::InvalidPersistedReadinessValue {
+            field: "required_version",
+            ..
+        }
+    ));
+    let retained_target: String = connection
+        .query_row(
+            "SELECT required_version FROM source_readiness_targets
+             WHERE source_id = ?1 AND scope_id = 'malformed-wake'
+               AND stage = 'analysis_features'",
+            [SOURCE_ID],
+            |row| row.get(0),
+        )
+        .expect("read retained target");
+    assert_eq!(retained_target.len(), MAX_READINESS_TARGET_TEXT_BYTES + 1);
+    let retained_digest: Vec<u8> = connection
+        .query_row(
+            "SELECT target_digest FROM source_readiness_wakes WHERE source_id = ?1",
+            [SOURCE_ID],
+            |row| row.get(0),
+        )
+        .expect("read retained wake digest");
+    assert_eq!(retained_digest, original_digest);
+
+    connection
+        .execute(
+            "UPDATE source_readiness_sources SET contract_version = ?1 WHERE source_id = ?2",
+            rusqlite::params![
+                "contract".repeat(MAX_READINESS_CONTRACT_VERSION_BYTES),
+                SOURCE_ID
+            ],
+        )
+        .expect("inject oversized source contract");
+    let error = ReadinessStore::new(&mut connection)
+        .source_state(SOURCE_ID)
+        .expect_err("oversized persisted source contract");
+    assert!(matches!(
+        error,
+        ReadinessError::InvalidPersistedReadinessValue {
+            field: "contract_version",
+            ..
+        }
+    ));
+    connection
+        .execute(
+            "UPDATE source_readiness_sources
+             SET contract_version = 'readiness-test-contract-v1' WHERE source_id = ?1",
+            [SOURCE_ID],
+        )
+        .expect("restore source contract");
+
+    connection
+        .execute(
+            "UPDATE source_readiness_targets
+             SET required_version = 'v1'
+             WHERE source_id = ?1 AND scope_id = 'malformed-wake'
+               AND stage = 'analysis_features'",
+            [SOURCE_ID],
+        )
+        .expect("restore target");
+    connection
+        .execute(
+            "UPDATE source_readiness_wakes SET target_digest = X'01' WHERE source_id = ?1",
+            [SOURCE_ID],
+        )
+        .expect("inject malformed wake digest");
+    let error = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect_err("malformed persisted wake");
+    assert!(matches!(
+        error,
+        ReadinessError::InvalidPersistedReadinessValue {
+            field: "target_digest",
+            ..
+        }
+    ));
+    let retained_digest: Vec<u8> = connection
+        .query_row(
+            "SELECT target_digest FROM source_readiness_wakes WHERE source_id = ?1",
+            [SOURCE_ID],
+            |row| row.get(0),
+        )
+        .expect("read malformed wake evidence");
+    assert_eq!(retained_digest, vec![1]);
+}
+
+#[test]
+fn readiness_wake_revision_overflow_rolls_back_complete_publication() {
+    let (_root, mut connection) = open_fixture();
+    let target = file_target("overflow", ReadinessStage::AnalysisFeatures, 1);
+    replace(&mut connection, 1, std::slice::from_ref(&target));
+    connection
+        .execute(
+            "UPDATE source_readiness_wakes SET owner_revision = ?1 WHERE source_id = ?2",
+            rusqlite::params![i64::MAX, SOURCE_ID],
+        )
+        .expect("force wake revision exhaustion");
+    let mut changed = complete_targets(1, std::slice::from_ref(&target));
+    changed
+        .iter_mut()
+        .find(|target| target.stage == ReadinessStage::SimilarityLayout)
+        .expect("source target")
+        .required_version = "layout-overflow".to_string();
+    sync_manifest(&connection, &changed);
+    let error = replace_readiness_targets(
+        &mut connection,
+        SOURCE_ID,
+        1,
+        102,
+        SourceAvailability::Active,
+        &changed,
+        2,
+    )
+    .expect_err("wake revision overflow");
+    assert!(matches!(
+        error,
+        ReadinessError::ReadinessWakeRevisionOverflow
+    ));
+    let state = ReadinessStore::new(&mut connection)
+        .source_state(SOURCE_ID)
+        .expect("read rolled-back source state")
+        .expect("source state");
+    assert_eq!(state.readiness_revision, 101);
+    let required_version: String = connection
+        .query_row(
+            "SELECT required_version FROM source_readiness_targets
+             WHERE source_id = ?1 AND scope_id = 'overflow'
+               AND stage = 'analysis_features'",
+            [SOURCE_ID],
+            |row| row.get(0),
+        )
+        .expect("read rolled-back target");
+    assert_eq!(required_version, "v1");
+    let owner_revision: i64 = connection
+        .query_row(
+            "SELECT owner_revision FROM source_readiness_wakes WHERE source_id = ?1",
+            [SOURCE_ID],
+            |row| row.get(0),
+        )
+        .expect("read exhausted wake");
+    assert_eq!(owner_revision, i64::MAX);
+}
+
+#[test]
+fn readiness_wake_cancelled_publication_preserves_targets_and_wake() {
+    let (_root, mut connection) = open_fixture();
+    let target = file_target("cancelled", ReadinessStage::AnalysisFeatures, 1);
+    replace(&mut connection, 1, std::slice::from_ref(&target));
+    let original_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read original wake")
+        .expect("original wake");
+    let changed = complete_targets(2, std::slice::from_ref(&target));
+    let publication = ReadinessTargetPublication::new(
+        SOURCE_ID,
+        2,
+        102,
+        SourceAvailability::Active,
+        "readiness-test-contract-v1",
+        &changed,
+        2,
+    );
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let mut store = ReadinessStore::new(&mut connection);
+    let origin = store
+        .capture_publication_origin()
+        .expect("publication origin");
+    let error = store
+        .publish_targets_with_cancel(&origin, &publication, &cancel)
+        .expect_err("cancelled publication");
+    assert!(matches!(error, ReadinessError::Cancelled));
+    drop(store);
+    let retained_wake = ReadinessStore::new(&mut connection)
+        .readiness_wake(SOURCE_ID)
+        .expect("read retained wake")
+        .expect("retained wake");
+    assert_eq!(retained_wake, original_wake);
+    let state = ReadinessStore::new(&mut connection)
+        .source_state(SOURCE_ID)
+        .expect("read retained source state")
+        .expect("source state");
+    assert_eq!(state.source_generation, 1);
+    assert_eq!(state.readiness_revision, 101);
 }

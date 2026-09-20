@@ -82,6 +82,16 @@ pub(super) fn ensure_source_readiness_schema(connection: &Connection) -> Result<
                 membership_count INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS source_readiness_wakes (
+                source_id TEXT PRIMARY KEY,
+                wake_id TEXT NOT NULL,
+                owner_revision INTEGER NOT NULL,
+                source_generation INTEGER NOT NULL,
+                readiness_revision INTEGER NOT NULL,
+                contract_version TEXT NOT NULL,
+                target_digest BLOB NOT NULL,
+                target_count INTEGER NOT NULL
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS source_readiness_targets (
                 source_id TEXT NOT NULL,
                 scope_kind TEXT NOT NULL,
@@ -167,6 +177,21 @@ pub(super) fn ensure_source_readiness_schema(connection: &Connection) -> Result<
                     [],
                 )
                 .map_err(map_sql_error)?;
+        }
+    }
+    let wake_columns = table_columns(connection, "source_readiness_wakes")?;
+    for column in [
+        "source_id",
+        "wake_id",
+        "owner_revision",
+        "source_generation",
+        "readiness_revision",
+        "contract_version",
+        "target_digest",
+        "target_count",
+    ] {
+        if !wake_columns.contains(column) {
+            return Err(SourceDbError::Unexpected);
         }
     }
     let artifact_columns = table_columns(connection, "source_readiness_artifacts")?;

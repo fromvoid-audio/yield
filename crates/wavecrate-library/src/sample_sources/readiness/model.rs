@@ -1,5 +1,14 @@
 use crate::sample_sources::db::SourcePublicationFence;
 
+/// Maximum UTF-8 byte length of a durable readiness target text field.
+///
+/// This bound is shared by publication validation and the canonical target digest so a source
+/// database can never force an unbounded text materialization at the wake boundary.
+pub const MAX_READINESS_TARGET_TEXT_BYTES: usize = 64 * 1024;
+
+/// Maximum UTF-8 byte length of the readiness contract identity stored with a publication.
+pub const MAX_READINESS_CONTRACT_VERSION_BYTES: usize = 1024;
+
 /// Stable readiness stages required for a usable source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReadinessStage {
