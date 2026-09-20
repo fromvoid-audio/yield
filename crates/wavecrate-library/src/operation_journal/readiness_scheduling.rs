@@ -745,6 +745,105 @@ impl ReadinessSchedulingObservationRecord {
     }
 }
 
+/// One accepted, compact proof that an exact optional-artifact subset was deferred.
+///
+/// The full planner manifest is retained only on the untrusted candidate record.  Once accepted,
+/// WorkProgress owns the immutable plan, so this historical value keeps only the generation,
+/// observation epoch, selected artifacts, and the exact readiness rows needed to revalidate the
+/// proof later.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessDeferralBatchObservation {
+    observation_generation: u64,
+    observation_epoch: u64,
+    artifact_keys: Vec<WorkUnitKey>,
+    rows: Vec<ReadinessSchedulingObservationRow>,
+}
+
+impl ReadinessDeferralBatchObservation {
+    /// Construct one bounded compact deferral observation.
+    pub(crate) fn new(
+        observation_generation: u64,
+        observation_epoch: u64,
+        artifact_keys: Vec<WorkUnitKey>,
+        rows: Vec<ReadinessSchedulingObservationRow>,
+    ) -> Result<Self, ReadinessSchedulingObservationError> {
+        let observation = Self {
+            observation_generation,
+            observation_epoch,
+            artifact_keys,
+            rows,
+        };
+        observation.validate_shape()?;
+        Ok(observation)
+    }
+
+    /// Return the positive accepted deferral generation.
+    pub const fn observation_generation(&self) -> u64 {
+        self.observation_generation
+    }
+
+    /// Return the execution epoch at which this deferral was observed.
+    pub const fn observation_epoch(&self) -> u64 {
+        self.observation_epoch
+    }
+
+    /// Borrow the exact selected optional-artifact keys.
+    pub fn artifact_keys(&self) -> &[WorkUnitKey] {
+        &self.artifact_keys
+    }
+
+    /// Borrow the exact readiness observations retained with this batch.
+    pub fn rows(&self) -> &[ReadinessSchedulingObservationRow] {
+        &self.rows
+    }
+
+    pub(crate) fn validate_shape(&self) -> Result<(), ReadinessSchedulingObservationError> {
+        if self.observation_generation == 0 {
+            return Err(ReadinessSchedulingObservationError::ZeroDeferralBatchGeneration);
+        }
+        if self.artifact_keys.is_empty() {
+            return Err(ReadinessSchedulingObservationError::EmptyDeferralBatchSelection);
+        }
+        if self.artifact_keys.len() > MAX_WORK_PLAN_UNITS {
+            return Err(
+                ReadinessSchedulingObservationError::TooManyDeferralBatchArtifacts {
+                    actual: self.artifact_keys.len(),
+                    maximum: MAX_WORK_PLAN_UNITS,
+                },
+            );
+        }
+        if self
+            .artifact_keys
+            .windows(2)
+            .any(|window| window[0] >= window[1])
+        {
+            return Err(ReadinessSchedulingObservationError::DeferralBatchArtifactsNotSortedUnique);
+        }
+        if self.rows.len() > self.artifact_keys.len() {
+            return Err(
+                ReadinessSchedulingObservationError::DeferralBatchRowsExceedArtifacts {
+                    rows: self.rows.len(),
+                    artifacts: self.artifact_keys.len(),
+                },
+            );
+        }
+        let mut wake_ids = BTreeSet::new();
+        for (index, row) in self.rows.iter().enumerate() {
+            row.validate_shape()?;
+            if index > 0 && self.rows[index - 1].readiness_key >= row.readiness_key {
+                return Err(ReadinessSchedulingObservationError::DeferralBatchRowsNotSortedUnique);
+            }
+            if !wake_ids.insert(row.wake.wake_id) {
+                return Err(ReadinessSchedulingObservationError::DuplicateWakeId {
+                    wake_id: row.wake.wake_id,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_sorted_unique(
     keys: &[WorkUnitKey],
     maximum: usize,
@@ -1018,6 +1117,34 @@ pub enum ReadinessSchedulingObservationError {
         /// Wake identity reused by another row.
         wake_id: Uuid,
     },
+    /// A compact accepted deferral batch used generation zero.
+    #[error("readiness deferral batch generation must be positive")]
+    ZeroDeferralBatchGeneration,
+    /// A compact accepted deferral batch selected no artifacts.
+    #[error("readiness deferral batch selection must not be empty")]
+    EmptyDeferralBatchSelection,
+    /// A compact accepted deferral batch exceeded the frozen-plan bound.
+    #[error("readiness deferral batch has {actual} artifacts, maximum is {maximum}")]
+    TooManyDeferralBatchArtifacts {
+        /// Number of selected artifacts.
+        actual: usize,
+        /// Maximum permitted plan units.
+        maximum: usize,
+    },
+    /// Compact batch artifact keys were not canonical.
+    #[error("readiness deferral batch artifact keys must be sorted and unique")]
+    DeferralBatchArtifactsNotSortedUnique,
+    /// Compact batch rows exceeded the selected artifact count.
+    #[error("readiness deferral batch has {rows} rows for {artifacts} artifacts")]
+    DeferralBatchRowsExceedArtifacts {
+        /// Number of retained readiness rows.
+        rows: usize,
+        /// Number of selected artifacts.
+        artifacts: usize,
+    },
+    /// Compact batch rows were not canonical.
+    #[error("readiness deferral batch rows must be sorted and unique")]
+    DeferralBatchRowsNotSortedUnique,
     /// A source revision observation was malformed.
     #[error("invalid readiness source revision observation: {0}")]
     SourceObservation(#[source] super::work_progress::ProgressEvidenceError),

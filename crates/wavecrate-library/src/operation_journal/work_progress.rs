@@ -67,9 +67,9 @@ use super::participants::{
     ParticipantValidationError, StoredSourceFence,
 };
 use super::readiness_scheduling::{
-    ReadinessDeferralManifest, ReadinessDeferralManifestError, ReadinessSchedulingObservationError,
-    ReadinessSchedulingObservationRecord, ReadinessSchedulingObservationRow,
-    derive_readiness_deferral_manifest,
+    ReadinessDeferralBatchObservation, ReadinessDeferralManifest, ReadinessDeferralManifestError,
+    ReadinessSchedulingObservationError, ReadinessSchedulingObservationRecord,
+    ReadinessSchedulingObservationRow, derive_readiness_deferral_manifest,
 };
 use super::work_plan::{
     GLOBAL_ACTION_ORDINAL, MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite,
@@ -1353,6 +1353,19 @@ struct VerifiedCancellationCleanupObservations {
     namespace_cleanup_observation: CancellationNamespaceCleanupObservationRecord,
 }
 
+/// Private owner-issued authority for accepting one exact current readiness deferral batch.
+///
+/// The full plan is retained only in this non-serialized authority and in WorkProgress itself;
+/// accepted history stores the compact observation value instead of duplicating the plan.
+#[allow(dead_code)]
+pub(crate) struct VerifiedReadinessDeferral {
+    operation_id: OperationId,
+    plan: WorkPlan,
+    execution_epoch: u64,
+    expected_previous_generation: u64,
+    observation: ReadinessSchedulingObservationRecord,
+}
+
 /// Origin state required by one prepublication cleanup action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrePublishOriginPolicy {
@@ -1402,6 +1415,7 @@ pub struct WorkProgress {
     pre_publish_cancellation: Option<PrePublishCancellationObservation>,
     after_effect_reconciliation: Option<AfterEffectReconciliationObservation>,
     cancellation_cleanup_observations: Option<CancellationCleanupObservation>,
+    readiness_deferral_batches: Vec<ReadinessDeferralBatchObservation>,
 }
 
 #[allow(dead_code)]
@@ -1464,6 +1478,7 @@ impl WorkProgress {
             pre_publish_cancellation: None,
             after_effect_reconciliation: None,
             cancellation_cleanup_observations: None,
+            readiness_deferral_batches: Vec::new(),
         })
     }
 
@@ -1511,6 +1526,11 @@ impl WorkProgress {
         &self.steps
     }
 
+    /// Borrow compact accepted optional-artifact deferral history in generation order.
+    pub fn readiness_deferral_batches(&self) -> &[ReadinessDeferralBatchObservation] {
+        &self.readiness_deferral_batches
+    }
+
     /// Validate retained completion observations against their accepted historical context.
     ///
     /// This is an observational check only.  It uses each completed step's accepted participant
@@ -1543,6 +1563,135 @@ impl WorkProgress {
                 }
                 (_, None, None) => {}
             }
+        }
+        self.validate_readiness_deferral_history()?;
+        Ok(())
+    }
+
+    /// Validate compact accepted optional-artifact deferral history.
+    pub(crate) fn validate_readiness_deferral_history(&self) -> Result<(), WorkProgressError> {
+        let mut expected_generation = 1_u64;
+        let mut previous_epoch = 0_u64;
+        let mut previous_artifacts = BTreeSet::new();
+        let mut deferred_artifacts = BTreeSet::new();
+        let mut previous_rows = BTreeMap::new();
+
+        for (batch_index, batch) in self.readiness_deferral_batches.iter().enumerate() {
+            batch
+                .validate_shape()
+                .map_err(WorkProgressError::ReadinessSchedulingObservation)?;
+            if batch.observation_generation() != expected_generation {
+                return Err(WorkProgressError::ReadinessDeferralGenerationMismatch {
+                    expected: expected_generation,
+                    actual: batch.observation_generation(),
+                });
+            }
+            if batch.observation_epoch() > self.execution_epoch
+                || batch.observation_epoch() < previous_epoch
+            {
+                return Err(WorkProgressError::ReadinessDeferralEpochInvalid {
+                    epoch: batch.observation_epoch(),
+                    previous: previous_epoch,
+                    current: self.execution_epoch,
+                });
+            }
+            let manifest = self.readiness_deferral_manifest(batch.artifact_keys())?;
+            if manifest.readiness_keys().len() != batch.rows().len()
+                || manifest
+                    .readiness_keys()
+                    .iter()
+                    .zip(batch.rows())
+                    .any(|(expected, row)| *expected != row.readiness_key())
+            {
+                return Err(WorkProgressError::ReadinessDeferralRowCoverageMismatch);
+            }
+            for artifact in batch.artifact_keys() {
+                if !previous_artifacts.insert(*artifact) {
+                    return Err(WorkProgressError::ReadinessDeferralArtifactOverlap {
+                        key: *artifact,
+                    });
+                }
+                deferred_artifacts.insert(*artifact);
+                let step = self
+                    .steps
+                    .iter()
+                    .find(|step| step.key == *artifact)
+                    .ok_or(WorkProgressError::UnknownWorkUnit { key: *artifact })?;
+                if step.status != ProgressStepStatus::Deferred {
+                    return Err(WorkProgressError::ReadinessDeferralStatusMismatch {
+                        key: *artifact,
+                    });
+                }
+            }
+            for row in batch.rows() {
+                if row.context().execution_epoch() != batch.observation_epoch() {
+                    return Err(WorkProgressError::ReadinessDeferralRowEpochMismatch {
+                        key: row.readiness_key(),
+                        actual: row.context().execution_epoch(),
+                        expected: batch.observation_epoch(),
+                    });
+                }
+                let readiness_step = self
+                    .steps
+                    .iter()
+                    .find(|step| step.key == row.readiness_key())
+                    .ok_or(WorkProgressError::UnknownWorkUnit {
+                        key: row.readiness_key(),
+                    })?;
+                let (normal_context, normal_row) = match (
+                    readiness_step.status,
+                    readiness_step.completion_context.as_ref(),
+                    readiness_step.evidence.as_ref(),
+                ) {
+                    (
+                        ProgressStepStatus::Completed,
+                        Some(context),
+                        Some(StoredStepEvidence::ReadinessScheduled { observation }),
+                    ) => (context, observation),
+                    _ => {
+                        return Err(WorkProgressError::ReadinessDeferralReadinessIncomplete {
+                            key: row.readiness_key(),
+                        });
+                    }
+                };
+                if normal_context.execution_epoch() > batch.observation_epoch() {
+                    return Err(WorkProgressError::ReadinessDeferralReadinessEpochInvalid {
+                        key: row.readiness_key(),
+                    });
+                }
+                validate_readiness_deferral_source_revision_order(
+                    row,
+                    normal_row,
+                    &self.readiness_deferral_batches[..batch_index],
+                )?;
+                self.validate_historical_completion(
+                    row.readiness_key(),
+                    row.context(),
+                    &StoredStepEvidence::ReadinessScheduled {
+                        observation: row.clone(),
+                    },
+                )?;
+                validate_readiness_publication_order(
+                    Some(normal_row),
+                    previous_rows.get(&row.readiness_key()),
+                    row,
+                )?;
+                previous_rows.insert(row.readiness_key(), row.clone());
+            }
+            expected_generation = expected_generation
+                .checked_add(1)
+                .ok_or(WorkProgressError::ReadinessDeferralGenerationOverflow)?;
+            previous_epoch = batch.observation_epoch();
+        }
+
+        let actual_deferred = self
+            .steps
+            .iter()
+            .filter(|step| step.status == ProgressStepStatus::Deferred)
+            .map(|step| step.key)
+            .collect::<BTreeSet<_>>();
+        if actual_deferred != deferred_artifacts {
+            return Err(WorkProgressError::ReadinessDeferralStatusCoverageMismatch);
         }
         Ok(())
     }
@@ -3054,30 +3203,153 @@ impl WorkProgress {
         Ok(())
     }
 
-    /// Defer one optional artifact while retaining required-progress guards.
-    pub(crate) fn defer_optional_artifact(
+    /// Apply one private, current-epoch exact-subset readiness deferral.
+    #[allow(dead_code)]
+    pub(crate) fn apply_verified_readiness_deferral(
         &mut self,
-        key: WorkUnitKey,
-    ) -> Result<(), WorkProgressError> {
+        authority: VerifiedReadinessDeferral,
+    ) -> Result<ProgressApplyOutcome, WorkProgressError> {
+        if authority.operation_id != self.operation_id || authority.plan != self.plan {
+            return Err(WorkProgressError::ReadinessDeferralAuthorityMismatch);
+        }
+        if authority.execution_epoch != self.execution_epoch {
+            return Err(WorkProgressError::ReadinessDeferralEpochMismatch {
+                expected: self.execution_epoch,
+                actual: authority.execution_epoch,
+            });
+        }
+        let selected_artifact_keys = authority.observation.manifest().artifact_keys();
+        let expected_manifest = self.readiness_deferral_manifest(selected_artifact_keys)?;
+        authority
+            .observation
+            .validate_against(&expected_manifest)
+            .map_err(WorkProgressError::ReadinessSchedulingObservation)?;
+        if authority.observation.observation_epoch() != self.execution_epoch {
+            return Err(WorkProgressError::ReadinessDeferralCandidateEpochMismatch);
+        }
+        let expected_generation = authority
+            .expected_previous_generation
+            .checked_add(1)
+            .ok_or(WorkProgressError::ReadinessDeferralGenerationOverflow)?;
+        if authority.observation.observation_generation() != expected_generation {
+            return Err(WorkProgressError::ReadinessDeferralGenerationMismatch {
+                expected: expected_generation,
+                actual: authority.observation.observation_generation(),
+            });
+        }
+        let compact = ReadinessDeferralBatchObservation::new(
+            authority.observation.observation_generation(),
+            authority.observation.observation_epoch(),
+            selected_artifact_keys.to_vec(),
+            authority.observation.rows().to_vec(),
+        )
+        .map_err(WorkProgressError::ReadinessSchedulingObservation)?;
+        if let Some(existing) = self
+            .readiness_deferral_batches
+            .iter()
+            .find(|batch| batch.observation_generation() == compact.observation_generation())
+        {
+            if existing == &compact {
+                return Ok(ProgressApplyOutcome::Replay);
+            }
+            return Err(WorkProgressError::ReadinessDeferralPublicationConflict {
+                key: compact.rows().first().map_or(
+                    selected_artifact_keys[0],
+                    ReadinessSchedulingObservationRow::readiness_key,
+                ),
+            });
+        }
+        let current_previous_generation = self
+            .readiness_deferral_batches
+            .last()
+            .map_or(0, ReadinessDeferralBatchObservation::observation_generation);
+        if authority.expected_previous_generation != current_previous_generation {
+            return Err(WorkProgressError::ReadinessDeferralGenerationMismatch {
+                expected: current_previous_generation,
+                actual: authority.expected_previous_generation,
+            });
+        }
+        self.validate_completion_history()?;
         if self.disposition != FullProgressDisposition::None {
             return Err(WorkProgressError::ProgressSuspended {
                 disposition: self.disposition,
             });
         }
-        let step = self
-            .steps
-            .iter_mut()
-            .find(|step| step.key == key)
-            .ok_or(WorkProgressError::UnknownWorkUnit { key })?;
-        if step.key.role() != WorkUnitRole::Artifact
-            || step.requirement != ParticipantRequirement::OptionalRebuildable
-            || step.status != ProgressStepStatus::Pending
-        {
-            return Err(WorkProgressError::ArtifactDeferralForbidden { key });
+        self.validate_readiness_scheduling_observation_record(
+            &authority.observation,
+            selected_artifact_keys,
+        )?;
+        for artifact in selected_artifact_keys {
+            let step = self
+                .steps
+                .iter()
+                .find(|step| step.key == *artifact)
+                .ok_or(WorkProgressError::UnknownWorkUnit { key: *artifact })?;
+            if step.key.role() != WorkUnitRole::Artifact
+                || step.requirement != ParticipantRequirement::OptionalRebuildable
+                || step.status != ProgressStepStatus::Pending
+            {
+                return Err(WorkProgressError::ReadinessDeferralArtifactNotPending {
+                    key: *artifact,
+                });
+            }
         }
-        step.status = ProgressStepStatus::Deferred;
+        for row in authority.observation.rows() {
+            let step = self
+                .steps
+                .iter()
+                .find(|step| step.key == row.readiness_key())
+                .ok_or(WorkProgressError::UnknownWorkUnit {
+                    key: row.readiness_key(),
+                })?;
+            if !matches!(
+                (
+                    step.status,
+                    step.evidence.as_ref(),
+                    step.completion_context.as_ref()
+                ),
+                (
+                    ProgressStepStatus::Completed,
+                    Some(StoredStepEvidence::ReadinessScheduled { .. }),
+                    Some(_)
+                )
+            ) {
+                return Err(WorkProgressError::ReadinessDeferralReadinessIncomplete {
+                    key: row.readiness_key(),
+                });
+            }
+        }
+        let previous_rows = self
+            .readiness_deferral_batches
+            .last()
+            .map(|batch| batch.rows())
+            .unwrap_or(&[]);
+        for row in authority.observation.rows() {
+            let previous = previous_rows
+                .iter()
+                .find(|previous| previous.readiness_key() == row.readiness_key());
+            let normal = self
+                .steps
+                .iter()
+                .find(|step| step.key == row.readiness_key())
+                .and_then(|step| step.evidence.as_ref())
+                .and_then(|evidence| match evidence {
+                    StoredStepEvidence::ReadinessScheduled { observation } => Some(observation),
+                    _ => None,
+                });
+            validate_readiness_publication_order(normal, previous, row)?;
+        }
+        self.readiness_deferral_batches.push(compact);
+        for artifact in selected_artifact_keys {
+            let step = self
+                .steps
+                .iter_mut()
+                .find(|step| step.key == *artifact)
+                .expect("validated optional artifact key");
+            step.status = ProgressStepStatus::Deferred;
+        }
         self.refresh_derived_state();
-        Ok(())
+        Ok(ProgressApplyOutcome::Applied)
     }
 
     /// Apply a crate-private completion after checking its full operation and prerequisite fence.
@@ -4068,6 +4340,14 @@ impl WorkProgress {
                 consider(context, evidence);
             }
         }
+        for batch in &self.readiness_deferral_batches {
+            for row in batch.rows() {
+                let evidence = StoredStepEvidence::ReadinessScheduled {
+                    observation: row.clone(),
+                };
+                consider(row.context(), &evidence);
+            }
+        }
         minimum
     }
 
@@ -4164,6 +4444,22 @@ impl WorkProgress {
                     if let Some(observation) = source_observation_for_evidence(evidence) {
                         minimum = Some(minimum.unwrap_or(0).max(observation.revision()));
                     }
+                }
+            }
+        }
+        for batch in &self.readiness_deferral_batches {
+            for row in batch.rows() {
+                if row
+                    .context()
+                    .scope()
+                    .source_fence()
+                    .is_some_and(|candidate| candidate == fence)
+                {
+                    minimum = Some(
+                        minimum
+                            .unwrap_or(0)
+                            .max(row.source_observation().revision()),
+                    );
                 }
             }
         }
@@ -4276,6 +4572,18 @@ impl WorkProgress {
                     if same_stable_source_identity_observation(observation, fence) {
                         minimum = minimum.max(observation.revision());
                     }
+                }
+            }
+        }
+        for batch in &self.readiness_deferral_batches {
+            for row in batch.rows() {
+                let Some(context_fence) = row.context().scope().source_fence() else {
+                    continue;
+                };
+                if same_stable_source_identity(context_fence, fence)
+                    && same_stable_source_identity_observation(row.source_observation(), fence)
+                {
+                    minimum = minimum.max(row.source_observation().revision());
                 }
             }
         }
@@ -4515,6 +4823,79 @@ fn validate_pre_publish_unstarted_quiescence_transition(
                 != Some(PrePublishAbsenceObservation::Absent);
         if quiescence_regressed || staging_regressed || recovery_regressed {
             return Err(WorkProgressError::PrePublishCancellationQuiescenceReplayConflict);
+        }
+    }
+    Ok(())
+}
+
+fn validate_readiness_deferral_source_revision_order(
+    candidate: &ReadinessSchedulingObservationRow,
+    normal: &ReadinessSchedulingObservationRow,
+    previous_batches: &[ReadinessDeferralBatchObservation],
+) -> Result<(), WorkProgressError> {
+    let mut minimum = None;
+    let candidate_observation = candidate.source_observation();
+    if same_stable_source_observation_identity(candidate_observation, normal.source_observation()) {
+        minimum = Some(normal.source_observation().revision());
+    }
+    for batch in previous_batches {
+        for previous in batch.rows() {
+            if same_stable_source_observation_identity(
+                candidate_observation,
+                previous.source_observation(),
+            ) {
+                minimum = Some(
+                    minimum
+                        .unwrap_or(0)
+                        .max(previous.source_observation().revision()),
+                );
+            }
+        }
+    }
+    if let Some(minimum) = minimum {
+        if candidate_observation.revision() < minimum {
+            return Err(
+                WorkProgressError::ReadinessDeferralSourceRevisionRegression {
+                    key: candidate.readiness_key(),
+                    observed: candidate_observation.revision(),
+                    minimum,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_readiness_publication_order(
+    normal: Option<&ReadinessSchedulingObservationRow>,
+    previous: Option<&ReadinessSchedulingObservationRow>,
+    candidate: &ReadinessSchedulingObservationRow,
+) -> Result<(), WorkProgressError> {
+    for reference in [normal, previous].into_iter().flatten() {
+        let source_unchanged = candidate.source_generation() == reference.source_generation();
+        let revision_unchanged = candidate.readiness_revision() == reference.readiness_revision();
+        if source_unchanged && revision_unchanged {
+            if candidate.contract_version() != reference.contract_version()
+                || candidate.target_set() != reference.target_set()
+                || candidate.wake() != reference.wake()
+            {
+                return Err(WorkProgressError::ReadinessDeferralPublicationConflict {
+                    key: candidate.readiness_key(),
+                });
+            }
+            continue;
+        }
+        if candidate.source_generation() < reference.source_generation() {
+            return Err(
+                WorkProgressError::ReadinessDeferralSourceGenerationRegression {
+                    key: candidate.readiness_key(),
+                },
+            );
+        }
+        if candidate.readiness_revision() <= reference.readiness_revision() {
+            return Err(WorkProgressError::ReadinessDeferralRevisionRegression {
+                key: candidate.readiness_key(),
+            });
         }
     }
     Ok(())
@@ -5195,6 +5576,16 @@ fn same_stable_source_identity_observation(
         && observation.lifecycle_generation() == fence.lifecycle_generation()
 }
 
+fn same_stable_source_observation_identity(
+    left: &SourceRevisionObservation,
+    right: &SourceRevisionObservation,
+) -> bool {
+    left.source_id() == right.source_id()
+        && left.root_identity() == right.root_identity()
+        && left.database_identity() == right.database_identity()
+        && left.lifecycle_generation() == right.lifecycle_generation()
+}
+
 fn validate_source_text(
     value: &str,
     field: ParticipantTextField,
@@ -5334,6 +5725,123 @@ pub enum WorkProgressError {
     ReadinessSchedulingSourceFenceMissing {
         /// Readiness key whose scope is unfenced.
         key: WorkUnitKey,
+    },
+    /// The private readiness-deferral authority did not bind this operation or plan.
+    #[error("work progress readiness deferral authority does not match")]
+    ReadinessDeferralAuthorityMismatch,
+    /// The private readiness-deferral authority carried another execution epoch.
+    #[error(
+        "work progress readiness deferral epoch {actual} does not match expected epoch {expected}"
+    )]
+    ReadinessDeferralEpochMismatch {
+        /// Current progress epoch.
+        expected: u64,
+        /// Authority epoch.
+        actual: u64,
+    },
+    /// The candidate did not follow the dense accepted deferral generation sequence.
+    #[error(
+        "work progress readiness deferral generation {actual} does not match expected generation {expected}"
+    )]
+    ReadinessDeferralGenerationMismatch {
+        /// Expected prior or next generation.
+        expected: u64,
+        /// Supplied generation.
+        actual: u64,
+    },
+    /// The accepted deferral generation could not advance without wrapping.
+    #[error("work progress readiness deferral generation overflowed")]
+    ReadinessDeferralGenerationOverflow,
+    /// A compact historical batch repeated an artifact already deferred.
+    #[error("work progress readiness deferral artifact {key:?} appears in more than one batch")]
+    ReadinessDeferralArtifactOverlap {
+        /// Repeated selected artifact.
+        key: WorkUnitKey,
+    },
+    /// A compact batch did not contain the exact readiness rows selected by its artifacts.
+    #[error("work progress readiness deferral rows do not cover the exact selected prerequisites")]
+    ReadinessDeferralRowCoverageMismatch,
+    /// An accepted compact batch did not leave its selected artifact Deferred.
+    #[error("work progress readiness deferral artifact {key:?} is not Deferred")]
+    ReadinessDeferralStatusMismatch {
+        /// Artifact whose status was not Deferred.
+        key: WorkUnitKey,
+    },
+    /// Deferred progress rows were not exactly explained by retained compact batches.
+    #[error("work progress Deferred rows do not match retained readiness deferral batches")]
+    ReadinessDeferralStatusCoverageMismatch,
+    /// A selected artifact's required Readiness step was not completed with rich evidence.
+    #[error("work progress readiness prerequisite {key:?} is not a completed rich observation")]
+    ReadinessDeferralReadinessIncomplete {
+        /// Readiness prerequisite key.
+        key: WorkUnitKey,
+    },
+    /// A required Readiness completion was accepted after the deferral observation.
+    #[error("work progress readiness prerequisite {key:?} was completed after its deferral")]
+    ReadinessDeferralReadinessEpochInvalid {
+        /// Readiness prerequisite key.
+        key: WorkUnitKey,
+    },
+    /// A retained deferral row was not captured at its batch epoch.
+    #[error(
+        "work progress readiness deferral row {key:?} context epoch {actual} does not match batch epoch {expected}"
+    )]
+    ReadinessDeferralRowEpochMismatch {
+        /// Readiness row key.
+        key: WorkUnitKey,
+        /// Row context epoch.
+        actual: u64,
+        /// Batch observation epoch.
+        expected: u64,
+    },
+    /// A compact deferral batch epoch regressed or exceeded current progress.
+    #[error("work progress readiness deferral epoch {epoch} is outside [{previous}, {current}]")]
+    ReadinessDeferralEpochInvalid {
+        /// Candidate batch epoch.
+        epoch: u64,
+        /// Previous accepted epoch.
+        previous: u64,
+        /// Current progress epoch.
+        current: u64,
+    },
+    /// A current candidate was not captured at the authority's current epoch.
+    #[error("work progress readiness deferral candidate epoch does not match current progress")]
+    ReadinessDeferralCandidateEpochMismatch,
+    /// A candidate selected a non-pending optional artifact or changed a completed step.
+    #[error("work progress readiness deferral artifact {key:?} is not pending optional work")]
+    ReadinessDeferralArtifactNotPending {
+        /// Artifact whose status or role was invalid.
+        key: WorkUnitKey,
+    },
+    /// A current candidate's readiness row violated publication identity ordering.
+    #[error("work progress readiness deferral publication identity conflicts for {key:?}")]
+    ReadinessDeferralPublicationConflict {
+        /// Readiness key whose identity fields changed.
+        key: WorkUnitKey,
+    },
+    /// A current candidate lowered a readiness source generation.
+    #[error("work progress readiness deferral source generation regressed for {key:?}")]
+    ReadinessDeferralSourceGenerationRegression {
+        /// Readiness key whose source generation regressed.
+        key: WorkUnitKey,
+    },
+    /// A current candidate reused or lowered a readiness publication revision.
+    #[error("work progress readiness deferral publication revision did not advance for {key:?}")]
+    ReadinessDeferralRevisionRegression {
+        /// Readiness key whose publication revision regressed.
+        key: WorkUnitKey,
+    },
+    /// A retained readiness source observation regressed below causally prior proof.
+    #[error(
+        "work progress readiness deferral source revision {observed} regressed below {minimum} for {key:?}"
+    )]
+    ReadinessDeferralSourceRevisionRegression {
+        /// Readiness key carrying the regressed source observation.
+        key: WorkUnitKey,
+        /// Observed source revision.
+        observed: u64,
+        /// Greatest causally prior revision.
+        minimum: u64,
     },
     /// The private after-effect reconciliation authority did not bind this operation or plan.
     #[error("work progress after-effect reconciliation authority does not match")]
@@ -6169,15 +6677,16 @@ mod tests {
         NamespaceEntryEndpoint, NamespaceEntryExpectation, NamespaceFileExpectation,
         NamespaceLeafName, NamespaceMoveIntentArgs, NamespaceRenameIntentArgs, NamespaceTarget,
         ParticipantCheckpoint, ParticipantCheckpointState, RawWavExtractionRecipe,
-        ReadinessSchedulingObservationRecord, ReadinessSchedulingObservationRow,
-        ReadinessTargetSetSummary, RetainedDeleteId, RetainedFolderObservation,
-        RetainedPurgeDecision, RetainedPurgeIntentArgs, RetainedRecoveryRootKind,
-        RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedRestoreIntentArgs,
-        RetryErrorClass, RetryLeaseId, SelectionExtractIntentArgs, SelectionOutputCommandArgs,
-        SelectionOutputRecipe, SourceClosureManifest, SourceClosureManifestError,
-        SourceClosureManifestValidationError, StoredRelativePath, UniversalCommandArgs,
-        WaveformEditFrameRange, WaveformFileRevisionObservation, WaveformOutputSpec,
-        WaveformSampleFormat, WaveformSourceSpec, fingerprint_selected_entry_json,
+        ReadinessDeferralBatchObservation, ReadinessSchedulingObservationRecord,
+        ReadinessSchedulingObservationRow, ReadinessTargetSetSummary, RetainedDeleteId,
+        RetainedFolderObservation, RetainedPurgeDecision, RetainedPurgeIntentArgs,
+        RetainedRecoveryRootKind, RetainedResolutionCommandArgs, RetainedResolutionStage,
+        RetainedRestoreIntentArgs, RetryErrorClass, RetryLeaseId, SelectionExtractIntentArgs,
+        SelectionOutputCommandArgs, SelectionOutputRecipe, SourceClosureManifest,
+        SourceClosureManifestError, SourceClosureManifestValidationError, StoredRelativePath,
+        UniversalCommandArgs, WaveformEditFrameRange, WaveformFileRevisionObservation,
+        WaveformOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
+        fingerprint_selected_entry_json,
     };
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use serde_json::json;
@@ -7595,6 +8104,72 @@ mod tests {
         .expect("readiness row")
     }
 
+    fn readiness_deferral_observation(
+        progress: &WorkProgress,
+        artifact_keys: &[WorkUnitKey],
+        generation: u64,
+    ) -> ReadinessSchedulingObservationRecord {
+        let manifest = progress
+            .readiness_deferral_manifest(artifact_keys)
+            .expect("readiness deferral manifest");
+        let rows = manifest
+            .readiness_keys()
+            .iter()
+            .map(|key| {
+                progress
+                    .step_for(*key)
+                    .and_then(WorkProgressStep::evidence)
+                    .and_then(|evidence| match evidence {
+                        StoredStepEvidence::ReadinessScheduled { observation } => {
+                            Some(observation.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("completed rich readiness evidence")
+            })
+            .collect();
+        ReadinessSchedulingObservationRecord::new(
+            manifest,
+            progress.execution_epoch(),
+            generation,
+            rows,
+        )
+        .expect("readiness deferral observation")
+    }
+
+    fn readiness_deferral_authority(
+        progress: &WorkProgress,
+        observation: ReadinessSchedulingObservationRecord,
+        expected_previous_generation: u64,
+    ) -> VerifiedReadinessDeferral {
+        VerifiedReadinessDeferral {
+            operation_id: progress.operation_id,
+            plan: progress.plan.clone(),
+            execution_epoch: progress.execution_epoch(),
+            expected_previous_generation,
+            observation,
+        }
+    }
+
+    fn apply_readiness_deferral(
+        progress: &mut WorkProgress,
+        artifact_keys: &[WorkUnitKey],
+        generation: u64,
+    ) {
+        let observation = readiness_deferral_observation(progress, artifact_keys, generation);
+        let expected_previous_generation = progress
+            .readiness_deferral_batches()
+            .last()
+            .map_or(0, |batch| batch.observation_generation());
+        progress
+            .apply_verified_readiness_deferral(readiness_deferral_authority(
+                progress,
+                observation,
+                expected_previous_generation,
+            ))
+            .expect("readiness deferral applies");
+    }
+
     fn evidence_for(
         progress: &WorkProgress,
         key: WorkUnitKey,
@@ -8081,6 +8656,10 @@ mod tests {
     }
 
     fn complete_required(progress: &mut WorkProgress) {
+        complete_required_at(progress, 7);
+    }
+
+    fn complete_required_at(progress: &mut WorkProgress, revision: u64) {
         loop {
             let next = progress.steps().iter().find_map(|step| {
                 if step.status() != ProgressStepStatus::Pending
@@ -8110,7 +8689,7 @@ mod tests {
                 }));
                 return;
             };
-            let evidence = evidence_for(progress, key, 7);
+            let evidence = evidence_for(progress, key, revision);
             progress
                 .apply_verified_completion(completion(progress, key, evidence))
                 .expect("required completion applies");
@@ -12910,9 +13489,7 @@ mod tests {
             .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
             .map(WorkProgressStep::key)
             .expect("optional artifact");
-        optional
-            .defer_optional_artifact(artifact)
-            .expect("defer optional artifact");
+        apply_readiness_deferral(&mut optional, &[artifact], 1);
         optional
             .request_cancellation(CancellationRequestObservation::new(319).expect("cancel"))
             .expect("deferred cancellation");
@@ -14256,9 +14833,7 @@ mod tests {
             .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
             .map(WorkProgressStep::key)
             .expect("optional artifact");
-        progress
-            .defer_optional_artifact(artifact_key)
-            .expect("defer optional artifact");
+        apply_readiness_deferral(&mut progress, &[artifact_key], 1);
         assert_eq!(progress.phase(), OperationPhase::ReadinessScheduled);
         assert_eq!(progress.disposition(), FullProgressDisposition::None);
 
@@ -14290,9 +14865,7 @@ mod tests {
             .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
             .map(WorkProgressStep::key)
             .expect("optional artifact");
-        optional
-            .defer_optional_artifact(optional_artifact)
-            .expect("defer optional artifact");
+        apply_readiness_deferral(&mut optional, &[optional_artifact], 1);
         let settlement = settlement_inventory(&optional, AdmissionClaimSettlementOutcome::Released);
         optional
             .apply_verified_claim_settlement(settlement_authority(&optional, settlement))
@@ -14351,6 +14924,472 @@ mod tests {
                 .status(),
             ProgressStepStatus::Pending
         );
+    }
+
+    #[test]
+    fn readiness_deferral_accepts_exact_subsets_replays_and_keeps_history() {
+        let mut progress = cross_source_optional_progress();
+        complete_required_at(&mut progress, 8);
+        let artifacts = progress
+            .steps()
+            .iter()
+            .filter(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .collect::<Vec<_>>();
+        assert_eq!(artifacts.len(), 2);
+
+        let first_observation = readiness_deferral_observation(&progress, &[artifacts[0]], 1);
+        let first_authority = readiness_deferral_authority(&progress, first_observation.clone(), 0);
+        assert_eq!(
+            progress.apply_verified_readiness_deferral(first_authority),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(
+            progress
+                .step_for(artifacts[0])
+                .expect("first artifact")
+                .status(),
+            ProgressStepStatus::Deferred
+        );
+        assert_eq!(
+            progress
+                .step_for(artifacts[1])
+                .expect("second artifact")
+                .status(),
+            ProgressStepStatus::Pending
+        );
+
+        let replay = readiness_deferral_authority(&progress, first_observation, 0);
+        assert_eq!(
+            progress.apply_verified_readiness_deferral(replay),
+            Ok(ProgressApplyOutcome::Replay)
+        );
+        assert_eq!(progress.readiness_deferral_batches().len(), 1);
+
+        let second_observation = readiness_deferral_observation(&progress, &[artifacts[1]], 2);
+        assert_eq!(
+            progress.apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                second_observation,
+                1,
+            )),
+            Ok(ProgressApplyOutcome::Applied)
+        );
+        assert_eq!(progress.readiness_deferral_batches().len(), 2);
+        assert!(
+            progress
+                .steps()
+                .iter()
+                .filter(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+                .all(|step| step.status() == ProgressStepStatus::Deferred)
+        );
+        let before_overlap = progress.clone();
+        let overlap = readiness_deferral_observation(&progress, &[artifacts[0]], 3);
+        assert!(matches!(
+            progress.apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                overlap,
+                2,
+            )),
+            Err(WorkProgressError::ReadinessDeferralArtifactNotPending { key })
+                if key == artifacts[0]
+        ));
+        assert_eq!(progress, before_overlap);
+        progress
+            .validate_completion_history()
+            .expect("retained deferral history");
+    }
+
+    #[test]
+    fn readiness_deferral_rejects_same_generation_payload_conflict_atomically() {
+        let mut progress = copy_progress(true);
+        complete_required(&mut progress);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        let observation = readiness_deferral_observation(&progress, &[artifact], 1);
+        progress
+            .apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                observation.clone(),
+                0,
+            ))
+            .expect("initial deferral");
+        let before_wrong_previous = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                observation.clone(),
+                1,
+            )),
+            Err(WorkProgressError::ReadinessDeferralGenerationMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        ));
+        assert_eq!(progress, before_wrong_previous);
+
+        let mut wrong_manifest = serde_json::to_value(&observation).expect("observation JSON");
+        wrong_manifest["manifest"]["operation_id"] =
+            serde_json::to_value(OperationId::from_uuid(Uuid::from_u128(9999)))
+                .expect("operation ID JSON");
+        let wrong_manifest: ReadinessSchedulingObservationRecord =
+            serde_json::from_value(wrong_manifest).expect("wrong-manifest observation shape");
+        let before_wrong_manifest = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                wrong_manifest,
+                0,
+            )),
+            Err(WorkProgressError::ReadinessSchedulingObservation(
+                ReadinessSchedulingObservationError::Manifest(
+                    ReadinessDeferralManifestError::ExpectedManifestMismatch
+                )
+            ))
+        ));
+        assert_eq!(progress, before_wrong_manifest);
+
+        let mut conflicting = serde_json::to_value(&observation).expect("observation JSON");
+        conflicting["rows"][0]["wake"]["owner_revision"] = serde_json::json!(2);
+        let conflicting: ReadinessSchedulingObservationRecord =
+            serde_json::from_value(conflicting).expect("conflicting observation shape");
+        let before = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                conflicting,
+                0,
+            )),
+            Err(WorkProgressError::ReadinessDeferralPublicationConflict { .. })
+        ));
+        assert_eq!(progress, before);
+    }
+
+    #[test]
+    fn readiness_deferral_source_floor_and_snapshot_history_are_preserved() {
+        let mut progress = copy_progress_with_admission_claims_and_optional();
+        complete_required(&mut progress);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        let observation = readiness_deferral_observation(&progress, &[artifact], 1);
+        let mut elevated = serde_json::to_value(&observation).expect("observation JSON");
+        elevated["rows"][0]["source_observation"]["revision"] = serde_json::json!(8);
+        let elevated: ReadinessSchedulingObservationRecord =
+            serde_json::from_value(elevated).expect("elevated observation");
+        progress
+            .apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                elevated.clone(),
+                0,
+            ))
+            .expect("elevated deferral");
+
+        let readiness_key = progress
+            .readiness_deferral_batches()
+            .first()
+            .expect("accepted batch")
+            .rows()[0]
+            .readiness_key();
+        let readiness_fence = progress
+            .scope_for(readiness_key)
+            .and_then(ParticipantScope::source_fence)
+            .expect("readiness fence");
+        let source_target = progress
+            .scopes
+            .iter()
+            .find(|scope| {
+                scope.kind() == ParticipantKind::SourceDatabase
+                    && scope
+                        .source_fence()
+                        .is_some_and(|fence| same_stable_source_identity(fence, readiness_fence))
+            })
+            .map(ParticipantScope::participant_id)
+            .expect("matching source database");
+        let before_reacquisition = progress.clone();
+        assert_eq!(
+            progress.reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_target,
+                7,
+                2,
+                0,
+            )),
+            Err(WorkProgressError::SourceReacquisitionRevisionRegressed {
+                observed: 7,
+                minimum: 8,
+            })
+        );
+        assert_eq!(progress, before_reacquisition);
+
+        let (participants, source, _filesystem, source_id) = valid_topology(true);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(
+                &progress,
+                copy_args_at(source, source_id, "copy.wav"),
+                participants,
+            ))
+            .expect("deferral snapshot");
+        let mut regressed = serde_json::to_value(&snapshot).expect("snapshot JSON");
+        regressed["readiness_deferral_batches"][0]["rows"][0]["source_observation"]["revision"] =
+            serde_json::json!(6);
+        let regressed: FullProgressSnapshotObservation =
+            serde_json::from_value(regressed).expect("regressed snapshot shape");
+        assert!(matches!(
+            regressed.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation {
+                    source: WorkProgressError::ReadinessDeferralSourceRevisionRegression {
+                        observed: 6,
+                        minimum: 7,
+                        ..
+                    }
+                }
+            )
+        ));
+
+        let mut publication_regressed = serde_json::to_value(&snapshot).expect("snapshot JSON");
+        publication_regressed["readiness_deferral_batches"][0]["rows"][0]["readiness_revision"] =
+            serde_json::json!(0);
+        let publication_regressed: FullProgressSnapshotObservation =
+            serde_json::from_value(publication_regressed).expect("publication regression shape");
+        assert!(matches!(
+            publication_regressed.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation {
+                    source: WorkProgressError::ReadinessDeferralRevisionRegression { .. }
+                }
+            )
+        ));
+
+        let mut source_generation_regressed =
+            serde_json::to_value(&snapshot).expect("snapshot JSON");
+        source_generation_regressed["readiness_deferral_batches"][0]["rows"][0]["source_generation"] =
+            serde_json::json!(0);
+        let source_generation_regressed: FullProgressSnapshotObservation =
+            serde_json::from_value(source_generation_regressed)
+                .expect("source-generation regression shape");
+        assert!(matches!(
+            source_generation_regressed.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation {
+                    source: WorkProgressError::ReadinessDeferralSourceGenerationRegression { .. }
+                }
+            )
+        ));
+
+        let mut metadata_conflict = serde_json::to_value(&snapshot).expect("snapshot JSON");
+        metadata_conflict["readiness_deferral_batches"][0]["rows"][0]["contract_version"] =
+            serde_json::json!("different-contract-v1");
+        let metadata_conflict: FullProgressSnapshotObservation =
+            serde_json::from_value(metadata_conflict).expect("metadata conflict shape");
+        assert!(matches!(
+            metadata_conflict.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation {
+                    source: WorkProgressError::ReadinessDeferralPublicationConflict { .. }
+                }
+            )
+        ));
+
+        let stale_authority = readiness_deferral_authority(&progress, elevated.clone(), 0);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source_target,
+                8,
+                2,
+                0,
+            ))
+            .expect("valid source reacquisition retaining deferral receipt");
+        progress
+            .validate_completion_history()
+            .expect("historical deferral survives reacquisition");
+        let (participants, source, _filesystem, source_id) = valid_topology(true);
+        let rebound_snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(
+                &progress,
+                copy_args_at(source, source_id, "copy.wav"),
+                participants,
+            ))
+            .expect("rebound deferral snapshot");
+        rebound_snapshot
+            .validate_base()
+            .expect("rebound deferral snapshot validates");
+        let before_stale_authority = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_readiness_deferral(stale_authority),
+            Err(WorkProgressError::ReadinessDeferralEpochMismatch {
+                expected: 1,
+                actual: 0,
+            })
+        ));
+        assert_eq!(progress, before_stale_authority);
+    }
+
+    #[test]
+    fn readiness_deferral_rejects_incomplete_readiness_atomically() {
+        let mut progress = copy_progress(true);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        let manifest = progress
+            .readiness_deferral_manifest(&[artifact])
+            .expect("readiness manifest");
+        let rows = manifest
+            .readiness_keys()
+            .iter()
+            .map(|key| readiness_row(&progress, *key, 900))
+            .collect();
+        let observation = ReadinessSchedulingObservationRecord::new(
+            manifest,
+            progress.execution_epoch(),
+            1,
+            rows,
+        )
+        .expect("incomplete-readiness observation shape");
+        let before = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_readiness_deferral(readiness_deferral_authority(
+                &progress,
+                observation,
+                0,
+            )),
+            Err(WorkProgressError::ReadinessDeferralReadinessIncomplete { .. })
+        ));
+        assert_eq!(progress, before);
+    }
+
+    #[test]
+    fn snapshot_rejects_overcounted_readiness_deferral_history_before_reconstruction() {
+        let mut progress = copy_progress_with_admission_claims_and_optional();
+        complete_required(&mut progress);
+        let artifact = progress
+            .steps()
+            .iter()
+            .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .expect("optional artifact");
+        apply_readiness_deferral(&mut progress, &[artifact], 1);
+        let (participants, source, _filesystem, source_id) = valid_topology(true);
+        let snapshot = progress
+            .capture_full_progress_snapshot(&snapshot_intent_for(
+                &progress,
+                copy_args_at(source, source_id, "copy.wav"),
+                participants,
+            ))
+            .expect("deferral snapshot");
+        let mut overcounted = serde_json::to_value(&snapshot).expect("snapshot JSON");
+        let first = overcounted["readiness_deferral_batches"][0].clone();
+        let batches = overcounted["readiness_deferral_batches"]
+            .as_array_mut()
+            .expect("batch array");
+        for _ in 0..snapshot.intent().plan().units().len() {
+            batches.push(first.clone());
+        }
+        let overcounted: FullProgressSnapshotObservation =
+            serde_json::from_value(overcounted).expect("overcounted snapshot shape");
+        assert!(matches!(
+            overcounted.validate_base(),
+            Err(FullProgressSnapshotObservationError::TooManyReadinessDeferralBatches { .. })
+                | Err(
+                    FullProgressSnapshotObservationError::TooManyReadinessDeferralObservations { .. }
+                )
+        ));
+
+        let mut missing_proof = serde_json::to_value(&snapshot).expect("snapshot JSON");
+        missing_proof["readiness_deferral_batches"] = serde_json::json!([]);
+        let missing_proof: FullProgressSnapshotObservation =
+            serde_json::from_value(missing_proof).expect("missing-proof snapshot shape");
+        assert!(matches!(
+            missing_proof.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation {
+                    source: WorkProgressError::ReadinessDeferralStatusCoverageMismatch
+                }
+            )
+        ));
+
+        let mut wrong_generation = serde_json::to_value(&snapshot).expect("snapshot JSON");
+        wrong_generation["readiness_deferral_batches"][0]["observation_generation"] =
+            serde_json::json!(2);
+        let wrong_generation: FullProgressSnapshotObservation =
+            serde_json::from_value(wrong_generation).expect("wrong-generation snapshot shape");
+        assert!(matches!(
+            wrong_generation.validate_base(),
+            Err(
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation {
+                    source: WorkProgressError::ReadinessDeferralGenerationMismatch {
+                        expected: 1,
+                        actual: 2
+                    }
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn compact_deferral_batch_rejects_duplicate_wakes() {
+        let mut progress = cross_source_optional_progress();
+        complete_required_at(&mut progress, 8);
+        let artifacts = progress
+            .steps()
+            .iter()
+            .filter(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
+            .map(WorkProgressStep::key)
+            .collect::<Vec<_>>();
+        let manifest = progress
+            .readiness_deferral_manifest(&artifacts)
+            .expect("cross-source manifest");
+        let rows = manifest
+            .readiness_keys()
+            .iter()
+            .map(|key| {
+                progress
+                    .step_for(*key)
+                    .and_then(WorkProgressStep::evidence)
+                    .and_then(|evidence| match evidence {
+                        StoredStepEvidence::ReadinessScheduled { observation } => {
+                            Some(observation.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("rich readiness evidence")
+            })
+            .collect::<Vec<_>>();
+        assert!(rows.len() >= 2);
+        let mut duplicate_rows = rows;
+        let first_wake = duplicate_rows[0].wake().clone();
+        duplicate_rows[1] = ReadinessSchedulingObservationRow::new(
+            duplicate_rows[1].readiness_key(),
+            duplicate_rows[1].context().clone(),
+            duplicate_rows[1].source_observation().clone(),
+            duplicate_rows[1].source_generation(),
+            duplicate_rows[1].readiness_revision(),
+            duplicate_rows[1].contract_version(),
+            *duplicate_rows[1].target_set(),
+            first_wake,
+        )
+        .expect("duplicate wake row");
+        assert!(matches!(
+            ReadinessDeferralBatchObservation::new(
+                1,
+                progress.execution_epoch(),
+                artifacts,
+                duplicate_rows
+            ),
+            Err(ReadinessSchedulingObservationError::DuplicateWakeId { .. })
+        ));
     }
 
     #[test]
@@ -21507,9 +22546,7 @@ mod tests {
             .find(|step| step.requirement() == ParticipantRequirement::OptionalRebuildable)
             .map(WorkProgressStep::key)
             .expect("optional artifact");
-        deferred
-            .defer_optional_artifact(artifact_key)
-            .expect("defer optional artifact");
+        apply_readiness_deferral(&mut deferred, &[artifact_key], 1);
         deferred
             .apply_verified_claim_settlement(settlement_authority(
                 &deferred,

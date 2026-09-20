@@ -96,10 +96,10 @@ pub use cancellation_reconciliation::{
 
 pub use readiness_scheduling::{
     DurableReadinessWakeObservation, MAX_READINESS_CONTRACT_VERSION_BYTES,
-    ReadinessArtifactBinding, ReadinessDeferralManifest, ReadinessDeferralManifestError,
-    ReadinessSchedulingObservationError, ReadinessSchedulingObservationRecord,
-    ReadinessSchedulingObservationRow, ReadinessTargetSetSummary,
-    derive_readiness_deferral_manifest,
+    ReadinessArtifactBinding, ReadinessDeferralBatchObservation, ReadinessDeferralManifest,
+    ReadinessDeferralManifestError, ReadinessSchedulingObservationError,
+    ReadinessSchedulingObservationRecord, ReadinessSchedulingObservationRow,
+    ReadinessTargetSetSummary, derive_readiness_deferral_manifest,
 };
 
 pub use coordinator::{

@@ -17,6 +17,7 @@ use super::super::full_progress_record::{
     FullProgressIntentObservation, FullProgressIntentObservationError,
 };
 use super::super::participants::ParticipantValidationError;
+use super::super::readiness_scheduling::ReadinessDeferralBatchObservation;
 use super::super::work_plan::{WorkUnitApplicability, WorkUnitKey, WorkUnitRole};
 use super::{
     ActiveAudit, AdmissionClaimSettlementInventory, AdmissionClaimValidationError,
@@ -55,6 +56,7 @@ pub struct FullProgressSnapshotObservation {
     pre_publish_cancellation: Option<PrePublishCancellationObservation>,
     after_effect_reconciliation: Option<AfterEffectReconciliationObservation>,
     cancellation_cleanup_observations: Option<CancellationCleanupObservation>,
+    readiness_deferral_batches: Vec<ReadinessDeferralBatchObservation>,
 }
 
 impl FullProgressSnapshotObservation {
@@ -143,6 +145,11 @@ impl FullProgressSnapshotObservation {
         self.cancellation_cleanup_observations.as_ref()
     }
 
+    /// Borrow compact accepted optional-artifact deferral history.
+    pub fn readiness_deferral_batches(&self) -> &[ReadinessDeferralBatchObservation] {
+        &self.readiness_deferral_batches
+    }
+
     /// Validate this snapshot's topology and retained completion history without live progress.
     ///
     /// This is deliberately a partial consistency check.  It proves that the supplied intent,
@@ -156,15 +163,51 @@ impl FullProgressSnapshotObservation {
             .map_err(FullProgressSnapshotObservationError::Intent)?;
         self.validate_scopes()?;
         self.validate_step_bounds()?;
+        self.validate_readiness_deferral_bounds()?;
         self.validate_retry_state()?;
         self.validate_audit_state()?;
         self.validate_cancellation_envelope()?;
         let validation_progress = self.validation_progress();
         self.validate_steps(&validation_progress)?;
+        validation_progress
+            .validate_readiness_deferral_history()
+            .map_err(|source| {
+                FullProgressSnapshotObservationError::ReadinessDeferralValidation { source }
+            })?;
         self.validate_after_effect_reconciliation(&validation_progress)?;
         self.validate_cancellation_cleanup_observations(&validation_progress)?;
         self.validate_pre_publish_cancellation(&validation_progress)?;
         self.validate_lifecycle_consistency(&validation_progress)?;
+        Ok(())
+    }
+
+    fn validate_readiness_deferral_bounds(
+        &self,
+    ) -> Result<(), FullProgressSnapshotObservationError> {
+        let maximum = self.intent.plan().units().len();
+        if self.readiness_deferral_batches.len() > maximum {
+            return Err(
+                FullProgressSnapshotObservationError::TooManyReadinessDeferralBatches {
+                    actual: self.readiness_deferral_batches.len(),
+                    maximum,
+                },
+            );
+        }
+        let mut keys = 0usize;
+        let mut rows = 0usize;
+        for batch in &self.readiness_deferral_batches {
+            keys = keys.saturating_add(batch.artifact_keys().len());
+            rows = rows.saturating_add(batch.rows().len());
+            if keys > maximum || rows > maximum {
+                return Err(
+                    FullProgressSnapshotObservationError::TooManyReadinessDeferralObservations {
+                        keys,
+                        rows,
+                        maximum,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1029,6 +1072,7 @@ impl FullProgressSnapshotObservation {
             pre_publish_cancellation: self.pre_publish_cancellation.clone(),
             after_effect_reconciliation: self.after_effect_reconciliation.clone(),
             cancellation_cleanup_observations: self.cancellation_cleanup_observations.clone(),
+            readiness_deferral_batches: self.readiness_deferral_batches.clone(),
         }
     }
 
@@ -1299,6 +1343,9 @@ impl FullProgressSnapshotObservation {
         if self.cancellation_cleanup_observations != progress.cancellation_cleanup_observations {
             return Err(mismatch("cancellation_cleanup_observations"));
         }
+        if self.readiness_deferral_batches != progress.readiness_deferral_batches {
+            return Err(mismatch("readiness_deferral_batches"));
+        }
         Ok(())
     }
 }
@@ -1368,6 +1415,12 @@ fn cancellation_audit_hold_matches_route(
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum FullProgressSnapshotObservationError {
+    /// Retained compact readiness deferral proof failed WorkProgress validation.
+    #[error("invalid full-progress snapshot readiness deferral history: {source}")]
+    ReadinessDeferralValidation {
+        #[source]
+        source: WorkProgressError,
+    },
     /// The retained immutable intent failed its own consistency checks.
     #[error("invalid full-progress snapshot intent: {0}")]
     Intent(#[source] FullProgressIntentObservationError),
@@ -1424,6 +1477,21 @@ pub enum FullProgressSnapshotObservationError {
     /// The snapshot exceeded the frozen plan bound.
     #[error("full-progress snapshot has {actual} steps, maximum is {maximum}")]
     TooManySteps { actual: usize, maximum: usize },
+    /// The retained deferral batch count exceeded the frozen-plan bound.
+    #[error("full-progress snapshot has {actual} readiness deferral batches, maximum is {maximum}")]
+    TooManyReadinessDeferralBatches { actual: usize, maximum: usize },
+    /// The aggregate retained deferral keys or rows exceeded the frozen-plan bound.
+    #[error(
+        "full-progress snapshot has {keys} readiness deferral keys and {rows} rows, maximum is {maximum}"
+    )]
+    TooManyReadinessDeferralObservations {
+        /// Aggregate selected artifact keys.
+        keys: usize,
+        /// Aggregate readiness rows.
+        rows: usize,
+        /// Maximum permitted aggregate observations.
+        maximum: usize,
+    },
     /// The snapshot had the wrong number of progress rows.
     #[error("full-progress snapshot has {actual} steps, expected {expected}")]
     StepCountMismatch { actual: usize, expected: usize },
@@ -1823,6 +1891,34 @@ impl WorkProgress {
         &self,
         intent: &FullProgressIntentObservation,
     ) -> Result<FullProgressSnapshotObservation, FullProgressSnapshotObservationError> {
+        let maximum = self.plan.units().len();
+        if self.readiness_deferral_batches.len() > maximum {
+            return Err(
+                FullProgressSnapshotObservationError::TooManyReadinessDeferralBatches {
+                    actual: self.readiness_deferral_batches.len(),
+                    maximum,
+                },
+            );
+        }
+        let retained_keys = self
+            .readiness_deferral_batches
+            .iter()
+            .map(|batch| batch.artifact_keys().len())
+            .fold(0usize, |total, count| total.saturating_add(count));
+        let retained_rows = self
+            .readiness_deferral_batches
+            .iter()
+            .map(|batch| batch.rows().len())
+            .fold(0usize, |total, count| total.saturating_add(count));
+        if retained_keys > maximum || retained_rows > maximum {
+            return Err(
+                FullProgressSnapshotObservationError::TooManyReadinessDeferralObservations {
+                    keys: retained_keys,
+                    rows: retained_rows,
+                    maximum,
+                },
+            );
+        }
         let WorkProgress {
             operation_id: _,
             plan: _,
@@ -1844,6 +1940,7 @@ impl WorkProgress {
             pre_publish_cancellation,
             after_effect_reconciliation,
             cancellation_cleanup_observations,
+            readiness_deferral_batches,
         } = self;
         let snapshot = FullProgressSnapshotObservation {
             intent: intent.clone(),
@@ -1863,6 +1960,7 @@ impl WorkProgress {
             pre_publish_cancellation: pre_publish_cancellation.clone(),
             after_effect_reconciliation: after_effect_reconciliation.clone(),
             cancellation_cleanup_observations: cancellation_cleanup_observations.clone(),
+            readiness_deferral_batches: readiness_deferral_batches.clone(),
         };
         snapshot.validate_base()?;
         snapshot.validate_against_progress(self)?;
