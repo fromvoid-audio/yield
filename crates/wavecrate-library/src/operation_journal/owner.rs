@@ -1450,6 +1450,87 @@ mod tests {
     }
 
     #[test]
+    fn owner_reopens_each_guarded_terminal_observation_without_authority_restoration() {
+        let fixture = fixture("journal-owner-guarded-terminals-reopen");
+        let snapshots =
+            crate::operation_journal::work_progress::test_guarded_terminal_store_snapshots();
+        assert_eq!(snapshots.len(), 4);
+        let mut records = snapshots
+            .into_iter()
+            .map(|snapshot| StoredFullProgressRecord::new(snapshot).expect("terminal record"))
+            .collect::<Vec<_>>();
+        records.push(StoredFullProgressRecord::new(
+            crate::operation_journal::work_progress::test_guarded_terminal_origin_restoration_snapshot(),
+        ).expect("origin restoration terminal record"));
+        assert_eq!(records.len(), 5);
+        let operation_ids = records
+            .iter()
+            .map(|record| record.snapshot().intent().operation_id())
+            .collect::<Vec<_>>();
+
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        wait_until_available(&owner);
+        for (index, record) in records.iter().cloned().enumerate() {
+            let mut request = owner
+                .client()
+                .persist_full(record, None)
+                .expect("terminal observation queues");
+            assert_eq!(
+                request
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("terminal observation result")
+                    .expect("terminal observation worker"),
+                FullProgressWriteOutcome::Applied {
+                    sequence: (index + 1) as i64,
+                }
+            );
+        }
+        assert!(owner.shutdown());
+
+        let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let mut reopened_owner =
+            OperationJournalOwner::start(reopened_store).expect("reopen owner");
+        wait_until_available(&reopened_owner);
+        for (operation_id, expected) in operation_ids.into_iter().zip(&records) {
+            let mut request = reopened_owner
+                .client()
+                .get_full(operation_id)
+                .expect("reopened terminal lookup queues");
+            let observed = request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reopened terminal lookup result")
+                .expect("reopened terminal lookup worker")
+                .expect("reopened terminal observation");
+            assert_eq!(&observed, expected);
+            let snapshot = observed.snapshot();
+            assert!(snapshot.terminal_outcome_observation().is_some());
+            assert!(snapshot.claim_settlement().is_some());
+            if matches!(
+                snapshot.disposition(),
+                super::super::full_status::FullProgressDisposition::FailedPreservingData
+            ) {
+                assert!(snapshot.retry_observation().is_some());
+            }
+            if matches!(
+                snapshot.disposition(),
+                super::super::full_status::FullProgressDisposition::FailedDataLossRisk
+            ) {
+                assert!(snapshot.audit_observation().is_some());
+            }
+            let rehydrated = snapshot
+                .rehydrate_observation()
+                .expect("reopened terminal observation rehydrates");
+            let recaptured = rehydrated
+                .capture_full_progress_snapshot(snapshot.intent())
+                .expect("reopened terminal observation recaptures");
+            assert_eq!(&recaptured, snapshot);
+        }
+        assert!(reopened_owner.shutdown());
+        drop(fixture);
+    }
+
+    #[test]
     fn owner_full_progress_commit_survives_dropped_ack() {
         let fixture = fixture("journal-owner-full-progress-drop");
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
