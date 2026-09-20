@@ -64,7 +64,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -75,6 +75,8 @@ const SQLITE_JOURNAL_SUFFIX: &str = "-journal";
 const SQLITE_WAL_SUFFIX: &str = "-wal";
 const SQLITE_SHM_SUFFIX: &str = "-shm";
 const JOURNAL_TABLE_NAME: &str = "operation_journal";
+const FULL_PROGRESS_TABLE_NAME: &str = "operation_journal_full_progress";
+const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const MAX_SCHEMA_OBJECTS: i64 = 8;
 const MAX_SCHEMA_COLUMNS: usize = 8;
 const MAX_SCHEMA_INDEXES: usize = 8;
@@ -85,6 +87,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_VALUE_LIMIT: i32 = (MAX_RECORD_BYTES + 64 * 1024) as i32;
 
 const CREATE_JOURNAL_TABLE: &str = "CREATE TABLE operation_journal (
+    operation_id TEXT NOT NULL PRIMARY KEY,
+    sequence INTEGER NOT NULL UNIQUE,
+    record BLOB NOT NULL CHECK(length(record) <= 1048576)
+)";
+const CREATE_FULL_PROGRESS_TABLE: &str = "CREATE TABLE operation_journal_full_progress (
     operation_id TEXT NOT NULL PRIMARY KEY,
     sequence INTEGER NOT NULL UNIQUE,
     record BLOB NOT NULL CHECK(length(record) <= 1048576)
@@ -481,6 +488,21 @@ enum InsertTestBoundary {
     AfterCommit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationTestBoundary {
+    BeforeMigration,
+    AfterFullProgressTable,
+    BeforeCommit,
+}
+
+struct OpenHooks<'a> {
+    #[cfg(test)]
+    before_sqlite_open: Option<&'a dyn Fn(&Path)>,
+    migration_failure: Option<
+        &'a dyn Fn(MigrationTestBoundary, &Connection) -> Option<OperationJournalStoreError>,
+    >,
+}
+
 #[cfg(test)]
 enum InsertTestDirective {
     Continue,
@@ -542,6 +564,20 @@ impl OperationJournalStore {
         profile_guard: &WritableProfileGuard,
         #[cfg(test)] before_sqlite_open: Option<&dyn Fn(&Path)>,
     ) -> Result<Self, OperationJournalStoreError> {
+        Self::open_inner_with_hooks(
+            profile_guard,
+            OpenHooks {
+                #[cfg(test)]
+                before_sqlite_open,
+                migration_failure: None,
+            },
+        )
+    }
+
+    fn open_inner_with_hooks(
+        profile_guard: &WritableProfileGuard,
+        hooks: OpenHooks<'_>,
+    ) -> Result<Self, OperationJournalStoreError> {
         let database_root = BoundDatabaseRoot::for_profile_child(
             profile_guard,
             Path::new(JOURNAL_DATABASE_ROOT_NAME),
@@ -564,6 +600,11 @@ impl OperationJournalStore {
                 }
             })?;
 
+        let header_version = if created {
+            None
+        } else {
+            Some(validate_sqlite_header(&mut file, &database_path)?)
+        };
         if created {
             if file
                 .metadata()
@@ -576,11 +617,9 @@ impl OperationJournalStore {
                     "a newly created journal file was populated before SQLite bootstrap",
                 ));
             }
-        } else {
-            validate_sqlite_header(&mut file, &database_path)?;
         }
         #[cfg(test)]
-        if let Some(gate) = before_sqlite_open {
+        if let Some(gate) = hooks.before_sqlite_open {
             gate(&database_path);
         }
         validate_pre_sqlite_sidecars(&database_root, &database_path, rollback_journal.as_ref())?;
@@ -602,8 +641,43 @@ impl OperationJournalStore {
             configure_connection(&connection)?;
             bootstrap_schema(&connection)?;
         } else {
-            validate_existing_schema(&connection, &database_path)?;
-            configure_connection(&connection)?;
+            let connection_version = read_sqlite_user_version(&connection, &database_path)?;
+            let header_version = header_version.expect("existing journal has a header version");
+            if connection_version != header_version {
+                return Err(audit_error(
+                    &database_path,
+                    format!(
+                        "SQLite header user version {header_version} differs from PRAGMA user_version {connection_version}"
+                    ),
+                ));
+            }
+            validate_existing_schema(&connection, &database_path, header_version)?;
+            if header_version == LEGACY_JOURNAL_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    LEGACY_JOURNAL_SCHEMA_VERSION,
+                )?;
+                migrate_legacy_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                    hooks.migration_failure,
+                )?;
+            } else {
+                configure_connection(&connection)?;
+            }
         }
         if let Some(rollback_journal) = rollback_journal.as_ref() {
             validate_rollback_journal_identity(
@@ -618,7 +692,7 @@ impl OperationJournalStore {
             &database_path,
             &database_identity,
         )?;
-        verify_connection_configuration(&connection, &database_path)?;
+        verify_connection_configuration(&connection, &database_path, JOURNAL_SCHEMA_VERSION)?;
         database_root.sync_namespace(profile_guard)?;
         database_root.validate_profile_guard(profile_guard)?;
         drop(rollback_journal);
@@ -3315,7 +3389,11 @@ impl OperationJournalStore {
 
     fn next_sequence_inside_transaction(&self) -> Result<i64, OperationJournalStoreError> {
         let previous_sequence = self.connection.query_row(
-            "SELECT MAX(sequence) FROM operation_journal",
+            "SELECT MAX(sequence) FROM (
+                 SELECT sequence FROM operation_journal
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_full_progress
+             )",
             [],
             |row| row.get::<_, Option<i64>>(0),
         )?;
@@ -3765,7 +3843,7 @@ fn reject_unexpected_sidecars(
     Ok(())
 }
 
-fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<(), OperationJournalStoreError> {
+fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, OperationJournalStoreError> {
     let length = file
         .metadata()
         .map_err(|source| io_error(path, source))?
@@ -3808,31 +3886,58 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<(), OperationJ
             format!("SQLite application id {application_id:#x} is not the operation-journal id"),
         ));
     }
-    if user_version != JOURNAL_SCHEMA_VERSION {
+    if !matches!(
+        user_version,
+        LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         return Err(audit_error(
             path,
             format!(
-                "SQLite user version {user_version} is not the supported journal schema {}",
-                JOURNAL_SCHEMA_VERSION
+                "SQLite user version {user_version} is not a supported operation-journal schema"
             ),
         ));
     }
-    Ok(())
+    Ok(user_version)
+}
+
+fn read_sqlite_user_version(
+    connection: &Connection,
+    path: &Path,
+) -> Result<u32, OperationJournalStoreError> {
+    let user_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let user_version = u32::try_from(user_version).map_err(|_| {
+        audit_error(
+            path,
+            format!("SQLite user version {user_version} is outside the supported range"),
+        )
+    })?;
+    if !matches!(
+        user_version,
+        LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
+        return Err(audit_error(
+            path,
+            format!(
+                "SQLite user version {user_version} is not a supported operation-journal schema"
+            ),
+        ));
+    }
+    Ok(user_version)
 }
 
 fn validate_existing_schema(
     connection: &Connection,
     path: &Path,
+    schema_version: u32,
 ) -> Result<(), OperationJournalStoreError> {
-    let object_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !(1..=MAX_SCHEMA_OBJECTS).contains(&object_count) {
+    let actual_version = read_sqlite_user_version(connection, path)?;
+    if actual_version != schema_version {
         return Err(audit_error(
             path,
-            format!("unexpected SQLite schema object count {object_count}"),
+            format!(
+                "SQLite user version {actual_version} does not match expected schema {schema_version}"
+            ),
         ));
     }
     let objects: Vec<(String, String)> = connection
@@ -3844,28 +3949,56 @@ fn validate_existing_schema(
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    if objects.len() != 1 || objects[0] != (String::from(JOURNAL_TABLE_NAME), String::from("table"))
-    {
+    let expected_objects = if schema_version == LEGACY_JOURNAL_SCHEMA_VERSION {
+        vec![(String::from(JOURNAL_TABLE_NAME), String::from("table"))]
+    } else {
+        vec![
+            (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+            (
+                String::from(FULL_PROGRESS_TABLE_NAME),
+                String::from("table"),
+            ),
+        ]
+    };
+    if objects != expected_objects {
         return Err(audit_error(
             path,
             "existing SQLite schema has unexpected objects",
         ));
     }
 
+    validate_table_schema(connection, path, JOURNAL_TABLE_NAME, CREATE_JOURNAL_TABLE)?;
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            FULL_PROGRESS_TABLE_NAME,
+            CREATE_FULL_PROGRESS_TABLE,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_table_schema(
+    connection: &Connection,
+    path: &Path,
+    table_name: &str,
+    expected_sql: &str,
+) -> Result<(), OperationJournalStoreError> {
     let table_sql: String = connection.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        params![JOURNAL_TABLE_NAME],
+        params![table_name],
         |row| row.get(0),
     )?;
-    if normalize_sql(&table_sql) != normalize_sql(CREATE_JOURNAL_TABLE) {
+    if normalize_sql(&table_sql) != normalize_sql(expected_sql) {
         return Err(audit_error(
             path,
-            "existing operation-journal table schema differs",
+            format!("existing {table_name} table schema differs"),
         ));
     }
 
     let columns: Vec<(String, String, i64, i64)> = connection
-        .prepare("PRAGMA table_info(operation_journal)")?
+        .prepare(&format!("PRAGMA table_info({table_name})"))?
         .query_map([], |row| {
             Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?))
         })?
@@ -3879,20 +4012,135 @@ fn validate_existing_schema(
     if columns != expected_columns {
         return Err(audit_error(
             path,
-            "existing operation-journal columns differ",
+            format!("existing {table_name} columns differ"),
         ));
     }
 
-    let index_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM pragma_index_list('operation_journal')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !(1..=MAX_SCHEMA_INDEXES as i64).contains(&index_count) {
+    let indexes: Vec<(i64, String, i64, String, i64)> = connection
+        .prepare(&format!("PRAGMA index_list({table_name})"))?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .take(MAX_SCHEMA_INDEXES)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut origins: Vec<String> = indexes
+        .iter()
+        .filter(|(_, _, unique, _, partial)| *unique == 1 && *partial == 0)
+        .map(|(_, _, _, origin, _)| origin.clone())
+        .collect();
+    origins.sort_unstable();
+    if indexes.len() != 2 || origins != [String::from("pk"), String::from("u")] {
         return Err(audit_error(
             path,
-            "operation-journal unique indexes are unavailable",
+            format!("existing {table_name} indexes differ"),
         ));
+    }
+    Ok(())
+}
+
+fn migrate_legacy_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+    migration_failure: Option<
+        &dyn Fn(MigrationTestBoundary, &Connection) -> Option<OperationJournalStoreError>,
+    >,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        LEGACY_JOURNAL_SCHEMA_VERSION,
+    )?;
+    if let Some(error) =
+        migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeMigration, connection))
+    {
+        return Err(error);
+    }
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            LEGACY_JOURNAL_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, LEGACY_JOURNAL_SCHEMA_VERSION)?;
+        connection.execute_batch(CREATE_FULL_PROGRESS_TABLE)?;
+        if let Some(error) = migration_failure
+            .and_then(|hook| hook(MigrationTestBoundary::AfterFullProgressTable, connection))
+        {
+            return Err(error);
+        }
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        if let Some(error) =
+            migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
+        {
+            return Err(error);
+        }
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn validate_migration_guards(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+    expected_schema_version: u32,
+) -> Result<(), OperationJournalStoreError> {
+    database_root.validate_profile_guard(profile_guard)?;
+    validate_database_file_identity(database_root, database_path, database_identity)?;
+    validate_connection_identity(connection, database_root, database_path, database_identity)?;
+    verify_connection_configuration(connection, database_path, expected_schema_version)?;
+    reject_unexpected_sidecars(database_root, database_path, true)?;
+    if let Some(rollback_journal) = rollback_journal {
+        validate_rollback_journal_identity(
+            database_root,
+            database_path,
+            &rollback_journal.identity,
+        )?;
     }
     Ok(())
 }
@@ -3919,7 +4167,8 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
         .execute_batch(&format!(
             "PRAGMA application_id = {JOURNAL_APPLICATION_ID};
              PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};
-             {CREATE_JOURNAL_TABLE};"
+             {CREATE_JOURNAL_TABLE};
+             {CREATE_FULL_PROGRESS_TABLE};"
         ))
         .map(|_| ());
     match result {
@@ -3941,6 +4190,7 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
 fn verify_connection_configuration(
     connection: &Connection,
     path: &Path,
+    expected_schema_version: u32,
 ) -> Result<(), OperationJournalStoreError> {
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
@@ -3955,7 +4205,7 @@ fn verify_connection_configuration(
         || !locking_mode.eq_ignore_ascii_case("exclusive")
         || synchronous != 3
         || application_id != i64::from(JOURNAL_APPLICATION_ID)
-        || user_version != i64::from(JOURNAL_SCHEMA_VERSION)
+        || user_version != i64::from(expected_schema_version)
     {
         return Err(audit_error(
             path,
@@ -4940,6 +5190,33 @@ mod tests {
             .profile_root()
             .join(JOURNAL_DATABASE_ROOT_NAME)
             .join(JOURNAL_DATABASE_FILE_NAME)
+    }
+
+    fn write_v1_database(
+        owner: &WritableProfileGuard,
+        record: &StoredOperationRecord,
+        sequence: i64,
+    ) -> (PathBuf, Vec<u8>) {
+        let path = database_path(owner);
+        fs::create_dir_all(path.parent().expect("journal directory")).expect("journal directory");
+        let encoded = encode(record).expect("encode legacy fixture");
+        let connection = Connection::open(&path).expect("open legacy fixture");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {JOURNAL_APPLICATION_ID};
+                 PRAGMA user_version = {LEGACY_JOURNAL_SCHEMA_VERSION};
+                 {CREATE_JOURNAL_TABLE};"
+            ))
+            .expect("create v1 journal schema");
+        connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![record.operation_id.to_string(), sequence, &encoded],
+            )
+            .expect("insert v1 journal row");
+        drop(connection);
+        (path, encoded)
     }
 
     #[test]
@@ -7309,6 +7586,534 @@ mod tests {
             OperationJournalStoreError::RequiresAudit { .. }
         ));
         assert_eq!(fs::read(&path).expect("read retained header"), bytes);
+    }
+
+    #[test]
+    fn new_database_bootstraps_exact_v2_schema() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open v2 store");
+        let user_version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read v2 user version");
+        assert_eq!(user_version, i64::from(JOURNAL_SCHEMA_VERSION));
+        let objects: Vec<(String, String)> = store
+            .connection
+            .prepare(
+                "SELECT name, type FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("prepare schema objects")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query schema objects")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect schema objects");
+        assert_eq!(
+            objects,
+            vec![
+                (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+                (
+                    String::from(FULL_PROGRESS_TABLE_NAME),
+                    String::from("table")
+                ),
+            ]
+        );
+        let full_progress_rows: i64 = store
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {FULL_PROGRESS_TABLE_NAME}"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count empty full-progress table");
+        assert_eq!(full_progress_rows, 0);
+    }
+
+    #[test]
+    fn existing_v1_database_migrates_without_rewriting_legacy_rows() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v1_database(&fixture.owner, &record, 7);
+        let before = Connection::open(&path)
+            .expect("open v1 snapshot")
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .expect("read v1 snapshot");
+
+        let observe_configuration = |boundary: MigrationTestBoundary,
+                                     connection: &Connection|
+         -> Option<OperationJournalStoreError> {
+            if boundary == MigrationTestBoundary::BeforeMigration {
+                let journal_mode: String = connection
+                    .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                    .expect("read migration journal mode");
+                let locking_mode: String = connection
+                    .pragma_query_value(None, "locking_mode", |row| row.get(0))
+                    .expect("read migration locking mode");
+                let synchronous: i64 = connection
+                    .pragma_query_value(None, "synchronous", |row| row.get(0))
+                    .expect("read migration synchronous mode");
+                let foreign_keys: i64 = connection
+                    .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                    .expect("read migration foreign keys");
+                assert_eq!(journal_mode, "delete");
+                assert_eq!(locking_mode, "exclusive");
+                assert_eq!(synchronous, 3);
+                assert_eq!(foreign_keys, 1);
+            }
+            None
+        };
+
+        let store = OperationJournalStore::open_inner_with_hooks(
+            &fixture.owner,
+            OpenHooks {
+                before_sqlite_open: None,
+                migration_failure: Some(&observe_configuration),
+            },
+        )
+        .expect("migrate v1 store");
+        let after = store
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .expect("read migrated snapshot");
+        assert_eq!(before, after);
+        assert_eq!(before.0, record.operation_id.to_string());
+        assert_eq!(before.1, 7);
+        assert_eq!(before.2, encoded);
+        assert_eq!(
+            store.get(record.operation_id).expect("read migrated row"),
+            Some(record.clone())
+        );
+        let retained: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read migrated bytes");
+        assert_eq!(retained, encoded);
+        let user_version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated user version");
+        assert_eq!(user_version, i64::from(JOURNAL_SCHEMA_VERSION));
+        let full_progress_rows: i64 = store
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {FULL_PROGRESS_TABLE_NAME}"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count migrated full-progress rows");
+        assert_eq!(full_progress_rows, 0);
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen migrated v2");
+        let reopened_snapshot = reopened
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .expect("read reopened snapshot");
+        assert_eq!(reopened_snapshot, before);
+        assert_eq!(
+            reopened
+                .get(record.operation_id)
+                .expect("read reopened row"),
+            Some(record)
+        );
+    }
+
+    #[test]
+    fn migration_failure_rolls_back_new_table_and_version() {
+        let first_fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v1_database(&first_fixture.owner, &record, 11);
+        let failure = |boundary, _connection: &Connection| {
+            (boundary == MigrationTestBoundary::AfterFullProgressTable).then_some(
+                OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced migration failure"),
+                },
+            )
+        };
+        let error = OperationJournalStore::open_inner_with_hooks(
+            &first_fixture.owner,
+            OpenHooks {
+                before_sqlite_open: None,
+                migration_failure: Some(&failure),
+            },
+        )
+        .expect_err("forced migration failure");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::IdentityCheckUnavailable { reason }
+                if reason == "forced migration failure"
+        ));
+
+        let connection = Connection::open(&path).expect("open rolled-back v1 database");
+        let user_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back user version");
+        assert_eq!(user_version, i64::from(LEGACY_JOURNAL_SCHEMA_VERSION));
+        let full_progress_exists: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE name = ?1",
+                params![FULL_PROGRESS_TABLE_NAME],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query rolled-back table");
+        assert_eq!(full_progress_exists, None);
+        let retained: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read rolled-back legacy bytes");
+        assert_eq!(retained, encoded);
+        let retained_snapshot = connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .expect("read rolled-back legacy snapshot");
+        assert_eq!(
+            retained_snapshot,
+            (record.operation_id.to_string(), 11, encoded.clone())
+        );
+
+        let second_fixture = fixture();
+        let second_record = intent_record(OperationId::new());
+        let (second_path, second_encoded) =
+            write_v1_database(&second_fixture.owner, &second_record, 11);
+        let second_failure = |boundary: MigrationTestBoundary, connection: &Connection| {
+            if boundary == MigrationTestBoundary::BeforeCommit {
+                let version: i64 = connection
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .expect("read bumped migration version");
+                assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+                let full_progress_exists: Option<String> = connection
+                    .query_row(
+                        "SELECT name FROM sqlite_master WHERE name = ?1",
+                        params![FULL_PROGRESS_TABLE_NAME],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .expect("query pre-commit full-progress table");
+                assert_eq!(
+                    full_progress_exists,
+                    Some(String::from(FULL_PROGRESS_TABLE_NAME))
+                );
+                return Some(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced pre-commit migration failure"),
+                });
+            }
+            None
+        };
+        let second_error = OperationJournalStore::open_inner_with_hooks(
+            &second_fixture.owner,
+            OpenHooks {
+                before_sqlite_open: None,
+                migration_failure: Some(&second_failure),
+            },
+        )
+        .expect_err("forced pre-commit migration failure");
+        assert!(matches!(
+            second_error,
+            OperationJournalStoreError::IdentityCheckUnavailable { reason }
+                if reason == "forced pre-commit migration failure"
+        ));
+        let second_connection =
+            Connection::open(&second_path).expect("open second rolled-back v1 database");
+        let second_version: i64 = second_connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read second rolled-back version");
+        assert_eq!(second_version, i64::from(LEGACY_JOURNAL_SCHEMA_VERSION));
+        let second_full_progress_exists: Option<String> = second_connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE name = ?1",
+                params![FULL_PROGRESS_TABLE_NAME],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query second rolled-back table");
+        assert_eq!(second_full_progress_exists, None);
+        let second_snapshot = second_connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                params![second_record.operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .expect("read second rolled-back snapshot");
+        assert_eq!(
+            second_snapshot,
+            (second_record.operation_id.to_string(), 11, second_encoded)
+        );
+    }
+
+    #[test]
+    fn migration_guard_rejects_new_wal_and_shm_before_begin() {
+        for suffix in [SQLITE_WAL_SUFFIX, SQLITE_SHM_SUFFIX] {
+            let fixture = fixture();
+            let record = intent_record(OperationId::new());
+            let (path, encoded) = write_v1_database(&fixture.owner, &record, 19);
+            let sidecar = path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{suffix}"));
+            let marker = format!("unexpected {suffix}").into_bytes();
+            let marker_for_hook = marker.clone();
+            let sidecar_for_hook = sidecar.clone();
+            let inject_sidecar = move |boundary: MigrationTestBoundary,
+                                       _connection: &Connection|
+                  -> Option<OperationJournalStoreError> {
+                if boundary == MigrationTestBoundary::BeforeMigration {
+                    fs::write(&sidecar_for_hook, &marker_for_hook)
+                        .expect("install unexpected migration sidecar");
+                }
+                None
+            };
+            let error = OperationJournalStore::open_inner_with_hooks(
+                &fixture.owner,
+                OpenHooks {
+                    before_sqlite_open: None,
+                    migration_failure: Some(&inject_sidecar),
+                },
+            )
+            .expect_err("reject sidecar introduced before migration");
+            assert!(matches!(
+                error,
+                OperationJournalStoreError::RequiresAudit { reason, .. }
+                    if reason.contains("sidecar")
+            ));
+            let connection = Connection::open(&path).expect("open retained v1 database");
+            let version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("read retained version");
+            assert_eq!(version, i64::from(LEGACY_JOURNAL_SCHEMA_VERSION));
+            let full_progress_exists: Option<String> = connection
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE name = ?1",
+                    params![FULL_PROGRESS_TABLE_NAME],
+                    |row| row.get(0),
+                )
+                .optional()
+                .expect("query retained full-progress table");
+            assert_eq!(full_progress_exists, None);
+            let snapshot = connection
+                .query_row(
+                    "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                    params![record.operation_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+                )
+                .expect("read retained v1 snapshot");
+            assert_eq!(
+                snapshot,
+                (record.operation_id.to_string(), 19, encoded.clone())
+            );
+            assert_eq!(fs::read(&sidecar).expect("read retained sidecar"), marker);
+        }
+    }
+
+    #[test]
+    fn migration_guard_rejects_sidecar_introduced_after_schema_change_and_rolls_back() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v1_database(&fixture.owner, &record, 23);
+        let sidecar =
+            path.with_file_name(format!("{JOURNAL_DATABASE_FILE_NAME}{SQLITE_WAL_SUFFIX}"));
+        let marker = b"unexpected migration WAL".to_vec();
+        let marker_for_hook = marker.clone();
+        let sidecar_for_hook = sidecar.clone();
+        let inject_sidecar = move |boundary: MigrationTestBoundary,
+                                   _connection: &Connection|
+              -> Option<OperationJournalStoreError> {
+            if boundary == MigrationTestBoundary::AfterFullProgressTable {
+                fs::write(&sidecar_for_hook, &marker_for_hook)
+                    .expect("install in-transaction migration sidecar");
+            }
+            None
+        };
+        let error = OperationJournalStore::open_inner_with_hooks(
+            &fixture.owner,
+            OpenHooks {
+                before_sqlite_open: None,
+                migration_failure: Some(&inject_sidecar),
+            },
+        )
+        .expect_err("reject sidecar introduced during migration");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::RequiresAudit { reason, .. }
+                if reason.contains("sidecar")
+        ));
+        let connection = Connection::open(&path).expect("open rolled-back v1 database");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back version");
+        assert_eq!(version, i64::from(LEGACY_JOURNAL_SCHEMA_VERSION));
+        let full_progress_exists: Option<String> = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE name = ?1",
+                params![FULL_PROGRESS_TABLE_NAME],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query rolled-back full-progress table");
+        assert_eq!(full_progress_exists, None);
+        let snapshot = connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .expect("read rolled-back v1 snapshot");
+        assert_eq!(snapshot, (record.operation_id.to_string(), 23, encoded));
+        assert_eq!(
+            fs::read(&sidecar).expect("read retained migration sidecar"),
+            marker
+        );
+    }
+
+    #[test]
+    fn v1_database_with_extra_full_progress_table_is_rejected_unchanged() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v1_database(&fixture.owner, &record, 13);
+        let connection = Connection::open(&path).expect("open v1 schema");
+        connection
+            .execute_batch(CREATE_FULL_PROGRESS_TABLE)
+            .expect("add unexpected full-progress table");
+        drop(connection);
+
+        let error = OperationJournalStore::open(&fixture.owner).expect_err("reject extra table");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::RequiresAudit { .. }
+        ));
+        let connection = Connection::open(&path).expect("reopen retained schema");
+        let user_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read retained v1 version");
+        assert_eq!(user_version, i64::from(LEGACY_JOURNAL_SCHEMA_VERSION));
+        let retained: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained legacy row");
+        assert_eq!(retained, encoded);
+    }
+
+    #[test]
+    fn header_and_connection_versions_must_match_before_schema_configuration() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v1_database(&fixture.owner, &record, 17);
+        let gate = |path: &Path| {
+            let mut bytes = fs::read(path).expect("read v1 header");
+            bytes[SQLITE_USER_VERSION_OFFSET..SQLITE_USER_VERSION_OFFSET + 4]
+                .copy_from_slice(&JOURNAL_SCHEMA_VERSION.to_be_bytes());
+            fs::write(path, bytes).expect("rewrite mismatched header");
+        };
+        let error = OperationJournalStore::open_inner(&fixture.owner, Some(&gate))
+            .expect_err("reject header/PRAGMA mismatch");
+        assert!(
+            matches!(error, OperationJournalStoreError::RequiresAudit { reason, .. } if reason.contains("differs from PRAGMA"))
+        );
+        let connection = Connection::open(&path).expect("open retained mismatch");
+        let retained: Vec<u8> = connection
+            .query_row(
+                "SELECT record FROM operation_journal WHERE operation_id = ?1",
+                params![record.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained mismatch row");
+        assert_eq!(retained, encoded);
+    }
+
+    #[test]
+    fn full_progress_sequence_participates_in_legacy_allocation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open v2 store");
+        let full_progress_id = OperationId::new();
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {FULL_PROGRESS_TABLE_NAME} (operation_id, sequence, record)
+                     VALUES (?1, ?2, ?3)"
+                ),
+                params![full_progress_id.to_string(), 41_i64, vec![1_u8]],
+            )
+            .expect("insert full-progress sequence fixture");
+        let record = intent_record(OperationId::new());
+        let receipt = store
+            .insert_intent(&record)
+            .expect("allocate after full-progress row");
+        assert_eq!(receipt.sequence(), 42);
+    }
+
+    #[test]
+    fn full_progress_sequence_participates_in_legacy_update_allocation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open v2 store");
+        let record = universal_intent_record(OperationId::new());
+        let inserted = store.insert_intent(&record).expect("insert v3 intent");
+        let full_progress_id = OperationId::new();
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {FULL_PROGRESS_TABLE_NAME} (operation_id, sequence, record)
+                     VALUES (?1, ?2, ?3)"
+                ),
+                params![full_progress_id.to_string(), 41_i64, vec![1_u8]],
+            )
+            .expect("insert full-progress sequence fixture");
+        let observation = CancellationRequestObservation::new(43).expect("request timestamp");
+        let cancellation = store
+            .request_cancel_before_publish(record.operation_id, inserted.sequence(), observation)
+            .expect("allocate update after full-progress row");
+        assert_eq!(cancellation.sequence(), 42);
+    }
+
+    #[test]
+    fn full_progress_sequence_overflow_rejects_legacy_insert() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open v2 store");
+        let full_progress_id = OperationId::new();
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {FULL_PROGRESS_TABLE_NAME} (operation_id, sequence, record)
+                     VALUES (?1, ?2, ?3)"
+                ),
+                params![full_progress_id.to_string(), i64::MAX, vec![1_u8]],
+            )
+            .expect("insert max full-progress sequence fixture");
+        let record = intent_record(OperationId::new());
+        assert!(matches!(
+            store.insert_intent(&record),
+            Err(OperationJournalStoreError::SequenceExhausted)
+        ));
+        assert!(
+            store
+                .get(record.operation_id)
+                .expect("read absent overflow row")
+                .is_none()
+        );
     }
 
     #[test]
