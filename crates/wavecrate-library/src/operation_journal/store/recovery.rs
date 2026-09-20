@@ -646,7 +646,10 @@ fn ensure_sequence_unique(
     let mut statement = store
         .connection
         .prepare(
-            "SELECT rowid FROM operation_journal
+            "SELECT sequence FROM operation_journal
+             WHERE typeof(sequence) = 'integer' AND sequence = ?1
+             UNION ALL
+             SELECT sequence FROM operation_journal_full_progress
              WHERE typeof(sequence) = 'integer' AND sequence = ?1
              LIMIT 2",
         )

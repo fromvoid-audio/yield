@@ -51,6 +51,8 @@ use super::selection_output_commands::{
 };
 use super::validation::{RecordConsistency, classify_record};
 
+#[allow(dead_code)]
+mod full_progress;
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
 
@@ -244,6 +246,24 @@ pub enum OperationJournalStoreError {
     #[error("operation journal retry observation is invalid: {reason}")]
     InvalidRetryObservation {
         /// Bounded validation diagnostic.
+        reason: String,
+    },
+    /// The expected full-progress row sequence was invalid or did not match the retained row.
+    #[error(
+        "operation journal full-progress sequence conflict for {operation_id}: expected {expected:?}, actual {actual:?}"
+    )]
+    FullProgressSequenceConflict {
+        /// Operation identity carrying the full-progress observation.
+        operation_id: OperationId,
+        /// Sequence supplied by the caller, when one was supplied.
+        expected: Option<i64>,
+        /// Sequence currently retained by the full-progress table, when present.
+        actual: Option<i64>,
+    },
+    /// The full-progress observation could not be validated or encoded at the store boundary.
+    #[error("operation journal full-progress observation is invalid: {reason}")]
+    InvalidFullProgressObservation {
+        /// Bounded validation or encoding diagnostic.
         reason: String,
     },
     /// A different retry observation is already durable for this operation.
@@ -3363,15 +3383,15 @@ impl OperationJournalStore {
         self.validate_namespace_without_sidecars()?;
         let operation_id = record.operation_id;
         let key = operation_id.to_string();
-        let already_present: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT sequence FROM operation_journal WHERE operation_id = ?1",
-                params![key.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if already_present.is_some() {
+        let (legacy_present, full_progress_present) =
+            self.operation_family_presence(operation_id)?;
+        if legacy_present && full_progress_present {
+            return Err(audit_error(
+                &self.database_path,
+                format!("operation id {operation_id} is present in both journal families"),
+            ));
+        }
+        if legacy_present || full_progress_present {
             return Err(OperationJournalStoreError::DuplicateOperation { operation_id });
         }
         let sequence = self.next_sequence_inside_transaction()?;
@@ -3416,6 +3436,17 @@ impl OperationJournalStore {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<JournalRow>, OperationJournalStoreError> {
+        let (legacy_present, full_progress_present) =
+            self.operation_family_presence(operation_id)?;
+        if legacy_present && full_progress_present {
+            return Err(audit_error(
+                &self.database_path,
+                format!("operation id {operation_id} is present in both journal families"),
+            ));
+        }
+        if !legacy_present {
+            return Ok(None);
+        }
         let row = self
             .connection
             .query_row(
@@ -3480,6 +3511,7 @@ impl OperationJournalStore {
                 String::from("stored sequence is not positive"),
             ));
         }
+        self.ensure_sequence_unique(sequence)?;
         if record_type != "blob" {
             return Err(retained_error(
                 Some(operation_id),
@@ -3539,9 +3571,17 @@ impl OperationJournalStore {
                 "operation journal connection has an active transaction",
             ));
         }
+        self.validate_namespace_for_precommit()
+    }
+
+    /// Validate the store identity and sidecar namespace at a transaction pre-commit boundary.
+    ///
+    /// This is deliberately separate from [`Self::validate_namespace`], whose autocommit check
+    /// rejects an active transaction. DELETE mode may retain its ordinary rollback journal while
+    /// this exclusive connection remains open; WAL/SHM and unsafe/non-regular entries are still
+    /// rejected here before a full-progress mutation is committed.
+    fn validate_namespace_for_precommit(&self) -> Result<(), OperationJournalStoreError> {
         self.validate_namespace_without_sidecars()?;
-        // DELETE mode may retain its ordinary rollback journal while this exclusive connection
-        // remains open. WAL/SHM and unsafe/non-regular entries are still rejected.
         reject_unexpected_sidecars(&self.database_root, &self.database_path, true)
     }
 
@@ -3559,6 +3599,45 @@ impl OperationJournalStore {
             &self.database_path,
             &self.database_identity,
         )
+    }
+
+    fn operation_family_presence(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<(bool, bool), OperationJournalStoreError> {
+        let key = operation_id.to_string();
+        let legacy_present: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_journal WHERE operation_id = ?1)",
+            params![key.as_str()],
+            |row| row.get(0),
+        )?;
+        let full_progress_present: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_journal_full_progress WHERE operation_id = ?1)",
+            params![key.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok((legacy_present, full_progress_present))
+    }
+
+    fn ensure_sequence_unique(&self, sequence: i64) -> Result<(), OperationJournalStoreError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT sequence FROM operation_journal
+                 WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_full_progress
+                 WHERE typeof(sequence) = 'integer' AND sequence = ?1
+             )",
+            params![sequence],
+            |row| row.get(0),
+        )?;
+        if count > 1 {
+            return Err(audit_error(
+                &self.database_path,
+                format!("duplicate journal-observation sequence {sequence}"),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -4309,6 +4388,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use super::full_progress::FullProgressWriteOutcome;
     use super::*;
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::durable_capacity::{
@@ -4345,6 +4425,37 @@ mod tests {
     };
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use crate::test_runtime::TestRuntimeGuard;
+
+    fn full_progress_store_records() -> (
+        crate::operation_journal::full_progress_codec::StoredFullProgressRecord,
+        crate::operation_journal::full_progress_codec::StoredFullProgressRecord,
+    ) {
+        let (initial, progressed) =
+            crate::operation_journal::work_progress::test_full_progress_store_snapshots();
+        (
+            crate::operation_journal::full_progress_codec::StoredFullProgressRecord::new(initial)
+                .expect("valid initial full-progress fixture"),
+            crate::operation_journal::full_progress_codec::StoredFullProgressRecord::new(
+                progressed,
+            )
+            .expect("valid progressed full-progress fixture"),
+        )
+    }
+
+    fn full_progress_raw_row(
+        store: &OperationJournalStore,
+        operation_id: OperationId,
+    ) -> (String, i64, Vec<u8>) {
+        store
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record
+                 FROM operation_journal_full_progress WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read full-progress raw row")
+    }
 
     struct Fixture {
         owner: WritableProfileGuard,
@@ -7627,6 +7738,670 @@ mod tests {
             )
             .expect("count empty full-progress table");
         assert_eq!(full_progress_rows, 0);
+    }
+
+    #[test]
+    fn full_progress_insert_get_reopen_and_global_sequence() {
+        let fixture = fixture();
+        let (initial, progressed) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+
+        assert_eq!(
+            store
+                .persist_full(&initial, None)
+                .expect("insert full progress"),
+            FullProgressWriteOutcome::Applied { sequence: 1 }
+        );
+        let first = store
+            .get_full(operation_id)
+            .expect("read full progress")
+            .expect("full-progress row");
+        assert_eq!(first.sequence(), 1);
+        assert_eq!(first.record(), &initial);
+
+        let legacy = intent_record(OperationId::new());
+        assert_eq!(
+            store
+                .insert_intent(&legacy)
+                .expect("insert legacy row")
+                .sequence,
+            2
+        );
+        assert_eq!(
+            store
+                .persist_full(&progressed, Some(1))
+                .expect("update full progress"),
+            FullProgressWriteOutcome::Applied { sequence: 3 }
+        );
+        let updated = store
+            .get_full(operation_id)
+            .expect("read updated full progress")
+            .expect("updated full-progress row");
+        assert_eq!(updated.sequence(), 3);
+        assert_eq!(updated.record(), &progressed);
+
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let persisted = reopened
+            .get_full(operation_id)
+            .expect("read reopened full progress")
+            .expect("reopened full-progress row");
+        assert_eq!(persisted.sequence(), 3);
+        assert_eq!(persisted.record(), &progressed);
+    }
+
+    #[test]
+    fn full_progress_replays_exactly_and_rejects_sequence_conflicts() {
+        let test_fixture = fixture();
+        let (initial, progressed) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let store = OperationJournalStore::open(&test_fixture.owner).expect("open store");
+        store
+            .persist_full(&initial, None)
+            .expect("insert initial full progress");
+
+        let before = full_progress_raw_row(&store, operation_id);
+        assert_eq!(
+            store.persist_full(&initial, None).expect("initial replay"),
+            FullProgressWriteOutcome::Replay { sequence: 1 }
+        );
+        assert_eq!(full_progress_raw_row(&store, operation_id), before);
+        assert!(matches!(
+            store.persist_full(&initial, Some(2)),
+            Err(OperationJournalStoreError::FullProgressSequenceConflict {
+                expected: Some(2),
+                actual: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(full_progress_raw_row(&store, operation_id), before);
+        assert!(matches!(
+            store
+                .persist_full(&initial, Some(0))
+                .expect_err("non-positive expectation must conflict"),
+            OperationJournalStoreError::FullProgressSequenceConflict {
+                operation_id: observed,
+                expected: Some(0),
+                actual: None,
+            } if observed == operation_id
+        ));
+        assert_eq!(full_progress_raw_row(&store, operation_id), before);
+        assert!(matches!(
+            store.persist_full(&progressed, None),
+            Err(OperationJournalStoreError::FullProgressSequenceConflict {
+                expected: None,
+                actual: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(full_progress_raw_row(&store, operation_id), before);
+        assert!(matches!(
+            store.persist_full(&progressed, Some(2)),
+            Err(OperationJournalStoreError::FullProgressSequenceConflict {
+                expected: Some(2),
+                actual: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(full_progress_raw_row(&store, operation_id), before);
+        assert_eq!(
+            store
+                .persist_full(&progressed, Some(1))
+                .expect("apply update"),
+            FullProgressWriteOutcome::Applied { sequence: 2 }
+        );
+        let after_update = full_progress_raw_row(&store, operation_id);
+        assert_eq!(after_update.1, 2);
+        assert_ne!(after_update.2, before.2);
+        assert_eq!(
+            store
+                .persist_full(&progressed, Some(1))
+                .expect("update acknowledgement replay"),
+            FullProgressWriteOutcome::Replay { sequence: 2 }
+        );
+        assert_eq!(full_progress_raw_row(&store, operation_id), after_update);
+        assert!(matches!(
+            store.persist_full(&initial, Some(1)),
+            Err(OperationJournalStoreError::FullProgressSequenceConflict {
+                expected: Some(1),
+                actual: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(full_progress_raw_row(&store, operation_id), after_update);
+        assert_eq!(
+            store
+                .get_full(operation_id)
+                .expect("read replayed row")
+                .expect("row remains present")
+                .sequence(),
+            2
+        );
+
+        let missing_fixture = fixture();
+        let missing_store =
+            OperationJournalStore::open(&missing_fixture.owner).expect("open missing store");
+        assert!(matches!(
+            missing_store.persist_full(&initial, Some(1)),
+            Err(OperationJournalStoreError::FullProgressSequenceConflict {
+                expected: Some(1),
+                actual: None,
+                ..
+            })
+        ));
+        let missing_rows: i64 = missing_store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_journal_full_progress",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count missing expected rows");
+        assert_eq!(missing_rows, 0);
+    }
+
+    #[test]
+    fn full_progress_precommit_sidecar_failure_rolls_back_without_overwrite() {
+        let initial_fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let store = OperationJournalStore::open(&initial_fixture.owner).expect("open store");
+        let sidecar = database_path(&initial_fixture.owner).with_file_name("journal.sqlite3-wal");
+        let marker = b"unexpected full-progress WAL".to_vec();
+        let sidecar_for_hook = sidecar.clone();
+        let marker_for_hook = marker.clone();
+        store.set_insert_test_hook(move |boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                fs::write(&sidecar_for_hook, &marker_for_hook).expect("inject WAL sidecar");
+            }
+            InsertTestDirective::Continue
+        });
+
+        let error = store
+            .persist_full(&initial, None)
+            .expect_err("unexpected sidecar must reject full-progress commit");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::RequiresAudit { reason, .. }
+                if reason.contains("sidecar")
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_journal_full_progress",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count rolled-back rows"),
+            0
+        );
+        assert_eq!(fs::read(&sidecar).expect("retain injected sidecar"), marker);
+        fs::remove_file(sidecar).expect("remove retained test sidecar");
+        assert!(
+            store
+                .get_full(operation_id)
+                .expect("read absent row")
+                .is_none()
+        );
+
+        let update_fixture = fixture();
+        let (update_initial, update_progressed) = full_progress_store_records();
+        let update_id = update_initial.snapshot().intent().operation_id();
+        let update_store =
+            OperationJournalStore::open(&update_fixture.owner).expect("open update store");
+        update_store
+            .persist_full(&update_initial, None)
+            .expect("insert update baseline");
+        let original_row = full_progress_raw_row(&update_store, update_id);
+        let update_sidecar =
+            database_path(&update_fixture.owner).with_file_name("journal.sqlite3-wal");
+        let update_marker = b"unexpected update WAL".to_vec();
+        let update_sidecar_for_hook = update_sidecar.clone();
+        let update_marker_for_hook = update_marker.clone();
+        update_store.set_insert_test_hook(move |boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                fs::write(&update_sidecar_for_hook, &update_marker_for_hook)
+                    .expect("inject update WAL sidecar");
+            }
+            InsertTestDirective::Continue
+        });
+        let update_error = update_store
+            .persist_full(&update_progressed, Some(1))
+            .expect_err("sidecar must reject full-progress update");
+        assert!(matches!(
+            update_error,
+            OperationJournalStoreError::RequiresAudit { reason, .. }
+                if reason.contains("sidecar")
+        ));
+        assert_eq!(
+            full_progress_raw_row(&update_store, update_id),
+            original_row
+        );
+        assert_eq!(
+            fs::read(&update_sidecar).expect("retain update sidecar evidence"),
+            update_marker
+        );
+        fs::remove_file(update_sidecar).expect("remove retained update sidecar");
+    }
+
+    #[test]
+    fn full_progress_max_sequence_replays_without_allocation_and_rejects_update() {
+        let fixture = fixture();
+        let (initial, progressed) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let encoded = crate::operation_journal::full_progress_codec::encode(&initial)
+            .expect("encode max-sequence fixture");
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![operation_id.to_string(), i64::MAX, encoded.clone()],
+            )
+            .expect("insert max full-progress row");
+
+        assert_eq!(
+            store
+                .persist_full(&initial, None)
+                .expect("max-sequence exact replay"),
+            FullProgressWriteOutcome::Replay { sequence: i64::MAX }
+        );
+        assert!(matches!(
+            store.persist_full(&progressed, Some(i64::MAX)),
+            Err(OperationJournalStoreError::SequenceExhausted)
+        ));
+        let retained = full_progress_raw_row(&store, operation_id);
+        assert_eq!(retained.1, i64::MAX);
+        assert_eq!(retained.2, encoded);
+    }
+
+    #[test]
+    fn full_progress_collision_and_ambiguous_family_reads_fail_closed() {
+        let first_fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let first_store = OperationJournalStore::open(&first_fixture.owner).expect("open store");
+        first_store
+            .persist_full(&initial, None)
+            .expect("insert full-progress row");
+        let legacy = intent_record(operation_id);
+        assert!(matches!(
+            first_store.insert_intent(&legacy),
+            Err(OperationJournalStoreError::DuplicateOperation { operation_id: observed })
+                if observed == operation_id
+        ));
+        first_store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    operation_id.to_string(),
+                    2_i64,
+                    encode(&legacy).expect("encode collision fixture")
+                ],
+            )
+            .expect("create ambiguous family rows");
+        assert!(matches!(
+            first_store.get_full(operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        assert!(matches!(
+            first_store.get(operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        let ambiguous_full_row = full_progress_raw_row(&first_store, operation_id);
+        assert!(matches!(
+            first_store.persist_full(&initial, None),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        assert_eq!(
+            full_progress_raw_row(&first_store, operation_id),
+            ambiguous_full_row
+        );
+        let ambiguous_legacy_row: (String, i64, Vec<u8>) = first_store
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal
+                 WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read ambiguous legacy row");
+        let cancellation =
+            CancellationRequestObservation::new(1).expect("cancellation mutation lookup fixture");
+        assert!(matches!(
+            first_store.request_cancel_before_publish(operation_id, 2, cancellation),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        let retained_legacy_row: (String, i64, Vec<u8>) = first_store
+            .connection
+            .query_row(
+                "SELECT operation_id, sequence, record FROM operation_journal
+                 WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read retained ambiguous legacy row");
+        assert_eq!(retained_legacy_row, ambiguous_legacy_row);
+
+        let second_fixture = fixture();
+        let second_store = OperationJournalStore::open(&second_fixture.owner).expect("open store");
+        let reverse_legacy = intent_record(operation_id);
+        second_store
+            .insert_intent(&reverse_legacy)
+            .expect("insert legacy collision row");
+        assert!(matches!(
+            second_store.persist_full(&initial, None),
+            Err(OperationJournalStoreError::DuplicateOperation { operation_id: observed })
+                if observed == operation_id
+        ));
+    }
+
+    #[test]
+    fn full_progress_malformed_payload_is_retained_without_overwrite() {
+        let fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store
+            .persist_full(&initial, None)
+            .expect("insert full-progress row");
+        store
+            .connection
+            .execute(
+                "UPDATE operation_journal_full_progress SET record = ?1 WHERE operation_id = ?2",
+                params!["retained malformed payload", operation_id.to_string()],
+            )
+            .expect("corrupt full-progress payload type");
+
+        assert!(matches!(
+            store.get_full(operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("BLOB")
+        ));
+        assert!(matches!(
+            store.persist_full(&initial, None),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        let retained: String = store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_full_progress WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained malformed payload");
+        assert_eq!(retained, "retained malformed payload");
+    }
+
+    #[test]
+    fn full_progress_malformed_blob_and_sequence_cells_require_audit() {
+        let blob_fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let blob_id = initial.snapshot().intent().operation_id();
+        let blob_store = OperationJournalStore::open(&blob_fixture.owner).expect("open blob store");
+        blob_store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![blob_id.to_string(), 1_i64, vec![0x7b_u8, 0x00_u8]],
+            )
+            .expect("insert malformed JSON blob");
+        assert!(matches!(
+            blob_store.get_full(blob_id),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("decode")
+        ));
+        assert!(matches!(
+            blob_store.persist_full(&initial, None),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("decode")
+        ));
+        let retained_blob: Vec<u8> = blob_store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_full_progress WHERE operation_id = ?1",
+                params![blob_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained malformed blob");
+        assert_eq!(retained_blob, vec![0x7b_u8, 0x00_u8]);
+
+        for (label, sequence_sql, expected_reason) in [
+            ("noninteger", "'not-an-integer'", "SQLite integer"),
+            ("nonpositive", "-1", "not positive"),
+        ] {
+            let sequence_fixture = fixture();
+            let sequence_store =
+                OperationJournalStore::open(&sequence_fixture.owner).expect("open sequence store");
+            let sequence_id = initial.snapshot().intent().operation_id();
+            let encoded = crate::operation_journal::full_progress_codec::encode(&initial)
+                .expect("encode sequence fixture");
+            sequence_store
+                .connection
+                .execute(
+                    "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                     VALUES (?1, 1, ?2)",
+                    params![sequence_id.to_string(), encoded.as_slice()],
+                )
+                .expect("insert sequence fixture");
+            sequence_store
+                .connection
+                .execute_batch(&format!(
+                    "UPDATE operation_journal_full_progress
+                     SET sequence = {sequence_sql}
+                     WHERE operation_id = '{}';",
+                    sequence_id
+                ))
+                .expect("corrupt sequence cell");
+            assert!(
+                matches!(
+                    sequence_store.get_full(sequence_id),
+                    Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                        if reason.contains(expected_reason)
+                ),
+                "{label} sequence should require audit"
+            );
+            assert!(
+                matches!(
+                    sequence_store.persist_full(&initial, None),
+                    Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                        if reason.contains(expected_reason)
+                ),
+                "{label} persist should require audit"
+            );
+            let retained_sequence: String = sequence_store
+                .connection
+                .query_row(
+                    "SELECT CAST(sequence AS TEXT) FROM operation_journal_full_progress
+                     WHERE operation_id = ?1",
+                    params![sequence_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("read retained sequence cell");
+            assert_eq!(retained_sequence, sequence_sql.trim_matches('\''));
+        }
+    }
+
+    #[test]
+    fn full_progress_key_mismatch_and_oversize_payload_require_audit() {
+        let mismatch_fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let wrong_key = OperationId::new();
+        let encoded = crate::operation_journal::full_progress_codec::encode(&initial)
+            .expect("encode key-mismatch fixture");
+        let mismatch_store =
+            OperationJournalStore::open(&mismatch_fixture.owner).expect("open key-mismatch store");
+        mismatch_store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![wrong_key.to_string(), 1_i64, encoded.as_slice()],
+            )
+            .expect("insert key-mismatch row");
+        let mut wrong_candidate_value =
+            serde_json::to_value(&initial).expect("serialize key-mismatch candidate");
+        wrong_candidate_value["snapshot"]["intent"]["operation_id"] =
+            serde_json::json!(wrong_key.as_uuid());
+        let wrong_candidate: crate::operation_journal::full_progress_codec::StoredFullProgressRecord =
+            serde_json::from_value(wrong_candidate_value)
+                .expect("decode key-mismatch candidate");
+        assert!(matches!(
+            mismatch_store.get_full(wrong_key),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("identity")
+        ));
+        assert!(matches!(
+            mismatch_store.persist_full(&wrong_candidate, None),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("identity")
+        ));
+        let retained_mismatch: Vec<u8> = mismatch_store
+            .connection
+            .query_row(
+                "SELECT record FROM operation_journal_full_progress WHERE operation_id = ?1",
+                params![wrong_key.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained key-mismatch row");
+        assert_eq!(retained_mismatch, encoded);
+        assert!(
+            mismatch_store
+                .get_full(operation_id)
+                .expect("read missing original key")
+                .is_none()
+        );
+
+        let oversize_fixture = fixture();
+        let oversize_store =
+            OperationJournalStore::open(&oversize_fixture.owner).expect("open oversize store");
+        oversize_store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("disable checks for retained corruption fixture");
+        oversize_store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, zeroblob(?3))",
+                params![
+                    operation_id.to_string(),
+                    1_i64,
+                    (crate::operation_journal::full_progress_codec::FULL_PROGRESS_MAX_RECORD_BYTES
+                        + 1) as i64
+                ],
+            )
+            .expect("insert oversize retained row");
+        oversize_store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore checks after corruption fixture");
+        assert!(matches!(
+            oversize_store.get_full(operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("exceeds")
+        ));
+        assert!(matches!(
+            oversize_store.persist_full(&initial, None),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("exceeds")
+        ));
+        let retained_length: i64 = oversize_store
+            .connection
+            .query_row(
+                "SELECT length(record) FROM operation_journal_full_progress WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read retained oversize length");
+        assert_eq!(
+            retained_length,
+            (crate::operation_journal::full_progress_codec::FULL_PROGRESS_MAX_RECORD_BYTES + 1)
+                as i64
+        );
+    }
+
+    #[test]
+    fn full_progress_changed_frozen_intent_conflicts_without_mutation() {
+        let fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store
+            .persist_full(&initial, None)
+            .expect("insert initial full progress");
+
+        let mut changed = serde_json::to_value(&initial).expect("serialize full-progress fixture");
+        changed["snapshot"]["intent"]["capacity_plan"]["allocations"][0]["logical_bytes"] =
+            serde_json::json!(13);
+        changed["snapshot"]["intent"]["capacity_plan"]["allocations"][0]["allocated_bytes"] =
+            serde_json::json!(13);
+        changed["snapshot"]["intent"]["admission_claims"]["claims"][0]["allocated_bytes"] =
+            serde_json::json!(13);
+        let changed: crate::operation_journal::full_progress_codec::StoredFullProgressRecord =
+            serde_json::from_value(changed).expect("decode changed frozen intent");
+
+        assert!(matches!(
+            store.persist_full(&changed, Some(1)),
+            Err(OperationJournalStoreError::FullProgressSequenceConflict {
+                operation_id: observed,
+                expected: Some(1),
+                actual: Some(1),
+            }) if observed == operation_id
+        ));
+        let retained = store
+            .get_full(operation_id)
+            .expect("read retained original")
+            .expect("original remains present");
+        assert_eq!(retained.sequence(), 1);
+        assert_eq!(retained.record(), &initial);
+    }
+
+    #[test]
+    fn full_progress_duplicate_sequence_is_rejected_by_reads_and_recovery() {
+        let fixture = fixture();
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        let legacy = intent_record(OperationId::new());
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store
+            .persist_full(&initial, None)
+            .expect("insert full-progress row");
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    legacy.operation_id.to_string(),
+                    1_i64,
+                    encode(&legacy).expect("encode duplicate-sequence fixture")
+                ],
+            )
+            .expect("insert duplicate legacy sequence");
+
+        assert!(matches!(
+            store.get_full(operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("sequence")
+        ));
+        assert!(matches!(
+            store.get(legacy.operation_id),
+            Err(OperationJournalStoreError::RequiresAudit { reason, .. })
+                if reason.contains("sequence")
+        ));
+        assert!(matches!(
+            store.scan_recovery_page(None),
+            Err(recovery::RecoveryScanError::RequiresAudit { reason })
+                if reason.contains("sequence")
+        ));
     }
 
     #[test]

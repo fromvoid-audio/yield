@@ -21621,6 +21621,37 @@ mod tests {
         assert_eq!(cancelled, before);
     }
 
+    pub(super) fn full_progress_store_snapshots() -> (
+        FullProgressSnapshotObservation,
+        FullProgressSnapshotObservation,
+    ) {
+        let initial = copy_progress_with_admission_claims();
+        let initial_snapshot = initial
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&initial))
+            .expect("initial full-progress store snapshot");
+
+        let mut progressed = copy_progress_with_admission_claims();
+        progressed
+            .request_retry(
+                RetryObservation::new(
+                    1,
+                    100,
+                    200,
+                    RetryLeaseId::new("store-retry").expect("retry lease"),
+                    300,
+                    RetryErrorClass::TransientAvailability,
+                    "store-test",
+                    None,
+                )
+                .expect("retry observation"),
+            )
+            .expect("retry request");
+        let progressed_snapshot = progressed
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progressed))
+            .expect("progressed full-progress store snapshot");
+        (initial_snapshot, progressed_snapshot)
+    }
+
     #[test]
     fn full_progress_snapshot_validates_retained_after_effect_headers_and_history() {
         let mut progress = copy_progress_with_admission_claims();
@@ -23706,4 +23737,12 @@ mod tests {
             Err(FullProgressSnapshotObservationError::PrerequisiteIncomplete { .. })
         ));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_full_progress_store_snapshots() -> (
+    FullProgressSnapshotObservation,
+    FullProgressSnapshotObservation,
+) {
+    tests::full_progress_store_snapshots()
 }
