@@ -1182,7 +1182,7 @@ impl FullProgressSnapshotObservation {
             ) {
                 (ProgressStepStatus::Completed, Some(evidence), Some(context)) => {
                     progress
-                        .validate_historical_completion(step.key, context, evidence)
+                        .validate_normal_historical_completion(step.key, context, evidence)
                         .map_err(|source| FullProgressSnapshotObservationError::Completion {
                             source,
                         })?;

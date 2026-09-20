@@ -68,7 +68,8 @@ use super::participants::{
 };
 use super::readiness_scheduling::{
     ReadinessDeferralManifest, ReadinessDeferralManifestError, ReadinessSchedulingObservationError,
-    ReadinessSchedulingObservationRecord, derive_readiness_deferral_manifest,
+    ReadinessSchedulingObservationRecord, ReadinessSchedulingObservationRow,
+    derive_readiness_deferral_manifest,
 };
 use super::work_plan::{
     GLOBAL_ACTION_ORDINAL, MAX_WORK_PLAN_UNITS, WorkPlan, WorkPlanError, WorkPrerequisite,
@@ -380,6 +381,15 @@ pub enum StoredStepEvidence {
         /// Coordinator receipt observation.
         receipt: CoordinatorReceiptSummary,
     },
+    /// A normal Readiness owner returned the bounded scheduling observation for this completion.
+    ///
+    /// This remains an untrusted receipt.  It carries the scheduling row needed to validate
+    /// normal Readiness history, but does not prove that a durable wake was persisted or grant
+    /// permission to defer an Artifact.
+    ReadinessScheduled {
+        /// Readiness scheduling observation bound to the completed Readiness unit.
+        observation: ReadinessSchedulingObservationRow,
+    },
 }
 
 impl StoredStepEvidence {
@@ -390,6 +400,11 @@ impl StoredStepEvidence {
             Self::SourceCommitted { after, .. } => after.validate(),
             Self::Filesystem { .. } => Ok(()),
             Self::Coordinator { receipt } => receipt.validate(),
+            Self::ReadinessScheduled { observation } => observation
+                .validate_for_stored_step_evidence()
+                .map_err(|error| {
+                    ProgressEvidenceError::ReadinessSchedulingObservation(Box::new(error))
+                }),
         }
     }
 }
@@ -1509,7 +1524,7 @@ impl WorkProgress {
                 step.completion_context.as_ref(),
             ) {
                 (ProgressStepStatus::Completed, Some(evidence), Some(context)) => {
-                    self.validate_historical_completion(step.key, context, evidence)?;
+                    self.validate_normal_historical_completion(step.key, context, evidence)?;
                 }
                 (ProgressStepStatus::Completed, None, Some(_)) => {
                     return Err(WorkProgressError::CompletionEvidenceMissing { key: step.key });
@@ -1561,7 +1576,18 @@ impl WorkProgress {
                 }
             }
         }
-        validate_evidence_for_role(key.role(), &context.scope, evidence, None)
+        validate_evidence_for_role(key.role(), &context.scope, evidence, None)?;
+        validate_readiness_scheduled_binding(key, context, evidence)
+    }
+
+    fn validate_normal_historical_completion(
+        &self,
+        key: WorkUnitKey,
+        context: &CompletionContext,
+        evidence: &StoredStepEvidence,
+    ) -> Result<(), WorkProgressError> {
+        self.validate_historical_completion(key, context, evidence)?;
+        require_normal_readiness_evidence(key, evidence)
     }
 
     /// Validate the historical epoch and participant scope retained for one unit.
@@ -3153,18 +3179,17 @@ impl WorkProgress {
         let minimum_revision = expected_scope
             .source_fence()
             .and_then(|fence| self.minimum_source_revision_for_fence(fence));
-        validate_evidence_for_role(
-            completion.key.role(),
-            expected_scope,
+        let completion_context =
+            CompletionContext::new(completion.execution_epoch, completion.scope.clone());
+        validate_normal_completion_evidence(
+            completion.key,
+            &completion_context,
             &completion.evidence,
             minimum_revision,
         )?;
         self.steps[index].status = ProgressStepStatus::Completed;
         self.steps[index].evidence = Some(completion.evidence);
-        self.steps[index].completion_context = Some(CompletionContext::new(
-            completion.execution_epoch,
-            completion.scope,
-        ));
+        self.steps[index].completion_context = Some(completion_context);
         if self.disposition == FullProgressDisposition::RetryPending {
             self.disposition = FullProgressDisposition::None;
             self.retry_observation = None;
@@ -4946,6 +4971,24 @@ fn validate_evidence_for_role(
                 actual: scope.kind,
             });
         }
+        if role == WorkUnitRole::Readiness {
+            if let StoredStepEvidence::ReadinessScheduled { observation } = evidence {
+                observation
+                    .validate_for_stored_step_evidence()
+                    .map_err(WorkProgressError::ReadinessSchedulingObservation)?;
+                let fence = scope
+                    .source_fence
+                    .as_ref()
+                    .ok_or(WorkProgressError::SourceFenceMissing { role })?;
+                validate_source_observation(
+                    role,
+                    observation.source_observation(),
+                    fence,
+                    minimum_revision,
+                )?;
+                return Ok(());
+            }
+        }
         let StoredStepEvidence::Coordinator { receipt } = evidence else {
             return Err(WorkProgressError::RoleEvidenceMismatch { role });
         };
@@ -5090,8 +5133,56 @@ fn source_observation_for_evidence(
             after: observation, ..
         } => Some(observation),
         StoredStepEvidence::Coordinator { receipt } => receipt.source_observation(),
+        StoredStepEvidence::ReadinessScheduled { observation } => {
+            Some(observation.source_observation())
+        }
         StoredStepEvidence::Filesystem { .. } => None,
     }
+}
+
+fn validate_readiness_scheduled_binding(
+    key: WorkUnitKey,
+    context: &CompletionContext,
+    evidence: &StoredStepEvidence,
+) -> Result<(), WorkProgressError> {
+    let StoredStepEvidence::ReadinessScheduled { observation } = evidence else {
+        return Ok(());
+    };
+    if observation.readiness_key() != key {
+        return Err(WorkProgressError::ReadinessEvidenceKeyMismatch {
+            expected: key,
+            actual: observation.readiness_key(),
+        });
+    }
+    if observation.context() != context {
+        return Err(WorkProgressError::ReadinessEvidenceContextMismatch { key });
+    }
+    Ok(())
+}
+
+fn validate_normal_completion_evidence(
+    key: WorkUnitKey,
+    context: &CompletionContext,
+    evidence: &StoredStepEvidence,
+    minimum_revision: Option<u64>,
+) -> Result<(), WorkProgressError> {
+    validate_evidence_for_role(key.role(), context.scope(), evidence, minimum_revision)?;
+    validate_readiness_scheduled_binding(key, context, evidence)?;
+    require_normal_readiness_evidence(key, evidence)
+}
+
+fn require_normal_readiness_evidence(
+    key: WorkUnitKey,
+    evidence: &StoredStepEvidence,
+) -> Result<(), WorkProgressError> {
+    if key.role() == WorkUnitRole::Readiness
+        && !matches!(evidence, StoredStepEvidence::ReadinessScheduled { .. })
+    {
+        return Err(WorkProgressError::RoleEvidenceMismatch {
+            role: WorkUnitRole::Readiness,
+        });
+    }
+    Ok(())
 }
 
 fn same_stable_source_identity_observation(
@@ -5131,6 +5222,9 @@ pub enum ProgressEvidenceError {
     /// A source observation failed the existing source-fence bounds.
     #[error("invalid source progress observation: {0}")]
     InvalidSourceObservation(#[source] ParticipantValidationError),
+    /// A rich Readiness scheduling row failed its bounded observation shape.
+    #[error("invalid Readiness scheduling evidence row: {0}")]
+    ReadinessSchedulingObservation(#[source] Box<ReadinessSchedulingObservationError>),
 }
 
 /// Failure while deriving or advancing guarded work progress.
@@ -5717,6 +5811,22 @@ pub enum WorkProgressError {
     RoleEvidenceMismatch {
         /// Work role expected by the key.
         role: WorkUnitRole,
+    },
+    /// A rich normal Readiness receipt named a different work-unit key.
+    #[error(
+        "work progress Readiness evidence key {actual:?} does not match enclosing key {expected:?}"
+    )]
+    ReadinessEvidenceKeyMismatch {
+        /// Key carried by the enclosing progress completion.
+        expected: WorkUnitKey,
+        /// Key carried by the embedded Readiness scheduling row.
+        actual: WorkUnitKey,
+    },
+    /// A rich normal Readiness receipt carried a different completion context.
+    #[error("work progress Readiness evidence context does not match {key:?}")]
+    ReadinessEvidenceContextMismatch {
+        /// Key carrying the mismatched embedded context.
+        key: WorkUnitKey,
     },
     /// The participant kind did not match the exact work role.
     #[error("work progress participant kind for {role:?} is {actual:?}, expected {expected:?}")]
@@ -7500,6 +7610,14 @@ mod tests {
                 before_revision: revision,
                 after: source_observation(progress, key, revision),
             },
+            WorkUnitRole::Readiness => StoredStepEvidence::ReadinessScheduled {
+                observation: readiness_row_at(
+                    progress,
+                    key,
+                    key.participant_id().as_uuid().as_u128() | 1,
+                    revision,
+                ),
+            },
             role => {
                 if let Some(kind) = expected_filesystem_receipt(role) {
                     StoredStepEvidence::Filesystem {
@@ -7524,6 +7642,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn generic_coordinator_evidence_for(
+        progress: &WorkProgress,
+        key: WorkUnitKey,
+        revision: u64,
+    ) -> StoredStepEvidence {
+        let receipt = CoordinatorReceiptSummary::new(
+            expected_coordinator_receipt(key.role()).expect("coordinator role"),
+            1,
+            None,
+        );
+        let receipt = if progress
+            .scope_for(key)
+            .and_then(ParticipantScope::source_fence)
+            .is_some()
+        {
+            receipt.with_source_observation(source_observation(progress, key, revision))
+        } else {
+            receipt
+        };
+        StoredStepEvidence::Coordinator { receipt }
     }
 
     fn completion(
@@ -8458,15 +8598,12 @@ mod tests {
             ))
             .expect("current projection revision");
         let readiness = key_for(&progress, u8::MAX, WorkUnitRole::Readiness);
-        let stale_readiness =
-            CoordinatorReceiptSummary::new(CoordinatorReceiptKind::Readiness, 1, None)
-                .with_source_observation(source_observation(&progress, readiness, 9));
         assert!(matches!(
             progress.apply_verified_completion(completion(
                 &progress,
                 readiness,
-                StoredStepEvidence::Coordinator {
-                    receipt: stale_readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: readiness_row_at(&progress, readiness, 8574, 9),
                 },
             )),
             Err(WorkProgressError::SourceRevisionRegressed {
@@ -8680,15 +8817,12 @@ mod tests {
             .expect("current projection revision");
 
         let readiness = key_for(&progress, u8::MAX, WorkUnitRole::Readiness);
-        let stale_readiness =
-            CoordinatorReceiptSummary::new(CoordinatorReceiptKind::Readiness, 1, None)
-                .with_source_observation(source_observation(&progress, readiness, 7));
         assert!(matches!(
             progress.apply_verified_completion(completion(
                 &progress,
                 readiness,
-                StoredStepEvidence::Coordinator {
-                    receipt: stale_readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: readiness_row_at(&progress, readiness, 8796, 7),
                 },
             )),
             Err(WorkProgressError::SourceRevisionRegressed {
@@ -8697,15 +8831,12 @@ mod tests {
                 minimum: 8,
             })
         ));
-        let current_readiness =
-            CoordinatorReceiptSummary::new(CoordinatorReceiptKind::Readiness, 1, None)
-                .with_source_observation(source_observation(&progress, readiness, 8));
         progress
             .apply_verified_completion(completion(
                 &progress,
                 readiness,
-                StoredStepEvidence::Coordinator {
-                    receipt: current_readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: readiness_row_at(&progress, readiness, 8813, 8),
                 },
             ))
             .expect("current readiness revision");
@@ -8713,6 +8844,237 @@ mod tests {
         let unfenced =
             CoordinatorReceiptSummary::new(CoordinatorReceiptKind::GlobalLibrary, 1, None);
         assert!(unfenced.source_observation().is_none());
+    }
+
+    #[test]
+    fn normal_readiness_completion_requires_rich_scheduling_evidence_and_snapshot_history() {
+        let mut progress = copy_progress_with_admission_claims();
+        assert!(
+            progress
+                .scopes
+                .iter()
+                .all(|scope| scope.kind() != ParticipantKind::Artifact)
+        );
+        publish_prefix(&mut progress);
+        apply_role(&mut progress, 0, WorkUnitRole::SourceAffect);
+        for role in [
+            WorkUnitRole::GlobalLibrary,
+            WorkUnitRole::Harvest,
+            WorkUnitRole::Projection,
+        ] {
+            apply_role(&mut progress, u8::MAX, role);
+        }
+        let readiness = key_for(&progress, u8::MAX, WorkUnitRole::Readiness);
+
+        let before_generic = progress.clone();
+        assert_eq!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                generic_coordinator_evidence_for(&progress, readiness, 7),
+            )),
+            Err(WorkProgressError::RoleEvidenceMismatch {
+                role: WorkUnitRole::Readiness,
+            })
+        );
+        assert_eq!(progress, before_generic);
+
+        let valid_row = readiness_row_at(&progress, readiness, 8801, 7);
+        let wrong_key = WorkUnitKey::new(
+            readiness.action_ordinal(),
+            readiness.step_ordinal() + 1,
+            readiness.participant_id(),
+            WorkUnitRole::Readiness,
+        );
+        let wrong_key_row = ReadinessSchedulingObservationRow::new(
+            wrong_key,
+            valid_row.context().clone(),
+            valid_row.source_observation().clone(),
+            valid_row.source_generation(),
+            valid_row.readiness_revision(),
+            valid_row.contract_version(),
+            *valid_row.target_set(),
+            valid_row.wake().clone(),
+        )
+        .expect("wrong-key Readiness row shape");
+        let before_wrong_key = progress.clone();
+        assert_eq!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: wrong_key_row,
+                },
+            )),
+            Err(WorkProgressError::ReadinessEvidenceKeyMismatch {
+                expected: readiness,
+                actual: wrong_key,
+            })
+        );
+        assert_eq!(progress, before_wrong_key);
+
+        let projection = key_for(&progress, u8::MAX, WorkUnitRole::Projection);
+        let wrong_context_row = ReadinessSchedulingObservationRow::new(
+            readiness,
+            CompletionContext::new(
+                progress.execution_epoch(),
+                progress
+                    .scope_for(projection)
+                    .expect("projection scope")
+                    .clone(),
+            ),
+            valid_row.source_observation().clone(),
+            valid_row.source_generation(),
+            valid_row.readiness_revision(),
+            valid_row.contract_version(),
+            *valid_row.target_set(),
+            DurableReadinessWakeObservation::new(Uuid::from_u128(8802), 1)
+                .expect("wrong-context wake"),
+        )
+        .expect("wrong-context Readiness row shape");
+        assert_eq!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: wrong_context_row,
+                },
+            )),
+            Err(WorkProgressError::ReadinessEvidenceContextMismatch { key: readiness })
+        );
+
+        let stale_row = readiness_row_at(&progress, readiness, 8803, 6);
+        assert!(matches!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: stale_row,
+                },
+            )),
+            Err(WorkProgressError::SourceRevisionRegressed {
+                role: WorkUnitRole::Readiness,
+                observed: 6,
+                minimum: 7,
+            })
+        ));
+
+        let wrong_source = SourceRevisionObservation::new(
+            SourceId::from_string("other-readiness-source"),
+            "root-a",
+            "db-a",
+            1,
+            1,
+            7,
+        )
+        .expect("wrong Readiness source observation");
+        let wrong_source_row = ReadinessSchedulingObservationRow::new(
+            readiness,
+            valid_row.context().clone(),
+            wrong_source,
+            valid_row.source_generation(),
+            valid_row.readiness_revision(),
+            valid_row.contract_version(),
+            *valid_row.target_set(),
+            DurableReadinessWakeObservation::new(Uuid::from_u128(8804), 1)
+                .expect("wrong-source wake"),
+        )
+        .expect("wrong-source Readiness row shape");
+        assert_eq!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: wrong_source_row,
+                },
+            )),
+            Err(WorkProgressError::SourceFenceMismatch {
+                role: WorkUnitRole::Readiness,
+            })
+        );
+
+        let mut malformed_row_json = serde_json::to_value(&valid_row).expect("row JSON");
+        malformed_row_json["contract_version"] = json!(" ");
+        let malformed_row: ReadinessSchedulingObservationRow =
+            serde_json::from_value(malformed_row_json).expect("malformed row shape");
+        let before_malformed = progress.clone();
+        assert!(matches!(
+            progress.apply_verified_completion(completion(
+                &progress,
+                readiness,
+                StoredStepEvidence::ReadinessScheduled {
+                    observation: malformed_row,
+                },
+            )),
+            Err(WorkProgressError::Evidence(
+                ProgressEvidenceError::ReadinessSchedulingObservation(error)
+            )) if matches!(*error, ReadinessSchedulingObservationError::EmptyContractVersion)
+        ));
+        assert_eq!(progress, before_malformed);
+
+        let valid_evidence = StoredStepEvidence::ReadinessScheduled {
+            observation: valid_row,
+        };
+        assert_eq!(
+            progress
+                .apply_verified_completion(
+                    completion(&progress, readiness, valid_evidence.clone(),)
+                )
+                .expect("rich Readiness completion"),
+            ProgressApplyOutcome::Applied
+        );
+        assert_eq!(
+            progress
+                .apply_verified_completion(completion(&progress, readiness, valid_evidence.clone()))
+                .expect("exact Readiness replay"),
+            ProgressApplyOutcome::Replay
+        );
+
+        let accepted_snapshot = progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("snapshot with rich Readiness history");
+        accepted_snapshot
+            .validate_base()
+            .expect("rich Readiness snapshot validates");
+        let readiness_index = accepted_snapshot
+            .steps()
+            .iter()
+            .position(|step| step.key() == readiness)
+            .expect("Readiness snapshot step");
+        let mut generic_snapshot_json =
+            serde_json::to_value(&accepted_snapshot).expect("snapshot JSON");
+        generic_snapshot_json["steps"][readiness_index]["evidence"] =
+            serde_json::to_value(generic_coordinator_evidence_for(&progress, readiness, 7))
+                .expect("generic Readiness evidence JSON");
+        let generic_snapshot: FullProgressSnapshotObservation =
+            serde_json::from_value(generic_snapshot_json).expect("generic snapshot shape");
+        assert_eq!(
+            generic_snapshot.validate_base(),
+            Err(FullProgressSnapshotObservationError::Completion {
+                source: WorkProgressError::RoleEvidenceMismatch {
+                    role: WorkUnitRole::Readiness,
+                },
+            })
+        );
+
+        let source = key_for(&progress, 0, WorkUnitRole::SourceRead);
+        progress
+            .reacquire_source(source_reacquisition_authority(
+                &progress,
+                source.participant_id(),
+                8,
+                2,
+                0,
+            ))
+            .expect("source reacquisition");
+        progress
+            .validate_completion_history()
+            .expect("rich Readiness history survives reacquisition");
+        progress
+            .capture_full_progress_snapshot(&copy_snapshot_intent(&progress))
+            .expect("snapshot with rich Readiness history")
+            .validate_base()
+            .expect("snapshot validates rich Readiness history");
     }
 
     #[test]
@@ -9945,6 +10307,47 @@ mod tests {
                 &dispatch,
             )
             .expect("pending coordinator observation validates");
+
+        let readiness = global_key(&progress, WorkUnitRole::Readiness);
+        let generic_readiness = generic_coordinator_evidence_for(&progress, readiness, 7);
+        let generic_readiness_context = CompletionContext::new(
+            progress.execution_epoch(),
+            progress
+                .scope_for(readiness)
+                .expect("Readiness coordinator scope")
+                .clone(),
+        );
+        let generic_readiness_record = CancellationCoordinatorClosureObservationRecord::new(
+            manifest.clone(),
+            dispatch.observation_epoch(),
+            1,
+            manifest
+                .keys()
+                .iter()
+                .map(|key| {
+                    let outcome = if *key == readiness {
+                        CancellationCoordinatorClosureOutcome::Observed {
+                            evidence: generic_readiness.clone(),
+                            context: generic_readiness_context.clone(),
+                        }
+                    } else {
+                        CancellationCoordinatorClosureOutcome::Pending
+                    };
+                    CancellationCoordinatorClosureObservationRow::new(*key, outcome)
+                })
+                .collect(),
+        )
+        .expect("generic Readiness coordinator observation");
+        let before_generic_readiness = progress.clone();
+        progress
+            .validate_cancellation_coordinator_closure_observation_record(
+                &generic_readiness_record,
+                &source_observation,
+                &recovery,
+                &dispatch,
+            )
+            .expect("generic Readiness cancellation receipt remains valid");
+        assert_eq!(progress, before_generic_readiness);
 
         let missing = CoordinatorClosureManifest::new(
             source_observation,

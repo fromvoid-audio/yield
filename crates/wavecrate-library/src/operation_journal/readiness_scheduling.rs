@@ -590,6 +590,13 @@ impl ReadinessSchedulingObservationRow {
         &self.wake
     }
 
+    /// Validate the row shape when it is embedded in normal Readiness completion evidence.
+    pub(crate) fn validate_for_stored_step_evidence(
+        &self,
+    ) -> Result<(), ReadinessSchedulingObservationError> {
+        self.validate_shape()
+    }
+
     fn validate_shape(&self) -> Result<(), ReadinessSchedulingObservationError> {
         if self.readiness_key.role() != WorkUnitRole::Readiness {
             return Err(ReadinessSchedulingObservationError::RowNotReadiness {
