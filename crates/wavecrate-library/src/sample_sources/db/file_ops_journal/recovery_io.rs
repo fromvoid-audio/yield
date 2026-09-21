@@ -549,7 +549,7 @@ pub(crate) struct BoundDatabaseRoot {
     profile_identity: String,
     named_path: Option<PathBuf>,
     namespace_kind: BoundDatabaseRootNamespace,
-    _lease: Option<ProfileChildLease>,
+    _lease: Option<Arc<ProfileChildLease>>,
 }
 
 #[derive(Clone, Copy)]
@@ -596,6 +596,28 @@ impl fmt::Display for BoundDatabaseRootError {
 impl BoundDatabaseRoot {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Duplicate the retained directory descriptor for an owner-owned capability.
+    ///
+    /// The original profile-child lease remains held by the store and is shared by the duplicate
+    /// through the retained lease handle. The duplicate acquires no second in-process lease and
+    /// keeps an owner-owned reserve capsule separate from the store while that shared lease lives.
+    pub(crate) fn try_clone_for_owned_capability(&self) -> io::Result<Self> {
+        Ok(Self {
+            path: self.path.clone(),
+            _capability: self._capability.try_clone()?,
+            identity: self.identity.clone(),
+            profile_identity: self.profile_identity.clone(),
+            named_path: self.named_path.clone(),
+            namespace_kind: self.namespace_kind,
+            _lease: self._lease.as_ref().map(Arc::clone),
+        })
+    }
+
+    /// Duplicate the retained directory descriptor for descriptor-derived volume facts.
+    pub(crate) fn try_clone_descriptor(&self) -> io::Result<fs::File> {
+        self._capability.try_clone()
     }
 
     /// Open one direct child through the retained database-root capability.
@@ -775,7 +797,7 @@ impl BoundDatabaseRoot {
             profile_identity: profile_guard.profile_root_identity().to_owned(),
             named_path: Some(profile_guard.profile_root().join(child)),
             namespace_kind: BoundDatabaseRootNamespace::ProfileChild,
-            _lease: Some(lease),
+            _lease: Some(Arc::new(lease)),
         })
     }
 

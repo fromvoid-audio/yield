@@ -24,7 +24,9 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
-use super::capacity_reserve_namespace::{BoundReserve, PhysicalReserveProof};
+use super::capacity_reserve_namespace::{
+    BoundReserve, OwnedReserveAllocation, PhysicalReserveProof,
+};
 use super::capacity_volume_owner::{VolumeOwnershipCapability, VolumeOwnershipError};
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{
@@ -567,6 +569,24 @@ pub(crate) struct RecoveryReserveContext<'a> {
     profile_identity: String,
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum ProfileJournalReserveBootstrapError {
+    #[error("journal root descriptor could not be duplicated: {0}")]
+    RootDescriptor(String),
+    #[error(transparent)]
+    VolumeOwnership(#[from] VolumeOwnershipError),
+    #[error("protected reserve namespace bootstrap failed: {0}")]
+    Namespace(String),
+    #[error("live reserve validation failed during bootstrap: {0}")]
+    NamespaceValidation(String),
+    #[error(transparent)]
+    Recovery(#[from] RecoveryReserveContextError),
+    #[error(transparent)]
+    Binding(#[from] recovery_reserve_binding::ReserveBindingError),
+    #[error(transparent)]
+    Store(#[from] OperationJournalStoreError),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum RecoveryReserveContextError {
@@ -623,6 +643,14 @@ impl PhysicalMutationFault {
 
 #[allow(dead_code)]
 impl<'a> RecoveryReserveContext<'a> {
+    fn into_owned_reserve(self) -> Result<OwnedReserveAllocation, RecoveryReserveContextError> {
+        let RecoveryReserveContext { reserve, .. } = self;
+        let reserve = reserve
+            .into_owned()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        Ok(reserve)
+    }
+
     fn validate_binding(&self) -> Result<(), RecoveryReserveContextError> {
         let live = recovery_reserve_binding::ReserveBinding::from_live(
             self.volume_owner.volume().clone(),
@@ -1017,6 +1045,184 @@ impl OperationJournalStore {
     /// expected journal namespace.
     pub(crate) fn validate_for_admission(&self) -> Result<(), OperationJournalStoreError> {
         self.validate_namespace()
+    }
+
+    pub(crate) fn try_clone_profile_guard_for_owner(
+        &self,
+    ) -> Result<WritableProfileGuard, ProfileOwnershipError> {
+        self.profile_guard.try_clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reserve_bootstrap_snapshot(
+        &self,
+        volume: &crate::durable_capacity::VolumeIdentity,
+    ) -> Result<(Option<(String, String, u64, u64)>, (u64, u64, u64, u64)), String> {
+        let binding = recovery_reserve_binding::read(&self.connection, volume)
+            .map_err(|error| error.to_string())?
+            .map(|binding| {
+                (
+                    binding.root_identity().to_owned(),
+                    binding.file_identity().to_owned(),
+                    binding.allocation_unit(),
+                    binding.owner_generation(),
+                )
+            });
+        let count = |table: &str| {
+            self.connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map(|count| count as u64)
+                .map_err(|error| error.to_string())
+        };
+        let operation_rows = count("operation_journal")?
+            .checked_add(count("operation_journal_full_progress")?)
+            .ok_or_else(|| String::from("operation row count overflowed"))?;
+        let counts = (
+            operation_rows,
+            count(recovery_reserve_binding::TABLE_NAME)?,
+            count(recovery_reserve::CHARGE_TABLE_NAME)?,
+            count(recovery_reserve::TRANSITION_TABLE_NAME)?,
+        );
+        Ok((binding, counts))
+    }
+
+    /// Acquire the descriptor-derived shared volume owner after this store reaches its owner
+    /// thread. The caller must install the returned capability before any later fallible reserve
+    /// bootstrap so the owner runtime retains the lock across every error path.
+    pub(crate) fn acquire_profile_journal_volume_owner(
+        &self,
+        #[cfg(test)] registry_path: Option<&Path>,
+    ) -> Result<VolumeOwnershipCapability, ProfileJournalReserveBootstrapError> {
+        self.validate_namespace()?;
+        let descriptor = self.database_root.try_clone_descriptor().map_err(|error| {
+            ProfileJournalReserveBootstrapError::RootDescriptor(error.to_string())
+        })?;
+        #[cfg(test)]
+        {
+            let volume_owner = match registry_path {
+                Some(registry_path) => {
+                    super::capacity_volume_owner::acquire_for_descriptor_fixture_test(
+                        &descriptor,
+                        registry_path,
+                        &self.profile_guard,
+                    )?
+                }
+                None => super::capacity_volume_owner::acquire_for_descriptor(
+                    &descriptor,
+                    &self.profile_guard,
+                )?,
+            };
+            return Ok(volume_owner);
+        }
+        #[cfg(not(test))]
+        super::capacity_volume_owner::acquire_for_descriptor(&descriptor, &self.profile_guard)
+            .map_err(ProfileJournalReserveBootstrapError::from)
+    }
+
+    /// Bootstrap or reopen the profile/journal volume reserve using an already-installed owner
+    /// lock. This is recovery-only state: it creates no operation id, charge, permit, or ordinary
+    /// admission authority. Any context clone of the lock is dropped before this returns.
+    pub(crate) fn bootstrap_profile_journal_reserve(
+        &self,
+        volume_owner: &VolumeOwnershipCapability,
+        #[cfg(test)] registry_path: Option<&Path>,
+    ) -> Result<OwnedReserveAllocation, ProfileJournalReserveBootstrapError> {
+        self.validate_namespace()?;
+        #[cfg(test)]
+        let _ = registry_path;
+        volume_owner.revalidate()?;
+
+        let existing = recovery_reserve_binding::read(&self.connection, volume_owner.volume())?;
+        if existing.is_some() {
+            let context_owner = volume_owner.try_clone_for_context()?;
+            let context = self.reopen_recovery_reserve(
+                context_owner,
+                &self.database_root,
+                &self.profile_guard,
+            )?;
+            return context
+                .into_owned_reserve()
+                .map_err(ProfileJournalReserveBootstrapError::from);
+        }
+
+        let reserve = super::capacity_reserve_namespace::create_owned_reserve(
+            &self.database_root,
+            &self.profile_guard,
+        )
+        .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
+        let mut reserve = reserve
+            .into_owned()
+            .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
+        {
+            let view = reserve.view(&self.profile_guard);
+            view.revalidate_and_prove().map_err(|error| {
+                ProfileJournalReserveBootstrapError::NamespaceValidation(error.to_string())
+            })?;
+        }
+        self.validate_namespace()?;
+        volume_owner.revalidate()?;
+        let observation = reserve.observation();
+        let binding = recovery_reserve_binding::ReserveBinding::from_live(
+            volume_owner.volume().clone(),
+            self.profile_guard.profile_root_identity(),
+            observation.root_identity(),
+            observation.file_identity(),
+            observation.allocation_unit(),
+            volume_owner.owner_generation(),
+        )?;
+        recovery_reserve_binding::persist(&self.connection, &binding)?;
+        Ok(reserve)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_seed_spent_profile_journal_reserve(
+        &self,
+        registry_path: &Path,
+        operation_id: OperationId,
+        charge_id: uuid::Uuid,
+        budget_bytes: u64,
+        margin_bytes: u64,
+        spend_bytes: u64,
+    ) -> Result<(), String> {
+        let descriptor = self
+            .database_root
+            .try_clone_descriptor()
+            .map_err(|error| error.to_string())?;
+        let facts = crate::durable_capacity::descriptor_capacity_facts(&descriptor)
+            .map_err(|error| error.to_string())?;
+        let volume_owner = super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            registry_path,
+            facts.identity.clone(),
+            self.profile_guard.profile_root_identity(),
+        )
+        .map_err(|error| error.to_string())?;
+        let reserve = super::capacity_reserve_namespace::create_owned_reserve(
+            &self.database_root,
+            &self.profile_guard,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut context = self
+            .bind_recovery_reserve(volume_owner, reserve)
+            .map_err(|error| error.to_string())?;
+        let request = recovery_reserve::ChargeRequest {
+            charge_id,
+            operation_id,
+            volume: facts.identity,
+            purpose: recovery_reserve::RecoveryReservePurpose::OperationRecovery,
+            budget_bytes,
+            margin_bytes,
+            precharge_capacity_bytes: facts.free_bytes,
+        };
+        context
+            .begin_charge(&request)
+            .map_err(|error| error.to_string())?;
+        context
+            .spend_physical(charge_id, uuid::Uuid::new_v4(), spend_bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     /// Bind the durable ledger to a live per-volume owner and physical reserve.

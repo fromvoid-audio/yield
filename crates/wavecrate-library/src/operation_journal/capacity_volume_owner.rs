@@ -178,6 +178,39 @@ impl VolumeOwnershipCapability {
         VolumeOwnershipReadiness::RecoveryOnly
     }
 
+    /// Duplicate the retained lock descriptors for a short-lived recovery context.
+    ///
+    /// The duplicate shares the already-acquired OS lock; it never performs a second path-based
+    /// acquisition. The owner runtime keeps the original capability until the journal closes.
+    pub(super) fn try_clone_for_context(&self) -> Result<Self, VolumeOwnershipError> {
+        let registry_capability = self.registry.capability.try_clone().map_err(|source| {
+            VolumeOwnershipError::MarkerIo {
+                path: self.registry.path.clone(),
+                source,
+            }
+        })?;
+        let lock_file =
+            self.lock_file
+                .try_clone()
+                .map_err(|source| VolumeOwnershipError::MarkerIo {
+                    path: self.lock_path.clone(),
+                    source,
+                })?;
+        Ok(Self {
+            registry: RegistryRoot {
+                path: self.registry.path.clone(),
+                identity: self.registry.identity.clone(),
+                capability: registry_capability,
+            },
+            volume: self.volume.clone(),
+            lock_path: self.lock_path.clone(),
+            lock_identity: self.lock_identity.clone(),
+            lock_file,
+            marker: self.marker.clone(),
+            _owner_thread: PhantomData,
+        })
+    }
+
     /// Revalidate the retained registry root, lock entry, and dirty marker.
     pub(super) fn revalidate(&self) -> Result<(), VolumeOwnershipError> {
         self.registry.validate()?;
@@ -749,6 +782,22 @@ pub(super) fn acquire_fixture_for_test(
         volume,
         owner_profile_identity,
         true,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn acquire_for_descriptor_fixture_test(
+    descriptor: &File,
+    registry_path: &Path,
+    profile: &WritableProfileGuard,
+) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
+    let facts = descriptor_capacity_facts(descriptor)
+        .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?;
+    acquire_fixture_for_test(
+        descriptor,
+        registry_path,
+        facts.identity,
+        profile.profile_root_identity(),
     )
 }
 
