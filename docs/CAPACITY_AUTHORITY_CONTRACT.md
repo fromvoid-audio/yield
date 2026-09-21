@@ -248,6 +248,20 @@ bounded SQL lookahead row to produce the next cursor; malformed rows fail
 closed. These rows preserve evidence only and do not grant claim, provider,
 settlement, or admission authority.
 
+OPT-1558 now adds a crate-private legacy `IntentDurable` settlement boundary.
+It validates `FullCapacityPlan::from_legacy` and exact claim coverage before
+calling the owner-thread provisional provider, pins that lease before entering
+the journal's `BEGIN EXCLUSIVE`, inserts the intent and all ordinary claims in
+one transaction, and requires exact record and claim readback before an
+acknowledgement. A confirmed rollback releases the provisional token exactly
+once; a committed result changes it to a durable retained disposition, while
+rollback uncertainty or post-commit readback uncertainty leaves it
+audit-pending. Lease `Drop` cannot release either retained disposition.
+Duplicate operations or claim identities roll back the new attempt without
+changing the original charge. This slice does not upgrade full-progress
+observations, expose a production write API, settle later releases, rebuild
+claims, or enable the unavailable ordinary admission gate.
+
 ## Acceptance checks for implementation children
 
 These are required future checks, not evidence that this documentation change

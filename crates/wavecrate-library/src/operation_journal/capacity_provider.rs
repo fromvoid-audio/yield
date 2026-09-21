@@ -11,11 +11,14 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
-use super::admission_claims::{AdmissionClaimInventory, MAX_ADMISSION_CLAIMS};
+use super::admission_claims::{
+    AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory, MAX_ADMISSION_CLAIMS,
+};
 use super::full_capacity::{
     FullCapacityAllocationClass, FullCapacityPlan, MAX_FULL_CAPACITY_ALLOCATIONS,
 };
 use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity};
+use crate::operation_journal::model::OperationId;
 
 const INITIAL_LEASE_TOKEN: u64 = 1;
 
@@ -56,10 +59,18 @@ impl PartialOrd for ChargeKey {
 #[derive(Debug)]
 struct ProvisionalLedger {
     next_token: u64,
-    charges_by_token: BTreeMap<u64, BTreeMap<ChargeKey, u64>>,
+    charges_by_token: BTreeMap<u64, LedgerCharge>,
     aggregate_charges: BTreeMap<ChargeKey, u64>,
     #[cfg(test)]
     fail_release: bool,
+    #[cfg(test)]
+    fail_disposition: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LedgerCharge {
+    charges: BTreeMap<ChargeKey, u64>,
+    disposition: ProvisionalLeaseDisposition,
 }
 
 impl Default for ProvisionalLedger {
@@ -70,6 +81,8 @@ impl Default for ProvisionalLedger {
             aggregate_charges: BTreeMap::new(),
             #[cfg(test)]
             fail_release: false,
+            #[cfg(test)]
+            fail_disposition: false,
         }
     }
 }
@@ -88,14 +101,14 @@ impl CapacityFacts {
 /// Private in-process provider state.  `Rc<RefCell<_>>` keeps this authority synchronous and
 /// non-`Send`; it must remain owned by the operation-journal owner thread.
 #[allow(dead_code)]
-struct CapacityProvider {
+pub(crate) struct CapacityProvider {
     qualification: ProviderQualification,
     facts: Option<CapacityFacts>,
     ledger: Rc<RefCell<ProvisionalLedger>>,
 }
 
 impl CapacityProvider {
-    fn unavailable() -> Self {
+    pub(crate) fn unavailable() -> Self {
         Self {
             qualification: ProviderQualification::Unavailable,
             facts: None,
@@ -104,7 +117,7 @@ impl CapacityProvider {
     }
 
     #[cfg(test)]
-    fn qualified_fixture(facts: BTreeMap<VolumeIdentity, VolumeFacts>) -> Self {
+    pub(crate) fn qualified_fixture(facts: BTreeMap<VolumeIdentity, VolumeFacts>) -> Self {
         Self {
             qualification: ProviderQualification::QualifiedFixture,
             facts: Some(CapacityFacts::new(facts)),
@@ -112,7 +125,7 @@ impl CapacityProvider {
         }
     }
 
-    fn admit(
+    pub(crate) fn admit(
         &self,
         plan: &FullCapacityPlan,
         claims: &AdmissionClaimInventory,
@@ -243,15 +256,26 @@ impl CapacityProvider {
                 .checked_add(*bytes)
                 .expect("provisional aggregate was checked before mutation");
         }
-        ledger
-            .charges_by_token
-            .insert(next_token - 1, charge_by_key.clone());
+        ledger.charges_by_token.insert(
+            next_token - 1,
+            LedgerCharge {
+                charges: charge_by_key.clone(),
+                disposition: ProvisionalLeaseDisposition::Provisional,
+            },
+        );
+
+        let claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect();
 
         Ok(ProvisionalCapacityLease {
             ledger: Rc::clone(&self.ledger),
             token: next_token - 1,
             charges: charge_by_key,
-            released: false,
+            claim_ids,
+            disposition: ProvisionalLeaseDisposition::Provisional,
         })
     }
 
@@ -263,7 +287,11 @@ impl CapacityProvider {
     }
 
     #[cfg(test)]
-    fn outstanding(&self, volume: &VolumeIdentity, class: FullCapacityAllocationClass) -> u64 {
+    pub(crate) fn outstanding(
+        &self,
+        volume: &VolumeIdentity,
+        class: FullCapacityAllocationClass,
+    ) -> u64 {
         self.ledger
             .borrow()
             .aggregate_charges
@@ -276,23 +304,43 @@ impl CapacityProvider {
     }
 
     #[cfg(test)]
-    fn claim_count(&self) -> usize {
+    pub(crate) fn claim_count(&self) -> usize {
         self.ledger.borrow().charges_by_token.len()
     }
 
     #[cfg(test)]
-    fn next_token(&self) -> u64 {
+    pub(crate) fn ledger_dispositions(&self) -> Vec<ProvisionalLeaseDisposition> {
+        self.ledger
+            .borrow()
+            .charges_by_token
+            .values()
+            .map(|entry| entry.disposition.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_token(&self) -> u64 {
         self.ledger.borrow().next_token
     }
 
     #[cfg(test)]
-    fn fail_release_for_test(&self) {
+    pub(crate) fn fail_release_for_test(&self) {
         self.ledger.borrow_mut().fail_release = true;
     }
 
     #[cfg(test)]
-    fn allow_release_for_test(&self) {
+    pub(crate) fn allow_release_for_test(&self) {
         self.ledger.borrow_mut().fail_release = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_disposition_for_test(&self) {
+        self.ledger.borrow_mut().fail_disposition = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_disposition_for_test(&self) {
+        self.ledger.borrow_mut().fail_disposition = false;
     }
 }
 
@@ -300,20 +348,51 @@ pub(crate) fn production_admission_gate() -> Result<(), ()> {
     CapacityProvider::unavailable().admission_gate()
 }
 
-/// A synchronous, non-serializable provisional charge.  It has no durable identity and cannot
-/// be transferred to an operation intent in this milestone.
+/// A synchronous, non-serializable owner-thread charge. It can be bound privately to the exact
+/// persisted operation and claim identities by the settlement helper; generic transfer remains
+/// unavailable in this milestone.
 #[allow(dead_code)]
-struct ProvisionalCapacityLease {
+#[derive(Debug)]
+pub(crate) struct ProvisionalCapacityLease {
     ledger: Rc<RefCell<ProvisionalLedger>>,
     token: u64,
     charges: BTreeMap<ChargeKey, u64>,
-    released: bool,
+    claim_ids: Vec<AdmissionClaimId>,
+    disposition: ProvisionalLeaseDisposition,
+}
+
+/// The owner-thread disposition of one provisional ledger token.
+///
+/// Durable and audit-pending entries intentionally remain in the provisional ledger until the
+/// later ordinary-claim release or restart-rebuild milestone.  Dropping their handle therefore
+/// cannot make capacity appear available prematurely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProvisionalLeaseDisposition {
+    /// The token may be released only after a confirmed pre-intent rollback.
+    Provisional,
+    /// The exact claim identities and operation now own this retained charge.
+    Durable {
+        operation_id: OperationId,
+        claim_ids: Vec<AdmissionClaimId>,
+    },
+    /// Persistence may have committed; retain the charge for later audit/reconciliation.
+    AuditPending {
+        operation_id: OperationId,
+        claim_ids: Vec<AdmissionClaimId>,
+    },
+    /// The provisional token was successfully released.
+    Released,
 }
 
 impl ProvisionalCapacityLease {
-    fn release(&mut self) -> Result<(), CapacityProviderError> {
-        if self.released {
-            return Ok(());
+    pub(crate) fn release(&mut self) -> Result<(), CapacityProviderError> {
+        match &self.disposition {
+            ProvisionalLeaseDisposition::Released => return Ok(()),
+            ProvisionalLeaseDisposition::Provisional => {}
+            ProvisionalLeaseDisposition::Durable { .. }
+            | ProvisionalLeaseDisposition::AuditPending { .. } => {
+                return Err(CapacityProviderError::LeaseRetained);
+            }
         }
         let mut ledger = self
             .ledger
@@ -323,10 +402,20 @@ impl ProvisionalCapacityLease {
         if ledger.fail_release {
             return Err(CapacityProviderError::ReleaseFailed);
         }
-        let Some(owned_charges) = ledger.charges_by_token.get(&self.token) else {
+        let Some(entry) = ledger.charges_by_token.get(&self.token) else {
             return Err(CapacityProviderError::ReleaseFailed);
         };
-        if owned_charges != &self.charges {
+        match &entry.disposition {
+            ProvisionalLeaseDisposition::Provisional => {}
+            ProvisionalLeaseDisposition::Durable { .. }
+            | ProvisionalLeaseDisposition::AuditPending { .. } => {
+                return Err(CapacityProviderError::LeaseRetained);
+            }
+            ProvisionalLeaseDisposition::Released => {
+                return Err(CapacityProviderError::ReleaseFailed);
+            }
+        }
+        if entry.charges != self.charges {
             return Err(CapacityProviderError::ReleaseFailed);
         }
         for (key, bytes) in &self.charges {
@@ -348,23 +437,181 @@ impl ProvisionalCapacityLease {
             }
         }
         ledger.charges_by_token.remove(&self.token);
-        self.released = true;
+        self.disposition = ProvisionalLeaseDisposition::Released;
         Ok(())
     }
 
-    fn transfer_to_intent(&self) -> Result<(), CapacityProviderError> {
+    pub(crate) fn mark_durable(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<(), CapacityProviderError> {
+        self.bind_disposition(operation_id, false)
+    }
+
+    pub(crate) fn mark_audit_pending(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<(), CapacityProviderError> {
+        self.bind_disposition(operation_id, true)
+    }
+
+    /// Pin this lease before entering a transaction whose durable outcome is not yet known.
+    pub(crate) fn pin_for_persistence(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<(), CapacityProviderError> {
+        self.mark_audit_pending(operation_id)
+    }
+
+    /// Atomically release a pinned lease after a confirmed rollback.
+    pub(crate) fn release_after_confirmed_rollback(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<(), CapacityProviderError> {
+        if operation_id.as_uuid().is_nil() {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        match &self.disposition {
+            ProvisionalLeaseDisposition::AuditPending {
+                operation_id: current,
+                ..
+            } if *current == operation_id => {
+                self.release_pinned_after_confirmed_rollback(operation_id)
+            }
+            ProvisionalLeaseDisposition::Provisional => self.release(),
+            _ => Err(CapacityProviderError::LeaseDispositionConflict),
+        }
+    }
+
+    pub(crate) fn disposition(&self) -> &ProvisionalLeaseDisposition {
+        &self.disposition
+    }
+
+    fn bind_disposition(
+        &mut self,
+        operation_id: OperationId,
+        audit_pending: bool,
+    ) -> Result<(), CapacityProviderError> {
+        if operation_id.as_uuid().is_nil() {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        let mut ledger = self
+            .ledger
+            .try_borrow_mut()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        #[cfg(test)]
+        if ledger.fail_disposition && !audit_pending {
+            return Err(CapacityProviderError::LedgerBusy);
+        }
+        let Some(entry) = ledger.charges_by_token.get_mut(&self.token) else {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        };
+        if entry.charges != self.charges {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        let claim_ids = self.claim_ids.clone();
+        let next = match &entry.disposition {
+            ProvisionalLeaseDisposition::Provisional => {
+                if audit_pending {
+                    ProvisionalLeaseDisposition::AuditPending {
+                        operation_id,
+                        claim_ids,
+                    }
+                } else {
+                    ProvisionalLeaseDisposition::Durable {
+                        operation_id,
+                        claim_ids,
+                    }
+                }
+            }
+            ProvisionalLeaseDisposition::AuditPending {
+                operation_id: current,
+                ..
+            } if !audit_pending && *current == operation_id => {
+                ProvisionalLeaseDisposition::Durable {
+                    operation_id,
+                    claim_ids,
+                }
+            }
+            ProvisionalLeaseDisposition::Durable {
+                operation_id: current,
+                ..
+            } if !audit_pending && *current == operation_id => return Ok(()),
+            ProvisionalLeaseDisposition::AuditPending {
+                operation_id: current,
+                ..
+            } if audit_pending && *current == operation_id => return Ok(()),
+            _ => return Err(CapacityProviderError::LeaseDispositionConflict),
+        };
+        entry.disposition = next.clone();
+        self.disposition = next;
+        Ok(())
+    }
+
+    fn release_pinned_after_confirmed_rollback(
+        &mut self,
+        operation_id: OperationId,
+    ) -> Result<(), CapacityProviderError> {
+        let mut ledger = self
+            .ledger
+            .try_borrow_mut()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        #[cfg(test)]
+        if ledger.fail_release {
+            return Err(CapacityProviderError::ReleaseFailed);
+        }
+        let Some(entry) = ledger.charges_by_token.get_mut(&self.token) else {
+            return Err(CapacityProviderError::ReleaseFailed);
+        };
+        match &entry.disposition {
+            ProvisionalLeaseDisposition::AuditPending {
+                operation_id: current,
+                claim_ids,
+            } if *current == operation_id && claim_ids == &self.claim_ids => {}
+            _ => return Err(CapacityProviderError::LeaseDispositionConflict),
+        }
+        if entry.charges != self.charges {
+            return Err(CapacityProviderError::ReleaseFailed);
+        }
+        let owned_charges = entry.charges.clone();
+        for (key, bytes) in &owned_charges {
+            let Some(current) = ledger.aggregate_charges.get(key).copied() else {
+                return Err(CapacityProviderError::ReleaseFailed);
+            };
+            if current < *bytes {
+                return Err(CapacityProviderError::ReleaseFailed);
+            }
+        }
+        for (key, bytes) in &owned_charges {
+            let current = ledger
+                .aggregate_charges
+                .get_mut(key)
+                .expect("validated provisional aggregate");
+            *current -= *bytes;
+            if *current == 0 {
+                ledger.aggregate_charges.remove(key);
+            }
+        }
+        ledger.charges_by_token.remove(&self.token);
+        self.disposition = ProvisionalLeaseDisposition::Released;
+        Ok(())
+    }
+
+    pub(crate) fn transfer_to_intent(&self) -> Result<(), CapacityProviderError> {
         Err(CapacityProviderError::IntentTransferUnavailable)
     }
 }
 
 impl Drop for ProvisionalCapacityLease {
     fn drop(&mut self) {
-        let _ = self.release();
+        if matches!(&self.disposition, ProvisionalLeaseDisposition::Provisional) {
+            let _ = self.release();
+        }
     }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-enum CapacityProviderError {
+pub(crate) enum CapacityProviderError {
     #[error("capacity provider is unavailable")]
     Unavailable,
     #[error("capacity plan validation failed")]
@@ -400,6 +647,10 @@ enum CapacityProviderError {
     LedgerBusy,
     #[error("provisional capacity release failed; accounting remains held")]
     ReleaseFailed,
+    #[error("provisional capacity is retained by a durable or audit-pending intent")]
+    LeaseRetained,
+    #[error("provisional lease disposition does not match the requested operation")]
+    LeaseDispositionConflict,
     #[error("provisional capacity cannot transfer to a durable intent yet")]
     IntentTransferUnavailable,
 }
@@ -873,5 +1124,97 @@ mod tests {
         );
         drop(lease);
         assert_eq!(provider.claim_count(), 0);
+    }
+
+    #[test]
+    fn durable_and_audit_pending_drop_retain_accounting() {
+        let volume = VolumeIdentity { device: 13 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let (plan, claims) = plan_and_claims(&[(volume.clone(), class, 4096, 4096)]);
+        let mut fixture = BTreeMap::new();
+        fixture.insert(
+            volume.clone(),
+            facts(13, PROTECTED_FREE_SPACE_FLOOR + 8192, 4096),
+        );
+        let provider = CapacityProvider::qualified_fixture(fixture);
+
+        let operation_id = OperationId::new();
+        let expected_durable_claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect::<Vec<_>>();
+        let mut durable = provider.admit(&plan, &claims).expect("durable claim");
+        durable
+            .pin_for_persistence(operation_id)
+            .expect("pin durable claim");
+        durable
+            .mark_durable(operation_id)
+            .expect("settle durable claim");
+        assert_eq!(durable.release(), Err(CapacityProviderError::LeaseRetained));
+        drop(durable);
+        assert_eq!(provider.outstanding(&volume, class), 4096);
+        assert_eq!(provider.claim_count(), 1);
+        assert_eq!(
+            provider.ledger_dispositions(),
+            vec![ProvisionalLeaseDisposition::Durable {
+                operation_id,
+                claim_ids: expected_durable_claim_ids.clone(),
+            }]
+        );
+
+        let audit_claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect::<Vec<_>>();
+        let mut audit_pending = provider.admit(&plan, &claims).expect("audit claim");
+        audit_pending
+            .pin_for_persistence(operation_id)
+            .expect("pin audit claim");
+        assert_eq!(
+            audit_pending.release(),
+            Err(CapacityProviderError::LeaseRetained)
+        );
+        drop(audit_pending);
+        assert_eq!(provider.outstanding(&volume, class), 8192);
+        assert_eq!(provider.claim_count(), 2);
+        assert_eq!(
+            provider.ledger_dispositions(),
+            vec![
+                ProvisionalLeaseDisposition::Durable {
+                    operation_id,
+                    claim_ids: expected_durable_claim_ids,
+                },
+                ProvisionalLeaseDisposition::AuditPending {
+                    operation_id,
+                    claim_ids: audit_claim_ids,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn audit_pending_drop_during_unwind_retains_accounting() {
+        let volume = VolumeIdentity { device: 14 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let (plan, claims) = plan_and_claims(&[(volume.clone(), class, 4096, 4096)]);
+        let mut fixture = BTreeMap::new();
+        fixture.insert(
+            volume.clone(),
+            facts(14, PROTECTED_FREE_SPACE_FLOOR + 4096, 4096),
+        );
+        let provider = CapacityProvider::qualified_fixture(fixture);
+        let operation_id = OperationId::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut lease = provider.admit(&plan, &claims).expect("claim");
+            lease
+                .pin_for_persistence(operation_id)
+                .expect("pin before persistence");
+            panic!("simulate unwind after persistence started");
+        }));
+        assert!(result.is_err());
+        assert_eq!(provider.outstanding(&volume, class), 4096);
+        assert_eq!(provider.claim_count(), 1);
     }
 }

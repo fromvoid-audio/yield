@@ -24,6 +24,8 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
+use super::admission_claims::{AdmissionClaimInventory, AdmissionClaimValidationError};
+use super::capacity_provider::{CapacityProvider, CapacityProviderError, ProvisionalCapacityLease};
 use super::capacity_reserve_namespace::{
     BoundReserve, OwnedReserveAllocation, PhysicalReserveProof,
 };
@@ -33,6 +35,7 @@ use super::coordinator::{
     CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
 };
 use super::external_commands::ExternalReconciliationIntentArgs;
+use super::full_capacity::FullCapacityPlan;
 use super::history_commands::HistoryUndoRedoIntentArgs;
 use super::model::UniversalIntent;
 use super::model::{
@@ -430,6 +433,73 @@ impl JournalInsertOutcome {
         match self {
             Self::Committed(receipt) => Ok(receipt),
             Self::Failed(failure) => Err(failure),
+        }
+    }
+}
+
+/// The claim-aware result keeps the owner-thread lease alive after any persistence outcome whose
+/// durable state is not fully known.  A confirmed rollback consumes the lease before returning;
+/// durable and audit-pending dispositions remain retained after the handle is dropped.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct InitialClaimSettlement {
+    outcome: JournalInsertOutcome,
+    lease: Option<ProvisionalCapacityLease>,
+}
+
+#[allow(dead_code)]
+impl InitialClaimSettlement {
+    pub(crate) fn outcome(&self) -> &JournalInsertOutcome {
+        &self.outcome
+    }
+
+    pub(crate) fn lease(&self) -> Option<&ProvisionalCapacityLease> {
+        self.lease.as_ref()
+    }
+
+    pub(crate) fn into_parts(self) -> (JournalInsertOutcome, Option<ProvisionalCapacityLease>) {
+        (self.outcome, self.lease)
+    }
+}
+
+/// Validation or storage errors before an initial claim settlement can be acknowledged.
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum InitialClaimSettlementError {
+    #[error("initial capacity plan is invalid: {0}")]
+    CapacityPlan(#[from] super::full_capacity::FullCapacityValidationError),
+    #[error("initial claim inventory is invalid: {0}")]
+    Claims(#[from] AdmissionClaimValidationError),
+    #[error("initial capacity admission failed: {0}")]
+    Capacity(#[from] CapacityProviderError),
+    #[error("initial claim storage validation failed: {0}")]
+    ClaimStorage(String),
+    #[error("initial claim persistence outcome retained while ledger settlement failed: {source}")]
+    OutcomeRetained {
+        outcome: JournalInsertOutcome,
+        lease: ProvisionalCapacityLease,
+        source: CapacityProviderError,
+    },
+    #[error(transparent)]
+    Store(#[from] OperationJournalStoreError),
+}
+
+#[allow(dead_code)]
+impl InitialClaimSettlementError {
+    pub(crate) fn into_retained_parts(
+        self,
+    ) -> Option<(
+        JournalInsertOutcome,
+        ProvisionalCapacityLease,
+        CapacityProviderError,
+    )> {
+        match self {
+            Self::OutcomeRetained {
+                outcome,
+                lease,
+                source,
+            } => Some((outcome, lease, source)),
+            _ => None,
         }
     }
 }
@@ -3983,6 +4053,81 @@ impl OperationJournalStore {
             .map_err(JournalInsertFailure::into_error)
     }
 
+    /// Atomically settle one validated initial ordinary claim set with its legacy intent row.
+    ///
+    /// The provider lease is pinned before the transaction starts.  Confirmed pre-commit
+    /// rollback releases it; every ambiguous or post-commit outcome keeps the owner-thread token
+    /// retained for later audit/reconciliation.  This remains crate-private and does not enable
+    /// the production admission gate or treat full-progress observations as authority.
+    #[allow(dead_code)]
+    pub(crate) fn settle_initial_claims(
+        &self,
+        record: &StoredOperationRecord,
+        provider: &CapacityProvider,
+        claims: &AdmissionClaimInventory,
+    ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
+        validate_intent_record(record).map_err(InitialClaimSettlementError::Store)?;
+        let legacy_plan = record
+            .capacity_plan
+            .as_ref()
+            .ok_or(OperationJournalStoreError::MissingCapacityPlan)
+            .map_err(InitialClaimSettlementError::Store)?;
+        let full_plan = FullCapacityPlan::from_legacy(legacy_plan)?;
+        claims.validate_against(&full_plan)?;
+        ordinary_claims::validate_storage_values(claims)
+            .map_err(|error| InitialClaimSettlementError::ClaimStorage(error.to_string()))?;
+        let encoded = encode(record)
+            .map_err(OperationJournalStoreError::from)
+            .map_err(InitialClaimSettlementError::Store)?;
+        let mut lease = provider.admit(&full_plan, claims)?;
+        lease
+            .pin_for_persistence(record.operation_id)
+            .map_err(InitialClaimSettlementError::Capacity)?;
+
+        let outcome =
+            self.persist_record_with_encoded_outcome_and_claims(record, &encoded, Some(claims));
+        let retain = match &outcome {
+            JournalInsertOutcome::Committed(_) => false,
+            JournalInsertOutcome::Failed(failure) => matches!(
+                failure.stage(),
+                JournalInsertWriteStage::RollbackNotConfirmed
+                    | JournalInsertWriteStage::CommitOutcomeUnknown
+                    | JournalInsertWriteStage::CommittedButNotAcknowledged
+            ),
+        };
+        if matches!(&outcome, JournalInsertOutcome::Committed(_)) {
+            if let Err(source) = lease.mark_durable(record.operation_id) {
+                return Err(InitialClaimSettlementError::OutcomeRetained {
+                    outcome,
+                    lease,
+                    source,
+                });
+            }
+            return Ok(InitialClaimSettlement {
+                outcome,
+                lease: Some(lease),
+            });
+        }
+        if retain {
+            return Ok(InitialClaimSettlement {
+                outcome,
+                lease: Some(lease),
+            });
+        }
+
+        let lease = match lease.release_after_confirmed_rollback(record.operation_id) {
+            Ok(()) => None,
+            Err(source) => {
+                return Err(InitialClaimSettlementError::OutcomeRetained {
+                    outcome,
+                    lease,
+                    source,
+                });
+            }
+        };
+        Ok(InitialClaimSettlement { outcome, lease })
+    }
+
     /// Insert one durable intent and expose the exact write-stage outcome.
     ///
     /// This is the typed counterpart to [`Self::insert_intent`]. The returned receipt is exposed
@@ -4023,6 +4168,15 @@ impl OperationJournalStore {
         &self,
         record: &StoredOperationRecord,
         encoded: &[u8],
+    ) -> JournalInsertOutcome {
+        self.persist_record_with_encoded_outcome_and_claims(record, encoded, None)
+    }
+
+    fn persist_record_with_encoded_outcome_and_claims(
+        &self,
+        record: &StoredOperationRecord,
+        encoded: &[u8],
+        claims: Option<&AdmissionClaimInventory>,
     ) -> JournalInsertOutcome {
         let operation_id = record.operation_id;
         if let Err(error) = self.validate_namespace() {
@@ -4065,6 +4219,27 @@ impl OperationJournalStore {
                 return self.rollback_insert_failure(operation_id, error, None, encoded.len());
             }
         };
+        if let Some(claims) = claims {
+            if let Err(error) = ordinary_claims::insert_rows_inside_transaction(
+                &self.connection,
+                operation_id,
+                claims,
+            )
+            .and_then(|()| {
+                ordinary_claims::verify_rows_inside_transaction(
+                    &self.connection,
+                    operation_id,
+                    claims,
+                )
+            }) {
+                return self.rollback_insert_failure(
+                    operation_id,
+                    ordinary_claim_write_error(error),
+                    Some(receipt.sequence),
+                    encoded.len(),
+                );
+            }
+        }
 
         #[cfg(test)]
         if let Some(directive) =
@@ -4189,6 +4364,22 @@ impl OperationJournalStore {
                 encoded.len(),
                 None,
             );
+        }
+        if let Some(claims) = claims {
+            if let Err(error) = ordinary_claims::verify_rows_inside_transaction(
+                &self.connection,
+                operation_id,
+                claims,
+            ) {
+                return failed_insert(
+                    operation_id,
+                    JournalInsertWriteStage::CommittedButNotAcknowledged,
+                    ordinary_claim_write_error(error),
+                    Some(receipt.sequence),
+                    encoded.len(),
+                    None,
+                );
+            }
         }
         JournalInsertOutcome::Committed(receipt)
     }
@@ -4527,6 +4718,14 @@ impl OperationJournalStore {
             ));
         }
         Ok(())
+    }
+}
+
+fn ordinary_claim_write_error(
+    error: ordinary_claims::OrdinaryClaimWriteError,
+) -> OperationJournalStoreError {
+    OperationJournalStoreError::InconsistentRecord {
+        reason: format!("ordinary claim settlement failed: {error}"),
     }
 }
 
@@ -5699,6 +5898,7 @@ impl From<EncodeError> for OperationJournalStoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
     use std::io::Write;
@@ -5715,9 +5915,12 @@ mod tests {
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::durable_capacity::{
         CapacityAllocationClass, DurableCapacityPlan, DurableVolumeCapacity,
-        PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
+        PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity,
     };
-    use crate::operation_journal::AdmissionClaimId;
+    use crate::operation_journal::capacity_provider::{
+        CapacityProvider, ProvisionalLeaseDisposition,
+    };
+    use crate::operation_journal::{AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory};
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
@@ -5837,6 +6040,81 @@ mod tests {
         });
         decode(&serde_json::to_vec(&value).expect("serialize intent fixture"))
             .expect("decode intent fixture")
+    }
+
+    fn claim_for_intent(
+        record: &StoredOperationRecord,
+        claim_id: AdmissionClaimId,
+        allocated_bytes: Option<u64>,
+    ) -> AdmissionClaim {
+        let row = &record
+            .capacity_plan
+            .as_ref()
+            .expect("intent capacity plan")
+            .volumes[0];
+        AdmissionClaim::new(
+            claim_id,
+            row.identity.clone(),
+            row.allocation_class.into(),
+            allocated_bytes.unwrap_or(row.allocated_bytes),
+        )
+        .expect("intent claim")
+    }
+
+    fn claims_for_intent(record: &StoredOperationRecord) -> AdmissionClaimInventory {
+        let rows = &record
+            .capacity_plan
+            .as_ref()
+            .expect("intent capacity plan")
+            .volumes;
+        AdmissionClaimInventory::new(
+            rows.iter()
+                .map(|row| {
+                    AdmissionClaim::new(
+                        AdmissionClaimId::new(),
+                        row.identity.clone(),
+                        row.allocation_class.into(),
+                        row.allocated_bytes,
+                    )
+                    .expect("intent claim")
+                })
+                .collect(),
+        )
+        .expect("intent claim inventory")
+    }
+
+    fn provider_for_intent(record: &StoredOperationRecord) -> CapacityProvider {
+        let mut facts = BTreeMap::new();
+        for row in &record
+            .capacity_plan
+            .as_ref()
+            .expect("intent capacity plan")
+            .volumes
+        {
+            facts.insert(
+                row.identity.clone(),
+                VolumeFacts {
+                    identity: row.identity.clone(),
+                    free_bytes: PROTECTED_FREE_SPACE_FLOOR
+                        .checked_add(
+                            row.allocated_bytes
+                                .checked_mul(8)
+                                .expect("fixture free-space range"),
+                        )
+                        .expect("fixture free-space range"),
+                    allocation_unit: row.allocation_unit,
+                },
+            );
+        }
+        CapacityProvider::qualified_fixture(facts)
+    }
+
+    fn ordinary_claim_count(store: &OperationJournalStore) -> usize {
+        store
+            .read_ordinary_claim_page(None, MAX_PAGE_ROWS)
+            .expect("read ordinary claim page")
+            .records()
+            .len()
     }
 
     fn universal_intent_record(operation_id: OperationId) -> StoredOperationRecord {
@@ -12351,5 +12629,471 @@ mod tests {
         drop(store);
         fs::remove_dir_all(&root).expect("remove replacement root");
         fs::rename(displaced, root).expect("restore profile root");
+    }
+
+    #[test]
+    fn initial_claim_settlement_commits_exact_multi_volume_claims_and_retains_charge() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let mut record = intent_record(operation_id);
+        record
+            .capacity_plan
+            .as_mut()
+            .expect("intent capacity plan")
+            .volumes
+            .push(DurableVolumeCapacity {
+                identity: VolumeIdentity { device: 2 },
+                allocation_unit: 1,
+                allocation_class: CapacityAllocationClass::JournalRecord,
+                logical_bytes: 1,
+                allocated_bytes: 1,
+                protected_free_bytes: PROTECTED_FREE_SPACE_FLOOR,
+            });
+        let claims = claims_for_intent(&record);
+        let expected_claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect::<Vec<_>>();
+        let provider = provider_for_intent(&record);
+
+        let settlement = store
+            .settle_initial_claims(&record, &provider, &claims)
+            .expect("settle initial claims");
+        assert!(settlement.outcome().receipt().is_some());
+        match settlement
+            .lease()
+            .expect("retained durable lease")
+            .disposition()
+        {
+            ProvisionalLeaseDisposition::Durable {
+                operation_id: retained_operation,
+                claim_ids,
+            } => {
+                assert_eq!(*retained_operation, operation_id);
+                assert_eq!(claim_ids, &expected_claim_ids);
+            }
+            disposition => panic!("unexpected lease disposition: {disposition:?}"),
+        }
+        assert_eq!(
+            store.get(operation_id).expect("read committed record"),
+            Some(record)
+        );
+        assert_eq!(ordinary_claim_count(&store), 2);
+        let (outcome, lease) = settlement.into_parts();
+        assert!(outcome.receipt().is_some());
+        drop(lease);
+        assert_eq!(
+            provider.outstanding(
+                &VolumeIdentity { device: 1 },
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            ),
+            1
+        );
+        assert_eq!(
+            provider.outstanding(
+                &VolumeIdentity { device: 2 },
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::JournalRecord,
+            ),
+            1
+        );
+        assert_eq!(provider.claim_count(), 1);
+    }
+
+    #[test]
+    fn confirmed_rollback_removes_intent_and_claim_rows_and_releases_charge() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced claim rollback"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let record = intent_record(OperationId::new());
+        let claims = claims_for_intent(&record);
+        let provider = provider_for_intent(&record);
+
+        let settlement = store
+            .settle_initial_claims(&record, &provider, &claims)
+            .expect("settlement reports rollback outcome");
+        let failure = settlement.outcome().failure().expect("rollback failure");
+        assert_eq!(
+            failure.stage(),
+            JournalInsertWriteStage::RolledBackBeforeCommit
+        );
+        assert!(settlement.lease().is_none());
+        assert_eq!(store.get(record.operation_id).expect("read rollback"), None);
+        assert_eq!(ordinary_claim_count(&store), 0);
+        assert_eq!(provider.claim_count(), 0);
+    }
+
+    #[test]
+    fn rollback_not_confirmed_keeps_claim_charge_pinned() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store.set_insert_test_hook(|boundary| match boundary {
+            InsertTestBoundary::BeforePrecommitValidation | InsertTestBoundary::Rollback => {
+                InsertTestDirective::FailAndLeaveForRollback(
+                    OperationJournalStoreError::IdentityCheckUnavailable {
+                        reason: String::from("forced rollback uncertainty"),
+                    },
+                )
+            }
+            _ => InsertTestDirective::Continue,
+        });
+        let record = intent_record(OperationId::new());
+        let claims = claims_for_intent(&record);
+        let provider = provider_for_intent(&record);
+        let settlement = store
+            .settle_initial_claims(&record, &provider, &claims)
+            .expect("uncertain rollback outcome");
+        assert!(matches!(
+            settlement
+                .outcome()
+                .failure()
+                .map(JournalInsertFailure::stage),
+            Some(JournalInsertWriteStage::RollbackNotConfirmed)
+        ));
+        assert!(matches!(
+            settlement.lease().map(|lease| lease.disposition()),
+            Some(ProvisionalLeaseDisposition::AuditPending { .. })
+        ));
+        drop(settlement);
+        assert_eq!(provider.claim_count(), 1);
+
+        store.set_insert_test_hook(|_| InsertTestDirective::Continue);
+        store
+            .connection
+            .execute_batch("ROLLBACK")
+            .expect("clean up uncertain test transaction");
+        assert_eq!(
+            store.get(record.operation_id).expect("read after cleanup"),
+            None
+        );
+        assert_eq!(ordinary_claim_count(&store), 0);
+    }
+
+    #[test]
+    fn ambiguous_commit_and_postcommit_readback_retain_charge_after_lease_drop() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let first = intent_record(OperationId::new());
+        let first_claims = claims_for_intent(&first);
+        let provider = provider_for_intent(&first);
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::Commit {
+                InsertTestDirective::ExecuteThenFail(
+                    OperationJournalStoreError::IdentityCheckUnavailable {
+                        reason: String::from("forced ambiguous commit"),
+                    },
+                )
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let first_settlement = store
+            .settle_initial_claims(&first, &provider, &first_claims)
+            .expect("ambiguous commit outcome");
+        assert!(matches!(
+            first_settlement
+                .outcome()
+                .failure()
+                .map(JournalInsertFailure::stage),
+            Some(JournalInsertWriteStage::CommitOutcomeUnknown)
+        ));
+        assert!(matches!(
+            first_settlement.lease().map(|lease| lease.disposition()),
+            Some(ProvisionalLeaseDisposition::AuditPending { .. })
+        ));
+        drop(first_settlement);
+        assert_eq!(provider.claim_count(), 1);
+
+        let second = intent_record(OperationId::new());
+        let second_claims = claims_for_intent(&second);
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced readback failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let second_settlement = store
+            .settle_initial_claims(&second, &provider, &second_claims)
+            .expect("postcommit outcome");
+        assert!(matches!(
+            second_settlement
+                .outcome()
+                .failure()
+                .map(JournalInsertFailure::stage),
+            Some(JournalInsertWriteStage::CommittedButNotAcknowledged)
+        ));
+        assert!(matches!(
+            second_settlement.lease().map(|lease| lease.disposition()),
+            Some(ProvisionalLeaseDisposition::AuditPending { .. })
+        ));
+        drop(second_settlement);
+        assert_eq!(provider.claim_count(), 2);
+    }
+
+    #[test]
+    fn duplicate_operation_and_claim_collision_release_only_new_provisional_charge() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let first = intent_record(OperationId::new());
+        let first_claim = claim_for_intent(&first, AdmissionClaimId::new(), None);
+        let first_claims =
+            AdmissionClaimInventory::new(vec![first_claim.clone()]).expect("first claim inventory");
+        let provider = provider_for_intent(&first);
+        let first_settlement = store
+            .settle_initial_claims(&first, &provider, &first_claims)
+            .expect("first settlement");
+        drop(first_settlement);
+        assert_eq!(provider.claim_count(), 1);
+
+        let duplicate = store
+            .settle_initial_claims(&first, &provider, &first_claims)
+            .expect("duplicate is a typed failed outcome");
+        assert!(matches!(
+            duplicate.outcome().failure().map(JournalInsertFailure::error),
+            Some(OperationJournalStoreError::DuplicateOperation { operation_id })
+                if *operation_id == first.operation_id
+        ));
+        assert!(duplicate.lease().is_none());
+        assert_eq!(provider.claim_count(), 1);
+
+        let second = intent_record(OperationId::new());
+        let collision_claims =
+            AdmissionClaimInventory::new(vec![first_claim]).expect("collision claim inventory");
+        let collision = store
+            .settle_initial_claims(&second, &provider, &collision_claims)
+            .expect("claim collision is a typed failed outcome");
+        assert!(collision.outcome().failure().is_some());
+        assert!(collision.lease().is_none());
+        assert_eq!(
+            store.get(second.operation_id).expect("read collision"),
+            None
+        );
+        assert_eq!(ordinary_claim_count(&store), 1);
+        assert_eq!(provider.claim_count(), 1);
+    }
+
+    #[test]
+    fn failed_confirmed_rollback_returns_outcome_and_retained_lease() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced release failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let record = intent_record(OperationId::new());
+        let claims = claims_for_intent(&record);
+        let expected_claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect::<Vec<_>>();
+        let provider = provider_for_intent(&record);
+        provider.fail_release_for_test();
+
+        let result = store.settle_initial_claims(&record, &provider, &claims);
+        match result {
+            Err(InitialClaimSettlementError::OutcomeRetained {
+                outcome,
+                lease,
+                source,
+            }) => {
+                assert!(matches!(
+                    outcome.failure().map(JournalInsertFailure::stage),
+                    Some(JournalInsertWriteStage::RolledBackBeforeCommit)
+                ));
+                assert_eq!(source, CapacityProviderError::ReleaseFailed);
+                assert!(matches!(
+                    lease.disposition(),
+                    ProvisionalLeaseDisposition::AuditPending {
+                        operation_id,
+                        claim_ids,
+                    } if *operation_id == record.operation_id && claim_ids == &expected_claim_ids
+                ));
+                drop(lease);
+            }
+            other => panic!("unexpected settlement result: {other:?}"),
+        }
+        assert_eq!(provider.claim_count(), 1);
+        assert_eq!(
+            provider.ledger_dispositions(),
+            vec![ProvisionalLeaseDisposition::AuditPending {
+                operation_id: record.operation_id,
+                claim_ids: expected_claim_ids,
+            }]
+        );
+        assert_eq!(ordinary_claim_count(&store), 0);
+    }
+
+    #[test]
+    fn durable_binding_failure_returns_committed_outcome_and_retained_audit_identity() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let record = intent_record(OperationId::new());
+        let claims = claims_for_intent(&record);
+        let expected_claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect::<Vec<_>>();
+        let provider = provider_for_intent(&record);
+        provider.fail_disposition_for_test();
+
+        let result = store.settle_initial_claims(&record, &provider, &claims);
+        match result {
+            Err(InitialClaimSettlementError::OutcomeRetained {
+                outcome,
+                lease,
+                source,
+            }) => {
+                assert!(outcome.receipt().is_some());
+                assert_eq!(source, CapacityProviderError::LedgerBusy);
+                assert!(matches!(
+                    lease.disposition(),
+                    ProvisionalLeaseDisposition::AuditPending {
+                        operation_id,
+                        claim_ids,
+                    } if *operation_id == record.operation_id && claim_ids == &expected_claim_ids
+                ));
+                drop(lease);
+            }
+            other => panic!("unexpected settlement result: {other:?}"),
+        }
+        provider.allow_disposition_for_test();
+        assert_eq!(
+            provider.ledger_dispositions(),
+            vec![ProvisionalLeaseDisposition::AuditPending {
+                operation_id: record.operation_id,
+                claim_ids: expected_claim_ids,
+            }]
+        );
+        assert_eq!(
+            store
+                .get(record.operation_id)
+                .expect("read committed record"),
+            Some(record)
+        );
+        assert_eq!(ordinary_claim_count(&store), 1);
+    }
+
+    #[test]
+    fn invalid_claims_and_storage_range_fail_before_provider_or_sqlite_mutation() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+
+        let under_record = {
+            let mut record = intent_record(OperationId::new());
+            let row = &mut record.capacity_plan.as_mut().expect("plan").volumes[0];
+            row.logical_bytes = 2;
+            row.allocated_bytes = 2;
+            record
+        };
+        let under_claim = claim_for_intent(&under_record, AdmissionClaimId::new(), Some(1));
+        let under_claims = AdmissionClaimInventory::new(vec![under_claim]).expect("under claims");
+        let under_provider = CapacityProvider::unavailable();
+        assert!(matches!(
+            store.settle_initial_claims(&under_record, &under_provider, &under_claims),
+            Err(InitialClaimSettlementError::Claims(_))
+        ));
+        assert_eq!(under_provider.claim_count(), 0);
+
+        let over_record = intent_record(OperationId::new());
+        let over_claim = claim_for_intent(&over_record, AdmissionClaimId::new(), Some(2));
+        let over_claims = AdmissionClaimInventory::new(vec![over_claim]).expect("over claims");
+        let over_provider = CapacityProvider::unavailable();
+        assert!(matches!(
+            store.settle_initial_claims(&over_record, &over_provider, &over_claims),
+            Err(InitialClaimSettlementError::Claims(_))
+        ));
+        assert_eq!(over_provider.claim_count(), 0);
+
+        let duplicate_record = intent_record(OperationId::new());
+        let duplicate_claim = claim_for_intent(&duplicate_record, AdmissionClaimId::new(), None);
+        let duplicate_claims =
+            AdmissionClaimInventory::new(vec![duplicate_claim.clone(), duplicate_claim]);
+        assert!(matches!(
+            duplicate_claims,
+            Err(crate::operation_journal::admission_claims::AdmissionClaimValidationError::DuplicateClaimId { .. })
+        ));
+
+        let unavailable_record = intent_record(OperationId::new());
+        let unavailable_claims = claims_for_intent(&unavailable_record);
+        let unavailable_provider = CapacityProvider::unavailable();
+        assert!(matches!(
+            store.settle_initial_claims(
+                &unavailable_record,
+                &unavailable_provider,
+                &unavailable_claims,
+            ),
+            Err(InitialClaimSettlementError::Capacity(
+                CapacityProviderError::Unavailable
+            ))
+        ));
+        assert_eq!(unavailable_provider.claim_count(), 0);
+
+        let mut low_record = intent_record(OperationId::new());
+        let low_row = &mut low_record.capacity_plan.as_mut().expect("plan").volumes[0];
+        low_row.logical_bytes = 2;
+        low_row.allocated_bytes = 2;
+        let low_claims = claims_for_intent(&low_record);
+        let mut low_facts = BTreeMap::new();
+        low_facts.insert(
+            VolumeIdentity { device: 1 },
+            VolumeFacts {
+                identity: VolumeIdentity { device: 1 },
+                free_bytes: PROTECTED_FREE_SPACE_FLOOR + 1,
+                allocation_unit: 1,
+            },
+        );
+        let low_provider = CapacityProvider::qualified_fixture(low_facts);
+        assert!(matches!(
+            store.settle_initial_claims(&low_record, &low_provider, &low_claims),
+            Err(InitialClaimSettlementError::Capacity(
+                CapacityProviderError::DiskPressureRecoveryOnly { .. }
+            ))
+        ));
+        assert_eq!(low_provider.claim_count(), 0);
+
+        let mut huge_record = intent_record(OperationId::new());
+        let huge = i64::MAX as u64 + 1;
+        let huge_row = &mut huge_record.capacity_plan.as_mut().expect("plan").volumes[0];
+        huge_row.logical_bytes = huge;
+        huge_row.allocated_bytes = huge;
+        let huge_claims = claims_for_intent(&huge_record);
+        let huge_provider = CapacityProvider::unavailable();
+        assert!(matches!(
+            store.settle_initial_claims(&huge_record, &huge_provider, &huge_claims),
+            Err(InitialClaimSettlementError::ClaimStorage(_))
+        ));
+        assert_eq!(huge_provider.claim_count(), 0);
+        assert_eq!(ordinary_claim_count(&store), 0);
+        assert_eq!(
+            store.get(under_record.operation_id).expect("under absent"),
+            None
+        );
+        assert_eq!(
+            store.get(over_record.operation_id).expect("over absent"),
+            None
+        );
+        assert_eq!(
+            store.get(huge_record.operation_id).expect("huge absent"),
+            None
+        );
     }
 }
