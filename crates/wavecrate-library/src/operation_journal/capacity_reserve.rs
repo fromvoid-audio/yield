@@ -35,6 +35,25 @@ pub(super) struct ProtectedReserve {
     observation: ReserveObservation,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MutationFault {
+    None,
+    BeforeTruncate,
+    AfterTruncateBeforeSync,
+    Allocate,
+    Sync,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TestReserveMutationFault {
+    BeforeTruncate,
+    AfterTruncateBeforeSync,
+    Allocate,
+    Sync,
+}
+
 impl ProtectedReserve {
     /// Revalidate the retained descriptor and its protected allocation without reopening a path.
     pub(super) fn revalidate(&self) -> Result<(), ReserveFailureReason> {
@@ -55,6 +74,242 @@ impl ProtectedReserve {
 
     pub(super) fn file(&self) -> &File {
         &self.file
+    }
+
+    pub(super) fn revalidate_partial(&self) -> Result<ReserveObservation, ReserveFailureReason> {
+        let observed = capture_observation(&self.file)?;
+        validate_partial_observation(&observed, &self.observation)?;
+        Ok(observed)
+    }
+
+    pub(super) fn revalidate_extent(
+        &self,
+        expected_length: u64,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        let observed = self.revalidate_partial()?;
+        validate_extent_observation(&observed, &self.observation, expected_length)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn shrink_to(
+        &mut self,
+        expected_current_length: u64,
+        target_length: u64,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        self.shrink_to_with_fault(expected_current_length, target_length, MutationFault::None)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn shrink_to_with_mutation_fault(
+        &mut self,
+        expected_current_length: u64,
+        target_length: u64,
+        fault: MutationFault,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        self.shrink_to_with_fault(expected_current_length, target_length, fault)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn shrink_to_with_fault(
+        &mut self,
+        expected_current_length: u64,
+        target_length: u64,
+        fault: MutationFault,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        let current = self.revalidate_extent(expected_current_length)?;
+        if target_length > expected_current_length {
+            return Err(ReserveFailureReason::LengthMismatch {
+                expected: expected_current_length,
+                actual: target_length,
+            });
+        }
+        if target_length == expected_current_length {
+            return Ok(current);
+        }
+        if fault == MutationFault::BeforeTruncate {
+            return Err(ReserveFailureReason::Io(
+                "injected failure before reserve truncate".to_owned(),
+            ));
+        }
+        let backend = MacReserveBackend;
+        if let Err(reason) = backend.set_len(&self.file, target_length) {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        if fault == MutationFault::AfterTruncateBeforeSync {
+            self.refresh_observation();
+            return Err(ReserveFailureReason::Io(
+                "injected failure after reserve truncate".to_owned(),
+            ));
+        }
+        if fault == MutationFault::Sync {
+            self.refresh_observation();
+            return Err(ReserveFailureReason::Io(
+                "injected reserve sync failure".to_owned(),
+            ));
+        }
+        if let Err(reason) = backend.sync(&self.file) {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        let observed = match backend.final_observation(&self.file) {
+            Ok(observed) => observed,
+            Err(reason) => {
+                self.refresh_observation();
+                return Err(reason);
+            }
+        };
+        if let Err(reason) =
+            validate_extent_observation(&observed, &self.observation, target_length)
+        {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        self.observation = observed.clone();
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn ensure_extent_at_most(
+        &mut self,
+        target_length: u64,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        self.ensure_extent_at_most_with_fault(target_length, MutationFault::None)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn ensure_extent_at_most_with_mutation_fault(
+        &mut self,
+        target_length: u64,
+        fault: MutationFault,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        self.ensure_extent_at_most_with_fault(target_length, fault)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_extent_at_most_with_fault(
+        &mut self,
+        target_length: u64,
+        fault: MutationFault,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        let current = self.revalidate_partial()?;
+        if current.length < target_length {
+            self.observation = current.clone();
+            return Ok(current);
+        }
+        if current.length > target_length {
+            return self.shrink_to_with_fault(current.length, target_length, fault);
+        }
+        let backend = MacReserveBackend;
+        if fault == MutationFault::Sync {
+            self.refresh_observation();
+            return Err(ReserveFailureReason::Io(
+                "injected reserve sync failure".to_owned(),
+            ));
+        }
+        if let Err(reason) = backend.sync(&self.file) {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        let observed = match backend.final_observation(&self.file) {
+            Ok(observed) => observed,
+            Err(reason) => {
+                self.refresh_observation();
+                return Err(reason);
+            }
+        };
+        if let Err(reason) =
+            validate_extent_observation(&observed, &self.observation, target_length)
+        {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        self.observation = observed.clone();
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn reconstitute_to_floor(
+        &mut self,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        self.reconstitute_to_floor_with_fault(MutationFault::None)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn reconstitute_to_floor_with_mutation_fault(
+        &mut self,
+        fault: MutationFault,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        self.reconstitute_to_floor_with_fault(fault)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconstitute_to_floor_with_fault(
+        &mut self,
+        fault: MutationFault,
+    ) -> Result<ReserveObservation, ReserveFailureReason> {
+        let current = self.revalidate_partial()?;
+        let required_allocation = rounded_floor(self.observation.allocation_unit)?;
+        let allocation_deficit = required_allocation.saturating_sub(current.allocated_bytes);
+        let length_deficit = PROTECTED_FREE_SPACE_FLOOR.saturating_sub(current.length);
+        let allocation_request = allocation_deficit.max(length_deficit);
+        let backend = MacReserveBackend;
+        if fault == MutationFault::Allocate {
+            self.refresh_observation();
+            return Err(ReserveFailureReason::Io(
+                "injected reserve reallocation failure".to_owned(),
+            ));
+        }
+        if allocation_request > 0 {
+            let allocated = match backend.preallocate(&self.file, allocation_request) {
+                Ok(allocated) => allocated,
+                Err(reason) => {
+                    self.refresh_observation();
+                    return Err(reason);
+                }
+            };
+            if allocated < allocation_request {
+                self.refresh_observation();
+                return Err(ReserveFailureReason::ShortAllocation {
+                    requested: allocation_request,
+                    allocated,
+                });
+            }
+        }
+        if let Err(reason) = backend.set_len(&self.file, PROTECTED_FREE_SPACE_FLOOR) {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        if fault == MutationFault::AfterTruncateBeforeSync || fault == MutationFault::Sync {
+            self.refresh_observation();
+            return Err(ReserveFailureReason::Io(
+                "injected reserve reconstitution sync failure".to_owned(),
+            ));
+        }
+        if let Err(reason) = backend.sync(&self.file) {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        let observed = match backend.final_observation(&self.file) {
+            Ok(observed) => observed,
+            Err(reason) => {
+                self.refresh_observation();
+                return Err(reason);
+            }
+        };
+        if let Err(reason) = validate_verified_observation(&observed, &self.observation) {
+            self.refresh_observation();
+            return Err(reason);
+        }
+        self.observation = observed.clone();
+        Ok(observed)
+    }
+
+    fn refresh_observation(&mut self) {
+        if let Ok(observed) = capture_observation(&self.file) {
+            self.observation = observed;
+        }
     }
 
     /// Release only the retained descriptor for caller-directed recovery.
@@ -238,6 +493,52 @@ pub(super) fn revalidate_existing_owned_file(
     }
 }
 
+/// Verify an existing reserve descriptor while permitting a physically released partial extent.
+///
+/// This is only for owner-bound restart recovery. It never allocates, changes the logical length,
+/// or constructs authority from the expected observation.
+pub(super) fn revalidate_existing_partial_owned_file(
+    file: File,
+    expected: &ReserveObservation,
+) -> Result<ProtectedReserve, ReserveFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        let observed = match capture_observation(&file) {
+            Ok(observation) => observation,
+            Err(reason) => {
+                return Err(ReserveFailure::new(
+                    file,
+                    ReserveFailureStage::InitialValidation,
+                    reason,
+                    None,
+                ));
+            }
+        };
+        if let Err(reason) = validate_partial_observation(&observed, expected) {
+            return Err(ReserveFailure::new(
+                file,
+                ReserveFailureStage::Verification,
+                reason,
+                Some(observed.allocated_bytes),
+            ));
+        }
+        return Ok(ProtectedReserve {
+            file,
+            observation: observed,
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = expected;
+        Err(ReserveFailure::new(
+            file,
+            ReserveFailureStage::Unsupported,
+            ReserveFailureReason::Unsupported,
+            None,
+        ))
+    }
+}
+
 #[cfg(test)]
 pub(super) fn test_fixture_reserve(file: File) -> ProtectedReserve {
     let mut observation = capture_observation(&file).expect("test fixture descriptor facts");
@@ -395,6 +696,27 @@ fn validate_verified_observation(
     observation: &ReserveObservation,
     expected: &ReserveObservation,
 ) -> Result<(), ReserveFailureReason> {
+    validate_partial_observation(observation, expected)?;
+    if observation.length != PROTECTED_FREE_SPACE_FLOOR {
+        return Err(ReserveFailureReason::LengthMismatch {
+            expected: PROTECTED_FREE_SPACE_FLOOR,
+            actual: observation.length,
+        });
+    }
+    let required_allocation = rounded_floor(expected.allocation_unit)?;
+    if observation.allocated_bytes < required_allocation {
+        return Err(ReserveFailureReason::AllocationBelowFloor {
+            required: required_allocation,
+            actual: observation.allocated_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_partial_observation(
+    observation: &ReserveObservation,
+    expected: &ReserveObservation,
+) -> Result<(), ReserveFailureReason> {
     if !observation.regular {
         return Err(ReserveFailureReason::NotRegular);
     }
@@ -415,13 +737,13 @@ fn validate_verified_observation(
     if observation.allocation_unit != expected.allocation_unit {
         return Err(ReserveFailureReason::VerifiedAllocationUnitMismatch);
     }
-    if observation.length != PROTECTED_FREE_SPACE_FLOOR {
+    if observation.length > PROTECTED_FREE_SPACE_FLOOR {
         return Err(ReserveFailureReason::LengthMismatch {
             expected: PROTECTED_FREE_SPACE_FLOOR,
             actual: observation.length,
         });
     }
-    let required_allocation = rounded_floor(expected.allocation_unit)?;
+    let required_allocation = round_up_extent(observation.length, observation.allocation_unit)?;
     if observation.allocated_bytes < required_allocation {
         return Err(ReserveFailureReason::AllocationBelowFloor {
             required: required_allocation,
@@ -429,6 +751,41 @@ fn validate_verified_observation(
         });
     }
     Ok(())
+}
+
+fn validate_extent_observation(
+    observation: &ReserveObservation,
+    expected: &ReserveObservation,
+    expected_length: u64,
+) -> Result<(), ReserveFailureReason> {
+    if expected_length > PROTECTED_FREE_SPACE_FLOOR {
+        return Err(ReserveFailureReason::LengthMismatch {
+            expected: PROTECTED_FREE_SPACE_FLOOR,
+            actual: expected_length,
+        });
+    }
+    validate_partial_observation(observation, expected)?;
+    if observation.length != expected_length {
+        return Err(ReserveFailureReason::LengthMismatch {
+            expected: expected_length,
+            actual: observation.length,
+        });
+    }
+    Ok(())
+}
+
+fn round_up_extent(bytes: u64, allocation_unit: u64) -> Result<u64, ReserveFailureReason> {
+    if allocation_unit == 0 {
+        return Err(ReserveFailureReason::ZeroAllocationUnit);
+    }
+    let remainder = bytes % allocation_unit;
+    if remainder == 0 {
+        Ok(bytes)
+    } else {
+        bytes
+            .checked_add(allocation_unit - remainder)
+            .ok_or(ReserveFailureReason::ArithmeticOverflow)
+    }
 }
 
 fn rounded_floor(allocation_unit: u64) -> Result<u64, ReserveFailureReason> {
