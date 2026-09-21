@@ -241,6 +241,13 @@ The capacity work is intentionally split as follows:
 | OPT-1563 | Common owner pre-intent gate and typed rejection with no journal row. |
 | OPT-1564–1568 | Chunk claims, typed estimators, and pre/post-intent fault matrices; outside this lifetime decision. |
 
+OPT-1557's v5 slice now persists immutable ordinary-claim observations in a
+dedicated table without an operation foreign key. Its crate-internal reader
+uses canonical UUID keyset cursors and returns at most 256 rows, with one
+bounded SQL lookahead row to produce the next cursor; malformed rows fail
+closed. These rows preserve evidence only and do not grant claim, provider,
+settlement, or admission authority.
+
 ## Acceptance checks for implementation children
 
 These are required future checks, not evidence that this documentation change
