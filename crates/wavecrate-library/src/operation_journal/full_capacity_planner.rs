@@ -313,6 +313,7 @@ pub(super) enum FullCapacityPlannerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs::OpenOptions;
 
     fn facts(device: u64, allocation_unit: u64) -> VolumeFacts {

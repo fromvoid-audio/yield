@@ -1296,6 +1296,20 @@ returns `CapacityProviderUnavailable` with no operation ID, row, or durable perm
 requirements are not yet wired into that path. OS non-sparse reservation, durable charge/recovery,
 and chunk claims remain outside this milestone.
 
+The following private OPT-1338 reserve slice adds a macOS-only, descriptor-bound
+non-sparse 256 MiB allocation and verification helper. It accepts only an already
+owner-created fresh writable regular `File`, validates its descriptor identity,
+volume, link count, compression state, and allocation unit, then requests
+`F_PREALLOCATE` with `F_ALLOCATEALL` at physical EOF, sets the logical length only
+after the full allocation succeeds, and requires `F_FULLFSYNC` before readback.
+The non-serializable result retains the original descriptor and can revalidate it;
+any failure returns that descriptor with its stage, typed reason, and any observed
+allocation, without unlinking or truncating it. Linux and Windows remain
+unsupported for this helper, and it does not create namespace entries, qualify
+the production provider, issue admission claims, or add durable ledger/recovery
+authority. Namespace adoption, reconciliation, and operation-owner integration
+remain deferred.
+
 Prepublication cancellation now has a guarded terminal path over bounded cleanup
 and settlement observations. It covers only entered actions from the frozen
 inventory, distinguishes creation from preservation of an existing input, and
