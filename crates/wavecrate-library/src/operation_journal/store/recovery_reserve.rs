@@ -147,6 +147,8 @@ pub(crate) enum LedgerError {
     },
     #[error("charge {0} is already reconstituted")]
     AlreadyReconstituted(Uuid),
+    #[error("charge {0} is not the active charge for its volume")]
+    ChargeNotActive(Uuid),
 }
 
 #[cfg(test)]
@@ -598,6 +600,17 @@ fn historical_snapshot(
     snapshot
 }
 
+pub(super) struct SpendOutcome {
+    pub(super) snapshot: ChargeSnapshot,
+    pub(super) head: ChargeSnapshot,
+    pub(super) applied: bool,
+}
+
+pub(super) enum ReconstitutePreflight {
+    Historical(ChargeSnapshot),
+    Pending,
+}
+
 fn next_sequence(sequence: i64) -> Result<i64, LedgerError> {
     sequence
         .checked_add(1)
@@ -727,6 +740,25 @@ fn active_charge_for_volume(
         .transpose()
 }
 
+pub(super) fn active_charge_snapshot_for_volume(
+    connection: &Connection,
+    volume: &VolumeIdentity,
+) -> Result<Option<ChargeSnapshot>, LedgerError> {
+    let Some(charge_id) = active_charge_for_volume(connection, volume)? else {
+        return Ok(None);
+    };
+    let snapshot = read_charge(connection, charge_id)?
+        .ok_or_else(|| LedgerError::Corrupt("active charge row is missing".into()))?;
+    if snapshot.volume != *volume {
+        return Err(LedgerError::VolumeConflict {
+            charge_id,
+            expected: volume.clone(),
+            actual: snapshot.volume,
+        });
+    }
+    Ok(Some(snapshot))
+}
+
 pub(super) fn begin_charge(
     connection: &Connection,
     request: &ChargeRequest,
@@ -806,6 +838,23 @@ pub(super) fn spend(
     transition_id: Uuid,
     amount_bytes: u64,
 ) -> Result<ChargeSnapshot, LedgerError> {
+    Ok(spend_with_outcome(
+        connection,
+        expected_volume,
+        charge_id,
+        transition_id,
+        amount_bytes,
+    )?
+    .snapshot)
+}
+
+pub(super) fn spend_with_outcome(
+    connection: &Connection,
+    expected_volume: &VolumeIdentity,
+    charge_id: Uuid,
+    transition_id: Uuid,
+    amount_bytes: u64,
+) -> Result<SpendOutcome, LedgerError> {
     if amount_bytes == 0 {
         return Err(LedgerError::Invalid("spend amount must be positive".into()));
     }
@@ -825,7 +874,11 @@ pub(super) fn spend(
             read_transition(connection, charge_id, transition_id)?
         {
             if kind == "Spent" && amount == amount_bytes {
-                return Ok(historical_snapshot(snapshot, sequence, remaining, state));
+                return Ok(SpendOutcome {
+                    snapshot: historical_snapshot(snapshot.clone(), sequence, remaining, state),
+                    head: snapshot,
+                    applied: false,
+                });
             }
             return Err(LedgerError::TransitionConflict {
                 charge_id,
@@ -878,9 +931,80 @@ pub(super) fn spend(
                 to_sql_integer(remaining_bytes, "remaining_bytes")?,
             ],
         )?;
-        read_charge(connection, charge_id)?.ok_or_else(|| {
+        let head = read_charge(connection, charge_id)?.ok_or_else(|| {
             LedgerError::Corrupt("spent charge disappeared before commit".to_string())
+        })?;
+        Ok(SpendOutcome {
+            snapshot: head.clone(),
+            head,
+            applied: true,
         })
+    })();
+    finish_transaction(connection, result)
+}
+
+pub(super) fn charge_snapshot_for_volume(
+    connection: &Connection,
+    expected_volume: &VolumeIdentity,
+    charge_id: Uuid,
+) -> Result<ChargeSnapshot, LedgerError> {
+    let snapshot = read_charge(connection, charge_id)?
+        .ok_or_else(|| LedgerError::Corrupt("charge references missing charge".into()))?;
+    if snapshot.volume != *expected_volume {
+        return Err(LedgerError::VolumeConflict {
+            charge_id,
+            expected: expected_volume.clone(),
+            actual: snapshot.volume,
+        });
+    }
+    Ok(snapshot)
+}
+
+pub(super) fn require_active_charge_for_volume(
+    connection: &Connection,
+    expected_volume: &VolumeIdentity,
+    charge_id: Uuid,
+) -> Result<ChargeSnapshot, LedgerError> {
+    begin_transaction(connection)?;
+    let result = (|| {
+        let snapshot = charge_snapshot_for_volume(connection, expected_volume, charge_id)?;
+        if active_charge_for_volume(connection, expected_volume)? != Some(charge_id) {
+            return Err(LedgerError::ChargeNotActive(charge_id));
+        }
+        Ok(snapshot)
+    })();
+    finish_transaction(connection, result)
+}
+
+pub(super) fn reconstitute_preflight(
+    connection: &Connection,
+    expected_volume: &VolumeIdentity,
+    charge_id: Uuid,
+    transition_id: Uuid,
+) -> Result<ReconstitutePreflight, LedgerError> {
+    begin_transaction(connection)?;
+    let result = (|| {
+        let snapshot = charge_snapshot_for_volume(connection, expected_volume, charge_id)?;
+        if let Some((sequence, kind, amount, remaining, state)) =
+            read_transition(connection, charge_id, transition_id)?
+        {
+            if kind == "Reconstituted" && amount == 0 && remaining == 0 {
+                return Ok(ReconstitutePreflight::Historical(historical_snapshot(
+                    snapshot, sequence, remaining, state,
+                )));
+            }
+            return Err(LedgerError::TransitionConflict {
+                charge_id,
+                transition_id,
+            });
+        }
+        if snapshot.state == RecoveryReserveState::Reconstituted {
+            return Err(LedgerError::AlreadyReconstituted(charge_id));
+        }
+        if active_charge_for_volume(connection, expected_volume)? != Some(charge_id) {
+            return Err(LedgerError::ChargeNotActive(charge_id));
+        }
+        Ok(ReconstitutePreflight::Pending)
     })();
     finish_transaction(connection, result)
 }

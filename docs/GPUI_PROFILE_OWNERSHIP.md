@@ -1350,9 +1350,15 @@ The following private OPT-1338 recovery-context slice binds that owner capabilit
 charge, spend, and release observation revalidates the journal namespace, profile identity, volume
 lock, and reserve descriptors before the atomic SQLite transition. Reconstitution can only use a
 fresh non-serialized proof produced by `BoundReserve::revalidate_and_prove`; stored observations
-cannot manufacture physical authority. The context remains private and the ordinary admission
-gate remains unavailable. Durability-fault injection coverage and full claim/physical-spend wiring
-remain pending.
+cannot manufacture physical authority. The private context now also settles durable physical spends
+before shrinking the retained descriptor and restores the protected floor before committing
+`Reconstituted`, retaining the durable blocked state across failures. The schema-v4 reserve-binding
+observation records the fixed namespace and descriptor identities after a full proof. Restart
+reacquisition requires the live profile/root/volume capabilities and accepts a partial extent only
+when its logical length and non-sparse allocation satisfy the active durable spend; missing,
+foreign, short, or sparse evidence remains recovery-required without mutation. The context remains
+private and the ordinary admission gate remains unavailable; durable claims, operation-family
+estimators, and ordinary admission wiring remain pending.
 
 Prepublication cancellation now has a guarded terminal path over bounded cleanup
 and settlement observations. It covers only entered actions from the frozen

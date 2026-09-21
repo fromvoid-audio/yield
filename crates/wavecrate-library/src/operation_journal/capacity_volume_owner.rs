@@ -169,6 +169,10 @@ impl VolumeOwnershipCapability {
         &self.marker.owner_profile_identity
     }
 
+    pub(super) fn owner_generation(&self) -> u64 {
+        self.marker.generation
+    }
+
     /// Return the only readiness level this bounded capability can provide.
     pub(super) fn readiness(&self) -> VolumeOwnershipReadiness {
         VolumeOwnershipReadiness::RecoveryOnly

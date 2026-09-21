@@ -56,6 +56,7 @@ use super::validation::{RecordConsistency, classify_record};
 #[allow(dead_code)]
 mod full_progress;
 mod recovery_reserve;
+mod recovery_reserve_binding;
 pub(crate) use full_progress::FullProgressWriteOutcome;
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
@@ -70,7 +71,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 3;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -84,6 +85,7 @@ const JOURNAL_TABLE_NAME: &str = "operation_journal";
 const FULL_PROGRESS_TABLE_NAME: &str = "operation_journal_full_progress";
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 2;
+const RECOVERY_RESERVE_SCHEMA_VERSION: u32 = 3;
 const MAX_SCHEMA_OBJECTS: i64 = 8;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
@@ -582,10 +584,71 @@ pub(crate) enum RecoveryReserveContextError {
     Reserve(String),
     #[error(transparent)]
     Ledger(#[from] recovery_reserve::LedgerError),
+    #[error(transparent)]
+    Binding(#[from] recovery_reserve_binding::ReserveBindingError),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalMutationFault {
+    None,
+    #[cfg(test)]
+    BeforeTruncate,
+    #[cfg(test)]
+    AfterTruncateBeforeSync,
+    #[cfg(test)]
+    Allocate,
+    #[cfg(test)]
+    Sync,
+}
+
+#[cfg(target_os = "macos")]
+impl PhysicalMutationFault {
+    fn reserve_fault(self) -> super::capacity_reserve::MutationFault {
+        match self {
+            Self::None => super::capacity_reserve::MutationFault::None,
+            #[cfg(test)]
+            Self::BeforeTruncate => super::capacity_reserve::MutationFault::BeforeTruncate,
+            #[cfg(test)]
+            Self::AfterTruncateBeforeSync => {
+                super::capacity_reserve::MutationFault::AfterTruncateBeforeSync
+            }
+            #[cfg(test)]
+            Self::Allocate => super::capacity_reserve::MutationFault::Allocate,
+            #[cfg(test)]
+            Self::Sync => super::capacity_reserve::MutationFault::Sync,
+        }
+    }
 }
 
 #[allow(dead_code)]
 impl<'a> RecoveryReserveContext<'a> {
+    fn validate_binding(&self) -> Result<(), RecoveryReserveContextError> {
+        let live = recovery_reserve_binding::ReserveBinding::from_live(
+            self.volume_owner.volume().clone(),
+            self.profile_identity.as_str(),
+            self.reserve.observation().root_identity(),
+            self.reserve.observation().file_identity(),
+            self.reserve.observation().allocation_unit(),
+            self.volume_owner.owner_generation(),
+        )?;
+        let stored =
+            recovery_reserve_binding::read(&self.store.connection, self.volume_owner.volume())?
+                .ok_or_else(|| {
+                    recovery_reserve_binding::ReserveBindingError::Missing(
+                        self.volume_owner.volume().clone(),
+                    )
+                })?;
+        if stored != live {
+            return Err(RecoveryReserveContextError::Binding(
+                recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
+                    "stored reserve binding differs from the live owner-bound observation".into(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_live(&self, validate_reserve: bool) -> Result<(), RecoveryReserveContextError> {
         self.store.validate_namespace()?;
         if self.store.database_identity != self.journal_identity {
@@ -601,6 +664,7 @@ impl<'a> RecoveryReserveContext<'a> {
         if self.volume_owner.volume() != self.reserve.observation().volume() {
             return Err(RecoveryReserveContextError::VolumeIdentityMismatch);
         }
+        self.validate_binding()?;
         self.volume_owner.revalidate()?;
         if validate_reserve {
             self.reserve
@@ -669,6 +733,215 @@ impl<'a> RecoveryReserveContext<'a> {
     ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
         self.validate_live(false)?;
         let proof: PhysicalReserveProof = self
+            .reserve
+            .revalidate_and_prove()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        Ok(recovery_reserve::reconstitute(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+            transition_id,
+            &proof,
+        )?)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn spend_physical(
+        &mut self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        requested_bytes: u64,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.spend_physical_impl(
+            charge_id,
+            transition_id,
+            requested_bytes,
+            PhysicalMutationFault::None,
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn spend_physical_with_test_fault(
+        &mut self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        requested_bytes: u64,
+        fault: super::capacity_reserve::TestReserveMutationFault,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        let fault = match fault {
+            super::capacity_reserve::TestReserveMutationFault::BeforeTruncate => {
+                PhysicalMutationFault::BeforeTruncate
+            }
+            super::capacity_reserve::TestReserveMutationFault::AfterTruncateBeforeSync => {
+                PhysicalMutationFault::AfterTruncateBeforeSync
+            }
+            super::capacity_reserve::TestReserveMutationFault::Allocate => {
+                PhysicalMutationFault::Allocate
+            }
+            super::capacity_reserve::TestReserveMutationFault::Sync => PhysicalMutationFault::Sync,
+        };
+        self.spend_physical_impl(charge_id, transition_id, requested_bytes, fault)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spend_physical_impl(
+        &mut self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        requested_bytes: u64,
+        fault: PhysicalMutationFault,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.validate_live(false)?;
+        self.reserve
+            .revalidate_partial()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let facts = self
+            .reserve
+            .fresh_capacity_facts()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let before = recovery_reserve::charge_snapshot_for_volume(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+        )?;
+        let rounded =
+            crate::durable_capacity::round_up_allocation(requested_bytes, facts.allocation_unit)
+                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        if rounded == 0 {
+            return Err(RecoveryReserveContextError::Reserve(
+                "physical spend must round to a positive allocation".into(),
+            ));
+        }
+        // Durable accounting is committed before the descriptor extent changes. A failed
+        // physical release therefore leaves a recoverable Spent head and never gets rolled back.
+        // The ledger's remaining-budget check is stricter than the remaining-plus-margin bound;
+        // its charge invariant keeps the margin below the protected floor. It must run before any
+        // retry-specific physical handling so a matching transition remains idempotent after
+        // later spends have reduced the current remaining budget.
+        let outcome = recovery_reserve::spend_with_outcome(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+            transition_id,
+            rounded,
+        )?;
+        if outcome.head.state == recovery_reserve::RecoveryReserveState::Reconstituted {
+            return Ok(outcome.snapshot);
+        }
+        recovery_reserve::require_active_charge_for_volume(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+        )?;
+        let spent_after = outcome
+            .head
+            .budget_bytes
+            .checked_sub(outcome.head.remaining_bytes)
+            .ok_or_else(|| {
+                RecoveryReserveContextError::Reserve(
+                    "durable spend head exceeds its charge budget".into(),
+                )
+            })?;
+        let target_length = crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+            .checked_sub(spent_after)
+            .ok_or_else(|| {
+                RecoveryReserveContextError::Reserve(
+                    "durable spend would consume the protected floor".into(),
+                )
+            })?;
+        if target_length < outcome.head.margin_bytes {
+            return Err(RecoveryReserveContextError::Reserve(
+                "durable spend would consume the control margin".into(),
+            ));
+        }
+
+        if outcome.applied {
+            let spent_before = before
+                .budget_bytes
+                .checked_sub(before.remaining_bytes)
+                .ok_or_else(|| {
+                    RecoveryReserveContextError::Reserve(
+                        "durable spend head has invalid prior budget".into(),
+                    )
+                })?;
+            let expected_current_length = crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+                .checked_sub(spent_before)
+                .ok_or_else(|| {
+                    RecoveryReserveContextError::Reserve(
+                        "prior spend exceeds the protected floor".into(),
+                    )
+                })?;
+            self.reserve
+                .shrink_to_with_mutation_fault(
+                    expected_current_length,
+                    target_length,
+                    fault.reserve_fault(),
+                )
+                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        } else {
+            self.reserve
+                .ensure_extent_at_most_with_mutation_fault(target_length, fault.reserve_fault())
+                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        }
+        Ok(outcome.snapshot)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reconstitute_physical(
+        &mut self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.reconstitute_physical_impl(charge_id, transition_id, PhysicalMutationFault::None)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn reconstitute_physical_with_test_fault(
+        &mut self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        fault: super::capacity_reserve::TestReserveMutationFault,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        let fault = match fault {
+            super::capacity_reserve::TestReserveMutationFault::BeforeTruncate => {
+                PhysicalMutationFault::BeforeTruncate
+            }
+            super::capacity_reserve::TestReserveMutationFault::AfterTruncateBeforeSync => {
+                PhysicalMutationFault::AfterTruncateBeforeSync
+            }
+            super::capacity_reserve::TestReserveMutationFault::Allocate => {
+                PhysicalMutationFault::Allocate
+            }
+            super::capacity_reserve::TestReserveMutationFault::Sync => PhysicalMutationFault::Sync,
+        };
+        self.reconstitute_physical_impl(charge_id, transition_id, fault)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconstitute_physical_impl(
+        &mut self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        fault: PhysicalMutationFault,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.validate_live(false)?;
+        let preflight = recovery_reserve::reconstitute_preflight(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+            transition_id,
+        )?;
+        if let recovery_reserve::ReconstitutePreflight::Historical(snapshot) = preflight {
+            return Ok(snapshot);
+        }
+        let _ = self
+            .reserve
+            .revalidate_partial()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        self.reserve
+            .reconstitute_to_floor_with_mutation_fault(fault.reserve_fault())
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let proof = self
             .reserve
             .revalidate_and_prove()
             .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
@@ -770,6 +1043,126 @@ impl OperationJournalStore {
         reserve
             .revalidate()
             .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let binding = recovery_reserve_binding::ReserveBinding::from_live(
+            volume_owner.volume().clone(),
+            &profile_identity,
+            reserve.observation().root_identity(),
+            reserve.observation().file_identity(),
+            reserve.observation().allocation_unit(),
+            volume_owner.owner_generation(),
+        )?;
+        recovery_reserve_binding::persist(&self.connection, &binding)?;
+        Ok(RecoveryReserveContext {
+            store: self,
+            volume_owner,
+            reserve,
+            journal_identity: self.database_identity.clone(),
+            profile_identity,
+        })
+    }
+
+    /// Reopen a previously bound reserve after a crash-like owner restart.
+    ///
+    /// The durable binding is only an observation. The caller must provide the current profile,
+    /// root, and per-volume lock capabilities; the fixed child is then reopened and revalidated
+    /// from its live descriptor. A partial extent is accepted only when the active durable charge
+    /// proves the minimum remaining protected extent.
+    #[allow(dead_code)]
+    pub(crate) fn reopen_recovery_reserve<'a>(
+        &'a self,
+        volume_owner: VolumeOwnershipCapability,
+        root: &'a BoundDatabaseRoot,
+        profile_guard: &'a WritableProfileGuard,
+    ) -> Result<RecoveryReserveContext<'a>, RecoveryReserveContextError> {
+        self.validate_namespace()?;
+        root.validate_profile_guard(profile_guard)
+            .map_err(OperationJournalStoreError::ProfileOwnership)?;
+        let profile_identity = self.profile_guard.profile_root_identity().to_owned();
+        if profile_guard.profile_root_identity() != profile_identity
+            || volume_owner.owner_profile_identity() != profile_identity
+        {
+            return Err(RecoveryReserveContextError::ProfileIdentityMismatch);
+        }
+        volume_owner.revalidate()?;
+
+        let binding = recovery_reserve_binding::read(&self.connection, volume_owner.volume())?
+            .ok_or_else(|| {
+                recovery_reserve_binding::ReserveBindingError::Missing(
+                    volume_owner.volume().clone(),
+                )
+            })?;
+        if binding.profile_identity() != profile_identity
+            || binding.owner_generation() != volume_owner.owner_generation()
+            || binding.volume() != volume_owner.volume()
+            || binding.root_identity() != root.identity()
+            || binding.namespace_version() != recovery_reserve_binding::NAMESPACE_VERSION
+            || binding.namespace_name() != super::capacity_reserve_namespace::RESERVE_FILE_NAME
+            || binding.protected_floor_bytes()
+                != crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+        {
+            return Err(RecoveryReserveContextError::Binding(
+                recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
+                    "durable reserve binding does not match the live owner/root".into(),
+                ),
+            ));
+        }
+
+        let active = recovery_reserve::active_charge_snapshot_for_volume(
+            &self.connection,
+            volume_owner.volume(),
+        )?;
+        let minimum_length = if let Some(snapshot) = active {
+            let spent = snapshot
+                .budget_bytes
+                .checked_sub(snapshot.remaining_bytes)
+                .ok_or_else(|| {
+                    RecoveryReserveContextError::Reserve(
+                        "durable reserve charge remaining bytes exceed its budget".into(),
+                    )
+                })?;
+            let minimum = crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+                .checked_sub(spent)
+                .ok_or_else(|| {
+                    RecoveryReserveContextError::Reserve(
+                        "durable reserve spend exceeds the protected floor".into(),
+                    )
+                })?;
+            if minimum < snapshot.margin_bytes {
+                return Err(RecoveryReserveContextError::Reserve(
+                    "durable reserve spend consumes its control margin".into(),
+                ));
+            }
+            minimum
+        } else {
+            crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+        };
+        let expected =
+            super::capacity_reserve_namespace::ReserveNamespaceObservation::from_binding(
+                binding.root_identity(),
+                binding.file_identity(),
+                binding.volume().clone(),
+                binding.allocation_unit(),
+            )
+            .map_err(|reason| RecoveryReserveContextError::Reserve(reason.into()))?;
+        let reserve = super::capacity_reserve_namespace::reopen_owned_reserve_partial(
+            root,
+            profile_guard,
+            &expected,
+            minimum_length,
+        )
+        .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        if reserve.profile_identity() != profile_identity
+            || reserve.observation().volume() != volume_owner.volume()
+            || reserve.observation().file_identity() != binding.file_identity()
+            || reserve.observation().allocation_unit() != binding.allocation_unit()
+        {
+            return Err(RecoveryReserveContextError::Binding(
+                recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
+                    "reopened reserve descriptor differs from the durable binding".into(),
+                ),
+            ));
+        }
+        volume_owner.revalidate()?;
         Ok(RecoveryReserveContext {
             store: self,
             volume_owner,
@@ -909,6 +1302,28 @@ impl OperationJournalStore {
                     PREVIOUS_JOURNAL_SCHEMA_VERSION,
                 )?;
                 migrate_previous_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == RECOVERY_RESERVE_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    RECOVERY_RESERVE_SCHEMA_VERSION,
+                )?;
+                migrate_recovery_reserve_schema(
                     &connection,
                     &database_root,
                     &database_path,
@@ -4188,7 +4603,10 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
     }
     if !matches!(
         user_version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION
+            | PREVIOUS_JOURNAL_SCHEMA_VERSION
+            | RECOVERY_RESERVE_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
             path,
@@ -4214,7 +4632,10 @@ fn read_sqlite_user_version(
     })?;
     if !matches!(
         user_version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION
+            | PREVIOUS_JOURNAL_SCHEMA_VERSION
+            | RECOVERY_RESERVE_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
             path,
@@ -4260,6 +4681,21 @@ fn validate_existing_schema(
                 String::from("table"),
             ),
         ],
+        RECOVERY_RESERVE_SCHEMA_VERSION => vec![
+            (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+            (
+                String::from(FULL_PROGRESS_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::TRANSITION_TABLE_NAME),
+                String::from("table"),
+            ),
+        ],
         JOURNAL_SCHEMA_VERSION => vec![
             (String::from(JOURNAL_TABLE_NAME), String::from("table")),
             (
@@ -4268,6 +4704,10 @@ fn validate_existing_schema(
             ),
             (
                 String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve_binding::TABLE_NAME),
                 String::from("table"),
             ),
             (
@@ -4292,7 +4732,7 @@ fn validate_existing_schema(
     validate_table_schema(connection, path, JOURNAL_TABLE_NAME, CREATE_JOURNAL_TABLE)?;
     if matches!(
         schema_version,
-        PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        PREVIOUS_JOURNAL_SCHEMA_VERSION | RECOVERY_RESERVE_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -4301,7 +4741,10 @@ fn validate_existing_schema(
             CREATE_FULL_PROGRESS_TABLE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        RECOVERY_RESERVE_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         validate_table_schema(
             connection,
             path,
@@ -4313,6 +4756,14 @@ fn validate_existing_schema(
             path,
             recovery_reserve::TRANSITION_TABLE_NAME,
             recovery_reserve::CREATE_TRANSITION_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            recovery_reserve_binding::TABLE_NAME,
+            recovery_reserve_binding::CREATE_TABLE,
         )?;
     }
     Ok(())
@@ -4401,6 +4852,37 @@ fn validate_table_schema(
             ),
             (String::from("state"), String::from("TEXT"), 1, 0),
         ],
+        recovery_reserve_binding::TABLE_NAME => vec![
+            (String::from("volume_device"), String::from("TEXT"), 1, 1),
+            (String::from("profile_identity"), String::from("TEXT"), 1, 0),
+            (String::from("root_identity"), String::from("TEXT"), 1, 0),
+            (String::from("file_identity"), String::from("TEXT"), 1, 0),
+            (
+                String::from("allocation_unit"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (
+                String::from("protected_floor_bytes"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (
+                String::from("namespace_version"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (String::from("namespace_name"), String::from("TEXT"), 1, 0),
+            (
+                String::from("owner_generation"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+        ],
         _ => {
             return Err(audit_error(path, format!("unsupported table {table_name}")));
         }
@@ -4431,7 +4913,17 @@ fn validate_table_schema(
         .map(|(_, _, _, origin, _)| origin.clone())
         .collect();
     origins.sort_unstable();
-    if indexes.len() != 2 || origins != [String::from("pk"), String::from("u")] {
+    let expected_index_count = if table_name == recovery_reserve_binding::TABLE_NAME {
+        1
+    } else {
+        2
+    };
+    let expected_origins: Vec<String> = if table_name == recovery_reserve_binding::TABLE_NAME {
+        vec![String::from("pk")]
+    } else {
+        vec![String::from("pk"), String::from("u")]
+    };
+    if indexes.len() != expected_index_count || origins != expected_origins {
         return Err(audit_error(
             path,
             format!("existing {table_name} indexes differ"),
@@ -4485,6 +4977,7 @@ fn migrate_legacy_schema(
         }
         connection.execute_batch(recovery_reserve::CREATE_CHARGE_TABLE)?;
         connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
+        connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -4550,6 +5043,66 @@ fn migrate_previous_schema(
         validate_existing_schema(connection, database_path, PREVIOUS_JOURNAL_SCHEMA_VERSION)?;
         connection.execute_batch(recovery_reserve::CREATE_CHARGE_TABLE)?;
         connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
+        connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_recovery_reserve_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        RECOVERY_RESERVE_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            RECOVERY_RESERVE_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, RECOVERY_RESERVE_SCHEMA_VERSION)?;
+        connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -4628,9 +5181,11 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {CREATE_JOURNAL_TABLE};
              {CREATE_FULL_PROGRESS_TABLE};
              {charge_table};
-             {transition_table};",
+             {transition_table};
+             {binding_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
+            binding_table = recovery_reserve_binding::CREATE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -4767,6 +5322,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::io::Write;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::MetadataExt;
     #[cfg(target_os = "macos")]
     use std::path::Path;
 
@@ -5743,6 +6300,38 @@ mod tests {
         (path, encoded)
     }
 
+    fn write_v3_database(
+        owner: &WritableProfileGuard,
+        record: &StoredOperationRecord,
+        sequence: i64,
+    ) -> (PathBuf, Vec<u8>) {
+        let path = database_path(owner);
+        fs::create_dir_all(path.parent().expect("journal directory")).expect("journal directory");
+        let encoded = encode(record).expect("encode recovery-schema fixture");
+        let connection = Connection::open(&path).expect("open recovery-schema fixture");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {JOURNAL_APPLICATION_ID};
+                 PRAGMA user_version = {RECOVERY_RESERVE_SCHEMA_VERSION};
+                 {CREATE_JOURNAL_TABLE};
+                 {CREATE_FULL_PROGRESS_TABLE};
+                 {charge_table};
+                 {transition_table};",
+                charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
+                transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
+            ))
+            .expect("create v3 journal schema");
+        connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![record.operation_id.to_string(), sequence, &encoded],
+            )
+            .expect("insert v3 journal row");
+        drop(connection);
+        (path, encoded)
+    }
+
     #[test]
     fn typed_insert_outcome_acknowledges_exact_readback() {
         let fixture = fixture();
@@ -5774,6 +6363,7 @@ mod tests {
             .owner
             .profile_root()
             .join("context-recovery-reserve");
+        let reserve_file_path = reserve_path.join("recovery-reserve.bin");
         let reserve = super::super::capacity_reserve_namespace::create_owned_reserve(
             &reserve_root,
             &fixture.owner,
@@ -5867,7 +6457,7 @@ mod tests {
             fixture.owner.profile_root_identity(),
         )
         .expect("matching volume owner");
-        let context = store
+        let mut context = store
             .bind_recovery_reserve(volume_owner, reserve)
             .expect("bind live recovery context");
         let charge_id = Uuid::new_v4();
@@ -5876,7 +6466,7 @@ mod tests {
             operation_id,
             volume: volume.clone(),
             purpose: super::recovery_reserve::RecoveryReservePurpose::OperationRecovery,
-            budget_bytes: 4096,
+            budget_bytes: 32 * 1024,
             margin_bytes: 4096,
             precharge_capacity_bytes: u64::MAX,
         };
@@ -5973,22 +6563,116 @@ mod tests {
         );
         assert_eq!(charge_b_transitions(), charge_b_transitions_before);
 
-        let spend_id = Uuid::new_v4();
-        let spent = context
-            .spend(charge_id, spend_id, 512)
-            .expect("durable spend");
-        assert_eq!(spent.remaining_bytes, 3584);
-        let spend_retry = context
-            .spend(charge_id, spend_id, 512)
-            .expect("same-volume durable spend retry");
-        assert_eq!(spend_retry.transition_sequence, spent.transition_sequence);
-        assert_eq!(spend_retry.remaining_bytes, spent.remaining_bytes);
-        let released = context
-            .record_release_observation(charge_id, Uuid::new_v4(), 512)
-            .expect("durable release observation");
+        let allocation_unit = expected_observation.allocation_unit();
+        let rounded_spend = crate::durable_capacity::round_up_allocation(512, allocation_unit)
+            .expect("round physical spend");
+        let floor = PROTECTED_FREE_SPACE_FLOOR;
+        let initial_length = fs::metadata(&reserve_file_path)
+            .expect("read initial reserve metadata")
+            .len();
+        assert_eq!(initial_length, floor);
+
+        let overspend = context
+            .spend_physical(charge_id, Uuid::new_v4(), 64 * 1024)
+            .expect_err("overspend must reject before physical mutation");
+        assert!(matches!(
+            overspend,
+            RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::BudgetExceeded { .. }
+            )
+        ));
         assert_eq!(
-            released.state,
-            super::recovery_reserve::RecoveryReserveState::ReleaseObserved
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after overspend")
+                .len(),
+            initial_length
+        );
+
+        let first_spend_id = Uuid::new_v4();
+        let before_truncate = context
+            .spend_physical_with_test_fault(
+                charge_id,
+                first_spend_id,
+                512,
+                super::super::capacity_reserve::TestReserveMutationFault::BeforeTruncate,
+            )
+            .expect_err("failure before truncate must retain durable spend");
+        assert!(matches!(
+            before_truncate,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        let after_first_failure = super::recovery_reserve::charge_snapshot_for_volume(
+            &store.connection,
+            &volume,
+            charge_id,
+        )
+        .expect("read durable first spend");
+        assert_eq!(
+            after_first_failure.state,
+            super::recovery_reserve::RecoveryReserveState::Spent
+        );
+        assert_eq!(
+            after_first_failure.remaining_bytes,
+            32 * 1024 - rounded_spend
+        );
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after pre-truncate fault")
+                .len(),
+            initial_length
+        );
+
+        let first_retry = context
+            .spend_physical(charge_id, first_spend_id, 512)
+            .expect("retry first physical spend");
+        assert_eq!(first_retry.transition_sequence, 2);
+        assert_eq!(first_retry.remaining_bytes, 32 * 1024 - rounded_spend);
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after first retry")
+                .len(),
+            floor - rounded_spend
+        );
+
+        let second_spend_id = Uuid::new_v4();
+        let after_truncate = context
+            .spend_physical_with_test_fault(
+                charge_id,
+                second_spend_id,
+                512,
+                super::super::capacity_reserve::TestReserveMutationFault::AfterTruncateBeforeSync,
+            )
+            .expect_err("failure after truncate must retain durable spend");
+        assert!(matches!(
+            after_truncate,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after post-truncate fault")
+                .len(),
+            floor - 2 * rounded_spend
+        );
+        let second_retry = context
+            .spend_physical(charge_id, second_spend_id, 512)
+            .expect("retry second physical spend");
+        assert_eq!(second_retry.transition_sequence, 3);
+        assert_eq!(second_retry.remaining_bytes, 32 * 1024 - 2 * rounded_spend);
+        let first_late_retry = context
+            .spend_physical(charge_id, first_spend_id, 512)
+            .expect("late retry must use current durable head");
+        assert_eq!(first_late_retry.transition_sequence, 2);
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after late retry")
+                .len(),
+            floor - 2 * rounded_spend
+        );
+        assert!(
+            super::recovery_reserve::readiness(&store.connection)
+                .expect("read recovery readiness")
+                .is_some(),
+            "Spent durable state must keep ordinary readiness blocked"
         );
 
         let displaced_root = fixture
@@ -5998,7 +6682,7 @@ mod tests {
         fs::rename(&reserve_path, &displaced_root).expect("displace reserve root");
         fs::create_dir(&reserve_path).expect("install replacement reserve root");
         let stale_error = context
-            .reconstitute(charge_id, Uuid::new_v4())
+            .reconstitute_physical(charge_id, Uuid::new_v4())
             .expect_err("reconstitution must reject a replaced reserve root");
         assert!(matches!(
             stale_error,
@@ -6012,19 +6696,594 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read state after stale proof");
-        assert_eq!(state_after_stale, "ReleaseObserved");
+        assert_eq!(state_after_stale, "Spent");
         fs::remove_dir(&reserve_path).expect("remove replacement reserve root");
         fs::rename(&displaced_root, &reserve_path).expect("restore reserve root");
 
+        let a_reconstitute_id = Uuid::new_v4();
         let reconstituted = context
-            .reconstitute(charge_id, Uuid::new_v4())
+            .reconstitute_physical(charge_id, a_reconstitute_id)
             .expect("fresh physical proof reconstitution");
         assert_eq!(
             reconstituted.state,
             super::recovery_reserve::RecoveryReserveState::Reconstituted
         );
+        let restored_metadata = fs::metadata(&reserve_file_path).expect("read restored reserve");
+        assert_eq!(restored_metadata.len(), floor);
+        assert!(
+            restored_metadata.blocks().checked_mul(512).unwrap_or(0) >= floor,
+            "reconstitution must restore physical allocation"
+        );
+
+        let terminal_a = super::recovery_reserve::charge_snapshot_for_volume(
+            &store.connection,
+            &volume,
+            charge_id,
+        )
+        .expect("read completed charge A");
+        let terminal_length = restored_metadata.len();
+        assert_eq!(
+            context
+                .spend_physical(charge_id, first_spend_id, 512)
+                .expect("retry completed charge A spend")
+                .state,
+            super::recovery_reserve::RecoveryReserveState::Spent
+        );
+        assert_eq!(
+            context
+                .reconstitute_physical(charge_id, a_reconstitute_id)
+                .expect("retry completed charge A reconstitution")
+                .state,
+            super::recovery_reserve::RecoveryReserveState::Reconstituted
+        );
+        assert!(matches!(
+            context.spend_physical(charge_id, Uuid::new_v4(), 512),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::AlreadyReconstituted(_)
+            ))
+        ));
+        assert!(matches!(
+            context.reconstitute_physical(charge_id, Uuid::new_v4()),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::AlreadyReconstituted(_)
+            ))
+        ));
+        assert_eq!(
+            super::recovery_reserve::charge_snapshot_for_volume(
+                &store.connection,
+                &volume,
+                charge_id,
+            )
+            .expect("read unchanged completed charge A")
+            .state,
+            terminal_a.state
+        );
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after completed charge A retries")
+                .len(),
+            terminal_length
+        );
+
+        let charge_c = Uuid::new_v4();
+        let request_c = super::recovery_reserve::ChargeRequest {
+            charge_id: charge_c,
+            operation_id,
+            volume: volume.clone(),
+            purpose: super::recovery_reserve::RecoveryReservePurpose::OperationRecovery,
+            budget_bytes: 16 * 1024,
+            margin_bytes: 4096,
+            precharge_capacity_bytes: u64::MAX,
+        };
+        context
+            .begin_charge(&request_c)
+            .expect("charge after prior reconstitution");
+        let spend_c = Uuid::new_v4();
+        context
+            .spend_physical(charge_c, spend_c, 512)
+            .expect("spend second recovery charge");
+        let partial_length = fs::metadata(&reserve_file_path)
+            .expect("read partial second reserve")
+            .len();
+        assert_eq!(partial_length, floor - rounded_spend);
+        let charge_c_before_old_a_retry = super::recovery_reserve::charge_snapshot_for_volume(
+            &store.connection,
+            &volume,
+            charge_c,
+        )
+        .expect("read active charge B");
+        assert_eq!(
+            context
+                .spend_physical(charge_id, first_spend_id, 512)
+                .expect("retry old charge A spend while B is active")
+                .state,
+            super::recovery_reserve::RecoveryReserveState::Spent
+        );
+        assert_eq!(
+            context
+                .reconstitute_physical(charge_id, a_reconstitute_id)
+                .expect("retry old charge A reconstitution while B is active")
+                .state,
+            super::recovery_reserve::RecoveryReserveState::Reconstituted
+        );
+        assert!(matches!(
+            context.spend_physical(charge_id, Uuid::new_v4(), 512),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::AlreadyReconstituted(_)
+            ))
+        ));
+        assert!(matches!(
+            context.reconstitute_physical(charge_id, Uuid::new_v4()),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::AlreadyReconstituted(_)
+            ))
+        ));
+        assert_eq!(
+            super::recovery_reserve::charge_snapshot_for_volume(
+                &store.connection,
+                &volume,
+                charge_c,
+            )
+            .expect("read unchanged active charge B"),
+            charge_c_before_old_a_retry
+        );
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after old charge A retries")
+                .len(),
+            partial_length
+        );
+        let allocator_failure = context
+            .reconstitute_physical_with_test_fault(
+                charge_c,
+                Uuid::new_v4(),
+                super::super::capacity_reserve::TestReserveMutationFault::Allocate,
+            )
+            .expect_err("allocator failure must leave durable spend blocked");
+        assert!(matches!(
+            allocator_failure,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        let after_allocator_failure = super::recovery_reserve::charge_snapshot_for_volume(
+            &store.connection,
+            &volume,
+            charge_c,
+        )
+        .expect("read second charge after allocator failure");
+        assert_eq!(
+            after_allocator_failure.state,
+            super::recovery_reserve::RecoveryReserveState::Spent
+        );
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after allocator failure")
+                .len(),
+            partial_length
+        );
+        let sync_failure = context
+            .reconstitute_physical_with_test_fault(
+                charge_c,
+                Uuid::new_v4(),
+                super::super::capacity_reserve::TestReserveMutationFault::Sync,
+            )
+            .expect_err("sync failure must leave durable spend blocked");
+        assert!(matches!(
+            sync_failure,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        assert_eq!(
+            super::recovery_reserve::charge_snapshot_for_volume(
+                &store.connection,
+                &volume,
+                charge_c,
+            )
+            .expect("read second charge after sync failure")
+            .state,
+            super::recovery_reserve::RecoveryReserveState::Spent
+        );
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after sync failure")
+                .len(),
+            floor
+        );
+        let second_reconstituted = context
+            .reconstitute_physical(charge_c, Uuid::new_v4())
+            .expect("retry physical reconstitution after sync failure");
+        assert_eq!(
+            second_reconstituted.state,
+            super::recovery_reserve::RecoveryReserveState::Reconstituted
+        );
         drop(context);
         drop(owner_registry_root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_reserve_restart_reopens_full_and_partial_binding() {
+        let fixture = fixture();
+        let reserve_root = BoundDatabaseRoot::for_profile_child(
+            &fixture.owner,
+            Path::new("restart-recovery-reserve"),
+        )
+        .expect("restart reserve root");
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("restart-recovery-reserve");
+        let reserve_file_path = reserve_path.join("recovery-reserve.bin");
+        let reserve = super::super::capacity_reserve_namespace::create_owned_reserve(
+            &reserve_root,
+            &fixture.owner,
+        )
+        .expect("allocate restart reserve");
+        let expected = reserve.observation().clone();
+        let volume = expected.volume().clone();
+        let descriptor_path = fixture._base.path().join("restart-owner-descriptor");
+        fs::write(&descriptor_path, b"descriptor").expect("write owner descriptor");
+        let descriptor = fs::File::open(&descriptor_path).expect("open owner descriptor");
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let registry_root = tempfile::tempdir_in(temp_root).expect("ownership registry root");
+        let registry_path = registry_root.path().join("volume-ownership");
+        fs::create_dir(&registry_path).expect("create ownership registry");
+        let store = OperationJournalStore::open(&fixture.owner).expect("open restart store");
+        let operation_id = OperationId::new();
+        store
+            .insert_intent_with_outcome(&intent_record(operation_id))
+            .receipt()
+            .expect("persist restart operation");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("acquire initial volume owner");
+        let context = store
+            .bind_recovery_reserve(owner, reserve)
+            .expect("bind initial reserve");
+        let charge_id = Uuid::new_v4();
+        context
+            .begin_charge(&super::recovery_reserve::ChargeRequest {
+                charge_id,
+                operation_id,
+                volume: volume.clone(),
+                purpose: super::recovery_reserve::RecoveryReservePurpose::OperationRecovery,
+                budget_bytes: 32 * 1024,
+                margin_bytes: 4096,
+                precharge_capacity_bytes: u64::MAX,
+            })
+            .expect("persist initial charged state");
+        drop(context);
+        drop(store);
+
+        let store = OperationJournalStore::open(&fixture.owner).expect("reopen charged store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire same owner after restart");
+        let mut context = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .expect("reopen full charged reserve");
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read full reserve")
+                .len(),
+            PROTECTED_FREE_SPACE_FLOOR
+        );
+        let allocation_unit = expected.allocation_unit();
+        let rounded_spend = crate::durable_capacity::round_up_allocation(512, allocation_unit)
+            .expect("round restart spend");
+        let spend_id = Uuid::new_v4();
+        context
+            .spend_physical(charge_id, spend_id, 512)
+            .expect("spend after charged restart");
+        let partial_length = fs::metadata(&reserve_file_path)
+            .expect("read partial reserve")
+            .len();
+        assert_eq!(partial_length, PROTECTED_FREE_SPACE_FLOOR - rounded_spend);
+        drop(context);
+        drop(store);
+
+        let store = OperationJournalStore::open(&fixture.owner).expect("reopen spent store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire spent owner");
+        let context = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .expect("reopen partial spent reserve");
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reopened partial reserve")
+                .len(),
+            partial_length
+        );
+
+        // A crash that leaves the logical extent one byte below the durable minimum must retain
+        // the file and reject restart before any physical or ledger mutation.
+        let short_length = partial_length
+            .checked_sub(1)
+            .expect("nonzero partial extent");
+        let short_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_file_path)
+            .expect("open reserve for short-extent fixture");
+        short_file
+            .set_len(short_length)
+            .expect("truncate short-extent fixture");
+        short_file.sync_all().expect("sync short-extent fixture");
+        drop(context);
+        drop(store);
+
+        let store = OperationJournalStore::open(&fixture.owner).expect("reopen short store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire short-extent owner");
+        let short_error = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .err()
+            .expect("short extent must reject restart");
+        assert!(matches!(
+            short_error,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read retained short extent")
+                .len(),
+            short_length
+        );
+        drop(store);
+
+        // Restore the same allocation-unit block, then make the logical extent sparse. The
+        // restart path must reject insufficient non-sparse allocation without replacing it.
+        let sparse_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_file_path)
+            .expect("open reserve for sparse fixture");
+        sparse_file
+            .set_len(partial_length)
+            .expect("restore partial logical extent");
+        sparse_file
+            .sync_all()
+            .expect("sync restored partial extent");
+        sparse_file
+            .set_len(0)
+            .expect("clear reserve for sparse fixture");
+        sparse_file.sync_all().expect("sync sparse clear");
+        sparse_file
+            .set_len(partial_length)
+            .expect("create sparse partial extent");
+        sparse_file.sync_all().expect("sync sparse partial extent");
+        drop(sparse_file);
+        let sparse_allocation = fs::metadata(&reserve_file_path)
+            .expect("read sparse allocation")
+            .blocks()
+            .checked_mul(512)
+            .expect("sparse allocation arithmetic");
+        assert!(
+            sparse_allocation
+                < crate::durable_capacity::round_up_allocation(partial_length, allocation_unit)
+                    .expect("round sparse extent"),
+            "fixture must have insufficient non-sparse allocation"
+        );
+        let store = OperationJournalStore::open(&fixture.owner).expect("reopen sparse store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire sparse owner");
+        let sparse_error = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .err()
+            .expect("sparse extent must reject restart");
+        assert!(matches!(
+            sparse_error,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read retained sparse extent")
+                .len(),
+            partial_length
+        );
+        drop(store);
+
+        // Rebuild the same retained descriptor's physical floor for the next crash-window case.
+        let empty_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_file_path)
+            .expect("open sparse reserve for physical restore");
+        empty_file.set_len(0).expect("clear sparse reserve");
+        empty_file.sync_all().expect("sync cleared reserve");
+        let restored_reserve =
+            super::super::capacity_reserve::allocate_protected_reserve(empty_file)
+                .expect("restore retained reserve floor");
+        assert_eq!(
+            restored_reserve.observation().length,
+            PROTECTED_FREE_SPACE_FLOOR
+        );
+        drop(restored_reserve);
+
+        let store = OperationJournalStore::open(&fixture.owner).expect("reopen restored store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire restored owner");
+        let mut context = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .expect("reopen physically restored spent reserve");
+        let before_failure = super::recovery_reserve::charge_snapshot_for_volume(
+            &store.connection,
+            &volume,
+            charge_id,
+        )
+        .expect("read spent restart charge");
+        let allocation_failure = context
+            .reconstitute_physical_with_test_fault(
+                charge_id,
+                Uuid::new_v4(),
+                super::super::capacity_reserve::TestReserveMutationFault::Allocate,
+            )
+            .expect_err("failed physical reconstitution remains blocked");
+        assert!(matches!(
+            allocation_failure,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        assert_eq!(
+            super::recovery_reserve::charge_snapshot_for_volume(
+                &store.connection,
+                &volume,
+                charge_id,
+            )
+            .expect("read unchanged spent charge"),
+            before_failure
+        );
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after failed reconstitution")
+                .len(),
+            PROTECTED_FREE_SPACE_FLOOR
+        );
+
+        // The physical restore above is intentionally left uncommitted. Dropping the context
+        // models a crash before the durable Reconstituted transition; restart must retain the
+        // Spent ledger head and then commit it only after a fresh proof.
+        drop(context);
+        drop(store);
+        let store = OperationJournalStore::open(&fixture.owner).expect("reopen crash-window store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire crash-window owner");
+        let mut context = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .expect("reopen physically restored spent reserve");
+        assert_eq!(
+            super::recovery_reserve::charge_snapshot_for_volume(
+                &store.connection,
+                &volume,
+                charge_id,
+            )
+            .expect("read spent state before durable restore")
+            .state,
+            super::recovery_reserve::RecoveryReserveState::Spent
+        );
+        context
+            .reconstitute_physical(charge_id, Uuid::new_v4())
+            .expect("commit reconstitution after restart proof");
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read restored reserve")
+                .len(),
+            PROTECTED_FREE_SPACE_FLOOR
+        );
+        drop(context);
+        drop(store);
+
+        let store =
+            OperationJournalStore::open(&fixture.owner).expect("reopen reconstituted store");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("reacquire terminal owner");
+        let context = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .expect("repeat terminal reconciliation");
+        assert_eq!(
+            context.reserve.observation().length(),
+            PROTECTED_FREE_SPACE_FLOOR
+        );
+        drop(context);
+        drop(store);
+
+        let store = OperationJournalStore::open(&fixture.owner).expect("open final-check store");
+        let wrong_root = BoundDatabaseRoot::for_profile_child(
+            &fixture.owner,
+            Path::new("restart-recovery-wrong-root"),
+        )
+        .expect("wrong restart root");
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("acquire owner for wrong-root check");
+        let before_wrong_root = fs::metadata(&reserve_file_path)
+            .expect("read reserve before wrong-root check")
+            .len();
+        let wrong_root_error = store
+            .reopen_recovery_reserve(owner, &wrong_root, &fixture.owner)
+            .err()
+            .expect("wrong root binding must reject");
+        assert!(matches!(
+            wrong_root_error,
+            RecoveryReserveContextError::Binding(_)
+        ));
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after wrong-root check")
+                .len(),
+            before_wrong_root
+        );
+
+        let owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("acquire owner for missing-binding check");
+        store
+            .connection
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE volume_device = ?1",
+                    recovery_reserve_binding::TABLE_NAME
+                ),
+                params![volume.device.to_string()],
+            )
+            .expect("remove binding corruption fixture");
+        let missing_error = store
+            .reopen_recovery_reserve(owner, &reserve_root, &fixture.owner)
+            .err()
+            .expect("missing binding must require reconciliation");
+        assert!(matches!(
+            missing_error,
+            RecoveryReserveContextError::Binding(
+                recovery_reserve_binding::ReserveBindingError::Missing(_)
+            )
+        ));
+        assert_eq!(
+            fs::metadata(&reserve_file_path)
+                .expect("read reserve after missing-binding check")
+                .len(),
+            before_wrong_root
+        );
+        drop(store);
     }
 
     #[test]
@@ -8411,6 +9670,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(recovery_reserve_binding::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(recovery_reserve::TRANSITION_TABLE_NAME),
                     String::from("table")
                 ),
@@ -8465,6 +9728,52 @@ mod tests {
         );
         drop(store);
         let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen migrated v3");
+        assert_eq!(
+            reopened
+                .get(record.operation_id)
+                .expect("read reopened operation")
+                .expect("operation remains"),
+            record
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn existing_v3_database_migrates_reserve_binding_table_atomically() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v3_database(&fixture.owner, &record, 11);
+        let store = OperationJournalStore::open(&fixture.owner).expect("migrate v3 store");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated v3 version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT sequence, record FROM operation_journal WHERE operation_id = ?1",
+                    params![record.operation_id.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .expect("read migrated v3 operation"),
+            (11, encoded)
+        );
+        let binding_count: i64 = store
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {}",
+                    recovery_reserve_binding::TABLE_NAME
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count empty reserve bindings");
+        assert_eq!(binding_count, 0);
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen migrated v4");
         assert_eq!(
             reopened
                 .get(record.operation_id)

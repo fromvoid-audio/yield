@@ -19,7 +19,7 @@ use crate::sample_sources::db::BoundDatabaseRoot;
 
 use super::capacity_reserve::{
     ProtectedReserve, ReserveFailureReason, ReserveObservation, allocate_protected_reserve,
-    revalidate_existing_owned_file,
+    revalidate_existing_owned_file, revalidate_existing_partial_owned_file,
 };
 
 /// Reserved direct child name for the owner-created recovery-reserve namespace.
@@ -57,6 +57,25 @@ impl ReserveNamespaceObservation {
         Ok(result)
     }
 
+    pub(super) fn from_binding(
+        root_identity: &str,
+        file_identity: &str,
+        volume: VolumeIdentity,
+        allocation_unit: u64,
+    ) -> Result<Self, &'static str> {
+        let rounded_floor = round_up_namespace_extent(PROTECTED_FREE_SPACE_FLOOR, allocation_unit)?;
+        let result = Self {
+            root_identity: root_identity.to_owned(),
+            file_identity: file_identity.to_owned(),
+            volume,
+            allocation_unit,
+            length: PROTECTED_FREE_SPACE_FLOOR,
+            allocated_bytes: rounded_floor,
+        };
+        result.validate_shape()?;
+        Ok(result)
+    }
+
     fn to_file_observation(&self) -> ReserveObservation {
         ReserveObservation {
             identity: self.file_identity.clone(),
@@ -80,19 +99,19 @@ impl ReserveNamespaceObservation {
         if self.allocation_unit == 0 {
             return Err("reserve allocation unit is zero");
         }
-        if self.length != PROTECTED_FREE_SPACE_FLOOR {
-            return Err("reserve length does not equal the protected floor");
+        if self.length > PROTECTED_FREE_SPACE_FLOOR {
+            return Err("reserve length exceeds the protected floor");
         }
-        let remainder = PROTECTED_FREE_SPACE_FLOOR % self.allocation_unit;
-        let rounded_floor = if remainder == 0 {
-            PROTECTED_FREE_SPACE_FLOOR
+        let remainder = self.length % self.allocation_unit;
+        let rounded_length = if remainder == 0 {
+            self.length
         } else {
-            PROTECTED_FREE_SPACE_FLOOR
+            self.length
                 .checked_add(self.allocation_unit - remainder)
-                .ok_or("reserve floor rounding overflowed")?
+                .ok_or("reserve length rounding overflowed")?
         };
-        if self.allocated_bytes < rounded_floor {
-            return Err("reserve allocation is below the rounded protected floor");
+        if self.allocated_bytes < rounded_length {
+            return Err("reserve allocation is below the rounded logical length");
         }
         Ok(())
     }
@@ -119,6 +138,20 @@ impl ReserveNamespaceObservation {
 
     pub(super) fn allocated_bytes(&self) -> u64 {
         self.allocated_bytes
+    }
+}
+
+fn round_up_namespace_extent(bytes: u64, allocation_unit: u64) -> Result<u64, &'static str> {
+    if allocation_unit == 0 {
+        return Err("reserve allocation unit is zero");
+    }
+    let remainder = bytes % allocation_unit;
+    if remainder == 0 {
+        Ok(bytes)
+    } else {
+        bytes
+            .checked_add(allocation_unit - remainder)
+            .ok_or("reserve length rounding overflowed")
     }
 }
 
@@ -325,9 +358,131 @@ impl BoundReserve<'_> {
         self.revalidate()?;
         Ok(PhysicalReserveProof {
             volume: self.observation.volume().clone(),
-            physical_bytes: self.observation.allocated_bytes(),
+            physical_bytes: self.reserve.observation().allocated_bytes,
             non_sparse: true,
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn revalidate_partial(
+        &self,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        validate_root(self._root, self._profile_guard)?;
+        let observed = self
+            .reserve
+            .revalidate_partial()
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn revalidate_extent(
+        &self,
+        expected_length: u64,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        validate_root(self._root, self._profile_guard)?;
+        let observed = self
+            .reserve
+            .revalidate_extent(expected_length)
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn shrink_to(
+        &mut self,
+        expected_current_length: u64,
+        target_length: u64,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        self.revalidate_extent(expected_current_length)?;
+        let observed = self
+            .reserve
+            .shrink_to(expected_current_length, target_length)
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn shrink_to_with_mutation_fault(
+        &mut self,
+        expected_current_length: u64,
+        target_length: u64,
+        fault: super::capacity_reserve::MutationFault,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        self.revalidate_extent(expected_current_length)?;
+        let observed = self
+            .reserve
+            .shrink_to_with_mutation_fault(expected_current_length, target_length, fault)
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn ensure_extent_at_most(
+        &mut self,
+        target_length: u64,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        self.revalidate_partial()?;
+        let observed = self
+            .reserve
+            .ensure_extent_at_most(target_length)
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn ensure_extent_at_most_with_mutation_fault(
+        &mut self,
+        target_length: u64,
+        fault: super::capacity_reserve::MutationFault,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        self.revalidate_partial()?;
+        let observed = self
+            .reserve
+            .ensure_extent_at_most_with_mutation_fault(target_length, fault)
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn reconstitute_to_floor(
+        &mut self,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        self.revalidate_partial()?;
+        let observed = self
+            .reserve
+            .reconstitute_to_floor()
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn reconstitute_to_floor_with_mutation_fault(
+        &mut self,
+        fault: super::capacity_reserve::MutationFault,
+    ) -> Result<ReserveObservation, ReserveNamespaceFailureReason> {
+        self.revalidate_partial()?;
+        let observed = self
+            .reserve
+            .reconstitute_to_floor_with_mutation_fault(fault)
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self._root, &self.reserve.observation().identity)?;
+        validate_root(self._root, self._profile_guard)?;
+        Ok(observed)
     }
 
     /// Reopen the fixed child through the retained root and verify it against live descriptor facts.
@@ -506,6 +661,152 @@ pub(super) fn reopen_owned_reserve<'a>(
     {
         reopen_owned_reserve_impl(root, profile_guard, expected, || {})
     }
+}
+
+/// Reopen the fixed reserve child for crash recovery while accepting a descriptor extent that was
+/// durably spent. The caller supplies the minimum logical extent derived from the durable ledger;
+/// this helper never constructs that authority from the stored observation itself.
+pub(super) fn reopen_owned_reserve_partial<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile_guard: &'a WritableProfileGuard,
+    expected: &ReserveNamespaceObservation,
+    minimum_length: u64,
+) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (root, profile_guard, expected, minimum_length);
+        return Err(unsupported_failure());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        reopen_owned_reserve_partial_impl(root, profile_guard, expected, minimum_length)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reopen_owned_reserve_partial_impl<'a>(
+    root: &'a BoundDatabaseRoot,
+    profile_guard: &'a WritableProfileGuard,
+    expected: &ReserveNamespaceObservation,
+    minimum_length: u64,
+) -> Result<BoundReserve<'a>, ReserveNamespaceFailure> {
+    expected.validate_shape().map_err(|reason| {
+        ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Observation,
+            ReserveNamespaceFailureReason::InvalidObservation(reason),
+            None,
+            None,
+            None,
+        )
+    })?;
+    if minimum_length > PROTECTED_FREE_SPACE_FLOOR {
+        return Err(ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Observation,
+            ReserveNamespaceFailureReason::InvalidObservation(
+                "reserve minimum extent exceeds the protected floor",
+            ),
+            None,
+            None,
+            None,
+        ));
+    }
+    validate_root(root, profile_guard).map_err(|reason| {
+        ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::RootValidation,
+            reason,
+            None,
+            None,
+            None,
+        )
+    })?;
+    if root.identity() != expected.root_identity() {
+        return Err(ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Binding,
+            ReserveNamespaceFailureReason::RootIdentityMismatch,
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let file = open_existing(root).map_err(|reason| {
+        ReserveNamespaceFailure::new(ReserveNamespaceFailureStage::Open, reason, None, None, None)
+    })?;
+    let expected_file = expected.to_file_observation();
+    let reserve = match revalidate_existing_partial_owned_file(file, &expected_file) {
+        Ok(reserve) => reserve,
+        Err(failure) => {
+            let reason = failure.reason().clone();
+            let observed_allocation = failure.observed_allocation();
+            let file = failure.into_file();
+            return Err(ReserveNamespaceFailure::new(
+                ReserveNamespaceFailureStage::Binding,
+                ReserveNamespaceFailureReason::Observation(reason),
+                Some(OwnedFailureFile::Raw(file)),
+                None,
+                observed_allocation,
+            ));
+        }
+    };
+    let observed_length = reserve.observation().length;
+    let observed_allocation = reserve.observation().allocated_bytes;
+    if observed_length < minimum_length {
+        return Err(ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Binding,
+            ReserveNamespaceFailureReason::Observation(ReserveFailureReason::LengthMismatch {
+                expected: minimum_length,
+                actual: observed_length,
+            }),
+            Some(OwnedFailureFile::Protected(reserve)),
+            None,
+            Some(observed_allocation),
+        ));
+    }
+    if let Err(reason) = reserve.revalidate_partial() {
+        return Err(ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Binding,
+            ReserveNamespaceFailureReason::Observation(reason),
+            Some(OwnedFailureFile::Protected(reserve)),
+            None,
+            None,
+        ));
+    }
+    if let Err(reason) = verify_current_child_binding(root, &expected.file_identity) {
+        return Err(ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Binding,
+            reason,
+            Some(OwnedFailureFile::Protected(reserve)),
+            None,
+            None,
+        ));
+    }
+    let observation = match ReserveNamespaceObservation::from_reserve(root.identity(), &reserve) {
+        Ok(observation) => observation,
+        Err(reason) => {
+            return Err(ReserveNamespaceFailure::new(
+                ReserveNamespaceFailureStage::Observation,
+                ReserveNamespaceFailureReason::InvalidObservation(reason),
+                Some(OwnedFailureFile::Protected(reserve)),
+                None,
+                None,
+            ));
+        }
+    };
+    if let Err(reason) = validate_root(root, profile_guard) {
+        return Err(ReserveNamespaceFailure::new(
+            ReserveNamespaceFailureStage::Binding,
+            reason,
+            Some(OwnedFailureFile::Protected(reserve)),
+            Some(observation),
+            None,
+        ));
+    }
+    Ok(BoundReserve {
+        _root: root,
+        _profile_guard: profile_guard,
+        reserve,
+        observation,
+    })
 }
 
 #[cfg(test)]
