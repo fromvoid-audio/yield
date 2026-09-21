@@ -16,7 +16,11 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::app_dirs::WritableProfileGuard;
+
 use super::capacity_provider;
+use super::capacity_reserve_namespace::OwnedReserveAllocation;
+use super::capacity_volume_owner::VolumeOwnershipCapability;
 use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{RetryObservation, UniversalCommandArgs};
 use super::full_progress_codec::{
@@ -240,6 +244,186 @@ pub struct OperationJournalOwner {
     worker: Option<JoinHandle<()>>,
 }
 
+/// Worker-owned runtime state with an explicit teardown order.
+///
+/// The profile guard clone is deliberately kept separate from the store's clone. This ensures
+/// that the journal connection and its root lease close before the shared volume lock, while the
+/// final profile guard remains alive until both have been released. Every fallible bootstrap path
+/// and worker panic unwinds through this same guard.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct OwnerRuntimeDropObservation {
+    profile_held_after_store_drop: bool,
+    volume_held_after_store_drop: bool,
+    profile_available_after_teardown: bool,
+    volume_available_after_teardown: bool,
+}
+
+#[cfg(test)]
+struct OwnerRuntimeDropProbe {
+    descriptor: std::fs::File,
+    registry_path: std::path::PathBuf,
+    volume: crate::durable_capacity::VolumeIdentity,
+    profile_identity: String,
+}
+
+#[cfg(test)]
+type OwnerRuntimeDropObserver = Arc<Mutex<Option<OwnerRuntimeDropObservation>>>;
+
+#[cfg(test)]
+impl OwnerRuntimeDropProbe {
+    fn profile_is_held() -> bool {
+        match WritableProfileGuard::acquire_current() {
+            Ok(guard) => {
+                drop(guard);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn volume_is_held(&self) -> bool {
+        match super::capacity_volume_owner::acquire_fixture_for_test(
+            &self.descriptor,
+            &self.registry_path,
+            self.volume.clone(),
+            &self.profile_identity,
+        ) {
+            Ok(capability) => {
+                drop(capability);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn observe(&self) -> OwnerRuntimeDropObservation {
+        let profile_held =
+            panic::catch_unwind(AssertUnwindSafe(Self::profile_is_held)).unwrap_or(false);
+        let volume_held =
+            panic::catch_unwind(AssertUnwindSafe(|| self.volume_is_held())).unwrap_or(false);
+        OwnerRuntimeDropObservation {
+            profile_held_after_store_drop: profile_held,
+            volume_held_after_store_drop: volume_held,
+            profile_available_after_teardown: !profile_held,
+            volume_available_after_teardown: !volume_held,
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_owner_runtime_drop_observation(
+    observer: &OwnerRuntimeDropObserver,
+    observation: OwnerRuntimeDropObservation,
+) {
+    if let Ok(mut slot) = observer.lock() {
+        if let Some(existing) = slot.as_mut() {
+            existing.profile_held_after_store_drop |= observation.profile_held_after_store_drop;
+            existing.volume_held_after_store_drop |= observation.volume_held_after_store_drop;
+            existing.profile_available_after_teardown |=
+                observation.profile_available_after_teardown;
+            existing.volume_available_after_teardown |= observation.volume_available_after_teardown;
+        } else {
+            *slot = Some(observation);
+        }
+    }
+}
+
+struct OwnerRuntime {
+    store: Option<OperationJournalStore>,
+    reserve: Option<OwnedReserveAllocation>,
+    volume_owner: Option<VolumeOwnershipCapability>,
+    final_profile_guard: Option<WritableProfileGuard>,
+    #[cfg(test)]
+    drop_observer: Option<OwnerRuntimeDropObserver>,
+    #[cfg(test)]
+    drop_probe: Option<OwnerRuntimeDropProbe>,
+}
+
+impl OwnerRuntime {
+    fn new(store: OperationJournalStore) -> Result<Self, String> {
+        let final_profile_guard = store
+            .try_clone_profile_guard_for_owner()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            store: Some(store),
+            reserve: None,
+            volume_owner: None,
+            final_profile_guard: Some(final_profile_guard),
+            #[cfg(test)]
+            drop_observer: None,
+            #[cfg(test)]
+            drop_probe: None,
+        })
+    }
+
+    fn store(&self) -> &OperationJournalStore {
+        self.store
+            .as_ref()
+            .expect("owner runtime store must remain installed")
+    }
+
+    fn volume_owner(&self) -> &VolumeOwnershipCapability {
+        self.volume_owner
+            .as_ref()
+            .expect("owner runtime volume owner must be installed")
+    }
+
+    fn install_volume_owner(&mut self, volume_owner: VolumeOwnershipCapability) {
+        debug_assert!(self.volume_owner.is_none());
+        self.volume_owner = Some(volume_owner);
+    }
+
+    fn install_reserve(&mut self, reserve: OwnedReserveAllocation) {
+        debug_assert!(self.reserve.is_none());
+        self.reserve = Some(reserve);
+    }
+
+    #[cfg(test)]
+    fn install_drop_observer(
+        &mut self,
+        observer: OwnerRuntimeDropObserver,
+        probe: OwnerRuntimeDropProbe,
+    ) {
+        self.drop_observer = Some(observer);
+        self.drop_probe = Some(probe);
+    }
+}
+
+impl Drop for OwnerRuntime {
+    fn drop(&mut self) {
+        // Keep this order explicit. The reserve root/descriptor must go first, then SQLite and
+        // its profile-child lease, then the cross-process volume lock, and finally the profile
+        // guard clone retained solely for this runtime.
+        #[cfg(test)]
+        let observer = self.drop_observer.take();
+        #[cfg(test)]
+        let probe = self.drop_probe.as_ref();
+        self.reserve.take();
+        self.store.take();
+        #[cfg(test)]
+        if let (Some(observer), Some(probe)) = (observer.as_ref(), probe) {
+            let mut observation =
+                panic::catch_unwind(AssertUnwindSafe(|| probe.observe())).unwrap_or_default();
+            // At this point the store is gone while the volume and final profile capabilities
+            // remain held by the runtime.
+            observation.profile_available_after_teardown = false;
+            observation.volume_available_after_teardown = false;
+            record_owner_runtime_drop_observation(observer, observation);
+        }
+        self.volume_owner.take();
+        self.final_profile_guard.take();
+        #[cfg(test)]
+        if let (Some(observer), Some(probe)) = (observer.as_ref(), probe) {
+            let mut observation =
+                panic::catch_unwind(AssertUnwindSafe(|| probe.observe())).unwrap_or_default();
+            observation.profile_held_after_store_drop = false;
+            observation.volume_held_after_store_drop = false;
+            record_owner_runtime_drop_observation(observer, observation);
+        }
+    }
+}
+
 impl OperationJournalOwner {
     /// Start a worker by consuming an already-open journal store.
     pub fn start(store: OperationJournalStore) -> Result<Self, OperationJournalOwnerStartError> {
@@ -249,7 +433,26 @@ impl OperationJournalOwner {
             None,
             #[cfg(test)]
             false,
+            #[cfg(test)]
+            true,
+            #[cfg(test)]
+            None,
         )
+    }
+
+    #[cfg(test)]
+    fn start_without_capacity_for_test(
+        store: OperationJournalStore,
+    ) -> Result<Self, OperationJournalOwnerStartError> {
+        Self::start_inner(store, None, false, false, None)
+    }
+
+    #[cfg(test)]
+    fn start_with_capacity_fixture_for_test(
+        store: OperationJournalStore,
+        registry_path: std::path::PathBuf,
+    ) -> Result<Self, OperationJournalOwnerStartError> {
+        Self::start_inner(store, None, false, true, Some(registry_path))
     }
 
     #[cfg(test)]
@@ -262,6 +465,8 @@ impl OperationJournalOwner {
             store,
             Some((Arc::clone(&ready), Arc::clone(&release))),
             false,
+            false,
+            None,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -277,6 +482,8 @@ impl OperationJournalOwner {
             store,
             Some((Arc::clone(&ready), Arc::clone(&release))),
             true,
+            false,
+            None,
         )
         .expect("operation journal owner start");
         (owner, ready, release)
@@ -286,6 +493,8 @@ impl OperationJournalOwner {
         store: OperationJournalStore,
         #[cfg(test)] command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         #[cfg(test)] panic_on_command: bool,
+        #[cfg(test)] bootstrap_capacity: bool,
+        #[cfg(test)] bootstrap_registry_path: Option<std::path::PathBuf>,
     ) -> Result<Self, OperationJournalOwnerStartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY);
         let shared = Arc::new(OwnerShared::new(command_tx));
@@ -303,6 +512,10 @@ impl OperationJournalOwner {
                         command_gate,
                         #[cfg(test)]
                         panic_on_command,
+                        #[cfg(test)]
+                        bootstrap_capacity,
+                        #[cfg(test)]
+                        bootstrap_registry_path,
                     );
                 }));
                 if result.is_err() {
@@ -957,7 +1170,78 @@ fn run_owner(
     shared: Arc<OwnerShared>,
     #[cfg(test)] command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)] panic_on_command: bool,
+    #[cfg(test)] bootstrap_capacity: bool,
+    #[cfg(test)] bootstrap_registry_path: Option<std::path::PathBuf>,
 ) {
+    let mut runtime = match OwnerRuntime::new(store) {
+        Ok(runtime) => runtime,
+        Err(reason) => {
+            shared.mark_unavailable(&format!("owner runtime bootstrap failed: {reason}"));
+            return;
+        }
+    };
+
+    #[cfg(test)]
+    let bootstrap_capacity = bootstrap_capacity;
+    #[cfg(test)]
+    let bootstrap_registry_path = bootstrap_registry_path;
+    #[cfg(test)]
+    if bootstrap_capacity {
+        let volume_owner = match runtime
+            .store()
+            .acquire_profile_journal_volume_owner(bootstrap_registry_path.as_deref())
+        {
+            Ok(volume_owner) => volume_owner,
+            Err(error) => {
+                shared.mark_unavailable(&format!(
+                    "profile/journal volume ownership bootstrap failed: {error}"
+                ));
+                return;
+            }
+        };
+        runtime.install_volume_owner(volume_owner);
+        let reserve = match runtime.store().bootstrap_profile_journal_reserve(
+            runtime.volume_owner(),
+            bootstrap_registry_path.as_deref(),
+        ) {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                shared.mark_unavailable(&format!(
+                    "profile/journal reserve bootstrap failed: {error}"
+                ));
+                return;
+            }
+        };
+        runtime.install_reserve(reserve);
+    }
+
+    #[cfg(not(test))]
+    {
+        let volume_owner = match runtime.store().acquire_profile_journal_volume_owner() {
+            Ok(volume_owner) => volume_owner,
+            Err(error) => {
+                shared.mark_unavailable(&format!(
+                    "profile/journal volume ownership bootstrap failed: {error}"
+                ));
+                return;
+            }
+        };
+        runtime.install_volume_owner(volume_owner);
+        let reserve = match runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner())
+        {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                shared.mark_unavailable(&format!(
+                    "profile/journal reserve bootstrap failed: {error}"
+                ));
+                return;
+            }
+        };
+        runtime.install_reserve(reserve);
+    }
+
     let starting = shared.lifecycle.compare_exchange(
         OwnerLifecycle::Initializing as u8,
         OwnerLifecycle::Available as u8,
@@ -969,7 +1253,6 @@ fn run_owner(
             while let Ok(command) = command_rx.try_recv() {
                 reject_command(command, OperationJournalOwnerError::Closed);
             }
-            drop(store);
             return;
         }
     }
@@ -991,7 +1274,7 @@ fn run_owner(
         if panic_on_command {
             panic!("operation journal owner panic fixture");
         }
-        let panicked = execute_command(command, &store);
+        let panicked = execute_command(command, runtime.store());
         if panicked {
             shared.mark_unavailable("operation journal owner command panicked");
             while let Ok(command) = command_rx.try_recv() {
@@ -1000,7 +1283,7 @@ fn run_owner(
             break;
         }
     }
-    drop(store);
+    drop(runtime);
     if OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
         != OwnerLifecycle::Unavailable
     {
@@ -1205,6 +1488,7 @@ mod tests {
     use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
     use crate::durable_capacity::{
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
+        descriptor_capacity_facts,
     };
     use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;
     use crate::operation_journal::{
@@ -1266,7 +1550,8 @@ mod tests {
     fn open_owner(name: &str) -> (Fixture, OperationJournalOwner) {
         let fixture = fixture(name);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
-        let owner = OperationJournalOwner::start(store).expect("journal owner");
+        let owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         (fixture, owner)
     }
@@ -1287,6 +1572,374 @@ mod tests {
         }
     }
 
+    fn wait_until_unavailable(owner: &OperationJournalOwner) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match owner.status() {
+                OperationJournalOwnerStatus::Unavailable { reason } => return reason,
+                OperationJournalOwnerStatus::Available => {
+                    panic!("journal owner unexpectedly became available")
+                }
+                status if std::time::Instant::now() >= deadline => {
+                    panic!("journal owner status: {status:?}")
+                }
+                _ => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fixture_volume_registry(fixture: &Fixture) -> std::path::PathBuf {
+        // macOS exposes the temporary root through /var -> /private/var. The
+        // registry owner deliberately walks every path component without
+        // following symlinks, so use the canonical retained fixture root.
+        let base = fs::canonicalize(fixture._base.path()).expect("canonical fixture root");
+        let path = base.join("volume-registry");
+        fs::create_dir(&path).expect("fixture volume registry");
+        assert!(
+            fs::metadata(&path)
+                .expect("fixture volume registry metadata")
+                .is_dir(),
+            "fixture volume registry must be a directory: {}",
+            path.display()
+        );
+        path
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_bootstraps_and_reopens_profile_journal_reserve() {
+        let fixture = fixture("journal-owner-reserve-bootstrap");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            store,
+            registry_path.clone(),
+        )
+        .expect("journal owner");
+        wait_until_available(&owner);
+        let client = owner.client();
+        let (args, participants) = valid_full_admission_request();
+        let mut admission = client
+            .admit_full(args, participants)
+            .expect("ordinary admission request");
+        assert!(matches!(
+            admission
+                .recv_timeout(Duration::from_secs(2))
+                .expect("ordinary admission result")
+                .expect_err("ordinary admission remains unavailable"),
+            OperationJournalOwnerError::CapacityProviderUnavailable
+        ));
+        assert!(owner.shutdown());
+
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let first_metadata = fs::metadata(&reserve_path).expect("reserve after bootstrap");
+        assert_eq!(
+            first_metadata.len(),
+            crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+        );
+        let reserve_descriptor = fs::File::open(&reserve_path).expect("open reserve descriptor");
+        let volume = descriptor_capacity_facts(&reserve_descriptor)
+            .expect("reserve capacity facts")
+            .identity;
+
+        let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let (binding_before, counts_before) = reopened_store
+            .test_reserve_bootstrap_snapshot(&volume)
+            .expect("fresh bootstrap snapshot");
+        assert!(
+            binding_before.is_some(),
+            "fresh bootstrap must persist binding"
+        );
+        assert_eq!(counts_before, (0, 1, 0, 0));
+        let mut reopened_owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            reopened_store,
+            registry_path,
+        )
+        .expect("reopen journal owner");
+        wait_until_available(&reopened_owner);
+        assert!(reopened_owner.shutdown());
+
+        let second_metadata = fs::metadata(&reserve_path).expect("reserve after reopen");
+        assert_eq!(second_metadata.len(), first_metadata.len());
+        let final_store = OperationJournalStore::open(&fixture.owner).expect("final store");
+        let (binding_after, counts_after) = final_store
+            .test_reserve_bootstrap_snapshot(&volume)
+            .expect("reopened bootstrap snapshot");
+        assert_eq!(binding_after, binding_before);
+        assert_eq!(counts_after, counts_before);
+        drop(final_store);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_runtime_retains_profile_and_volume_ownership_until_shutdown() {
+        let fixture = fixture("journal-owner-runtime-lifetime");
+        let registry_path = fixture_volume_registry(&fixture);
+        let Fixture {
+            owner: profile_owner,
+            _profile,
+            _config,
+            _base,
+            _runtime,
+        } = fixture;
+        let profile_identity = profile_owner.profile_root_identity().to_owned();
+        let profile_root = profile_owner.profile_root().to_path_buf();
+        let store = OperationJournalStore::open(&profile_owner).expect("journal store");
+        drop(profile_owner);
+
+        let mut owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            store,
+            registry_path.clone(),
+        )
+        .expect("journal owner");
+        wait_until_available(&owner);
+        assert!(matches!(
+            WritableProfileGuard::acquire_current(),
+            Err(crate::app_dirs::ProfileOwnershipError::ProfileOwnedByAnotherProcess { .. })
+        ));
+
+        let reserve_path = profile_root
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("open reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let contention = match super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            facts.identity.clone(),
+            &profile_identity,
+        ) {
+            Ok(_) => panic!("volume owner must remain held while worker is available"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            contention,
+            super::super::capacity_volume_owner::VolumeOwnershipError::OwnedByAnotherProcess { .. }
+        ));
+
+        assert!(owner.shutdown());
+        let replacement = WritableProfileGuard::acquire_current().expect("profile released");
+        let released = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            facts.identity,
+            &profile_identity,
+        )
+        .expect("volume owner released after shutdown");
+        drop(released);
+        drop(replacement);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_runtime_drop_observes_normal_and_unwind_teardown_boundaries() {
+        let fixture = fixture("journal-owner-runtime-drop-boundary");
+        let registry_path = fixture_volume_registry(&fixture);
+        let Fixture {
+            owner: profile_owner,
+            _profile,
+            _config,
+            _base,
+            _runtime,
+        } = fixture;
+        let profile_identity = profile_owner.profile_root_identity().to_owned();
+        let profile_root = profile_owner.profile_root().to_path_buf();
+        let store = OperationJournalStore::open(&profile_owner).expect("journal store");
+        drop(profile_owner);
+
+        let install_observed_runtime = |store: OperationJournalStore| {
+            let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+            let volume_owner = runtime
+                .store()
+                .acquire_profile_journal_volume_owner(Some(&registry_path))
+                .expect("volume owner");
+            runtime.install_volume_owner(volume_owner);
+            let reserve = runtime
+                .store()
+                .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+                .expect("reserve bootstrap");
+            runtime.install_reserve(reserve);
+            let reserve_path = profile_root
+                .join("operation_journal")
+                .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+            let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+            let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+            let observer = Arc::new(Mutex::new(None));
+            runtime.install_drop_observer(
+                Arc::clone(&observer),
+                OwnerRuntimeDropProbe {
+                    descriptor,
+                    registry_path: registry_path.clone(),
+                    volume: facts.identity,
+                    profile_identity: profile_identity.clone(),
+                },
+            );
+            (runtime, observer)
+        };
+
+        let (runtime, normal_observer) = install_observed_runtime(store);
+        drop(runtime);
+        let normal = normal_observer
+            .lock()
+            .expect("normal observer")
+            .clone()
+            .expect("normal drop observation");
+        assert!(normal.profile_held_after_store_drop);
+        assert!(normal.volume_held_after_store_drop);
+        assert!(normal.profile_available_after_teardown);
+        assert!(normal.volume_available_after_teardown);
+
+        let restarted_store = OperationJournalStore::open(
+            &WritableProfileGuard::acquire_current().expect("profile for restart"),
+        )
+        .expect("restart store");
+        let (runtime, unwind_observer) = install_observed_runtime(restarted_store);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _runtime = runtime;
+            panic!("owner runtime unwind fixture");
+        }));
+        assert!(result.is_err());
+        let unwind = unwind_observer
+            .lock()
+            .expect("unwind observer")
+            .clone()
+            .expect("unwind drop observation");
+        assert!(unwind.profile_held_after_store_drop);
+        assert!(unwind.volume_held_after_store_drop);
+        assert!(unwind.profile_available_after_teardown);
+        assert!(unwind.volume_available_after_teardown);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_reopens_explained_spent_partial_profile_journal_reserve() {
+        let fixture = fixture("journal-owner-partial-reserve-reopen");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let operation_id = OperationId::new();
+        store
+            .insert_intent(&intent_record(operation_id))
+            .expect("durable seed intent");
+        store
+            .test_seed_spent_profile_journal_reserve(
+                &registry_path,
+                operation_id,
+                uuid::Uuid::new_v4(),
+                8192,
+                4096,
+                4096,
+            )
+            .expect("seed spent reserve");
+        drop(store);
+
+        let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let reserve_descriptor = fs::File::open(&reserve_path).expect("open partial reserve");
+        let volume = descriptor_capacity_facts(&reserve_descriptor)
+            .expect("partial reserve capacity facts")
+            .identity;
+        let (binding_before, counts_before) = reopened_store
+            .test_reserve_bootstrap_snapshot(&volume)
+            .expect("partial bootstrap snapshot");
+        assert!(binding_before.is_some());
+        assert_eq!(counts_before, (1, 1, 1, 2));
+        let mut owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            reopened_store,
+            registry_path,
+        )
+        .expect("reopen owner");
+        wait_until_available(&owner);
+        assert!(owner.shutdown());
+
+        let metadata = fs::metadata(&reserve_path).expect("partial reserve after reopen");
+        assert!(metadata.len() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR);
+        assert!(metadata.len() >= 4096);
+        let final_store = OperationJournalStore::open(&fixture.owner).expect("final store");
+        let (binding_after, counts_after) = final_store
+            .test_reserve_bootstrap_snapshot(&volume)
+            .expect("reopened partial bootstrap snapshot");
+        assert_eq!(binding_after, binding_before);
+        assert_eq!(counts_after, counts_before);
+        drop(final_store);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_rejects_existing_unbound_reserve_without_replacement() {
+        let fixture = fixture("journal-owner-unbound-reserve");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        fs::write(&reserve_path, b"retained-unbound-reserve").expect("seed unbound reserve");
+        let mut owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            store,
+            registry_path.clone(),
+        )
+        .expect("journal owner");
+        let reason = wait_until_unavailable(&owner);
+        assert!(reason.contains("reserve bootstrap"));
+        assert!(reason.contains("child already exists"));
+        assert_eq!(
+            fs::read(&reserve_path).expect("retained reserve"),
+            b"retained-unbound-reserve"
+        );
+        assert!(!owner.shutdown());
+
+        let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let reserve_descriptor = fs::File::open(&reserve_path).expect("open unbound reserve");
+        let volume = descriptor_capacity_facts(&reserve_descriptor)
+            .expect("unbound reserve capacity facts")
+            .identity;
+        let (binding, counts) = reopened_store
+            .test_reserve_bootstrap_snapshot(&volume)
+            .expect("unbound bootstrap snapshot");
+        assert!(binding.is_none());
+        assert_eq!(counts, (0, 0, 0, 0));
+        drop(reopened_store);
+
+        let retry_store = OperationJournalStore::open(&fixture.owner).expect("retry store");
+        let mut retry_owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(retry_store, registry_path)
+                .expect("retry journal owner");
+        let retry_reason = wait_until_unavailable(&retry_owner);
+        assert!(retry_reason.contains("child already exists"));
+        assert!(!retry_owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn owner_rejects_unsupported_reserve_before_namespace_effects() {
+        let fixture = fixture("journal-owner-unsupported-reserve");
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let reason = wait_until_unavailable(&owner);
+        assert!(reason.contains("reserve bootstrap"));
+        assert!(!reserve_path.exists());
+        assert!(!owner.shutdown());
+        drop(fixture);
+    }
+
     #[test]
     fn owner_reads_full_progress_and_combined_recovery_through_one_queue() {
         let fixture = fixture("journal-owner-combined-recovery");
@@ -1305,7 +1958,8 @@ mod tests {
             2
         );
 
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         let client = owner.client();
 
@@ -1349,7 +2003,8 @@ mod tests {
         let operation_id = initial.snapshot().intent().operation_id();
         assert_eq!(progressed.snapshot().intent().operation_id(), operation_id);
 
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         let client = owner.client();
 
@@ -1435,7 +2090,8 @@ mod tests {
 
         let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
         let mut reopened_owner =
-            OperationJournalOwner::start(reopened_store).expect("reopen owner");
+            OperationJournalOwner::start_without_capacity_for_test(reopened_store)
+                .expect("reopen owner");
         wait_until_available(&reopened_owner);
         let mut reopened = reopened_owner
             .client()
@@ -1473,7 +2129,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         for (index, record) in records.iter().cloned().enumerate() {
             let mut request = owner
@@ -1494,7 +2151,8 @@ mod tests {
 
         let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
         let mut reopened_owner =
-            OperationJournalOwner::start(reopened_store).expect("reopen owner");
+            OperationJournalOwner::start_without_capacity_for_test(reopened_store)
+                .expect("reopen owner");
         wait_until_available(&reopened_owner);
         for (operation_id, expected) in operation_ids.into_iter().zip(&records) {
             let mut request = reopened_owner
@@ -1545,7 +2203,8 @@ mod tests {
             StoredFullProgressRecord::new(progressed_snapshot).expect("progressed full record");
         let operation_id = initial.snapshot().intent().operation_id();
 
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         let client = owner.client();
         let dropped = client
@@ -1586,7 +2245,8 @@ mod tests {
             crate::operation_journal::work_progress::test_oversized_full_progress_store_record();
         let operation_id = oversized.snapshot().intent().operation_id();
 
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         let client = owner.client();
         assert!(matches!(
@@ -1635,7 +2295,8 @@ mod tests {
             .map(|entry| entry.sequence())
             .collect();
 
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         let (args, participants) = valid_full_admission_request();
         let mut request = owner
@@ -1736,7 +2397,8 @@ mod tests {
     fn full_admission_reports_store_guard_failure_before_provider_result() {
         let fixture = fixture("journal-owner-full-admission-guard");
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
-        let mut owner = OperationJournalOwner::start(store).expect("journal owner");
+        let mut owner =
+            OperationJournalOwner::start_without_capacity_for_test(store).expect("journal owner");
         wait_until_available(&owner);
         let sidecar = fixture
             .owner

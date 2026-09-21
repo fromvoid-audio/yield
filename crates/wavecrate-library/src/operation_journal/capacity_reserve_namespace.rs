@@ -276,6 +276,25 @@ pub(crate) struct BoundReserve<'a> {
     observation: ReserveNamespaceObservation,
 }
 
+/// Owner-thread reserve storage that does not borrow the journal store.
+///
+/// The store keeps the original profile-child root lease alive. This capsule owns a duplicate
+/// descriptor and the protected file handle, while [`BoundReserveView`] supplies the short-lived
+/// borrowed view needed for descriptor validation or a recovery command.
+pub(crate) struct OwnedReserveAllocation {
+    root: BoundDatabaseRoot,
+    reserve: ProtectedReserve,
+    observation: ReserveNamespaceObservation,
+}
+
+/// Ephemeral validation view over an owner-thread reserve capsule.
+pub(crate) struct BoundReserveView<'a> {
+    root: &'a BoundDatabaseRoot,
+    profile_guard: &'a WritableProfileGuard,
+    reserve: &'a mut ProtectedReserve,
+    observation: &'a ReserveNamespaceObservation,
+}
+
 /// Fresh, descriptor-derived proof that the retained reserve still owns its physical floor.
 ///
 /// This proof is intentionally non-serialized and can only be produced by revalidating the
@@ -322,6 +341,33 @@ impl BoundReserve<'_> {
 
     pub(super) fn profile_identity(&self) -> &str {
         self._profile_guard.profile_root_identity()
+    }
+
+    /// Move the non-borrowed reserve state into an owner-thread capsule.
+    pub(super) fn into_owned(self) -> Result<OwnedReserveAllocation, ReserveNamespaceFailure> {
+        let BoundReserve {
+            _root,
+            reserve,
+            observation,
+            ..
+        } = self;
+        let root = match _root.try_clone_for_owned_capability() {
+            Ok(root) => root,
+            Err(error) => {
+                return Err(ReserveNamespaceFailure::new(
+                    ReserveNamespaceFailureStage::Binding,
+                    ReserveNamespaceFailureReason::RootValidation(error.to_string()),
+                    Some(OwnedFailureFile::Protected(reserve)),
+                    Some(observation),
+                    None,
+                ));
+            }
+        };
+        Ok(OwnedReserveAllocation {
+            root,
+            reserve,
+            observation,
+        })
     }
 
     pub(super) fn fresh_capacity_facts(
@@ -511,6 +557,50 @@ impl BoundReserve<'_> {
             verify_current_child_binding(self._root, &expected.identity)?;
             validate_root(self._root, self._profile_guard)
         }
+    }
+}
+
+impl OwnedReserveAllocation {
+    pub(super) fn observation(&self) -> &ReserveNamespaceObservation {
+        &self.observation
+    }
+
+    pub(super) fn view<'a>(
+        &'a mut self,
+        profile_guard: &'a WritableProfileGuard,
+    ) -> BoundReserveView<'a> {
+        BoundReserveView {
+            root: &self.root,
+            profile_guard,
+            reserve: &mut self.reserve,
+            observation: &self.observation,
+        }
+    }
+}
+
+impl BoundReserveView<'_> {
+    pub(super) fn observation(&self) -> &ReserveNamespaceObservation {
+        self.observation
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), ReserveNamespaceFailureReason> {
+        validate_root(self.root, self.profile_guard)?;
+        self.reserve
+            .revalidate()
+            .map_err(ReserveNamespaceFailureReason::Observation)?;
+        verify_current_child_binding(self.root, &self.reserve.observation().identity)?;
+        validate_root(self.root, self.profile_guard)
+    }
+
+    pub(super) fn revalidate_and_prove(
+        &self,
+    ) -> Result<PhysicalReserveProof, ReserveNamespaceFailureReason> {
+        self.revalidate()?;
+        Ok(PhysicalReserveProof {
+            volume: self.observation.volume().clone(),
+            physical_bytes: self.reserve.observation().allocated_bytes,
+            non_sparse: true,
+        })
     }
 }
 
@@ -1157,6 +1247,29 @@ mod tests {
     fn root(fixture: &Fixture, name: &str) -> BoundDatabaseRoot {
         BoundDatabaseRoot::for_profile_child(&fixture.owner, Path::new(name))
             .expect("dedicated reserve root")
+    }
+
+    #[test]
+    fn owned_root_clone_retains_profile_child_lease_until_clone_drop() {
+        let fixture = fixture();
+        let root = root(&fixture, "reserve-root-lease");
+        let clone = root
+            .try_clone_for_owned_capability()
+            .expect("clone retained root capability");
+        drop(root);
+
+        let conflict = match BoundDatabaseRoot::for_profile_child(
+            &fixture.owner,
+            Path::new("reserve-root-lease"),
+        ) {
+            Ok(_) => panic!("owned clone must retain the profile-child lease"),
+            Err(error) => error,
+        };
+        assert!(conflict.to_string().contains("already open"));
+
+        drop(clone);
+        BoundDatabaseRoot::for_profile_child(&fixture.owner, Path::new("reserve-root-lease"))
+            .expect("profile-child lease released with the final clone");
     }
 
     fn synthetic_observation(
