@@ -376,6 +376,181 @@ impl WritableProfileGuard {
     }
 }
 
+/// Open the profile-independent per-user application root used by shared ownership helpers.
+///
+/// This deliberately derives the root from the operating-system user account on macOS rather
+/// than from profile or process-local configuration overrides. Other targets remain unsupported
+/// until an equivalent identity-safe application-data location is qualified.
+pub(crate) fn open_canonical_global_app_root() -> Result<(PathBuf, Dir), ProfileOwnershipError> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = canonical_user_home().map_err(|source| ProfileOwnershipError::Io {
+            path: PathBuf::from("~"),
+            source,
+        })?;
+        let home_dir = open_profile_root(&home).map_err(|source| ProfileOwnershipError::Io {
+            path: home.clone(),
+            source,
+        })?;
+        ensure_current_user_owned(&home, &home_dir)?;
+
+        let library_dir = open_existing_child(&home_dir, "Library", &home)?;
+        ensure_current_user_owned(&home.join("Library"), &library_dir)?;
+        let support_path = home.join("Library").join("Application Support");
+        let support_dir =
+            open_existing_child(&library_dir, "Application Support", &home.join("Library"))?;
+        ensure_current_user_owned(&support_path, &support_dir)?;
+        let app_path = support_path.join(super::APP_DIR_NAME);
+        let (app_dir, _) =
+            open_or_create_final_child(&support_dir, super::APP_DIR_NAME, &support_path)?;
+        ensure_current_user_owned(&app_path, &app_dir)?;
+        return Ok((app_path, app_dir));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(ProfileOwnershipError::Unsupported {
+            path: PathBuf::from(super::APP_DIR_NAME),
+        })
+    }
+}
+
+/// Open an absolute directory by walking every component without following symlinks.
+pub(crate) fn open_no_follow_directory(path: &Path) -> io::Result<Dir> {
+    open_profile_root(path)
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_user_home() -> io::Result<PathBuf> {
+    use std::{ffi::CStr, mem::MaybeUninit, os::unix::ffi::OsStringExt, ptr};
+
+    let uid = unsafe { libc::geteuid() };
+    let mut passwd = MaybeUninit::<libc::passwd>::zeroed();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut result = ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            passwd.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if result.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "effective user has no passwd entry",
+        ));
+    }
+    let directory = unsafe { CStr::from_ptr((*result).pw_dir) };
+    if directory.to_bytes().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "effective user has an empty home directory",
+        ));
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(
+        directory.to_bytes().to_vec(),
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_current_user_owned(path: &Path, dir: &Dir) -> Result<(), ProfileOwnershipError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = dir
+        .try_clone()
+        .map_err(|source| ProfileOwnershipError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .into_std_file();
+    let metadata = file
+        .metadata()
+        .map_err(|source| ProfileOwnershipError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        return Err(ProfileOwnershipError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "shared ownership root is not owned by the effective user",
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_existing_child(
+    parent: &Dir,
+    name: &str,
+    parent_path: &Path,
+) -> Result<Dir, ProfileOwnershipError> {
+    parent
+        .open_dir_nofollow(name)
+        .map_err(|source| ProfileOwnershipError::Io {
+            path: parent_path.join(name),
+            source,
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn open_or_create_final_child(
+    parent: &Dir,
+    name: &str,
+    parent_path: &Path,
+) -> Result<(Dir, bool), ProfileOwnershipError> {
+    match parent.open_dir_nofollow(name) {
+        Ok(directory) => Ok((directory, false)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            parent
+                .create_dir(name)
+                .or_else(|create_error| {
+                    if create_error.kind() == io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(create_error)
+                    }
+                })
+                .map_err(|source| ProfileOwnershipError::Io {
+                    path: parent_path.join(name),
+                    source,
+                })?;
+            sync_directory(parent, parent_path)?;
+            parent
+                .open_dir_nofollow(name)
+                .map(|directory| (directory, true))
+                .map_err(|source| ProfileOwnershipError::Io {
+                    path: parent_path.join(name),
+                    source,
+                })
+        }
+        Err(source) => Err(ProfileOwnershipError::Io {
+            path: parent_path.join(name),
+            source,
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sync_directory(directory: &Dir, path: &Path) -> Result<(), ProfileOwnershipError> {
+    directory
+        .try_clone()
+        .and_then(|directory| directory.into_std_file().sync_all())
+        .map_err(|source| ProfileOwnershipError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 fn single_normal_component(path: &Path) -> io::Result<&Path> {
     let mut components = path.components();
     let Some(Component::Normal(name)) = components.next() else {
@@ -650,6 +825,33 @@ mod tests {
 
     fn profile_root(base: &std::path::Path, profile: &str) -> PathBuf {
         base.join(APP_DIR_NAME).join(PROFILE_DIR_NAME).join(profile)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn final_global_app_child_creation_is_parent_bound_and_no_follow() {
+        let _runtime = test_runtime();
+        let base = profile_base();
+        let support_path = base.path().join("Library").join("Application Support");
+        fs::create_dir_all(&support_path).expect("application support parent");
+        let support_dir = open_no_follow_directory(&support_path).expect("open support parent");
+
+        let (app_dir, created) =
+            open_or_create_final_child(&support_dir, APP_DIR_NAME, &support_path)
+                .expect("create final application child");
+        assert!(created);
+        assert!(app_dir.try_clone().is_ok());
+
+        let (_, existing) = open_or_create_final_child(&support_dir, APP_DIR_NAME, &support_path)
+            .expect("reopen final application child");
+        assert!(!existing);
+
+        let symlink_name = "symlink-child";
+        let symlink_target = support_path.join("symlink-target");
+        fs::create_dir(&symlink_target).expect("symlink target");
+        std::os::unix::fs::symlink(&symlink_target, support_path.join(symlink_name))
+            .expect("symlink child");
+        assert!(open_or_create_final_child(&support_dir, symlink_name, &support_path).is_err());
     }
 
     fn read_locked_diagnostic(file: &File) -> io::Result<Vec<u8>> {
