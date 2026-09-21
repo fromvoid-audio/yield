@@ -407,6 +407,9 @@ enum CapacityProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_journal::full_capacity_planner::{
+        CapacityAllocationNature, CapacityEstimate, CapacityRequirement, derive_full_capacity_plan,
+    };
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, FullCapacityAllocation, FullCapacityPlan,
     };
@@ -677,6 +680,70 @@ mod tests {
                 FullCapacityAllocationClass::OperationRecoveryPayload
             ),
             per_class_bytes
+        );
+        drop(lease);
+        assert_eq!(provider.claim_count(), 0);
+    }
+
+    #[test]
+    fn descriptor_planner_output_keeps_retained_rows_and_charges_independent_new_classes() {
+        let temp = tempfile::tempdir().expect("create planner fixtures");
+        let path = temp.path().join("destination");
+        let descriptor = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open planner descriptor");
+        let volume = VolumeIdentity { device: 12 };
+        let facts = |free_bytes| VolumeFacts {
+            identity: volume.clone(),
+            free_bytes,
+            allocation_unit: 4096,
+        };
+        let requirements = [
+            CapacityRequirement::with_test_facts(
+                &descriptor,
+                facts(PROTECTED_FREE_SPACE_FLOOR + 8192),
+                FullCapacityAllocationClass::ExistingDestination,
+                CapacityEstimate::Known(1 << 30),
+                CapacityAllocationNature::ExistingRetained,
+            ),
+            CapacityRequirement::with_test_facts(
+                &descriptor,
+                facts(PROTECTED_FREE_SPACE_FLOOR + 8192),
+                FullCapacityAllocationClass::DestinationStaging,
+                CapacityEstimate::Known(4096),
+                CapacityAllocationNature::NewAllocation,
+            ),
+            CapacityRequirement::with_test_facts(
+                &descriptor,
+                facts(PROTECTED_FREE_SPACE_FLOOR + 8192),
+                FullCapacityAllocationClass::OperationRecoveryPayload,
+                CapacityEstimate::Known(4096),
+                CapacityAllocationNature::NewAllocation,
+            ),
+        ];
+        let plan = derive_full_capacity_plan(&requirements).expect("descriptor-derived plan");
+        let claims = claims_for_plan(&plan);
+        let mut fixture = BTreeMap::new();
+        fixture.insert(volume.clone(), facts(PROTECTED_FREE_SPACE_FLOOR + 8192));
+        let provider = CapacityProvider::qualified_fixture(fixture);
+        let lease = provider.admit(&plan, &claims).expect("fixture admission");
+        assert_eq!(
+            provider.outstanding(&volume, FullCapacityAllocationClass::ExistingDestination),
+            1 << 30
+        );
+        assert_eq!(
+            provider.outstanding(&volume, FullCapacityAllocationClass::DestinationStaging),
+            4096
+        );
+        assert_eq!(
+            provider.outstanding(
+                &volume,
+                FullCapacityAllocationClass::OperationRecoveryPayload
+            ),
+            4096
         );
         drop(lease);
         assert_eq!(provider.claim_count(), 0);
