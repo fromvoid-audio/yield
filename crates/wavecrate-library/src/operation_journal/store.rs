@@ -57,9 +57,14 @@ use super::validation::{RecordConsistency, classify_record};
 
 #[allow(dead_code)]
 mod full_progress;
+#[allow(dead_code)]
+mod ordinary_claims;
 mod recovery_reserve;
 mod recovery_reserve_binding;
 pub(crate) use full_progress::FullProgressWriteOutcome;
+#[cfg(test)]
+pub(crate) use ordinary_claims::MAX_PAGE_ROWS;
+pub(crate) use ordinary_claims::{OrdinaryClaimCursor, OrdinaryClaimPage, OrdinaryClaimReadError};
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
 
@@ -73,7 +78,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 5;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -88,6 +93,7 @@ const FULL_PROGRESS_TABLE_NAME: &str = "operation_journal_full_progress";
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const RECOVERY_RESERVE_SCHEMA_VERSION: u32 = 3;
+const RECOVERY_RESERVE_BINDING_SCHEMA_VERSION: u32 = 4;
 const MAX_SCHEMA_OBJECTS: i64 = 8;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
@@ -1038,6 +1044,25 @@ impl OperationJournalStore {
         recovery::recovery_readiness(self)
     }
 
+    /// Read a bounded, immutable ordinary-claim observation page.
+    ///
+    /// Claim rows are sorted by their canonical UUID text and are never interpreted as live
+    /// capacity authority. A zero limit is an explicit empty page; larger requests are rejected
+    /// before SQLite is queried.
+    #[allow(dead_code)]
+    pub(crate) fn read_ordinary_claim_page(
+        &self,
+        cursor: Option<OrdinaryClaimCursor>,
+        limit: usize,
+    ) -> Result<OrdinaryClaimPage, OrdinaryClaimReadError> {
+        self.validate_namespace()
+            .map_err(|error| OrdinaryClaimReadError::Namespace(error.to_string()))?;
+        let page = ordinary_claims::read_page(&self.connection, cursor, limit)?;
+        self.validate_namespace()
+            .map_err(|error| OrdinaryClaimReadError::Namespace(error.to_string()))?;
+        Ok(page)
+    }
+
     /// Validate the profile-owned journal boundary before a future admission decision.
     ///
     /// This intentionally performs no operation-ID allocation, persistence, capacity
@@ -1530,6 +1555,28 @@ impl OperationJournalStore {
                     RECOVERY_RESERVE_SCHEMA_VERSION,
                 )?;
                 migrate_recovery_reserve_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == RECOVERY_RESERVE_BINDING_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    RECOVERY_RESERVE_BINDING_SCHEMA_VERSION,
+                )?;
+                migrate_ordinary_claim_schema(
                     &connection,
                     &database_root,
                     &database_path,
@@ -4812,6 +4859,7 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
         LEGACY_JOURNAL_SCHEMA_VERSION
             | PREVIOUS_JOURNAL_SCHEMA_VERSION
             | RECOVERY_RESERVE_SCHEMA_VERSION
+            | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -4841,6 +4889,7 @@ fn read_sqlite_user_version(
         LEGACY_JOURNAL_SCHEMA_VERSION
             | PREVIOUS_JOURNAL_SCHEMA_VERSION
             | RECOVERY_RESERVE_SCHEMA_VERSION
+            | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -4902,10 +4951,33 @@ fn validate_existing_schema(
                 String::from("table"),
             ),
         ],
+        RECOVERY_RESERVE_BINDING_SCHEMA_VERSION => vec![
+            (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+            (
+                String::from(FULL_PROGRESS_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve_binding::TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::TRANSITION_TABLE_NAME),
+                String::from("table"),
+            ),
+        ],
         JOURNAL_SCHEMA_VERSION => vec![
             (String::from(JOURNAL_TABLE_NAME), String::from("table")),
             (
                 String::from(FULL_PROGRESS_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(ordinary_claims::TABLE_NAME),
                 String::from("table"),
             ),
             (
@@ -4938,7 +5010,10 @@ fn validate_existing_schema(
     validate_table_schema(connection, path, JOURNAL_TABLE_NAME, CREATE_JOURNAL_TABLE)?;
     if matches!(
         schema_version,
-        PREVIOUS_JOURNAL_SCHEMA_VERSION | RECOVERY_RESERVE_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        PREVIOUS_JOURNAL_SCHEMA_VERSION
+            | RECOVERY_RESERVE_SCHEMA_VERSION
+            | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -4949,7 +5024,9 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        RECOVERY_RESERVE_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        RECOVERY_RESERVE_SCHEMA_VERSION
+            | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -4964,12 +5041,23 @@ fn validate_existing_schema(
             recovery_reserve::CREATE_TRANSITION_TABLE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        RECOVERY_RESERVE_BINDING_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         validate_table_schema(
             connection,
             path,
             recovery_reserve_binding::TABLE_NAME,
             recovery_reserve_binding::CREATE_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            ordinary_claims::TABLE_NAME,
+            ordinary_claims::CREATE_TABLE,
         )?;
     }
     Ok(())
@@ -5089,6 +5177,18 @@ fn validate_table_schema(
                 0,
             ),
         ],
+        ordinary_claims::TABLE_NAME => vec![
+            (String::from("claim_id"), String::from("TEXT"), 1, 1),
+            (String::from("operation_id"), String::from("TEXT"), 1, 0),
+            (String::from("volume_device"), String::from("TEXT"), 1, 0),
+            (String::from("allocation_class"), String::from("TEXT"), 1, 0),
+            (
+                String::from("allocated_bytes"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+        ],
         _ => {
             return Err(audit_error(path, format!("unsupported table {table_name}")));
         }
@@ -5119,12 +5219,18 @@ fn validate_table_schema(
         .map(|(_, _, _, origin, _)| origin.clone())
         .collect();
     origins.sort_unstable();
-    let expected_index_count = if table_name == recovery_reserve_binding::TABLE_NAME {
+    let expected_index_count = if matches!(
+        table_name,
+        recovery_reserve_binding::TABLE_NAME | ordinary_claims::TABLE_NAME
+    ) {
         1
     } else {
         2
     };
-    let expected_origins: Vec<String> = if table_name == recovery_reserve_binding::TABLE_NAME {
+    let expected_origins: Vec<String> = if matches!(
+        table_name,
+        recovery_reserve_binding::TABLE_NAME | ordinary_claims::TABLE_NAME
+    ) {
         vec![String::from("pk")]
     } else {
         vec![String::from("pk"), String::from("u")]
@@ -5184,6 +5290,7 @@ fn migrate_legacy_schema(
         connection.execute_batch(recovery_reserve::CREATE_CHARGE_TABLE)?;
         connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
         connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -5250,6 +5357,7 @@ fn migrate_previous_schema(
         connection.execute_batch(recovery_reserve::CREATE_CHARGE_TABLE)?;
         connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
         connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -5309,6 +5417,70 @@ fn migrate_recovery_reserve_schema(
         )?;
         validate_existing_schema(connection, database_path, RECOVERY_RESERVE_SCHEMA_VERSION)?;
         connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_ordinary_claim_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        RECOVERY_RESERVE_BINDING_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            RECOVERY_RESERVE_BINDING_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(
+            connection,
+            database_path,
+            RECOVERY_RESERVE_BINDING_SCHEMA_VERSION,
+        )?;
+        connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -5388,10 +5560,12 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {CREATE_FULL_PROGRESS_TABLE};
              {charge_table};
              {transition_table};
-             {binding_table};",
+             {binding_table};
+             {ordinary_claim_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
             binding_table = recovery_reserve_binding::CREATE_TABLE,
+            ordinary_claim_table = ordinary_claims::CREATE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -5543,6 +5717,7 @@ mod tests {
         CapacityAllocationClass, DurableCapacityPlan, DurableVolumeCapacity,
         PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
     };
+    use crate::operation_journal::AdmissionClaimId;
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
         CreateFolderIntentArgs, EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString,
@@ -6536,6 +6711,122 @@ mod tests {
             .expect("insert v3 journal row");
         drop(connection);
         (path, encoded)
+    }
+
+    fn write_v4_database(
+        owner: &WritableProfileGuard,
+        record: &StoredOperationRecord,
+        sequence: i64,
+    ) -> (PathBuf, Vec<u8>) {
+        let path = database_path(owner);
+        fs::create_dir_all(path.parent().expect("journal directory")).expect("journal directory");
+        let encoded = encode(record).expect("encode binding-schema fixture");
+        let connection = Connection::open(&path).expect("open binding-schema fixture");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {JOURNAL_APPLICATION_ID};
+                 PRAGMA user_version = {RECOVERY_RESERVE_BINDING_SCHEMA_VERSION};
+                 {CREATE_JOURNAL_TABLE};
+                 {CREATE_FULL_PROGRESS_TABLE};
+                 {charge_table};
+                 {binding_table};
+                 {transition_table};",
+                charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
+                binding_table = recovery_reserve_binding::CREATE_TABLE,
+                transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
+            ))
+            .expect("create v4 journal schema");
+        connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![record.operation_id.to_string(), sequence, &encoded],
+            )
+            .expect("insert v4 journal row");
+        let (_, progressed) = full_progress_store_records();
+        let progressed_encoded = crate::operation_journal::full_progress_codec::encode(&progressed)
+            .expect("encode v4 full-progress fixture");
+        let progressed_operation_id = progressed.snapshot().intent().operation_id();
+        connection
+            .execute(
+                "INSERT INTO operation_journal_full_progress (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    progressed_operation_id.to_string(),
+                    17_i64,
+                    &progressed_encoded
+                ],
+            )
+            .expect("insert v4 full-progress row");
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (volume_device, profile_identity, root_identity, file_identity,
+                      allocation_unit, protected_floor_bytes, namespace_version,
+                      namespace_name, owner_generation)
+                     VALUES ('7', 'fixture-profile', 'fixture-root', 'fixture-file',
+                             4096, ?1, 1, 'recovery-reserve.bin', 1)",
+                    table = recovery_reserve_binding::TABLE_NAME
+                ),
+                params![i64::try_from(PROTECTED_FREE_SPACE_FLOOR).expect("fixture floor")],
+            )
+            .expect("insert v4 reserve binding");
+        let charge_id = Uuid::from_u128(40_001);
+        let transition_id = Uuid::from_u128(40_002);
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (charge_id, volume_device, active_volume_device, operation_id, purpose,
+                      budget_bytes, margin_bytes, precharge_capacity_bytes, remaining_bytes,
+                      state, transition_sequence)
+                     VALUES (?1, '7', '7', ?2, 'OperationRecovery', 10, 1, 0, 10,
+                             'Charged', 1)",
+                    table = recovery_reserve::CHARGE_TABLE_NAME
+                ),
+                params![charge_id.to_string(), record.operation_id.to_string()],
+            )
+            .expect("insert v4 recovery charge");
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (charge_id, transition_id, transition_sequence, kind, amount_bytes,
+                      remaining_bytes, state)
+                     VALUES (?1, ?2, 1, 'Charged', 10, 10, 'Charged')",
+                    table = recovery_reserve::TRANSITION_TABLE_NAME
+                ),
+                params![charge_id.to_string(), transition_id.to_string()],
+            )
+            .expect("insert v4 recovery transition");
+        drop(connection);
+        (path, encoded)
+    }
+
+    fn insert_ordinary_claim(
+        store: &OperationJournalStore,
+        claim_id: Uuid,
+        operation_id: Uuid,
+        volume_device: &str,
+        allocation_class: &str,
+        allocated_bytes: i64,
+    ) -> rusqlite::Result<usize> {
+        store.connection.execute(
+            &format!(
+                "INSERT INTO {table}
+                 (claim_id, operation_id, volume_device, allocation_class, allocated_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                table = ordinary_claims::TABLE_NAME
+            ),
+            params![
+                claim_id.to_string(),
+                operation_id.to_string(),
+                volume_device,
+                allocation_class,
+                allocated_bytes
+            ],
+        )
     }
 
     #[test]
@@ -9872,6 +10163,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(ordinary_claims::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(recovery_reserve::CHARGE_TABLE_NAME),
                     String::from("table")
                 ),
@@ -9894,6 +10189,405 @@ mod tests {
             )
             .expect("count empty full-progress table");
         assert_eq!(full_progress_rows, 0);
+    }
+
+    #[test]
+    fn existing_v4_database_migrates_empty_ordinary_claim_table_without_rewriting_rows() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v4_database(&fixture.owner, &record, 13);
+        let store = OperationJournalStore::open(&fixture.owner).expect("migrate v4 store");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated v4 version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT sequence, record FROM operation_journal WHERE operation_id = ?1",
+                    params![record.operation_id.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .expect("read migrated v4 operation"),
+            (13, encoded)
+        );
+        let (_, progressed) = full_progress_store_records();
+        let progressed_operation_id = progressed.snapshot().intent().operation_id();
+        let progressed_encoded = crate::operation_journal::full_progress_codec::encode(&progressed)
+            .expect("encode expected full-progress row");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT sequence, record FROM operation_journal_full_progress
+                     WHERE operation_id = ?1",
+                    params![progressed_operation_id.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .expect("read migrated full-progress row"),
+            (17, progressed_encoded)
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT volume_device, profile_identity, root_identity, file_identity,
+                                allocation_unit, protected_floor_bytes, namespace_version,
+                                namespace_name, owner_generation
+                         FROM {}",
+                        recovery_reserve_binding::TABLE_NAME
+                    ),
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, i64>(8)?,
+                        ))
+                    },
+                )
+                .expect("read migrated reserve binding"),
+            (
+                String::from("7"),
+                String::from("fixture-profile"),
+                String::from("fixture-root"),
+                String::from("fixture-file"),
+                4096,
+                i64::try_from(PROTECTED_FREE_SPACE_FLOOR).expect("fixture floor"),
+                1,
+                String::from("recovery-reserve.bin"),
+                1,
+            )
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT charge_id, volume_device, active_volume_device, operation_id,
+                                purpose, budget_bytes, margin_bytes, precharge_capacity_bytes,
+                                remaining_bytes, state, transition_sequence
+                         FROM {}",
+                        recovery_reserve::CHARGE_TABLE_NAME
+                    ),
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, i64>(10)?,
+                        ))
+                    },
+                )
+                .expect("read migrated recovery charge"),
+            (
+                Uuid::from_u128(40_001).to_string(),
+                String::from("7"),
+                String::from("7"),
+                record.operation_id.to_string(),
+                String::from("OperationRecovery"),
+                10,
+                1,
+                0,
+                10,
+                String::from("Charged"),
+                1,
+            )
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT charge_id, transition_id, transition_sequence, kind,
+                                amount_bytes, remaining_bytes, state
+                         FROM {}",
+                        recovery_reserve::TRANSITION_TABLE_NAME
+                    ),
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    },
+                )
+                .expect("read migrated recovery transition"),
+            (
+                Uuid::from_u128(40_001).to_string(),
+                Uuid::from_u128(40_002).to_string(),
+                1,
+                String::from("Charged"),
+                10,
+                10,
+                String::from("Charged"),
+            )
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", ordinary_claims::TABLE_NAME),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count migrated ordinary claims"),
+            0
+        );
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen migrated v5");
+        assert!(
+            reopened
+                .read_ordinary_claim_page(None, MAX_PAGE_ROWS)
+                .expect("read empty ordinary-claim page")
+                .records()
+                .is_empty()
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn ordinary_claim_pages_are_uuid_keyset_bounded_and_restart_stable() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        for index in 1..=257_u128 {
+            insert_ordinary_claim(
+                &store,
+                Uuid::from_u128(index),
+                Uuid::from_u128(10_000 + index),
+                "7",
+                "DestinationStaging",
+                i64::try_from(index).expect("fixture bytes"),
+            )
+            .expect("insert ordinary claim fixture");
+        }
+
+        let first = store
+            .read_ordinary_claim_page(None, MAX_PAGE_ROWS)
+            .expect("read first ordinary-claim page");
+        assert_eq!(first.records().len(), MAX_PAGE_ROWS);
+        assert_eq!(first.records()[0].claim_id().as_uuid(), Uuid::from_u128(1));
+        assert_eq!(
+            first.records()[MAX_PAGE_ROWS - 1].claim_id().as_uuid(),
+            Uuid::from_u128(256)
+        );
+        let cursor = first.next_cursor().expect("page has a continuation cursor");
+        assert_eq!(cursor.claim_id().as_uuid(), Uuid::from_u128(256));
+
+        let second = store
+            .read_ordinary_claim_page(Some(cursor), MAX_PAGE_ROWS)
+            .expect("read second ordinary-claim page");
+        assert_eq!(second.records().len(), 1);
+        assert_eq!(
+            second.records()[0].claim_id().as_uuid(),
+            Uuid::from_u128(257)
+        );
+        assert!(second.next_cursor().is_none());
+        assert!(
+            store
+                .read_ordinary_claim_page(
+                    Some(OrdinaryClaimCursor::from_claim_id(
+                        AdmissionClaimId::from_uuid(Uuid::from_u128(u128::MAX))
+                            .expect("non-nil end cursor")
+                    )),
+                    MAX_PAGE_ROWS,
+                )
+                .expect("read page beyond end")
+                .records()
+                .is_empty()
+        );
+        assert!(
+            store
+                .read_ordinary_claim_page(None, 0)
+                .expect("read explicit empty page")
+                .records()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.read_ordinary_claim_page(None, MAX_PAGE_ROWS + 1),
+            Err(OrdinaryClaimReadError::PageLimitExceeded { .. })
+        ));
+
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let page = reopened
+            .read_ordinary_claim_page(None, 2)
+            .expect("read claims after restart");
+        assert_eq!(page.records().len(), 2);
+        assert_eq!(page.records()[0].claim_id().as_uuid(), Uuid::from_u128(1));
+        assert_eq!(
+            page.records()[0].operation_id().as_uuid(),
+            Uuid::from_u128(10_001)
+        );
+    }
+
+    #[test]
+    fn ordinary_claim_read_preserves_orphan_operation_association() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let claim_id = Uuid::from_u128(4_001);
+        let orphan_operation = Uuid::from_u128(8_001);
+        insert_ordinary_claim(
+            &store,
+            claim_id,
+            orphan_operation,
+            "9",
+            "OperationRecoveryPayload",
+            4_096,
+        )
+        .expect("insert orphan-associated claim");
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let page = reopened
+            .read_ordinary_claim_page(None, MAX_PAGE_ROWS)
+            .expect("read orphan-associated claim");
+        assert_eq!(page.records().len(), 1);
+        assert_eq!(page.records()[0].claim_id().as_uuid(), claim_id);
+        assert_eq!(page.records()[0].operation_id().as_uuid(), orphan_operation);
+        assert_eq!(page.records()[0].volume().device, 9);
+        assert_eq!(
+            page.records()[0].allocation_class(),
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload
+        );
+        assert_eq!(page.records()[0].allocated_bytes(), 4_096);
+    }
+
+    #[test]
+    fn ordinary_claim_constraints_reject_nil_duplicate_class_zero_and_overflow_rows() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = Uuid::from_u128(5_001);
+        let claim_id = Uuid::from_u128(5_002);
+        insert_ordinary_claim(&store, claim_id, operation_id, "11", "JournalRecord", 1)
+            .expect("insert valid claim");
+        assert!(
+            insert_ordinary_claim(&store, claim_id, operation_id, "11", "JournalRecord", 1,)
+                .is_err(),
+            "duplicate claim identity must remain unique"
+        );
+        assert!(
+            insert_ordinary_claim(&store, Uuid::nil(), operation_id, "11", "JournalRecord", 1,)
+                .is_err(),
+            "nil claim identity must be rejected"
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    &format!(
+                        "INSERT INTO {table}
+                         (claim_id, operation_id, volume_device, allocation_class, allocated_bytes)
+                         VALUES (?1, ?2, '11', 'JournalRecord', 1)",
+                        table = ordinary_claims::TABLE_NAME
+                    ),
+                    params![
+                        Uuid::from_u128(5_006).to_string().to_uppercase(),
+                        operation_id.to_string()
+                    ],
+                )
+                .is_err(),
+            "non-canonical claim identity must be rejected"
+        );
+        assert!(
+            insert_ordinary_claim(
+                &store,
+                Uuid::from_u128(5_003),
+                operation_id,
+                "11",
+                "UnknownClass",
+                1,
+            )
+            .is_err(),
+            "unknown allocation class must be rejected"
+        );
+        assert!(
+            insert_ordinary_claim(
+                &store,
+                Uuid::from_u128(5_004),
+                operation_id,
+                "11",
+                "JournalRecord",
+                0,
+            )
+            .is_err(),
+            "zero allocated bytes must be rejected"
+        );
+
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("enable malformed-row fixture");
+        let oversized_claim = "!".repeat(4_096);
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (claim_id, operation_id, volume_device, allocation_class, allocated_bytes)
+                     VALUES (?1, ?2, '11', 'JournalRecord', 1)",
+                    table = ordinary_claims::TABLE_NAME
+                ),
+                params![&oversized_claim, operation_id.to_string()],
+            )
+            .expect("insert oversized text fixture");
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (claim_id, operation_id, volume_device, allocation_class, allocated_bytes)
+                     VALUES (?1, ?2, '11', 'JournalRecord', '9223372036854775808')",
+                    table = ordinary_claims::TABLE_NAME
+                ),
+                params![Uuid::from_u128(5_005).to_string(), operation_id.to_string()],
+            )
+            .expect("insert out-of-range fixture");
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .expect("disable malformed-row fixture");
+        assert!(matches!(
+            store.read_ordinary_claim_page(None, MAX_PAGE_ROWS),
+            Err(OrdinaryClaimReadError::MalformedRow { ref reason, .. })
+                if reason.contains("claim_id exceeds 36 bytes")
+        ));
+        store
+            .connection
+            .execute(
+                &format!(
+                    "DELETE FROM {} WHERE claim_id = ?1",
+                    ordinary_claims::TABLE_NAME
+                ),
+                params![&oversized_claim],
+            )
+            .expect("remove oversized text fixture");
+        assert!(matches!(
+            store.read_ordinary_claim_page(None, MAX_PAGE_ROWS),
+            Err(OrdinaryClaimReadError::MalformedRow { .. })
+        ));
     }
 
     #[test]
