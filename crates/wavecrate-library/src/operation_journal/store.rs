@@ -24,6 +24,8 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
+use super::capacity_reserve_namespace::{BoundReserve, PhysicalReserveProof};
+use super::capacity_volume_owner::{VolumeOwnershipCapability, VolumeOwnershipError};
 use super::codec::{DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{
     CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
@@ -53,6 +55,7 @@ use super::validation::{RecordConsistency, classify_record};
 
 #[allow(dead_code)]
 mod full_progress;
+mod recovery_reserve;
 pub(crate) use full_progress::FullProgressWriteOutcome;
 /// Read-only, bounded recovery paging for the profile-owned operation journal.
 pub mod recovery;
@@ -67,7 +70,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 3;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -80,8 +83,9 @@ const SQLITE_SHM_SUFFIX: &str = "-shm";
 const JOURNAL_TABLE_NAME: &str = "operation_journal";
 const FULL_PROGRESS_TABLE_NAME: &str = "operation_journal_full_progress";
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const MAX_SCHEMA_OBJECTS: i64 = 8;
-const MAX_SCHEMA_COLUMNS: usize = 8;
+const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep SQLite itself from materializing an arbitrarily large key/value before the recovery
@@ -547,6 +551,137 @@ pub struct OperationJournalStore {
         std::sync::Mutex<Option<Box<dyn FnMut(InsertTestBoundary) -> InsertTestDirective + Send>>>,
 }
 
+/// Private live capability context for recovery-reserve ledger transitions.
+///
+/// The context retains the profile-owned journal, the per-user volume lock, and the owner-bound
+/// physical reserve together. It is intentionally crate-private: the ordinary admission gate
+/// cannot construct or use it until the complete claim and physical-spend boundary is wired.
+#[allow(dead_code)]
+pub(crate) struct RecoveryReserveContext<'a> {
+    store: &'a OperationJournalStore,
+    volume_owner: VolumeOwnershipCapability,
+    reserve: BoundReserve<'a>,
+    journal_identity: String,
+    profile_identity: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum RecoveryReserveContextError {
+    #[error(transparent)]
+    Store(#[from] OperationJournalStoreError),
+    #[error(transparent)]
+    VolumeOwnership(#[from] VolumeOwnershipError),
+    #[error("recovery-reserve context profile identity does not match the journal owner")]
+    ProfileIdentityMismatch,
+    #[error("recovery-reserve context volume identity does not match the live reserve")]
+    VolumeIdentityMismatch,
+    #[error("recovery-reserve context journal identity changed while retained")]
+    JournalIdentityChanged,
+    #[error("recovery-reserve physical proof is unavailable: {0}")]
+    Reserve(String),
+    #[error(transparent)]
+    Ledger(#[from] recovery_reserve::LedgerError),
+}
+
+#[allow(dead_code)]
+impl<'a> RecoveryReserveContext<'a> {
+    fn validate_live(&self, validate_reserve: bool) -> Result<(), RecoveryReserveContextError> {
+        self.store.validate_namespace()?;
+        if self.store.database_identity != self.journal_identity {
+            return Err(RecoveryReserveContextError::JournalIdentityChanged);
+        }
+        let profile_identity = self.store.profile_guard.profile_root_identity();
+        if profile_identity != self.profile_identity
+            || self.volume_owner.owner_profile_identity() != profile_identity
+            || self.reserve.profile_identity() != profile_identity
+        {
+            return Err(RecoveryReserveContextError::ProfileIdentityMismatch);
+        }
+        if self.volume_owner.volume() != self.reserve.observation().volume() {
+            return Err(RecoveryReserveContextError::VolumeIdentityMismatch);
+        }
+        self.volume_owner.revalidate()?;
+        if validate_reserve {
+            self.reserve
+                .revalidate()
+                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_charge(
+        &self,
+        request: &recovery_reserve::ChargeRequest,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.validate_live(true)?;
+        if request.volume != *self.volume_owner.volume() {
+            return Err(RecoveryReserveContextError::VolumeIdentityMismatch);
+        }
+        let fresh_facts = self
+            .reserve
+            .fresh_capacity_facts()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let mut factual_request = request.clone();
+        factual_request.precharge_capacity_bytes = fresh_facts.free_bytes;
+        Ok(recovery_reserve::begin_charge(
+            &self.store.connection,
+            &factual_request,
+        )?)
+    }
+
+    pub(crate) fn spend(
+        &self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        amount_bytes: u64,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.validate_live(true)?;
+        Ok(recovery_reserve::spend(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+            transition_id,
+            amount_bytes,
+        )?)
+    }
+
+    pub(crate) fn record_release_observation(
+        &self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+        amount_bytes: u64,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.validate_live(true)?;
+        Ok(recovery_reserve::record_release_observation(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+            transition_id,
+            amount_bytes,
+        )?)
+    }
+
+    pub(crate) fn reconstitute(
+        &self,
+        charge_id: uuid::Uuid,
+        transition_id: uuid::Uuid,
+    ) -> Result<recovery_reserve::ChargeSnapshot, RecoveryReserveContextError> {
+        self.validate_live(false)?;
+        let proof: PhysicalReserveProof = self
+            .reserve
+            .revalidate_and_prove()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        Ok(recovery_reserve::reconstitute(
+            &self.store.connection,
+            self.volume_owner.volume(),
+            charge_id,
+            transition_id,
+            &proof,
+        )?)
+    }
+}
+
 impl std::fmt::Debug for OperationJournalStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -609,6 +744,39 @@ impl OperationJournalStore {
     /// expected journal namespace.
     pub(crate) fn validate_for_admission(&self) -> Result<(), OperationJournalStoreError> {
         self.validate_namespace()
+    }
+
+    /// Bind the durable ledger to a live per-volume owner and physical reserve.
+    ///
+    /// This private recovery path validates every retained descriptor before returning. It does
+    /// not enable ordinary admission, allocate an operation id, or expose the SQLite connection.
+    #[allow(dead_code)]
+    pub(crate) fn bind_recovery_reserve<'a>(
+        &'a self,
+        volume_owner: VolumeOwnershipCapability,
+        reserve: BoundReserve<'a>,
+    ) -> Result<RecoveryReserveContext<'a>, RecoveryReserveContextError> {
+        self.validate_namespace()?;
+        let profile_identity = self.profile_guard.profile_root_identity().to_owned();
+        if volume_owner.owner_profile_identity() != profile_identity
+            || reserve.profile_identity() != profile_identity
+        {
+            return Err(RecoveryReserveContextError::ProfileIdentityMismatch);
+        }
+        if volume_owner.volume() != reserve.observation().volume() {
+            return Err(RecoveryReserveContextError::VolumeIdentityMismatch);
+        }
+        volume_owner.revalidate()?;
+        reserve
+            .revalidate()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        Ok(RecoveryReserveContext {
+            store: self,
+            volume_owner,
+            reserve,
+            journal_identity: self.database_identity.clone(),
+            profile_identity,
+        })
     }
 
     fn open_inner(
@@ -725,6 +893,28 @@ impl OperationJournalStore {
                     profile_guard,
                     rollback_journal.as_ref(),
                     hooks.migration_failure,
+                )?;
+            } else if header_version == PREVIOUS_JOURNAL_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    PREVIOUS_JOURNAL_SCHEMA_VERSION,
+                )?;
+                migrate_previous_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
                 )?;
             } else {
                 configure_connection(&connection)?;
@@ -3998,7 +4188,7 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
     }
     if !matches!(
         user_version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
             path,
@@ -4024,7 +4214,7 @@ fn read_sqlite_user_version(
     })?;
     if !matches!(
         user_version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
             path,
@@ -4059,16 +4249,38 @@ fn validate_existing_schema(
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_objects = if schema_version == LEGACY_JOURNAL_SCHEMA_VERSION {
-        vec![(String::from(JOURNAL_TABLE_NAME), String::from("table"))]
-    } else {
-        vec![
+    let expected_objects = match schema_version {
+        LEGACY_JOURNAL_SCHEMA_VERSION => {
+            vec![(String::from(JOURNAL_TABLE_NAME), String::from("table"))]
+        }
+        PREVIOUS_JOURNAL_SCHEMA_VERSION => vec![
             (String::from(JOURNAL_TABLE_NAME), String::from("table")),
             (
                 String::from(FULL_PROGRESS_TABLE_NAME),
                 String::from("table"),
             ),
-        ]
+        ],
+        JOURNAL_SCHEMA_VERSION => vec![
+            (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+            (
+                String::from(FULL_PROGRESS_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::TRANSITION_TABLE_NAME),
+                String::from("table"),
+            ),
+        ],
+        _ => {
+            return Err(audit_error(
+                path,
+                format!("unsupported schema version {schema_version}"),
+            ));
+        }
     };
     if objects != expected_objects {
         return Err(audit_error(
@@ -4078,12 +4290,29 @@ fn validate_existing_schema(
     }
 
     validate_table_schema(connection, path, JOURNAL_TABLE_NAME, CREATE_JOURNAL_TABLE)?;
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         validate_table_schema(
             connection,
             path,
             FULL_PROGRESS_TABLE_NAME,
             CREATE_FULL_PROGRESS_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            recovery_reserve::CHARGE_TABLE_NAME,
+            recovery_reserve::CREATE_CHARGE_TABLE,
+        )?;
+        validate_table_schema(
+            connection,
+            path,
+            recovery_reserve::TRANSITION_TABLE_NAME,
+            recovery_reserve::CREATE_TRANSITION_TABLE,
         )?;
     }
     Ok(())
@@ -4114,11 +4343,68 @@ fn validate_table_schema(
         })?
         .take(MAX_SCHEMA_COLUMNS)
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_columns = vec![
-        (String::from("operation_id"), String::from("TEXT"), 1, 1),
-        (String::from("sequence"), String::from("INTEGER"), 1, 0),
-        (String::from("record"), String::from("BLOB"), 1, 0),
-    ];
+    let expected_columns = match table_name {
+        JOURNAL_TABLE_NAME | FULL_PROGRESS_TABLE_NAME => vec![
+            (String::from("operation_id"), String::from("TEXT"), 1, 1),
+            (String::from("sequence"), String::from("INTEGER"), 1, 0),
+            (String::from("record"), String::from("BLOB"), 1, 0),
+        ],
+        recovery_reserve::CHARGE_TABLE_NAME => vec![
+            (String::from("charge_id"), String::from("TEXT"), 1, 1),
+            (String::from("volume_device"), String::from("TEXT"), 1, 0),
+            (
+                String::from("active_volume_device"),
+                String::from("TEXT"),
+                0,
+                0,
+            ),
+            (String::from("operation_id"), String::from("TEXT"), 1, 0),
+            (String::from("purpose"), String::from("TEXT"), 1, 0),
+            (String::from("budget_bytes"), String::from("INTEGER"), 1, 0),
+            (String::from("margin_bytes"), String::from("INTEGER"), 1, 0),
+            (
+                String::from("precharge_capacity_bytes"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (
+                String::from("remaining_bytes"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (String::from("state"), String::from("TEXT"), 1, 0),
+            (
+                String::from("transition_sequence"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+        ],
+        recovery_reserve::TRANSITION_TABLE_NAME => vec![
+            (String::from("charge_id"), String::from("TEXT"), 1, 1),
+            (String::from("transition_id"), String::from("TEXT"), 1, 2),
+            (
+                String::from("transition_sequence"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (String::from("kind"), String::from("TEXT"), 1, 0),
+            (String::from("amount_bytes"), String::from("INTEGER"), 1, 0),
+            (
+                String::from("remaining_bytes"),
+                String::from("INTEGER"),
+                1,
+                0,
+            ),
+            (String::from("state"), String::from("TEXT"), 1, 0),
+        ],
+        _ => {
+            return Err(audit_error(path, format!("unsupported table {table_name}")));
+        }
+    };
     if columns != expected_columns {
         return Err(audit_error(
             path,
@@ -4197,12 +4483,74 @@ fn migrate_legacy_schema(
         {
             return Err(error);
         }
+        connection.execute_batch(recovery_reserve::CREATE_CHARGE_TABLE)?;
+        connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
         {
             return Err(error);
         }
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_previous_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        PREVIOUS_JOURNAL_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            PREVIOUS_JOURNAL_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, PREVIOUS_JOURNAL_SCHEMA_VERSION)?;
+        connection.execute_batch(recovery_reserve::CREATE_CHARGE_TABLE)?;
+        connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
             connection,
@@ -4278,7 +4626,11 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
             "PRAGMA application_id = {JOURNAL_APPLICATION_ID};
              PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};
              {CREATE_JOURNAL_TABLE};
-             {CREATE_FULL_PROGRESS_TABLE};"
+             {CREATE_FULL_PROGRESS_TABLE};
+             {charge_table};
+             {transition_table};",
+            charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
+            transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -4415,6 +4767,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::io::Write;
+    #[cfg(target_os = "macos")]
+    use std::path::Path;
 
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -5361,6 +5715,34 @@ mod tests {
         (path, encoded)
     }
 
+    fn write_v2_database(
+        owner: &WritableProfileGuard,
+        record: &StoredOperationRecord,
+        sequence: i64,
+    ) -> (PathBuf, Vec<u8>) {
+        let path = database_path(owner);
+        fs::create_dir_all(path.parent().expect("journal directory")).expect("journal directory");
+        let encoded = encode(record).expect("encode previous-schema fixture");
+        let connection = Connection::open(&path).expect("open previous-schema fixture");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA application_id = {JOURNAL_APPLICATION_ID};
+                 PRAGMA user_version = {PREVIOUS_JOURNAL_SCHEMA_VERSION};
+                 {CREATE_JOURNAL_TABLE};
+                 {CREATE_FULL_PROGRESS_TABLE};"
+            ))
+            .expect("create v2 journal schema");
+        connection
+            .execute(
+                "INSERT INTO operation_journal (operation_id, sequence, record)
+                 VALUES (?1, ?2, ?3)",
+                params![record.operation_id.to_string(), sequence, &encoded],
+            )
+            .expect("insert v2 journal row");
+        drop(connection);
+        (path, encoded)
+    }
+
     #[test]
     fn typed_insert_outcome_acknowledges_exact_readback() {
         let fixture = fixture();
@@ -5377,6 +5759,272 @@ mod tests {
                 .expect("read acknowledged row"),
             Some(record)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_context_requires_live_bindings_and_reconstitutes_with_fresh_proof() {
+        let fixture = fixture();
+        let reserve_root = BoundDatabaseRoot::for_profile_child(
+            &fixture.owner,
+            Path::new("context-recovery-reserve"),
+        )
+        .expect("reserve root");
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("context-recovery-reserve");
+        let reserve = super::super::capacity_reserve_namespace::create_owned_reserve(
+            &reserve_root,
+            &fixture.owner,
+        )
+        .expect("allocate one protected reserve");
+        let expected_observation = reserve.observation().clone();
+        let volume = expected_observation.volume().clone();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let receipt = store
+            .insert_intent_with_outcome(&intent_record(operation_id))
+            .receipt()
+            .expect("durable operation intent");
+        assert_eq!(receipt.operation_id(), operation_id);
+
+        let make_registry = || {
+            let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+            let directory = tempfile::tempdir_in(temp_root).expect("ownership registry directory");
+            let registry = directory.path().join("volume-ownership");
+            fs::create_dir(&registry).expect("ownership registry");
+            (directory, registry)
+        };
+        let descriptor_path = fixture._base.path().join("context-owner-descriptor");
+        fs::write(&descriptor_path, b"descriptor").expect("owner descriptor");
+        let descriptor = fs::File::open(&descriptor_path).expect("open owner descriptor");
+
+        let (wrong_profile_root, wrong_profile_registry) = make_registry();
+        let wrong_profile = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &wrong_profile_registry,
+            volume.clone(),
+            "different-profile",
+        )
+        .expect("wrong-profile fixture owner");
+        let wrong_profile_error = store
+            .bind_recovery_reserve(wrong_profile, reserve)
+            .err()
+            .expect("profile mismatch must reject before ledger transition");
+        assert!(matches!(
+            wrong_profile_error,
+            RecoveryReserveContextError::ProfileIdentityMismatch
+        ));
+        let charge_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_journal_recovery_reserve",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count untouched charges");
+        assert_eq!(charge_count, 0);
+        drop(wrong_profile_root);
+
+        let reserve = super::super::capacity_reserve_namespace::reopen_owned_reserve(
+            &reserve_root,
+            &fixture.owner,
+            &expected_observation,
+        )
+        .expect("reopen reserve after profile mismatch");
+        let (wrong_volume_root, wrong_volume_registry) = make_registry();
+        let wrong_volume = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &wrong_volume_registry,
+            VolumeIdentity {
+                device: volume.device.checked_add(1).expect("test volume device"),
+            },
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("wrong-volume fixture owner");
+        let wrong_volume_error = store
+            .bind_recovery_reserve(wrong_volume, reserve)
+            .err()
+            .expect("volume mismatch must reject before ledger transition");
+        assert!(matches!(
+            wrong_volume_error,
+            RecoveryReserveContextError::VolumeIdentityMismatch
+        ));
+        drop(wrong_volume_root);
+
+        let reserve = super::super::capacity_reserve_namespace::reopen_owned_reserve(
+            &reserve_root,
+            &fixture.owner,
+            &expected_observation,
+        )
+        .expect("reopen reserve after volume mismatch");
+        let (owner_registry_root, owner_registry) = make_registry();
+        let volume_owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &owner_registry,
+            volume.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("matching volume owner");
+        let context = store
+            .bind_recovery_reserve(volume_owner, reserve)
+            .expect("bind live recovery context");
+        let charge_id = Uuid::new_v4();
+        let request = super::recovery_reserve::ChargeRequest {
+            charge_id,
+            operation_id,
+            volume: volume.clone(),
+            purpose: super::recovery_reserve::RecoveryReservePurpose::OperationRecovery,
+            budget_bytes: 4096,
+            margin_bytes: 4096,
+            precharge_capacity_bytes: u64::MAX,
+        };
+        let charged = context.begin_charge(&request).expect("durable charge");
+        assert_eq!(
+            charged.state,
+            super::recovery_reserve::RecoveryReserveState::Charged
+        );
+        assert_ne!(
+            charged.precharge_capacity_bytes, request.precharge_capacity_bytes,
+            "the persisted observation must come from the live descriptor"
+        );
+
+        let charge_b = Uuid::new_v4();
+        let volume_b = VolumeIdentity {
+            device: volume.device.checked_add(1).expect("second test volume"),
+        };
+        let request_b = super::recovery_reserve::ChargeRequest {
+            charge_id: charge_b,
+            operation_id,
+            volume: volume_b,
+            purpose: super::recovery_reserve::RecoveryReservePurpose::OperationRecovery,
+            budget_bytes: 1024,
+            margin_bytes: 16,
+            precharge_capacity_bytes: 0,
+        };
+        super::recovery_reserve::begin_charge(&store.connection, &request_b)
+            .expect("independent second-volume charge");
+        let charge_b_row = || {
+            store.connection.query_row(
+                "SELECT volume_device, active_volume_device, remaining_bytes, state,
+                        transition_sequence
+                 FROM operation_journal_recovery_reserve WHERE charge_id = ?1",
+                params![charge_b.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+        };
+        let charge_b_transitions = || {
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT transition_id, transition_sequence, kind, amount_bytes,
+                            remaining_bytes, state
+                     FROM operation_journal_recovery_reserve_transition
+                     WHERE charge_id = ?1 ORDER BY transition_sequence",
+                )
+                .expect("prepare second-volume transitions");
+            statement
+                .query_map(params![charge_b.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .expect("read second-volume transitions")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("decode second-volume transitions")
+        };
+        let charge_b_before = charge_b_row().expect("read second-volume charge");
+        let charge_b_transitions_before = charge_b_transitions();
+        assert!(matches!(
+            context.spend(charge_b, Uuid::new_v4(), 1),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::VolumeConflict { .. }
+            ))
+        ));
+        assert!(matches!(
+            context.record_release_observation(charge_b, Uuid::new_v4(), 1),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::VolumeConflict { .. }
+            ))
+        ));
+        assert!(matches!(
+            context.reconstitute(charge_b, Uuid::new_v4()),
+            Err(RecoveryReserveContextError::Ledger(
+                super::recovery_reserve::LedgerError::VolumeConflict { .. }
+            ))
+        ));
+        assert_eq!(
+            charge_b_row().expect("read unchanged second-volume charge"),
+            charge_b_before
+        );
+        assert_eq!(charge_b_transitions(), charge_b_transitions_before);
+
+        let spend_id = Uuid::new_v4();
+        let spent = context
+            .spend(charge_id, spend_id, 512)
+            .expect("durable spend");
+        assert_eq!(spent.remaining_bytes, 3584);
+        let spend_retry = context
+            .spend(charge_id, spend_id, 512)
+            .expect("same-volume durable spend retry");
+        assert_eq!(spend_retry.transition_sequence, spent.transition_sequence);
+        assert_eq!(spend_retry.remaining_bytes, spent.remaining_bytes);
+        let released = context
+            .record_release_observation(charge_id, Uuid::new_v4(), 512)
+            .expect("durable release observation");
+        assert_eq!(
+            released.state,
+            super::recovery_reserve::RecoveryReserveState::ReleaseObserved
+        );
+
+        let displaced_root = fixture
+            ._base
+            .path()
+            .join("context-recovery-reserve-displaced");
+        fs::rename(&reserve_path, &displaced_root).expect("displace reserve root");
+        fs::create_dir(&reserve_path).expect("install replacement reserve root");
+        let stale_error = context
+            .reconstitute(charge_id, Uuid::new_v4())
+            .expect_err("reconstitution must reject a replaced reserve root");
+        assert!(matches!(
+            stale_error,
+            RecoveryReserveContextError::Reserve(_)
+        ));
+        let state_after_stale: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM operation_journal_recovery_reserve WHERE charge_id = ?1",
+                params![charge_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read state after stale proof");
+        assert_eq!(state_after_stale, "ReleaseObserved");
+        fs::remove_dir(&reserve_path).expect("remove replacement reserve root");
+        fs::rename(&displaced_root, &reserve_path).expect("restore reserve root");
+
+        let reconstituted = context
+            .reconstitute(charge_id, Uuid::new_v4())
+            .expect("fresh physical proof reconstitution");
+        assert_eq!(
+            reconstituted.state,
+            super::recovery_reserve::RecoveryReserveState::Reconstituted
+        );
+        drop(context);
+        drop(owner_registry_root);
     }
 
     #[test]
@@ -7731,9 +8379,9 @@ mod tests {
     }
 
     #[test]
-    fn new_database_bootstraps_exact_v2_schema() {
+    fn new_database_bootstraps_exact_v3_schema() {
         let fixture = fixture();
-        let store = OperationJournalStore::open(&fixture.owner).expect("open v2 store");
+        let store = OperationJournalStore::open(&fixture.owner).expect("open v3 store");
         let user_version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -7758,6 +8406,14 @@ mod tests {
                     String::from(FULL_PROGRESS_TABLE_NAME),
                     String::from("table")
                 ),
+                (
+                    String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                    String::from("table")
+                ),
+                (
+                    String::from(recovery_reserve::TRANSITION_TABLE_NAME),
+                    String::from("table")
+                ),
             ]
         );
         let full_progress_rows: i64 = store
@@ -7769,6 +8425,119 @@ mod tests {
             )
             .expect("count empty full-progress table");
         assert_eq!(full_progress_rows, 0);
+    }
+
+    #[test]
+    fn existing_v2_database_migrates_recovery_reserve_tables_atomically() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v2_database(&fixture.owner, &record, 9);
+        let store = OperationJournalStore::open(&fixture.owner).expect("migrate v2 store");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT sequence, record FROM operation_journal WHERE operation_id = ?1",
+                    params![record.operation_id.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .expect("read migrated operation"),
+            (9, encoded)
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {charge_table}",
+                        charge_table = recovery_reserve::CHARGE_TABLE_NAME
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count migrated charges"),
+            0
+        );
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen migrated v3");
+        assert_eq!(
+            reopened
+                .get(record.operation_id)
+                .expect("read reopened operation")
+                .expect("operation remains"),
+            record
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn malformed_recovery_reserve_row_blocks_reopen_readiness() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        store
+            .insert_intent(&record)
+            .expect("persist durable operation");
+        let charge_id = Uuid::new_v4();
+        let transition_id = Uuid::new_v4();
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {charge_table}
+                     (charge_id, volume_device, active_volume_device, operation_id, purpose,
+                      budget_bytes, margin_bytes, precharge_capacity_bytes, remaining_bytes,
+                      state, transition_sequence)
+                     VALUES (?1, '7', '7', ?2, 'OperationRecovery', 10, 1, 11, 10,
+                             'Charged', 1)",
+                    charge_table = recovery_reserve::CHARGE_TABLE_NAME
+                ),
+                params![charge_id.to_string(), record.operation_id.to_string()],
+            )
+            .expect("insert valid charge fixture");
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {transition_table}
+                     (charge_id, transition_id, transition_sequence, kind, amount_bytes,
+                      remaining_bytes, state)
+                     VALUES (?1, ?2, 1, 'Charged', 10, 10, 'Charged')",
+                    transition_table = recovery_reserve::TRANSITION_TABLE_NAME
+                ),
+                params![charge_id.to_string(), transition_id.to_string()],
+            )
+            .expect("insert valid transition fixture");
+        let path = database_path(&fixture.owner);
+        drop(store);
+
+        let connection = Connection::open(&path).expect("open raw journal");
+        connection
+            .pragma_update(None, "ignore_check_constraints", 1_i64)
+            .expect("allow malformed fixture");
+        connection
+            .execute(
+                &format!(
+                    "UPDATE {charge_table}
+                     SET state = 'Unknown' WHERE charge_id = ?1",
+                    charge_table = recovery_reserve::CHARGE_TABLE_NAME
+                ),
+                params![charge_id.to_string()],
+            )
+            .expect("corrupt retained charge");
+        drop(connection);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
+        assert!(matches!(
+            reopened.recovery_readiness(),
+            Err(recovery::RecoveryScanError::RequiresAudit { reason })
+                if reason.contains("unsupported state")
+        ));
     }
 
     #[test]

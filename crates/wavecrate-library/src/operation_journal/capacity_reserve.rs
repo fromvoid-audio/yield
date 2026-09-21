@@ -53,6 +53,10 @@ impl ProtectedReserve {
         &self.observation
     }
 
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+
     /// Release only the retained descriptor for caller-directed recovery.
     pub(super) fn into_file(self) -> File {
         self.file

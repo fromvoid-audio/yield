@@ -17,6 +17,8 @@ mod capacity_provider;
 mod capacity_reserve;
 #[allow(dead_code)]
 mod capacity_reserve_namespace;
+#[allow(dead_code)]
+mod capacity_volume_owner;
 pub mod codec;
 pub mod coordinator;
 pub mod decoded_edit_commands;

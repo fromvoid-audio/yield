@@ -1326,6 +1326,34 @@ admission authority, journal mutation, or automatic adoption of an existing
 collision. Bootstrap persistence ordering and restart reconciliation remain
 outside this slice.
 
+The next private OPT-1338 ownership slice adds a per-user cooperating-process lock for one
+descriptor-derived volume. Its registry is rooted at the canonical macOS OS-account application
+directory (`Library/Application Support/.wavecrate`), independent of the selected profile and
+process configuration overrides; the account home, `Library`, and `Application Support` parents
+must already exist, while only the final `.wavecrate` child may be created through the retained
+no-follow parent. A fixed `volume-<device>.lock` entry is created beneath a retained
+`volume-ownership` directory, where `<device>` is the canonical live volume identity rather than
+caller path text. The retained registry and lock identities are revalidated before use and the
+lock entry is never removed or replaced. A bounded dirty marker records the owning profile root
+identity and generation. A dirty marker from the same profile may be reacquired as the retained
+recovery-only lock without rewriting its generation; a different profile must preserve the marker
+and stop for reconciliation. Lock entries are regular, single-link files owned by the effective
+user, and parent/registry directory entries are flushed before the capability is returned. The
+capability is non-serializable, recovery-only, and drops only the OS lock. Clean release is
+fixture-only pending durable claims and physical reserve proof. This is per-user cooperating-process
+serialization; it is not OS-wide cross-user authority, a volume registry, ordinary admission, or
+ledger integration. Other platforms remain fail-closed until an equivalent identity-safe
+application-data root and locking sequence is qualified.
+
+The following private OPT-1338 recovery-context slice binds that owner capability, a retained
+`BoundReserve`, and the profile-owned `OperationJournalStore` before any ledger transition. Each
+charge, spend, and release observation revalidates the journal namespace, profile identity, volume
+lock, and reserve descriptors before the atomic SQLite transition. Reconstitution can only use a
+fresh non-serialized proof produced by `BoundReserve::revalidate_and_prove`; stored observations
+cannot manufacture physical authority. The context remains private and the ordinary admission
+gate remains unavailable. Durability-fault injection coverage and full claim/physical-spend wiring
+remain pending.
+
 Prepublication cancellation now has a guarded terminal path over bounded cleanup
 and settlement observations. It covers only entered actions from the frozen
 inventory, distinguishes creation from preservation of an existing input, and

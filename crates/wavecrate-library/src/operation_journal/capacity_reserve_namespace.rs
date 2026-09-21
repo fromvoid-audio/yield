@@ -11,7 +11,9 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::app_dirs::WritableProfileGuard;
-use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity};
+use crate::durable_capacity::{
+    PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity, descriptor_capacity_facts,
+};
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
 
@@ -31,7 +33,7 @@ const MAX_RESERVE_IDENTITY_BYTES: usize = 256;
 /// cannot construct a [`ProtectedReserve`] without reopening the fixed child and revalidating
 /// facts from its live descriptor.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ReserveNamespaceObservation {
+pub(crate) struct ReserveNamespaceObservation {
     root_identity: String,
     file_identity: String,
     volume: VolumeIdentity,
@@ -234,16 +236,98 @@ impl std::fmt::Display for ReserveNamespaceFailure {
 impl std::error::Error for ReserveNamespaceFailure {}
 
 /// A live namespace-bound reserve whose lifetime cannot outlive its caller-owned root capability.
-pub(super) struct BoundReserve<'a> {
+pub(crate) struct BoundReserve<'a> {
     _root: &'a BoundDatabaseRoot,
     _profile_guard: &'a WritableProfileGuard,
     reserve: ProtectedReserve,
     observation: ReserveNamespaceObservation,
 }
 
+/// Fresh, descriptor-derived proof that the retained reserve still owns its physical floor.
+///
+/// This proof is intentionally non-serialized and can only be produced by revalidating the
+/// retained reserve handle. It is accepted by the private ledger context for reconstitution;
+/// callers cannot rebuild it from a stored observation.
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalReserveProof {
+    volume: VolumeIdentity,
+    physical_bytes: u64,
+    non_sparse: bool,
+}
+
+impl PhysicalReserveProof {
+    pub(super) fn volume(&self) -> &VolumeIdentity {
+        &self.volume
+    }
+
+    pub(super) fn physical_bytes(&self) -> u64 {
+        self.physical_bytes
+    }
+
+    pub(super) fn non_sparse(&self) -> bool {
+        self.non_sparse
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_physical_reserve_proof(
+    volume: VolumeIdentity,
+    physical_bytes: u64,
+    non_sparse: bool,
+) -> PhysicalReserveProof {
+    PhysicalReserveProof {
+        volume,
+        physical_bytes,
+        non_sparse,
+    }
+}
+
 impl BoundReserve<'_> {
     pub(super) fn observation(&self) -> &ReserveNamespaceObservation {
         &self.observation
+    }
+
+    pub(super) fn profile_identity(&self) -> &str {
+        self._profile_guard.profile_root_identity()
+    }
+
+    pub(super) fn fresh_capacity_facts(
+        &self,
+    ) -> Result<VolumeFacts, ReserveNamespaceFailureReason> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(ReserveNamespaceFailureReason::Unsupported);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let facts = descriptor_capacity_facts(self.reserve.file()).map_err(|error| {
+                ReserveNamespaceFailureReason::Observation(
+                    ReserveFailureReason::CapacityFactsUnavailable(error.to_string()),
+                )
+            })?;
+            if facts.identity != *self.observation.volume() {
+                return Err(ReserveNamespaceFailureReason::Observation(
+                    ReserveFailureReason::VerifiedVolumeMismatch,
+                ));
+            }
+            if facts.allocation_unit != self.observation.allocation_unit() {
+                return Err(ReserveNamespaceFailureReason::Observation(
+                    ReserveFailureReason::VerifiedAllocationUnitMismatch,
+                ));
+            }
+            Ok(facts)
+        }
+    }
+
+    pub(super) fn revalidate_and_prove(
+        &self,
+    ) -> Result<PhysicalReserveProof, ReserveNamespaceFailureReason> {
+        self.revalidate()?;
+        Ok(PhysicalReserveProof {
+            volume: self.observation.volume().clone(),
+            physical_bytes: self.observation.allocated_bytes(),
+            non_sparse: true,
+        })
     }
 
     /// Reopen the fixed child through the retained root and verify it against live descriptor facts.

@@ -362,6 +362,11 @@ pub(super) fn recovery_readiness(
     store: &OperationJournalStore,
 ) -> Result<OperationJournalRecoveryReadiness, RecoveryScanError> {
     let page = scan_coordinator_page(store, None)?;
+    if let Some(reason) = super::recovery_reserve::readiness(&store.connection)
+        .map_err(|reason| RecoveryScanError::RequiresAudit { reason })?
+    {
+        return Ok(OperationJournalRecoveryReadiness::Blocked { reason });
+    }
     let Some(entry) = page.entries.first() else {
         return Ok(OperationJournalRecoveryReadiness::Clear);
     };
