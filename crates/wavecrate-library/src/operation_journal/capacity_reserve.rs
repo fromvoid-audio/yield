@@ -17,15 +17,15 @@ use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
 /// One descriptor-bound observation retained by a protected reserve handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ReserveObservation {
-    identity: String,
-    volume: VolumeIdentity,
-    allocation_unit: u64,
-    length: u64,
-    allocated_bytes: u64,
-    regular: bool,
-    links: u64,
-    compressed: bool,
+pub(super) struct ReserveObservation {
+    pub(super) identity: String,
+    pub(super) volume: VolumeIdentity,
+    pub(super) allocation_unit: u64,
+    pub(super) length: u64,
+    pub(super) allocated_bytes: u64,
+    pub(super) regular: bool,
+    pub(super) links: u64,
+    pub(super) compressed: bool,
 }
 
 /// A verified, non-serializable protected reserve held by its original file descriptor.
@@ -49,9 +49,13 @@ impl ProtectedReserve {
         }
     }
 
-    #[cfg(test)]
-    fn observation(&self) -> &ReserveObservation {
+    pub(super) fn observation(&self) -> &ReserveObservation {
         &self.observation
+    }
+
+    /// Release only the retained descriptor for caller-directed recovery.
+    pub(super) fn into_file(self) -> File {
+        self.file
     }
 }
 
@@ -182,6 +186,60 @@ pub(super) fn allocate_protected_reserve(file: File) -> Result<ProtectedReserve,
             None,
         ))
     }
+}
+
+/// Verify an already allocated reserve descriptor without performing any filesystem mutation.
+///
+/// The expected observation is only a comparison value. The returned reserve is constructed
+/// from facts captured from `file`, so a stored observation cannot authorize a reserve by itself.
+pub(super) fn revalidate_existing_owned_file(
+    file: File,
+    expected: &ReserveObservation,
+) -> Result<ProtectedReserve, ReserveFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        let observed = match capture_observation(&file) {
+            Ok(observation) => observation,
+            Err(reason) => {
+                return Err(ReserveFailure::new(
+                    file,
+                    ReserveFailureStage::InitialValidation,
+                    reason,
+                    None,
+                ));
+            }
+        };
+        if let Err(reason) = validate_verified_observation(&observed, expected) {
+            return Err(ReserveFailure::new(
+                file,
+                ReserveFailureStage::Verification,
+                reason,
+                Some(observed.allocated_bytes),
+            ));
+        }
+        return Ok(ProtectedReserve {
+            file,
+            observation: observed,
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = expected;
+        Err(ReserveFailure::new(
+            file,
+            ReserveFailureStage::Unsupported,
+            ReserveFailureReason::Unsupported,
+            None,
+        ))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_fixture_reserve(file: File) -> ProtectedReserve {
+    let mut observation = capture_observation(&file).expect("test fixture descriptor facts");
+    observation.length = PROTECTED_FREE_SPACE_FLOOR;
+    observation.allocated_bytes = PROTECTED_FREE_SPACE_FLOOR;
+    ProtectedReserve { file, observation }
 }
 
 trait ReserveBackend {

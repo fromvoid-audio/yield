@@ -1310,6 +1310,22 @@ the production provider, issue admission claims, or add durable ledger/recovery
 authority. Namespace adoption, reconciliation, and operation-owner integration
 remain deferred.
 
+This private OPT-1338 namespace slice binds the reserve to one fixed child,
+`recovery-reserve.bin`, beneath a caller-selected and already-owned dedicated
+`BoundDatabaseRoot`. Creation validates the live root and profile guard before
+opening the child with no-follow/create-new semantics, allocates through the
+descriptor-bound reserve helper, flushes the file and containing namespace, and
+revalidates both the root and the child identity. Reopen uses only the fixed
+child and a bounded untrusted observation, then derives fresh identity, volume,
+allocation-unit, length, link, compression, and allocation facts from the live
+descriptor. The returned private handle borrows the root and profile guard, so
+it cannot outlive that ownership context; failures retain any available file
+descriptor without deleting or truncating the namespace entry. The binding is a
+physical namespace observation with no per-volume lock, cross-process registry,
+admission authority, journal mutation, or automatic adoption of an existing
+collision. Bootstrap persistence ordering and restart reconciliation remain
+outside this slice.
+
 Prepublication cancellation now has a guarded terminal path over bounded cleanup
 and settlement observations. It covers only entered actions from the frozen
 inventory, distinguishes creation from preservation of an existing input, and
