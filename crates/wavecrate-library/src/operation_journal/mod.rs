@@ -15,6 +15,8 @@ pub mod cancellation_recovery;
 mod capacity_provider;
 #[allow(dead_code)]
 mod capacity_reserve;
+#[allow(dead_code)]
+mod capacity_reserve_namespace;
 pub mod codec;
 pub mod coordinator;
 pub mod decoded_edit_commands;
