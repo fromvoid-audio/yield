@@ -146,6 +146,135 @@ pub(crate) enum OrdinaryClaimReadError {
     MalformedRow { claim: String, reason: String },
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum OrdinaryClaimWriteError {
+    #[error(
+        "ordinary claim {claim_id} allocated bytes exceed SQLite INTEGER range: {allocated_bytes}"
+    )]
+    AllocatedBytesOutOfRange {
+        claim_id: AdmissionClaimId,
+        allocated_bytes: u64,
+    },
+    #[error("ordinary claim readback for operation {operation_id} did not match the submitted set")]
+    ReadbackMismatch { operation_id: OperationId },
+    #[error("ordinary claim SQLite error: {0}")]
+    Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Read(#[from] OrdinaryClaimReadError),
+}
+
+pub(super) fn validate_storage_values(
+    claims: &crate::operation_journal::admission_claims::AdmissionClaimInventory,
+) -> Result<(), OrdinaryClaimWriteError> {
+    for claim in claims.claims() {
+        if i64::try_from(claim.allocated_bytes()).is_err() {
+            return Err(OrdinaryClaimWriteError::AllocatedBytesOutOfRange {
+                claim_id: claim.claim_id(),
+                allocated_bytes: claim.allocated_bytes(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn insert_rows_inside_transaction(
+    connection: &Connection,
+    operation_id: OperationId,
+    claims: &crate::operation_journal::admission_claims::AdmissionClaimInventory,
+) -> Result<(), OrdinaryClaimWriteError> {
+    validate_storage_values(claims)?;
+    let operation_text = operation_id.to_string();
+    for claim in claims.claims() {
+        connection.execute(
+            &format!(
+                "INSERT INTO {TABLE_NAME}
+                 (claim_id, operation_id, volume_device, allocation_class, allocated_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            ),
+            params![
+                claim.claim_id().to_string(),
+                &operation_text,
+                claim.volume().device.to_string(),
+                allocation_class_text(claim.allocation_class()),
+                i64::try_from(claim.allocated_bytes()).expect("validated SQLite INTEGER range"),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn verify_rows_inside_transaction(
+    connection: &Connection,
+    operation_id: OperationId,
+    claims: &crate::operation_journal::admission_claims::AdmissionClaimInventory,
+) -> Result<(), OrdinaryClaimWriteError> {
+    let mut expected = expected_records(operation_id, claims);
+    let mut actual = read_operation_rows(connection, operation_id)?;
+    expected.sort_by_key(OrdinaryClaimRecord::claim_id);
+    actual.sort_by_key(OrdinaryClaimRecord::claim_id);
+    if actual != expected {
+        return Err(OrdinaryClaimWriteError::ReadbackMismatch { operation_id });
+    }
+    Ok(())
+}
+
+fn expected_records(
+    operation_id: OperationId,
+    claims: &crate::operation_journal::admission_claims::AdmissionClaimInventory,
+) -> Vec<OrdinaryClaimRecord> {
+    claims
+        .claims()
+        .iter()
+        .map(|claim| OrdinaryClaimRecord {
+            claim_id: claim.claim_id(),
+            operation_id,
+            volume: claim.volume().clone(),
+            allocation_class: claim.allocation_class(),
+            allocated_bytes: claim.allocated_bytes(),
+        })
+        .collect()
+}
+
+fn read_operation_rows(
+    connection: &Connection,
+    operation_id: OperationId,
+) -> Result<Vec<OrdinaryClaimRecord>, OrdinaryClaimReadError> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT claim_id, operation_id, volume_device, allocation_class, allocated_bytes
+         FROM {TABLE_NAME}
+         WHERE operation_id = ?1
+         ORDER BY claim_id ASC
+         LIMIT ?2"
+    ))?;
+    let fetch_limit = i64::try_from(MAX_PAGE_ROWS + 1).expect("bounded ordinary claim limit");
+    let mut rows = statement.query(params![operation_id.to_string(), fetch_limit])?;
+    let mut records = Vec::with_capacity(MAX_PAGE_ROWS);
+    while let Some(row) = rows.next()? {
+        if records.len() == MAX_PAGE_ROWS {
+            return Err(malformed(
+                None,
+                format!("operation {operation_id} has more than {MAX_PAGE_ROWS} claim rows"),
+            ));
+        }
+        records.push(decode_row(row)?);
+    }
+    Ok(records)
+}
+
+fn allocation_class_text(class: FullCapacityAllocationClass) -> &'static str {
+    match class {
+        FullCapacityAllocationClass::DestinationStaging => "DestinationStaging",
+        FullCapacityAllocationClass::JournalRecord => "JournalRecord",
+        FullCapacityAllocationClass::SourceDatabaseCommit => "SourceDatabaseCommit",
+        FullCapacityAllocationClass::SourceWalShm => "SourceWalShm",
+        FullCapacityAllocationClass::GlobalDatabaseCommit => "GlobalDatabaseCommit",
+        FullCapacityAllocationClass::GlobalWalShm => "GlobalWalShm",
+        FullCapacityAllocationClass::ExistingDestination => "ExistingDestination",
+        FullCapacityAllocationClass::ExistingRecoveryPayload => "ExistingRecoveryPayload",
+        FullCapacityAllocationClass::OperationRecoveryPayload => "OperationRecoveryPayload",
+    }
+}
+
 pub(crate) fn read_page(
     connection: &Connection,
     cursor: Option<OrdinaryClaimCursor>,
