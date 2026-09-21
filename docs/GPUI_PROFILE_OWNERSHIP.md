@@ -1283,6 +1283,16 @@ Windows storage run `34900358246` passed at exact settlement source `a9fcfc83b`:
 tests. The remaining storage-lane checks passed; native Windows UI/audio
 acceptance remains separate.
 
+The first private OPT-1338 ledger slice defines an owner-thread-bound contract that accepts the
+existing full-capacity plan and admission-claim observations. Qualified test fixtures exercise its
+non-serializable provisional per-volume/class charges, synchronous release/drop accounting, fixed
+256 MiB floor, and retained existing-destination/recovery rows without charging them again against
+incremental ordinary headroom. The production owner currently invokes only an unavailable-provider
+gate before any full-admission journal mutation, so it still returns
+`CapacityProviderUnavailable` with no operation ID, row, or durable permit. Full plan derivation,
+shared-allocation identity handling, descriptor-bound live facts, OS non-sparse reservation,
+durable charge/recovery, and chunk claims remain outside this milestone.
+
 Prepublication cancellation now has a guarded terminal path over bounded cleanup
 and settlement observations. It covers only entered actions from the frozen
 inventory, distinguishes creation from preservation of an existing input, and

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use super::capacity_provider;
 use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{RetryObservation, UniversalCommandArgs};
 use super::full_progress_codec::{
@@ -464,7 +465,8 @@ impl OperationJournalClient {
 
     /// Queue one bounded full-operation admission request.
     ///
-    /// The request deliberately remains fail-closed until the capacity provider is integrated.
+    /// The request deliberately remains fail-closed until the descriptor-bound physical
+    /// capacity provider is qualified.
     /// A successful queue submission only admits the typed request to the journal owner; it does
     /// not allocate an operation ID, create progress, reserve capacity, or grant dispatch
     /// authority.
@@ -1083,6 +1085,8 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
                         reason: error.to_string(),
                     }
                 })?;
+                capacity_provider::production_admission_gate()
+                    .map_err(|_| OperationJournalOwnerError::CapacityProviderUnavailable)?;
                 Err(OperationJournalOwnerError::CapacityProviderUnavailable)
             })
         }
