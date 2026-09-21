@@ -99,7 +99,9 @@ on their exact timings or messages.
   cursor to the evidence batch boundary.
 - **Recovery reserve charge**: a durable, serialized per-volume recovery-only reservation
   with an exact bounded byte budget, control-plane margin, spend/reconstitution state, and
-  operation linkage. It is not ordinary capacity.
+  operation linkage. It is not ordinary capacity. The owner-thread lifetime and startup
+  decision for this capability is recorded in [the OPT-1554 capacity authority contract](CAPACITY_AUTHORITY_CONTRACT.md);
+  that decision does not enable admission.
 - **Readiness**: durable desired/observed artifact state for a source identity and revision;
   cache availability alone is never readiness.
 - **Region**: the smallest filesystem area whose truth may have changed. Regions widen from
