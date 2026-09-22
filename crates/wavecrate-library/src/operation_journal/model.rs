@@ -176,6 +176,31 @@ pub enum UniversalCommandKind {
     ExternalReconciliation,
 }
 
+impl UniversalCommandKind {
+    /// Return the stable documentation identifier for this command family.
+    pub const fn stable_id(self) -> &'static str {
+        match self {
+            Self::Extract => "family.extract",
+            Self::Copy => "family.copy",
+            Self::Import => "family.import",
+            Self::CreateFile => "family.create_file",
+            Self::CreateFolder => "family.create_folder",
+            Self::Duplicate => "family.duplicate",
+            Self::Export => "family.export",
+            Self::Rename => "family.rename",
+            Self::Move => "family.move",
+            Self::Trash => "family.trash",
+            Self::Delete => "family.delete",
+            Self::RestoreRetained => "family.restore_retained",
+            Self::PurgeRetained => "family.purge_retained",
+            Self::DestructiveEdit => "family.destructive_edit",
+            Self::Undo => "family.undo",
+            Self::Redo => "family.redo",
+            Self::ExternalReconciliation => "family.external_reconciliation",
+        }
+    }
+}
+
 /// Stored universal-intent fields added by schema V3.
 ///
 /// This is an untrusted data value. It identifies the command, parent relationship, status

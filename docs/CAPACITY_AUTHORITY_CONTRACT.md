@@ -304,7 +304,18 @@ The capacity work is intentionally split as follows:
 | OPT-1562 | Clean volume-ownership handoff after zero claims/charges and proof. |
 | OPT-1563 | Common owner pre-intent gate and typed rejection with no journal row. |
 | OPT-1564 | Durable post-intent chunk claims, owner-held write tickets, and logical release retry. |
-| OPT-1565–1568 | Typed estimators and pre/post-intent fault matrices; outside this lifetime decision. |
+| OPT-1566 | Authority-free typed requirement/estimator matrix for all command families and nine allocation classes; no admission or family wiring. |
+| OPT-1565 | Post-intent retry versus partial classification, deferred until capability-bound staging checkpoints exist. |
+| OPT-1568 | Post-intent chunk, release, and restart fault matrix; remains deferred. |
+
+OPT-1566's matrix is authority-free and returns all nine allocation classes for every typed
+command payload. Its stable family/class IDs and current `Known`, `Unknown`, and `Unsupported`
+outcomes are specified in the typed matrix table in
+[`IO_ARCHITECTURE_TARGET.md`](IO_ARCHITECTURE_TARGET.md#typed-capacity-requirement-and-estimator-matrix).
+Only checked single-output byte bounds are currently `Known`; metadata, retained-data absence,
+multi-output rounding, and descriptor-bound rows remain `Unknown` until their payload proves a
+safe bound. `CapacityRequirementMatrix::require_known_bytes` fails closed for unresolved or
+missing rows, so no future planner may filter unknown classes into implicit zero requirements.
 
 The implemented OPT-1563 boundary accepts a private prepared template only after it validates
 the participant topology, derived work plan, full claim coverage, bounded arithmetic, and current
