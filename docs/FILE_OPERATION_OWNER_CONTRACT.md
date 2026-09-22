@@ -1,6 +1,6 @@
 # FileOperationOwner command, result, and capability-fence contract
 
-Status: [OPT-1629](https://linear.app/boostnlvp/issue/OPT-1629) decision artifact. This document freezes a proposed boundary; it does not implement a `FileOperationOwner`, add a filesystem backend, or enable production admission. The current GPUI worktree has no general file-effect owner. Producer adapters and runtime wiring remain explicit follow-up work.
+Status: [OPT-1629](https://linear.app/boostnlvp/issue/OPT-1629) decision artifact, with the bounded queue foundation from [OPT-1630](https://linear.app/boostnlvp/issue/OPT-1630) implemented in [`file_operation_owner.rs`](../crates/wavecrate-library/src/file_operation_owner.rs). The module owns command validation, owner-local registration observations, lifecycle, bounded receipts, and fail-closed result handling. It does not add a filesystem backend, enable production admission, or provide a production root/live-write/custody producer; those adapters remain explicit follow-up work.
 
 Related contracts: [IO architecture target](IO_ARCHITECTURE_TARGET.md), [capacity authority contract](CAPACITY_AUTHORITY_CONTRACT.md), [OPT-1337](https://linear.app/boostnlvp/issue/OPT-1337), [OPT-1338](https://linear.app/boostnlvp/issue/OPT-1338), and [OPT-1554](https://linear.app/boostnlvp/issue/OPT-1554).
 
@@ -11,6 +11,14 @@ The coordinator owns the logical operation. A future `FileOperationOwner` owns o
 The owners communicate with bounded commands and effect-specific receipts. Neither owner synchronously waits for the other while holding an owner command or SQLite transaction. A source lease, source control connection, publication fence, profile guard, or borrowed database connection never crosses into the file owner. A future source/file adapter may carry a sealed `Send`-safe authority request derived by the source owner, following the existing source-authority pattern, but the source owner retains the lease and its control connection.
 
 This is a contract decision rather than a claim that the boundary already exists. The current [operation-journal owner](../crates/wavecrate-library/src/operation_journal/owner.rs) is a bounded storage owner and is useful as a queue/result-permit baseline. The current [source authority](../crates/wavecrate-library/src/sample_sources/db/source_authority.rs) illustrates the sealed request/owner-held lease split. The current [`file_ops_journal`](../crates/wavecrate-library/src/sample_sources/db/file_ops_journal/) is source-database-local recovery evidence, not the proposed general file owner.
+
+## OPT-1630 implementation boundary
+
+`wavecrate_library::file_operation_owner::FileOperationOwner` starts one background owner thread with a 32-command synchronous queue. It reserves one result permit before queueing and retains the complete canonical request bytes, input permit, and receipt identity until each result alias is acknowledged. Submission normalizes owned variable-capacity buffers and charges a checked `2 * canonical_bytes + authorization_backing_bytes` amount: two canonical-record units cover the command backing and canonical copy, while every normalized live-authorization source-fence vector and its source/root/database string backing is charged separately because live proofs are intentionally excluded from the fingerprint. The input permit is held while any representation remains retained, including terminal tombstone history. Exact completed requests remain collision-safe owner-local tombstones after acknowledgement so a duplicate cannot execute again; tombstones share the 64-receipt bound and retain their input permits. When that bounded history is full, new identities receive backpressure rather than causing eviction, and a failed queue send refunds the full checked charge. A confirmed coordinator-custody acknowledgement is scoped to this owner and the exact retained identity/fingerprint set; it is the only testable seam that permits the owner to release this retained history at shutdown.
+
+The public command and effect types have private fields. Root registrations, live intent/capacity authorization, and custody acknowledgements have no production constructors in this milestone; the module's `cfg(test)` fixtures are synthetic validation seams only. Every accepted production-shaped command therefore returns typed `Unsupported` evidence because no qualified producer or filesystem backend is available. `ObservationOnly` authorization is accepted only for inspection-shaped requests and can never be used as a mutation fallback. The owner rejects stale owner/generation/fence values, invalid locators, overflow, duplicate identity conflicts, and more than two roots or source fences before any effect could run.
+
+The lifecycle is owner-local and nonblocking across owners: `Running` accepts work, `Draining` closes the effect front door while already accepted commands and acknowledgements drain, and `shutdown` reports `DrainedAck` only when no retained receipt remains or confirmed custody has been supplied. Otherwise it returns `RetirementDeferred` and leaves the owner explicitly `Draining` with its command, receipt, fingerprint, and input evidence retained for reconciliation; deferred shutdown is not a clean `Stopped` state. Panic or implicit drop remains sticky `Unavailable`/`RetirementUncertain` with bounded effect identities and retained state, and normal worker exit cannot overwrite that failure state. No source lease, SQLite connection, profile guard, filesystem handle, or physical effect crosses this module.
 
 ## Ownership and lifetime
 
@@ -105,9 +113,10 @@ enum EffectRequest {
 The role table freezes what each payload must bind. Every role wrapper carries an
 opaque registration identity and generation, its matching source or profile authority
 fence, a bounded relative locator, and an exact object identity/absence predicate.
-`SourceRoot` must bind a `SourceFence`; `DestinationRoot` and `StagingRoot` bind a
-distinct owner-local registration generation and an explicitly qualified source or
-profile authority as applicable. No target registration can authorize a source read or
+`SourceRoot` must bind a `SourceFence`; `DestinationRoot` and `StagingRoot` bind an
+owner-local registration and generation plus an explicitly qualified source or profile
+authority as applicable. Independent roles may share one registration when each role
+still carries its own locator and object predicate. No target registration can authorize a source read or
 a move's source half.
 
 | Effect payload | Root roles and fences | Required predicate, proof, and data |
@@ -153,6 +162,12 @@ never a path or UUID fallback.
 Every effect variant except `InspectOwnedObject` requires `EffectAuthorization::Mutating`;
 the owner rejects `ObservationOnly` for writes, publication, movement, replacement, or
 cleanup rather than treating it as a weaker write grant.
+
+The live authorization proofs and the full command envelope are intentionally non-`Clone` and
+non-serializable in production. Duplicate identity uses the authority-free canonical request
+projection, while the owner consumes live proofs only at its boundary. The current `cfg(test)`
+fixtures can recreate synthetic proofs for boundary tests; they do not expose production
+constructors or turn a serialized observation into authority.
 
 ## Effect vocabulary and responsibilities
 
@@ -297,11 +312,21 @@ observed journal-owner constants above:
 | Unacknowledged effect receipts | At most 64 receipts, including pending/uncertain receipts |
 
 The input permit remains held until the owner no longer retains the command payload
-or its executing buffer. Result permits are acquired before queueing. When the pending
-receipt cap is reached, the owner returns bounded backpressure before starting an
-effect; it never evicts, overwrites, or forgets uncertain evidence. These limits are
-proposed FileOperationOwner behavior, not an assertion that a file-owner runtime
-already enforces them.
+or its executing buffer, including acknowledged tombstone history. The implemented
+submission path normalizes variable-capacity owned buffers and reserves the checked
+`2 * canonical_bytes + authorization_backing_bytes` charge described above. Result
+permits are acquired before queueing. Cancellation is recorded against an already-admitted
+identity under the admission gate; a queued cancellation is consumed before the execution
+boundary and returns a stable no-effect result, while an executing identity returns
+`AlreadyStarted` and a completed identity returns `AlreadyCompleted`. Cancellation is
+nonblocking, never creates an unbounded tombstone, and never waits on another owner. When
+the pending receipt cap is reached, the owner returns bounded backpressure
+before starting an effect; it never evicts, overwrites, or forgets uncertain evidence. These limits are
+implemented by the OPT-1630 queue foundation for its owner-local receipt and input
+state. The physical effect and custody producers remain unavailable, so an `Unsupported`
+receipt is still retained until its result alias is acknowledged and then remains in the
+bounded duplicate tombstone history. Acknowledge does not replenish deduplication history
+capacity; only explicit custody-backed owner shutdown may release that history.
 
 ## Caller and producer inventory
 
@@ -361,4 +386,7 @@ These follow-ups must not make a source/database owner perform file effects, mak
 - [x] Stale, collision, unsupported, uncertainty, drain, shutdown, exact-fingerprint duplicate/conflict behavior fail closed and retain evidence.
 - [x] Missing producer adapters, the explicit OPT-1857 authority handoff, and the 1630–1634/1856 follow-up boundaries are explicit.
 
-This artifact intentionally contains no runtime implementation or filesystem test seam. Runtime work must first supply the missing producer/authority adapters and then prove each barrier and outcome against the live owner boundaries above.
+The runtime foundation intentionally contains no filesystem implementation or production
+authority seam. Later producer and backend work must prove each barrier and outcome against
+the live owner boundary above; this milestone only makes the queue, identity, lifecycle, and
+retention rules executable and testable without upgrading observations into authority.
