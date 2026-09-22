@@ -482,6 +482,89 @@ fn source_snapshot_cancellation_during_control_wait_fails_closed() {
     writer.close().expect("close source writer");
 }
 
+#[test]
+fn source_snapshot_owner_release_during_control_wait_fails_closed() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-manifest-snapshot-live-owner-loss"),
+        1,
+    )
+    .expect("source writer");
+    let expected = writer.current_revision().expect("live source revision");
+    let fence = writer
+        .database_for_tests()
+        .source_publication_fence()
+        .expect("live publication fence");
+    let lease = Arc::clone(
+        writer
+            .database_for_tests()
+            .source_lease
+            .as_ref()
+            .expect("retained source lease"),
+    );
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_lease = Arc::clone(&lease);
+    let holder = std::thread::spawn(move || {
+        let control = holder_lease
+            .lock_control_connection_for_tests()
+            .expect("control mutex");
+        ready_tx.send(()).expect("announce held mutex");
+        release_rx.recv().expect("wait for release");
+        drop(control);
+    });
+    ready_rx.recv().expect("control mutex is held");
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let result = writer.read_manifest_snapshot_page(
+            &expected,
+            None,
+            1,
+            &Arc::new(AtomicBool::new(false)),
+        );
+        result_tx
+            .send((
+                matches!(&result, Err(SourceWriterError::StaleFence)),
+                format!("{result:?}"),
+            ))
+            .expect("report snapshot result");
+        writer
+    });
+    let wait_started = std::time::Instant::now();
+    while !lease.is_waiting_for_control_for_tests() {
+        assert!(
+            wait_started.elapsed() < std::time::Duration::from_secs(1),
+            "snapshot did not enter lease-control validation"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let retiring_lease = Arc::clone(&lease);
+    let retire = std::thread::spawn(move || retiring_lease.release());
+    let retirement_started = std::time::Instant::now();
+    while fence.is_live() {
+        assert!(
+            retirement_started.elapsed() < std::time::Duration::from_secs(1),
+            "owner retirement did not invalidate the publication fence"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    release_tx.send(()).expect("release control mutex");
+    let (stale, result) = result_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("in-flight snapshot responds to owner retirement");
+    assert!(stale, "unexpected snapshot result: {result}");
+    holder.join().expect("control holder");
+    retire
+        .join()
+        .expect("owner retire thread")
+        .expect("retire owner");
+    let writer = reader.join().expect("snapshot reader");
+    drop(lease);
+    writer.close().expect("close source writer");
+}
+
 fn continuity_state(database: &SourceDatabase) -> (u64, SourceDirectoryTruthState) {
     (
         database
