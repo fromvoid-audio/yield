@@ -2342,6 +2342,137 @@ fn source_authority_guard_drop_invalidates_pending_use_proof() {
 }
 
 #[test]
+fn source_effect_pin_rejects_drain_and_guard_loss() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let _app_root_guard =
+        AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
+            .expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database.prepare_source_authority().expect("authority");
+    let (request, guard) = registration.split();
+    let proof = request
+        .accept_confirmation(guard.confirm().expect("confirmation"))
+        .expect("registered source");
+    let pin = guard.pin_for_effect().expect("live source pin");
+    let in_flight = pin.begin_effect().expect("first effect boundary");
+    request
+        .begin_drain(proof.into_drain_marker())
+        .expect("drain source");
+    assert!(matches!(
+        pin.begin_effect(),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+    drop(in_flight);
+    drop(guard);
+    assert!(matches!(
+        pin.begin_effect(),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_effect_pin_rejects_replaced_root_at_effect_boundary() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let _app_root_guard =
+        AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
+            .expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database.prepare_source_authority().expect("authority");
+    let (request, guard) = registration.split();
+    let _proof = request
+        .accept_confirmation(guard.confirm().expect("confirmation"))
+        .expect("registered source");
+    let pin = guard.pin_for_effect().expect("live source pin");
+    std::fs::remove_dir_all(source_root.path()).expect("remove source root");
+    assert!(matches!(
+        pin.begin_effect(),
+        Err(SourceAuthorityError::Lease(
+            SourceLeaseError::SourceRootUnavailable { .. }
+                | SourceLeaseError::SourceRootReplaced { .. }
+                | SourceLeaseError::SourceRootIdentityUnavailable { .. }
+        ))
+    ));
+}
+
+#[test]
+fn source_release_waits_for_effect_permit_before_releasing_durable_row() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let _app_root_guard =
+        AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
+            .expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database.prepare_source_authority().expect("authority");
+    let (request, guard) = registration.split();
+    let _proof = request
+        .accept_confirmation(guard.confirm().expect("confirmation"))
+        .expect("registered source");
+    let pin = guard.pin_for_effect().expect("live source pin");
+    let permit = pin.begin_effect().expect("in-flight effect");
+    let lease = Arc::clone(database.source_lease.as_ref().expect("retained lease"));
+    let gate = lease.effect_gate();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let releaser = thread::spawn(move || {
+        result_tx.send(lease.release()).expect("release result");
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !gate.is_closed_for_tests() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "release did not close admission"
+        );
+        thread::yield_now();
+    }
+    assert!(matches!(
+        result_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let state: String = database
+        .connection
+        .query_row(
+            "SELECT state FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("durable lease row");
+    assert_eq!(state, "active");
+    drop(permit);
+    result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("release completion")
+        .expect("released source");
+    releaser.join().expect("releaser");
+    assert!(matches!(
+        pin.begin_effect(),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+}
+
+#[test]
 fn source_authority_expired_use_proof_still_allows_restrictive_drain() {
     let app_root = tempdir().expect("app root");
     let source_root = tempdir().expect("source root");

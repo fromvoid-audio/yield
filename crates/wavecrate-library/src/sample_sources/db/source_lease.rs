@@ -18,6 +18,7 @@ use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 
 use super::file_ops_journal::BoundDatabaseRoot;
+use super::source_authority::SourceEffectGate;
 use super::sqlite_identity::DatabaseFileBinding;
 use super::{SourceDatabaseIdentityError, schema};
 
@@ -282,6 +283,7 @@ pub(crate) struct SourceLease {
     /// This token only invalidates an already issued handoff when the retained lease is retired
     /// or superseded. It never grants source or capacity authority on its own.
     authority_liveness: Arc<AtomicBool>,
+    effect_gate: Arc<SourceEffectGate>,
     authority_registration: Mutex<Option<Uuid>>,
     profile_guard: WritableProfileGuard,
 }
@@ -510,6 +512,7 @@ impl SourceLeaseReservation {
             lease_epoch: epoch,
             publication_liveness,
             authority_liveness,
+            effect_gate: Arc::new(SourceEffectGate::new()),
             authority_registration: Mutex::new(None),
             profile_guard,
         }))
@@ -595,6 +598,11 @@ impl SourceLease {
         Arc::clone(&self.authority_liveness)
     }
 
+    /// Share the retirement/effect gate with this lease's private source authority state.
+    pub(crate) fn effect_gate(&self) -> Arc<SourceEffectGate> {
+        Arc::clone(&self.effect_gate)
+    }
+
     /// Reserve the one private source-authority slot for this retained lease.
     pub(crate) fn try_reserve_authority_registration(
         &self,
@@ -666,6 +674,7 @@ impl SourceLease {
         new_media_root: Arc<BoundDatabaseRoot>,
         profile_guard: &WritableProfileGuard,
     ) -> Result<(), SourceLeaseError> {
+        self.effect_gate.close_and_wait()?;
         if !self.is_profile_child_namespace() {
             return Err(SourceLeaseError::Unsupported {
                 path: self.database_root.path().to_path_buf(),
@@ -810,6 +819,9 @@ impl SourceLease {
             self.lease_epoch,
         ));
         self.authority_liveness = Arc::new(AtomicBool::new(true));
+        // The old registration keeps its permanently closed gate. A fresh generation gets a
+        // distinct gate only after the retarget transaction committed.
+        self.effect_gate = Arc::new(SourceEffectGate::new());
         // A committed retarget supersedes the old source-generation registration. The old
         // journal evidence remains independently drainable, while the new generation may prepare
         // its own guarded registration against the advanced owner/epoch.
@@ -972,6 +984,7 @@ impl SourceLease {
 
     /// Mark this owner released using its retained control connection.
     pub(crate) fn release(&self) -> Result<(), SourceLeaseError> {
+        self.effect_gate.close_and_wait()?;
         self.publication_liveness
             .live
             .store(false, Ordering::Release);
