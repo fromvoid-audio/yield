@@ -58,6 +58,66 @@ fn apply_structural_migrations(connection: &Connection) -> Result<(), SourceDbEr
     ensure_pending_rename_destination_schema(connection)?;
     ensure_aspect_descriptor_tables(connection)?;
     ensure_directory_truth_schema(connection)?;
+    ensure_source_participant_curation_receipts_schema(connection)?;
+    Ok(())
+}
+
+/// Ensure the durable source-writer receipt relation used by the bounded source command path.
+///
+/// This relation is deliberately source-local. It is not an operation-journal table: the
+/// source database owns the curation transaction and retains the exact source-participant
+/// request/receipt bytes needed for replay after a lost acknowledgement.
+fn ensure_source_participant_curation_receipts_schema(
+    connection: &Connection,
+) -> Result<(), SourceDbError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS source_participant_curation_receipts (
+                operation_id TEXT NOT NULL,
+                participant_id TEXT NOT NULL,
+                command_id TEXT NOT NULL,
+                source_id TEXT NOT NULL CHECK(length(trim(source_id)) > 0),
+                root_identity BLOB NOT NULL,
+                root_binding_identity TEXT NOT NULL CHECK(length(trim(root_binding_identity)) > 0),
+                database_identity TEXT NOT NULL CHECK(length(trim(database_identity)) > 0),
+                lifecycle_generation TEXT NOT NULL CHECK(length(trim(lifecycle_generation)) > 0),
+                lease_epoch INTEGER NOT NULL CHECK(lease_epoch > 0),
+                expected_revision INTEGER NOT NULL CHECK(expected_revision >= 0),
+                committed_revision INTEGER NOT NULL CHECK(committed_revision > 0),
+                request_bytes BLOB NOT NULL CHECK(length(request_bytes) > 0),
+                receipt_bytes BLOB NOT NULL CHECK(length(receipt_bytes) > 0),
+                request_len INTEGER NOT NULL CHECK(request_len = length(request_bytes)),
+                receipt_len INTEGER NOT NULL CHECK(receipt_len = length(receipt_bytes)),
+                PRIMARY KEY(operation_id, participant_id, command_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_source_participant_curation_receipts_source
+                ON source_participant_curation_receipts(source_id, committed_revision);
+            CREATE INDEX IF NOT EXISTS idx_source_participant_curation_receipts_revision
+                ON source_participant_curation_receipts(committed_revision);",
+        )
+        .map_err(map_sql_error)?;
+
+    let columns = table_columns(connection, "source_participant_curation_receipts")?;
+    let required = [
+        "operation_id",
+        "participant_id",
+        "command_id",
+        "source_id",
+        "root_identity",
+        "root_binding_identity",
+        "database_identity",
+        "lifecycle_generation",
+        "lease_epoch",
+        "expected_revision",
+        "committed_revision",
+        "request_bytes",
+        "receipt_bytes",
+        "request_len",
+        "receipt_len",
+    ];
+    if required.iter().any(|column| !columns.contains(*column)) {
+        return Err(SourceDbError::Unexpected);
+    }
     Ok(())
 }
 

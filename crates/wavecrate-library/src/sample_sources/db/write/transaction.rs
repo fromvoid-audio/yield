@@ -55,6 +55,16 @@ enum DirectoryTruthActivationMode {
     RequireStaging,
 }
 
+/// Result of the final source-writer commit boundary.
+pub(super) enum CurationCommitOutcome {
+    /// SQLite committed the transaction and the owner can report the receipt.
+    Committed,
+    /// The transaction was explicitly rolled back before any commit became possible.
+    RolledBack(SourceDbError),
+    /// Commit or rollback acknowledgement was not conclusive.
+    Uncertain(SourceDbError),
+}
+
 impl SourceWriteBatch<'_> {
     /// Revalidate the retained source owner immediately before committing this transaction.
     ///
@@ -69,8 +79,24 @@ impl SourceWriteBatch<'_> {
         &self.tx
     }
 
+    /// Explicitly roll back a source-writer curation transaction and report whether that
+    /// rollback itself was confirmed by SQLite.
+    pub(super) fn rollback_curation_prepared(self) -> Result<(), SourceDbError> {
+        self.tx.rollback().map_err(map_sql_error)
+    }
+
     /// Commit a transaction whose caller already applied its exact revision policy.
     pub(super) fn commit_curation_prepared(self) -> Result<(), SourceDbError> {
+        match self.commit_curation_prepared_with_outcome() {
+            CurationCommitOutcome::Committed => Ok(()),
+            CurationCommitOutcome::RolledBack(error) | CurationCommitOutcome::Uncertain(error) => {
+                Err(error)
+            }
+        }
+    }
+
+    /// Commit the source-writer transaction while preserving rollback certainty.
+    pub(super) fn commit_curation_prepared_with_outcome(self) -> CurationCommitOutcome {
         if self.paths_revision_dirty
             || self.identities_revision_dirty
             || self.index_revision_dirty
@@ -78,13 +104,27 @@ impl SourceWriteBatch<'_> {
             || !self.source_index_changes.is_empty()
             || self.manifest_audit_completed
         {
-            return Err(SourceDbError::Unexpected);
+            return match self.tx.rollback() {
+                Ok(()) => CurationCommitOutcome::RolledBack(SourceDbError::Unexpected),
+                Err(error) => CurationCommitOutcome::Uncertain(map_sql_error(error)),
+            };
         }
         let owner = self.owner;
-        self.validate_profile_owned_mutation()?;
-        self.tx.commit().map_err(map_sql_error)?;
-        owner.maybe_checkpoint_owned_wal();
-        Ok(())
+        if let Err(error) = self.validate_profile_owned_mutation() {
+            return match self.tx.rollback() {
+                Ok(()) => CurationCommitOutcome::RolledBack(error),
+                Err(rollback_error) => {
+                    CurationCommitOutcome::Uncertain(map_sql_error(rollback_error))
+                }
+            };
+        }
+        match self.tx.commit() {
+            Ok(()) => {
+                owner.maybe_checkpoint_owned_wal();
+                CurationCommitOutcome::Committed
+            }
+            Err(error) => CurationCommitOutcome::Uncertain(map_sql_error(error)),
+        }
     }
 
     pub(crate) fn begin_next_source_directory_truth_generation(

@@ -15,7 +15,7 @@ pub(crate) use migrations::table_columns;
 /// A matching stamp means the file has already passed the full schema-assurance
 /// path once. Current-stamped opens still run low-cost additive table/column
 /// repairs, but they skip index rebuilds and deferred cleanup work.
-pub(super) const SOURCE_DB_SCHEMA_VERSION: i64 = 12;
+pub(super) const SOURCE_DB_SCHEMA_VERSION: i64 = 13;
 
 /// Apply the full source-database schema, including deferred cleanup work.
 pub(super) fn apply_schema(connection: &Connection) -> Result<SchemaApplyOutcome, SourceDbError> {
@@ -139,6 +139,54 @@ mod tests {
         assert_eq!(
             read_schema_version(&connection).unwrap(),
             SOURCE_DB_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v13_source_writer_receipts_are_repaired_for_legacy_and_current_stamps() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_schema_fast(&connection).unwrap();
+        connection
+            .execute("DROP TABLE source_participant_curation_receipts", [])
+            .unwrap();
+
+        // Current-stamped files still receive the low-cost additive relation repair.
+        assert_eq!(
+            apply_schema_fast(&connection).unwrap(),
+            SchemaApplyOutcome::Current
+        );
+        assert!(
+            table_columns(&connection, "source_participant_curation_receipts")
+                .unwrap()
+                .contains("root_binding_identity")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT type FROM pragma_table_info('source_participant_curation_receipts')
+                     WHERE name = 'lifecycle_generation'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "TEXT"
+        );
+
+        // A legacy stamp receives the same relation while the rest of schema assurance runs.
+        connection
+            .execute("DROP TABLE source_participant_curation_receipts", [])
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", SOURCE_DB_SCHEMA_VERSION - 1)
+            .unwrap();
+        assert_eq!(
+            apply_schema_fast(&connection).unwrap(),
+            SchemaApplyOutcome::Assured
+        );
+        assert!(
+            table_columns(&connection, "source_participant_curation_receipts")
+                .unwrap()
+                .contains("receipt_len")
         );
     }
 

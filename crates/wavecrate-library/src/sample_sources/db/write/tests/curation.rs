@@ -19,7 +19,8 @@ use crate::sample_sources::db::{DatabaseRootBindingGuard, SourceDirectoryTruthSt
 use crate::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 use crate::sample_sources::{
     Rating, SOURCE_CURATION_BATCH_LIMIT, SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SampleCollection,
-    SourceCurationUpdate, SourceDatabase, SourceDbError, SourcePlaybackType,
+    SourceCommandId, SourceCurationUpdate, SourceDatabase, SourceDbError, SourceId,
+    SourcePlaybackType, SourceWriter, SourceWriterError, SourceWriterRequest,
 };
 
 struct CurationFixture {
@@ -74,7 +75,19 @@ impl CurationFixture {
         database
             .begin_source_directory_truth_generation(1, 0)
             .expect("directory generation");
-        let root_identity = RootIdentity::from_bytes(b"curation-root".to_vec());
+        let root_identity = match profile_child.as_ref() {
+            Some(_) => RootIdentity::from_bytes(
+                database
+                    .source_lease
+                    .as_ref()
+                    .expect("profile-bound source lease")
+                    .media_root_binding()
+                    .identity()
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            None => RootIdentity::from_bytes(b"curation-root".to_vec()),
+        };
         database
             .write_batch()
             .expect("audit batch")
@@ -167,6 +180,51 @@ fn continuity_state(database: &SourceDatabase) -> (u64, SourceDirectoryTruthStat
             .source_directory_truth_state()
             .expect("directory truth state"),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceWriterStateSnapshot {
+    revision: u64,
+    continuity: (u64, SourceDirectoryTruthState),
+    paths_revision: u64,
+    identities_revision: u64,
+    index_revision: u64,
+    entry: (i64, i64, Option<i64>, Option<i64>),
+    receipt_count: i64,
+}
+
+fn source_writer_state_snapshot(database: &SourceDatabase) -> SourceWriterStateSnapshot {
+    SourceWriterStateSnapshot {
+        revision: database.get_revision().expect("source revision"),
+        continuity: continuity_state(database),
+        paths_revision: metadata_number(database, "wav_paths_revision_v1"),
+        identities_revision: metadata_number(database, "wav_identities_revision_v1"),
+        index_revision: metadata_number(database, "source_index_revision_v1"),
+        entry: database
+            .connection
+            .query_row(
+                "SELECT tag, locked, last_played_at, last_curated_at
+                 FROM wav_files WHERE path = 'one.wav'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .expect("curation state row"),
+        receipt_count: database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM source_participant_curation_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("receipt count"),
+    }
 }
 
 #[test]
@@ -1193,6 +1251,647 @@ fn curation_existing_tag_ids_reject_invalid_missing_and_stale_without_writes() {
         Err(SourceDbError::InvalidTagId { tag_id: 0 })
     ));
     drop(batch);
+}
+
+#[test]
+fn source_writer_replays_durable_receipts_and_reopens_as_observation_only() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-writer-test");
+    let mut writer = SourceWriter::new(fixture.database, source_id.clone(), u64::MAX)
+        .expect("source writer authority");
+    let initial = writer.current_revision().expect("initial revision");
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(11)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(12)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(13)),
+        initial.clone(),
+        vec![SourceCurationUpdate::SetRating {
+            path: CurationFixture::path("one.wav"),
+            rating: Rating::KEEP_3,
+        }],
+    )
+    .expect("request");
+    let stale_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(41)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(42)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(43)),
+        initial.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("stale request");
+    let conflicting_request = SourceWriterRequest::new(
+        request.identity().operation_id(),
+        request.identity().participant_id(),
+        request.identity().command_id(),
+        initial.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("conflicting request");
+    let first = writer
+        .commit_curation(request.clone())
+        .expect("first source command");
+    assert_eq!(first.source_revision().revision(), initial.revision() + 1);
+    let replay = writer
+        .commit_curation(request.clone())
+        .expect("exact duplicate replay");
+    assert_eq!(first, replay);
+    let state_after_first = source_writer_state_snapshot(writer.database_for_tests());
+    assert_eq!(
+        writer.current_revision().unwrap().revision(),
+        first.source_revision().revision()
+    );
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        state_after_first
+    );
+    let conflicting_before = source_writer_state_snapshot(writer.database_for_tests());
+    assert!(matches!(
+        writer.commit_curation(conflicting_request),
+        Err(SourceWriterError::ConflictingCommand { .. })
+    ));
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        conflicting_before
+    );
+    let stale_before = source_writer_state_snapshot(writer.database_for_tests());
+    assert!(matches!(
+        writer.commit_curation(stale_request),
+        Err(SourceWriterError::StaleRevision {
+            expected: 3,
+            actual: 4
+        })
+    ));
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        stale_before
+    );
+
+    writer.inject_fault_for_tests("before_commit");
+    let rollback_expected = writer.current_revision().unwrap();
+    let rollback_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(21)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(22)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(23)),
+        rollback_expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("rollback request");
+    let rollback_before = source_writer_state_snapshot(writer.database_for_tests());
+    assert!(matches!(
+        writer.commit_curation(rollback_request.clone()),
+        Err(SourceWriterError::Database(SourceDbError::Canceled))
+    ));
+    assert_eq!(
+        writer.current_revision().unwrap().revision(),
+        rollback_expected.revision()
+    );
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        rollback_before
+    );
+    let rollback_receipt = writer
+        .commit_curation(rollback_request)
+        .expect("retry after confirmed rollback");
+    assert_eq!(
+        rollback_receipt.source_revision().revision(),
+        rollback_expected.revision() + 1
+    );
+
+    let rollback_uncertain_expected = writer.current_revision().unwrap();
+    let rollback_uncertain_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(24)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(25)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(26)),
+        rollback_uncertain_expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: false,
+        }],
+    )
+    .expect("rollback uncertainty request");
+    let rollback_uncertain_before = source_writer_state_snapshot(writer.database_for_tests());
+    writer.inject_fault_for_tests("rollback_uncertain");
+    assert!(matches!(
+        writer.commit_curation(rollback_uncertain_request.clone()),
+        Err(SourceWriterError::Uncertain { .. })
+    ));
+    assert_eq!(
+        writer.current_revision().unwrap().revision(),
+        rollback_uncertain_expected.revision()
+    );
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        rollback_uncertain_before
+    );
+    let rollback_uncertain_replay = writer
+        .commit_curation(rollback_uncertain_request)
+        .expect("retry after rollback uncertainty");
+    assert_eq!(
+        rollback_uncertain_replay.source_revision().revision(),
+        rollback_uncertain_expected.revision() + 1
+    );
+
+    writer.inject_fault_for_tests("after_commit");
+    let uncertain_expected = writer.current_revision().unwrap();
+    let uncertain_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(31)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(32)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(33)),
+        uncertain_expected,
+        vec![SourceCurationUpdate::SetLastPlayedAt {
+            path: CurationFixture::path("one.wav"),
+            played_at: Some(9),
+        }],
+    )
+    .expect("uncertain request");
+    let uncertain_result = writer.commit_curation(uncertain_request.clone());
+    match uncertain_result {
+        Err(SourceWriterError::Uncertain {
+            identity,
+            canonical_request,
+        }) => {
+            assert_eq!(identity, uncertain_request.identity());
+            assert_eq!(canonical_request, uncertain_request.canonical_bytes());
+        }
+        other => panic!("expected uncertain source writer result, got {other:?}"),
+    }
+    let uncertain_replay = writer
+        .commit_curation(uncertain_request.clone())
+        .expect("exact retry after uncertain acknowledgement");
+    assert_eq!(uncertain_replay.identity(), uncertain_request.identity());
+    assert_eq!(
+        uncertain_replay.curation().files()[0].relative_path,
+        PathBuf::from("one.wav")
+    );
+    assert_eq!(
+        uncertain_replay.curation().files()[0].last_played_at,
+        Some(9)
+    );
+
+    writer.close().expect("close source writer");
+    let reopened_database = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        PathBuf::from("curation-profile-bound"),
+    )
+    .expect("reopen source database");
+    assert_eq!(
+        reopened_database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM source_participant_curation_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        4
+    );
+    let mut reopened = SourceWriter::new(reopened_database, source_id, u64::MAX - 1)
+        .expect("reopened source writer");
+    let historical = reopened
+        .read_receipt_observation(request.identity())
+        .expect("read historical source receipt")
+        .expect("historical source receipt exists");
+    assert_eq!(historical.identity(), request.identity());
+    assert_eq!(
+        historical.source_revision().lifecycle_generation(),
+        u64::MAX
+    );
+    assert_eq!(
+        historical.source_revision().revision(),
+        first.source_revision().revision()
+    );
+    assert_eq!(
+        historical.source_revision().root_identity(),
+        first.source_revision().root_identity()
+    );
+    assert_eq!(
+        historical.source_revision().root_binding_identity(),
+        first.source_revision().root_binding_identity()
+    );
+    assert_eq!(
+        historical.source_revision().database_identity(),
+        first.source_revision().database_identity()
+    );
+    assert_eq!(
+        historical.source_revision().lease_epoch(),
+        first.source_revision().lease_epoch()
+    );
+    assert!(matches!(
+        reopened.commit_curation(request.clone()),
+        Err(SourceWriterError::SupersededLifecycle { .. })
+    ));
+    let stale_generation_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(51)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(52)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(53)),
+        first.source_revision().clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: false,
+        }],
+    )
+    .expect("stale generation request");
+    assert!(matches!(
+        reopened.commit_curation(stale_generation_request),
+        Err(SourceWriterError::StaleFence)
+    ));
+    reopened.close().expect("close reopened source writer");
+}
+
+#[test]
+fn source_writer_replays_at_full_retained_history_limit() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-writer-history-limit");
+    let mut writer =
+        SourceWriter::new(fixture.database, source_id.clone(), 1).expect("source writer authority");
+    let first_expected = writer.current_revision().expect("initial revision");
+    let first_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(1_000)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(2_000)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(3_000)),
+        first_expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("first history request");
+    let first = writer
+        .commit_curation(first_request.clone())
+        .expect("first history commit");
+
+    for index in 1..256usize {
+        let expected = writer.current_revision().expect("history revision");
+        let request = SourceWriterRequest::new(
+            crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(
+                1_000 + index as u128,
+            )),
+            crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(
+                2_000 + index as u128,
+            )),
+            SourceCommandId::from_uuid(uuid::Uuid::from_u128(3_000 + index as u128)),
+            expected.clone(),
+            vec![SourceCurationUpdate::SetLocked {
+                path: CurationFixture::path("one.wav"),
+                locked: index % 2 == 0,
+            }],
+        )
+        .expect("history request");
+        let receipt = writer.commit_curation(request).expect("history commit");
+        assert_eq!(
+            receipt.source_revision().revision(),
+            expected.revision() + 1
+        );
+    }
+
+    let at_capacity = writer.current_revision().expect("full history revision");
+    let at_capacity_state = source_writer_state_snapshot(writer.database_for_tests());
+    let over_limit_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(9_001)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(9_002)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(9_003)),
+        at_capacity.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("over-limit history request");
+    assert!(matches!(
+        writer.commit_curation(over_limit_request),
+        Err(SourceWriterError::CapacityExceeded)
+    ));
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        at_capacity_state
+    );
+    let replay = writer
+        .commit_curation(first_request)
+        .expect("replay at retained history limit");
+    assert_eq!(replay, first);
+    assert_eq!(
+        writer.current_revision().unwrap().revision(),
+        at_capacity.revision()
+    );
+    writer.close().expect("close history writer");
+
+    let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        PathBuf::from("curation-profile-bound"),
+    )
+    .expect("reopen history source database");
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT count(*) FROM source_participant_curation_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        256
+    );
+}
+
+#[test]
+fn source_writer_rolls_back_oversized_receipt_after_curation_mutation() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-writer-oversized-receipt");
+    let mut writer =
+        SourceWriter::new(fixture.database, source_id, 1).expect("source writer authority");
+    let expected = writer.current_revision().expect("initial revision");
+    let before = source_writer_state_snapshot(writer.database_for_tests());
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(5_001)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(5_002)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(5_003)),
+        expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("oversized receipt request");
+
+    writer.inject_fault_for_tests("oversized_receipt");
+    assert!(matches!(
+        writer.commit_curation(request.clone()),
+        Err(SourceWriterError::CapacityExceeded)
+    ));
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        before
+    );
+
+    let receipt = writer
+        .commit_curation(request)
+        .expect("retry after oversized receipt rollback");
+    assert_eq!(
+        receipt.source_revision().revision(),
+        expected.revision() + 1
+    );
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()).receipt_count,
+        before.receipt_count + 1
+    );
+}
+
+#[test]
+fn source_writer_rejects_combined_receipt_budget_without_state_change() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-writer-receipt-budget");
+    let mut writer =
+        SourceWriter::new(fixture.database, source_id, 1).expect("source writer authority");
+
+    for index in 0..15u128 {
+        let expected = writer.current_revision().expect("budget revision");
+        let request = SourceWriterRequest::new(
+            crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(10_000 + index)),
+            crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(
+                20_000 + index,
+            )),
+            SourceCommandId::from_uuid(uuid::Uuid::from_u128(30_000 + index)),
+            expected,
+            vec![SourceCurationUpdate::SetLocked {
+                path: CurationFixture::path("one.wav"),
+                locked: index % 2 == 0,
+            }],
+        )
+        .expect("budget request");
+        writer.inject_fault_for_tests("receipt_at_record_limit");
+        writer
+            .commit_curation(request)
+            .expect("padded receipt within combined budget");
+    }
+
+    let expected = writer.current_revision().expect("budget boundary revision");
+    let before = source_writer_state_snapshot(writer.database_for_tests());
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(40_001)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(40_002)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(40_003)),
+        expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("budget boundary request");
+    writer.inject_fault_for_tests("receipt_at_record_limit");
+    assert!(matches!(
+        writer.commit_curation(request),
+        Err(SourceWriterError::CapacityExceeded)
+    ));
+    assert_eq!(
+        source_writer_state_snapshot(writer.database_for_tests()),
+        before
+    );
+}
+
+#[test]
+fn source_writer_rejects_oversized_request_before_transaction_mutation() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-writer-oversized");
+    let writer =
+        SourceWriter::new(fixture.database, source_id, 1).expect("source writer authority");
+    let expected = writer.current_revision().expect("initial revision");
+    let long_path = CurationFixture::path(&format!("{}.wav", "x".repeat(10_000)));
+    let updates = (0..SOURCE_CURATION_BATCH_LIMIT)
+        .map(|_| SourceCurationUpdate::SetLocked {
+            path: long_path.clone(),
+            locked: true,
+        })
+        .collect();
+    let oversized = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(4_001)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(4_002)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(4_003)),
+        expected.clone(),
+        updates,
+    );
+    assert!(matches!(
+        oversized,
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    assert_eq!(writer.current_revision().unwrap(), expected);
+    writer.close().expect("close oversized writer");
+    let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        PathBuf::from("curation-profile-bound"),
+    )
+    .expect("reopen oversized source database");
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT count(*) FROM source_participant_curation_receipts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn source_writer_rejects_revision_beyond_sqlite_integer_before_mutation() {
+    let fixture = CurationFixture::new_profile_bound();
+    let max_revision = i64::MAX.to_string();
+    fixture
+        .database
+        .connection
+        .execute(
+            "UPDATE metadata SET value = ?1 WHERE key = 'revision'",
+            [&max_revision],
+        )
+        .expect("set max source revision");
+    fixture
+        .database
+        .connection
+        .execute(
+            "UPDATE metadata SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                &max_revision,
+                crate::sample_sources::db::META_LAST_AUTHORITATIVE_AUDIT_REVISION
+            ],
+        )
+        .expect("set max audit revision");
+    fixture
+        .database
+        .connection
+        .execute(
+            "UPDATE source_directory_generations
+             SET published_source_revision = ?1
+             WHERE status = 'active'",
+            [i64::MAX],
+        )
+        .expect("set max directory revision");
+
+    let mut writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-writer-max-revision"),
+        1,
+    )
+    .expect("source writer authority");
+    let expected = writer.current_revision().expect("max revision");
+    assert_eq!(expected.revision(), i64::MAX as u64);
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(5_001)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(5_002)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(5_003)),
+        expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("max revision request");
+    assert!(matches!(
+        writer.commit_curation(request),
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    assert_eq!(writer.current_revision().unwrap(), expected);
+    writer.close().expect("close max revision writer");
+}
+
+#[test]
+fn source_writer_rejects_audit_root_mismatch_before_issuing_a_revision() {
+    let fixture = CurationFixture::new_profile_bound();
+    fixture
+        .database
+        .connection
+        .execute(
+            "UPDATE metadata SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                "[99]",
+                crate::sample_sources::db::META_LAST_AUTHORITATIVE_AUDIT_ROOT_IDENTITY
+            ],
+        )
+        .expect("tamper audit root");
+    assert!(matches!(
+        SourceWriter::new(
+            fixture.database,
+            SourceId::from_string("source-writer-root-mismatch"),
+            1,
+        ),
+        Err(SourceWriterError::StaleFence)
+    ));
+}
+
+#[test]
+fn source_writer_rejects_tampered_receipt_lengths_before_loading_payloads() {
+    let fixture = CurationFixture::new_profile_bound();
+    let source_id = SourceId::from_string("source-writer-malformed");
+    let mut writer =
+        SourceWriter::new(fixture.database, source_id.clone(), 1).expect("source writer authority");
+    let expected = writer.current_revision().expect("revision");
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(61)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(62)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(63)),
+        expected,
+        vec![SourceCurationUpdate::SetRating {
+            path: CurationFixture::path("one.wav"),
+            rating: Rating::KEEP_1,
+        }],
+    )
+    .expect("request");
+    writer.commit_curation(request.clone()).expect("commit");
+    writer.close().expect("close source writer");
+
+    let reopened_database = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        PathBuf::from("curation-profile-bound"),
+    )
+    .expect("reopen source database");
+    reopened_database
+        .connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("allow malformed fixture row");
+    reopened_database
+        .connection
+        .execute(
+            "UPDATE source_participant_curation_receipts
+             SET request_len = request_len + 1",
+            [],
+        )
+        .expect("tamper request length");
+    let mut reopened =
+        SourceWriter::new(reopened_database, source_id, 1).expect("reopen source writer");
+    assert!(matches!(
+        reopened.commit_curation(request),
+        Err(SourceWriterError::MalformedReceipt)
+    ));
+    let expected = reopened.current_revision().expect("revision after tamper");
+    let new_request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(64)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(65)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(66)),
+        expected,
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("new request after tamper");
+    assert!(matches!(
+        reopened.commit_curation(new_request),
+        Err(SourceWriterError::MalformedReceipt)
+    ));
+    reopened.close().expect("close reopened source writer");
 }
 
 fn insert_tag(database: &SourceDatabase, normalized_text: &str, display_label: &str) -> i64 {

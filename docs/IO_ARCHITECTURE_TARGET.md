@@ -60,11 +60,23 @@ source-writer routing, provider qualification, or production admission.
 
 The source-owner, typed `SourceRevision`, duplicate/uncertain commit, and bounded
 read-snapshot decision is recorded in
-[SOURCE_WRITER_CONTRACT.md](SOURCE_WRITER_CONTRACT.md). It is a docs-only contract: the
-current catalog and source-database paths remain named migration exceptions, and no
-source receipt schema, snapshot backend, filesystem no-write proof, or asynchronous live
-grant is implemented by this decision. Its WAL caveat and deferred boundaries must be
-preserved when OPT-1638, OPT-1639, and OPT-1857 are implemented.
+[SOURCE_WRITER_CONTRACT.md](SOURCE_WRITER_CONTRACT.md). The broader snapshot and lifecycle
+boundary is a docs-only contract: the current catalog and source-database paths remain
+named migration exceptions, and the snapshot backend, filesystem no-write proof, and
+asynchronous live grant remain deferred. OPT-1638 now implements only the bounded
+source-library curation slice: its
+schema-v13 receipt relation, private live-fenced `SourceWriter`, exact duplicate replay,
+structured commit receipt, and rollback/uncertainty readback. It does not route catalog
+or family callers, retire/pin source leases, or promote a receipt/snapshot into
+filesystem or operation authority. Its WAL caveat and deferred boundaries remain the
+OPT-1637/OPT-1639/OPT-1857 contract.
+
+The implemented `SourceWriter::read_receipt_observation` method reads a bounded historical
+receipt for reconciliation; it cannot mint a live revision or write authority. Persisted
+source revisions accept the SQLite signed-integer ceiling (`i64::MAX`) and reject an
+increment beyond it, while lifecycle generations retain their full checked `u64` domain.
+The 256-row and 16 MiB per-source receipt budget has no eviction path; retirement and any
+history cleanup remain deferred to a later owner/coordinator contract.
 
 ### Proposed FileOperationOwner contract (OPT-1629)
 

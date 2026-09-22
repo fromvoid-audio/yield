@@ -128,6 +128,20 @@ pub struct SourceCurationCommitReceipt {
 }
 
 impl SourceCurationCommitReceipt {
+    pub(crate) fn from_parts(
+        source_revision: u64,
+        root_identity: RootIdentity,
+        directory_generation: u64,
+        files: Vec<super::super::BrowserFileMetadata>,
+    ) -> Self {
+        Self {
+            source_revision,
+            root_identity,
+            directory_generation,
+            files,
+        }
+    }
+
     /// Return the exact source revision committed by this curation transaction.
     pub const fn source_revision(&self) -> u64 {
         self.source_revision
@@ -181,46 +195,7 @@ impl SourceDatabase {
             &normalized_paths,
         )?;
 
-        for update in updates {
-            match update {
-                SourceCurationUpdate::SetLastPlayedAt { path, played_at } => match played_at {
-                    Some(value) => batch.set_last_played_at(path.as_path(), *value)?,
-                    None => batch.clear_last_played_at(path.as_path())?,
-                },
-                SourceCurationUpdate::SetRating { path, rating } => {
-                    batch.set_tag(path.as_path(), *rating)?;
-                }
-                SourceCurationUpdate::SetRatingAndLastCuratedAt {
-                    path,
-                    rating,
-                    last_curated_at,
-                } => {
-                    batch.set_tag(path.as_path(), *rating)?;
-                    batch.set_last_curated_at(path.as_path(), *last_curated_at)?;
-                }
-                SourceCurationUpdate::SetLocked { path, locked } => {
-                    batch.set_locked(path.as_path(), *locked)?;
-                }
-                SourceCurationUpdate::AddCollection { path, collection } => {
-                    batch.add_collection(path.as_path(), *collection)?;
-                }
-                SourceCurationUpdate::RemoveCollection { path, collection } => {
-                    batch.remove_collection(path.as_path(), *collection)?;
-                }
-                SourceCurationUpdate::AddTag { path, label } => {
-                    batch.assign_tag_for_curation(path.as_path(), label)?;
-                }
-                SourceCurationUpdate::RemoveTag { path, label } => {
-                    batch.remove_tag_from_path(path.as_path(), label)?;
-                }
-                SourceCurationUpdate::AssignExistingTag { path, tag_id } => {
-                    batch.assign_existing_tag_for_curation(path.as_path(), *tag_id)?;
-                }
-                SourceCurationUpdate::RemoveExistingTag { path, tag_id } => {
-                    batch.remove_existing_tag_for_curation(path.as_path(), *tag_id)?;
-                }
-            }
-        }
+        apply_curation_updates(&mut batch, updates)?;
 
         SourceDatabase::bump_revision(batch.curation_transaction())?;
         let committed_source_revision = source_revision(batch.curation_transaction())?;
@@ -287,7 +262,9 @@ impl SourceDatabase {
     }
 }
 
-fn normalize_update_paths(updates: &[SourceCurationUpdate]) -> Result<Vec<String>, SourceDbError> {
+pub(super) fn normalize_update_paths(
+    updates: &[SourceCurationUpdate],
+) -> Result<Vec<String>, SourceDbError> {
     let mut paths = BTreeSet::new();
     for update in updates {
         paths.insert(super::super::normalize_relative_path(
@@ -297,7 +274,9 @@ fn normalize_update_paths(updates: &[SourceCurationUpdate]) -> Result<Vec<String
     Ok(paths.into_iter().collect())
 }
 
-fn validate_update_values(updates: &[SourceCurationUpdate]) -> Result<(), SourceDbError> {
+pub(super) fn validate_update_values(
+    updates: &[SourceCurationUpdate],
+) -> Result<(), SourceDbError> {
     for update in updates {
         match update {
             SourceCurationUpdate::SetRating { rating, .. }
@@ -328,7 +307,7 @@ fn validate_update_values(updates: &[SourceCurationUpdate]) -> Result<(), Source
     Ok(())
 }
 
-fn validate_curation_preconditions(
+pub(super) fn validate_curation_preconditions(
     transaction: &Transaction<'_>,
     expected_source_revision: u64,
     expected_root_identity: &RootIdentity,
@@ -442,6 +421,53 @@ fn validate_curation_preconditions(
 
     validate_live_supported_paths(transaction, normalized_paths)?;
     u64::try_from(generation).map_err(|_| SourceDbError::Unexpected)
+}
+
+pub(super) fn apply_curation_updates(
+    batch: &mut super::super::SourceWriteBatch<'_>,
+    updates: &[SourceCurationUpdate],
+) -> Result<(), SourceDbError> {
+    for update in updates {
+        match update {
+            SourceCurationUpdate::SetLastPlayedAt { path, played_at } => match played_at {
+                Some(value) => batch.set_last_played_at(path.as_path(), *value)?,
+                None => batch.clear_last_played_at(path.as_path())?,
+            },
+            SourceCurationUpdate::SetRating { path, rating } => {
+                batch.set_tag(path.as_path(), *rating)?;
+            }
+            SourceCurationUpdate::SetRatingAndLastCuratedAt {
+                path,
+                rating,
+                last_curated_at,
+            } => {
+                batch.set_tag(path.as_path(), *rating)?;
+                batch.set_last_curated_at(path.as_path(), *last_curated_at)?;
+            }
+            SourceCurationUpdate::SetLocked { path, locked } => {
+                batch.set_locked(path.as_path(), *locked)?;
+            }
+            SourceCurationUpdate::AddCollection { path, collection } => {
+                batch.add_collection(path.as_path(), *collection)?;
+            }
+            SourceCurationUpdate::RemoveCollection { path, collection } => {
+                batch.remove_collection(path.as_path(), *collection)?;
+            }
+            SourceCurationUpdate::AddTag { path, label } => {
+                batch.assign_tag_for_curation(path.as_path(), label)?;
+            }
+            SourceCurationUpdate::RemoveTag { path, label } => {
+                batch.remove_tag_from_path(path.as_path(), label)?;
+            }
+            SourceCurationUpdate::AssignExistingTag { path, tag_id } => {
+                batch.assign_existing_tag_for_curation(path.as_path(), *tag_id)?;
+            }
+            SourceCurationUpdate::RemoveExistingTag { path, tag_id } => {
+                batch.remove_existing_tag_for_curation(path.as_path(), *tag_id)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_live_supported_paths(

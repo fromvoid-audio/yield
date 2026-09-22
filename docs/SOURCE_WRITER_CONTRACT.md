@@ -1,14 +1,47 @@
 # Source writer and snapshot contract
 
-Status: [OPT-1637](https://linear.app/boostnlvp/issue/OPT-1637) decision artifact.
-This document freezes the source-writer, revision, and bounded-snapshot boundary for
-the next implementation slices. It adds no runtime owner, queue, schema, migration,
-filesystem operation, or asynchronous grant.
+Status: [OPT-1637](https://linear.app/boostnlvp/issue/OPT-1637) decision artifact for the
+broader snapshot and lifecycle boundary. The bounded source-library curation slice
+implemented under OPT-1638 is recorded below; the remaining sections add no runtime
+owner, queue, filesystem operation, or asynchronous grant beyond that slice.
 
 Related contracts are the [I/O architecture target](IO_ARCHITECTURE_TARGET.md), the
 [file-operation owner contract](FILE_OPERATION_OWNER_CONTRACT.md), the
 [capacity authority contract](CAPACITY_AUTHORITY_CONTRACT.md), and the existing
 [database migration contract](DATABASE_MIGRATIONS.md).
+
+## Implemented OPT-1638 boundary
+
+The first source-writer slice is implemented in `wavecrate-library`. Schema version 13
+adds the source-local `source_participant_curation_receipts` relation. It retains a
+versioned, deny-unknown request codec and structured curation receipt, with a 256-row
+and 16 MiB combined request/receipt budget and a per-record `MAX_RECORD_BYTES` limit.
+The relation is additive; existing curation rows and legacy source opens remain intact.
+
+`SourceWriter` owns one already profile-bound `SourceDatabase` and issues a private
+`SourceRevision` only after live profile, database-file, bound-root, source-lease, and
+authoritative-audit validation. A request carries an exact source, lifecycle, positive
+lease-epoch, root-binding, database-binding, and revision fence. Live validation occurs
+before duplicate lookup; an exact same-lifecycle command replays its durable receipt
+without changing SQL or the revision, while changed bytes, stale fences, and superseded
+lifecycle generations fail closed. The curation updates, source revision, directory/audit
+revision, structured result, and receipt row commit in the existing bounded SQLite
+transaction. Confirmed pre-commit rollback leaves the database unchanged; commit or
+acknowledgement uncertainty retains exact command and canonical request evidence for
+readback rather than blindly rerunning.
+
+`SourceWriter::read_receipt_observation` is the bounded production readback entrypoint
+for historical reconciliation. It returns an observation only and never constructs a
+new live fence. SQLite source revisions are bounded by `i64::MAX`; lifecycle generations
+are stored and checked across their full `u64` domain. The 256-row and 16 MiB retained
+receipt budget has no eviction path, and retirement or history cleanup is deferred until
+a later owner/coordinator contract can preserve duplicate and uncertainty evidence.
+
+This slice exposes a source-library entrypoint only. It does not route catalog or family
+callers, create an asynchronous source grant, change source retirement, implement
+filesystem effects, or turn receipts/snapshots into operation or filesystem authority.
+The broader lifecycle and snapshot proposal below remains the OPT-1637 decision
+boundary; later work must add caller routing and any cross-owner lease pin explicitly.
 
 ## Boundary and authority
 
@@ -136,14 +169,14 @@ returns the previously committed receipt without another revision increment or S
 mutation. The same key with a changed payload, source identity, or fence is a typed
 conflict and leaves the prior state unchanged.
 
-Receipts must eventually be stored by the source participant with a bounded versioned
-codec and migration rule. No such source receipt/idempotency relation exists today. The
-current source schema is version 12; both `Fast` and `Full` opens can create or migrate
-the schema, while `Full` also performs invalid-path cleanup. The source-local
+Receipts are stored by the source participant with the implemented bounded versioned
+codec and migration rule described above. The source schema is now version 13; both
+`Fast` and `Full` opens run the additive receipt relation assurance, while `Full` also
+performs invalid-path cleanup. The source-local
 `file_ops_journal` has recovery semantics and is not a source participant receipt table.
 The volatile catalog request ID and the existing in-memory curation lineage do not supply
-durable duplicate identity. OPT-1638 must decide the receipt relation, byte limits,
-retention, migration, and readback behavior before claiming durable replay.
+the durable duplicate identity; `SourceWriter` supplies that identity and readback path
+for its bounded curation entrypoint.
 
 A confirmed rollback before the transaction commits leaves the source mutation unchanged
 and returns an error-specific outcome; stale, invalid, or conflicting input is not
@@ -249,7 +282,7 @@ filesystem writer calls, UI policy, or a second authority thread.
 
 | Follow-up | Required decision or implementation |
 | --- | --- |
-| [OPT-1638](https://linear.app/boostnlvp/issue/OPT-1638) | Add the versioned source participant receipt/duplicate relation, bounded codec and byte limits, exact commit/uncertainty readback, and lifecycle/operation fields. Preserve legacy source schema/readiness behavior through explicit migration. |
+| [OPT-1638](https://linear.app/boostnlvp/issue/OPT-1638) | Implemented source-owned curation receipts, versioned codec, schema-v13 migration, exact duplicate replay, live fence validation, and confirmed-rollback/uncertainty readback. Caller routing, source retirement pinning, and broader source-write families remain deferred. |
 | [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639) | Implement bounded revisioned snapshots, migration/no-hidden-write qualification, WAL-aware freshness, and fail-closed read backends. |
 | [OPT-1640](https://linear.app/boostnlvp/issue/OPT-1640) | Define the competing-writer guard and the source-owner admission/reconciliation boundary. |
 | [OPT-1782](https://linear.app/boostnlvp/issue/OPT-1782)–[OPT-1794](https://linear.app/boostnlvp/issue/OPT-1794) | Migrate individual source metadata, history, playback, and family callers after the owner and receipt contracts exist. |
