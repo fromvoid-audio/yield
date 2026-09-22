@@ -251,6 +251,8 @@ Full and Fast schema opens can both create or migrate source schema state, and F
 clean invalid paths. A read role skipping migrations is not a migration-safe immutable
 reader. The target migration rule is narrower: only the source owner's `Maintenance`
 startup phase may create, migrate, or repair schema while it holds source ownership.
+The [OPT-1639 design checkpoint](OPT_1639_SOURCE_SNAPSHOT_BOUNDARY.md) records the
+owner-held snapshot path, migration handoff, and evidence needed to qualify it.
 Operational writable roles require a currently compatible schema and return a typed
 `MaintenanceRequired` result instead of opportunistically repairing it. The same owned
 connection may perform that maintenance before entering the operational queue; no

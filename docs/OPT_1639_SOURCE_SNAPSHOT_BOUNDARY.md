@@ -1,0 +1,41 @@
+# OPT-1639 source migration and snapshot boundary
+
+Status: design checkpoint for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). This records the boundary that implementation must prove; it does not qualify existing `UiRead` or `BackgroundRead` connections as no-write snapshots.
+
+## Current evidence
+
+- `sample_sources/db/open.rs::initialize_source_database` calls `apply_schema_fast` for Fast opens and `apply_schema` for Full opens. Both can create or repair schema, even when `user_version` is current. `open_for_catalog_with_profile_guard` currently uses Full and is an authorized startup/migration exception.
+- `sample_sources/db/open/read_only.rs` opens `SQLITE_OPEN_READ_ONLY` and skips writable schema routines. Its returned `SourceDatabase` has no retained profile guard, source lease, or database-file binding. SQLite flags reject SQL writes through that connection; they do not establish that opening a live WAL database leaves the surrounding files untouched.
+- `SourceDatabase::snapshot_to_path_with_write_fence` uses SQLite backup under a source write fence and writes a destination database. It is an export/retarget primitive, not the requested bounded read-only snapshot.
+- The source revision writer from OPT-1638 can provide a committed revision cut. A revision number, copied row, or old publication fence remains an observation, not owner authority.
+
+## Chosen ownership boundary
+
+The first qualified snapshot path uses the already-owned source connection on the source owner thread. It opens no second SQLite connection and creates no snapshot file. The owner retains the profile/source lease and database identity for the entire read. Existing path-only `UiRead` and `BackgroundRead` calls remain legacy observations until callers are separately routed or a no-sidecar-write backend is qualified. In particular, `immutable=1` is not an allowed shortcut for a live WAL database.
+
+Only an owner startup maintenance phase may create, migrate, repair, or clean schema. That phase runs while the profile/source capability is held and before the operational queue accepts requests. Operational writer and snapshot entry points require the already-current schema; a mismatch or missing required object returns a typed maintenance-required result without DDL, retrying under another role, or changing the source database. The startup transition must preserve the same source ownership across maintenance and operational service. Until that transition is implemented, the existing Full catalog open remains an explicitly named exception, and no Fast open may be described as migration-free.
+
+## Snapshot request and result
+
+One request names the retained physical source, expected lifecycle generation, expected `SourceRevision`, a bounded query shape, and an optional keyset continuation. It carries neither a path-only fallback nor mutation authority. The owner validates source/root/database bindings before the read, starts one read transaction on its retained connection, checks the committed revision inside that transaction, performs bounded keyset reads, and rechecks the owner binding before returning. It does not compose pages across different revisions or generations.
+
+The aggregate limit per request is two seconds, 100,000 decoded rows, and 16 MiB of request/result backing, with a stricter page limit where the existing query has one (metadata pages currently use 64 rows). Count actual decoded rows and checked encoded/backing bytes, including continuation state; a SQL `LIMIT` alone does not bound work before the first row. Use a cancellable SQLite progress boundary plus a monotonic elapsed-time check. A budget hit yields a continuation only at a completed keyset boundary. It never returns a partial page as `FreshAsOf`.
+
+| Result | Required evidence | Caller action |
+| --- | --- | --- |
+| `FreshAsOf` | Exact source identity, lifecycle generation, revision, complete bounded page, and continuation cut from one transaction | Publish only as of that cut; revalidate for later pages |
+| `Stale` or `Superseded` | Expected generation/revision differs from the transaction cut or owner binding changed | Retain last-good projection; restart at a new cut |
+| `Unavailable` | Lease, database identity, owner, or source root cannot be validated | Retain last-good projection and request recovery |
+| `BudgetExceeded` | Time, row, or byte bound stopped work at a safe boundary | Continue from an exact keyset cut or request audit |
+| `Malformed` or `AuditRequired` | Required schema or durable data cannot be interpreted | Do not publish an optimistic replacement |
+
+`FreshAsOf` means the returned revision was committed and matched while the transaction held a consistent read view. It does not promise that the source remains current after the response. No result or continuation can authorize a write or schema repair.
+
+## Acceptance sequence
+
+1. Add a non-mutating schema compatibility check and a typed maintenance-required result. Prove a current operational open leaves schema objects and `user_version` unchanged; prove stale or damaged schema fails without repair. Do not switch existing startup to this check until the owner-held maintenance-to-operation handoff is established.
+2. Establish the maintenance handoff on the retained profile/source owner, then use the compatibility check for operational opens. Prove the lease and database identity remain bound, and competing writable opens do not acquire a second owner.
+3. Add the bounded owner-read command and exact revision/fence result. Test a 64-row page, aggregate row/byte/time limits, keyset continuation, mutation between pages, cancellation, stale generation, and owner loss. Test filesystem sidecar/DB metadata before and after an owner-read with no concurrent writer; do not infer no-write behavior from `SQLITE_OPEN_READ_ONLY` alone.
+4. Run focused source schema/migration, owner revision, read-role, and snapshot tests. A legacy read caller is not considered migrated merely because the new command exists. Caller routing remains outside OPT-1639.
+
+If the owner-held connection cannot provide a bounded consistent read without crossing the writer transaction or lifecycle boundary, stop and replan before introducing a second connection or changing the source writer contract.
