@@ -56,6 +56,16 @@ uses the existing durable owner/epoch transaction and emits the old-generation a
 after commit, including a post-commit reopen failure. This bounded handoff adds no schema,
 source-writer routing, provider qualification, or production admission.
 
+### Proposed source-writer and snapshot contract (OPT-1637)
+
+The source-owner, typed `SourceRevision`, duplicate/uncertain commit, and bounded
+read-snapshot decision is recorded in
+[SOURCE_WRITER_CONTRACT.md](SOURCE_WRITER_CONTRACT.md). It is a docs-only contract: the
+current catalog and source-database paths remain named migration exceptions, and no
+source receipt schema, snapshot backend, filesystem no-write proof, or asynchronous live
+grant is implemented by this decision. Its WAL caveat and deferred boundaries must be
+preserved when OPT-1638, OPT-1639, and OPT-1857 are implemented.
+
 ### Proposed FileOperationOwner contract (OPT-1629)
 
 The bounded command/result and capability-fence decision for filesystem effects is in
