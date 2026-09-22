@@ -10,7 +10,8 @@
 //! retained-folder removal observations, V11 adds retained-folder resolution observations, V12
 //! adds selection-only Normalize observations, and V13 adds source-owned selection-output
 //! observations. V14 adds bounded transaction-history Undo and Redo action observations. V15 adds
-//! bounded, unproven external filesystem reconciliation observations.
+//! bounded, unproven external filesystem reconciliation observations. V16 adds a separate full
+//! allocation-plan initial-intent representation while preserving the V1-V15 wire shapes.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,6 +49,8 @@ pub const SCHEMA_V13: u32 = 13;
 pub const SCHEMA_V14: u32 = 14;
 /// The bounded external filesystem reconciliation command envelope schema.
 pub const SCHEMA_V15: u32 = 15;
+/// The full allocation-plan initial-intent schema.
+pub const SCHEMA_V16: u32 = 16;
 /// Current schema identifier retained for compatibility with the reference journal.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_V1;
 /// Maximum number of bytes accepted for one persisted operation record.

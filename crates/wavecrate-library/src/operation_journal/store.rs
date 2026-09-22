@@ -49,7 +49,7 @@ use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, OperationActor, OperationDisposition,
     OperationId, OperationIntent, OperationKind, OperationPhase, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
 };
 use super::namespace_commands::NamespaceCommandArgs;
 use super::removal_commands::{RemovalCommandArgs, StageRetainedFolderIntentArgs, TrashIntentArgs};
@@ -252,7 +252,7 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the pre-publication cancellation API.
     #[error(
-        "operation journal cancellation requires a V3 or V5-V15 universal intent, found schema v{schema_version}"
+        "operation journal cancellation requires a V3 or V5-V16 universal intent, found schema v{schema_version}"
     )]
     UnsupportedCancellationSchema {
         /// Schema version of the retained row.
@@ -302,13 +302,13 @@ pub enum OperationJournalStoreError {
     },
     /// This schema cannot be transitioned by the retry API.
     #[error(
-        "operation journal retry observation requires a V5-V15 coordinator record, found schema v{schema_version}"
+        "operation journal retry observation requires a V5-V16 coordinator record, found schema v{schema_version}"
     )]
     UnsupportedRetrySchema {
         /// Schema version of the retained row.
         schema_version: u32,
     },
-    /// The retained row is not eligible for a V5-V15 retry observation.
+    /// The retained row is not eligible for a V5-V16 retry observation.
     #[error("operation journal retry state is not eligible: {reason}")]
     UnsupportedRetryState {
         /// Bounded state diagnostic.
@@ -4479,7 +4479,7 @@ impl OperationJournalStore {
         self.insert_intent_with_outcome(&record)
     }
 
-    /// Persist a user cancellation request against a current V3 or V5-V15 universal intent.
+    /// Persist a user cancellation request against a current V3 or V5-V16 universal intent.
     ///
     /// The expected sequence is a compare-and-swap guard. A retry carrying the exact observation
     /// already stored for this operation is a read-only idempotent replay and returns the current
@@ -4569,6 +4569,7 @@ impl OperationJournalStore {
                 | SCHEMA_V13
                 | SCHEMA_V14
                 | SCHEMA_V15
+                | SCHEMA_V16
         ) && current.record.disposition == OperationDisposition::CancelRequestedBeforePublish
         {
             if current.record.cancellation_request() == Some(&observation) {
@@ -4602,13 +4603,15 @@ impl OperationJournalStore {
                 | SCHEMA_V13
                 | SCHEMA_V14
                 | SCHEMA_V15
+                | SCHEMA_V16
         ) {
             return Err(OperationJournalStoreError::UnsupportedCancellationSchema {
                 schema_version: current.record.schema_version,
             });
         }
-        let external_reconciliation = current.record.schema_version == SCHEMA_V15
-            && current.record.intent.kind == OperationKind::ExternalReconciliation;
+        let external_reconciliation =
+            matches!(current.record.schema_version, SCHEMA_V15 | SCHEMA_V16)
+                && current.record.intent.kind == OperationKind::ExternalReconciliation;
         if current.record.intent.actor != OperationActor::User
             && !(external_reconciliation
                 && current.record.intent.actor == OperationActor::ExternalFs)
@@ -4663,6 +4666,10 @@ impl OperationJournalStore {
                 current.record.disposition,
                 OperationDisposition::None | OperationDisposition::RetryPending
             ),
+            SCHEMA_V16 => matches!(
+                current.record.disposition,
+                OperationDisposition::None | OperationDisposition::RetryPending
+            ),
             _ => false,
         };
         if current.record.phase != OperationPhase::IntentDurable || !eligible_disposition {
@@ -4678,6 +4685,7 @@ impl OperationJournalStore {
                 SCHEMA_V13 => "V13 IntentDurable/None or RetryPending",
                 SCHEMA_V14 => "V14 IntentDurable/None or RetryPending",
                 SCHEMA_V15 => "V15 IntentDurable/None or RetryPending",
+                SCHEMA_V16 => "V16 IntentDurable/None or RetryPending",
                 _ => "V3 IntentDurable/None",
             };
             return Err(OperationJournalStoreError::UnsupportedCancellationState {
@@ -4735,7 +4743,7 @@ impl OperationJournalStore {
         })
     }
 
-    /// Persist the next typed V5-V15 retry observation using a sequence compare-and-swap.
+    /// Persist the next typed V5-V16 retry observation using a sequence compare-and-swap.
     ///
     /// An identical observation already stored for the operation is a read-only idempotent
     /// replay, even when the caller still holds an older sequence. A changed observation must
@@ -4824,6 +4832,7 @@ impl OperationJournalStore {
                 | SCHEMA_V13
                 | SCHEMA_V14
                 | SCHEMA_V15
+                | SCHEMA_V16
         ) && current.record.disposition == OperationDisposition::RetryPending
             && current.record.retry_observation() == Some(&observation)
         {
@@ -4854,6 +4863,7 @@ impl OperationJournalStore {
                 | SCHEMA_V13
                 | SCHEMA_V14
                 | SCHEMA_V15
+                | SCHEMA_V16
         ) {
             return Err(OperationJournalStoreError::UnsupportedRetrySchema {
                 schema_version: current.record.schema_version,
@@ -4867,7 +4877,7 @@ impl OperationJournalStore {
         {
             return Err(OperationJournalStoreError::UnsupportedRetryState {
                 reason: format!(
-                    "expected V5/V6/V7/V8/V9/V10/V11/V12/V13/V14/V15 IntentDurable/None or RetryPending, found {:?}/{:?}",
+                    "expected V5/V6/V7/V8/V9/V10/V11/V12/V13/V14/V15/V16 IntentDurable/None or RetryPending, found {:?}/{:?}",
                     current.record.phase, current.record.disposition
                 ),
             });
@@ -4963,12 +4973,8 @@ impl OperationJournalStore {
         claims: &AdmissionClaimInventory,
     ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
         validate_intent_record(record).map_err(InitialClaimSettlementError::Store)?;
-        let legacy_plan = record
-            .capacity_plan
-            .as_ref()
-            .ok_or(OperationJournalStoreError::MissingCapacityPlan)
-            .map_err(InitialClaimSettlementError::Store)?;
-        let full_plan = FullCapacityPlan::from_legacy(legacy_plan)?;
+        let full_plan =
+            full_capacity_plan_for_record(record).map_err(InitialClaimSettlementError::Store)?;
         claims.validate_against(&full_plan)?;
         ordinary_claims::validate_storage_values(claims)
             .map_err(|error| InitialClaimSettlementError::ClaimStorage(error.to_string()))?;
@@ -4989,12 +4995,8 @@ impl OperationJournalStore {
         mut lease: ProvisionalCapacityLease,
     ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
         validate_intent_record(record).map_err(InitialClaimSettlementError::Store)?;
-        let legacy_plan = record
-            .capacity_plan
-            .as_ref()
-            .ok_or(OperationJournalStoreError::MissingCapacityPlan)
-            .map_err(InitialClaimSettlementError::Store)?;
-        let full_plan = FullCapacityPlan::from_legacy(legacy_plan)?;
+        let full_plan =
+            full_capacity_plan_for_record(record).map_err(InitialClaimSettlementError::Store)?;
         claims.validate_against(&full_plan)?;
         ordinary_claims::validate_storage_values(claims)
             .map_err(|error| InitialClaimSettlementError::ClaimStorage(error.to_string()))?;
@@ -6124,8 +6126,13 @@ fn validate_intent_record(
             phase: record.phase,
         });
     }
-    if record.capacity_plan.is_none() {
+    if record.capacity_plan.is_none() && record.full_capacity_plan.is_none() {
         return Err(OperationJournalStoreError::MissingCapacityPlan);
+    }
+    if record.capacity_plan.is_some() && record.full_capacity_plan.is_some() {
+        return Err(OperationJournalStoreError::InconsistentRecord {
+            reason: String::from("durable intent cannot carry both legacy and full capacity plans"),
+        });
     }
     if record.disposition != OperationDisposition::None {
         return Err(OperationJournalStoreError::InconsistentRecord {
@@ -6167,6 +6174,32 @@ fn validate_intent_record(
         RecordConsistency::Invalid(reason) => {
             Err(OperationJournalStoreError::InconsistentRecord { reason })
         }
+    }
+}
+
+fn full_capacity_plan_for_record(
+    record: &StoredOperationRecord,
+) -> Result<FullCapacityPlan, OperationJournalStoreError> {
+    match (
+        record.capacity_plan.as_ref(),
+        record.full_capacity_plan.as_ref(),
+    ) {
+        (Some(_), Some(_)) => Err(OperationJournalStoreError::InconsistentRecord {
+            reason: String::from("durable intent cannot carry both legacy and full capacity plans"),
+        }),
+        (Some(legacy), None) => FullCapacityPlan::from_legacy(legacy).map_err(|error| {
+            OperationJournalStoreError::InconsistentRecord {
+                reason: format!("legacy capacity plan is invalid: {error}"),
+            }
+        }),
+        (None, Some(full)) => {
+            full.validate()
+                .map_err(|error| OperationJournalStoreError::InconsistentRecord {
+                    reason: format!("full capacity plan is invalid: {error}"),
+                })?;
+            Ok(full.clone())
+        }
+        (None, None) => Err(OperationJournalStoreError::MissingCapacityPlan),
     }
 }
 
@@ -7427,7 +7460,7 @@ mod tests {
         RetainedResolutionCommandArgs, RetainedResolutionStage, RetainedRestoreIntentArgs,
         RetryErrorClass, RetryLeaseId, RetryObservation, SCHEMA_V1, SCHEMA_V6, SCHEMA_V7,
         SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
-        SCHEMA_V15, SelectionExtractIntentArgs, SelectionNormalizeIntentArgs,
+        SCHEMA_V15, SCHEMA_V16, SelectionExtractIntentArgs, SelectionNormalizeIntentArgs,
         SelectionOutputCommandArgs, SelectionOutputRecipe, StoredRelativePath, StoredSourceFence,
         TrashIntentArgs, UniversalCommandArgs, UniversalCommandKind, UniversalIntent,
         WaveformDuplicateDoubleIntentArgs, WaveformEditFrameRange, WaveformEditIntentArgs,
@@ -10850,6 +10883,92 @@ mod tests {
                 if actual == operation_id
         ));
         assert_eq!(journal_sequence(&store, operation_id), 5);
+    }
+
+    #[test]
+    fn v16_copy_retry_and_cancel_preserve_full_plan_through_store_cas_and_restart() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal_intent, command_args, legacy_plan) = v5_copy_inputs();
+        let full_plan = FullCapacityPlan::from_legacy(&legacy_plan).expect("full capacity plan");
+        let record = StoredOperationRecord::new_v16_command(
+            operation_id,
+            intent.clone(),
+            universal_intent.clone(),
+            UniversalCommandArgs::Copy(command_args.clone()),
+            full_plan.clone(),
+            50,
+        );
+        let inserted = store.insert_intent(&record).expect("persist V16 intent");
+        assert_eq!(inserted.sequence(), 1);
+
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("v16-retry-lease").expect("retry lease"),
+            53,
+            RetryErrorClass::TransientContention,
+            "writer_busy",
+            Some(String::from("V16 retry")),
+        )
+        .expect("retry observation");
+        let retry_receipt = store
+            .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+            .expect("persist V16 retry");
+        assert_eq!(retry_receipt.sequence(), 2);
+        assert_eq!(
+            store
+                .record_retry_pending(operation_id, inserted.sequence(), retry.clone())
+                .expect("replay V16 retry"),
+            retry_receipt
+        );
+
+        let cancellation = CancellationRequestObservation::new(54).expect("cancel timestamp");
+        let cancel_receipt = store
+            .request_cancel_before_publish(operation_id, retry_receipt.sequence(), cancellation)
+            .expect("persist V16 cancellation");
+        assert_eq!(cancel_receipt.sequence(), 3);
+        assert_eq!(
+            store
+                .request_cancel_before_publish(operation_id, inserted.sequence(), cancellation)
+                .expect("replay V16 cancellation"),
+            cancel_receipt
+        );
+
+        let persisted = store
+            .get(operation_id)
+            .expect("read V16 transition")
+            .expect("V16 transition exists");
+        assert_eq!(persisted.schema_version, SCHEMA_V16);
+        assert_eq!(persisted.intent, intent);
+        assert_eq!(persisted.universal_intent, Some(universal_intent));
+        assert_eq!(persisted.command_args(), None);
+        assert_eq!(
+            persisted.universal_command_args(),
+            record.universal_command_args()
+        );
+        assert!(persisted.capacity_plan.is_none());
+        assert_eq!(persisted.full_capacity_plan, Some(full_plan.clone()));
+        assert_eq!(persisted.retry_observation(), Some(&retry));
+        assert_eq!(persisted.cancellation_request(), Some(&cancellation));
+        assert_eq!(
+            persisted.disposition,
+            OperationDisposition::CancelRequestedBeforePublish
+        );
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let restarted = reopened
+            .get(operation_id)
+            .expect("read restarted V16 transition")
+            .expect("restarted V16 transition exists");
+        assert_eq!(restarted.schema_version, SCHEMA_V16);
+        assert_eq!(restarted.full_capacity_plan, Some(full_plan));
+        assert_eq!(restarted.retry_observation(), Some(&retry));
+        assert_eq!(restarted.cancellation_request(), Some(&cancellation));
+        drop(reopened);
+        drop(fixture);
     }
 
     #[test]

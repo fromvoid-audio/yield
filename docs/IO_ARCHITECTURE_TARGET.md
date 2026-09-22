@@ -1344,23 +1344,24 @@ snapshots](#wal-maintenance-and-reader-snapshots). A full queue does
 not create a durable rejection or disposition; a low-priority request may be described as
 deferred with its retry cause, but the typed result remains `RejectedBeforeIntent`.
 
-The common OPT-1563 owner boundary implements this ordering for the currently representable
-initial-intent envelope. A private prepared template is checked for participant/work-plan
-consistency, exact full-plan/claim coverage, bounded SQLite values, and duplicate claim IDs in
-both the live owner ledger and durable ordinary claim/release history before `OperationId` is
-created. Each request refreshes retained descriptor facts and current recovery evidence. Valid
-empty recovery-only evidence and valid active ordinary charges may proceed to one provisional
-lease; audit-pending, malformed, ambiguous, stale, low-reserve, or disk-pressure states reject
-with typed bounded context and preserve existing accounting. The same lease is consumed by the
-atomic initial intent plus ordinary-claim settlement, so the gate never admits twice. The current
-legacy record codec cannot represent `OperationRecoveryPayload`, and full-progress-only command
-arguments are rejected before ID allocation rather than being dropped or defaulted. Existing
-family entry points remain unwired and production ordinary admission remains disabled until the
-later qualification and integration milestones; OPT-1855 tracks the all-class durable codec. The
-owner requires a fresh full protected-floor proof for every required retained volume immediately
-before the provider witness, and revalidates each registered source authority's descriptor
-identity, lease liveness, and active lifecycle. Partial reserve proofs remain limited to startup
-recovery and do not authorize this gate.
+The common OPT-1563 owner boundary implements this ordering for the prepared initial-intent
+envelope. A private prepared template is checked for participant/work-plan consistency, exact
+full-plan/claim coverage, bounded SQLite values, and duplicate claim IDs in both the live owner
+ledger and durable ordinary claim/release history before `OperationId` is created. Each request
+refreshes retained descriptor facts and current recovery evidence. Valid empty recovery-only
+evidence and valid active ordinary charges may proceed to one provisional lease; audit-pending,
+malformed, ambiguous, stale, low-reserve, or disk-pressure states reject with typed bounded context
+and preserve existing accounting. The same lease is consumed by the atomic initial intent plus
+ordinary-claim settlement, so the gate never admits twice. New prepared records use V16's separate
+full-capacity field and preserve all nine validated allocation classes, including
+`OperationRecoveryPayload`; V1 through V15 keep their legacy codec and reject a full plan rather
+than silently dropping it. Full-progress-only command arguments remain rejected before ID
+allocation. Existing family entry points remain unwired and production ordinary admission remains
+disabled until the later qualification and integration milestones. The owner requires a fresh full
+protected-floor proof for every required retained volume immediately before the provider witness,
+and revalidates each registered source authority's descriptor identity, lease liveness, and active
+lifecycle. Partial reserve proofs remain limited to startup recovery and do not authorize this
+gate.
 
 Cancellation rules:
 

@@ -320,14 +320,16 @@ use the separate partial-proof path, but it cannot authorize this gate. Register
 authorities are also revalidated at the consuming boundary for root identity, lease liveness, and
 active lifecycle state.
 
-The initial intent record still carries the legacy eight-class capacity plan. OPT-1563 therefore
-rejects `OperationRecoveryPayload` and full-progress-only command arguments before allocating an
-`OperationId`; it never renames, drops, or defaults a full-plan class. After fresh checks pass, one
-owner-thread provisional lease is consumed by the existing atomic intent-plus-ordinary-claim
-settlement transaction. Duplicate claim identities are checked against both the current ledger
-and durable claim/release history before the ID is allocated. Existing family entry points remain
-fail-closed and production qualification/admission remains disabled pending the later integration
-issues. OPT-1855 tracks the durable all-class initial-intent representation.
+New prepared initial intents use schema V16's separate full-capacity representation, which preserves
+all nine allocation classes, including `OperationRecoveryPayload`, without projecting them into the
+legacy eight-class field. V1 through V15 retain their existing codecs and legacy capacity field;
+they cannot encode a V16 full plan, and V16 rejects a missing or mixed legacy/full representation
+before allocating an `OperationId`. Full-progress observations still do not grant execution
+authority. After fresh checks pass, one owner-thread provisional lease is consumed by the existing
+atomic intent-plus-ordinary-claim settlement transaction. Duplicate claim identities are checked
+against both the current ledger and durable claim/release history before the ID is allocated.
+Existing family entry points remain fail-closed and production qualification/admission remains
+disabled pending the later integration issues.
 
 OPT-1557's v5 slice now persists immutable ordinary-claim observations in a
 dedicated table without an operation foreign key. Its crate-internal reader
@@ -336,15 +338,17 @@ bounded SQL lookahead row to produce the next cursor; malformed rows fail
 closed. These rows preserve evidence only and do not grant claim, provider,
 settlement, or admission authority.
 
-OPT-1558 now adds a crate-private legacy `IntentDurable` settlement boundary.
-It validates `FullCapacityPlan::from_legacy` and exact claim coverage before
-calling the owner-thread provisional provider, pins that lease before entering
-the journal's `BEGIN EXCLUSIVE`, inserts the intent and all ordinary claims in
-one transaction, and requires exact record and claim readback before an
-acknowledgement. A confirmed rollback releases the provisional token exactly
-once; a committed result changes it to a durable retained disposition, while
-rollback uncertainty or post-commit readback uncertainty leaves it
-audit-pending. Lease `Drop` cannot release either retained disposition.
+OPT-1558 now adds a crate-private `IntentDurable` settlement boundary. It uses
+the version-appropriate plan: legacy records are checked through
+`FullCapacityPlan::from_legacy`, while V16 records validate and settle their
+exact full plan. Both paths require exact claim coverage before calling the
+owner-thread provisional provider, pin that lease before entering the journal's
+`BEGIN EXCLUSIVE`, insert the intent and all ordinary claims in one transaction,
+and require exact record and claim readback before an acknowledgement. A
+confirmed rollback releases the provisional token exactly once; a committed
+result changes it to a durable retained disposition, while rollback uncertainty
+or post-commit readback uncertainty leaves it audit-pending. Lease `Drop` cannot
+release either retained disposition.
 Duplicate operations or claim identities roll back the new attempt without
 changing the original charge. This slice does not upgrade full-progress
 observations, expose a production write API, settle later releases, rebuild
