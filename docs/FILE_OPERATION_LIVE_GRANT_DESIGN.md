@@ -1,7 +1,17 @@
 # OPT-1857 live effect grant design checkpoint
 
-Status: design checkpoint, not implementation or physical-effect qualification.
+Status: design and source-gate implementation checkpoint; no journal-issued grant or physical-effect qualification yet.
 Source head: `28f61b8ea6714f959b9d2cc05047f8930be31f78` (2026-09-22).
+
+The source-gate checkpoint adds a private sendable `SourceEffectPin` from the
+registered source-owner guard and a shared gate on the retained `SourceLease`.
+Entering an effect validates the current registration and lease while closing
+admission serializes with it. The resulting RAII permit counts an effect in
+flight without holding a mutex across the effect. Drain and guard loss close
+admission without waiting on the journal worker; explicit lease release and
+catalog retarget close admission and wait for admitted effects. Retarget creates
+a fresh gate only after its new generation commits. The pin is not an issued
+grant and is not accepted by the file owner.
 
 ## Required result
 
@@ -49,16 +59,15 @@ effect without release serialization would also be a race.
    or execute a second grant; a changed command under the same key is a typed
    conflict. `FileOperationOwner` must not use its current test-only
    `LiveIntentAuthorization`/`LiveCapacityAuthorization` as production authority.
-4. Before a physical effect, the worker acquires a release/effect gate owned by
+4. Before a physical effect, the worker enters the release/effect gate owned by
    the retained source lease, revalidates the source row, binding, expiry,
-   lifecycle and root capabilities, and consumes the grant exactly once. Source
-   release, retirement and retarget must use the other side of this gate; an
-   atomic liveness flag or strong reference alone is insufficient. The gate
-   serializes lifetime but never mints authority. No gate may be held while
-   waiting on the journal or file-owner queue, avoiding a cross-owner wait
-   cycle. The future backend may hold the scoped gate only around a bounded
-   synchronous effect; an async backend needs an equivalent explicit in-flight
-   retirement protocol before qualification.
+   lifecycle and root capabilities, and consumes the grant exactly once. The
+   gate counts the admitted effect until its RAII permit drops; its mutex is not
+   held across the effect or another owner's queue. Source release and retarget
+   close admission and wait for that count to reach zero. Drain closes admission
+   without waiting on the journal worker. The gate serializes lifetime but
+   never mints authority. An async backend needs an equivalent explicit
+   in-flight retirement protocol before qualification.
 5. The producer retains custody until the file owner returns an outcome and
    the journal records its disposition. A dropped result receiver does not
    cancel accepted work. The file owner keeps one outcome by exact effect key

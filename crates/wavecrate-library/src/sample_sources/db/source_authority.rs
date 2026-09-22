@@ -12,7 +12,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -64,6 +64,7 @@ struct AuthorityState {
     lease_liveness: Arc<AtomicBool>,
     phase: std::sync::atomic::AtomicU8,
     pending_confirmation: Mutex<Option<SourceAuthorityConfirmation>>,
+    effect_gate: Arc<SourceEffectGate>,
 }
 
 impl AuthorityState {
@@ -71,6 +72,7 @@ impl AuthorityState {
         registration_id: SourceRegistrationId,
         lease_identity: SourceLeaseIdentity,
         lease_liveness: Arc<AtomicBool>,
+        effect_gate: Arc<SourceEffectGate>,
     ) -> Self {
         Self {
             registration_id,
@@ -78,11 +80,117 @@ impl AuthorityState {
             lease_liveness,
             phase: std::sync::atomic::AtomicU8::new(PREPARED),
             pending_confirmation: Mutex::new(None),
+            effect_gate,
         }
     }
 
     fn phase(&self) -> u8 {
         self.phase.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Serializes source retirement with the start and completion of a live effect.
+///
+/// The mutex is never held while a physical effect or another owner's queue runs. The in-flight
+/// count retains retirement custody; closing admission prevents any later effect from starting.
+#[derive(Debug)]
+pub(crate) struct SourceEffectGate {
+    state: Mutex<SourceEffectGateState>,
+    idle: Condvar,
+}
+
+#[derive(Debug)]
+struct SourceEffectGateState {
+    open: bool,
+    in_flight: usize,
+}
+
+impl SourceEffectGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(SourceEffectGateState {
+                open: true,
+                in_flight: 0,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn begin(
+        self: &Arc<Self>,
+        validate: impl FnOnce() -> Result<(), SourceAuthorityError>,
+    ) -> Result<SourceEffectPermit, SourceAuthorityError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SourceAuthorityError::StateUnavailable)?;
+        if !state.open {
+            return Err(SourceAuthorityError::ConfirmationClosed);
+        }
+        validate()?;
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .ok_or(SourceAuthorityError::StateUnavailable)?;
+        Ok(SourceEffectPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn close_admission(
+        &self,
+        transition: impl FnOnce() -> Result<(), SourceAuthorityError>,
+    ) -> Result<(), SourceAuthorityError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SourceAuthorityError::StateUnavailable)?;
+        transition()?;
+        state.open = false;
+        Ok(())
+    }
+
+    pub(crate) fn close_and_wait(&self) -> Result<(), SourceLeaseError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SourceLeaseError::ControlUnavailable)?;
+        state.open = false;
+        while state.in_flight != 0 {
+            state = self
+                .idle
+                .wait(state)
+                .map_err(|_| SourceLeaseError::ControlUnavailable)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed_for_tests(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .open
+    }
+}
+
+/// RAII custody for one effect already started against a live source lease.
+pub(crate) struct SourceEffectPermit {
+    gate: Arc<SourceEffectGate>,
+}
+
+impl Drop for SourceEffectPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight = state.in_flight.saturating_sub(1);
+        if state.in_flight == 0 {
+            self.gate.idle.notify_all();
+        }
     }
 }
 
@@ -325,16 +433,18 @@ impl SourceAuthorityRequest {
         // source owner can acknowledge durable retirement. It therefore remains valid after the
         // expiry-bound installation proof has gone stale. A dropped guard changes the lifecycle
         // to ABANDONED and is still rejected by the phase check above.
-        self.state
-            .phase
-            .compare_exchange(
-                REGISTERED,
-                DRAINING,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .map_err(|_| SourceAuthorityError::InvalidLifecycle)
-            .map(|_| ())
+        self.state.effect_gate.close_admission(|| {
+            self.state
+                .phase
+                .compare_exchange(
+                    REGISTERED,
+                    DRAINING,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .map_err(|_| SourceAuthorityError::InvalidLifecycle)
+                .map(|_| ())
+        })
     }
 
     /// Consume a sealed acknowledgement after the source lease has durably retired.
@@ -382,6 +492,36 @@ pub(crate) struct SourceAuthorityGuard {
     _source_owner_thread: PhantomData<Rc<()>>,
 }
 
+/// A private, sendable pin to the real source lock and control connection.
+///
+/// The pin alone is not a journal-issued effect grant. It must be joined with a one-shot issued
+/// claim and exact effect identity before a file-owner command may use it.
+pub(crate) struct SourceEffectPin {
+    lease: Arc<SourceLease>,
+    state: Arc<AuthorityState>,
+}
+
+impl SourceEffectPin {
+    /// Enter one bounded effect while source retirement and explicit release are excluded.
+    /// The returned permit must remain alive until the effect is quiescent.
+    pub(crate) fn begin_effect(&self) -> Result<SourceEffectPermit, SourceAuthorityError> {
+        self.state.effect_gate.begin(|| {
+            if self.state.phase() != REGISTERED {
+                return Err(SourceAuthorityError::ConfirmationClosed);
+            }
+            if !self.state.lease_liveness.load(Ordering::Acquire) {
+                return Err(SourceAuthorityError::ConfirmationStale);
+            }
+            let current = SourceLeaseIdentity::from_lease(&self.lease);
+            if current != self.state.lease_identity {
+                return Err(SourceAuthorityError::RegistrationMismatch);
+            }
+            self.lease.validate_current_owner()?;
+            Ok(())
+        })
+    }
+}
+
 impl fmt::Debug for SourceAuthorityGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -400,6 +540,24 @@ impl SourceAuthorityGuard {
             retirement_acknowledged: false,
             _source_owner_thread: PhantomData,
         }
+    }
+
+    /// Pin this registered source for a later journal-issued effect grant.
+    /// The effect boundary revalidates after queueing, so a drain racing this call cannot grant
+    /// stale authority.
+    pub(crate) fn pin_for_effect(&self) -> Result<SourceEffectPin, SourceAuthorityError> {
+        if self.state.phase() != REGISTERED {
+            return Err(SourceAuthorityError::ConfirmationClosed);
+        }
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or(SourceAuthorityError::ConfirmationClosed)?;
+        lease.validate_current_owner()?;
+        Ok(SourceEffectPin {
+            lease: Arc::clone(lease),
+            state: Arc::clone(&self.state),
+        })
     }
 
     /// Mint a fresh, one-shot confirmation after validating the retained control connection.
@@ -482,17 +640,24 @@ impl Drop for SourceAuthorityGuard {
         if let Ok(mut pending) = self.state.pending_confirmation.lock() {
             pending.take();
         }
-        self.state
-            .phase
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |phase| match phase {
-                    RETIRED | ABANDONED => None,
-                    _ => Some(ABANDONED),
-                },
-            )
-            .ok();
+        let abandon = || {
+            self.state
+                .phase
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |phase| match phase {
+                        RETIRED | ABANDONED => None,
+                        _ => Some(ABANDONED),
+                    },
+                )
+                .ok();
+            Ok(())
+        };
+        if self.state.effect_gate.close_admission(abandon).is_err() {
+            // A poisoned gate cannot admit an effect; still revoke the atomic lifecycle.
+            self.state.phase.store(ABANDONED, Ordering::Release);
+        }
     }
 }
 
@@ -759,6 +924,7 @@ impl SourceDatabase {
             registration_id,
             lease_identity.clone(),
             source_lease.authority_liveness(),
+            source_lease.effect_gate(),
         ));
         let media_root = match source_lease
             .media_root_binding()
@@ -858,5 +1024,10 @@ mod tests {
         assert_send_sync::<SourceAuthorityConfirmation>();
         assert_send_sync::<SourceAuthorityUseProof>();
         assert_send_sync::<SourceAuthorityRetirementAck>();
+    }
+
+    #[test]
+    fn private_effect_pin_can_cross_to_the_owner_thread() {
+        assert_send_sync::<SourceEffectPin>();
     }
 }
