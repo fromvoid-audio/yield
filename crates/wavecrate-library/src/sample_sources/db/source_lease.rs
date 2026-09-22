@@ -276,6 +276,8 @@ pub(crate) struct SourceLeaseReservation {
 /// ordinary connection has been moved or dropped.
 pub(crate) struct SourceLease {
     control_connection: Mutex<Connection>,
+    #[cfg(test)]
+    control_waiting_for_tests: AtomicBool,
     database_root: Arc<BoundDatabaseRoot>,
     media_root: Arc<BoundDatabaseRoot>,
     database_file_binding: Arc<DatabaseFileBinding>,
@@ -434,6 +436,16 @@ fn check_publication_deadline(
     Ok(())
 }
 
+#[cfg(test)]
+struct ControlWaitObserver<'a>(&'a AtomicBool);
+
+#[cfg(test)]
+impl Drop for ControlWaitObserver<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl SourceLeaseReservation {
     /// Acquire the source sidecar lock after profile/root proof and before SQLite opens.
     pub(crate) fn acquire(
@@ -551,6 +563,8 @@ impl SourceLeaseReservation {
         let authority_liveness = Arc::new(AtomicBool::new(true));
         Ok(Arc::new(SourceLease {
             control_connection: Mutex::new(control),
+            #[cfg(test)]
+            control_waiting_for_tests: AtomicBool::new(false),
             database_root: self.database_root,
             media_root: self.media_root,
             database_file_binding,
@@ -705,6 +719,11 @@ impl SourceLease {
         self.control_connection
             .lock()
             .map_err(|_| SourceLeaseError::ControlUnavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_waiting_for_control_for_tests(&self) -> bool {
+        self.control_waiting_for_tests.load(Ordering::Acquire)
     }
 
     /// Return the retained media-root capability used when this lease was acquired.
@@ -1025,11 +1044,16 @@ impl SourceLease {
         cancellation: &AtomicBool,
     ) -> Result<(), SourcePublicationFenceError> {
         self.validate_publication_fence_claim(expected_owner_identity, expected_epoch)?;
+        #[cfg(test)]
+        let _wait_observer = ControlWaitObserver(&self.control_waiting_for_tests);
         let control = loop {
             check_publication_deadline(deadline, cancellation)?;
             match self.control_connection.try_lock() {
                 Ok(control) => break control,
                 Err(TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    self.control_waiting_for_tests
+                        .store(true, Ordering::Release);
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(TryLockError::Poisoned(_)) => {
