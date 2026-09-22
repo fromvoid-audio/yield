@@ -24,9 +24,11 @@ use crate::app_dirs::WritableProfileGuard;
 use crate::durable_capacity::{
     PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity, descriptor_capacity_facts,
 };
+use crate::file_operation_owner::{EffectId, OutputIdentity, RootRegistrationRef, SourceFence};
 use crate::sample_sources::db::{
     SourceAuthorityDrainMarker, SourceAuthorityError, SourceAuthorityRegistrationReceipt,
     SourceAuthorityRegistrationRequest, SourceAuthorityRequest, SourceAuthorityRetirementAck,
+    SourceEffectPin,
 };
 
 use super::admission_claims::{AdmissionClaimId, AdmissionClaimInventory};
@@ -788,6 +790,99 @@ pub(crate) struct ChunkWritePermit {
     identity: ChunkWriteIdentity,
     logical_length: u64,
     allocated_bytes: u64,
+}
+
+/// Authority-free effect identity supplied before the journal issues a chunk.
+/// The output UUID is bound separately from the claim's arbitrary string output key.
+#[allow(dead_code)] // Consumed by the file-owner adapter in the next OPT-1857 stage.
+pub(crate) struct LiveChunkEffectSpec {
+    effect_id: EffectId,
+    output: OutputIdentity,
+    target: RootRegistrationRef,
+    source_fences: Vec<SourceFence>,
+    offset: u64,
+    logical_bytes: u64,
+    payload_bytes: u64,
+    payload_hash: [u8; 32],
+}
+
+impl LiveChunkEffectSpec {
+    fn queued_bytes(&self) -> Option<usize> {
+        let mut bytes = CONTROL_INPUT_BYTES.checked_add(
+            self.source_fences
+                .capacity()
+                .checked_mul(std::mem::size_of::<SourceFence>())?,
+        )?;
+        for fence in &self.source_fences {
+            bytes = bytes.checked_add(fence.dynamic_backing_bytes()?)?;
+        }
+        Some(bytes)
+    }
+
+    #[allow(dead_code)] // Consumed by the file-owner adapter in the next OPT-1857 stage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        effect_id: EffectId,
+        output: OutputIdentity,
+        target: RootRegistrationRef,
+        source_fences: Vec<SourceFence>,
+        offset: u64,
+        logical_bytes: u64,
+        payload: &[u8],
+    ) -> Result<Self, OperationJournalOwnerQueueError> {
+        if effect_id.as_uuid().is_nil()
+            || output.as_uuid().is_nil()
+            || logical_bytes == 0
+            || logical_bytes > MAX_RECORD_BYTES as u64
+            || payload.is_empty()
+            || payload.len() as u64 > logical_bytes
+            || source_fences.len() != 1
+            || offset.checked_add(logical_bytes).is_none()
+        {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: String::from("live chunk effect has invalid bounds or source fences"),
+            });
+        }
+        for fence in &source_fences {
+            fence
+                .validate()
+                .map_err(|error| OperationJournalOwnerQueueError::InvalidInput {
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(Self {
+            effect_id,
+            output,
+            target,
+            source_fences,
+            offset,
+            logical_bytes,
+            payload_bytes: payload.len() as u64,
+            payload_hash: *blake3::hash(payload).as_bytes(),
+        })
+    }
+}
+
+/// One journal-issued live chunk grant. Only the issuing worker can construct it; the retained
+/// source pin and non-Clone chunk permit are never reconstructed from a row or a UUID.
+#[allow(dead_code)] // Consumed by the file-owner adapter in the next OPT-1857 stage.
+pub(crate) struct LiveChunkEffectGrant {
+    permit: ChunkWritePermit,
+    source_pin: SourceEffectPin,
+    spec: LiveChunkEffectSpec,
+    output_key: String,
+}
+
+impl std::fmt::Debug for LiveChunkEffectGrant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveChunkEffectGrant")
+            .field("chunk_id", &self.permit.chunk_id)
+            .field("operation_id", &self.permit.operation_id)
+            .field("issue_id", &self.permit.issue_id)
+            .field("effect_id", &self.spec.effect_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -1565,6 +1660,108 @@ impl OwnerRuntime {
             },
         );
         Ok(permit)
+    }
+
+    fn issue_live_chunk_effect(
+        &mut self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        spec: LiveChunkEffectSpec,
+    ) -> Result<LiveChunkEffectGrant, OperationJournalOwnerError> {
+        let source = self
+            .source_registrations
+            .get(&registration.registration_id)
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk source registration is not retained"),
+            })?;
+        if source.receipt != registration
+            || !matches!(source.readiness, SourceRegistrationReadiness::Registered)
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk source registration is not current"),
+            });
+        }
+        let profile_guard = self.final_profile_guard.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk profile owner is unavailable"),
+            }
+        })?;
+        source_pin.validate_for_issuance(&source.request, profile_guard)?;
+        let lease_epoch = u64::try_from(registration.lease_identity.epoch()).map_err(|_| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk source lease epoch is invalid"),
+            }
+        })?;
+        if !spec.source_fences.iter().any(|fence| {
+            fence.root_identity() == source.request.media_root().identity()
+                && fence.database_identity() == source.request.database_file_identity()
+                && fence.lease_epoch() == lease_epoch
+        }) {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk source fences omit its registered lease"),
+            });
+        }
+        let record = self
+            .store()
+            .read_chunk_claim(chunk_id)
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk claim was not found"),
+            })?;
+        if record.operation_id() != operation_id
+            || record.logical_offset() != spec.offset
+            || spec.logical_bytes > record.logical_length()
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk effect does not match the claimed range"),
+            });
+        }
+        let operation = self
+            .store()
+            .get(operation_id)
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk operation was not found"),
+            })?;
+        let participants = operation
+            .universal_intent
+            .as_ref()
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("live chunk operation has no participant set"),
+            })?
+            .participants();
+        let fence = &spec.source_fences[0];
+        let participant_is_retained = participants
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.id() == record.participant_id());
+        let source_is_retained = participants.descriptors().iter().any(|descriptor| {
+            descriptor.source_fence().is_some_and(|stored| {
+                stored.source_id() == fence.source_id()
+                    && stored.root_identity() == fence.root_identity()
+                    && stored.database_identity() == fence.database_identity()
+                    && stored.lifecycle_generation() == fence.lifecycle_generation()
+                    && fence.source_revision() == Some(stored.source_revision())
+                    && stored.lease_epoch() == fence.lease_epoch()
+            })
+        });
+        if !participant_is_retained || !source_is_retained {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from(
+                    "live chunk source or participant is absent from the operation",
+                ),
+            });
+        }
+        let output_key = record.output_key().to_owned();
+        let permit = self.issue_chunk(chunk_id, operation_id)?;
+        Ok(LiveChunkEffectGrant {
+            permit,
+            source_pin,
+            spec,
+            output_key,
+        })
     }
 
     fn begin_chunk_write(
@@ -3393,6 +3590,38 @@ impl OperationJournalClient {
         })
     }
 
+    /// Issue a sealed effect-scoped grant from a live registered source and a durable chunk
+    /// claim. The command carries observations, but only the worker's retained registration,
+    /// source pin, capacity provider, and Claimed-to-Issued transition construct the grant.
+    #[allow(dead_code)] // Consumed by the file-owner adapter in the next OPT-1857 stage.
+    pub(crate) fn issue_live_chunk_effect(
+        &self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        spec: LiveChunkEffectSpec,
+    ) -> Result<OperationJournalRequest<LiveChunkEffectGrant>, OperationJournalOwnerQueueError>
+    {
+        let input_bytes =
+            spec.queued_bytes()
+                .ok_or(OperationJournalOwnerQueueError::RecordTooLarge {
+                    actual: usize::MAX,
+                    maximum: OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES,
+                })?;
+        self.submit(input_bytes, move |input, result| {
+            JournalCommand::IssueLiveChunk {
+                chunk_id,
+                operation_id,
+                registration,
+                source_pin,
+                spec,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one bounded synthetic write entry. The ticket is checked against the live owner
     /// registry and fresh descriptor/provider facts on the worker; it never carries execution or
     /// filesystem authority across this queue boundary.
@@ -4009,6 +4238,15 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<ChunkWritePermit, OperationJournalOwnerError>>,
     },
+    IssueLiveChunk {
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        spec: LiveChunkEffectSpec,
+        input: InputPermit,
+        result: SyncSender<Result<LiveChunkEffectGrant, OperationJournalOwnerError>>,
+    },
     BeginChunkWrite {
         permit: ChunkWritePermit,
         identity: ChunkWriteIdentity,
@@ -4397,6 +4635,26 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             drop(input);
             execute_store_result(result, || runtime.issue_chunk(chunk_id, operation_id))
         }
+        JournalCommand::IssueLiveChunk {
+            chunk_id,
+            operation_id,
+            registration,
+            source_pin,
+            spec,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.issue_live_chunk_effect(
+                    chunk_id,
+                    operation_id,
+                    registration,
+                    source_pin,
+                    spec,
+                )
+            })
+        }
         JournalCommand::BeginChunkWrite {
             permit,
             identity,
@@ -4582,6 +4840,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::IssueChunk { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::IssueLiveChunk { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -7133,6 +7395,354 @@ mod tests {
             plan,
             claims,
         )
+    }
+
+    #[test]
+    fn live_chunk_effect_spec_rejects_nil_and_unbounded_inputs() {
+        let target = RootRegistrationRef::synthetic_for_test();
+        let fence = SourceFence::new(
+            SourceId::from_string(String::from("source")),
+            "root",
+            "database",
+            1,
+            None,
+            1,
+        )
+        .expect("source fence");
+        let make = |effect_id, output, fences, offset, logical_bytes, payload: &[u8]| {
+            LiveChunkEffectSpec::new(
+                effect_id,
+                output,
+                target,
+                fences,
+                offset,
+                logical_bytes,
+                payload,
+            )
+        };
+        assert!(
+            make(
+                EffectId::from_uuid(Uuid::nil()),
+                OutputIdentity::new(),
+                vec![fence.clone()],
+                0,
+                1,
+                b"a",
+            )
+            .is_err()
+        );
+        assert!(
+            make(
+                EffectId::new(),
+                OutputIdentity::from_uuid(Uuid::nil()),
+                vec![fence.clone()],
+                0,
+                1,
+                b"a",
+            )
+            .is_err()
+        );
+        assert!(
+            make(
+                EffectId::new(),
+                OutputIdentity::new(),
+                vec![fence.clone(), fence.clone()],
+                0,
+                1,
+                b"a",
+            )
+            .is_err()
+        );
+        assert!(
+            make(
+                EffectId::new(),
+                OutputIdentity::new(),
+                vec![fence.clone()],
+                u64::MAX,
+                2,
+                b"a",
+            )
+            .is_err()
+        );
+        assert!(
+            make(
+                EffectId::new(),
+                OutputIdentity::new(),
+                vec![fence],
+                0,
+                1,
+                b"ab",
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_chunk_grant_requires_registered_source_and_cannot_reissue_after_drop() {
+        let fixture = fixture("journal-owner-live-chunk-grant");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let client = owner.client();
+
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "live-chunk-grant-source",
+        )
+        .expect("source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("source authority");
+        let journal_request = authority.journal_request().expect("source journal request");
+        let source_request = Arc::clone(&journal_request.request);
+        let (_request, guard) = authority.split();
+        let mut register = client
+            .register_source_authority(journal_request)
+            .expect("source registration queues");
+        let registration = register
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source registration result")
+            .expect("source registration worker");
+        let lease_epoch = u64::try_from(registration.lease_identity.epoch())
+            .expect("positive source lease epoch");
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let mut input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+        );
+        let prior_intent = input.universal_intent.clone();
+        let descriptors = input
+            .participants
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                let source_fence = descriptor.source_fence().map(|stored| {
+                    StoredSourceFence::new(
+                        stored.source_id().clone(),
+                        source_request.media_root().identity(),
+                        source_request.database_file_identity(),
+                        stored.lifecycle_generation(),
+                        stored.source_revision(),
+                        lease_epoch,
+                    )
+                    .expect("participant source fence")
+                });
+                ParticipantDescriptor::new(
+                    descriptor.id(),
+                    descriptor.kind(),
+                    descriptor.requirement(),
+                    source_fence,
+                    descriptor.artifact_key().map(str::to_owned),
+                )
+                .expect("participant descriptor")
+            })
+            .collect();
+        let participants =
+            ParticipantSet::new(descriptors, input.participants.checkpoints().to_vec())
+                .expect("live source participants");
+        let stored_fence = participants
+            .descriptors()
+            .iter()
+            .filter_map(ParticipantDescriptor::source_fence)
+            .next()
+            .expect("source participant");
+        let fence = SourceFence::new(
+            stored_fence.source_id().clone(),
+            stored_fence.root_identity(),
+            stored_fence.database_identity(),
+            stored_fence.lifecycle_generation(),
+            Some(stored_fence.source_revision()),
+            stored_fence.lease_epoch(),
+        )
+        .expect("source fence");
+        input.universal_intent = UniversalIntent::new(
+            prior_intent.parent_operation_id(),
+            prior_intent.command_kind(),
+            prior_intent.user_status_key(),
+            participants.clone(),
+        )
+        .expect("live source universal intent");
+        input.participants = participants;
+        let mut admit = client.admit_prepared(input).expect("operation queues");
+        let operation_id = admit
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operation result")
+            .expect("operation worker");
+        let mut lookup = client.get(operation_id).expect("operation lookup queues");
+        let operation = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operation lookup result")
+            .expect("operation lookup worker")
+            .expect("operation record");
+        let participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity,
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("claim"),
+            participant_id,
+            String::from("opaque-output-key"),
+            0,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("chunk request");
+        let mut claim_result = client.claim_chunk(claim.clone()).expect("claim queues");
+        assert_eq!(
+            claim_result
+                .recv_timeout(Duration::from_secs(2))
+                .expect("claim result")
+                .expect("claim worker")
+                .state(),
+            ChunkClaimState::Claimed
+        );
+        let target = RootRegistrationRef::synthetic_for_test();
+        let effect_id = EffectId::new();
+        let output = OutputIdentity::new();
+        let wrong_fence = SourceFence::new(
+            fence.source_id().clone(),
+            "unregistered-root",
+            fence.database_identity(),
+            fence.lifecycle_generation(),
+            fence.source_revision(),
+            lease_epoch,
+        )
+        .expect("wrong source fence observation");
+        let wrong_spec =
+            LiveChunkEffectSpec::new(effect_id, output, target, vec![wrong_fence], 0, 3, b"abc")
+                .expect("bounded wrong observation");
+        let mut denied = client
+            .issue_live_chunk_effect(
+                claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("source pin for denial"),
+                wrong_spec,
+            )
+            .expect("wrong issue queues");
+        assert!(
+            denied
+                .recv_timeout(Duration::from_secs(2))
+                .expect("wrong issue result")
+                .is_err()
+        );
+        let foreign_participant_fence = SourceFence::new(
+            SourceId::from_string(String::from("foreign-source")),
+            fence.root_identity(),
+            fence.database_identity(),
+            fence.lifecycle_generation(),
+            fence.source_revision(),
+            lease_epoch,
+        )
+        .expect("foreign participant observation");
+        let foreign_spec = LiveChunkEffectSpec::new(
+            effect_id,
+            output,
+            target,
+            vec![foreign_participant_fence],
+            0,
+            3,
+            b"abc",
+        )
+        .expect("bounded foreign observation");
+        let mut foreign = client
+            .issue_live_chunk_effect(
+                claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard
+                    .pin_for_effect()
+                    .expect("source pin for foreign denial"),
+                foreign_spec,
+            )
+            .expect("foreign issue queues");
+        assert!(
+            format!(
+                "{}",
+                foreign
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("foreign issue result")
+                    .expect_err("foreign participant cannot issue")
+            )
+            .contains("absent from the operation")
+        );
+        let spec =
+            LiveChunkEffectSpec::new(effect_id, output, target, vec![fence.clone()], 0, 3, b"abc")
+                .expect("bounded effect");
+        let mut issue = client
+            .issue_live_chunk_effect(
+                claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("source pin"),
+                spec,
+            )
+            .expect("live issue queues");
+        let grant = issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("live issue result")
+            .expect("live issue worker");
+        assert_eq!(grant.permit.chunk_id(), claim.chunk_id());
+        assert_eq!(grant.permit.operation_id(), operation_id);
+        assert_eq!(grant.output_key, "opaque-output-key");
+        assert_eq!(grant.spec.effect_id, effect_id);
+        assert_eq!(grant.spec.output, output);
+        assert_eq!(grant.spec.target, target);
+        assert_eq!(grant.spec.payload_bytes, 3);
+        assert_eq!(grant.spec.payload_hash, *blake3::hash(b"abc").as_bytes());
+        drop(grant);
+
+        let replay_spec =
+            LiveChunkEffectSpec::new(effect_id, output, target, vec![fence], 0, 3, b"abc")
+                .expect("replay observations");
+        let mut replay = client
+            .issue_live_chunk_effect(
+                claim.chunk_id(),
+                operation_id,
+                registration,
+                guard.pin_for_effect().expect("second source pin"),
+                replay_spec,
+            )
+            .expect("replay queues");
+        assert!(
+            format!(
+                "{}",
+                replay
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("replay result")
+                    .expect_err("dropped grant cannot reissue")
+            )
+            .contains("already Issued")
+        );
+        assert_eq!(owner.synthetic_chunk_write_invocations(), 0);
+        drop(guard);
+        drop(database);
+        let _ = owner.shutdown();
     }
 
     #[cfg(target_os = "macos")]

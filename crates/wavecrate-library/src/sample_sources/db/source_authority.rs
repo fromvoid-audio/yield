@@ -51,6 +51,10 @@ impl SourceLeaseIdentity {
             lease_epoch: lease.epoch(),
         }
     }
+
+    pub(crate) fn epoch(&self) -> i64 {
+        self.lease_epoch
+    }
 }
 
 /// Opaque identity for one source-volume registration handshake.

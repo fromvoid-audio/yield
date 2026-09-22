@@ -94,6 +94,11 @@ impl OutputIdentity {
     pub fn from_uuid(value: Uuid) -> Self {
         Self(value)
     }
+
+    /// Borrow the UUID representation of this observation.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
 }
 
 impl Default for OutputIdentity {
@@ -208,7 +213,7 @@ impl SourceFence {
     /// also its allocation bound.  The two ordinary `String` fields expose their capacities
     /// directly.  This is used only for the owner input budget; it never enters the request
     /// fingerprint or grants authority.
-    fn dynamic_backing_bytes(&self) -> Option<usize> {
+    pub(crate) fn dynamic_backing_bytes(&self) -> Option<usize> {
         self.source_id
             .as_str()
             .len()
@@ -219,6 +224,16 @@ impl SourceFence {
     /// Return the source identifier.
     pub fn source_id(&self) -> &SourceId {
         &self.source_id
+    }
+
+    /// Return the observed source-root identity without granting root access.
+    pub(crate) fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    /// Return the observed source database identity without granting database access.
+    pub(crate) fn database_identity(&self) -> &str {
+        &self.database_identity
     }
 
     /// Return the source lifecycle generation.
@@ -420,6 +435,15 @@ pub struct RootRegistrationRef {
 }
 
 impl RootRegistrationRef {
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test() -> Self {
+        Self {
+            owner: OwnerIdentity(Uuid::new_v4()),
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        }
+    }
+
     /// Return the owning file-operation owner identity as an observation.
     pub const fn owner_identity(self) -> OwnerIdentity {
         self.owner
