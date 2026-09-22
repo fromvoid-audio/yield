@@ -170,9 +170,9 @@ mutation. The same key with a changed payload, source identity, or fence is a ty
 conflict and leaves the prior state unchanged.
 
 Receipts are stored by the source participant with the implemented bounded versioned
-codec and migration rule described above. The source schema is now version 13; both
-`Fast` and `Full` opens run the additive receipt relation assurance, while `Full` also
-performs invalid-path cleanup. The source-local
+codec and migration rule described above. The source schema is now version 13;
+maintenance opens run receipt relation assurance and invalid-path cleanup.
+Operational role opens check compatibility without schema repair. The source-local
 `file_ops_journal` has recovery semantics and is not a source participant receipt table.
 The volatile catalog request ID and the existing in-memory curation lineage do not supply
 the durable duplicate identity; `SourceWriter` supplies that identity and readback path
@@ -224,11 +224,11 @@ The current source connection profiles map to the proposed authority boundary as
 
 | Role | Current open mode | Contract treatment |
 | --- | --- | --- |
-| `UiRead` | `SQLITE_OPEN_READ_ONLY`, `Fast`, short busy timeout | Read-only observation. No source lease, profile guard, or database binding is created by the current read-only opener. |
-| `BackgroundRead` | `SQLITE_OPEN_READ_ONLY`, `Fast` | Same read-only observation rule; bounded and stale-aware. |
-| `JobWorker` | Read/write/create, `Fast` | Requires the profile/source owner and exact bound source authority before mutation. |
-| `UserMetadataWrite` | Read/write/create, `Fast` | Serialized source-owner mutation; it must not become a second physical writer. |
-| `PlaybackHistoryWrite` | Read/write/create, `Fast` | Serialized source-owner mutation with its existing latency policy. |
+| `UiRead` | `SQLITE_OPEN_READ_ONLY`, short busy timeout | Read-only observation. No source lease, profile guard, or database binding is created by the current read-only opener. |
+| `BackgroundRead` | `SQLITE_OPEN_READ_ONLY` | Same read-only observation rule; bounded and stale-aware. |
+| `JobWorker` | Existing read/write database, `Operational` | Requires a current compatible schema; path-only writable entrypoints are rejected in normal builds. |
+| `UserMetadataWrite` | Existing read/write database, `Operational` | Same schema boundary and source-owner mutation requirement. |
+| `PlaybackHistoryWrite` | Existing read/write database, `Operational` | Same schema boundary with its short busy timeout. |
 | `Maintenance` | Read/write/create, `Full` | The only role that may perform the full schema/migration maintenance contract, under source ownership. |
 
 `open_read_only_source_database` validates the configured paths and opens a read-only
@@ -247,17 +247,19 @@ Path-only roots, database paths, and sidecar checks cannot authorize a source mu
 the writable owner still needs the bound root, database identity, profile guard, and live
 source lease.
 
-Full and Fast schema opens can both create or migrate source schema state, and Full may
-clean invalid paths. A read role skipping migrations is not a migration-safe immutable
-reader. The target migration rule is narrower: only the source owner's `Maintenance`
-startup phase may create, migrate, or repair schema while it holds source ownership.
-The [OPT-1639 design checkpoint](OPT_1639_SOURCE_SNAPSHOT_BOUNDARY.md) records the
+The role-dispatched operational writer opens now require an existing compatible
+database and return `MaintenanceRequired` without schema DDL or legacy-file rename.
+Full schema opens can still create or migrate source schema state and clean invalid
+paths. A read role skipping migrations is not a migration-safe immutable reader.
+Only the source owner's maintenance startup phase should create, migrate, or repair
+schema while it holds source ownership. The [OPT-1639 boundary](OPT_1639_SOURCE_SNAPSHOT_BOUNDARY.md) records the
 owner-held snapshot path, migration handoff, and evidence needed to qualify it.
 Operational writable roles require a currently compatible schema and return a typed
 `MaintenanceRequired` result instead of opportunistically repairing it. The same owned
 connection may perform that maintenance before entering the operational queue; no
-competing writer is introduced. Current Fast migration/repair behavior is an explicit
-OPT-1639 compatibility exception, and OPT-1637 does not change it.
+competing writer is introduced. The public profile-owned source-write opener and
+catalog startup/reopen paths still use Full schema assurance; their remaining role
+split is part of OPT-1639, and OPT-1637 does not change it.
 
 ## Current callers and migration exceptions
 

@@ -133,7 +133,7 @@ fn current_stamped_wav_files_table_repairs_missing_collection_column() {
         schema::SOURCE_DB_SCHEMA_VERSION
     ));
 
-    let db = SourceDatabase::open_for_user_metadata_write(dir.path()).unwrap();
+    let db = SourceDatabase::open_for_test_fixture_source_write(dir.path()).unwrap();
     let columns = column_names(&db.connection, "wav_files");
     assert!(columns.iter().any(|column| column == "collection"));
 

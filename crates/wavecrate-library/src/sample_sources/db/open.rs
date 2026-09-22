@@ -17,7 +17,7 @@ const DEFAULT_WRITABLE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceDatabaseOpenMode {
-    Fast,
+    Operational,
     Full,
 }
 
@@ -180,6 +180,11 @@ fn open_source_database_with_profile_guard_inner(
     }
     let current_database_exists =
         validate_profile_database_entry(&database_root, database_name, &db_path)?;
+    if mode == SourceDatabaseOpenMode::Operational && !current_database_exists {
+        return Err(SourceDbError::MaintenanceRequired {
+            reason: String::from("operational source database is unavailable"),
+        });
+    }
     if !current_database_exists {
         reject_legacy_profile_database(&database_root, &db_path)?;
     }
@@ -209,6 +214,9 @@ fn open_source_database_with_profile_guard_inner(
 
     let opened = match expected_database {
         Some(_) => {
+            sqlite_identity::open_existing_database_file(&database_root, database_name, &db_path)
+        }
+        None if mode == SourceDatabaseOpenMode::Operational => {
             sqlite_identity::open_existing_database_file(&database_root, database_name, &db_path)
         }
         None => sqlite_identity::open_database_file(&database_root, database_name, &db_path),
@@ -429,16 +437,33 @@ fn open_source_database_with_flags(
     }
 
     let database_is_embedded = database_root == root;
-    let db_path = if database_is_embedded {
+    let db_path = if mode == SourceDatabaseOpenMode::Operational {
+        let path = paths::read_only_db_path(database_root)?.ok_or_else(|| {
+            SourceDbError::MaintenanceRequired {
+                reason: String::from("operational source database is unavailable"),
+            }
+        })?;
+        if path != database_root.join(super::DB_FILE_NAME) {
+            return Err(SourceDbError::MaintenanceRequired {
+                reason: String::from("legacy source database requires maintenance"),
+            });
+        }
+        path
+    } else if database_is_embedded {
         paths::prepare_writable_db_path_in_existing_root(database_root)?
     } else {
         paths::prepare_writable_db_path(database_root)?
     };
-    if !database_is_embedded {
+    if !database_is_embedded && mode != SourceDatabaseOpenMode::Operational {
         util::create_parent_if_needed(&db_path)?;
     }
     let connect_started = std::time::Instant::now();
-    let connection = match Connection::open_with_flags(&db_path, open_flags) {
+    let flags = if mode == SourceDatabaseOpenMode::Operational {
+        open_flags & !OpenFlags::SQLITE_OPEN_CREATE
+    } else {
+        open_flags
+    };
+    let connection = match Connection::open_with_flags(&db_path, flags) {
         Ok(connection) => {
             telemetry::record_open_phase(
                 root,
@@ -559,7 +584,7 @@ fn initialize_source_database(
     }
     let schema_started = std::time::Instant::now();
     let schema_result = match mode {
-        SourceDatabaseOpenMode::Fast => db.apply_schema_fast(),
+        SourceDatabaseOpenMode::Operational => db.verify_operational_schema(),
         SourceDatabaseOpenMode::Full => db.apply_schema(),
     };
     match schema_result {
@@ -663,7 +688,7 @@ fn reject_legacy_profile_database(
 impl SourceDatabaseOpenMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Fast => "fast",
+            Self::Operational => "operational",
             Self::Full => "full",
         }
     }

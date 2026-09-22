@@ -1173,7 +1173,7 @@ impl SourceDatabase {
         }
     }
 
-    /// Open a startup-friendly database for a background job.
+    /// Open an existing, schema-compatible database for a background job.
     ///
     /// Normal builds reject this path-only writable alias with
     /// [`SourceDbError::ProfileOwnershipRequired`].
@@ -1181,7 +1181,7 @@ impl SourceDatabase {
         Self::open_with_role(root, SourceDatabaseConnectionRole::JobWorker)
     }
 
-    /// Open a startup-friendly external database for a background job.
+    /// Open an existing, schema-compatible external database for a background job.
     ///
     /// Normal builds reject this path-only writable alias with
     /// [`SourceDbError::ProfileOwnershipRequired`].
@@ -1196,7 +1196,7 @@ impl SourceDatabase {
         )
     }
 
-    /// Open a startup-friendly database owned by source scanning.
+    /// Open an existing, schema-compatible database owned by source scanning.
     ///
     /// This path-only alias returns [`SourceDbError::ProfileOwnershipRequired`] in normal builds;
     /// read-only roles remain available through their explicit read entrypoints.
@@ -1204,7 +1204,7 @@ impl SourceDatabase {
         Self::open_for_background_job(root)
     }
 
-    /// Open a startup-friendly external database owned by source scanning.
+    /// Open an existing, schema-compatible external database owned by source scanning.
     ///
     /// Normal builds reject this path-only writable alias with
     /// [`SourceDbError::ProfileOwnershipRequired`].
@@ -1356,7 +1356,7 @@ impl SourceDatabase {
         )
     }
 
-    /// Open a raw startup-friendly connection for a background job.
+    /// Open a raw connection to an existing, schema-compatible background-job database.
     ///
     /// Normal builds reject this path-only writable alias with
     /// [`SourceDbError::ProfileOwnershipRequired`].
@@ -1498,8 +1498,8 @@ impl SourceDatabase {
         schema::apply_schema(&self.connection).map(|_| ())
     }
 
-    fn apply_schema_fast(&self) -> Result<(), SourceDbError> {
-        schema::apply_schema_fast(&self.connection).map(|_| ())
+    fn verify_operational_schema(&self) -> Result<(), SourceDbError> {
+        schema::verify_current_compatible(&self.connection)
     }
 
     fn into_connection(self) -> Connection {

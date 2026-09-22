@@ -1,6 +1,108 @@
 use super::*;
 
 #[test]
+fn operational_role_requires_maintenance_without_creating_or_repairing_schema() {
+    let dir = tempdir().unwrap();
+    let db_file = dir.path().join(DB_FILE_NAME);
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+    assert!(
+        !db_file.exists(),
+        "operational open must not create a database"
+    );
+
+    {
+        let connection = Connection::open(&db_file).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE wav_files (path TEXT PRIMARY KEY); PRAGMA user_version = 0;",
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+    let connection = Connection::open(&db_file).unwrap();
+    assert_eq!(schema_version(&connection), 0);
+    let column_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('wav_files')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(column_count, 1, "operational open must not repair columns");
+    drop(connection);
+
+    drop(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::Maintenance)
+            .unwrap(),
+    );
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+
+    let current = tempdir().unwrap();
+    drop(SourceDatabase::open_for_source_write(current.path()).unwrap());
+    let current_file = current.path().join(DB_FILE_NAME);
+    Connection::open(&current_file)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 0")
+        .unwrap();
+    assert!(matches!(
+        SourceDatabase::open_with_role(current.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+    drop(
+        SourceDatabase::open_with_role(current.path(), SourceDatabaseConnectionRole::Maintenance)
+            .unwrap(),
+    );
+    let schema_before: String = Connection::open(&current_file)
+        .unwrap()
+        .query_row(
+            "SELECT group_concat(COALESCE(sql, ''), '|') FROM
+             (SELECT sql FROM sqlite_master ORDER BY type, name)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let operational =
+        SourceDatabase::open_with_role(current.path(), SourceDatabaseConnectionRole::JobWorker)
+            .unwrap();
+    assert_eq!(
+        schema_version(&operational.connection),
+        current_schema_version()
+    );
+    let schema_after: String = operational
+        .connection
+        .query_row(
+            "SELECT group_concat(COALESCE(sql, ''), '|') FROM
+             (SELECT sql FROM sqlite_master ORDER BY type, name)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema_after, schema_before);
+}
+
+#[test]
+fn operational_role_does_not_rename_legacy_database() {
+    let dir = tempdir().unwrap();
+    let legacy_file = dir.path().join(LEGACY_DB_FILE_NAME);
+    Connection::open(&legacy_file).unwrap();
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+    assert!(legacy_file.exists());
+    assert!(!dir.path().join(DB_FILE_NAME).exists());
+}
+
+#[test]
 fn missing_columns_are_added_on_open() {
     let dir = tempdir().unwrap();
     let db_file = dir.path().join(DB_FILE_NAME);

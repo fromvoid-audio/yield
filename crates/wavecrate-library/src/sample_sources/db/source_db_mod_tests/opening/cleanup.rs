@@ -3,18 +3,10 @@ use super::*;
 #[test]
 fn job_worker_role_defers_invalid_relative_path_cleanup() {
     let dir = tempdir().unwrap();
+    drop(SourceDatabase::open_for_source_write(dir.path()).unwrap());
     let db_file = dir.path().join(DB_FILE_NAME);
     {
         let conn = Connection::open(&db_file).unwrap();
-        conn.execute(
-            "CREATE TABLE wav_files (
-                    path TEXT PRIMARY KEY,
-                    file_size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL
-                )",
-            [],
-        )
-        .unwrap();
         conn.execute(
             "INSERT INTO wav_files (path, file_size, modified_ns) VALUES (?1, ?2, ?3)",
             params!["../escape.wav", 1i64, 1i64],
@@ -133,18 +125,10 @@ fn source_write_open_removes_invalid_relative_paths() {
 #[test]
 fn background_job_open_defers_invalid_relative_path_cleanup() {
     let dir = tempdir().unwrap();
+    drop(SourceDatabase::open_for_source_write(dir.path()).unwrap());
     let db_file = dir.path().join(DB_FILE_NAME);
     {
         let conn = Connection::open(&db_file).unwrap();
-        conn.execute(
-            "CREATE TABLE wav_files (
-                    path TEXT PRIMARY KEY,
-                    file_size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL
-                )",
-            [],
-        )
-        .unwrap();
         conn.execute(
             "INSERT INTO wav_files (path, file_size, modified_ns) VALUES (?1, ?2, ?3)",
             params!["../escape.wav", 1i64, 1i64],

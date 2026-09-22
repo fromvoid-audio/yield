@@ -1181,10 +1181,15 @@ mod plan_tests {
         tag_prefix_upper_bound, tag_vocabulary_sql,
     };
 
+    fn open_metadata_fixture(root: &Path) -> SourceDatabase {
+        drop(SourceDatabase::open_for_source_write(root).unwrap());
+        SourceDatabase::open_for_user_metadata_write(root).unwrap()
+    }
+
     #[test]
     fn vocabulary_prefix_range_plans_include_an_index_seek() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_metadata_fixture(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         for label in ["alpha", "atom", "beta"] {
             database
@@ -1211,7 +1216,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_page_plan_uses_wav_file_tag_primary_key_lookup() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_metadata_fixture(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         database
             .assign_tag_to_path(Path::new("one.wav"), "shared")
@@ -1249,7 +1254,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_ids_page_plan_uses_bounded_path_and_id_lookups() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_metadata_fixture(directory.path());
         database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
         let tag = database
             .assign_tag_to_path(Path::new("one.wav"), "shared")
@@ -1301,7 +1306,7 @@ mod plan_tests {
     #[test]
     fn selected_tag_ids_page_cancels_during_grouped_query_and_cleans_temp_scope() {
         let directory = tempdir().unwrap();
-        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let database = open_metadata_fixture(directory.path());
         let paths = (0..4096)
             .map(|index| PathBuf::from(format!("sample-{index:04}.wav")))
             .collect::<Vec<_>>();

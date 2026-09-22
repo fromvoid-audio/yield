@@ -53,7 +53,7 @@ impl SourceDatabaseConnectionRole {
             | Self::BackgroundRead
             | Self::JobWorker
             | Self::UserMetadataWrite
-            | Self::PlaybackHistoryWrite => SourceDatabaseOpenMode::Fast,
+            | Self::PlaybackHistoryWrite => SourceDatabaseOpenMode::Operational,
             Self::Maintenance => SourceDatabaseOpenMode::Full,
         }
     }

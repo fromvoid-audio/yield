@@ -1,10 +1,10 @@
 # OPT-1639 source migration and snapshot boundary
 
-Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). The catalog now validates schema compatibility on its retained owner connection after startup maintenance and before operational commands. This does not yet qualify existing `UiRead` or `BackgroundRead` connections as no-write snapshots.
+Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). The catalog validates schema compatibility on its retained owner connection after startup maintenance and before operational commands. Role-dispatched operational writer opens now require existing compatible schema. This does not yet qualify existing `UiRead` or `BackgroundRead` connections as no-write snapshots.
 
 ## Current evidence
 
-- `sample_sources/db/open.rs::initialize_source_database` calls `apply_schema_fast` for Fast opens and `apply_schema` for Full opens. Both can create or repair schema, even when `user_version` is current. `open_for_catalog_with_profile_guard` currently uses Full and is an authorized startup/migration exception.
+- `sample_sources/db/open.rs::initialize_source_database` checks compatibility for Operational opens and calls `apply_schema` for Full opens. Operational opens reject missing or stale schema without creating a DB file or repairing objects. `open_for_catalog_with_profile_guard` currently uses Full and is an authorized startup/migration exception. The public profile-owned source-write opener and other Full reopen paths still need a role split.
 - `sample_sources/db/open/read_only.rs` opens `SQLITE_OPEN_READ_ONLY` and skips writable schema routines. Its returned `SourceDatabase` has no retained profile guard, source lease, or database-file binding. SQLite flags reject SQL writes through that connection; they do not establish that opening a live WAL database leaves the surrounding files untouched.
 - `SourceDatabase::snapshot_to_path_with_write_fence` uses SQLite backup under a source write fence and writes a destination database. It is an export/retarget primitive, not the requested bounded read-only snapshot.
 - The source revision writer from OPT-1638 can provide a committed revision cut. A revision number, copied row, or old publication fence remains an observation, not owner authority.
@@ -13,7 +13,7 @@ Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue
 
 The first qualified snapshot path uses the already-owned source connection on the source owner thread. It opens no second SQLite connection and creates no snapshot file. The owner retains the profile/source lease and database identity for the entire read. Existing path-only `UiRead` and `BackgroundRead` calls remain legacy observations until callers are separately routed or a no-sidecar-write backend is qualified. In particular, `immutable=1` is not an allowed shortcut for a live WAL database.
 
-Only an owner startup maintenance phase may create, migrate, repair, or clean schema. That phase runs while the profile/source capability is held and before the operational queue accepts requests. Operational writer and snapshot entry points require the already-current schema; a mismatch or missing required object returns a typed maintenance-required result without DDL, retrying under another role, or changing the source database. The startup transition must preserve the same source ownership across maintenance and operational service. Until that transition is implemented, the existing Full catalog open remains an explicitly named exception, and no Fast open may be described as migration-free.
+Only an owner startup maintenance phase may create, migrate, repair, or clean schema. That phase runs while the profile/source capability is held and before the operational queue accepts requests. Role-dispatched operational writer entry points now require the already-current schema; a mismatch or missing required object returns a typed maintenance-required result without DDL, retrying under another role, or changing the source database. The catalog transition preserves the same source ownership across maintenance and operational service. Full source-write and internal reopen paths remain explicit migration exceptions until their roles are split.
 
 ## Snapshot request and result
 
@@ -34,7 +34,7 @@ The aggregate limit per request is two seconds, 100,000 decoded rows, and 16 MiB
 ## Acceptance sequence
 
 1. Add a non-mutating schema compatibility check and a typed maintenance-required result. Prove a current operational open leaves schema objects and `user_version` unchanged; prove stale or damaged schema fails without repair. Do not switch existing startup to this check until the owner-held maintenance-to-operation handoff is established.
-2. Establish the maintenance handoff on the retained profile/source owner, then use the compatibility check for operational opens. The registration handoff check is wired; still prove that operational reopen paths never migrate, the lease and database identity remain bound, and competing writable opens do not acquire a second owner.
+2. Establish the maintenance handoff on the retained profile/source owner, then use the compatibility check for operational opens. The registration handoff and role-dispatched operational checks are wired; still split Full reopen paths and prove lease/database identity binding and competing-writer exclusion.
 3. Add the bounded owner-read command and exact revision/fence result. Test a 64-row page, aggregate row/byte/time limits, keyset continuation, mutation between pages, cancellation, stale generation, and owner loss. Test filesystem sidecar/DB metadata before and after an owner-read with no concurrent writer; do not infer no-write behavior from `SQLITE_OPEN_READ_ONLY` alone.
 4. Run focused source schema/migration, owner revision, read-role, and snapshot tests. A legacy read caller is not considered migrated merely because the new command exists. Caller routing remains outside OPT-1639.
 
