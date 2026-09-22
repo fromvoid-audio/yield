@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::app_dirs::WritableProfileGuard;
 use crate::durable_capacity::{
@@ -49,11 +50,14 @@ use super::store::recovery::{
     CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
 };
 use super::store::{
-    FullProgressWriteOutcome, InitialClaimSettlementError, JournalCancelRequestReceipt,
-    JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt, JournalInsertWriteStage,
-    JournalRetryReceipt, OperationJournalStore, OperationJournalStoreError,
-    SourceReserveBindingFailure,
+    ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
+    ChunkWriteIdentity, FullProgressWriteOutcome, InitialClaimSettlementError,
+    JournalCancelRequestReceipt, JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt,
+    JournalInsertWriteStage, JournalRetryReceipt, OperationJournalStore,
+    OperationJournalStoreError, OrdinaryClaimReleaseReceipt, SourceReserveBindingFailure,
 };
+#[cfg(test)]
+use super::store::{ReleaseTestBoundary, ReleaseTestDirective};
 use super::work_plan::derive_work_plan;
 
 const CONTROL_INPUT_BYTES: usize = 1;
@@ -369,6 +373,13 @@ pub enum OperationJournalOwnerError {
     /// The owner allocated an identity and confirmed rollback before returning the failure.
     #[error(transparent)]
     PreparedAdmissionRolledBack(#[from] PreparedAdmissionRolledBackError),
+    /// A post-intent chunk claim or permit transition failed closed. Durable claim/release
+    /// evidence remains authoritative and must be retried or reconciled by its exact identity.
+    #[error("operation journal chunk claim failed: {reason}")]
+    ChunkClaim {
+        /// Bounded chunk transition diagnostic.
+        reason: String,
+    },
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -648,6 +659,8 @@ pub struct OperationJournalOwner {
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     prepared_admission_id_allocations: Arc<AtomicUsize>,
+    #[cfg(test)]
+    synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 }
 
 /// Worker-owned runtime state with an explicit teardown order.
@@ -743,6 +756,183 @@ struct SourceVolumeBinding {
     allocation_unit: Option<u64>,
     readiness: SourceVolumeBindingReadiness,
     registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
+}
+
+/// Owner-thread identity for one durable Issued chunk. The permit returned to a caller is not a
+/// write authority by itself; this live registry is required at every bounded entry/release.
+struct IssuedChunkTicket {
+    chunk_id: ChunkId,
+    operation_id: OperationId,
+    identity: ChunkWriteIdentity,
+}
+
+/// Proof retained after an unused issuance has been consumed by a release attempt. It forbids
+/// entry while allowing the exact durable release to be retried after rollback uncertainty or a
+/// provider reconciliation failure.
+struct PendingChunkRelease {
+    chunk_id: ChunkId,
+    operation_id: OperationId,
+    issue_id: Uuid,
+    release_id: Uuid,
+}
+
+/// Owner-issued opaque ticket for one durable chunk issuance. Only read-only identity getters
+/// cross the queue boundary; entry construction and consumption stay private to this module.
+#[derive(Debug)]
+pub(crate) struct ChunkWritePermit {
+    chunk_id: ChunkId,
+    operation_id: OperationId,
+    issue_id: Uuid,
+    identity: ChunkWriteIdentity,
+    logical_length: u64,
+    allocated_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ChunkWriteEntry {
+    chunk_id: ChunkId,
+    operation_id: OperationId,
+    issue_id: Uuid,
+    identity: ChunkWriteIdentity,
+    logical_length: u64,
+    allocated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+enum ChunkPermitError {
+    #[error("chunk write identity does not match the issued permit")]
+    IdentityMismatch,
+    #[error("chunk write budget {requested} exceeds the permit allowance {allowed}")]
+    BudgetExceeded { requested: u64, allowed: u64 },
+}
+
+impl ChunkWritePermit {
+    fn from_issue_receipt(receipt: ChunkIssueReceipt) -> Self {
+        Self {
+            chunk_id: receipt.chunk_id(),
+            operation_id: receipt.operation_id(),
+            issue_id: receipt.issue_id(),
+            identity: receipt.write_identity(),
+            logical_length: receipt.logical_length(),
+            allocated_bytes: receipt.allocated_bytes(),
+        }
+    }
+
+    pub(crate) fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn issue_id(&self) -> Uuid {
+        self.issue_id
+    }
+
+    pub(crate) fn identity(&self) -> &ChunkWriteIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn logical_length(&self) -> u64 {
+        self.logical_length
+    }
+
+    fn consume(
+        self,
+        identity: &ChunkWriteIdentity,
+        logical_bytes: u64,
+    ) -> Result<ChunkWriteEntry, ChunkPermitError> {
+        if self.identity != *identity {
+            return Err(ChunkPermitError::IdentityMismatch);
+        }
+        if logical_bytes == 0 || logical_bytes > self.logical_length {
+            return Err(ChunkPermitError::BudgetExceeded {
+                requested: logical_bytes,
+                allowed: self.logical_length,
+            });
+        }
+        Ok(ChunkWriteEntry {
+            chunk_id: self.chunk_id,
+            operation_id: self.operation_id,
+            issue_id: self.issue_id,
+            identity: self.identity,
+            logical_length: self.logical_length,
+            allocated_bytes: self.allocated_bytes,
+        })
+    }
+}
+
+impl ChunkWriteEntry {
+    fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+
+    fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    fn issue_id(&self) -> Uuid {
+        self.issue_id
+    }
+
+    fn identity(&self) -> &ChunkWriteIdentity {
+        &self.identity
+    }
+
+    fn logical_length(&self) -> u64 {
+        self.logical_length
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+}
+
+/// Owner-minted proof for releasing an unused Issued ticket. Its fields bind the release
+/// transition and are visible to the store only through read-only accessors.
+pub(crate) struct ChunkUnusedReleaseAuthorization {
+    chunk_id: ChunkId,
+    operation_id: OperationId,
+    issue_id: Uuid,
+    release_id: Uuid,
+}
+
+impl ChunkUnusedReleaseAuthorization {
+    fn new(chunk_id: ChunkId, operation_id: OperationId, issue_id: Uuid, release_id: Uuid) -> Self {
+        Self {
+            chunk_id,
+            operation_id,
+            issue_id,
+            release_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        issue_id: Uuid,
+        release_id: Uuid,
+    ) -> Self {
+        Self::new(chunk_id, operation_id, issue_id, release_id)
+    }
+
+    pub(crate) fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn issue_id(&self) -> Uuid {
+        self.issue_id
+    }
+
+    pub(crate) fn release_id(&self) -> Uuid {
+        self.release_id
+    }
 }
 
 /// A transient, owner-thread observation of descriptor-derived capacity facts.
@@ -950,12 +1140,18 @@ struct OwnerRuntime {
         HashMap<crate::sample_sources::db::SourceRegistrationId, SourceAuthorityRecord>,
     retired_source_registrations:
         HashMap<crate::sample_sources::db::SourceRegistrationId, RetiredSourceAuthorityRecord>,
+    issued_chunk_tickets: HashMap<Uuid, IssuedChunkTicket>,
+    pending_chunk_releases: HashMap<Uuid, PendingChunkRelease>,
     #[cfg(test)]
     drop_observer: Option<OwnerRuntimeDropObserver>,
     #[cfg(test)]
     drop_probe: Option<OwnerRuntimeDropProbe>,
     #[cfg(test)]
     prepared_admission_id_allocations: Arc<AtomicUsize>,
+    #[cfg(test)]
+    synthetic_chunk_write_invocations: Arc<AtomicUsize>,
+    #[cfg(test)]
+    next_chunk_callback_witness_error: Option<String>,
 }
 
 impl OwnerRuntime {
@@ -975,12 +1171,18 @@ impl OwnerRuntime {
             source_volumes: BTreeMap::new(),
             source_registrations: HashMap::new(),
             retired_source_registrations: HashMap::new(),
+            issued_chunk_tickets: HashMap::new(),
+            pending_chunk_releases: HashMap::new(),
             #[cfg(test)]
             drop_observer: None,
             #[cfg(test)]
             drop_probe: None,
             #[cfg(test)]
             prepared_admission_id_allocations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            synthetic_chunk_write_invocations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            next_chunk_callback_witness_error: None,
         })
     }
 
@@ -988,10 +1190,17 @@ impl OwnerRuntime {
     fn new_with_id_counter(
         store: OperationJournalStore,
         prepared_admission_id_allocations: Arc<AtomicUsize>,
+        synthetic_chunk_write_invocations: Arc<AtomicUsize>,
     ) -> Result<Self, String> {
         let mut runtime = Self::new(store)?;
         runtime.prepared_admission_id_allocations = prepared_admission_id_allocations;
+        runtime.synthetic_chunk_write_invocations = synthetic_chunk_write_invocations;
         Ok(runtime)
+    }
+
+    #[cfg(test)]
+    fn fail_next_chunk_callback_witness_for_test(&mut self, reason: impl Into<String>) {
+        self.next_chunk_callback_witness_error = Some(reason.into());
     }
 
     fn store(&self) -> &OperationJournalStore {
@@ -1133,6 +1342,543 @@ impl OwnerRuntime {
                 }
             }
         }
+    }
+
+    fn chunk_rebuild_snapshot(
+        &self,
+    ) -> Result<super::store::OrdinaryClaimRebuildSnapshot, OperationJournalOwnerError> {
+        let snapshot = self.store().rebuild_admission_snapshot().map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: format!("current durable chunk/claim image is not admissible: {error}"),
+            }
+        })?;
+        match snapshot.readiness() {
+            CapacityRebuildReadiness::ReconciliationRequired { diagnostics } => {
+                return Err(OperationJournalOwnerError::ChunkClaim {
+                    reason: format!(
+                        "durable chunk/claim image requires reconciliation: {}",
+                        bounded_diagnostics(diagnostics)
+                    ),
+                });
+            }
+            CapacityRebuildReadiness::Ready | CapacityRebuildReadiness::RecoveryOnly { .. } => {}
+        }
+        Ok(snapshot)
+    }
+
+    fn validate_chunk_operation_state(
+        &self,
+        operation_id: OperationId,
+        action: &str,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let operation = self
+            .store()
+            .get(operation_id)
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: format!("operation {operation_id} was not found for chunk {action}"),
+            })?;
+        if operation.phase != super::model::OperationPhase::IntentDurable
+            || !matches!(
+                operation.disposition,
+                super::model::OperationDisposition::None
+                    | super::model::OperationDisposition::RetryPending
+            )
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: format!("operation {operation_id} is not eligible for chunk {action}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn claim_chunk(
+        &mut self,
+        request: ChunkClaimRequest,
+    ) -> Result<ChunkClaimRecord, OperationJournalOwnerError> {
+        request
+            .validate()
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        if let Some(existing) = self
+            .store()
+            .read_chunk_claim(request.chunk_id())
+            .map_err(OperationJournalOwnerError::from)?
+        {
+            if existing.matches_request(&request) {
+                return Ok(existing);
+            }
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk identity is already bound to different metadata"),
+            });
+        }
+        self.validate_chunk_operation_state(request.operation_id(), "claim")?;
+        self.store().validate_for_admission()?;
+        let snapshot = self.chunk_rebuild_snapshot()?;
+        let claims =
+            request
+                .inventory()
+                .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                    reason: error.to_string(),
+                })?;
+        let plan = request
+            .plan()
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        #[cfg(test)]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission(None)
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        #[cfg(not(test))]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission()
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        let witness = self
+            .live_admission_witness(observation)
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("capacity provider is not installed"),
+            }
+        })?;
+        provider
+            .validate_rebuilt_claims(&snapshot)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: format!("current durable/live capacity image differs: {error}"),
+            })?;
+        provider.validate_recovery_state().map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            }
+        })?;
+        provider
+            .validate_claim_identities_available(&claims)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        let lease = provider
+            .admit_with_live_witness(&plan, &claims, witness)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        self.store()
+            .persist_chunk_claim_with_lease(&request, provider, lease)
+            .map_err(OperationJournalOwnerError::from)
+    }
+
+    fn issue_chunk(
+        &mut self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+    ) -> Result<ChunkWritePermit, OperationJournalOwnerError> {
+        let record = self
+            .store()
+            .read_chunk_claim(chunk_id)
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk claim was not found"),
+            })?;
+        if record.operation_id() != operation_id {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk claim belongs to a different operation"),
+            });
+        }
+        self.validate_chunk_operation_state(operation_id, "issuance")?;
+        match record.state() {
+            ChunkClaimState::Issued => {
+                return Err(OperationJournalOwnerError::ChunkClaim {
+                    reason: String::from(
+                        "chunk claim is already Issued; a dropped permit cannot be reissued",
+                    ),
+                });
+            }
+            ChunkClaimState::Released => {
+                return Err(OperationJournalOwnerError::ChunkClaim {
+                    reason: String::from("released chunk claim cannot be issued"),
+                });
+            }
+            ChunkClaimState::Claimed => {}
+        }
+        self.store().validate_for_admission()?;
+        let snapshot = self.chunk_rebuild_snapshot()?;
+        #[cfg(test)]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission(None)
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        #[cfg(not(test))]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission()
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        let witness = self
+            .live_admission_witness(observation)
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("capacity provider is not installed"),
+            }
+        })?;
+        provider
+            .validate_rebuilt_claims(&snapshot)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: format!("current durable/live capacity image differs: {error}"),
+            })?;
+        provider.validate_recovery_state().map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            }
+        })?;
+        provider
+            .validate_durable_chunk_claim(&record)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        provider
+            .validate_durable_chunk_issuance(&record, &witness)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        let issue_id = Uuid::new_v4();
+        let receipt = self
+            .store()
+            .issue_chunk_claim(chunk_id, operation_id, issue_id)
+            .map_err(OperationJournalOwnerError::from)?;
+        let permit = ChunkWritePermit::from_issue_receipt(receipt);
+        self.issued_chunk_tickets.insert(
+            permit.issue_id(),
+            IssuedChunkTicket {
+                chunk_id: permit.chunk_id(),
+                operation_id: permit.operation_id(),
+                identity: permit.identity().clone(),
+            },
+        );
+        Ok(permit)
+    }
+
+    fn begin_chunk_write(
+        &mut self,
+        permit: ChunkWritePermit,
+        identity: ChunkWriteIdentity,
+        logical_bytes: u64,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let issue_id = permit.issue_id();
+        let ticket = self.issued_chunk_tickets.get(&issue_id).ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk write ticket is not held by this owner"),
+            }
+        })?;
+        if ticket.chunk_id != permit.chunk_id()
+            || ticket.operation_id != permit.operation_id()
+            || ticket.identity != *permit.identity()
+            || ticket.identity != identity
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk write ticket identity conflicts with owner state"),
+            });
+        }
+        if logical_bytes == 0 || logical_bytes > permit.logical_length() {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "chunk write budget {logical_bytes} exceeds ticket allowance {}",
+                    permit.logical_length()
+                ),
+            });
+        }
+        let record = self
+            .store()
+            .read_chunk_claim(permit.chunk_id())
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk claim was not found for write ticket"),
+            })?;
+        if record.operation_id() != permit.operation_id()
+            || record.state() != ChunkClaimState::Issued
+            || record.issue_id() != Some(issue_id)
+            || record.write_identity() != *permit.identity()
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk write ticket no longer matches durable Issued row"),
+            });
+        }
+        self.validate_chunk_operation_state(permit.operation_id(), "entry")?;
+        self.store().validate_for_admission()?;
+        let snapshot = self.chunk_rebuild_snapshot()?;
+        #[cfg(test)]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission(None)
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        #[cfg(not(test))]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission()
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        let witness = self
+            .live_admission_witness(observation.clone())
+            .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("capacity provider is not installed"),
+            }
+        })?;
+        provider
+            .validate_rebuilt_claims(&snapshot)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: format!("current durable/live capacity image differs: {error}"),
+            })?;
+        provider.validate_recovery_state().map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            }
+        })?;
+        provider
+            .validate_durable_chunk_issuance(&record, &witness)
+            .map_err(|error| OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            })?;
+        drop(witness);
+
+        // The registry removal is the owner-thread single-use transition.  The entry is kept
+        // local to this call and the synthetic callback below receives no filesystem authority.
+        self.issued_chunk_tickets.remove(&issue_id);
+        let entry = permit.consume(&identity, logical_bytes).map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: error.to_string(),
+            }
+        })?;
+        // The registry transition consumes the ticket before the callback boundary.  Source
+        // lease liveness and filesystem identities can change on another owner between these
+        // checks, so the second witness revalidation may fail conservatively after consumption.
+        #[cfg(test)]
+        let callback_witness = if let Some(reason) = self.next_chunk_callback_witness_error.take() {
+            Err(reason)
+        } else {
+            self.live_admission_witness(observation)
+        };
+        #[cfg(not(test))]
+        let callback_witness = self.live_admission_witness(observation);
+        let callback_witness =
+            callback_witness.map_err(|reason| OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "live chunk entry authority became stale before callback: {reason}"
+                ),
+            })?;
+        run_synthetic_chunk_write(
+            &entry,
+            &callback_witness,
+            #[cfg(test)]
+            &self.synthetic_chunk_write_invocations,
+        )
+        .map_err(|reason| OperationJournalOwnerError::ChunkClaim { reason })?;
+        drop(entry);
+        Ok(())
+    }
+
+    fn release_chunk(
+        &mut self,
+        permit: ChunkWritePermit,
+        release_id: Uuid,
+    ) -> Result<OrdinaryClaimReleaseReceipt, OperationJournalOwnerError> {
+        if release_id.is_nil() {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk release identity is nil"),
+            });
+        }
+        let chunk_id = permit.chunk_id();
+        let operation_id = permit.operation_id();
+        let issue_id = permit.issue_id();
+        let Some(ticket) = self.issued_chunk_tickets.get(&issue_id) else {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk release ticket is not held by this owner"),
+            });
+        };
+        if ticket.chunk_id != chunk_id
+            || ticket.operation_id != operation_id
+            || ticket.identity != *permit.identity()
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk release ticket identity conflicts with owner state"),
+            });
+        }
+        if self.pending_chunk_releases.contains_key(&release_id) {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk release identity is already pending"),
+            });
+        }
+        self.issued_chunk_tickets.remove(&issue_id);
+        self.pending_chunk_releases.insert(
+            release_id,
+            PendingChunkRelease {
+                chunk_id,
+                operation_id,
+                issue_id,
+                release_id,
+            },
+        );
+        let authorization =
+            ChunkUnusedReleaseAuthorization::new(chunk_id, operation_id, issue_id, release_id);
+        let receipt = self
+            .store()
+            .release_chunk_claim(chunk_id, operation_id, Some(authorization), release_id)
+            .map_err(OperationJournalOwnerError::from)?;
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "chunk release {release_id} committed but capacity provider is not installed"
+                ),
+            }
+        })?;
+        provider.release_claim(&receipt).map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "chunk release {release_id} committed but provider accounting remains retained: {error}"
+                ),
+            }
+        })?;
+        self.pending_chunk_releases.remove(&release_id);
+        Ok(receipt)
+    }
+
+    fn retry_chunk_release(
+        &mut self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        release_id: Uuid,
+    ) -> Result<OrdinaryClaimReleaseReceipt, OperationJournalOwnerError> {
+        if release_id.is_nil() {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk release identity is nil"),
+            });
+        }
+        let pending_issue_id = match self.pending_chunk_releases.get(&release_id) {
+            Some(pending)
+                if pending.chunk_id == chunk_id
+                    && pending.operation_id == operation_id
+                    && pending.release_id == release_id =>
+            {
+                Some(pending.issue_id)
+            }
+            Some(_) => {
+                return Err(OperationJournalOwnerError::ChunkClaim {
+                    reason: String::from(
+                        "chunk release retry identity conflicts with pending proof",
+                    ),
+                });
+            }
+            None => None,
+        };
+        let current = self
+            .store()
+            .read_chunk_claim(chunk_id)
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk claim was not found for release retry"),
+            })?;
+        if current.operation_id() != operation_id {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk claim belongs to a different operation"),
+            });
+        }
+        let authorization = match current.state() {
+            ChunkClaimState::Released => {
+                if current.release_id() != Some(release_id) {
+                    return Err(OperationJournalOwnerError::ChunkClaim {
+                        reason: String::from("durable chunk release identity conflicts"),
+                    });
+                }
+                None
+            }
+            ChunkClaimState::Issued => {
+                let issue_id =
+                    current
+                        .issue_id()
+                        .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                            reason: String::from("Issued chunk has no issue identity"),
+                        })?;
+                if pending_issue_id != Some(issue_id) {
+                    return Err(OperationJournalOwnerError::ChunkClaim {
+                        reason: String::from(
+                            "Issued chunk has no retained unused release authority",
+                        ),
+                    });
+                }
+                Some(ChunkUnusedReleaseAuthorization::new(
+                    chunk_id,
+                    operation_id,
+                    issue_id,
+                    release_id,
+                ))
+            }
+            ChunkClaimState::Claimed => {
+                return Err(OperationJournalOwnerError::ChunkClaim {
+                    reason: String::from(
+                        "Claimed chunk requires cancel_chunk before release retry",
+                    ),
+                });
+            }
+        };
+        let receipt = self
+            .store()
+            .release_chunk_claim(chunk_id, operation_id, authorization, release_id)
+            .map_err(OperationJournalOwnerError::from)?;
+        let provider = self.capacity_provider.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "chunk release {release_id} is durable but capacity provider is not installed"
+                ),
+            }
+        })?;
+        provider.release_claim(&receipt).map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: format!("chunk release {release_id} remains retained for retry: {error}"),
+            }
+        })?;
+        self.pending_chunk_releases.remove(&release_id);
+        Ok(receipt)
+    }
+
+    fn cancel_chunk(
+        &mut self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        release_id: Uuid,
+    ) -> Result<OrdinaryClaimReleaseReceipt, OperationJournalOwnerError> {
+        if release_id.is_nil() {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk release identity is nil"),
+            });
+        }
+        let current = self
+            .store()
+            .read_chunk_claim(chunk_id)
+            .map_err(OperationJournalOwnerError::from)?
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk claim was not found for cancellation"),
+            })?;
+        if current.operation_id() != operation_id || current.state() != ChunkClaimState::Claimed {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("only a Claimed chunk can be cancelled by id"),
+            });
+        }
+        let receipt = self
+            .store()
+            .release_chunk_claim(chunk_id, operation_id, None, release_id)
+            .map_err(OperationJournalOwnerError::from)?;
+        let provider = self
+            .capacity_provider
+            .as_ref()
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "chunk cancellation {release_id} committed but capacity provider is not installed"
+                ),
+            })?;
+        provider.release_claim(&receipt).map_err(|error| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: format!(
+                    "chunk cancellation {release_id} committed but provider accounting remains retained: {error}"
+                ),
+            }
+        })?;
+        Ok(receipt)
     }
 
     fn live_admission_witness(
@@ -2040,6 +2786,26 @@ fn bounded_diagnostics(diagnostics: &[String]) -> String {
     reason.chars().take(512).collect()
 }
 
+fn run_synthetic_chunk_write(
+    entry: &ChunkWriteEntry,
+    witness: &LiveAdmissionWitness<'_>,
+    #[cfg(test)] callback_invocations: &AtomicUsize,
+) -> Result<(), String> {
+    if entry.logical_length() == 0 || entry.allocated_bytes() == 0 {
+        return Err(String::from("chunk write entry has no bounded allocation"));
+    }
+    let _ = (
+        entry.chunk_id(),
+        entry.operation_id(),
+        entry.issue_id(),
+        entry.identity(),
+        witness.facts(),
+    );
+    #[cfg(test)]
+    callback_invocations.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 fn prepared_record(
     operation_id: OperationId,
     prepared: &PreparedAdmissionInput,
@@ -2125,6 +2891,8 @@ impl Drop for OwnerRuntime {
         // visibly conservative and never mistaken for a successful per-source retirement.
         self.source_registrations.clear();
         self.retired_source_registrations.clear();
+        self.issued_chunk_tickets.clear();
+        self.pending_chunk_releases.clear();
         drop(std::mem::take(&mut self.source_volumes));
         // Keep this order explicit. The reserve root/descriptor must go first, then SQLite and
         // its profile-child lease, then the cross-process volume lock, and finally the profile
@@ -2242,11 +3010,16 @@ impl OperationJournalOwner {
         let shared = Arc::new(OwnerShared::new(command_tx));
         #[cfg(test)]
         let prepared_admission_id_allocations = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let synthetic_chunk_write_invocations = Arc::new(AtomicUsize::new(0));
         let panic_shared = Arc::clone(&shared);
         let worker_shared = Arc::clone(&shared);
         #[cfg(test)]
         let worker_prepared_admission_id_allocations =
             Arc::clone(&prepared_admission_id_allocations);
+        #[cfg(test)]
+        let worker_synthetic_chunk_write_invocations =
+            Arc::clone(&synthetic_chunk_write_invocations);
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-operation-journal-owner"))
             .spawn(move || {
@@ -2265,6 +3038,8 @@ impl OperationJournalOwner {
                         bootstrap_registry_path,
                         #[cfg(test)]
                         worker_prepared_admission_id_allocations,
+                        #[cfg(test)]
+                        worker_synthetic_chunk_write_invocations,
                     );
                 }));
                 if result.is_err() {
@@ -2279,6 +3054,8 @@ impl OperationJournalOwner {
             worker: Some(worker),
             #[cfg(test)]
             prepared_admission_id_allocations,
+            #[cfg(test)]
+            synthetic_chunk_write_invocations,
         })
     }
 
@@ -2297,6 +3074,12 @@ impl OperationJournalOwner {
     #[cfg(test)]
     fn prepared_admission_id_allocations(&self) -> usize {
         self.prepared_admission_id_allocations
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn synthetic_chunk_write_invocations(&self) -> usize {
+        self.synthetic_chunk_write_invocations
             .load(Ordering::Relaxed)
     }
 
@@ -2534,6 +3317,154 @@ impl OperationJournalClient {
         self.submit(input_bytes, move |input, result| {
             JournalCommand::AdmitPrepared {
                 prepared,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue one bounded post-intent chunk claim. The owner allocates no chunk or operation
+    /// identity here; the supplied stable identity and immutable request are validated again on
+    /// the owner thread before one provisional lease is persisted with the ordinary claim row.
+    #[allow(dead_code)]
+    pub(crate) fn claim_chunk(
+        &self,
+        request: ChunkClaimRequest,
+    ) -> Result<OperationJournalRequest<ChunkClaimRecord>, OperationJournalOwnerQueueError> {
+        request
+            .validate()
+            .map_err(|error| OperationJournalOwnerQueueError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+        let input_bytes = CONTROL_INPUT_BYTES
+            .checked_add(request.output_key().len())
+            .ok_or(OperationJournalOwnerQueueError::RecordTooLarge {
+                actual: usize::MAX,
+                maximum: OPERATION_JOURNAL_OWNER_MAX_QUEUED_INPUT_BYTES,
+            })?;
+        self.submit(input_bytes, move |input, result| {
+            JournalCommand::ClaimChunk {
+                request,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue the one-shot Claimed-to-Issued transition. An already-issued row is never reissued;
+    /// a dropped permit remains an ambiguous durable charge until explicit reconciliation.
+    #[allow(dead_code)]
+    pub(crate) fn issue_chunk(
+        &self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+    ) -> Result<OperationJournalRequest<ChunkWritePermit>, OperationJournalOwnerQueueError> {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::IssueChunk {
+                chunk_id,
+                operation_id,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue one bounded synthetic write entry. The ticket is checked against the live owner
+    /// registry and fresh descriptor/provider facts on the worker; it never carries execution or
+    /// filesystem authority across this queue boundary.
+    #[allow(dead_code)]
+    pub(crate) fn begin_chunk_write(
+        &self,
+        permit: ChunkWritePermit,
+        identity: ChunkWriteIdentity,
+        logical_bytes: u64,
+    ) -> Result<OperationJournalRequest<()>, OperationJournalOwnerQueueError> {
+        if logical_bytes == 0 {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: String::from("chunk write byte budget is zero"),
+            });
+        }
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::BeginChunkWrite {
+                permit,
+                identity,
+                logical_bytes,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue logical release of a claimed or issued chunk. The permit is consumed by the owner
+    /// command; durable release is committed before provider accounting is decremented.
+    #[allow(dead_code)]
+    pub(crate) fn release_chunk(
+        &self,
+        permit: ChunkWritePermit,
+        release_id: Uuid,
+    ) -> Result<OperationJournalRequest<OrdinaryClaimReleaseReceipt>, OperationJournalOwnerQueueError>
+    {
+        if release_id.is_nil() {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: String::from("chunk release identity is nil"),
+            });
+        }
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::ReleaseChunk {
+                permit,
+                release_id,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue retry of an already durable chunk release after a provider or acknowledgement
+    /// failure. The exact release identity is required; no new charge or receipt is minted.
+    #[allow(dead_code)]
+    pub(crate) fn retry_chunk_release(
+        &self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        release_id: Uuid,
+    ) -> Result<OperationJournalRequest<OrdinaryClaimReleaseReceipt>, OperationJournalOwnerQueueError>
+    {
+        if release_id.is_nil() {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: String::from("chunk release identity is nil"),
+            });
+        }
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::RetryChunkRelease {
+                chunk_id,
+                operation_id,
+                release_id,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue cancellation of a still-Claimed chunk. An Issued permit must instead use the exact
+    /// sealed permit release path, because a permit may already have escaped to its consumer.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_chunk(
+        &self,
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        release_id: Uuid,
+    ) -> Result<OperationJournalRequest<OrdinaryClaimReleaseReceipt>, OperationJournalOwnerQueueError>
+    {
+        if release_id.is_nil() {
+            return Err(OperationJournalOwnerQueueError::InvalidInput {
+                reason: String::from("chunk release identity is nil"),
+            });
+        }
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::CancelChunk {
+                chunk_id,
+                operation_id,
+                release_id,
                 input,
                 result,
             }
@@ -3018,6 +3949,44 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<OperationId, OperationJournalOwnerError>>,
     },
+    ClaimChunk {
+        request: ChunkClaimRequest,
+        input: InputPermit,
+        result: SyncSender<Result<ChunkClaimRecord, OperationJournalOwnerError>>,
+    },
+    IssueChunk {
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        input: InputPermit,
+        result: SyncSender<Result<ChunkWritePermit, OperationJournalOwnerError>>,
+    },
+    BeginChunkWrite {
+        permit: ChunkWritePermit,
+        identity: ChunkWriteIdentity,
+        logical_bytes: u64,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
+    ReleaseChunk {
+        permit: ChunkWritePermit,
+        release_id: Uuid,
+        input: InputPermit,
+        result: SyncSender<Result<OrdinaryClaimReleaseReceipt, OperationJournalOwnerError>>,
+    },
+    RetryChunkRelease {
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        release_id: Uuid,
+        input: InputPermit,
+        result: SyncSender<Result<OrdinaryClaimReleaseReceipt, OperationJournalOwnerError>>,
+    },
+    CancelChunk {
+        chunk_id: ChunkId,
+        operation_id: OperationId,
+        release_id: Uuid,
+        input: InputPermit,
+        result: SyncSender<Result<OrdinaryClaimReleaseReceipt, OperationJournalOwnerError>>,
+    },
     #[cfg(test)]
     InjectActiveRecoveryCharge {
         operation_id: OperationId,
@@ -3082,10 +4051,14 @@ fn run_owner(
     #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<std::path::PathBuf>,
     #[cfg(test)] prepared_admission_id_allocations: Arc<AtomicUsize>,
+    #[cfg(test)] synthetic_chunk_write_invocations: Arc<AtomicUsize>,
 ) {
     #[cfg(test)]
-    let runtime_result =
-        OwnerRuntime::new_with_id_counter(store, prepared_admission_id_allocations);
+    let runtime_result = OwnerRuntime::new_with_id_counter(
+        store,
+        prepared_admission_id_allocations,
+        synthetic_chunk_write_invocations,
+    );
     #[cfg(not(test))]
     let runtime_result = OwnerRuntime::new(store);
     let mut runtime = match runtime_result {
@@ -3353,6 +4326,68 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
             drop(input);
             execute_store_result(result, || runtime.admit_prepared(prepared))
         }
+        JournalCommand::ClaimChunk {
+            request,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.claim_chunk(request))
+        }
+        JournalCommand::IssueChunk {
+            chunk_id,
+            operation_id,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.issue_chunk(chunk_id, operation_id))
+        }
+        JournalCommand::BeginChunkWrite {
+            permit,
+            identity,
+            logical_bytes,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.begin_chunk_write(permit, identity, logical_bytes)
+            })
+        }
+        JournalCommand::ReleaseChunk {
+            permit,
+            release_id,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.release_chunk(permit, release_id))
+        }
+        JournalCommand::RetryChunkRelease {
+            chunk_id,
+            operation_id,
+            release_id,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.retry_chunk_release(chunk_id, operation_id, release_id)
+            })
+        }
+        JournalCommand::CancelChunk {
+            chunk_id,
+            operation_id,
+            release_id,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.cancel_chunk(chunk_id, operation_id, release_id)
+            })
+        }
         #[cfg(test)]
         JournalCommand::InjectActiveRecoveryCharge {
             operation_id,
@@ -3476,6 +4511,30 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::AdmitPrepared { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ClaimChunk { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::IssueChunk { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::BeginChunkWrite { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ReleaseChunk { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::RetryChunkRelease { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::CancelChunk { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -3968,6 +5027,226 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn test_witness_with_free_bytes(
+        runtime: &mut OwnerRuntime,
+        free_bytes: u64,
+    ) -> Result<LiveAdmissionWitness<'_>, String> {
+        let reader = move |reserve: &mut OwnedReserveAllocation,
+                           profile_guard: &WritableProfileGuard|
+              -> Result<VolumeFacts, String> {
+            let facts = reserve
+                .view(profile_guard)
+                .fresh_capacity_facts()
+                .map_err(|error| error.to_string())?;
+            Ok(VolumeFacts {
+                free_bytes,
+                ..facts
+            })
+        };
+        let observation = runtime.refresh_live_descriptor_capacity_inner(Some(&reader), true)?;
+        runtime.live_admission_witness(observation)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chunk_issuance_witness_checks_retained_headroom_without_ledger_mutation() {
+        let fixture = fixture("journal-owner-chunk-issuance-headroom");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+        let observation = runtime
+            .refresh_live_descriptor_capacity()
+            .expect("initial live descriptor refresh");
+        let (volume, base_facts) = observation
+            .facts
+            .iter()
+            .next()
+            .map(|(volume, facts)| (volume.clone(), facts.clone()))
+            .expect("profile facts");
+        runtime.capacity_provider = Some(CapacityProvider::unavailable());
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            volume.clone(),
+            base_facts.allocation_unit,
+        );
+        let operation_id = runtime
+            .admit_prepared(input)
+            .expect("initial operation admission");
+        let operation = runtime
+            .store()
+            .get(operation_id)
+            .expect("read admitted operation")
+            .expect("admitted operation");
+        let participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                volume.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                base_facts.allocation_unit,
+            )
+            .expect("chunk claim"),
+            participant_id,
+            String::from("headroom-check"),
+            0,
+            base_facts.allocation_unit,
+            base_facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("chunk request");
+        runtime
+            .claim_chunk(request.clone())
+            .expect("post-intent chunk claim");
+        let record = runtime
+            .store()
+            .read_chunk_claim(request.chunk_id())
+            .expect("read chunk claim")
+            .expect("chunk claim row");
+        let held = runtime
+            .capacity_provider
+            .as_ref()
+            .expect("provider")
+            .outstanding(
+            &volume,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+        );
+        let claims_before = runtime
+            .capacity_provider
+            .as_ref()
+            .expect("provider")
+            .claim_count();
+
+        let provider = runtime.capacity_provider.take().expect("provider");
+        let enough = test_witness_with_free_bytes(
+            &mut runtime,
+            PROTECTED_FREE_SPACE_FLOOR
+                .checked_add(held)
+                .and_then(|bytes| bytes.checked_add(base_facts.allocation_unit))
+                .expect("headroom range"),
+        )
+        .expect("full-floor witness with retained headroom");
+        provider
+            .validate_durable_chunk_issuance(&record, &enough)
+            .expect("held charge fits above the floor");
+        drop(enough);
+        runtime.capacity_provider = Some(provider);
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .expect("provider")
+                .claim_count(),
+            claims_before
+        );
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .expect("provider")
+                .outstanding(&volume, record.allocation_class()),
+            held
+        );
+
+        let provider = runtime.capacity_provider.take().expect("provider");
+        let disk_pressure = test_witness_with_free_bytes(
+            &mut runtime,
+            PROTECTED_FREE_SPACE_FLOOR
+                .checked_add(held.saturating_sub(1))
+                .expect("pressure range"),
+        )
+        .expect("full-floor pressure witness");
+        assert!(matches!(
+            provider.validate_durable_chunk_issuance(&record, &disk_pressure),
+            Err(CapacityProviderError::DiskPressureRecoveryOnly { .. })
+        ));
+        drop(disk_pressure);
+        runtime.capacity_provider = Some(provider);
+
+        let provider = runtime.capacity_provider.take().expect("provider");
+        let low = test_witness_with_free_bytes(&mut runtime, PROTECTED_FREE_SPACE_FLOOR)
+            .expect("full-floor low witness");
+        assert!(matches!(
+            provider.validate_durable_chunk_issuance(&record, &low),
+            Err(CapacityProviderError::RecoveryReserveLow { .. })
+        ));
+        drop(low);
+        runtime.capacity_provider = Some(provider);
+
+        let wrong_unit_reader = |reserve: &mut OwnedReserveAllocation,
+                                 profile_guard: &WritableProfileGuard|
+         -> Result<VolumeFacts, String> {
+            let facts = reserve
+                .view(profile_guard)
+                .fresh_capacity_facts()
+                .map_err(|error| error.to_string())?;
+            Ok(VolumeFacts {
+                allocation_unit: facts
+                    .allocation_unit
+                    .checked_add(1)
+                    .expect("wrong allocation unit"),
+                ..facts
+            })
+        };
+        assert!(
+            runtime
+                .refresh_live_descriptor_capacity_inner(Some(&wrong_unit_reader), true)
+                .is_err()
+        );
+
+        let mut missing_observation = runtime
+            .refresh_live_descriptor_capacity()
+            .expect("fresh observation for missing-facts fixture");
+        missing_observation.facts.clear();
+        let provider = runtime.capacity_provider.take().expect("provider");
+        let missing = runtime
+            .live_admission_witness(missing_observation)
+            .expect("sealed witness retains authority context");
+        assert!(matches!(
+            provider.validate_durable_chunk_issuance(&record, &missing),
+            Err(CapacityProviderError::FactsUnavailable { .. })
+        ));
+        drop(missing);
+        runtime.capacity_provider = Some(provider);
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .expect("provider")
+                .claim_count(),
+            claims_before
+        );
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .expect("provider")
+                .outstanding(&volume, record.allocation_class()),
+            held
+        );
+
+        drop(runtime);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn owner_refresh_faults_fail_closed_without_changing_ledger_or_readiness() {
         #[derive(Clone, Copy)]
@@ -4257,9 +5536,11 @@ mod tests {
         let fixture = fixture("journal-owner-source-authority");
         let registry_path = fixture_volume_registry(&fixture);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
-        let mut owner =
-            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
-                .expect("journal owner");
+        let mut owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            store,
+            registry_path.clone(),
+        )
+        .expect("journal owner");
         wait_until_available(&owner);
 
         let source_root = tempfile::tempdir().expect("source root");
@@ -5784,6 +7065,997 @@ mod tests {
             plan,
             claims,
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_intent_chunk_claim_issue_release_and_replay_are_owner_serialized() {
+        let fixture = fixture("journal-owner-chunk-claim-lifecycle");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            store,
+            registry_path.clone(),
+        )
+        .expect("journal owner");
+        wait_until_available(&owner);
+
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+        );
+        let operation_id = {
+            let mut request = owner
+                .client()
+                .admit_prepared(input)
+                .expect("initial operation admission queues");
+            request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("initial operation result")
+                .expect("initial operation worker")
+        };
+        let participant_id = crate::operation_journal::ParticipantId::new();
+        let client = owner.client();
+        let first = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+                AdmissionClaim::new(
+                    AdmissionClaimId::new(),
+                facts.identity.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("first chunk claim"),
+            participant_id,
+            String::from("chunk-a"),
+            0,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("first chunk request");
+
+        // The prepared copy fixture has its real participant identity in its envelope. Read it
+        // from the persisted operation before queueing the post-intent row.
+        let mut operation_lookup = client.get(operation_id).expect("operation lookup queues");
+        let operation = operation_lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operation lookup result")
+            .expect("operation lookup worker")
+            .expect("operation record");
+        let participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let first = ChunkClaimRequest::new(
+            first.chunk_id(),
+            operation_id,
+            first.claim().clone(),
+            participant_id,
+            first.output_key().to_owned(),
+            first.logical_offset(),
+            first.logical_length(),
+            first.allocation_unit(),
+            first.protected_free_bytes(),
+        )
+        .expect("participant-bound first chunk request");
+
+        let mut claim_request = client
+            .claim_chunk(first.clone())
+            .expect("chunk claim queues");
+        let claimed = claim_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("chunk claim result")
+            .expect("chunk claim worker");
+        assert_eq!(claimed.state(), ChunkClaimState::Claimed);
+        assert!(claimed.matches_request(&first));
+
+        let mut duplicate = client
+            .claim_chunk(first.clone())
+            .expect("duplicate chunk claim queues");
+        assert_eq!(
+            duplicate
+                .recv_timeout(Duration::from_secs(2))
+                .expect("duplicate result")
+                .expect("duplicate worker"),
+            claimed
+        );
+
+        let mut issue = client
+            .issue_chunk(first.chunk_id(), operation_id)
+            .expect("issue queues");
+        let permit = issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issue result")
+            .expect("issue worker");
+        let issue_id = permit.issue_id();
+        let mut issue_replay = client
+            .issue_chunk(first.chunk_id(), operation_id)
+            .expect("issued replay queues");
+        let issue_replay = issue_replay
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issued replay result")
+            .expect_err("issued chunk must never mint a second permit");
+        assert!(format!("{issue_replay}").contains("already Issued"));
+        let release_id = Uuid::new_v4();
+        let mut release = client
+            .release_chunk(permit, release_id)
+            .expect("release queues");
+        let released = release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("release result")
+            .expect("release worker");
+        assert_eq!(released.release_id(), release_id);
+        assert_eq!(released.operation_id(), operation_id);
+
+        let mut retry = client
+            .retry_chunk_release(first.chunk_id(), operation_id, release_id)
+            .expect("release replay queues");
+        assert_eq!(
+            retry
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release replay result")
+                .expect("release replay worker"),
+            released
+        );
+
+        // A released chunk remains in durable history while the initial operation claim stays
+        // live. A later independent chunk must reconcile that grouped history without treating
+        // the released token as an extra live charge or resurrecting it.
+        let second = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("second chunk claim"),
+            first.participant_id(),
+            String::from("chunk-b"),
+            facts.allocation_unit,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("second chunk request");
+        let mut second_claim = client
+            .claim_chunk(second.clone())
+            .expect("second chunk claim queues");
+        assert_eq!(
+            second_claim
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second claim result")
+                .expect("second claim worker")
+                .state(),
+            ChunkClaimState::Claimed
+        );
+        let mut second_cancel = client
+            .cancel_chunk(second.chunk_id(), operation_id, Uuid::new_v4())
+            .expect("second cancellation queues");
+        second_cancel
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second cancellation result")
+            .expect("second cancellation worker");
+
+        // An owner-held Issued ticket may be rejected at the synthetic entry boundary without
+        // becoming forgeable from its durable row. The consumed queue ticket is not converted
+        // into release authority by readback IDs, while id-only cancellation cannot release
+        // Issued state.
+        let guarded = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("guarded chunk claim"),
+            first.participant_id(),
+            String::from("chunk-guarded"),
+            facts.allocation_unit * 4,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("guarded chunk request");
+        let mut guarded_claim = client
+            .claim_chunk(guarded.clone())
+            .expect("guarded claim queues");
+        guarded_claim
+            .recv_timeout(Duration::from_secs(2))
+            .expect("guarded claim result")
+            .expect("guarded claim worker");
+        let reserve_len = fs::metadata(&reserve_path).expect("reserve metadata").len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_path)
+            .expect("open reserve for low-space issue")
+            .set_len(PROTECTED_FREE_SPACE_FLOOR - 1)
+            .expect("shorten reserve before issue");
+        let mut low_issue = client
+            .issue_chunk(guarded.chunk_id(), operation_id)
+            .expect("low-space issue queues");
+        assert!(
+            low_issue
+                .recv_timeout(Duration::from_secs(2))
+                .expect("low-space issue result")
+                .is_err()
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_path)
+            .expect("reopen reserve after low-space issue")
+            .set_len(reserve_len)
+            .expect("restore reserve after low-space issue");
+        let mut guarded_issue = client
+            .issue_chunk(guarded.chunk_id(), operation_id)
+            .expect("guarded issue queues");
+        let guarded_permit = guarded_issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("guarded issue result")
+            .expect("guarded issue worker");
+        let mut issued_cancel = client
+            .cancel_chunk(guarded.chunk_id(), operation_id, Uuid::new_v4())
+            .expect("issued cancellation queues");
+        assert!(
+            issued_cancel
+                .recv_timeout(Duration::from_secs(2))
+                .expect("issued cancellation result")
+                .is_err()
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_path)
+            .expect("open reserve for low-space entry")
+            .set_len(PROTECTED_FREE_SPACE_FLOOR - 1)
+            .expect("shorten reserve before entry");
+        let before_low_space_entry = owner.synthetic_chunk_write_invocations();
+        let mut denied_write = client
+            .begin_chunk_write(guarded_permit, guarded.identity(), guarded.logical_length())
+            .expect("low-space entry queues");
+        assert!(
+            denied_write
+                .recv_timeout(Duration::from_secs(2))
+                .expect("low-space entry result")
+                .is_err()
+        );
+        assert_eq!(
+            owner.synthetic_chunk_write_invocations(),
+            before_low_space_entry
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_path)
+            .expect("reopen reserve after low-space entry")
+            .set_len(reserve_len)
+            .expect("restore reserve after low-space entry");
+        let mut guarded_release = client
+            .retry_chunk_release(guarded.chunk_id(), operation_id, Uuid::new_v4())
+            .expect("readback-only release retry queues");
+        assert!(
+            guarded_release
+                .recv_timeout(Duration::from_secs(2))
+                .expect("readback-only release retry result")
+                .is_err()
+        );
+
+        let restart_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("restart chunk claim"),
+            first.participant_id(),
+            String::from("chunk-restart"),
+            facts.allocation_unit * 2,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("restart chunk request");
+        let issued_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("issued chunk claim"),
+            first.participant_id(),
+            String::from("chunk-issued"),
+            facts.allocation_unit * 3,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("issued chunk request");
+        let mut restart_claim_request = client
+            .claim_chunk(restart_claim.clone())
+            .expect("restart chunk claim queues");
+        restart_claim_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("restart chunk claim result")
+            .expect("restart chunk claim worker");
+        let mut issued_claim_request = client
+            .claim_chunk(issued_claim.clone())
+            .expect("issued chunk claim queues");
+        issued_claim_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issued chunk claim result")
+            .expect("issued chunk claim worker");
+        let mut issue_before_restart = client
+            .issue_chunk(issued_claim.chunk_id(), operation_id)
+            .expect("issued chunk transition queues");
+        let dropped_issued_permit = issue_before_restart
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issued transition result")
+            .expect("issued transition worker");
+        let mut synthetic_write = client
+            .begin_chunk_write(
+                dropped_issued_permit,
+                issued_claim.identity(),
+                issued_claim.logical_length(),
+            )
+            .expect("synthetic write queues");
+        synthetic_write
+            .recv_timeout(Duration::from_secs(2))
+            .expect("synthetic write result")
+            .expect("synthetic write worker");
+        assert_eq!(owner.synthetic_chunk_write_invocations(), 1);
+
+        let stale_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                facts.identity.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("stale ticket claim"),
+            first.participant_id(),
+            String::from("chunk-stale-ticket"),
+            facts.allocation_unit * 5,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("stale ticket request");
+        let mut stale_claim_request = client
+            .claim_chunk(stale_claim.clone())
+            .expect("stale ticket claim queues");
+        stale_claim_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale ticket claim result")
+            .expect("stale ticket claim worker");
+        let mut stale_issue_request = client
+            .issue_chunk(stale_claim.chunk_id(), operation_id)
+            .expect("stale ticket issue queues");
+        let stale_permit = stale_issue_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale ticket issue result")
+            .expect("stale ticket issue worker");
+
+        assert!(!issue_id.is_nil());
+
+        assert!(owner.shutdown());
+        let reopened_store = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let mut reopened_owner = OperationJournalOwner::start_with_capacity_fixture_for_test(
+            reopened_store,
+            registry_path,
+        )
+        .expect("reopened journal owner");
+        wait_until_available(&reopened_owner);
+        let reopened_client = reopened_owner.client();
+        let mut stale_entry = reopened_client
+            .begin_chunk_write(
+                stale_permit,
+                stale_claim.identity(),
+                stale_claim.logical_length(),
+            )
+            .expect("stale owner ticket queues");
+        assert!(
+            stale_entry
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale owner ticket result")
+                .is_err()
+        );
+        assert_eq!(reopened_owner.synthetic_chunk_write_invocations(), 0);
+        let mut reissue = reopened_client
+            .issue_chunk(restart_claim.chunk_id(), operation_id)
+            .expect("reissue Claimed chunk queues");
+        let reissued_permit = reissue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reissue result")
+            .expect("reissue worker");
+        let mut reissued_release = reopened_client
+            .release_chunk(reissued_permit, Uuid::new_v4())
+            .expect("reissued release queues");
+        reissued_release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reissued release result")
+            .expect("reissued release worker");
+        let mut issued_replay = reopened_client
+            .issue_chunk(issued_claim.chunk_id(), operation_id)
+            .expect("Issued replay queues");
+        let issued_replay = issued_replay
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Issued replay result")
+            .expect_err("restart must not reissue a possibly escaped permit");
+        assert!(format!("{issued_replay}").contains("already Issued"));
+        assert!(reopened_owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthetic_chunk_entry_denials_never_invoke_callback() {
+        let fixture = fixture("journal-owner-chunk-entry-callback");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+        );
+        let operation_id = {
+            let mut request = owner
+                .client()
+                .admit_prepared(input)
+                .expect("initial operation admission queues");
+            request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("initial operation result")
+                .expect("initial operation worker")
+        };
+        let client = owner.client();
+        let mut operation_lookup = client.get(operation_id).expect("operation lookup queues");
+        let operation = operation_lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operation lookup result")
+            .expect("operation lookup worker")
+            .expect("operation record");
+        let participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let make_request = |key: &str, offset: u64| {
+            ChunkClaimRequest::new(
+                ChunkId::new(),
+                operation_id,
+                AdmissionClaim::new(
+                    AdmissionClaimId::new(),
+                    facts.identity.clone(),
+                    crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                    facts.allocation_unit,
+                )
+                .expect("entry test claim"),
+                participant_id,
+                String::from(key),
+                offset,
+                facts.allocation_unit,
+                facts.allocation_unit,
+                PROTECTED_FREE_SPACE_FLOOR,
+            )
+            .expect("entry test request")
+        };
+        let issue = |request: &ChunkClaimRequest| {
+            let mut claim = client
+                .claim_chunk(request.clone())
+                .expect("entry test claim queues");
+            claim
+                .recv_timeout(Duration::from_secs(2))
+                .expect("entry test claim result")
+                .expect("entry test claim worker");
+            let mut issue = client
+                .issue_chunk(request.chunk_id(), operation_id)
+                .expect("entry test issue queues");
+            issue
+                .recv_timeout(Duration::from_secs(2))
+                .expect("entry test issue result")
+                .expect("entry test issue worker")
+        };
+
+        let identity_request = make_request("entry-identity", 0);
+        let identity_permit = issue(&identity_request);
+        let before_identity = owner.synthetic_chunk_write_invocations();
+        let mut identity_denied = client
+            .begin_chunk_write(
+                identity_permit,
+                ChunkWriteIdentity::new(
+                    identity_request.participant_id(),
+                    String::from("different-output"),
+                    identity_request.logical_offset(),
+                    identity_request.logical_length(),
+                )
+                .expect("different identity"),
+                identity_request.logical_length(),
+            )
+            .expect("identity denial queues");
+        assert!(
+            identity_denied
+                .recv_timeout(Duration::from_secs(2))
+                .expect("identity denial result")
+                .is_err()
+        );
+        assert_eq!(owner.synthetic_chunk_write_invocations(), before_identity);
+
+        let budget_request = make_request("entry-budget", facts.allocation_unit);
+        let budget_permit = issue(&budget_request);
+        let before_budget = owner.synthetic_chunk_write_invocations();
+        let mut budget_denied = client
+            .begin_chunk_write(
+                budget_permit,
+                budget_request.identity(),
+                budget_request.logical_length() + 1,
+            )
+            .expect("budget denial queues");
+        assert!(
+            budget_denied
+                .recv_timeout(Duration::from_secs(2))
+                .expect("budget denial result")
+                .is_err()
+        );
+        assert_eq!(owner.synthetic_chunk_write_invocations(), before_budget);
+
+        let valid_request = make_request("entry-valid", facts.allocation_unit * 2);
+        let valid_permit = issue(&valid_request);
+        let mut valid = client
+            .begin_chunk_write(
+                valid_permit,
+                valid_request.identity(),
+                valid_request.logical_length(),
+            )
+            .expect("valid entry queues");
+        valid
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid entry result")
+            .expect("valid entry worker");
+        assert_eq!(owner.synthetic_chunk_write_invocations(), before_budget + 1);
+
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancelled_operation_blocks_chunk_issue_and_entry_but_allows_unused_release() {
+        let fixture = fixture("journal-owner-chunk-cancel");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let client = owner.client();
+
+        let operation_id = OperationId::new();
+        let prepared = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+        );
+        let record = prepared_record(operation_id, &prepared).expect("prepared record");
+        let participant_id = record
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let volume = facts.identity.clone();
+        let allocation_unit = facts.allocation_unit;
+        let mut persist = client
+            .persist_intent(record)
+            .expect("persist cancelled operation");
+        let receipt = persist
+            .recv_timeout(Duration::from_secs(2))
+            .expect("persist result")
+            .expect("persist worker")
+            .receipt()
+            .expect("persist receipt");
+        let first_request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                volume.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                allocation_unit,
+            )
+            .expect("first cancellation claim"),
+            participant_id,
+            String::from("cancelled-claimed"),
+            0,
+            allocation_unit,
+            allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("first cancellation request");
+        let mut claim = client
+            .claim_chunk(first_request.clone())
+            .expect("claim before cancellation");
+        claim
+            .recv_timeout(Duration::from_secs(2))
+            .expect("claim result")
+            .expect("claim worker");
+        let mut cancel = client
+            .request_cancel_before_publish(
+                operation_id,
+                receipt.sequence(),
+                CancellationRequestObservation::new(2).expect("cancel observation"),
+            )
+            .expect("cancel request");
+        cancel
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancel result")
+            .expect("cancel worker");
+        let mut issue_after_claim_cancel = client
+            .issue_chunk(first_request.chunk_id(), operation_id)
+            .expect("issue after claimed cancellation");
+        assert!(
+            issue_after_claim_cancel
+                .recv_timeout(Duration::from_secs(2))
+                .expect("issue after claimed cancellation result")
+                .is_err()
+        );
+        let mut cancel_claim = client
+            .cancel_chunk(first_request.chunk_id(), operation_id, Uuid::new_v4())
+            .expect("cancel claimed chunk");
+        cancel_claim
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancel claimed chunk result")
+            .expect("cancel claimed chunk worker");
+
+        let issued_operation_id = OperationId::new();
+        let issued_prepared = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            volume.clone(),
+            allocation_unit,
+        );
+        let issued_record =
+            prepared_record(issued_operation_id, &issued_prepared).expect("issued record");
+        let issued_participant_id = issued_record
+            .universal_intent
+            .as_ref()
+            .expect("issued universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let mut persist_issued = client
+            .persist_intent(issued_record)
+            .expect("persist issued operation");
+        let issued_receipt = persist_issued
+            .recv_timeout(Duration::from_secs(2))
+            .expect("persist issued result")
+            .expect("persist issued worker")
+            .receipt()
+            .expect("issued persist receipt");
+        let issued_request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            issued_operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                volume.clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                allocation_unit,
+            )
+            .expect("issued cancellation claim"),
+            issued_participant_id,
+            String::from("cancelled-issued"),
+            allocation_unit,
+            allocation_unit,
+            allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("issued cancellation request");
+        let mut issued_claim = client
+            .claim_chunk(issued_request.clone())
+            .expect("issued claim");
+        issued_claim
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issued claim result")
+            .expect("issued claim worker");
+        let mut issue = client
+            .issue_chunk(issued_request.chunk_id(), issued_operation_id)
+            .expect("issue before cancellation");
+        let permit = issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issue result")
+            .expect("issue worker");
+        let mut cancel_issued = client
+            .request_cancel_before_publish(
+                issued_operation_id,
+                issued_receipt.sequence(),
+                CancellationRequestObservation::new(3).expect("issued cancel observation"),
+            )
+            .expect("issued cancel request");
+        cancel_issued
+            .recv_timeout(Duration::from_secs(2))
+            .expect("issued cancel result")
+            .expect("issued cancel worker");
+        let mut denied_entry = client
+            .begin_chunk_write(
+                permit,
+                issued_request.identity(),
+                issued_request.logical_length(),
+            )
+            .expect("entry after cancellation");
+        assert!(
+            denied_entry
+                .recv_timeout(Duration::from_secs(2))
+                .expect("entry after cancellation result")
+                .is_err()
+        );
+        assert_eq!(owner.synthetic_chunk_write_invocations(), 0);
+
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_pending_chunk_release_retry_reuses_exact_proof_without_reentry() {
+        let fixture = fixture("journal-owner-chunk-release-pending");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+        let observation = runtime
+            .refresh_live_descriptor_capacity()
+            .expect("descriptor observation");
+        let (volume, facts) = observation
+            .facts
+            .iter()
+            .next()
+            .map(|(volume, facts)| (volume.clone(), facts.clone()))
+            .expect("profile facts");
+        runtime.capacity_provider = Some(CapacityProvider::unavailable());
+        let operation_id = runtime
+            .admit_prepared(prepared_copy_input(
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                volume.clone(),
+                facts.allocation_unit,
+            ))
+            .expect("initial operation admission");
+        let operation = runtime
+            .store()
+            .get(operation_id)
+            .expect("read operation")
+            .expect("operation row");
+        let participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                volume,
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("chunk claim"),
+            participant_id,
+            String::from("pending-release"),
+            0,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("chunk request");
+        runtime
+            .claim_chunk(request.clone())
+            .expect("persist chunk claim");
+        let permit = runtime
+            .issue_chunk(request.chunk_id(), operation_id)
+            .expect("issue chunk");
+        let issue_id = permit.issue_id();
+        let release_id = Uuid::new_v4();
+        runtime.store().set_release_test_hook(|boundary| {
+            if boundary == ReleaseTestBoundary::BeforePrecommitValidation {
+                ReleaseTestDirective::Fail(OperationJournalStoreError::ChunkClaim {
+                    reason: String::from("forced owner release rollback"),
+                })
+            } else {
+                ReleaseTestDirective::Continue
+            }
+        });
+        let first_error = runtime
+            .release_chunk(permit, release_id)
+            .expect_err("confirmed release rollback retains pending proof");
+        assert!(format!("{first_error}").contains("forced owner release rollback"));
+        assert_eq!(
+            runtime
+                .pending_chunk_releases
+                .get(&release_id)
+                .map(|pending| pending.issue_id),
+            Some(issue_id)
+        );
+        assert_eq!(
+            runtime
+                .store()
+                .read_chunk_claim(request.chunk_id())
+                .expect("read retained chunk")
+                .expect("retained chunk")
+                .state(),
+            ChunkClaimState::Issued
+        );
+        assert_eq!(
+            runtime
+                .synthetic_chunk_write_invocations
+                .load(Ordering::Relaxed),
+            0
+        );
+        let replay = runtime
+            .retry_chunk_release(request.chunk_id(), operation_id, release_id)
+            .expect("retry exact pending release");
+        assert_eq!(replay.release_id(), release_id);
+        assert!(!runtime.pending_chunk_releases.contains_key(&release_id));
+        assert!(matches!(
+            runtime.issue_chunk(request.chunk_id(), operation_id),
+            Err(OperationJournalOwnerError::ChunkClaim { reason })
+                if reason.contains("released")
+        ));
+        let durable_replay = runtime
+            .retry_chunk_release(request.chunk_id(), operation_id, release_id)
+            .expect("durable release replay");
+        assert_eq!(durable_replay, replay);
+        drop(runtime);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_second_chunk_witness_retains_issued_charge_without_panicking() {
+        let fixture = fixture("journal-owner-chunk-stale-entry-witness");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+        let observation = runtime
+            .refresh_live_descriptor_capacity()
+            .expect("descriptor observation");
+        let (volume, facts) = observation
+            .facts
+            .iter()
+            .next()
+            .map(|(volume, facts)| (volume.clone(), facts.clone()))
+            .expect("profile facts");
+        runtime.capacity_provider = Some(CapacityProvider::unavailable());
+        let operation_id = runtime
+            .admit_prepared(prepared_copy_input(
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                volume.clone(),
+                facts.allocation_unit,
+            ))
+            .expect("initial operation admission");
+        let operation = runtime
+            .store()
+            .get(operation_id)
+            .expect("read operation")
+            .expect("operation row");
+        let participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("universal intent")
+            .participants()
+            .descriptors()[0]
+            .id();
+        let request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                volume,
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("chunk claim"),
+            participant_id,
+            String::from("stale-entry-witness"),
+            0,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("chunk request");
+        runtime
+            .claim_chunk(request.clone())
+            .expect("persist chunk claim");
+        let permit = runtime
+            .issue_chunk(request.chunk_id(), operation_id)
+            .expect("issue chunk");
+        let issue_id = permit.issue_id();
+        runtime.fail_next_chunk_callback_witness_for_test("forced stale source authority");
+
+        let error = runtime
+            .begin_chunk_write(permit, request.identity(), request.logical_length())
+            .expect_err("stale callback witness must be typed");
+        assert!(format!("{error}").contains("forced stale source authority"));
+        assert_eq!(
+            runtime
+                .synthetic_chunk_write_invocations
+                .load(Ordering::Relaxed),
+            0
+        );
+        let retained = runtime
+            .store()
+            .read_chunk_claim(request.chunk_id())
+            .expect("read retained chunk")
+            .expect("retained chunk");
+        assert_eq!(retained.state(), ChunkClaimState::Issued);
+        assert_eq!(retained.issue_id(), Some(issue_id));
+
+        // The owner continues to service live capacity work after the stale authority denial;
+        // the failed entry has neither panicked the worker nor erased its durable charge.
+        runtime
+            .refresh_live_descriptor_capacity()
+            .expect("owner remains usable after stale witness");
+        drop(runtime);
+        drop(fixture);
     }
 
     #[cfg(target_os = "macos")]

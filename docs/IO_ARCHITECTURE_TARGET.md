@@ -785,6 +785,55 @@ source bindings, zero-claim handoff, same-profile generation rebind and restart,
 cross-profile lock contention, marker write/sync uncertainty, and preservation
 of all ledger and reserve evidence on refusal.
 
+OPT-1564 defines the bounded post-intent chunk protocol. A stable global `ChunkId` is bound
+forever to one operation, one immutable bounded output identity (participant, output/artifact
+identity, logical offset and length), and its exact ordinary claim IDs. The chunk relation is
+separate from the frozen initial inventory: the owner appends its ordinary claim rows and the
+`Claimed` relation atomically after initial settlement. It does not reinterpret or deduct an
+initial claim.
+
+The relation is bounded at 256 rows globally, including released history, and each operation's
+ordinary claim inventory is bounded at 256 rows. The append transaction performs a bounded capped
+lookahead before mutation, allowing the 256th row and rejecting the next row before any row or
+capacity accounting changes. Restart and admission readers use bounded keyset pages and retain
+malformed, orphaned, conflicting, or overflowed evidence conservatively rather than scanning or
+installing an optimistic image.
+
+`Claimed`, `Issued`, and `Released` are durable chunk states. Claim admission uses the existing
+owner-thread provisional lease once, with fresh retained descriptor/profile/volume authority and
+current ledger checks; it never charges a frozen parent claim. Issuance performs a fresh authority
+and protected-floor/headroom check for the already-held claim, then performs a durable
+`Claimed -> Issued` CAS/readback before returning the owner-held opaque ticket. Exact duplicate
+requests return the existing durable state without a second charge or competing ticket. Changed
+identity, cross-operation reuse, unsupported allocation classes, cancellation, and stale or
+uncertain authority reject while retaining existing accounting.
+
+The queue ticket is not filesystem authority. The owner registry validates its exact operation,
+chunk, issue, and write identity; only the owner thread can consume it into a private
+`ChunkWriteEntry` while borrowing a fresh sealed live witness. A bounded synthetic callback is
+the only writer seam in this milestone. The ticket is single-use: identity, logical-byte, live
+operation, fresh descriptor, reserve-floor, and headroom failures invoke no callback. A denied
+entry consumes the ticket and retains the durable `Issued` charge. Independent new chunk IDs may
+be claimed alongside prior `Issued` chunks, including after restart; `Issued` is capacity
+authority/accounting and is not evidence of physical completion or partial output.
+
+Restart may reissue only a confirmed `Claimed` row after a fresh authority-backed CAS. An
+`Issued` or uncertain row remains charged and is never reissued; a durable `Released` receipt is
+replayable by its exact identity. For an unused Issued ticket, the owner first consumes its live
+proof into an exact pending-release carrier, then persists the chunk `Released` state and ordinary
+release receipt. A rollback before commit retains the Issued row and charge. Timeout or uncertain
+persistence may have committed `Released` while provider acknowledgement is unknown, so the
+conservative provider charge and exact issue/release identities remain pending until confirmed
+Released readback and provider reconciliation. Retry uses the same pending proof; a later
+confirmed provider subtraction occurs once. Replaying a durable Released receipt is idempotent.
+Logical release only changes capacity accounting and durable evidence; it does not delete files,
+clean physical data, replenish a reserve, or establish physical completion.
+
+Family writer integration, physical cleanup, OPT-1565 written-checkpoint/exhaustion
+classification, provider backend qualification, and ordinary production rollout remain
+deferred. Snapshots, copied issue IDs, and full-progress observations cannot create a ticket,
+enter a write, or authorize release.
+
 The store's consistent read snapshot pages both immutable ordinary-claim
 relations by canonical UUID key, with a maximum of 256 decoded rows and one
 bounded lookahead per page. It point-validates each claim's operation. An
