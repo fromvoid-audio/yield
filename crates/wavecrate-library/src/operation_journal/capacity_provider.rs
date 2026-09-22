@@ -740,6 +740,35 @@ impl CapacityProvider {
     }
 
     #[cfg(test)]
+    pub(crate) fn ledger_claims(
+        &self,
+    ) -> Vec<(
+        AdmissionClaimId,
+        VolumeIdentity,
+        FullCapacityAllocationClass,
+        u64,
+    )> {
+        let mut claims: Vec<_> = self
+            .ledger
+            .borrow()
+            .charges_by_token
+            .values()
+            .flat_map(|charge| {
+                charge.claims.iter().map(|(claim_id, claim)| {
+                    (
+                        *claim_id,
+                        claim.volume.clone(),
+                        claim.allocation_class,
+                        claim.allocated_bytes,
+                    )
+                })
+            })
+            .collect();
+        claims.sort_by_key(|row| row.0);
+        claims
+    }
+
+    #[cfg(test)]
     pub(crate) fn ledger_dispositions(&self) -> Vec<ProvisionalLeaseDisposition> {
         self.ledger
             .borrow()

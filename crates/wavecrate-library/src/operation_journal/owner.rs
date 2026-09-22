@@ -36,7 +36,7 @@ use super::capacity_reserve_namespace::{OwnedReserveAllocation, PhysicalReserveP
 use super::capacity_volume_owner::VolumeOwnershipCapability;
 use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{RetryObservation, UniversalCommandArgs};
-use super::full_capacity::{FullCapacityLegacyProjectionError, FullCapacityPlan};
+use super::full_capacity::FullCapacityPlan;
 use super::full_progress_codec::{
     FullProgressCodecError, StoredFullProgressRecord, decode as decode_full_progress,
     encode as encode_full_progress,
@@ -536,22 +536,6 @@ impl PreparedAdmissionInput {
                 ),
             });
         }
-        self.plan
-            .try_into_legacy()
-            .map_err(|error| match error {
-                FullCapacityLegacyProjectionError::InvalidPlan(error) => {
-                    PreparedAdmissionError::Unsupported {
-                        reason: error.to_string(),
-                    }
-                }
-                FullCapacityLegacyProjectionError::UnsupportedAllocationClass => {
-                    PreparedAdmissionError::Unsupported {
-                        reason: String::from(
-                            "operation recovery payload is not representable in the initial intent plan",
-                        ),
-                    }
-                }
-            })?;
         self.claims.validate_against(&self.plan).map_err(|error| {
             PreparedAdmissionError::Unsupported {
                 reason: error.to_string(),
@@ -572,11 +556,11 @@ impl PreparedAdmissionInput {
             });
         }
         let validation_record =
-            prepared_record(self.validation_operation_id(), self, self.legacy_plan()?).map_err(
-                |error| PreparedAdmissionError::Unsupported {
+            prepared_record(self.validation_operation_id(), self).map_err(|error| {
+                PreparedAdmissionError::Unsupported {
                     reason: error.to_string(),
-                },
-            )?;
+                }
+            })?;
         OperationJournalStore::validate_initial_intent_record(&validation_record).map_err(
             |error| PreparedAdmissionError::Unsupported {
                 reason: error.to_string(),
@@ -624,25 +608,6 @@ impl PreparedAdmissionInput {
         };
         prepared.validate_shape()?;
         Ok(prepared)
-    }
-
-    fn legacy_plan(
-        &self,
-    ) -> Result<crate::durable_capacity::DurableCapacityPlan, PreparedAdmissionError> {
-        self.plan.try_into_legacy().map_err(|error| match error {
-            FullCapacityLegacyProjectionError::InvalidPlan(error) => {
-                PreparedAdmissionError::Unsupported {
-                    reason: error.to_string(),
-                }
-            }
-            FullCapacityLegacyProjectionError::UnsupportedAllocationClass => {
-                PreparedAdmissionError::Unsupported {
-                    reason: String::from(
-                        "operation recovery payload is not representable in the initial intent plan",
-                    ),
-                }
-            }
-        })
     }
 
     #[cfg(test)]
@@ -1058,9 +1023,6 @@ impl OwnerRuntime {
         prepared
             .validate_shape()
             .map_err(OperationJournalOwnerError::from)?;
-        let legacy_plan = prepared
-            .legacy_plan()
-            .map_err(OperationJournalOwnerError::from)?;
         self.store()
             .validate_for_admission()
             .map_err(OperationJournalOwnerError::from)?;
@@ -1144,7 +1106,7 @@ impl OwnerRuntime {
         self.prepared_admission_id_allocations
             .fetch_add(1, Ordering::Relaxed);
         let operation_id = OperationId::new();
-        let record = prepared_record(operation_id, &prepared, legacy_plan)?;
+        let record = prepared_record(operation_id, &prepared)?;
         let settlement = self
             .store()
             .settle_initial_claims_with_lease(&record, &prepared.claims, provider, lease)
@@ -2081,107 +2043,28 @@ fn bounded_diagnostics(diagnostics: &[String]) -> String {
 fn prepared_record(
     operation_id: OperationId,
     prepared: &PreparedAdmissionInput,
-    legacy_plan: crate::durable_capacity::DurableCapacityPlan,
 ) -> Result<StoredOperationRecord, OperationJournalOwnerError> {
-    let intent = prepared.intent.clone();
-    let universal_intent = prepared.universal_intent.clone();
-    let args = prepared.args.clone();
-    let timestamp = prepared.timestamp_unix_ms;
-    let record = match args {
-        UniversalCommandArgs::Copy(_)
-        | UniversalCommandArgs::Import(_)
-        | UniversalCommandArgs::DuplicateSame(_) => StoredOperationRecord::new_v6_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::WaveformEdit(_) => StoredOperationRecord::new_v7_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::Namespace(_) => StoredOperationRecord::new_v8_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::Render(_) => StoredOperationRecord::new_v9_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::Removal(_) => StoredOperationRecord::new_v10_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::RetainedResolution(_) => StoredOperationRecord::new_v11_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::SelectionNormalize(_) => StoredOperationRecord::new_v12_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::SelectionOutput(_) => StoredOperationRecord::new_v13_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::History(_) => StoredOperationRecord::new_v14_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
-        UniversalCommandArgs::ExternalReconciliation(_) => StoredOperationRecord::new_v15_command(
-            operation_id,
-            intent,
-            universal_intent,
-            args,
-            legacy_plan,
-            timestamp,
-        ),
+    if matches!(
+        prepared.args,
         UniversalCommandArgs::DecodedEdit(_)
-        | UniversalCommandArgs::DecodedExport(_)
-        | UniversalCommandArgs::DecodedExportBatch(_) => {
-            return Err(PreparedAdmissionError::Unsupported {
-                reason: String::from(
-                    "full-progress-only command arguments have no initial-intent codec",
-                ),
-            }
-            .into());
+            | UniversalCommandArgs::DecodedExport(_)
+            | UniversalCommandArgs::DecodedExportBatch(_)
+    ) {
+        return Err(PreparedAdmissionError::Unsupported {
+            reason: String::from(
+                "full-progress-only command arguments have no initial-intent codec",
+            ),
         }
-    };
-    Ok(record)
+        .into());
+    }
+    Ok(StoredOperationRecord::new_v16_command(
+        operation_id,
+        prepared.intent.clone(),
+        prepared.universal_intent.clone(),
+        prepared.args.clone(),
+        prepared.plan.clone(),
+        prepared.timestamp_unix_ms,
+    ))
 }
 
 fn map_initial_settlement_error(
@@ -5830,20 +5713,210 @@ mod tests {
         )
     }
 
-    #[test]
-    fn prepared_admission_rejects_full_only_plan_before_queueing() {
-        let (_fixture, owner) = open_owner("journal-owner-prepared-unsupported");
-        let input = prepared_copy_input(
+    fn prepared_copy_all_classes_input(
+        volume: VolumeIdentity,
+        allocation_unit: u64,
+    ) -> PreparedAdmissionInput {
+        let (args, participants) = valid_full_admission_request();
+        let UniversalCommandArgs::Copy(copy_args) = args else {
+            panic!("copy admission fixture")
+        };
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Copy,
+            "operation.status.prepared-owner-full-classes-test",
+            participants.clone(),
+        )
+        .expect("prepared full-class universal intent");
+        let classes = [
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::JournalRecord,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::SourceDatabaseCommit,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::SourceWalShm,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::GlobalDatabaseCommit,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::GlobalWalShm,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::ExistingDestination,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::ExistingRecoveryPayload,
             crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload,
-            VolumeIdentity { device: 1 },
-            1,
+        ];
+        let allocations = classes
+            .iter()
+            .copied()
+            .map(|class| {
+                crate::operation_journal::FullCapacityAllocation::new(
+                    volume.clone(),
+                    allocation_unit,
+                    class,
+                    allocation_unit,
+                    allocation_unit,
+                    PROTECTED_FREE_SPACE_FLOOR,
+                )
+                .expect("prepared full-class allocation")
+            })
+            .collect();
+        let plan = crate::operation_journal::FullCapacityPlan::new(allocations)
+            .expect("prepared full-class plan");
+        let claims = AdmissionClaimInventory::new(
+            classes
+                .iter()
+                .copied()
+                .map(|class| {
+                    AdmissionClaim::new(
+                        crate::operation_journal::AdmissionClaimId::new(),
+                        volume.clone(),
+                        class,
+                        allocation_unit,
+                    )
+                    .expect("prepared full-class claim")
+                })
+                .collect(),
+        )
+        .expect("prepared full-class claims");
+        PreparedAdmissionInput::for_test(
+            OperationIntent {
+                actor: OperationActor::User,
+                kind: OperationKind::FileMutation,
+                label: String::from("prepared owner full classes test"),
+            },
+            universal_intent,
+            UniversalCommandArgs::Copy(copy_args),
+            participants,
+            plan,
+            claims,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_persists_all_full_capacity_classes_through_owner_queue() {
+        let fixture = fixture("journal-owner-prepared-full-only");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let input = prepared_copy_all_classes_input(facts.identity, facts.allocation_unit);
+        let expected_plan = input.plan.clone();
+        let expected_claims = input.claims.clone();
+        let mut request = owner
+            .client()
+            .admit_prepared(input)
+            .expect("full-only admission queues");
+        let operation_id = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("full-only admission result")
+            .expect("full-only admission commits");
+        let mut lookup = owner
+            .client()
+            .get(operation_id)
+            .expect("full-only lookup queues");
+        let record = lookup
+            .recv_timeout(Duration::from_secs(2))
+            .expect("full-only lookup result")
+            .expect("full-only record exists")
+            .expect("full-only record present");
+        assert_eq!(record.schema_version, crate::operation_journal::SCHEMA_V16);
+        assert!(record.capacity_plan.is_none());
+        assert_eq!(
+            record
+                .full_capacity_plan
+                .as_ref()
+                .expect("full plan persisted")
+                .allocations()
+                .len(),
+            9
         );
+        assert_eq!(
+            record
+                .full_capacity_plan
+                .as_ref()
+                .expect("full plan persisted")
+                .allocations()
+                .iter()
+                .map(|allocation| allocation.class())
+                .find(|class| {
+                    *class
+                        == crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload
+                }),
+            Some(
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload
+            )
+        );
+        assert!(owner.shutdown());
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let reopened_record = reopened
+            .get(operation_id)
+            .expect("reopen V16 record")
+            .expect("reopened V16 record exists");
+        assert_eq!(
+            reopened_record.schema_version,
+            crate::operation_journal::SCHEMA_V16
+        );
+        assert_eq!(
+            reopened_record
+                .full_capacity_plan
+                .as_ref()
+                .expect("reopened full plan"),
+            &expected_plan
+        );
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild all full-class claims");
+        assert_eq!(snapshot.claims().len(), expected_claims.claims().len());
         assert!(matches!(
-            owner.client().admit_prepared(input),
-            Err(OperationJournalOwnerQueueError::InvalidInput { reason })
-                if reason.contains("operation recovery payload")
+            snapshot.readiness(),
+            CapacityRebuildReadiness::Ready
         ));
-        drop(owner);
+        let mut expected_claim_rows: Vec<_> = expected_claims
+            .claims()
+            .iter()
+            .map(|claim| {
+                (
+                    claim.claim_id(),
+                    claim.volume().clone(),
+                    claim.allocation_class(),
+                    claim.allocated_bytes(),
+                )
+            })
+            .collect();
+        let mut rebuilt_claim_rows: Vec<_> = snapshot
+            .claims()
+            .iter()
+            .map(|claim| {
+                (
+                    claim.claim_id(),
+                    claim.volume().clone(),
+                    claim.allocation_class(),
+                    claim.allocated_bytes(),
+                )
+            })
+            .collect();
+        expected_claim_rows.sort_by_key(|row| row.0);
+        rebuilt_claim_rows.sort_by_key(|row| row.0);
+        assert_eq!(rebuilt_claim_rows, expected_claim_rows);
+
+        let rebuilt_provider = CapacityProvider::unavailable();
+        rebuilt_provider
+            .install_rebuilt_claims(&snapshot)
+            .expect("install exact restarted claim image");
+        assert_eq!(rebuilt_provider.claim_count(), 1);
+        assert_eq!(rebuilt_provider.ledger_claims(), expected_claim_rows);
+        for claim in expected_claims.claims() {
+            assert_eq!(
+                rebuilt_provider.outstanding(claim.volume(), claim.allocation_class()),
+                claim.allocated_bytes()
+            );
+        }
+        drop(reopened);
+        drop(fixture);
     }
 
     #[test]
@@ -5968,7 +6041,7 @@ mod tests {
 
         let before_id = owner.prepared_admission_id_allocations();
         let input = prepared_copy_input(
-            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload,
             facts.identity,
             facts.allocation_unit,
         );
@@ -6026,7 +6099,7 @@ mod tests {
         let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
         let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
         let input = prepared_copy_input(
-            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload,
             facts.identity,
             facts.allocation_unit,
         );
@@ -6150,7 +6223,7 @@ mod tests {
         let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
         let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
         let input = prepared_copy_input(
-            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload,
             facts.identity,
             facts.allocation_unit,
         );

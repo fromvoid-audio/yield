@@ -26,13 +26,14 @@ use super::evidence::{
     ReplacementQualificationAssessment,
 };
 use super::external_commands::validate_persisted_external_reconciliation_intent_value;
+use super::full_capacity::FullCapacityPlan;
 use super::history_commands::validate_persisted_history_command_args_value;
 use super::model::{
     CancellationRequestObservation, MAX_RECORD_BYTES, MAX_UNIVERSAL_LABEL_BYTES,
     MAX_USER_STATUS_KEY_BYTES, OperationActor, OperationDisposition, OperationId, OperationIntent,
     OperationKind, OperationPhase, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
     SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
-    SCHEMA_V14, SCHEMA_V15, UniversalIntent,
+    SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, UniversalIntent,
 };
 use super::namespace_commands::validate_persisted_namespace_command_args_value;
 use super::participants::MAX_PARTICIPANTS;
@@ -66,6 +67,8 @@ pub struct StoredOperationRecord {
     pub payload: Value,
     /// Optional stored physical-capacity plan.
     pub capacity_plan: Option<DurableCapacityPlan>,
+    /// Optional full allocation plan carried only by schema V16.
+    pub full_capacity_plan: Option<FullCapacityPlan>,
     /// Optional stored preparation evidence.
     pub prepared: Option<PreparedTargetContract>,
     /// Optional stored filesystem staging evidence.
@@ -112,6 +115,7 @@ impl StoredOperationRecord {
             disposition: OperationDisposition::None,
             payload: Value::Object(Map::new()),
             capacity_plan: Some(capacity_plan),
+            full_capacity_plan: None,
             prepared: None,
             staged: None,
             absent_final_recovery_observation: None,
@@ -336,6 +340,40 @@ impl StoredOperationRecord {
         )
     }
 
+    pub(crate) fn new_v16_command(
+        operation_id: OperationId,
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        command_args: UniversalCommandArgs,
+        full_capacity_plan: FullCapacityPlan,
+        timestamp_unix_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_V16,
+            operation_id,
+            intent,
+            universal_intent: Some(universal_intent),
+            phase: OperationPhase::IntentDurable,
+            disposition: OperationDisposition::None,
+            payload: Value::Object(Map::new()),
+            capacity_plan: None,
+            full_capacity_plan: Some(full_capacity_plan),
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: None,
+            command_args: None,
+            retry_observation: None,
+            universal_command_args: Some(command_args),
+            created_unix_ms: timestamp_unix_ms,
+            updated_unix_ms: timestamp_unix_ms,
+        }
+    }
+
     fn new_tagged_command(
         schema_version: u32,
         operation_id: OperationId,
@@ -354,6 +392,7 @@ impl StoredOperationRecord {
             disposition: OperationDisposition::None,
             payload: Value::Object(Map::new()),
             capacity_plan: Some(capacity_plan),
+            full_capacity_plan: None,
             prepared: None,
             staged: None,
             absent_final_recovery_observation: None,
@@ -413,6 +452,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V13
                 | SCHEMA_V14
                 | SCHEMA_V15
+                | SCHEMA_V16
         ) {
             record.schema_version = SCHEMA_V4;
         }
@@ -436,6 +476,7 @@ impl StoredOperationRecord {
                 | SCHEMA_V13
                 | SCHEMA_V14
                 | SCHEMA_V15
+                | SCHEMA_V16
         ) {
             record.schema_version = SCHEMA_V5;
         }
@@ -479,6 +520,12 @@ pub enum EncodeError {
     #[error("unsupported operation journal schema version: {version}")]
     UnsupportedSchemaVersion {
         /// Unsupported schema identifier.
+        version: u32,
+    },
+    /// A legacy schema would silently discard the full allocation plan.
+    #[error("schema-v{version} cannot encode a V16 full capacity plan")]
+    FullCapacityPlanInPriorSchema {
+        /// Legacy schema identifier that cannot carry the full plan.
         version: u32,
     },
     /// Schema-v1 cannot represent a schema-v2-only evidence value.
@@ -594,6 +641,12 @@ pub enum EncodeError {
         /// Bounded validation diagnostic.
         reason: String,
     },
+    /// A V16 full-capacity initial-intent record violates its bounded state or argument contract.
+    #[error("invalid schema-v16 full capacity record: {reason}")]
+    InvalidV16Record {
+        /// Bounded validation diagnostic.
+        reason: String,
+    },
     /// Serialized output exceeded the bounded record size.
     #[error("encoded operation journal record exceeds {maximum} bytes: {actual} bytes")]
     Oversize {
@@ -641,6 +694,7 @@ impl From<PersistedOperationRecordV1> for StoredOperationRecord {
             disposition: record.disposition,
             payload: record.payload,
             capacity_plan: record.capacity_plan,
+            full_capacity_plan: None,
             prepared: record
                 .prepared
                 .map(PreparedTargetContract::ExistingExpectedIdentity),
@@ -817,6 +871,7 @@ impl From<PersistedOperationRecordV2> for StoredOperationRecord {
             disposition: record.disposition,
             payload: record.payload,
             capacity_plan: record.capacity_plan,
+            full_capacity_plan: None,
             prepared: record.prepared.map(Into::into),
             staged: record.staged,
             absent_final_recovery_observation: record.absent_final_recovery_observation,
@@ -944,6 +999,7 @@ impl From<PersistedOperationRecordV3> for StoredOperationRecord {
             disposition: record.disposition,
             payload: record.payload,
             capacity_plan: Some(record.capacity_plan),
+            full_capacity_plan: None,
             prepared: None,
             staged: None,
             absent_final_recovery_observation: None,
@@ -1094,6 +1150,7 @@ impl From<PersistedOperationRecordV4> for StoredOperationRecord {
             disposition: record.disposition,
             payload: record.payload,
             capacity_plan: Some(record.capacity_plan),
+            full_capacity_plan: None,
             prepared: None,
             staged: None,
             absent_final_recovery_observation: None,
@@ -1202,6 +1259,7 @@ impl From<PersistedOperationRecordV5> for StoredOperationRecord {
             disposition: record.disposition,
             payload: Value::Object(Map::new()),
             capacity_plan: Some(record.capacity_plan),
+            full_capacity_plan: None,
             prepared: None,
             staged: None,
             absent_final_recovery_observation: None,
@@ -1295,6 +1353,55 @@ impl From<PersistedTaggedOperationRecord> for StoredOperationRecord {
             disposition: record.disposition,
             payload: Value::Object(Map::new()),
             capacity_plan: Some(record.capacity_plan),
+            full_capacity_plan: None,
+            prepared: None,
+            staged: None,
+            absent_final_recovery_observation: None,
+            absent_final_transaction_owned_proof: None,
+            absent_final_adoption_evidence: None,
+            published: None,
+            replacement_qualification: None,
+            cancellation_request: record.cancellation_request,
+            command_args: None,
+            retry_observation: record.retry_observation,
+            universal_command_args: Some(record.universal_command_args),
+            created_unix_ms: record.created_unix_ms,
+            updated_unix_ms: record.updated_unix_ms,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedFullCapacityOperationRecord {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: UniversalCommandArgs,
+    full_capacity_plan: FullCapacityPlan,
+    #[serde(default)]
+    retry_observation: Option<RetryObservation>,
+    #[serde(default)]
+    cancellation_request: Option<CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl From<PersistedFullCapacityOperationRecord> for StoredOperationRecord {
+    fn from(record: PersistedFullCapacityOperationRecord) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            operation_id: OperationId::from_uuid(record.operation_id),
+            intent: record.intent,
+            universal_intent: Some(record.universal_intent),
+            phase: record.phase,
+            disposition: record.disposition,
+            payload: Value::Object(Map::new()),
+            capacity_plan: None,
+            full_capacity_plan: Some(record.full_capacity_plan),
             prepared: None,
             staged: None,
             absent_final_recovery_observation: None,
@@ -1354,6 +1461,52 @@ struct PersistedTaggedOperationRecordRef<'a> {
     cancellation_request: Option<&'a CancellationRequestObservation>,
     created_unix_ms: i64,
     updated_unix_ms: i64,
+}
+
+#[derive(Serialize)]
+struct PersistedFullCapacityOperationRecordRef<'a> {
+    schema_version: u32,
+    operation_id: Uuid,
+    intent: &'a OperationIntent,
+    universal_intent: &'a UniversalIntent,
+    phase: OperationPhase,
+    disposition: OperationDisposition,
+    universal_command_args: &'a UniversalCommandArgs,
+    full_capacity_plan: &'a FullCapacityPlan,
+    retry_observation: Option<&'a RetryObservation>,
+    cancellation_request: Option<&'a CancellationRequestObservation>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+fn persisted_v16_from_record(
+    record: &StoredOperationRecord,
+) -> Result<PersistedFullCapacityOperationRecordRef<'_>, EncodeError> {
+    validate_v16_coordinator_shape(record)
+        .map_err(|reason| EncodeError::InvalidV16Record { reason })?;
+    Ok(PersistedFullCapacityOperationRecordRef {
+        schema_version: record.schema_version,
+        operation_id: record.operation_id.as_uuid(),
+        intent: &record.intent,
+        universal_intent: record
+            .universal_intent
+            .as_ref()
+            .expect("V16 universal intent checked above"),
+        phase: record.phase,
+        disposition: record.disposition,
+        universal_command_args: record
+            .universal_command_args
+            .as_ref()
+            .expect("V16 command arguments checked above"),
+        full_capacity_plan: record
+            .full_capacity_plan
+            .as_ref()
+            .expect("V16 full capacity plan checked above"),
+        retry_observation: record.retry_observation.as_ref(),
+        cancellation_request: record.cancellation_request.as_ref(),
+        created_unix_ms: record.created_unix_ms,
+        updated_unix_ms: record.updated_unix_ms,
+    })
 }
 
 fn persisted_v6_from_record(
@@ -1589,6 +1742,15 @@ pub fn decode(bytes: &[u8]) -> Result<StoredOperationRecord, DecodeError> {
             validate_v15_coordinator_shape(&record).map_err(malformed)?;
             Ok(record)
         }
+        SCHEMA_V16 => {
+            validate_json_depth(&value, MAX_V3_JSON_DEPTH).map_err(malformed)?;
+            validate_persisted_v16_object_boundaries(&value).map_err(malformed)?;
+            let record = serde_json::from_value::<PersistedFullCapacityOperationRecord>(value)
+                .map(Into::into)
+                .map_err(|error| malformed(error.to_string()))?;
+            validate_v16_coordinator_shape(&record).map_err(malformed)?;
+            Ok(record)
+        }
         version => Err(DecodeError::UnsupportedVersion { version }),
     }
 }
@@ -1715,6 +1877,30 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
 /// V4 and V5 encode their explicitly bounded pre-publication observations; later transition and
 /// publication-policy validation belongs to the owner boundary.
 pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
+    if record.full_capacity_plan.is_some()
+        && matches!(
+            record.schema_version,
+            SCHEMA_V1
+                | SCHEMA_V2
+                | SCHEMA_V3
+                | SCHEMA_V4
+                | SCHEMA_V5
+                | SCHEMA_V6
+                | SCHEMA_V7
+                | SCHEMA_V8
+                | SCHEMA_V9
+                | SCHEMA_V10
+                | SCHEMA_V11
+                | SCHEMA_V12
+                | SCHEMA_V13
+                | SCHEMA_V14
+                | SCHEMA_V15
+        )
+    {
+        return Err(EncodeError::FullCapacityPlanInPriorSchema {
+            version: record.schema_version,
+        });
+    }
     let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
     let result = match record.schema_version {
         SCHEMA_V1 => {
@@ -1775,6 +1961,10 @@ pub fn encode(record: &StoredOperationRecord) -> Result<Vec<u8>, EncodeError> {
         }
         SCHEMA_V15 => {
             let persisted = persisted_v15_from_record(record)?;
+            serde_json::to_writer_pretty(&mut writer, &persisted)
+        }
+        SCHEMA_V16 => {
+            let persisted = persisted_v16_from_record(record)?;
             serde_json::to_writer_pretty(&mut writer, &persisted)
         }
         version => {
@@ -2840,6 +3030,121 @@ fn validate_persisted_v15_universal_command_args_value(value: &Value) -> Result<
     validate_persisted_tagged_command_args_value(value, &["ExternalReconciliation"], "schema-v15")
 }
 
+fn validate_persisted_v16_object_boundaries(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(
+        value,
+        &[
+            "schema_version",
+            "operation_id",
+            "intent",
+            "universal_intent",
+            "phase",
+            "disposition",
+            "universal_command_args",
+            "full_capacity_plan",
+            "retry_observation",
+            "cancellation_request",
+            "created_unix_ms",
+            "updated_unix_ms",
+        ],
+    )?;
+    for field in [
+        "schema_version",
+        "operation_id",
+        "intent",
+        "universal_intent",
+        "phase",
+        "disposition",
+        "universal_command_args",
+        "full_capacity_plan",
+        "retry_observation",
+        "cancellation_request",
+        "created_unix_ms",
+        "updated_unix_ms",
+    ] {
+        required_field(object, field)?;
+    }
+    validate_persisted_intent_value(required_field(object, "intent")?)?;
+    validate_persisted_universal_intent_value_with_retained_resolution(
+        required_field(object, "universal_intent")?,
+        true,
+    )?;
+    validate_persisted_v16_universal_command_args_value(required_field(
+        object,
+        "universal_command_args",
+    )?)?;
+    validate_persisted_full_capacity_plan_value(required_field(object, "full_capacity_plan")?)?;
+    if let Some(retry) = object.get("retry_observation") {
+        if !retry.is_null() {
+            validate_persisted_retry_observation_value(retry)?;
+        }
+    }
+    if let Some(cancellation) = object.get("cancellation_request") {
+        if !cancellation.is_null() {
+            validate_persisted_cancellation_request_value(cancellation)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_v16_universal_command_args_value(value: &Value) -> Result<(), &'static str> {
+    validate_persisted_tagged_command_args_value(
+        value,
+        &[
+            "Copy",
+            "Import",
+            "DuplicateSame",
+            "WaveformEdit",
+            "Namespace",
+            "Render",
+            "Removal",
+            "RetainedResolution",
+            "SelectionNormalize",
+            "SelectionOutput",
+            "History",
+            "ExternalReconciliation",
+        ],
+        "schema-v16",
+    )
+}
+
+fn validate_persisted_full_capacity_plan_value(value: &Value) -> Result<(), &'static str> {
+    let object = strict_object(value, &["version", "allocations"])?;
+    let allocations = required_field(object, "allocations")?
+        .as_array()
+        .ok_or("full capacity allocations must be an array")?;
+    if allocations.is_empty()
+        || allocations.len() > super::full_capacity::MAX_FULL_CAPACITY_ALLOCATIONS
+    {
+        return Err("full capacity allocations exceed their bounded count");
+    }
+    for allocation in allocations {
+        let allocation = strict_object(
+            allocation,
+            &[
+                "volume",
+                "allocation_unit",
+                "class",
+                "logical_bytes",
+                "allocated_bytes",
+                "protected_free_bytes",
+            ],
+        )?;
+        for field in [
+            "volume",
+            "allocation_unit",
+            "class",
+            "logical_bytes",
+            "allocated_bytes",
+            "protected_free_bytes",
+        ] {
+            required_field(allocation, field)?;
+        }
+        validate_persisted_volume_identity_value(required_field(allocation, "volume")?)?;
+    }
+    Ok(())
+}
+
 fn validate_persisted_tagged_command_args_value(
     value: &Value,
     allowed_variants: &[&str],
@@ -2959,10 +3264,29 @@ pub(crate) fn validate_v3_initial_shape(record: &StoredOperationRecord) -> Resul
 }
 
 fn validate_universal_intent_envelope_shape(record: &StoredOperationRecord) -> Result<(), String> {
-    if record.capacity_plan.is_none() {
-        return Err(String::from(
-            "universal intent records require a capacity plan",
-        ));
+    if record.schema_version == SCHEMA_V16 {
+        if record.capacity_plan.is_some() {
+            return Err(String::from(
+                "schema-v16 universal intent records cannot carry a legacy capacity plan",
+            ));
+        }
+        if record.full_capacity_plan.is_none() {
+            return Err(String::from(
+                "schema-v16 universal intent records require a full capacity plan",
+            ));
+        }
+    } else {
+        if record.capacity_plan.is_none() {
+            return Err(String::from(
+                "universal intent records require a capacity plan",
+            ));
+        }
+        if record.full_capacity_plan.is_some() {
+            return Err(format!(
+                "schema-v{} universal intent records cannot carry a full capacity plan",
+                record.schema_version
+            ));
+        }
     }
     for (present, kind) in [
         (record.prepared.is_some(), "prepared"),
@@ -3542,6 +3866,56 @@ pub(crate) fn validate_v15_coordinator_shape(record: &StoredOperationRecord) -> 
     )
 }
 
+pub(crate) fn validate_v16_coordinator_shape(record: &StoredOperationRecord) -> Result<(), String> {
+    match record.intent.kind {
+        OperationKind::FileHistory => validate_tagged_coordinator_shape(
+            record,
+            SCHEMA_V16,
+            "schema-v16",
+            &["History"],
+            OperationActor::User,
+            OperationKind::FileHistory,
+        ),
+        OperationKind::ExternalReconciliation => validate_tagged_coordinator_shape(
+            record,
+            SCHEMA_V16,
+            "schema-v16",
+            &["ExternalReconciliation"],
+            OperationActor::ExternalFs,
+            OperationKind::ExternalReconciliation,
+        ),
+        OperationKind::FileMutation => validate_tagged_coordinator_shape(
+            record,
+            SCHEMA_V16,
+            "schema-v16",
+            &[
+                "Copy",
+                "Import",
+                "DuplicateSame",
+                "WaveformEdit",
+                "Namespace",
+                "Render",
+                "Removal",
+                "RetainedResolution",
+                "SelectionNormalize",
+                "SelectionOutput",
+            ],
+            OperationActor::User,
+            OperationKind::FileMutation,
+        ),
+    }?;
+    if record.capacity_plan.is_some() {
+        return Err(String::from(
+            "schema-v16 cannot carry the legacy capacity_plan field",
+        ));
+    }
+    let full_plan = record
+        .full_capacity_plan
+        .as_ref()
+        .ok_or_else(|| String::from("schema-v16 requires a full capacity plan"))?;
+    full_plan.validate().map_err(|error| error.to_string())
+}
+
 fn validate_tagged_coordinator_shape(
     record: &StoredOperationRecord,
     expected_schema: u32,
@@ -3750,7 +4124,7 @@ mod tests {
     use super::*;
     use crate::operation_journal::{
         DecodedEditIntentArgs, DecodedExportBatchIntentArgs, DecodedExportIntentArgs,
-        UniversalCommandKind,
+        FullCapacityAllocationClass, RetryErrorClass, RetryLeaseId, UniversalCommandKind,
     };
     use crate::operation_journal::{RecordConsistency, classify_record};
 
@@ -4027,6 +4401,41 @@ mod tests {
         };
         fixture["universal_intent"]["command_kind"] = Value::from(command_kind);
         fixture["universal_command_args"] = command_args;
+        fixture
+    }
+
+    fn v16_full_capacity_fixture() -> Value {
+        let mut fixture = v6_command_fixture("Copy");
+        fixture["schema_version"] = Value::from(SCHEMA_V16);
+        fixture
+            .as_object_mut()
+            .expect("V6 fixture object")
+            .remove("capacity_plan");
+        let classes = [
+            "DestinationStaging",
+            "JournalRecord",
+            "SourceDatabaseCommit",
+            "SourceWalShm",
+            "GlobalDatabaseCommit",
+            "GlobalWalShm",
+            "ExistingDestination",
+            "ExistingRecoveryPayload",
+            "OperationRecoveryPayload",
+        ];
+        fixture["full_capacity_plan"] = serde_json::json!({
+            "version": 1,
+            "allocations": classes
+                .into_iter()
+                .map(|class| serde_json::json!({
+                    "volume": {"device": 1},
+                    "allocation_unit": 1,
+                    "class": class,
+                    "logical_bytes": 1,
+                    "allocated_bytes": 1,
+                    "protected_free_bytes": 268435456,
+                }))
+                .collect::<Vec<_>>(),
+        });
         fixture
     }
 
@@ -4902,6 +5311,126 @@ mod tests {
                 fixture
             );
         }
+    }
+
+    #[test]
+    fn v16_round_trips_allocation_classes_without_legacy_projection() {
+        let fixture = v16_full_capacity_fixture();
+        let record = decode(&serde_json::to_vec(&fixture).expect("V16 fixture bytes"))
+            .expect("V16 full-capacity fixture decodes");
+        assert_eq!(record.schema_version, SCHEMA_V16);
+        assert!(record.capacity_plan.is_none());
+        let plan = record
+            .full_capacity_plan
+            .as_ref()
+            .expect("V16 full-capacity plan");
+        assert_eq!(plan.allocations().len(), 9);
+        assert!(plan.allocations().iter().any(|allocation| {
+            allocation.class() == FullCapacityAllocationClass::OperationRecoveryPayload
+        }));
+        assert_eq!(classify_record(&record), RecordConsistency::Consistent);
+
+        let round_tripped = decode(&encode(&record).expect("V16 fixture encodes"))
+            .expect("encoded V16 fixture decodes");
+        assert_eq!(round_tripped, record);
+    }
+
+    #[test]
+    fn prior_schema_cannot_silently_drop_a_v16_full_capacity_plan() {
+        let fixture = v16_full_capacity_fixture();
+        let mut record = decode(&serde_json::to_vec(&fixture).expect("V16 fixture bytes"))
+            .expect("V16 full-capacity fixture decodes");
+        record.schema_version = SCHEMA_V15;
+        assert_eq!(
+            encode(&record),
+            Err(EncodeError::FullCapacityPlanInPriorSchema {
+                version: SCHEMA_V15
+            })
+        );
+    }
+
+    #[test]
+    fn v16_requires_only_the_full_capacity_field() {
+        let fixture = v16_full_capacity_fixture();
+        let mut missing_full = fixture.clone();
+        missing_full
+            .as_object_mut()
+            .expect("V16 fixture object")
+            .remove("full_capacity_plan");
+        assert!(matches!(
+            decode(&serde_json::to_vec(&missing_full).expect("missing V16 plan bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+
+        let mut legacy_and_full = fixture;
+        legacy_and_full["capacity_plan"] = serde_json::json!({
+            "volumes": [{
+                "identity": {"device": 1},
+                "allocation_unit": 1,
+                "allocation_class": "DestinationStaging",
+                "logical_bytes": 1,
+                "allocated_bytes": 1,
+                "protected_free_bytes": 268435456
+            }]
+        });
+        assert!(matches!(
+            decode(&serde_json::to_vec(&legacy_and_full).expect("mixed V16 plan bytes")),
+            Err(DecodeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn v16_cancellation_and_retry_preserve_the_full_plan() {
+        let fixture = v16_full_capacity_fixture();
+        let record = decode(&serde_json::to_vec(&fixture).expect("V16 fixture bytes"))
+            .expect("V16 full-capacity fixture decodes");
+
+        let cancellation = record.with_cancellation_request(
+            CancellationRequestObservation::new(60).expect("cancellation observation"),
+        );
+        let decoded_cancellation =
+            decode(&encode(&cancellation).expect("V16 cancellation encodes"))
+                .expect("V16 cancellation decodes");
+        assert_eq!(decoded_cancellation.schema_version, SCHEMA_V16);
+        assert_eq!(
+            decoded_cancellation
+                .full_capacity_plan
+                .as_ref()
+                .expect("full plan after cancellation")
+                .allocations()
+                .len(),
+            9
+        );
+
+        let retry = record.with_retry_pending(
+            RetryObservation::new(
+                1,
+                60,
+                61,
+                RetryLeaseId::new("v16-retry").expect("retry lease"),
+                62,
+                RetryErrorClass::TransientContention,
+                "busy",
+                None,
+            )
+            .expect("retry observation"),
+        );
+        let decoded_retry =
+            decode(&encode(&retry).expect("V16 retry encodes")).expect("V16 retry decodes");
+        assert_eq!(decoded_retry.schema_version, SCHEMA_V16);
+        assert_eq!(
+            decoded_retry.disposition,
+            OperationDisposition::RetryPending
+        );
+        assert_eq!(
+            decoded_retry
+                .full_capacity_plan
+                .as_ref()
+                .expect("full plan after retry")
+                .allocations()
+                .len(),
+            9
+        );
     }
 
     #[test]
