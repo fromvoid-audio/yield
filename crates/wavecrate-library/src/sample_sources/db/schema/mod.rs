@@ -1,6 +1,6 @@
 //! SQLite schema creation and migration helpers for source databases.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::SourceDbError;
 use super::util::map_sql_error;
@@ -27,6 +27,54 @@ pub(super) fn apply_schema_fast(
     connection: &Connection,
 ) -> Result<SchemaApplyOutcome, SourceDbError> {
     apply_schema_with_mode(connection, SchemaApplyMode::Fast)
+}
+
+/// Check an operational connection without creating or repairing source schema objects.
+/// The canonical shape is built in a separate in-memory database; only SELECT and PRAGMA
+/// reads touch `connection`. Startup must still run owner-held maintenance before using this.
+#[allow(dead_code)] // Wired to operational profile-owned opens after the maintenance handoff.
+pub(super) fn verify_current_compatible(connection: &Connection) -> Result<(), SourceDbError> {
+    let observed_version = read_schema_version(connection)?;
+    if observed_version != SOURCE_DB_SCHEMA_VERSION {
+        return Err(SourceDbError::MaintenanceRequired {
+            reason: format!(
+                "schema version {observed_version}, expected {SOURCE_DB_SCHEMA_VERSION}"
+            ),
+        });
+    }
+
+    let reference = Connection::open_in_memory().map_err(map_sql_error)?;
+    apply_schema_fast(&reference)?;
+    let mut statement = reference
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .map_err(map_sql_error)?;
+    let expected_tables = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_sql_error)?;
+    for expected_table in expected_tables {
+        let expected_table = expected_table.map_err(map_sql_error)?;
+        let actual_kind = connection
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                [&expected_table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?;
+        if actual_kind.as_deref() != Some("table") {
+            return Err(SourceDbError::MaintenanceRequired {
+                reason: format!("required table {expected_table} is unavailable"),
+            });
+        }
+        let expected_columns = table_columns(&reference, &expected_table)?;
+        let actual_columns = table_columns(connection, &expected_table)?;
+        if !expected_columns.is_subset(&actual_columns) {
+            return Err(SourceDbError::MaintenanceRequired {
+                reason: format!("required columns are missing from {expected_table}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +138,7 @@ fn stamp_schema_version(connection: &Connection) -> Result<(), SourceDbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::OptionalExtension;
+    use rusqlite::{OpenFlags, OptionalExtension};
 
     fn index_exists(connection: &Connection, index_name: &str) -> bool {
         connection
@@ -102,6 +150,84 @@ mod tests {
             .optional()
             .unwrap()
             .is_some()
+    }
+
+    #[test]
+    fn operational_compatibility_check_accepts_current_read_only_schema_without_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        apply_schema_fast(&writer).unwrap();
+        drop(writer);
+
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let before_version = read_schema_version(&reader).unwrap();
+        let before_objects: Vec<(String, String)> = reader
+            .prepare("SELECT type, name FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        verify_current_compatible(&reader).unwrap();
+        let after_objects: Vec<(String, String)> = reader
+            .prepare("SELECT type, name FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(read_schema_version(&reader).unwrap(), before_version);
+        assert_eq!(after_objects, before_objects);
+    }
+
+    #[test]
+    fn operational_compatibility_check_rejects_stale_or_missing_schema_without_repair() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_schema_fast(&connection).unwrap();
+        connection
+            .pragma_update(None, "user_version", SOURCE_DB_SCHEMA_VERSION - 1)
+            .unwrap();
+        assert!(matches!(
+            verify_current_compatible(&connection),
+            Err(SourceDbError::MaintenanceRequired { .. })
+        ));
+        assert_eq!(
+            read_schema_version(&connection).unwrap(),
+            SOURCE_DB_SCHEMA_VERSION - 1
+        );
+
+        connection
+            .pragma_update(None, "user_version", SOURCE_DB_SCHEMA_VERSION)
+            .unwrap();
+        connection
+            .execute("DROP TABLE source_participant_curation_receipts", [])
+            .unwrap();
+        assert!(matches!(
+            verify_current_compatible(&connection),
+            Err(SourceDbError::MaintenanceRequired { .. })
+        ));
+        assert!(
+            table_columns(&connection, "source_participant_curation_receipts")
+                .unwrap()
+                .is_empty()
+        );
+
+        let missing_column = Connection::open_in_memory().unwrap();
+        apply_schema_fast(&missing_column).unwrap();
+        missing_column.execute("DROP TABLE metadata", []).unwrap();
+        missing_column
+            .execute("CREATE TABLE metadata (key TEXT PRIMARY KEY)", [])
+            .unwrap();
+        assert!(matches!(
+            verify_current_compatible(&missing_column),
+            Err(SourceDbError::MaintenanceRequired { .. })
+        ));
+        assert!(
+            !table_columns(&missing_column, "metadata")
+                .unwrap()
+                .contains("value")
+        );
     }
 
     #[test]

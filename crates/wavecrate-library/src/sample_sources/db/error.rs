@@ -158,6 +158,12 @@ pub enum SourceDatabaseIdentityError {
 /// Errors returned when managing a source database.
 #[derive(Debug, Error)]
 pub enum SourceDbError {
+    /// An operational source connection found a schema that needs owner-held maintenance.
+    #[error("Source database schema requires owner-held maintenance: {reason}")]
+    MaintenanceRequired {
+        /// Bounded reason suitable for diagnosis, not a migration instruction.
+        reason: String,
+    },
     /// Writable source database access requires an already-acquired profile ownership capability.
     #[error("profile ownership is required for writable source database access")]
     ProfileOwnershipRequired,
