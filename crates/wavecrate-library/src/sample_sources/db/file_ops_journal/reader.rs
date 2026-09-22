@@ -1378,7 +1378,7 @@ mod tests {
             let profile = WritableProfileGuard::acquire_current().expect("profile owner");
             let source_root = tempdir().expect("source root");
             let database_root = tempdir().expect("database root");
-            let db = SourceDatabase::open_for_source_write_with_profile_guard(
+            let db = SourceDatabase::open_for_source_maintenance_with_profile_guard(
                 source_root.path(),
                 &profile,
                 database_root.path(),
@@ -1497,7 +1497,7 @@ mod tests {
         let profile = WritableProfileGuard::acquire_current().expect("profile owner");
         let source_root = tempdir().expect("source root");
         let database_root = tempdir().expect("database root");
-        let db = SourceDatabase::open_for_source_write_with_profile_guard(
+        let db = SourceDatabase::open_for_source_maintenance_with_profile_guard(
             source_root.path(),
             &profile,
             database_root.path(),
@@ -1508,7 +1508,7 @@ mod tests {
         let before_identity = before.entries()[0].dedup_identity().clone();
         drop(db);
 
-        let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+        let reopened = SourceDatabase::open_for_source_maintenance_with_profile_guard(
             source_root.path(),
             &profile,
             database_root.path(),
@@ -1943,7 +1943,7 @@ mod tests {
         let profile = WritableProfileGuard::acquire_current().expect("profile owner");
         let source_root = tempdir().expect("source root");
         let database_root = tempdir().expect("database root");
-        let db = SourceDatabase::open_for_source_write_with_profile_guard(
+        let db = SourceDatabase::open_for_source_maintenance_with_profile_guard(
             source_root.path(),
             &profile,
             database_root.path(),
@@ -1965,7 +1965,7 @@ mod tests {
         let database_path = db.db_path.clone();
         drop(db);
 
-        let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+        let reopened = SourceDatabase::open_for_source_maintenance_with_profile_guard(
             source_root.path(),
             &profile,
             database_root.path(),

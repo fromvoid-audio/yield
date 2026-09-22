@@ -257,9 +257,11 @@ owner-held snapshot path, migration handoff, and evidence needed to qualify it.
 Operational writable roles require a currently compatible schema and return a typed
 `MaintenanceRequired` result instead of opportunistically repairing it. The same owned
 connection may perform that maintenance before entering the operational queue; no
-competing writer is introduced. The public profile-owned source-write opener and
-catalog startup/reopen paths still use Full schema assurance; their remaining role
-split is part of OPT-1639, and OPT-1637 does not change it.
+competing writer is introduced. The public profile-owned source-write opener now
+requires an existing compatible schema; its explicit maintenance counterpart performs
+Full assurance. Catalog startup and retarget reopen paths still use Full assurance.
+The snapshot write-fence reopen now uses Operational mode. OPT-1637 does not change
+the remaining catalog startup boundary.
 
 ## Current callers and migration exceptions
 

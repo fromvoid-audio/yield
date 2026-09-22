@@ -63,6 +63,62 @@ fn catalog_maintenance_handoff_checks_owned_schema_without_repair() {
     assert_eq!(table_count, 0);
 }
 
+#[test]
+fn profile_owned_source_write_requires_prior_maintenance_and_one_live_owner() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    assert!(matches!(
+        SourceDatabase::open_for_source_write_with_profile_guard(
+            source_root.path(),
+            &profile_guard,
+            database_root.path(),
+        ),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+    assert!(!database_root.path().join(DB_FILE_NAME).exists());
+
+    let maintenance = SourceDatabase::open_for_source_maintenance_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("owner-held maintenance setup");
+    let version_before: i64 = maintenance
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    maintenance
+        .close()
+        .expect("release maintenance source lease");
+
+    let operational = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("operational owner open");
+    let version_after: i64 = operational
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version_after, version_before);
+    assert!(matches!(
+        SourceDatabase::open_for_source_write_with_profile_guard(
+            source_root.path(),
+            &profile_guard,
+            database_root.path(),
+        ),
+        Err(SourceDbError::SourceLease(_))
+    ));
+    operational
+        .close()
+        .expect("release operational source lease");
+}
+
 struct ControlledReadinessBinding {
     fail: AtomicBool,
 }
@@ -552,13 +608,13 @@ fn readiness_publication_origin_rejects_cross_database_publications_without_rene
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let mut database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+    let mut database_a = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root_a.path(),
     )
     .expect("database a");
-    let mut database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+    let mut database_b = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root_b.path(),
@@ -911,13 +967,13 @@ fn readiness_claim_fence_rejects_cross_database_claims_and_accepts_own_claims() 
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let mut database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+    let mut database_a = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root_a.path(),
     )
     .expect("database a");
-    let mut database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+    let mut database_b = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root_b.path(),

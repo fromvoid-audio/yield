@@ -207,7 +207,7 @@ fn source_database_identity_publication_fence_is_read_only_and_weak() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -244,7 +244,7 @@ fn source_database_identity_publication_fence_rejects_owner_and_epoch_changes() 
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -427,7 +427,7 @@ fn source_database_identity_external_handoff_is_unsupported() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -509,7 +509,7 @@ fn source_database_identity_lease_implicit_drop_closes_connection_before_release
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -545,14 +545,14 @@ fn source_database_identity_lease_conflicts_on_one_external_source() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
     )
     .expect("first external source database");
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -585,7 +585,7 @@ fn source_database_identity_lease_conflicts_across_profile_processes() {
     );
     wait_for_source_lease_helper_ready(&mut helper);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -599,7 +599,7 @@ fn source_database_identity_lease_conflicts_across_profile_processes() {
     ));
 
     finish_source_lease_helper(&mut helper, "release", true);
-    let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+    let reopened = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -627,7 +627,7 @@ fn source_database_identity_lease_recovers_same_profile_after_abrupt_expired_exi
     finish_source_lease_helper(&mut helper, "crash", false);
 
     let profile_guard = WritableProfileGuard::acquire_current().expect("reacquire profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -652,7 +652,7 @@ fn source_database_identity_lease_rejects_unexpired_reclaim() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -671,7 +671,7 @@ fn source_database_identity_lease_rejects_unexpired_reclaim() {
         .expect("make active lease unexpired");
     drop(connection);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -693,7 +693,7 @@ fn source_database_identity_lease_rejects_foreign_expired_reclaim() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -720,7 +720,7 @@ fn source_database_identity_lease_rejects_foreign_expired_reclaim() {
         .expect("make foreign lease expired");
     drop(connection);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -743,7 +743,7 @@ fn source_database_identity_lease_fence_survives_original_drop() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -755,7 +755,7 @@ fn source_database_identity_lease_fence_survives_original_drop() {
         .expect("snapshot write fence");
     drop(database);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -768,7 +768,7 @@ fn source_database_identity_lease_fence_survives_original_drop() {
         SourceDbError::SourceLease(SourceLeaseError::WritableSourceOwnedByAnotherProcess { .. })
     ));
     drop(fence);
-    let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+    let reopened = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -786,7 +786,7 @@ fn source_database_identity_close_waits_for_snapshot_fence_before_release() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -805,7 +805,7 @@ fn source_database_identity_close_waits_for_snapshot_fence_before_release() {
     ));
     drop(fence);
 
-    let reopened = SourceDatabase::open_for_source_write_with_profile_guard(
+    let reopened = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -822,7 +822,7 @@ fn source_database_identity_lease_rejects_changed_epoch_before_mutation() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -859,7 +859,7 @@ fn source_database_identity_lease_renews_after_idle_before_mutation() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -901,7 +901,7 @@ fn source_database_identity_lease_does_not_renew_healthy_writes() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -971,7 +971,7 @@ fn source_database_identity_lease_rejects_unknown_database_layout_unchanged() {
     drop(connection);
     let before = std::fs::read(&database_path).expect("unknown database bytes before open");
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1009,7 +1009,7 @@ fn source_database_identity_lease_reports_missing_media_root_before_open_without
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
     let database_path = database_root.path().join(DB_FILE_NAME);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         &source_root,
         &profile_guard,
         database_root.path(),
@@ -1036,7 +1036,7 @@ fn source_database_identity_lease_rejects_source_root_replacement() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1065,7 +1065,7 @@ fn source_database_identity_lease_reports_missing_media_root_as_unavailable() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1158,7 +1158,7 @@ fn source_database_identity_lease_retains_media_root_separately_from_database_ro
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1206,7 +1206,7 @@ fn source_database_identity_lease_rejects_sidecar_replacement() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1253,7 +1253,7 @@ fn source_lease_process_helper() {
     let _base_guard = ConfigBaseGuard::set(base);
     let _profile_selection = PersistenceProfileGuard::named(profile);
     let profile_guard = WritableProfileGuard::acquire_current().expect("helper profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         &source_root,
         &profile_guard,
         &database_root,
@@ -1435,7 +1435,7 @@ fn source_database_identity_lease_does_not_recreate_database_with_existing_sidec
     std::fs::write(&lock_path, lock_bytes).expect("preexisting lease sidecar");
     let database_path = database_root.path().join(DB_FILE_NAME);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1462,7 +1462,7 @@ fn source_database_identity_lease_missing_row_is_retained_without_rebootstrap() 
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1476,7 +1476,7 @@ fn source_database_identity_lease_missing_row_is_retained_without_rebootstrap() 
     drop(database);
     let before = std::fs::read(&database_path).expect("database bytes before retry");
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1528,7 +1528,7 @@ fn source_database_identity_lease_bootstraps_fresh_sidecar_on_current_legacy_sch
 
     let diagnostic_sidecar = b"prior source lease sidecar";
     std::fs::write(&lease_path, diagnostic_sidecar).expect("preexisting source sidecar");
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1557,7 +1557,7 @@ fn source_database_identity_lease_bootstraps_fresh_sidecar_on_current_legacy_sch
     );
 
     std::fs::remove_file(&lease_path).expect("remove diagnostic sidecar");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1623,7 +1623,7 @@ fn source_database_identity_rejects_wrong_current_base_schema_without_mutation()
         drop(connection);
         let before = std::fs::read(&database_path).expect("wrong-shape bytes before open");
 
-        let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+        let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
             source_root.path(),
             &profile_guard,
             database_root.path(),
@@ -1667,7 +1667,7 @@ fn source_database_identity_lease_rejects_lease_trigger_without_mutating_databas
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1712,7 +1712,7 @@ fn source_database_identity_lease_rejects_lease_trigger_without_mutating_databas
     };
     let before = sqlite_artifacts(&database_path);
 
-    let error = match SourceDatabase::open_for_source_write_with_profile_guard(
+    let error = match SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -1784,7 +1784,7 @@ fn source_database_identity_readiness_reports_database_root_replacement() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let mut database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let mut database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2018,7 +2018,7 @@ fn source_authority_handoff_uses_one_shot_confirmation_and_durable_retirement_ac
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2093,7 +2093,7 @@ fn source_authority_handoff_rejects_replaced_root_and_invalidates_pending_confir
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2133,13 +2133,13 @@ fn source_authority_handoff_rejects_stale_owner_and_cross_source_guard() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database_a = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root_a.path(),
         &profile_guard,
         database_root_a.path(),
     )
     .expect("source database a");
-    let database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database_b = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root_b.path(),
         &profile_guard,
         database_root_b.path(),
@@ -2280,7 +2280,7 @@ fn source_authority_handoff_retains_draining_state_when_snapshot_blocks_retireme
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2319,7 +2319,7 @@ fn source_authority_guard_drop_invalidates_pending_use_proof() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2350,7 +2350,7 @@ fn source_effect_pin_rejects_drain_and_guard_loss() {
         AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
             .expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2395,13 +2395,13 @@ fn source_effect_pin_cannot_join_another_registered_source() {
         AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
             .expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database_a = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root_a.path(),
         &profile_guard,
         database_root_a.path(),
     )
     .expect("source a");
-    let database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database_b = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root_b.path(),
         &profile_guard,
         database_root_b.path(),
@@ -2441,7 +2441,7 @@ fn source_effect_pin_rejects_replaced_root_at_effect_boundary() {
         AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
             .expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2476,7 +2476,7 @@ fn source_release_waits_for_effect_permit_before_releasing_durable_row() {
         AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
             .expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2536,7 +2536,7 @@ fn source_authority_expired_use_proof_still_allows_restrictive_drain() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),
@@ -2578,7 +2578,7 @@ fn source_authority_confirmation_is_consumed_once_under_concurrent_acceptors() {
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+    let database = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         source_root.path(),
         &profile_guard,
         database_root.path(),

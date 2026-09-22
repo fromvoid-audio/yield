@@ -946,7 +946,7 @@ impl SourceDatabase {
                     &self.root,
                     Arc::clone(expected_database.root()),
                     profile_guard,
-                    open::SourceDatabaseOpenMode::Full,
+                    open::SourceDatabaseOpenMode::Operational,
                     expected_database,
                     Arc::clone(source_lease),
                 )?
@@ -955,7 +955,7 @@ impl SourceDatabase {
                 &self.root,
                 database_root,
                 false,
-                open::SourceDatabaseOpenMode::Full,
+                open::SourceDatabaseOpenMode::Operational,
             )?,
             _ => return Err(SourceDbError::ProfileOwnershipRequired),
         };
@@ -1038,26 +1038,58 @@ impl SourceDatabase {
         )
     }
 
-    /// Open a writable source database in an explicitly profile-owned external namespace.
+    /// Open an existing writable source database in a profile-owned external namespace.
     ///
     /// The profile guard authorizes the database-root binding and remains retained by the
     /// returned database. The physical-source lease is acquired before the SQLite connection is
     /// opened, so two profile-owned callers cannot concurrently mutate the same source database.
+    /// The schema must already be current; this operational entrypoint never creates or repairs it.
     pub fn open_for_source_write_with_profile_guard(
         root: impl AsRef<Path>,
         profile_guard: &crate::app_dirs::WritableProfileGuard,
         database_root: impl AsRef<Path>,
     ) -> Result<Self, SourceDbError> {
-        let database_root = file_ops_journal::BoundDatabaseRoot::for_external_source_root(
+        Self::open_profile_owned_source_with_mode(
+            root.as_ref(),
             profile_guard,
             database_root.as_ref(),
+            open::SourceDatabaseOpenMode::Operational,
+        )
+    }
+
+    /// Create or migrate a profile-owned source database during owner-held maintenance.
+    ///
+    /// This is the explicit startup path for a source writer that needs schema assurance.
+    /// Callers must complete maintenance before handing the retained owner to operational work.
+    pub fn open_for_source_maintenance_with_profile_guard(
+        root: impl AsRef<Path>,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+        database_root: impl AsRef<Path>,
+    ) -> Result<Self, SourceDbError> {
+        Self::open_profile_owned_source_with_mode(
+            root.as_ref(),
+            profile_guard,
+            database_root.as_ref(),
+            open::SourceDatabaseOpenMode::Full,
+        )
+    }
+
+    fn open_profile_owned_source_with_mode(
+        root: &Path,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+        database_root: &Path,
+        mode: open::SourceDatabaseOpenMode,
+    ) -> Result<Self, SourceDbError> {
+        let database_root = file_ops_journal::BoundDatabaseRoot::for_external_source_root(
+            profile_guard,
+            database_root,
         )
         .map_err(open::map_database_root_open_error)?;
         open::open_source_database_with_profile_guard(
-            root.as_ref(),
+            root,
             Arc::new(database_root),
             profile_guard,
-            open::SourceDatabaseOpenMode::Full,
+            mode,
             None,
         )
     }

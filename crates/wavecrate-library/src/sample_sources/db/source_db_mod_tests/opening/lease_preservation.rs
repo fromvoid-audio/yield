@@ -107,7 +107,7 @@ fn source_database_identity_first_lease_preserves_user_and_recovery_state() {
     );
     drop(read_only);
 
-    let owned = SourceDatabase::open_for_source_write_with_profile_guard(
+    let owned = SourceDatabase::open_for_source_maintenance_with_profile_guard(
         media_root.path(),
         &profile,
         database_root.path(),
