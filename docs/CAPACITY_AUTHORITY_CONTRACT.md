@@ -303,7 +303,8 @@ The capacity work is intentionally split as follows:
 | OPT-1561 | Live descriptor provider and retained-authority volume refresh. |
 | OPT-1562 | Clean volume-ownership handoff after zero claims/charges and proof. |
 | OPT-1563 | Common owner pre-intent gate and typed rejection with no journal row. |
-| OPT-1564–1568 | Chunk claims, typed estimators, and pre/post-intent fault matrices; outside this lifetime decision. |
+| OPT-1564 | Durable post-intent chunk claims, owner-held write tickets, and logical release retry. |
+| OPT-1565–1568 | Typed estimators and pre/post-intent fault matrices; outside this lifetime decision. |
 
 The implemented OPT-1563 boundary accepts a private prepared template only after it validates
 the participant topology, derived work plan, full claim coverage, bounded arithmetic, and current
@@ -483,6 +484,58 @@ The finite OPT-1562 checklist is:
 - exercise cross-profile lock contention and foreign-artifact refusal without
   adopting or deleting another profile's reserve; leave ordinary admission,
   physical cleanup, provider qualification, chunks, and family wiring deferred.
+
+### OPT-1564 durable chunk claims and bounded write tickets
+
+OPT-1564 adds a post-intent chunk relation without changing the V16 operation-record codec or
+the frozen initial inventory. A globally unique `ChunkId` permanently binds one operation, one
+immutable bounded write identity (participant, output/artifact identity, logical offset and
+length), and the exact ordinary claim IDs charged for that chunk. The chunk's ordinary rows and
+its `Claimed` relation are inserted together through the owner-thread transaction after initial
+settlement; they are not a deduction from an unrelated initial claim.
+
+The chunk relation has two explicit bounded-read/write limits. The complete relation, including
+released history, is capped at 256 rows globally, and each operation is capped at 256 ordinary
+claim rows. The append path performs a bounded capped lookahead before inserting, so the 256th
+row is allowed and a further row is rejected before any ordinary row, relation row, or provider
+charge is changed. Restart and admission scans use the same bounded pages and reject
+oversized, orphaned, malformed, conflicting, or overflowed evidence conservatively.
+
+The owner validates a fresh retained-authority descriptor observation and the current provider
+ledger before creating a chunk claim. The claim is charged once through the existing provisional
+lease and becomes durable only after exact row readback. A `Claimed` row has no write authority.
+Issuance revalidates the operation state, durable claim identity, current protected-floor facts,
+and retained headroom without admitting or charging a second time. Only a confirmed durable
+`Claimed -> Issued` CAS/readback creates an owner-issued opaque ticket. Repeating an `Issued`
+request never creates another receipt or competing ticket; changed write metadata or reuse under
+another operation is rejected.
+
+The ticket crosses the bounded owner queue as an opaque, non-reusable value. The actual
+`ChunkWriteEntry` is private to the owner thread and is created only after the owner registry,
+durable row, operation disposition, fresh descriptor facts, and sealed live witness all match.
+The entry borrows that witness through the synthetic callback boundary and carries no filesystem
+authority. A denied identity, budget, cancellation, stale-authority, or capacity check invokes
+no callback; the single-use ticket is consumed and the durable `Issued` charge remains retained.
+New independent chunk IDs may coexist with already charged `Issued` chunks, including after
+restart, because `Issued` is capacity accounting only and never means physical output completed.
+
+On restart, a confirmed `Claimed` row may be issued again only after fresh retained authority,
+descriptor facts, and a durable CAS. An `Issued` row or uncertain issuance remains charged and is
+never reissued; a durable `Released` row is replayable by its exact release identity. An Issued
+ticket can enter only once. Before logical release, the owner moves its live unused proof into an
+exact `ReleasePending` record. A rollback before commit retains the `Issued` row, charge, issue
+identity, and release identity. A timeout or uncertain result may already have committed
+`Released` while provider acknowledgement is unknown, so the conservative provider charge and
+exact pending identities remain until confirmed Released readback and provider reconciliation.
+Retry uses the same owner-held proof and release ID; after confirmed reconciliation, provider
+subtraction occurs once and exact replay is idempotent. Logical release does not delete rows,
+clean physical data, replenish the reserve, prove physical completion/exhaustion, or enable
+ordinary admission.
+
+The chunk protocol deliberately leaves family writer wiring, physical cleanup, OPT-1565 written
+checkpoint/exhaustion classification, provider backend qualification, and production rollout
+deferred. Snapshots, copied issue IDs, and restart observations never mint a ticket or release
+proof.
 
 ## Acceptance checks for implementation children
 

@@ -17,7 +17,9 @@ use super::admission_claims::{
 use super::full_capacity::{
     FullCapacityAllocationClass, FullCapacityPlan, MAX_FULL_CAPACITY_ALLOCATIONS,
 };
-use super::store::{OrdinaryClaimRebuildSnapshot, OrdinaryClaimReleaseReceipt, RebuildClaim};
+use super::store::{
+    ChunkClaimRecord, OrdinaryClaimRebuildSnapshot, OrdinaryClaimReleaseReceipt, RebuildClaim,
+};
 use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity};
 use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
@@ -324,6 +326,108 @@ impl CapacityProvider {
                     claim_id: claim.claim_id(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Verify that a durable post-intent claim still owns exactly one retained provider token.
+    /// Issuance is a state transition on the journal relation; it must never call admission or
+    /// add a second charge for the already-held ordinary claim.
+    pub(crate) fn validate_durable_chunk_claim(
+        &self,
+        record: &ChunkClaimRecord,
+    ) -> Result<(), CapacityProviderError> {
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        let mut matching_tokens = Vec::new();
+        for (token, entry) in &ledger.charges_by_token {
+            if !matches!(
+                entry.disposition,
+                ProvisionalLeaseDisposition::Durable { .. }
+                    | ProvisionalLeaseDisposition::AuditPending { .. }
+            ) {
+                continue;
+            }
+            let Some(claim) = entry.claims.get(&record.claim_id()) else {
+                continue;
+            };
+            if disposition_operation(&entry.disposition) != Some(record.operation_id())
+                || claim.volume != *record.volume()
+                || claim.allocation_class != record.allocation_class()
+                || claim.allocated_bytes != record.allocated_bytes()
+                || claim.release_id.is_some()
+            {
+                return Err(CapacityProviderError::ClaimReleaseConflict);
+            }
+            matching_tokens.push(*token);
+        }
+        match matching_tokens.as_slice() {
+            [] => Err(CapacityProviderError::ClaimReleaseNotFound),
+            [_] => Ok(()),
+            _ => Err(CapacityProviderError::ClaimReleaseAmbiguous),
+        }
+    }
+
+    /// Revalidate an already-held chunk charge against the current descriptor observation before
+    /// issuing or entering it. This deliberately performs no admission and adds no ledger bytes;
+    /// it only proves that the retained charge still fits above the full protected floor.
+    pub(crate) fn validate_durable_chunk_issuance(
+        &self,
+        record: &ChunkClaimRecord,
+        witness: &super::owner::LiveAdmissionWitness<'_>,
+    ) -> Result<(), CapacityProviderError> {
+        self.validate_durable_chunk_claim(record)?;
+        if record.protected_free_bytes() != PROTECTED_FREE_SPACE_FLOOR {
+            return Err(CapacityProviderError::UnsupportedFacts);
+        }
+        let observed = witness.facts().get(record.volume()).ok_or_else(|| {
+            CapacityProviderError::FactsUnavailable {
+                volume: record.volume().clone(),
+            }
+        })?;
+        if observed.identity != *record.volume() {
+            return Err(CapacityProviderError::FactsUnavailable {
+                volume: record.volume().clone(),
+            });
+        }
+        if observed.allocation_unit == 0 {
+            return Err(CapacityProviderError::UnsupportedAllocationUnit {
+                volume: record.volume().clone(),
+            });
+        }
+        if observed.allocation_unit != record.allocation_unit() {
+            return Err(CapacityProviderError::UnsupportedAllocationUnit {
+                volume: record.volume().clone(),
+            });
+        }
+        if observed.free_bytes <= PROTECTED_FREE_SPACE_FLOOR {
+            return Err(CapacityProviderError::RecoveryReserveLow {
+                volume: record.volume().clone(),
+                free_bytes: observed.free_bytes,
+            });
+        }
+        let available = observed.free_bytes - PROTECTED_FREE_SPACE_FLOOR;
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        let retained = ledger
+            .aggregate_charges
+            .iter()
+            .filter(|(key, _)| {
+                key.volume == *record.volume()
+                    && counts_against_incremental_free_space(key.allocation_class)
+            })
+            .try_fold(0u64, |total, (_, bytes)| total.checked_add(*bytes))
+            .ok_or(CapacityProviderError::ArithmeticOverflow)?;
+        if retained > available {
+            return Err(CapacityProviderError::DiskPressureRecoveryOnly {
+                volume: record.volume().clone(),
+                required_bytes: retained,
+                available_bytes: available,
+            });
         }
         Ok(())
     }
@@ -932,14 +1036,110 @@ fn stage_rebuilt_ledger(
 }
 
 fn ledger_matches_rebuild(current: &ProvisionalLedger, staged: &ProvisionalLedger) -> bool {
-    let mut current_charges: Vec<LedgerCharge> =
-        current.charges_by_token.values().cloned().collect();
-    let mut staged_charges: Vec<LedgerCharge> = staged.charges_by_token.values().cloned().collect();
-    current_charges.sort_by_key(|charge| disposition_operation(&charge.disposition));
-    staged_charges.sort_by_key(|charge| disposition_operation(&charge.disposition));
-    current_charges == staged_charges
-        && current.aggregate_charges == staged.aggregate_charges
-        && current.released_claims == staged.released_claims
+    match (
+        normalized_ledger_image(current),
+        normalized_ledger_image(staged),
+    ) {
+        (Some(current), Some(staged)) => current == staged,
+        _ => false,
+    }
+}
+
+/// Compare durable accounting by operation and claim identity rather than by provisional token.
+/// Post-intent chunk claims may be admitted as separate owner-thread tokens, while the bounded
+/// restart image intentionally groups every retained ordinary claim for one operation together.
+/// A provisional or otherwise non-durable token is never normalized and therefore cannot be
+/// mistaken for a durable restart image.
+fn normalized_ledger_image(
+    ledger: &ProvisionalLedger,
+) -> Option<(
+    BTreeMap<OperationId, LedgerCharge>,
+    BTreeMap<ChargeKey, u64>,
+    BTreeMap<AdmissionClaimId, ReleasedClaim>,
+)> {
+    let mut by_operation: BTreeMap<OperationId, LedgerCharge> = BTreeMap::new();
+    for entry in ledger.charges_by_token.values() {
+        let operation_id = match entry.disposition {
+            ProvisionalLeaseDisposition::Durable { operation_id, .. }
+            | ProvisionalLeaseDisposition::AuditPending { operation_id, .. } => operation_id,
+            ProvisionalLeaseDisposition::Provisional | ProvisionalLeaseDisposition::Released => {
+                return None;
+            }
+        };
+        let target = by_operation
+            .entry(operation_id)
+            .or_insert_with(|| LedgerCharge {
+                charges: BTreeMap::new(),
+                claims: BTreeMap::new(),
+                disposition: ProvisionalLeaseDisposition::Durable {
+                    operation_id,
+                    claim_ids: Vec::new(),
+                },
+            });
+        let pending = matches!(
+            entry.disposition,
+            ProvisionalLeaseDisposition::AuditPending { .. }
+        );
+        if pending {
+            target.disposition = ProvisionalLeaseDisposition::AuditPending {
+                operation_id,
+                claim_ids: Vec::new(),
+            };
+        }
+        for (key, bytes) in &entry.charges {
+            let aggregate = target.charges.entry(key.clone()).or_insert(0);
+            *aggregate = aggregate.checked_add(*bytes)?;
+        }
+        for (claim_id, claim) in &entry.claims {
+            if target.claims.insert(*claim_id, claim.clone()).is_some() {
+                return None;
+            }
+        }
+    }
+    for (claim_id, released) in &ledger.released_claims {
+        let Some(target) = by_operation.get_mut(&released.operation_id) else {
+            continue;
+        };
+        let released_claim = LedgerClaim {
+            volume: released.volume.clone(),
+            allocation_class: released.allocation_class,
+            allocated_bytes: released.allocated_bytes,
+            release_id: Some(released.release_id),
+        };
+        if let Some(previous) = target.claims.insert(*claim_id, released_claim.clone()) {
+            if previous != released_claim {
+                return None;
+            }
+        }
+    }
+    for charge in by_operation.values_mut() {
+        let operation_id = disposition_operation(&charge.disposition)?;
+        let mut claim_ids = charge
+            .claims
+            .iter()
+            .filter_map(|(claim_id, claim)| claim.release_id.is_none().then_some(*claim_id))
+            .collect::<Vec<_>>();
+        claim_ids.sort();
+        charge.disposition = if matches!(
+            charge.disposition,
+            ProvisionalLeaseDisposition::AuditPending { .. }
+        ) {
+            ProvisionalLeaseDisposition::AuditPending {
+                operation_id,
+                claim_ids,
+            }
+        } else {
+            ProvisionalLeaseDisposition::Durable {
+                operation_id,
+                claim_ids,
+            }
+        };
+    }
+    Some((
+        by_operation,
+        ledger.aggregate_charges.clone(),
+        ledger.released_claims.clone(),
+    ))
 }
 
 pub(crate) fn production_admission_gate() -> Result<(), ()> {
