@@ -674,6 +674,26 @@ durable owner if written. `Held` is never terminal. Operation-created recovery
 material must be distinguished from pre-existing recovery data before any cleanup
 or release authority can be issued.
 
+For OPT-1559, logical ordinary-claim release is a separate owner-thread
+transaction. The v6 release relation is keyed by `claim_id` and stores the exact
+operation and stable release identity; it preserves the immutable ordinary row
+and derives release volume, class, and bytes from that row. The store commits
+and reads this receipt back before provider reconciliation. The retained ledger
+subtracts one claim only after a unique operation/claim/token match and checked
+aggregate and token residuals; it leaves every other claim held. Duplicate
+requests return the same durable identity, conflicting identities and ambiguous
+retained matches fail closed, and a fully released token cannot be resurrected
+by replay. Persistence or reconciliation uncertainty retains the charge and
+retry identities. This path has no physical deletion, recovery-reserve
+mutation, restart rebuild, admission qualification, or production admission
+authority.
+
+The finite release verification set covers two claims sharing one aggregate
+charge, duplicate and conflicting requests, provider failure, pre-commit and
+post-commit uncertainty, rollback uncertainty, journal reopen replay, concurrent
+same-claim serialization, ambiguous retained-token lookup, residual-charge
+retention, final-token replay, and strict v5-to-v6 migration/readback checks.
+
 The first cancellation freezes a non-executable recovery inventory. A verified
 late publication may refine an already-entered action, advance its recovery
 generation and select the after-publication route, but cannot introduce an action

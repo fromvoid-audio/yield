@@ -18,13 +18,17 @@ use rusqlite::limits::Limit;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
+use crate::durable_capacity::VolumeIdentity;
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 
-use super::admission_claims::{AdmissionClaimInventory, AdmissionClaimValidationError};
+use super::admission_claims::{
+    AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimValidationError,
+};
 use super::capacity_provider::{CapacityProvider, CapacityProviderError, ProvisionalCapacityLease};
 use super::capacity_reserve_namespace::{
     BoundReserve, OwnedReserveAllocation, PhysicalReserveProof,
@@ -35,7 +39,7 @@ use super::coordinator::{
     CopyIntentArgs, RetryObservation, UniversalCommandArgs, WaveformEditIntentArgs,
 };
 use super::external_commands::ExternalReconciliationIntentArgs;
-use super::full_capacity::FullCapacityPlan;
+use super::full_capacity::{FullCapacityAllocationClass, FullCapacityPlan};
 use super::history_commands::HistoryUndoRedoIntentArgs;
 use super::model::UniversalIntent;
 use super::model::{
@@ -81,7 +85,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 5;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 6;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -97,6 +101,7 @@ const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const RECOVERY_RESERVE_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_RESERVE_BINDING_SCHEMA_VERSION: u32 = 4;
+const ORDINARY_CLAIM_SCHEMA_VERSION: u32 = 5;
 const MAX_SCHEMA_OBJECTS: i64 = 8;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
@@ -504,6 +509,145 @@ impl InitialClaimSettlementError {
     }
 }
 
+/// Explicit owner-thread request for logically releasing exactly one durable ordinary claim.
+/// The request carries only identities; the claim's volume, class, and bytes are always read
+/// from the durable ordinary-claim row before a receipt is created.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinaryClaimReleaseRequest {
+    operation_id: OperationId,
+    claim_id: AdmissionClaimId,
+    release_id: Uuid,
+}
+
+#[allow(dead_code)]
+impl OrdinaryClaimReleaseRequest {
+    pub(crate) fn new(
+        operation_id: OperationId,
+        claim_id: AdmissionClaimId,
+        release_id: Uuid,
+    ) -> Result<Self, OrdinaryClaimReleaseError> {
+        if operation_id.as_uuid().is_nil() || claim_id.validate().is_err() || release_id.is_nil() {
+            return Err(OrdinaryClaimReleaseError::InvalidRequest);
+        }
+        Ok(Self {
+            operation_id,
+            claim_id,
+            release_id,
+        })
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn claim_id(&self) -> AdmissionClaimId {
+        self.claim_id
+    }
+
+    pub(crate) fn release_id(&self) -> Uuid {
+        self.release_id
+    }
+}
+
+/// Private receipt returned only after the release relation has committed and read back exactly.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinaryClaimReleaseReceipt {
+    operation_id: OperationId,
+    claim_id: AdmissionClaimId,
+    release_id: Uuid,
+    volume: VolumeIdentity,
+    allocation_class: FullCapacityAllocationClass,
+    allocated_bytes: u64,
+}
+
+#[allow(dead_code)]
+impl OrdinaryClaimReleaseReceipt {
+    fn from_claim(claim: &ordinary_claims::OrdinaryClaimRecord, release_id: Uuid) -> Self {
+        Self {
+            operation_id: claim.operation_id(),
+            claim_id: claim.claim_id(),
+            release_id,
+            volume: claim.volume().clone(),
+            allocation_class: claim.allocation_class(),
+            allocated_bytes: claim.allocated_bytes(),
+        }
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn claim_id(&self) -> AdmissionClaimId {
+        self.claim_id
+    }
+
+    pub(crate) fn release_id(&self) -> Uuid {
+        self.release_id
+    }
+
+    pub(crate) fn volume(&self) -> &VolumeIdentity {
+        &self.volume
+    }
+
+    pub(crate) fn allocation_class(&self) -> FullCapacityAllocationClass {
+        self.allocation_class
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation_id: OperationId,
+        claim_id: AdmissionClaimId,
+        release_id: Uuid,
+        volume: VolumeIdentity,
+        allocation_class: FullCapacityAllocationClass,
+        allocated_bytes: u64,
+    ) -> Self {
+        Self {
+            operation_id,
+            claim_id,
+            release_id,
+            volume,
+            allocation_class,
+            allocated_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[allow(dead_code)]
+pub(crate) enum OrdinaryClaimReleaseError {
+    #[error("ordinary claim release request contains a nil or invalid identity")]
+    InvalidRequest,
+    #[error("ordinary claim {claim_id} was not found")]
+    ClaimNotFound { claim_id: AdmissionClaimId },
+    #[error("ordinary claim {claim_id} belongs to a different operation")]
+    OperationMismatch { claim_id: AdmissionClaimId },
+    #[error("ordinary claim {claim_id} already has a conflicting release receipt")]
+    ReleaseConflict { claim_id: AdmissionClaimId },
+    #[error("ordinary claim release persistence failed: {source}")]
+    Persistence {
+        #[source]
+        source: OperationJournalStoreError,
+    },
+    #[error("ordinary claim release persistence outcome is uncertain: {source}")]
+    PersistenceUncertain {
+        #[source]
+        source: OperationJournalStoreError,
+    },
+    #[error("ordinary claim release receipt committed but provider retained its charge: {source}")]
+    ProviderRetained {
+        receipt: OrdinaryClaimReleaseReceipt,
+        #[source]
+        source: CapacityProviderError,
+    },
+}
+
 /// Acknowledgement returned after a cancellation request has committed and passed readback.
 ///
 /// The receipt proves only that the non-terminal request is durable in this profile-owned
@@ -583,9 +727,25 @@ enum RetryTransition {
     },
 }
 
+#[allow(dead_code)]
+enum OrdinaryClaimReleaseTransition {
+    Replay(OrdinaryClaimReleaseReceipt),
+    Inserted(OrdinaryClaimReleaseReceipt),
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InsertTestBoundary {
+    BeforeBegin,
+    BeforePrecommitValidation,
+    Rollback,
+    Commit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseTestBoundary {
     BeforeBegin,
     BeforePrecommitValidation,
     Rollback,
@@ -616,6 +776,15 @@ enum InsertTestDirective {
     ExecuteThenFail(OperationJournalStoreError),
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+enum ReleaseTestDirective {
+    Continue,
+    Fail(OperationJournalStoreError),
+    FailAndLeaveForRollback(OperationJournalStoreError),
+    ExecuteThenFail(OperationJournalStoreError),
+}
+
 /// One profile-owned operation-journal SQLite connection.
 ///
 /// The retained root binding and cloned profile owner are kept until after the SQLite connection
@@ -629,6 +798,10 @@ pub struct OperationJournalStore {
     #[cfg(test)]
     insert_test_hook:
         std::sync::Mutex<Option<Box<dyn FnMut(InsertTestBoundary) -> InsertTestDirective + Send>>>,
+    #[cfg(test)]
+    release_test_hook: std::sync::Mutex<
+        Option<Box<dyn FnMut(ReleaseTestBoundary) -> ReleaseTestDirective + Send>>,
+    >,
 }
 
 /// Private live capability context for recovery-reserve ledger transitions.
@@ -1654,6 +1827,28 @@ impl OperationJournalStore {
                     profile_guard,
                     rollback_journal.as_ref(),
                 )?;
+            } else if header_version == ORDINARY_CLAIM_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    ORDINARY_CLAIM_SCHEMA_VERSION,
+                )?;
+                migrate_ordinary_claim_release_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
             } else {
                 configure_connection(&connection)?;
             }
@@ -1687,6 +1882,8 @@ impl OperationJournalStore {
             profile_guard: retained_profile_guard,
             #[cfg(test)]
             insert_test_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            release_test_hook: std::sync::Mutex::new(None),
         })
     }
 
@@ -4128,6 +4325,198 @@ impl OperationJournalStore {
         Ok(InitialClaimSettlement { outcome, lease })
     }
 
+    /// Persist and reconcile one explicit owner-thread logical release. The immutable receipt is
+    /// committed and read back before the provider ledger is decremented; a provider failure
+    /// therefore returns the receipt while retaining the original charge for retry.
+    #[allow(dead_code)]
+    pub(crate) fn release_ordinary_claim(
+        &self,
+        request: OrdinaryClaimReleaseRequest,
+        provider: &CapacityProvider,
+    ) -> Result<OrdinaryClaimReleaseReceipt, OrdinaryClaimReleaseError> {
+        let receipt = self.persist_ordinary_claim_release(request)?;
+        if let Err(source) = provider.release_claim(&receipt) {
+            return Err(OrdinaryClaimReleaseError::ProviderRetained { receipt, source });
+        }
+        Ok(receipt)
+    }
+
+    #[allow(dead_code)]
+    fn persist_ordinary_claim_release(
+        &self,
+        request: OrdinaryClaimReleaseRequest,
+    ) -> Result<OrdinaryClaimReleaseReceipt, OrdinaryClaimReleaseError> {
+        self.validate_namespace()
+            .map_err(|source| OrdinaryClaimReleaseError::Persistence { source })?;
+        #[cfg(test)]
+        if let Some(ReleaseTestDirective::Fail(error))
+        | Some(ReleaseTestDirective::FailAndLeaveForRollback(error)) =
+            self.release_test_directive(ReleaseTestBoundary::BeforeBegin)
+        {
+            return Err(OrdinaryClaimReleaseError::Persistence { source: error });
+        }
+        self.connection
+            .execute_batch("BEGIN EXCLUSIVE")
+            .map_err(|error| OrdinaryClaimReleaseError::Persistence {
+                source: error.into(),
+            })?;
+        let transition = match self.release_ordinary_claim_inside_transaction(request) {
+            Ok(transition) => transition,
+            Err(error) => return Err(self.rollback_ordinary_claim_release(error)),
+        };
+        if let Err(source) = self.validate_namespace_without_sidecars() {
+            return Err(self.rollback_ordinary_claim_release(
+                OrdinaryClaimReleaseError::Persistence { source },
+            ));
+        }
+        #[cfg(test)]
+        if let Some(directive) =
+            self.release_test_directive(ReleaseTestBoundary::BeforePrecommitValidation)
+        {
+            match directive {
+                ReleaseTestDirective::Fail(error)
+                | ReleaseTestDirective::FailAndLeaveForRollback(error) => {
+                    return Err(self.rollback_ordinary_claim_release(
+                        OrdinaryClaimReleaseError::Persistence { source: error },
+                    ));
+                }
+                ReleaseTestDirective::Continue | ReleaseTestDirective::ExecuteThenFail(_) => {}
+            }
+        }
+        #[cfg(test)]
+        let commit_directive = self.release_test_directive(ReleaseTestBoundary::Commit);
+        #[cfg(test)]
+        if let Some(ReleaseTestDirective::Fail(error)) = commit_directive {
+            let rollback_error = self.rollback_ordinary_claim_release_transaction();
+            return Err(OrdinaryClaimReleaseError::PersistenceUncertain {
+                source: rollback_error.unwrap_or(error),
+            });
+        }
+        #[cfg(test)]
+        if let Some(ReleaseTestDirective::ExecuteThenFail(error)) = commit_directive {
+            let commit_result = self.connection.execute_batch("COMMIT");
+            let rollback_error = self.rollback_ordinary_claim_release_transaction();
+            if let Err(commit_error) = commit_result {
+                return Err(OrdinaryClaimReleaseError::PersistenceUncertain {
+                    source: rollback_error.unwrap_or_else(|| commit_error.into()),
+                });
+            }
+            return Err(OrdinaryClaimReleaseError::PersistenceUncertain {
+                source: rollback_error.unwrap_or(error),
+            });
+        }
+        if let Err(error) = self.connection.execute_batch("COMMIT") {
+            let rollback_error = self.rollback_ordinary_claim_release_transaction();
+            return Err(OrdinaryClaimReleaseError::PersistenceUncertain {
+                source: rollback_error.unwrap_or_else(|| error.into()),
+            });
+        }
+        #[cfg(test)]
+        if let Some(ReleaseTestDirective::Fail(error)) =
+            self.release_test_directive(ReleaseTestBoundary::AfterCommit)
+        {
+            return Err(OrdinaryClaimReleaseError::PersistenceUncertain { source: error });
+        }
+        if let Err(source) = self.validate_namespace() {
+            return Err(OrdinaryClaimReleaseError::PersistenceUncertain { source });
+        }
+        let receipt = match transition {
+            OrdinaryClaimReleaseTransition::Replay(receipt)
+            | OrdinaryClaimReleaseTransition::Inserted(receipt) => receipt,
+        };
+        let persisted = ordinary_claims::read_release(&self.connection, request.claim_id())
+            .map_err(|error| OrdinaryClaimReleaseError::PersistenceUncertain {
+                source: ordinary_claim_read_error(error),
+            })?;
+        if persisted
+            != Some(ordinary_claims::OrdinaryClaimReleaseRecord::new(
+                request.claim_id(),
+                request.operation_id(),
+                request.release_id(),
+            ))
+        {
+            return Err(OrdinaryClaimReleaseError::PersistenceUncertain {
+                source: retained_error(
+                    Some(request.operation_id()),
+                    String::from("ordinary claim release readback changed after commit"),
+                ),
+            });
+        }
+        Ok(receipt)
+    }
+
+    #[allow(dead_code)]
+    fn release_ordinary_claim_inside_transaction(
+        &self,
+        request: OrdinaryClaimReleaseRequest,
+    ) -> Result<OrdinaryClaimReleaseTransition, OrdinaryClaimReleaseError> {
+        self.validate_namespace_without_sidecars()
+            .map_err(|source| OrdinaryClaimReleaseError::Persistence { source })?;
+        release_ordinary_claim_transition_inside_transaction(&self.connection, request)
+    }
+
+    #[allow(dead_code)]
+    fn rollback_ordinary_claim_release(
+        &self,
+        error: OrdinaryClaimReleaseError,
+    ) -> OrdinaryClaimReleaseError {
+        match self.rollback_ordinary_claim_release_transaction() {
+            Some(source) => OrdinaryClaimReleaseError::PersistenceUncertain { source },
+            None => error,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn rollback_ordinary_claim_release_transaction(&self) -> Option<OperationJournalStoreError> {
+        #[cfg(test)]
+        if let Some(directive) = self.release_test_directive(ReleaseTestBoundary::Rollback) {
+            match directive {
+                ReleaseTestDirective::Fail(error)
+                | ReleaseTestDirective::FailAndLeaveForRollback(error) => return Some(error),
+                ReleaseTestDirective::ExecuteThenFail(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Some(error);
+                }
+                ReleaseTestDirective::Continue => {}
+            }
+        }
+        self.connection
+            .execute_batch("ROLLBACK")
+            .err()
+            .map(OperationJournalStoreError::from)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn set_release_test_hook<F>(&self, hook: F)
+    where
+        F: FnMut(ReleaseTestBoundary) -> ReleaseTestDirective + Send + 'static,
+    {
+        *self
+            .release_test_hook
+            .lock()
+            .expect("release test hook mutex") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn release_test_directive(
+        &self,
+        boundary: ReleaseTestBoundary,
+    ) -> Option<ReleaseTestDirective> {
+        let mut hook = self
+            .release_test_hook
+            .lock()
+            .expect("release test hook mutex");
+        let directive = hook.as_mut().map(|hook| hook(boundary));
+        if matches!(
+            &directive,
+            Some(ReleaseTestDirective::Fail(_) | ReleaseTestDirective::ExecuteThenFail(_))
+        ) {
+            *hook = None;
+        }
+        directive
+    }
+
     /// Insert one durable intent and expose the exact write-stage outcome.
     ///
     /// This is the typed counterpart to [`Self::insert_intent`]. The returned receipt is exposed
@@ -4721,11 +5110,68 @@ impl OperationJournalStore {
     }
 }
 
+#[allow(dead_code)]
+fn release_ordinary_claim_transition_inside_transaction(
+    connection: &Connection,
+    request: OrdinaryClaimReleaseRequest,
+) -> Result<OrdinaryClaimReleaseTransition, OrdinaryClaimReleaseError> {
+    let claim = ordinary_claims::read_claim(connection, request.claim_id())
+        .map_err(|error| OrdinaryClaimReleaseError::Persistence {
+            source: ordinary_claim_read_error(error),
+        })?
+        .ok_or(OrdinaryClaimReleaseError::ClaimNotFound {
+            claim_id: request.claim_id(),
+        })?;
+    if claim.operation_id() != request.operation_id() {
+        return Err(OrdinaryClaimReleaseError::OperationMismatch {
+            claim_id: request.claim_id(),
+        });
+    }
+    let durable = ordinary_claims::OrdinaryClaimReleaseRecord::new(
+        request.claim_id(),
+        request.operation_id(),
+        request.release_id(),
+    );
+    if let Some(existing) =
+        ordinary_claims::read_release(connection, request.claim_id()).map_err(|error| {
+            OrdinaryClaimReleaseError::Persistence {
+                source: ordinary_claim_read_error(error),
+            }
+        })?
+    {
+        if existing == durable {
+            return Ok(OrdinaryClaimReleaseTransition::Replay(
+                OrdinaryClaimReleaseReceipt::from_claim(&claim, request.release_id()),
+            ));
+        }
+        return Err(OrdinaryClaimReleaseError::ReleaseConflict {
+            claim_id: request.claim_id(),
+        });
+    }
+    ordinary_claims::insert_release_inside_transaction(connection, durable)
+        .and_then(|()| ordinary_claims::verify_release_inside_transaction(connection, durable))
+        .map_err(|error| OrdinaryClaimReleaseError::Persistence {
+            source: ordinary_claim_write_error(error),
+        })?;
+    Ok(OrdinaryClaimReleaseTransition::Inserted(
+        OrdinaryClaimReleaseReceipt::from_claim(&claim, request.release_id()),
+    ))
+}
+
 fn ordinary_claim_write_error(
     error: ordinary_claims::OrdinaryClaimWriteError,
 ) -> OperationJournalStoreError {
     OperationJournalStoreError::InconsistentRecord {
         reason: format!("ordinary claim settlement failed: {error}"),
+    }
+}
+
+#[allow(dead_code)]
+fn ordinary_claim_read_error(
+    error: ordinary_claims::OrdinaryClaimReadError,
+) -> OperationJournalStoreError {
+    OperationJournalStoreError::InconsistentRecord {
+        reason: format!("ordinary claim release read failed: {error}"),
     }
 }
 
@@ -5059,6 +5505,7 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
             | PREVIOUS_JOURNAL_SCHEMA_VERSION
             | RECOVERY_RESERVE_SCHEMA_VERSION
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | ORDINARY_CLAIM_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -5089,6 +5536,7 @@ fn read_sqlite_user_version(
             | PREVIOUS_JOURNAL_SCHEMA_VERSION
             | RECOVERY_RESERVE_SCHEMA_VERSION
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | ORDINARY_CLAIM_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -5169,6 +5617,29 @@ fn validate_existing_schema(
                 String::from("table"),
             ),
         ],
+        ORDINARY_CLAIM_SCHEMA_VERSION => vec![
+            (String::from(JOURNAL_TABLE_NAME), String::from("table")),
+            (
+                String::from(FULL_PROGRESS_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(ordinary_claims::TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::CHARGE_TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve_binding::TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(recovery_reserve::TRANSITION_TABLE_NAME),
+                String::from("table"),
+            ),
+        ],
         JOURNAL_SCHEMA_VERSION => vec![
             (String::from(JOURNAL_TABLE_NAME), String::from("table")),
             (
@@ -5177,6 +5648,10 @@ fn validate_existing_schema(
             ),
             (
                 String::from(ordinary_claims::TABLE_NAME),
+                String::from("table"),
+            ),
+            (
+                String::from(ordinary_claims::RELEASE_TABLE_NAME),
                 String::from("table"),
             ),
             (
@@ -5212,6 +5687,7 @@ fn validate_existing_schema(
         PREVIOUS_JOURNAL_SCHEMA_VERSION
             | RECOVERY_RESERVE_SCHEMA_VERSION
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | ORDINARY_CLAIM_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -5225,6 +5701,7 @@ fn validate_existing_schema(
         schema_version,
         RECOVERY_RESERVE_SCHEMA_VERSION
             | RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | ORDINARY_CLAIM_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -5242,7 +5719,9 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        RECOVERY_RESERVE_BINDING_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        RECOVERY_RESERVE_BINDING_SCHEMA_VERSION
+            | ORDINARY_CLAIM_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -5251,12 +5730,23 @@ fn validate_existing_schema(
             recovery_reserve_binding::CREATE_TABLE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        ORDINARY_CLAIM_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         validate_table_schema(
             connection,
             path,
             ordinary_claims::TABLE_NAME,
             ordinary_claims::CREATE_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            ordinary_claims::RELEASE_TABLE_NAME,
+            ordinary_claims::CREATE_RELEASE_TABLE,
         )?;
     }
     Ok(())
@@ -5388,6 +5878,11 @@ fn validate_table_schema(
                 0,
             ),
         ],
+        ordinary_claims::RELEASE_TABLE_NAME => vec![
+            (String::from("claim_id"), String::from("TEXT"), 1, 1),
+            (String::from("operation_id"), String::from("TEXT"), 1, 0),
+            (String::from("release_id"), String::from("TEXT"), 1, 0),
+        ],
         _ => {
             return Err(audit_error(path, format!("unsupported table {table_name}")));
         }
@@ -5490,6 +5985,7 @@ fn migrate_legacy_schema(
         connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
         connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -5557,6 +6053,7 @@ fn migrate_previous_schema(
         connection.execute_batch(recovery_reserve::CREATE_TRANSITION_TABLE)?;
         connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -5617,6 +6114,7 @@ fn migrate_recovery_reserve_schema(
         validate_existing_schema(connection, database_path, RECOVERY_RESERVE_SCHEMA_VERSION)?;
         connection.execute_batch(recovery_reserve_binding::CREATE_TABLE)?;
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -5680,6 +6178,66 @@ fn migrate_ordinary_claim_schema(
             RECOVERY_RESERVE_BINDING_SCHEMA_VERSION,
         )?;
         connection.execute_batch(ordinary_claims::CREATE_TABLE)?;
+        connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_ordinary_claim_release_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        ORDINARY_CLAIM_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            ORDINARY_CLAIM_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, ORDINARY_CLAIM_SCHEMA_VERSION)?;
+        connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -5760,11 +6318,13 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {charge_table};
              {transition_table};
              {binding_table};
-             {ordinary_claim_table};",
+             {ordinary_claim_table};
+             {ordinary_claim_release_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
             binding_table = recovery_reserve_binding::CREATE_TABLE,
             ordinary_claim_table = ordinary_claims::CREATE_TABLE,
+            ordinary_claim_release_table = ordinary_claims::CREATE_RELEASE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -5906,6 +6466,8 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     #[cfg(target_os = "macos")]
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
 
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -6107,6 +6669,15 @@ mod tests {
             );
         }
         CapacityProvider::qualified_fixture(facts)
+    }
+
+    fn release_request(
+        operation_id: OperationId,
+        claim_id: AdmissionClaimId,
+        release_id: Uuid,
+    ) -> OrdinaryClaimReleaseRequest {
+        OrdinaryClaimReleaseRequest::new(operation_id, claim_id, release_id)
+            .expect("valid ordinary claim release request")
     }
 
     fn ordinary_claim_count(store: &OperationJournalStore) -> usize {
@@ -7078,6 +7649,23 @@ mod tests {
                 params![charge_id.to_string(), transition_id.to_string()],
             )
             .expect("insert v4 recovery transition");
+        drop(connection);
+        (path, encoded)
+    }
+
+    fn write_v5_database(
+        owner: &WritableProfileGuard,
+        record: &StoredOperationRecord,
+        sequence: i64,
+    ) -> (PathBuf, Vec<u8>) {
+        let (path, encoded) = write_v4_database(owner, record, sequence);
+        let connection = Connection::open(&path).expect("open ordinary-claim schema fixture");
+        connection
+            .execute_batch(&format!(
+                "{ordinary_claim_table}; PRAGMA user_version = {ORDINARY_CLAIM_SCHEMA_VERSION};",
+                ordinary_claim_table = ordinary_claims::CREATE_TABLE,
+            ))
+            .expect("create v5 ordinary-claim schema");
         drop(connection);
         (path, encoded)
     }
@@ -10445,6 +11033,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(ordinary_claims::RELEASE_TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(recovery_reserve::CHARGE_TABLE_NAME),
                     String::from("table")
                 ),
@@ -10644,6 +11236,69 @@ mod tests {
                 .is_empty()
         );
         assert!(path.exists());
+    }
+
+    #[test]
+    fn existing_v5_database_migrates_release_relation_without_rewriting_claim_rows() {
+        let fixture = fixture();
+        let record = intent_record(OperationId::new());
+        let (path, encoded) = write_v5_database(&fixture.owner, &record, 19);
+        let claim_id = Uuid::from_u128(7001);
+        let operation_id = record.operation_id.as_uuid();
+        let before = Connection::open(&path).expect("open v5 claim fixture");
+        before
+            .execute(
+                &format!(
+                    "INSERT INTO {} (claim_id, operation_id, volume_device, allocation_class,
+                     allocated_bytes) VALUES (?1, ?2, '1', 'DestinationStaging', 1)",
+                    ordinary_claims::TABLE_NAME
+                ),
+                params![claim_id.to_string(), operation_id.to_string()],
+            )
+            .expect("insert v5 claim fixture");
+        drop(before);
+        let store = OperationJournalStore::open(&fixture.owner).expect("migrate v5 store");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated v5 version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT sequence, record FROM operation_journal WHERE operation_id = ?1",
+                    params![record.operation_id.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .expect("read migrated operation"),
+            (19, encoded)
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", ordinary_claims::TABLE_NAME),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count migrated claim"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {}",
+                        ordinary_claims::RELEASE_TABLE_NAME
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count migrated release relation"),
+            0
+        );
     }
 
     #[test]
@@ -12699,6 +13354,328 @@ mod tests {
             1
         );
         assert_eq!(provider.claim_count(), 1);
+    }
+
+    #[test]
+    fn ordinary_claim_release_subtracts_one_claim_and_replays_after_token_removal() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let mut record = intent_record(operation_id);
+        let (volume, allocation_class) = {
+            let row = &mut record
+                .capacity_plan
+                .as_mut()
+                .expect("intent capacity plan")
+                .volumes[0];
+            row.logical_bytes = 2;
+            row.allocated_bytes = 2;
+            (row.identity.clone(), row.allocation_class.into())
+        };
+        let first_id = AdmissionClaimId::new();
+        let second_id = AdmissionClaimId::new();
+        let claims = AdmissionClaimInventory::new(vec![
+            claim_for_intent(&record, first_id, Some(1)),
+            claim_for_intent(&record, second_id, Some(1)),
+        ])
+        .expect("split claim inventory");
+        let provider = provider_for_intent(&record);
+        let settlement = store
+            .settle_initial_claims(&record, &provider, &claims)
+            .expect("settle split claims");
+        drop(settlement);
+        assert_eq!(provider.outstanding(&volume, allocation_class), 2);
+
+        let first_request = release_request(operation_id, first_id, Uuid::new_v4());
+        store
+            .release_ordinary_claim(first_request, &provider)
+            .expect("release first claim");
+        assert_eq!(provider.outstanding(&volume, allocation_class), 1);
+        store
+            .release_ordinary_claim(first_request, &provider)
+            .expect("replay first release");
+        assert_eq!(provider.outstanding(&volume, allocation_class), 1);
+
+        let conflicting = release_request(operation_id, first_id, Uuid::new_v4());
+        assert!(matches!(
+            store.release_ordinary_claim(conflicting, &provider),
+            Err(OrdinaryClaimReleaseError::ReleaseConflict { claim_id }) if claim_id == first_id
+        ));
+        assert_eq!(provider.outstanding(&volume, allocation_class), 1);
+
+        let second_request = release_request(operation_id, second_id, Uuid::new_v4());
+        store
+            .release_ordinary_claim(second_request, &provider)
+            .expect("release second claim");
+        assert_eq!(provider.outstanding(&volume, allocation_class), 0);
+        assert_eq!(provider.claim_count(), 0);
+        store
+            .release_ordinary_claim(first_request, &provider)
+            .expect("replay after token removal");
+        assert_eq!(provider.outstanding(&volume, allocation_class), 0);
+        assert_eq!(ordinary_claim_count(&store), 2);
+        let release_count: i64 = store
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {}",
+                    ordinary_claims::RELEASE_TABLE_NAME
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count release receipts");
+        assert_eq!(release_count, 2);
+    }
+
+    #[test]
+    fn ordinary_claim_release_retains_charge_when_provider_reconciliation_fails() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let record = intent_record(operation_id);
+        let claims = claims_for_intent(&record);
+        let claim_id = claims.claims()[0].claim_id();
+        let provider = provider_for_intent(&record);
+        let settlement = store
+            .settle_initial_claims(&record, &provider, &claims)
+            .expect("settle claim");
+        drop(settlement);
+        let request = release_request(operation_id, claim_id, Uuid::new_v4());
+        provider.fail_release_for_test();
+        assert!(matches!(
+            store.release_ordinary_claim(request, &provider),
+            Err(OrdinaryClaimReleaseError::ProviderRetained { .. })
+        ));
+        let row = &record
+            .capacity_plan
+            .as_ref()
+            .expect("capacity plan")
+            .volumes[0];
+        assert_eq!(
+            provider.outstanding(&row.identity, row.allocation_class.into()),
+            1
+        );
+        provider.allow_release_for_test();
+        store
+            .release_ordinary_claim(request, &provider)
+            .expect("retry committed release");
+        assert_eq!(
+            provider.outstanding(&row.identity, row.allocation_class.into()),
+            0
+        );
+    }
+
+    #[test]
+    fn ordinary_claim_release_replays_after_journal_reopen() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let record = intent_record(operation_id);
+        let claims = claims_for_intent(&record);
+        let claim_id = claims.claims()[0].claim_id();
+        let provider = provider_for_intent(&record);
+        drop(
+            store
+                .settle_initial_claims(&record, &provider, &claims)
+                .expect("settle claim"),
+        );
+        let request = release_request(operation_id, claim_id, Uuid::new_v4());
+        store
+            .release_ordinary_claim(request, &provider)
+            .expect("release claim");
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        reopened
+            .release_ordinary_claim(request, &provider)
+            .expect("replay durable release after reopen");
+        assert_eq!(provider.claim_count(), 0);
+    }
+
+    #[test]
+    fn ordinary_claim_release_transactions_serialize_same_claim_and_preserve_conflict() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let claim_id = AdmissionClaimId::new();
+        let operation_id = OperationId::new();
+        insert_ordinary_claim(
+            &store,
+            claim_id.as_uuid(),
+            operation_id.as_uuid(),
+            "1",
+            "DestinationStaging",
+            1,
+        )
+        .expect("insert claim fixture");
+        let path = database_path(&fixture.owner);
+        drop(store);
+
+        let release_id = Uuid::new_v4();
+        let first_connection = Connection::open(&path).expect("open first release connection");
+        let second_connection = Connection::open(&path).expect("open second release connection");
+        first_connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .expect("first busy timeout");
+        second_connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .expect("second busy timeout");
+        first_connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("first foreign keys");
+        second_connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("second foreign keys");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_thread = thread::spawn(move || {
+            first_connection
+                .execute_batch("BEGIN EXCLUSIVE")
+                .expect("first begin exclusive");
+            assert!(matches!(
+                release_ordinary_claim_transition_inside_transaction(
+                    &first_connection,
+                    release_request(operation_id, claim_id, release_id),
+                )
+                .expect("first insert release"),
+                OrdinaryClaimReleaseTransition::Inserted(receipt)
+                    if receipt.release_id() == release_id
+            ));
+            ready_tx.send(()).expect("signal first transaction");
+            release_rx.recv().expect("wait to commit first transaction");
+            first_connection
+                .execute_batch("COMMIT")
+                .expect("commit first release");
+        });
+        let second_thread = thread::spawn(move || {
+            ready_rx.recv().expect("wait for first transaction");
+            blocked_tx.send(()).expect("signal second begin");
+            second_connection
+                .execute_batch("BEGIN EXCLUSIVE")
+                .expect("second begin waits for first");
+            assert!(matches!(
+                release_ordinary_claim_transition_inside_transaction(
+                    &second_connection,
+                    release_request(operation_id, claim_id, release_id),
+                )
+                .expect("read serialized release"),
+                OrdinaryClaimReleaseTransition::Replay(receipt)
+                    if receipt.release_id() == release_id
+            ));
+            second_connection
+                .execute_batch("COMMIT")
+                .expect("commit serialized read");
+        });
+        blocked_rx
+            .recv()
+            .expect("second transaction attempted begin");
+        release_tx.send(()).expect("release first transaction");
+        first_thread.join().expect("first release thread");
+        second_thread.join().expect("second release thread");
+
+        let connection = Connection::open(&path).expect("open conflict check connection");
+        connection
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("begin conflict check");
+        let conflicting = release_request(operation_id, claim_id, Uuid::new_v4());
+        assert!(matches!(
+            release_ordinary_claim_transition_inside_transaction(&connection, conflicting),
+            Err(OrdinaryClaimReleaseError::ReleaseConflict { claim_id: id }) if id == claim_id
+        ));
+        connection
+            .execute_batch("ROLLBACK")
+            .expect("rollback conflict check");
+    }
+
+    #[test]
+    fn ordinary_claim_release_retries_post_commit_uncertainty_and_rollback_uncertainty() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let record = intent_record(operation_id);
+        let claims = claims_for_intent(&record);
+        let claim_id = claims.claims()[0].claim_id();
+        let provider = provider_for_intent(&record);
+        drop(
+            store
+                .settle_initial_claims(&record, &provider, &claims)
+                .expect("settle claim"),
+        );
+        let request = release_request(operation_id, claim_id, Uuid::new_v4());
+        store.set_release_test_hook(|boundary| {
+            if boundary == ReleaseTestBoundary::AfterCommit {
+                ReleaseTestDirective::Fail(OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("injected post-commit acknowledgement failure"),
+                })
+            } else {
+                ReleaseTestDirective::Continue
+            }
+        });
+        assert!(matches!(
+            store.release_ordinary_claim(request, &provider),
+            Err(OrdinaryClaimReleaseError::PersistenceUncertain { .. })
+        ));
+        assert_eq!(
+            provider.outstanding(&VolumeIdentity { device: 1 }, row_class(&record)),
+            1
+        );
+        store
+            .release_ordinary_claim(request, &provider)
+            .expect("retry post-commit release");
+        assert_eq!(
+            provider.outstanding(&VolumeIdentity { device: 1 }, row_class(&record)),
+            0
+        );
+
+        let operation_id = OperationId::new();
+        let record = intent_record(operation_id);
+        let claims = claims_for_intent(&record);
+        let claim_id = claims.claims()[0].claim_id();
+        let provider = provider_for_intent(&record);
+        drop(
+            store
+                .settle_initial_claims(&record, &provider, &claims)
+                .expect("settle second claim"),
+        );
+        let request = release_request(operation_id, claim_id, Uuid::new_v4());
+        store.set_release_test_hook(|boundary| match boundary {
+            ReleaseTestBoundary::BeforePrecommitValidation => {
+                ReleaseTestDirective::FailAndLeaveForRollback(
+                    OperationJournalStoreError::InconsistentRecord {
+                        reason: String::from("injected pre-commit failure"),
+                    },
+                )
+            }
+            ReleaseTestBoundary::Rollback => ReleaseTestDirective::ExecuteThenFail(
+                OperationJournalStoreError::InconsistentRecord {
+                    reason: String::from("injected rollback uncertainty"),
+                },
+            ),
+            _ => ReleaseTestDirective::Continue,
+        });
+        assert!(matches!(
+            store.release_ordinary_claim(request, &provider),
+            Err(OrdinaryClaimReleaseError::PersistenceUncertain { .. })
+        ));
+        store
+            .release_ordinary_claim(request, &provider)
+            .expect("retry rollback uncertainty");
+        assert_eq!(
+            provider.outstanding(&VolumeIdentity { device: 1 }, row_class(&record)),
+            0
+        );
+    }
+
+    fn row_class(
+        record: &StoredOperationRecord,
+    ) -> crate::operation_journal::full_capacity::FullCapacityAllocationClass {
+        record
+            .capacity_plan
+            .as_ref()
+            .expect("capacity plan")
+            .volumes[0]
+            .allocation_class
+            .into()
     }
 
     #[test]

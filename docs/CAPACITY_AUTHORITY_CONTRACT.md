@@ -262,6 +262,43 @@ changing the original charge. This slice does not upgrade full-progress
 observations, expose a production write API, settle later releases, rebuild
 claims, or enable the unavailable ordinary admission gate.
 
+OPT-1559 adds the v6 `operation_journal_ordinary_claim_release` relation. It is
+an immutable, claim-keyed receipt containing the durable operation identity and
+one stable release-transition identity; the original ordinary-claim row remains
+available as evidence. Only the crate-private owner-thread release request may
+create the receipt, and it reads volume, allocation class, and allocated bytes
+from the durable claim row. A snapshot or settlement observation cannot create
+one. The store commits and reads the receipt back before asking the retained
+provider ledger to subtract bytes.
+
+The provider ledger retains the exact per-claim volume, class, and byte mapping
+inside each aggregate token. A release subtracts one matching claim after
+checking the operation, claim, release identity, and current aggregate for
+underflow; all checks complete before mutation. Other claims and residual token
+charges remain held. A token is removed only after every claim in that token is
+released, while the private release history makes replay after removal
+idempotent. Zero, conflicting, missing, or ambiguous matches fail closed.
+Provider failure, rollback uncertainty, commit uncertainty, or post-commit
+readback uncertainty retains the charge and stable request identity for retry.
+This logical release does not delete ordinary rows, clean physical data,
+replenish the recovery reserve, rebuild the provider after restart, or enable
+ordinary admission.
+
+The bounded OPT-1559 checklist is:
+
+- migrate v5 databases to strict schema v6 and reject unknown objects, columns,
+  indexes, malformed identities, and mismatched release readback;
+- persist one exact receipt per claim through the owner-thread transaction and
+  return only a private receipt after commit and readback;
+- retry exact requests idempotently, reject conflicting request identities, and
+  preserve the original ordinary row and actionable provider charge on every
+  uncertain or failed reconciliation;
+- subtract one claim atomically from a uniquely identified retained token,
+  fail closed on ambiguity, preserve residual claims, and guard replay after
+  the final token is removed;
+- exercise multi-claim, duplicate/conflict, failure and uncertainty, reopen,
+  concurrent serialization, retained-evidence, and v5-to-v6 migration cases.
+
 ## Acceptance checks for implementation children
 
 These are required future checks, not evidence that this documentation change

@@ -17,8 +17,10 @@ use super::admission_claims::{
 use super::full_capacity::{
     FullCapacityAllocationClass, FullCapacityPlan, MAX_FULL_CAPACITY_ALLOCATIONS,
 };
+use super::store::OrdinaryClaimReleaseReceipt;
 use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity};
 use crate::operation_journal::model::OperationId;
+use uuid::Uuid;
 
 const INITIAL_LEASE_TOKEN: u64 = 1;
 
@@ -61,6 +63,7 @@ struct ProvisionalLedger {
     next_token: u64,
     charges_by_token: BTreeMap<u64, LedgerCharge>,
     aggregate_charges: BTreeMap<ChargeKey, u64>,
+    released_claims: BTreeMap<AdmissionClaimId, ReleasedClaim>,
     #[cfg(test)]
     fail_release: bool,
     #[cfg(test)]
@@ -70,7 +73,25 @@ struct ProvisionalLedger {
 #[derive(Clone, Debug)]
 struct LedgerCharge {
     charges: BTreeMap<ChargeKey, u64>,
+    claims: BTreeMap<AdmissionClaimId, LedgerClaim>,
     disposition: ProvisionalLeaseDisposition,
+}
+
+#[derive(Clone, Debug)]
+struct LedgerClaim {
+    volume: VolumeIdentity,
+    allocation_class: FullCapacityAllocationClass,
+    allocated_bytes: u64,
+    release_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug)]
+struct ReleasedClaim {
+    operation_id: OperationId,
+    volume: VolumeIdentity,
+    allocation_class: FullCapacityAllocationClass,
+    allocated_bytes: u64,
+    release_id: Uuid,
 }
 
 impl Default for ProvisionalLedger {
@@ -79,6 +100,7 @@ impl Default for ProvisionalLedger {
             next_token: INITIAL_LEASE_TOKEN,
             charges_by_token: BTreeMap::new(),
             aggregate_charges: BTreeMap::new(),
+            released_claims: BTreeMap::new(),
             #[cfg(test)]
             fail_release: false,
             #[cfg(test)]
@@ -256,10 +278,26 @@ impl CapacityProvider {
                 .checked_add(*bytes)
                 .expect("provisional aggregate was checked before mutation");
         }
+        let claim_by_id = claims
+            .claims()
+            .iter()
+            .map(|claim| {
+                (
+                    claim.claim_id(),
+                    LedgerClaim {
+                        volume: claim.volume().clone(),
+                        allocation_class: claim.allocation_class(),
+                        allocated_bytes: claim.allocated_bytes(),
+                        release_id: None,
+                    },
+                )
+            })
+            .collect();
         ledger.charges_by_token.insert(
             next_token - 1,
             LedgerCharge {
                 charges: charge_by_key.clone(),
+                claims: claim_by_id,
                 disposition: ProvisionalLeaseDisposition::Provisional,
             },
         );
@@ -277,6 +315,182 @@ impl CapacityProvider {
             claim_ids,
             disposition: ProvisionalLeaseDisposition::Provisional,
         })
+    }
+
+    /// Apply one already-acknowledged ordinary-claim release to the retained owner-thread ledger.
+    ///
+    /// A claim identity must map to exactly one retained token, and all metadata must match the
+    /// durable receipt before any aggregate byte is decremented. Successful releases remain in a
+    /// private history so replay is idempotent even after the final token is removed.
+    pub(crate) fn release_claim(
+        &self,
+        receipt: &OrdinaryClaimReleaseReceipt,
+    ) -> Result<(), CapacityProviderError> {
+        let mut ledger = self
+            .ledger
+            .try_borrow_mut()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        if receipt.allocated_bytes() == 0 || receipt.release_id().is_nil() {
+            return Err(CapacityProviderError::ClaimReleaseConflict);
+        }
+        let released_history = ledger.released_claims.get(&receipt.claim_id()).cloned();
+        let release_id_in_use = ledger
+            .released_claims
+            .values()
+            .any(|released| released.release_id == receipt.release_id());
+        #[cfg(test)]
+        if ledger.fail_release {
+            return Err(CapacityProviderError::ReleaseFailed);
+        }
+
+        let mut matching_tokens = Vec::new();
+        let mut matching_metadata = None;
+        let mut unreleased_tokens = Vec::new();
+        for (token, entry) in &ledger.charges_by_token {
+            let retained = matches!(
+                entry.disposition,
+                ProvisionalLeaseDisposition::Durable { .. }
+                    | ProvisionalLeaseDisposition::AuditPending { .. }
+            );
+            if !retained {
+                continue;
+            }
+            let Some(claim) = entry.claims.get(&receipt.claim_id()) else {
+                continue;
+            };
+            matching_tokens.push(*token);
+            if claim.release_id.is_none() {
+                unreleased_tokens.push(*token);
+            }
+            if claim.volume == *receipt.volume()
+                && claim.allocation_class == receipt.allocation_class()
+                && claim.allocated_bytes == receipt.allocated_bytes()
+                && claim.release_id.is_none()
+                && disposition_operation(&entry.disposition) == Some(receipt.operation_id())
+            {
+                matching_metadata = Some((
+                    *token,
+                    ChargeKey {
+                        volume: claim.volume.clone(),
+                        allocation_class: claim.allocation_class,
+                    },
+                    claim.allocated_bytes,
+                ));
+            }
+        }
+        if let Some(released) = released_history {
+            if released.operation_id != receipt.operation_id()
+                || released.volume != *receipt.volume()
+                || released.allocation_class != receipt.allocation_class()
+                || released.allocated_bytes != receipt.allocated_bytes()
+                || released.release_id != receipt.release_id()
+            {
+                return Err(CapacityProviderError::ClaimReleaseConflict);
+            }
+            if matching_tokens.len() > 1 || !unreleased_tokens.is_empty() {
+                return Err(if matching_tokens.len() > 1 {
+                    CapacityProviderError::ClaimReleaseAmbiguous
+                } else {
+                    CapacityProviderError::ClaimReleaseConflict
+                });
+            }
+            return Ok(());
+        }
+        if release_id_in_use {
+            return Err(CapacityProviderError::ClaimReleaseConflict);
+        }
+        if matching_tokens.is_empty() {
+            return Err(CapacityProviderError::ClaimReleaseNotFound);
+        }
+        if matching_tokens.len() != 1 {
+            return Err(CapacityProviderError::ClaimReleaseAmbiguous);
+        }
+        let Some((token, key, bytes)) = matching_metadata else {
+            return Err(CapacityProviderError::ClaimReleaseConflict);
+        };
+
+        {
+            let entry = ledger
+                .charges_by_token
+                .get(&token)
+                .ok_or(CapacityProviderError::ClaimReleaseNotFound)?;
+            let claim = entry
+                .claims
+                .get(&receipt.claim_id())
+                .ok_or(CapacityProviderError::ClaimReleaseNotFound)?;
+            if claim.release_id.is_some()
+                || claim.volume != *receipt.volume()
+                || claim.allocation_class != receipt.allocation_class()
+                || claim.allocated_bytes != bytes
+                || disposition_operation(&entry.disposition) != Some(receipt.operation_id())
+            {
+                return Err(CapacityProviderError::ClaimReleaseConflict);
+            }
+            let current = entry
+                .charges
+                .get(&key)
+                .copied()
+                .ok_or(CapacityProviderError::ReleaseFailed)?;
+            if current < bytes {
+                return Err(CapacityProviderError::ReleaseFailed);
+            }
+        }
+        let aggregate = ledger
+            .aggregate_charges
+            .get(&key)
+            .copied()
+            .ok_or(CapacityProviderError::ReleaseFailed)?;
+        if aggregate < bytes {
+            return Err(CapacityProviderError::ReleaseFailed);
+        }
+
+        {
+            let current = ledger
+                .aggregate_charges
+                .get_mut(&key)
+                .expect("validated retained aggregate");
+            *current -= bytes;
+            if *current == 0 {
+                ledger.aggregate_charges.remove(&key);
+            }
+        }
+        let all_released = {
+            let entry = ledger
+                .charges_by_token
+                .get_mut(&token)
+                .expect("validated retained token");
+            let current = entry
+                .charges
+                .get_mut(&key)
+                .expect("validated retained token charge");
+            *current -= bytes;
+            if *current == 0 {
+                entry.charges.remove(&key);
+            }
+            let claim = entry
+                .claims
+                .get_mut(&receipt.claim_id())
+                .expect("validated retained claim");
+            claim.release_id = Some(receipt.release_id());
+            entry
+                .claims
+                .values()
+                .all(|claim| claim.release_id.is_some())
+        };
+        ledger.released_claims.insert(
+            receipt.claim_id(),
+            ReleasedClaim {
+                operation_id: receipt.operation_id(),
+                volume: receipt.volume().clone(),
+                allocation_class: receipt.allocation_class(),
+                allocated_bytes: receipt.allocated_bytes(),
+                release_id: receipt.release_id(),
+            },
+        );
+        if all_released {
+            ledger.charges_by_token.remove(&token);
+        }
+        Ok(())
     }
 
     fn admission_gate(&self) -> Result<(), ()> {
@@ -647,12 +861,26 @@ pub(crate) enum CapacityProviderError {
     LedgerBusy,
     #[error("provisional capacity release failed; accounting remains held")]
     ReleaseFailed,
+    #[error("ordinary claim release has no unique retained capacity token")]
+    ClaimReleaseNotFound,
+    #[error("ordinary claim release matches multiple retained capacity tokens")]
+    ClaimReleaseAmbiguous,
+    #[error("ordinary claim release identity or durable metadata conflicts")]
+    ClaimReleaseConflict,
     #[error("provisional capacity is retained by a durable or audit-pending intent")]
     LeaseRetained,
     #[error("provisional lease disposition does not match the requested operation")]
     LeaseDispositionConflict,
     #[error("provisional capacity cannot transfer to a durable intent yet")]
     IntentTransferUnavailable,
+}
+
+fn disposition_operation(disposition: &ProvisionalLeaseDisposition) -> Option<OperationId> {
+    match disposition {
+        ProvisionalLeaseDisposition::Durable { operation_id, .. }
+        | ProvisionalLeaseDisposition::AuditPending { operation_id, .. } => Some(*operation_id),
+        ProvisionalLeaseDisposition::Provisional | ProvisionalLeaseDisposition::Released => None,
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +974,68 @@ mod tests {
         );
         drop(second);
         assert_eq!(provider.claim_count(), 0);
+    }
+
+    #[test]
+    fn ordinary_release_fails_closed_for_ambiguous_or_reused_claim_identity() {
+        let volume = VolumeIdentity { device: 11 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let (plan, claims) = plan_and_claims(&[(volume.clone(), class, 4096, 4096)]);
+        let mut fixture = BTreeMap::new();
+        fixture.insert(
+            volume.clone(),
+            facts(11, PROTECTED_FREE_SPACE_FLOOR + 8192, 4096),
+        );
+        let provider = CapacityProvider::qualified_fixture(fixture);
+        let operation_one = OperationId::new();
+        let operation_two = OperationId::new();
+        let mut first = provider.admit(&plan, &claims).expect("first lease");
+        first.mark_durable(operation_one).expect("first durable");
+        drop(first);
+        let mut second = provider.admit(&plan, &claims).expect("second lease");
+        second.mark_durable(operation_two).expect("second durable");
+        drop(second);
+        let claim = &claims.claims()[0];
+        let ambiguous = OrdinaryClaimReleaseReceipt::for_test(
+            operation_one,
+            claim.claim_id(),
+            Uuid::new_v4(),
+            volume.clone(),
+            class,
+            claim.allocated_bytes(),
+        );
+        assert!(matches!(
+            provider.release_claim(&ambiguous),
+            Err(CapacityProviderError::ClaimReleaseAmbiguous)
+        ));
+        assert_eq!(provider.outstanding(&volume, class), 8192);
+
+        let unique = CapacityProvider::qualified_fixture(BTreeMap::from([(
+            volume.clone(),
+            facts(11, PROTECTED_FREE_SPACE_FLOOR + 4096, 4096),
+        )]));
+        let mut lease = unique.admit(&plan, &claims).expect("unique lease");
+        lease.mark_durable(operation_one).expect("unique durable");
+        drop(lease);
+        let released = OrdinaryClaimReleaseReceipt::for_test(
+            operation_one,
+            claim.claim_id(),
+            Uuid::new_v4(),
+            volume.clone(),
+            class,
+            claim.allocated_bytes(),
+        );
+        unique
+            .release_claim(&released)
+            .expect("release unique claim");
+        let mut reused = unique.admit(&plan, &claims).expect("reused claim lease");
+        reused.mark_durable(operation_two).expect("reused durable");
+        drop(reused);
+        assert!(matches!(
+            unique.release_claim(&released),
+            Err(CapacityProviderError::ClaimReleaseConflict)
+        ));
+        assert_eq!(unique.outstanding(&volume, class), 4096);
     }
 
     #[test]

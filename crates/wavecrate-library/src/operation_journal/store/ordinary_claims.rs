@@ -1,8 +1,9 @@
 //! Durable observations of ordinary capacity claims.
 //!
 //! Rows in this table preserve the claim identity and the operation association that an owner
-//! recorded. They are deliberately observations only: this module has no write, settlement,
-//! admission, or physical-capacity authority API.
+//! recorded. Ordinary claim rows remain immutable observations; the private release relation is
+//! written only by the owner-thread store transaction and proves one logical release identity.
+//! Neither relation grants admission, physical cleanup, or physical-capacity authority.
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Row, params};
@@ -15,6 +16,7 @@ use crate::operation_journal::full_capacity::FullCapacityAllocationClass;
 use crate::operation_journal::model::OperationId;
 
 pub(super) const TABLE_NAME: &str = "operation_journal_ordinary_claim";
+pub(super) const RELEASE_TABLE_NAME: &str = "operation_journal_ordinary_claim_release";
 pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_ordinary_claim (
     claim_id TEXT NOT NULL PRIMARY KEY,
     operation_id TEXT NOT NULL,
@@ -62,6 +64,43 @@ pub(super) const CREATE_TABLE: &str = "CREATE TABLE operation_journal_ordinary_c
     )),
     CHECK (typeof(allocated_bytes) = 'integer' AND allocated_bytes > 0)
 )";
+pub(super) const CREATE_RELEASE_TABLE: &str =
+    "CREATE TABLE operation_journal_ordinary_claim_release (
+    claim_id TEXT NOT NULL PRIMARY KEY,
+    operation_id TEXT NOT NULL,
+    release_id TEXT NOT NULL UNIQUE,
+    CHECK (
+        length(claim_id) = 36
+        AND substr(claim_id, 9, 1) = '-'
+        AND substr(claim_id, 14, 1) = '-'
+        AND substr(claim_id, 19, 1) = '-'
+        AND substr(claim_id, 24, 1) = '-'
+        AND length(replace(claim_id, '-', '')) = 32
+        AND claim_id NOT GLOB '*[^0-9a-f-]*'
+    ),
+    CHECK (claim_id <> '00000000-0000-0000-0000-000000000000'),
+    CHECK (
+        length(operation_id) = 36
+        AND substr(operation_id, 9, 1) = '-'
+        AND substr(operation_id, 14, 1) = '-'
+        AND substr(operation_id, 19, 1) = '-'
+        AND substr(operation_id, 24, 1) = '-'
+        AND length(replace(operation_id, '-', '')) = 32
+        AND operation_id NOT GLOB '*[^0-9a-f-]*'
+    ),
+    CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'),
+    CHECK (
+        length(release_id) = 36
+        AND substr(release_id, 9, 1) = '-'
+        AND substr(release_id, 14, 1) = '-'
+        AND substr(release_id, 19, 1) = '-'
+        AND substr(release_id, 24, 1) = '-'
+        AND length(replace(release_id, '-', '')) = 32
+        AND release_id NOT GLOB '*[^0-9a-f-]*'
+    ),
+    CHECK (release_id <> '00000000-0000-0000-0000-000000000000'),
+    FOREIGN KEY (claim_id) REFERENCES operation_journal_ordinary_claim(claim_id)
+)";
 
 pub(crate) const MAX_PAGE_ROWS: usize = MAX_ADMISSION_CLAIMS;
 const MAX_UUID_TEXT_BYTES: usize = 36;
@@ -94,6 +133,40 @@ pub(crate) struct OrdinaryClaimRecord {
     volume: VolumeIdentity,
     allocation_class: FullCapacityAllocationClass,
     allocated_bytes: u64,
+}
+
+/// Immutable proof that one durable ordinary claim was logically released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinaryClaimReleaseRecord {
+    claim_id: AdmissionClaimId,
+    operation_id: OperationId,
+    release_id: Uuid,
+}
+
+impl OrdinaryClaimReleaseRecord {
+    pub(crate) fn new(
+        claim_id: AdmissionClaimId,
+        operation_id: OperationId,
+        release_id: Uuid,
+    ) -> Self {
+        Self {
+            claim_id,
+            operation_id,
+            release_id,
+        }
+    }
+
+    pub(crate) fn claim_id(self) -> AdmissionClaimId {
+        self.claim_id
+    }
+
+    pub(crate) fn operation_id(self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn release_id(self) -> Uuid {
+        self.release_id
+    }
 }
 
 impl OrdinaryClaimRecord {
@@ -157,6 +230,10 @@ pub(crate) enum OrdinaryClaimWriteError {
     },
     #[error("ordinary claim readback for operation {operation_id} did not match the submitted set")]
     ReadbackMismatch { operation_id: OperationId },
+    #[error(
+        "ordinary claim release readback for claim {claim_id} did not match the submitted identity"
+    )]
+    ReleaseReadbackMismatch { claim_id: AdmissionClaimId },
     #[error("ordinary claim SQLite error: {0}")]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -214,6 +291,64 @@ pub(super) fn verify_rows_inside_transaction(
     actual.sort_by_key(OrdinaryClaimRecord::claim_id);
     if actual != expected {
         return Err(OrdinaryClaimWriteError::ReadbackMismatch { operation_id });
+    }
+    Ok(())
+}
+
+pub(super) fn read_claim(
+    connection: &Connection,
+    claim_id: AdmissionClaimId,
+) -> Result<Option<OrdinaryClaimRecord>, OrdinaryClaimReadError> {
+    let claim_text = claim_id.to_string();
+    let mut statement = connection.prepare(&format!(
+        "SELECT claim_id, operation_id, volume_device, allocation_class, allocated_bytes
+         FROM {TABLE_NAME}
+         WHERE claim_id = ?1"
+    ))?;
+    let mut rows = statement.query(params![claim_text])?;
+    rows.next()?.map(decode_row).transpose()
+}
+
+pub(super) fn read_release(
+    connection: &Connection,
+    claim_id: AdmissionClaimId,
+) -> Result<Option<OrdinaryClaimReleaseRecord>, OrdinaryClaimReadError> {
+    let claim_text = claim_id.to_string();
+    let mut statement = connection.prepare(&format!(
+        "SELECT claim_id, operation_id, release_id
+         FROM {RELEASE_TABLE_NAME}
+         WHERE claim_id = ?1"
+    ))?;
+    let mut rows = statement.query(params![claim_text])?;
+    rows.next()?.map(decode_release_row).transpose()
+}
+
+pub(super) fn insert_release_inside_transaction(
+    connection: &Connection,
+    release: OrdinaryClaimReleaseRecord,
+) -> Result<(), OrdinaryClaimWriteError> {
+    connection.execute(
+        &format!(
+            "INSERT INTO {RELEASE_TABLE_NAME} (claim_id, operation_id, release_id)
+             VALUES (?1, ?2, ?3)"
+        ),
+        params![
+            release.claim_id().to_string(),
+            release.operation_id().to_string(),
+            release.release_id().to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn verify_release_inside_transaction(
+    connection: &Connection,
+    release: OrdinaryClaimReleaseRecord,
+) -> Result<(), OrdinaryClaimWriteError> {
+    if read_release(connection, release.claim_id())? != Some(release) {
+        return Err(OrdinaryClaimWriteError::ReleaseReadbackMismatch {
+            claim_id: release.claim_id(),
+        });
     }
     Ok(())
 }
@@ -399,6 +534,28 @@ fn decode_row(row: &Row<'_>) -> Result<OrdinaryClaimRecord, OrdinaryClaimReadErr
         },
         allocation_class,
         allocated_bytes,
+    })
+}
+
+fn decode_release_row(row: &Row<'_>) -> Result<OrdinaryClaimReleaseRecord, OrdinaryClaimReadError> {
+    let claim_text = text_value(row, 0, "claim_id", None, MAX_UUID_TEXT_BYTES)?;
+    let claim_uuid = parse_uuid(&claim_text, "claim_id", false)?;
+    let claim_id = AdmissionClaimId::from_uuid(claim_uuid)
+        .map_err(|error| malformed(Some(&claim_text), error.to_string()))?;
+    let operation_text = text_value(
+        row,
+        1,
+        "operation_id",
+        Some(&claim_text),
+        MAX_UUID_TEXT_BYTES,
+    )?;
+    let operation_id = OperationId::from_uuid(parse_uuid(&operation_text, "operation_id", false)?);
+    let release_text = text_value(row, 2, "release_id", Some(&claim_text), MAX_UUID_TEXT_BYTES)?;
+    let release_id = parse_uuid(&release_text, "release_id", false)?;
+    Ok(OrdinaryClaimReleaseRecord {
+        claim_id,
+        operation_id,
+        release_id,
     })
 }
 
