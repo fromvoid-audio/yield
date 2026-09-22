@@ -5,6 +5,15 @@ defines the private owner-thread boundary needed by the later capacity issues;
 the shapes below are proposed and are not implemented by this document. The
 production admission gate remains unavailable.
 
+## File effects remain a separate owner (OPT-1629)
+
+Capacity proofs, ordinary claims, and chunk tickets authorize bounded capacity
+accounting only. They do not authorize filesystem effects, target-root access,
+publication, cleanup, or source/database transactions. The proposed
+[FileOperationOwner command/result contract](FILE_OPERATION_OWNER_CONTRACT.md) keeps
+those effects behind a separate retained-root owner and live fence checks; this
+capacity contract does not add that runtime or create a live file-write adapter.
+
 ## Current lifetime boundary
 
 The existing implementation already makes the lifetime problem explicit:

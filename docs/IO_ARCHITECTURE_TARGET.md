@@ -56,6 +56,16 @@ uses the existing durable owner/epoch transaction and emits the old-generation a
 after commit, including a post-commit reopen failure. This bounded handoff adds no schema,
 source-writer routing, provider qualification, or production admission.
 
+### Proposed FileOperationOwner contract (OPT-1629)
+
+The bounded command/result and capability-fence decision for filesystem effects is in
+[FILE_OPERATION_OWNER_CONTRACT.md](FILE_OPERATION_OWNER_CONTRACT.md). It is a design
+artifact only: this worktree has no general `FileOperationOwner` runtime, and the
+source-local file-operation journal remains recovery evidence rather than filesystem
+authority. Capacity claims, source fences, and stored progress observations must not
+be used as path-based or writer authority until the follow-up owner and producer
+adapters exist.
+
 Once the source lease has retired, the catalog records the receipt and sealed ack in a
 bounded pending-finalization carrier before sending the journal finalization command. It
 polls an existing request before retrying, preserves the exact ack through queue rejection,
