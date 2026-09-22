@@ -6,6 +6,7 @@
 //! durable evidence that the previous owner may have left work requiring reconciliation.
 
 use std::{
+    cell::Cell,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
@@ -96,6 +97,9 @@ pub(crate) enum VolumeOwnershipError {
     /// The marker changed while this capability was retained.
     #[error("volume ownership marker changed at {path}")]
     MarkerChanged { path: PathBuf },
+    /// A clean handoff was attempted; this owner can no longer perform capacity work.
+    #[error("volume ownership handoff was fenced at {path}")]
+    HandoffFenced { path: PathBuf },
     /// Marker generations cannot wrap.
     #[error("volume ownership marker generation overflowed")]
     GenerationOverflow,
@@ -147,7 +151,8 @@ impl RegistryRoot {
 ///
 /// The `Rc` marker intentionally makes this capability non-`Send` and non-`Sync`; a future
 /// owner must retain it on the serialized journal-owner thread. Dropping it releases only the
-/// operating-system lock. Production has no clean-release method in this milestone.
+/// operating-system lock; an orderly owner shutdown must use the private clean-handoff method
+/// before dropping the capability.
 #[derive(Debug)]
 pub(crate) struct VolumeOwnershipCapability {
     registry: RegistryRoot,
@@ -156,6 +161,9 @@ pub(crate) struct VolumeOwnershipCapability {
     lock_identity: String,
     lock_file: File,
     marker: OwnershipMarker,
+    /// Set before attempting a clean write.  A failed or uncertain write must never let this
+    /// runtime continue using the old generation as if the handoff had not started.
+    handoff_fenced: Rc<Cell<bool>>,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
@@ -180,8 +188,9 @@ impl VolumeOwnershipCapability {
 
     /// Duplicate the retained lock descriptors for a short-lived recovery context.
     ///
-    /// The duplicate shares the already-acquired OS lock; it never performs a second path-based
-    /// acquisition. The owner runtime keeps the original capability until the journal closes.
+    /// The duplicate shares the already-acquired OS lock and handoff fence; it never performs a
+    /// second path-based acquisition. The owner runtime keeps the original capability until the
+    /// journal closes.
     pub(super) fn try_clone_for_context(&self) -> Result<Self, VolumeOwnershipError> {
         let registry_capability = self.registry.capability.try_clone().map_err(|source| {
             VolumeOwnershipError::MarkerIo {
@@ -207,12 +216,18 @@ impl VolumeOwnershipCapability {
             lock_identity: self.lock_identity.clone(),
             lock_file,
             marker: self.marker.clone(),
+            handoff_fenced: Rc::clone(&self.handoff_fenced),
             _owner_thread: PhantomData,
         })
     }
 
     /// Revalidate the retained registry root, lock entry, and dirty marker.
     pub(super) fn revalidate(&self) -> Result<(), VolumeOwnershipError> {
+        if self.handoff_fenced.get() {
+            return Err(VolumeOwnershipError::HandoffFenced {
+                path: self.lock_path.clone(),
+            });
+        }
         self.registry.validate()?;
         let lock = open_existing_lock(&self.registry.capability, &self.lock_path)?;
         let identity =
@@ -234,22 +249,98 @@ impl VolumeOwnershipCapability {
         Ok(())
     }
 
+    /// Durably mark this owner clean as the final step of an orderly owner-thread handoff.
+    ///
+    /// The capability is fenced before any bytes are changed.  A file or directory sync error
+    /// therefore leaves the runtime unable to continue capacity work even when the bytes may have
+    /// reached storage; callers receive no success receipt and must retain conservative evidence.
+    pub(super) fn mark_clean_after_handoff(&mut self) -> Result<(), VolumeOwnershipError> {
+        self.mark_clean_after_handoff_with_sync(sync_directory)
+    }
+
+    fn mark_clean_after_handoff_with_sync<Sync>(
+        &mut self,
+        sync: Sync,
+    ) -> Result<(), VolumeOwnershipError>
+    where
+        Sync: Fn(&Dir, &Path) -> Result<(), VolumeOwnershipError>,
+    {
+        self.mark_clean_after_handoff_with_ops(write_marker, sync)
+    }
+
+    fn mark_clean_after_handoff_with_ops<WriteMarker, Sync>(
+        &mut self,
+        write: WriteMarker,
+        sync: Sync,
+    ) -> Result<(), VolumeOwnershipError>
+    where
+        WriteMarker: Fn(&mut File, &Path, &OwnershipMarker) -> Result<(), VolumeOwnershipError>,
+        Sync: Fn(&Dir, &Path) -> Result<(), VolumeOwnershipError>,
+    {
+        if self.handoff_fenced.get() {
+            return Err(VolumeOwnershipError::HandoffFenced {
+                path: self.lock_path.clone(),
+            });
+        }
+        self.revalidate()?;
+        self.handoff_fenced.set(true);
+        let mut clean_marker = self.marker.clone();
+        clean_marker.state = MarkerState::Clean;
+        let result = (|| {
+            let mut lock =
+                self.lock_file
+                    .try_clone()
+                    .map_err(|source| VolumeOwnershipError::MarkerIo {
+                        path: self.lock_path.clone(),
+                        source,
+                    })?;
+            write(&mut lock, &self.lock_path, &clean_marker)?;
+            sync(&self.registry.capability, &self.registry.path)?;
+            Ok::<(), VolumeOwnershipError>(())
+        })();
+        if result.is_ok() {
+            self.marker = clean_marker;
+        }
+        result
+    }
+
     #[cfg(test)]
     fn test_release_clean(&mut self) -> Result<(), VolumeOwnershipError> {
-        self.marker.state = MarkerState::Clean;
-        let mut lock =
-            self.lock_file
-                .try_clone()
-                .map_err(|source| VolumeOwnershipError::MarkerIo {
-                    path: self.lock_path.clone(),
-                    source,
-                })?;
-        write_marker(&mut lock, &self.lock_path, &self.marker)
+        self.mark_clean_after_handoff()
+    }
+
+    #[cfg(test)]
+    fn test_mark_clean_with_sync_failure<Sync>(
+        &mut self,
+        sync: Sync,
+    ) -> Result<(), VolumeOwnershipError>
+    where
+        Sync: Fn(&Dir, &Path) -> Result<(), VolumeOwnershipError>,
+    {
+        self.mark_clean_after_handoff_with_sync(sync)
+    }
+
+    #[cfg(test)]
+    fn test_mark_clean_with_write_failure(&mut self) -> Result<(), VolumeOwnershipError> {
+        self.mark_clean_after_handoff_with_ops(
+            |_, path, _| {
+                Err(VolumeOwnershipError::MarkerIo {
+                    path: path.to_path_buf(),
+                    source: io::Error::other("injected pre-write failure"),
+                })
+            },
+            sync_directory,
+        )
     }
 
     #[cfg(test)]
     fn lock_path_for_test(&self) -> &Path {
         &self.lock_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn marker_is_clean_for_test(&self) -> bool {
+        self.marker.state == MarkerState::Clean
     }
 }
 
@@ -272,6 +363,27 @@ pub(super) fn acquire_for_descriptor(
         facts.identity,
         profile.profile_root_identity().to_owned(),
         false,
+    )
+}
+
+/// Acquire a volume owner for restart after a confirmed clean marker.  The acquisition writes a
+/// new dirty generation while the lock is held; the caller must complete the private durable-zero
+/// and physical-proof checks before it can rebind the reserve generation or mark the owner clean.
+pub(super) fn acquire_for_descriptor_after_clean_handoff(
+    descriptor: &File,
+    profile: &WritableProfileGuard,
+) -> Result<VolumeOwnershipCapability, VolumeOwnershipError> {
+    let registry = production_registry_root()?;
+    profile
+        .validate_current()
+        .map_err(|error| root_error(PathBuf::from("profile-owner.lock"), error))?;
+    let facts = descriptor_capacity_facts(descriptor)
+        .map_err(|_| VolumeOwnershipError::VolumeIdentityUnavailable)?;
+    acquire_inner(
+        registry,
+        facts.identity,
+        profile.profile_root_identity().to_owned(),
+        true,
     )
 }
 
@@ -417,6 +529,7 @@ where
         lock_identity,
         lock_file,
         marker,
+        handoff_fenced: Rc::new(Cell::new(false)),
         _owner_thread: PhantomData,
     };
     capability.revalidate()?;
@@ -1067,6 +1180,138 @@ mod tests {
         assert_eq!(second.marker.generation, 2);
         assert_eq!(second.marker.state, MarkerState::Dirty);
         drop(second);
+        drop(fixture);
+    }
+
+    #[test]
+    fn clean_handoff_fences_the_runtime_before_unlock() {
+        let fixture = fixture();
+        let mut first = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(26),
+            "profile-one",
+        )
+        .expect("first volume owner");
+        first
+            .mark_clean_after_handoff()
+            .expect("clean marker handoff");
+        assert!(matches!(
+            first.revalidate(),
+            Err(VolumeOwnershipError::HandoffFenced { .. })
+        ));
+        let marker = fs::read(first.lock_path_for_test()).expect("clean marker");
+        assert!(String::from_utf8_lossy(&marker).contains("state=clean"));
+        drop(first);
+        let second = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(26),
+            "profile-one",
+        )
+        .expect("same profile clean restart");
+        assert_eq!(second.marker.generation, 2);
+        drop(second);
+        drop(fixture);
+    }
+
+    #[test]
+    fn uncertain_registry_sync_keeps_lock_and_never_reports_clean_success() {
+        let fixture = fixture();
+        let mut first = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(27),
+            "profile-one",
+        )
+        .expect("first volume owner");
+        let error = first
+            .test_mark_clean_with_sync_failure(|_, path| {
+                Err(VolumeOwnershipError::RootUnavailable {
+                    path: path.to_path_buf(),
+                    reason: String::from("injected post-write sync uncertainty"),
+                })
+            })
+            .expect_err("post-write sync failure is not a clean receipt");
+        assert!(matches!(
+            error,
+            VolumeOwnershipError::RootUnavailable { .. }
+        ));
+        assert!(matches!(
+            first.revalidate(),
+            Err(VolumeOwnershipError::HandoffFenced { .. })
+        ));
+        let held = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(27),
+            "profile-one",
+        )
+        .expect_err("uncertain handoff retains the lock while runtime lives");
+        assert!(matches!(
+            held,
+            VolumeOwnershipError::OwnedByAnotherProcess { .. }
+        ));
+        let marker = fs::read(first.lock_path_for_test()).expect("marker bytes");
+        assert!(String::from_utf8_lossy(&marker).contains("state=clean"));
+        drop(first);
+        let second = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(27),
+            "profile-one",
+        )
+        .expect("restart conservatively reconciles uncertain marker");
+        assert_eq!(second.marker.generation, 2);
+        drop(second);
+        drop(fixture);
+    }
+
+    #[test]
+    fn prewrite_handoff_failure_fences_retained_context_clones_and_keeps_lock() {
+        let fixture = fixture();
+        let mut first = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(28),
+            "profile-one",
+        )
+        .expect("first volume owner");
+        let context = first.try_clone_for_context().expect("context owner clone");
+        let error = first
+            .test_mark_clean_with_write_failure()
+            .expect_err("injected pre-write failure is not a clean receipt");
+        assert!(matches!(error, VolumeOwnershipError::MarkerIo { .. }));
+        assert!(matches!(
+            first.revalidate(),
+            Err(VolumeOwnershipError::HandoffFenced { .. })
+        ));
+        assert!(matches!(
+            context.revalidate(),
+            Err(VolumeOwnershipError::HandoffFenced { .. })
+        ));
+        let held = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(28),
+            "profile-one",
+        )
+        .expect_err("pre-write uncertainty retains the OS lock");
+        assert!(matches!(
+            held,
+            VolumeOwnershipError::OwnedByAnotherProcess { .. }
+        ));
+        drop(context);
+        drop(first);
+        let restarted = acquire_fixture_for_test(
+            &fixture.descriptor,
+            &fixture.registry,
+            volume(28),
+            "profile-one",
+        )
+        .expect("dirty marker remains recoverable after failed handoff");
+        assert_eq!(restarted.owner_generation(), 1);
+        drop(restarted);
         drop(fixture);
     }
 

@@ -281,6 +281,108 @@ pub(super) fn persist(
     }
 }
 
+/// Rebind an existing same-profile reserve to the strictly newer owner generation produced by a
+/// clean-marker restart.  The identity namespace is immutable: only the generation column may
+/// change, and an uncertain commit is returned as an error so the caller keeps recovery-only
+/// ownership rather than claiming a clean handoff.
+pub(super) fn rebind_owner_generation(
+    connection: &Connection,
+    expected: &ReserveBinding,
+    new_generation: u64,
+) -> Result<(), ReserveBindingError> {
+    rebind_owner_generation_with_post_commit(connection, expected, new_generation, || Ok(()))
+}
+
+fn rebind_owner_generation_with_post_commit<AfterCommit>(
+    connection: &Connection,
+    expected: &ReserveBinding,
+    new_generation: u64,
+    after_commit: AfterCommit,
+) -> Result<(), ReserveBindingError>
+where
+    AfterCommit: FnOnce() -> Result<(), ReserveBindingError>,
+{
+    expected.validate()?;
+    if new_generation <= expected.owner_generation() {
+        return Err(ReserveBindingError::IdentityMismatch(
+            "owner generation must advance strictly during clean handoff".into(),
+        ));
+    }
+    let stored_new_generation = i64::try_from(new_generation).map_err(|_| {
+        ReserveBindingError::Corrupt("new owner generation exceeds SQLite INTEGER range".into())
+    })?;
+    let stored_old_generation = i64::try_from(expected.owner_generation()).map_err(|_| {
+        ReserveBindingError::Corrupt("owner generation exceeds SQLite INTEGER range".into())
+    })?;
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let Some(stored) = read(connection, expected.volume())? else {
+            return Err(ReserveBindingError::Missing(expected.volume.clone()));
+        };
+        if stored != *expected {
+            return Err(ReserveBindingError::IdentityMismatch(
+                "stored reserve binding differs before generation rebind".into(),
+            ));
+        }
+        let changed = connection.execute(
+            &format!(
+                "UPDATE {TABLE_NAME} SET owner_generation = ?1
+                 WHERE volume_device = ?2
+                   AND profile_identity = ?3
+                   AND root_identity = ?4
+                   AND file_identity = ?5
+                   AND allocation_unit = ?6
+                   AND protected_floor_bytes = ?7
+                   AND namespace_version = ?8
+                   AND namespace_name = ?9
+                   AND owner_generation = ?10"
+            ),
+            params![
+                stored_new_generation,
+                expected.volume.device.to_string(),
+                expected.profile_identity,
+                expected.root_identity,
+                expected.file_identity,
+                to_sql_integer(expected.allocation_unit, "allocation_unit")?,
+                to_sql_integer(expected.protected_floor_bytes, "protected_floor_bytes")?,
+                to_sql_integer(expected.namespace_version, "namespace_version")?,
+                expected.namespace_name,
+                stored_old_generation,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ReserveBindingError::Conflict(expected.volume.clone()));
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => match connection.execute_batch("COMMIT") {
+            Ok(()) => after_commit(),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(ReserveBindingError::Sql(error))
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+fn rebind_owner_generation_with_post_commit_error(
+    connection: &Connection,
+    expected: &ReserveBinding,
+    new_generation: u64,
+) -> Result<(), ReserveBindingError> {
+    rebind_owner_generation_with_post_commit(connection, expected, new_generation, || {
+        Err(ReserveBindingError::Corrupt(
+            "injected post-commit acknowledgement uncertainty".into(),
+        ))
+    })
+}
+
 fn parse_device(value: &str, field: &str) -> Result<u64, ReserveBindingError> {
     let parsed = value
         .parse::<u64>()
@@ -300,4 +402,89 @@ fn parse_integer(value: i64, field: &str) -> Result<u64, ReserveBindingError> {
 fn to_sql_integer(value: u64, field: &str) -> Result<i64, ReserveBindingError> {
     i64::try_from(value)
         .map_err(|_| ReserveBindingError::Corrupt(format!("{field} exceeds SQLite INTEGER")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn generation_rebind_updates_only_exact_matching_binding() {
+        let connection = Connection::open_in_memory().expect("binding database");
+        connection
+            .execute_batch(CREATE_TABLE)
+            .expect("binding schema");
+        let binding = ReserveBinding::from_live(
+            VolumeIdentity { device: 9 },
+            "profile",
+            "root",
+            "file",
+            4096,
+            3,
+        )
+        .expect("binding");
+        persist(&connection, &binding).expect("persist binding");
+        rebind_owner_generation(&connection, &binding, 4).expect("rebind generation");
+        assert_eq!(
+            read(&connection, binding.volume())
+                .unwrap()
+                .unwrap()
+                .owner_generation(),
+            4
+        );
+        assert!(matches!(
+            rebind_owner_generation(&connection, &binding, 5),
+            Err(ReserveBindingError::IdentityMismatch(_))
+        ));
+        assert_eq!(
+            read(&connection, binding.volume())
+                .unwrap()
+                .unwrap()
+                .owner_generation(),
+            4
+        );
+    }
+
+    #[test]
+    fn post_commit_rebind_error_keeps_generation_for_restart_reconciliation() {
+        let directory = tempfile::tempdir().expect("binding directory");
+        let database_path: PathBuf = directory.path().join("binding.sqlite3");
+        let connection = Connection::open(&database_path).expect("binding database");
+        connection
+            .execute_batch(CREATE_TABLE)
+            .expect("binding schema");
+        let binding = ReserveBinding::from_live(
+            VolumeIdentity { device: 10 },
+            "profile",
+            "root",
+            "file",
+            4096,
+            5,
+        )
+        .expect("binding");
+        persist(&connection, &binding).expect("persist binding");
+        assert!(matches!(
+            rebind_owner_generation_with_post_commit_error(&connection, &binding, 6),
+            Err(ReserveBindingError::Corrupt(reason))
+                if reason.contains("post-commit acknowledgement uncertainty")
+        ));
+        drop(connection);
+
+        let reopened = Connection::open(&database_path).expect("reopen binding database");
+        let rebound = read(&reopened, binding.volume())
+            .expect("read rebound binding")
+            .expect("rebound binding remains durable");
+        assert_eq!(rebound.owner_generation(), 6);
+        assert_eq!(rebound.profile_identity(), binding.profile_identity());
+        assert_eq!(rebound.root_identity(), binding.root_identity());
+        assert_eq!(rebound.file_identity(), binding.file_identity());
+        assert_eq!(rebound.allocation_unit(), binding.allocation_unit());
+        assert_eq!(
+            rebound.protected_floor_bytes(),
+            binding.protected_floor_bytes()
+        );
+        assert_eq!(rebound.namespace_version(), binding.namespace_version());
+        assert_eq!(rebound.namespace_name(), binding.namespace_name());
+    }
 }

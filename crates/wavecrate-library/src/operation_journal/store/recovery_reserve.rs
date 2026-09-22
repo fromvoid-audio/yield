@@ -149,6 +149,11 @@ pub(crate) enum LedgerError {
     AlreadyReconstituted(Uuid),
     #[error("charge {0} is not the active charge for its volume")]
     ChargeNotActive(Uuid),
+    #[error("charge {charge_id} remains active in state {state:?}")]
+    ActiveForCleanHandoff {
+        charge_id: Uuid,
+        state: RecoveryReserveState,
+    },
 }
 
 #[cfg(test)]
@@ -716,6 +721,92 @@ pub(super) fn readiness(connection: &Connection) -> Result<Option<String>, Strin
         )));
     }
     Ok(None)
+}
+
+/// Validate the complete durable recovery ledger for a clean ownership handoff.  Every row and
+/// transition is decoded and its operation reference is checked; only a fully reconstituted
+/// historical charge is non-active.  This structured boundary intentionally does not inspect or
+/// interpret the human readiness diagnostic strings above.
+pub(super) fn prove_no_active_charges(connection: &Connection) -> Result<(), LedgerError> {
+    let orphan_transition: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT transition_id
+             FROM {TRANSITION_TABLE_NAME} AS transition
+             LEFT JOIN {CHARGE_TABLE_NAME} AS charge
+               ON charge.charge_id = transition.charge_id
+             WHERE charge.charge_id IS NULL
+             ORDER BY transition.charge_id, transition.transition_sequence
+             LIMIT 1"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(transition_id) = orphan_transition {
+        return Err(LedgerError::Corrupt(format!(
+            "orphan recovery-reserve transition {transition_id}"
+        )));
+    }
+    let mut statement = connection.prepare(&format!(
+        "SELECT charge_id, volume_device, active_volume_device, operation_id, purpose,
+                budget_bytes, margin_bytes, precharge_capacity_bytes, remaining_bytes,
+                state, transition_sequence
+         FROM {CHARGE_TABLE_NAME} ORDER BY charge_id"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?,
+        ))
+    })?;
+    for row in rows {
+        let row = row?;
+        let (
+            charge_id,
+            _volume_device,
+            _active_volume_device,
+            operation_id,
+            budget_bytes,
+            margin_bytes,
+            precharge_capacity_bytes,
+            remaining_bytes,
+            state,
+            transition_sequence,
+        ) = validate_charge_row(
+            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
+        )
+        .map_err(LedgerError::Corrupt)?;
+        let operation_id = OperationId::parse(&operation_id)
+            .map_err(|_| LedgerError::Corrupt("operation id is not UUID text".into()))?;
+        if !operation_exists(connection, operation_id)? {
+            return Err(LedgerError::OperationNotFound(operation_id));
+        }
+        let state = state_from_str(&state)?;
+        validate_transitions(
+            connection,
+            charge_id,
+            budget_bytes,
+            remaining_bytes,
+            state.as_str(),
+            transition_sequence,
+        )
+        .map_err(LedgerError::Corrupt)?;
+        if state != RecoveryReserveState::Reconstituted {
+            return Err(LedgerError::ActiveForCleanHandoff { charge_id, state });
+        }
+        let _ = (margin_bytes, precharge_capacity_bytes);
+    }
+    Ok(())
 }
 
 fn active_charge_for_volume(
@@ -1602,6 +1693,58 @@ mod tests {
             .expect("read reconstituted readiness")
             .expect("reconstituted row still needs live proof");
         assert!(reason.contains("live physical revalidation"));
+    }
+
+    #[test]
+    fn clean_handoff_proof_distinguishes_active_from_reconstituted_history() {
+        let (connection, operation_id) = fixture();
+        prove_no_active_charges(&connection).expect("empty recovery ledger is zero");
+        let charge_id = Uuid::new_v4();
+        let request = request(operation_id, charge_id, 7, 100);
+        begin_charge(&connection, &request).expect("charge");
+        assert!(matches!(
+            prove_no_active_charges(&connection),
+            Err(LedgerError::ActiveForCleanHandoff {
+                charge_id: id,
+                state: RecoveryReserveState::Charged
+            }) if id == charge_id
+        ));
+        reconstitute_fixture(
+            &connection,
+            charge_id,
+            Uuid::new_v4(),
+            TestReconstitutionProof {
+                volume: request.volume,
+                physical_bytes: PROTECTED_FREE_SPACE_FLOOR,
+                non_sparse: true,
+            },
+        )
+        .expect("reconstitute charge");
+        prove_no_active_charges(&connection).expect("reconstituted history is non-active");
+    }
+
+    #[test]
+    fn clean_handoff_proof_rejects_orphan_transition_history() {
+        let (connection, _) = fixture();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for orphan fixture");
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (charge_id, transition_id, transition_sequence, kind, amount_bytes,
+                      remaining_bytes, state)
+                     VALUES (?1, ?2, 1, 'Charged', 10, 10, 'Charged')",
+                    table = TRANSITION_TABLE_NAME
+                ),
+                params![Uuid::new_v4().to_string(), Uuid::new_v4().to_string()],
+            )
+            .expect("insert orphan transition fixture");
+        assert!(matches!(
+            prove_no_active_charges(&connection),
+            Err(LedgerError::Corrupt(reason)) if reason.contains("orphan recovery-reserve transition")
+        ));
     }
 
     #[test]

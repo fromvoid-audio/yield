@@ -420,6 +420,42 @@ The bounded OPT-1559 checklist is:
 - exercise multi-claim, duplicate/conflict, failure and uncertainty, reopen,
   concurrent serialization, retained-evidence, and v5-to-v6 migration cases.
 
+The bounded OPT-1562 clean-volume handoff is an orderly owner-thread shutdown
+boundary. It requires a structured zero proof from the bounded ordinary-claim
+scan (every claim has an exact release and there is no orphan, conflict, or
+malformed evidence), a fully validated recovery-reserve history with no active
+charge, an empty live provider ledger, no active or incomplete source binding,
+and a fresh non-sparse reserve proof at the complete 256 MiB protected floor.
+Released claim history and valid fully reconstituted reserve history remain
+immutable audit evidence; RecoveryOnly readiness text is neither a blocker nor
+zero proof by itself.
+
+All retained volumes are preflighted before any marker is changed. Each full
+reserve revalidation refreshes the retained descriptor's identity and
+allocation unit through its owned handle; no cached observation authorizes the
+handoff. While the volume lock is held, the owner fences the runtime before it
+attempts a Clean marker write (including all shared context clones), then
+writes and syncs the marker and syncs the registry directory. A write or sync
+failure is uncertain about the bytes on disk, so it returns no clean receipt,
+retains conservative evidence, and prevents further capacity mutations; Drop
+and panic never claim a clean handoff. On restart, only an exact same-profile
+binding with matching root, file, unit, namespace, full proof, and durable-zero
+audit may update its owner generation in one checked transaction. Foreign
+reserve artifacts and generic generation mismatches remain recovery-only.
+
+The finite OPT-1562 checklist is:
+
+- refuse active provider claims, active or malformed reserve history, ordinary
+  release ambiguity, active source registrations, incomplete bindings, stale
+  roots, replacement descriptors, sparse/short reserves, and uncertain marker
+  persistence without dropping evidence;
+- complete a zero-claim handoff, reopen it with a strictly newer same-profile
+  generation, rebind the existing exact reserve binding, and preserve the
+  conservative result across restart and failed metadata commits;
+- exercise cross-profile lock contention and foreign-artifact refusal without
+  adopting or deleting another profile's reserve; leave ordinary admission,
+  physical cleanup, provider qualification, chunks, and family wiring deferred.
+
 ## Acceptance checks for implementation children
 
 These are required future checks, not evidence that this documentation change

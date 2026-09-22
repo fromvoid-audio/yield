@@ -789,20 +789,21 @@ impl OwnerRuntime {
                     proof.take(),
                 );
             }
-            let owner = match super::capacity_volume_owner::acquire_for_descriptor(
-                &descriptor,
-                &profile_guard,
-            ) {
-                Ok(owner) => owner,
-                Err(error) => {
-                    return self.retain_source_recovery(
-                        registration_id,
-                        "volume-ownership",
-                        error.to_string(),
-                        proof.take(),
-                    );
-                }
-            };
+            let owner =
+                match super::capacity_volume_owner::acquire_for_descriptor_after_clean_handoff(
+                    &descriptor,
+                    &profile_guard,
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        return self.retain_source_recovery(
+                            registration_id,
+                            "volume-ownership",
+                            error.to_string(),
+                            proof.take(),
+                        );
+                    }
+                };
             self.source_volumes
                 .get_mut(&volume)
                 .expect("source volume placeholder was inserted")
@@ -1055,6 +1056,122 @@ impl OwnerRuntime {
             ));
         }
         Ok(proof)
+    }
+
+    /// Complete the explicit orderly owner shutdown boundary.  The marker is attempted only
+    /// after every retained source and durable ledger proof has passed; any marker uncertainty
+    /// fences this runtime and returns no clean receipt.
+    fn handoff_volume_to_clean_owner(&mut self) -> Result<(), String> {
+        let volume_owner = self
+            .volume_owner
+            .as_ref()
+            .ok_or_else(|| String::from("volume ownership capability is not installed"))?;
+        volume_owner
+            .revalidate()
+            .map_err(|error| error.to_string())?;
+        if !self.source_registrations.is_empty() {
+            return Err(String::from(
+                "source registrations remain active during clean volume handoff",
+            ));
+        }
+        for (volume, binding) in &self.source_volumes {
+            if !matches!(binding.readiness, SourceVolumeBindingReadiness::Complete)
+                || !binding.registrations.is_empty()
+            {
+                return Err(format!(
+                    "source volume {volume:?} retains incomplete or active registration state"
+                ));
+            }
+        }
+        self.capacity_provider
+            .as_ref()
+            .ok_or_else(|| String::from("capacity provider is not installed"))?
+            .prove_no_live_charges()
+            .map_err(|error| error.to_string())?;
+        self.store()
+            .prove_clean_handoff_durable()
+            .map_err(|error| error.to_string())?;
+        let profile_guard = self
+            .final_profile_guard
+            .as_ref()
+            .ok_or_else(|| String::from("owner profile guard is not installed"))?;
+        {
+            let reserve = self
+                .reserve
+                .as_mut()
+                .ok_or_else(|| String::from("owned reserve is not installed"))?;
+            // `revalidate_and_prove` captures the retained descriptor's current identity and
+            // allocation unit before returning the non-serializable full-floor proof.
+            let proof = reserve
+                .view(profile_guard)
+                .revalidate_and_prove()
+                .map_err(|error| error.to_string())?;
+            if proof.volume() != volume_owner.volume()
+                || !proof.non_sparse()
+                || proof.physical_bytes() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+            {
+                return Err(String::from(
+                    "profile reserve does not meet the full protected physical floor",
+                ));
+            }
+        }
+        for (volume, binding) in &mut self.source_volumes {
+            if *volume == *volume_owner.volume() {
+                continue;
+            }
+            let owner = binding
+                .owner
+                .as_ref()
+                .ok_or_else(|| format!("source volume {volume:?} has no retained owner"))?;
+            owner.revalidate().map_err(|error| error.to_string())?;
+            let reserve = binding
+                .reserve
+                .as_mut()
+                .ok_or_else(|| format!("source volume {volume:?} has no retained reserve"))?;
+            let proof = reserve
+                .view(profile_guard)
+                .revalidate_and_prove()
+                .map_err(|error| error.to_string())?;
+            if proof.volume() != volume
+                || !proof.non_sparse()
+                || proof.physical_bytes() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+            {
+                return Err(format!(
+                    "source volume {volume:?} does not meet the full protected physical floor"
+                ));
+            }
+        }
+        // Every preflighted retained volume crosses the same fenced marker boundary.  A failure
+        // after an earlier volume was confirmed clean is intentionally not rolled back: those
+        // owners remain retired and the remaining runtime stays conservative.
+        let profile_volume = volume_owner.volume().clone();
+        for (volume, binding) in &mut self.source_volumes {
+            if *volume == profile_volume {
+                continue;
+            }
+            let owner = binding
+                .owner
+                .as_mut()
+                .ok_or_else(|| format!("source volume {volume:?} has no retained owner"))?;
+            owner.mark_clean_after_handoff().map_err(|error| {
+                format!("source volume {volume:?} clean handoff failed: {error}")
+            })?;
+        }
+        let volume_owner = self
+            .volume_owner
+            .as_mut()
+            .ok_or_else(|| String::from("volume ownership capability is not installed"))?;
+        volume_owner
+            .revalidate()
+            .map_err(|error| error.to_string())?;
+        volume_owner
+            .mark_clean_after_handoff()
+            .map_err(|error| error.to_string())?;
+        // The marker is now the only durable handoff result. Fence all in-memory capacity state
+        // before the normal drop order releases reserve and owner descriptors.
+        self.capacity_provider.take();
+        self.reserve.take();
+        Ok(())
     }
 
     /// Observe every retained reserve descriptor while its owner and profile authorities remain
@@ -2196,6 +2313,7 @@ fn run_owner(
     let mut command_gate = command_gate;
     #[cfg(any(test, feature = "test-support"))]
     let panic_on_command = panic_on_command;
+    let mut orderly_shutdown = true;
     loop {
         let command = match command_rx.recv() {
             Ok(command) => command,
@@ -2212,11 +2330,17 @@ fn run_owner(
         }
         let panicked = execute_command(command, &mut runtime);
         if panicked {
+            orderly_shutdown = false;
             shared.mark_unavailable("operation journal owner command panicked");
             while let Ok(command) = command_rx.try_recv() {
                 reject_command(command, OperationJournalOwnerError::WorkerPanicked);
             }
             break;
+        }
+    }
+    if orderly_shutdown {
+        if let Err(error) = runtime.handoff_volume_to_clean_owner() {
+            tracing::warn!(error = %error, "clean volume ownership handoff was not completed");
         }
     }
     drop(runtime);
@@ -2593,6 +2717,210 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn handoff_runtime(
+        name: &str,
+    ) -> (
+        Fixture,
+        OwnerRuntime,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        fs::File,
+        VolumeIdentity,
+    ) {
+        let fixture = fixture(name);
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        let volume = volume_owner.volume().clone();
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+        runtime.capacity_provider = Some(CapacityProvider::unavailable());
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        (
+            fixture,
+            runtime,
+            registry_path,
+            reserve_path,
+            descriptor,
+            volume,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clean_handoff_refuses_dirty_boundaries_without_marker_or_lock_release() {
+        enum Refusal {
+            OrdinaryUnreleased,
+            OrdinaryAuditPending,
+            LiveProviderToken,
+            ActiveSourceRegistration,
+            IncompleteSourceBinding,
+            ReplacedReserve,
+        }
+
+        let cases = [
+            (
+                "journal-owner-handoff-unreleased",
+                Refusal::OrdinaryUnreleased,
+            ),
+            ("journal-owner-handoff-audit", Refusal::OrdinaryAuditPending),
+            (
+                "journal-owner-handoff-live-token",
+                Refusal::LiveProviderToken,
+            ),
+            (
+                "journal-owner-handoff-active-source",
+                Refusal::ActiveSourceRegistration,
+            ),
+            (
+                "journal-owner-handoff-incomplete-source",
+                Refusal::IncompleteSourceBinding,
+            ),
+            (
+                "journal-owner-handoff-replaced-reserve",
+                Refusal::ReplacedReserve,
+            ),
+        ];
+        for (name, refusal) in cases {
+            let (fixture, mut runtime, registry_path, reserve_path, descriptor, volume) =
+                handoff_runtime(name);
+            match refusal {
+                Refusal::OrdinaryUnreleased | Refusal::OrdinaryAuditPending => {
+                    let operation_id = OperationId::new();
+                    if matches!(refusal, Refusal::OrdinaryUnreleased) {
+                        runtime
+                            .store()
+                            .insert_intent(&intent_record(operation_id))
+                            .expect("ordinary proof operation");
+                    }
+                    runtime
+                        .store()
+                        .insert_ordinary_claim_for_test(
+                            uuid::Uuid::new_v4(),
+                            operation_id,
+                            &volume,
+                            "DestinationStaging",
+                            4096,
+                        )
+                        .expect("ordinary refusal claim");
+                }
+                Refusal::LiveProviderToken => {
+                    let class = crate::operation_journal::full_capacity::FullCapacityAllocationClass::
+                        DestinationStaging;
+                    let provider = CapacityProvider::unavailable();
+                    provider
+                        .install_rebuilt_claims(&OrdinaryClaimRebuildSnapshot::for_test(
+                            vec![RebuildClaim::for_test(
+                                OperationId::new(),
+                                crate::operation_journal::AdmissionClaimId::new(),
+                                volume.clone(),
+                                class,
+                                4096,
+                                None,
+                                false,
+                            )],
+                            CapacityRebuildReadiness::ready(),
+                        ))
+                        .expect("live provider token");
+                    runtime.capacity_provider = Some(provider);
+                }
+                Refusal::ActiveSourceRegistration => {
+                    let source_root = tempfile::tempdir().expect("source root");
+                    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+                        source_root.path(),
+                        &fixture.owner,
+                        "handoff-active-source-catalog",
+                    )
+                    .expect("profile-owned source database");
+                    let authority = database
+                        .prepare_source_authority()
+                        .expect("source authority");
+                    let request = authority.journal_request().expect("journal request");
+                    runtime
+                        .register_source_authority(request)
+                        .expect("active source registration");
+                }
+                Refusal::IncompleteSourceBinding => {
+                    runtime.source_volumes.insert(
+                        volume.clone(),
+                        SourceVolumeBinding {
+                            owner: None,
+                            reserve: None,
+                            allocation_unit: Some(1),
+                            readiness: SourceVolumeBindingReadiness::Incomplete,
+                            registrations: BTreeSet::new(),
+                        },
+                    );
+                }
+                Refusal::ReplacedReserve => {
+                    fs::remove_file(&reserve_path).expect("remove reserve entry");
+                    fs::write(&reserve_path, b"replacement").expect("replace reserve entry");
+                }
+            }
+
+            let error = runtime
+                .handoff_volume_to_clean_owner()
+                .expect_err("unsafe handoff must remain recovery-only");
+            assert!(!runtime.volume_owner().marker_is_clean_for_test());
+            assert!(!error.is_empty());
+            let held = super::super::capacity_volume_owner::acquire_fixture_for_test(
+                &descriptor,
+                &registry_path,
+                volume,
+                fixture.owner.profile_root_identity(),
+            )
+            .expect_err("refused handoff retains volume lock");
+            assert!(matches!(
+                held,
+                super::super::capacity_volume_owner::VolumeOwnershipError::OwnedByAnotherProcess { .. }
+            ));
+            drop(runtime);
+            drop(fixture);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clean_handoff_with_exact_zero_proof_marks_then_reopens_new_generation() {
+        let (fixture, mut runtime, registry_path, _reserve_path, descriptor, volume) =
+            handoff_runtime("journal-owner-handoff-success");
+        runtime
+            .handoff_volume_to_clean_owner()
+            .expect("empty durable state and fresh proof permit handoff");
+        assert!(runtime.volume_owner().marker_is_clean_for_test());
+        assert!(matches!(
+            runtime.volume_owner().revalidate(),
+            Err(super::super::capacity_volume_owner::VolumeOwnershipError::HandoffFenced { .. })
+        ));
+        drop(runtime);
+        let restarted =
+            super::super::capacity_volume_owner::acquire_fixture_with_clean_marker_for_test(
+                &descriptor,
+                &registry_path,
+                volume,
+                fixture.owner.profile_root_identity(),
+                true,
+            )
+            .expect("clean marker restart");
+        assert_eq!(restarted.owner_generation(), 2);
+        drop(restarted);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn owner_bootstraps_and_reopens_profile_journal_reserve() {
         let fixture = fixture("journal-owner-reserve-bootstrap");
@@ -2656,7 +2984,18 @@ mod tests {
         let (binding_after, counts_after) = final_store
             .test_reserve_bootstrap_snapshot(&volume)
             .expect("reopened bootstrap snapshot");
-        assert_eq!(binding_after, binding_before);
+        let binding_before = binding_before.expect("binding before restart");
+        let binding_after = binding_after.expect("binding after restart");
+        assert_eq!(binding_after.0, binding_before.0);
+        assert_eq!(binding_after.1, binding_before.1);
+        assert_eq!(binding_after.2, binding_before.2);
+        assert_eq!(
+            binding_after.3,
+            binding_before
+                .3
+                .checked_add(1)
+                .expect("generation increment")
+        );
         assert_eq!(counts_after, counts_before);
         drop(final_store);
         drop(fixture);
@@ -3198,6 +3537,104 @@ mod tests {
             "proof failure must precede durable binding"
         );
         drop(failure);
+        drop(database);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_reserve_clean_restart_rebinds_exact_generation() {
+        let fixture = fixture("journal-owner-source-clean-rebind");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "source-clean-rebind-catalog",
+        )
+        .expect("profile-owned source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("source authority");
+        let request = authority.journal_request().expect("journal request");
+        let proof = request
+            .request
+            .accept_confirmation(request.confirmation.clone())
+            .expect("source proof");
+        let descriptor = request
+            .request
+            .media_root()
+            .try_clone_descriptor()
+            .expect("source descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("source facts");
+        let first_owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            facts.identity.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("first source volume owner");
+        let first_context_owner = first_owner
+            .try_clone_for_context()
+            .expect("first source context owner");
+        let first_reserve = store
+            .acquire_owned_source_reserve(
+                first_context_owner,
+                request.request.media_root(),
+                &fixture.owner,
+                &proof,
+            )
+            .unwrap_or_else(|failure| panic!("first source reserve binding: {}", failure.error));
+        drop(first_reserve);
+        let (binding_before, counts_before) = store
+            .test_reserve_bootstrap_snapshot(&facts.identity)
+            .expect("source binding before clean restart");
+        let binding_before = binding_before.expect("source binding before clean restart");
+        let mut first_owner = first_owner;
+        first_owner
+            .mark_clean_after_handoff()
+            .expect("clean source owner marker");
+        drop(first_owner);
+
+        let second_owner =
+            super::super::capacity_volume_owner::acquire_fixture_with_clean_marker_for_test(
+                &descriptor,
+                &registry_path,
+                facts.identity.clone(),
+                fixture.owner.profile_root_identity(),
+                true,
+            )
+            .expect("clean source owner restart");
+        assert_eq!(second_owner.owner_generation(), 2);
+        let second_context_owner = second_owner
+            .try_clone_for_context()
+            .expect("second source context owner");
+        let second_reserve = store
+            .acquire_owned_source_reserve(
+                second_context_owner,
+                request.request.media_root(),
+                &fixture.owner,
+                &proof,
+            )
+            .unwrap_or_else(|failure| {
+                panic!("source reserve generation rebind: {}", failure.error)
+            });
+        let (binding, _) = store
+            .test_reserve_bootstrap_snapshot(&facts.identity)
+            .expect("source binding snapshot");
+        let binding_after = binding.expect("source binding after clean restart");
+        assert_eq!(binding_after.0, binding_before.0);
+        assert_eq!(binding_after.1, binding_before.1);
+        assert_eq!(binding_after.2, binding_before.2);
+        assert_eq!(binding_after.3, binding_before.3 + 1);
+        let (_, counts_after) = store
+            .test_reserve_bootstrap_snapshot(&facts.identity)
+            .expect("source binding counts after clean restart");
+        assert_eq!(counts_after, counts_before);
+        drop(second_reserve);
+        drop(second_owner);
+        drop(authority);
         drop(database);
         drop(fixture);
     }
