@@ -13,6 +13,13 @@ catalog retarget close admission and wait for admitted effects. Retarget creates
 a fresh gate only after its new generation commits. The pin is not an issued
 grant and is not accepted by the file owner.
 
+The next source/journal seam compares the pin and the journal's retained
+`SourceAuthorityRequest` by their shared private lifecycle state, then
+revalidates the registered descriptors and live lease under that gate. A pin
+from another registration, a drained registration, or a replaced root fails
+before issuance. This validation is implemented; no journal issuance command
+calls it yet.
+
 ## Required result
 
 The journal owner issues one opaque, non-`Clone`, non-serializable grant for an
@@ -104,10 +111,18 @@ effect without release serialization would also be a race.
    A live effect has no acceptance until its authority is checked at the
    execution boundary, not merely at queue admission.
 
-This protocol is a design direction. Two implementation decisions remain: the
-smallest gate that serializes every explicit source release with a future
-bounded effect without holding a lock across another owner's queue; and the
-exact producer path that supplies existing live root capabilities to the file
-owner, whose current registrations are test fixtures. A source pin cannot
-replace a destination-root capability. Resolve both in code and tests before
+`ChunkWriteIdentity::output_key` is an arbitrary bounded string, while
+`WriteStagingChunk::output` is a UUID observation. Issuance must retain the
+exact string claim key and bind the supplied output UUID as a separate field;
+parsing or hashing the string into a UUID would change existing claim identity.
+The file-owner command must match its output UUID to the grant, while the
+grant retains the exact string claim key for journal custody and release.
+The grant also binds the target registration and source fences as observations;
+the file owner must check them against its retained registrations. None of
+these observations constructs root authority.
+
+The release/effect gate is implemented. The remaining producer decision is
+how to supply an existing live destination-root capability to the file owner:
+its current root registrations are test fixtures. A source pin cannot replace
+that destination-root capability. Resolve this in code and tests before
 claiming OPT-1857 complete.

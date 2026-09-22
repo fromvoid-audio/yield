@@ -502,6 +502,33 @@ pub(crate) struct SourceEffectPin {
 }
 
 impl SourceEffectPin {
+    /// Prove that this pin came from the exact registration retained by the journal owner.
+    /// Identity fields alone cannot establish this relationship: both values must share the
+    /// original private lifecycle state, and that state must still admit effects.
+    pub(crate) fn validate_for_issuance(
+        &self,
+        request: &SourceAuthorityRequest,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+    ) -> Result<(), SourceAuthorityError> {
+        let permit = self.state.effect_gate.begin(|| {
+            if !Arc::ptr_eq(&self.state, &request.state)
+                || self.state.registration_id != request.registration_id
+                || self.state.lease_identity != request.lease_identity
+            {
+                return Err(SourceAuthorityError::RegistrationMismatch);
+            }
+            request.validate_registered_boundary(profile_guard)?;
+            let current = SourceLeaseIdentity::from_lease(&self.lease);
+            if current != self.state.lease_identity {
+                return Err(SourceAuthorityError::RegistrationMismatch);
+            }
+            self.lease.validate_current_owner()?;
+            Ok(())
+        })?;
+        drop(permit);
+        Ok(())
+    }
+
     /// Enter one bounded effect while source retirement and explicit release are excluded.
     /// The returned permit must remain alive until the effect is quiescent.
     pub(crate) fn begin_effect(&self) -> Result<SourceEffectPermit, SourceAuthorityError> {

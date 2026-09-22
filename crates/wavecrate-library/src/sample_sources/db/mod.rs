@@ -39,7 +39,8 @@ pub(crate) mod sqlite_identity;
 #[allow(unused_imports)]
 pub(crate) use source_authority::{
     SourceAuthorityConfirmation, SourceAuthorityDrainMarker, SourceAuthorityGuard,
-    SourceAuthorityRequest, SourceAuthorityUseProof, SourceLeaseIdentity, SourceRegistrationId,
+    SourceAuthorityRequest, SourceAuthorityUseProof, SourceEffectPin, SourceLeaseIdentity,
+    SourceRegistrationId,
 };
 pub use source_authority::{
     SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt,
