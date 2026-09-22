@@ -6,6 +6,7 @@
 //! worker. It does not grant operation admission, filesystem authority, capacity authority, or a
 //! tentative persistence receipt.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,6 +18,11 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::app_dirs::WritableProfileGuard;
+use crate::durable_capacity::{VolumeIdentity, descriptor_capacity_facts};
+use crate::sample_sources::db::{
+    SourceAuthorityDrainMarker, SourceAuthorityError, SourceAuthorityRegistrationReceipt,
+    SourceAuthorityRegistrationRequest, SourceAuthorityRequest, SourceAuthorityRetirementAck,
+};
 
 use super::capacity_provider::{self, CapacityProvider, CapacityRebuildReadiness};
 use super::capacity_reserve_namespace::{OwnedReserveAllocation, PhysicalReserveProof};
@@ -35,6 +41,7 @@ use super::store::recovery::{
 use super::store::{
     FullProgressWriteOutcome, JournalCancelRequestReceipt, JournalInsertOutcome,
     JournalRetryReceipt, OperationJournalStore, OperationJournalStoreError,
+    SourceReserveBindingFailure,
 };
 use super::work_plan::derive_work_plan;
 
@@ -140,6 +147,25 @@ pub enum OperationJournalOwnerError {
     /// A recovery page could not be read or retained its audit-required state.
     #[error(transparent)]
     Recovery(#[from] RecoveryScanError),
+    /// A source-owner authority handshake failed closed.
+    #[error(transparent)]
+    SourceAuthority(#[from] SourceAuthorityError),
+    /// A source registration or retirement message conflicts with retained owner state.
+    #[error("source authority registration conflict: {reason}")]
+    SourceAuthorityConflict {
+        /// Bounded conflict diagnostic.
+        reason: String,
+    },
+    /// A source registration retained bounded owner-side state after a partial or uncertain
+    /// physical binding. The source must drain or reconcile this identity before reuse.
+    #[error("source authority registration requires recovery: {reason}")]
+    SourceAuthorityRecoveryRequired {
+        /// Bounded stage and failure diagnostic.
+        reason: String,
+        /// Receipt retained when physical binding began before the failure. `None` means the
+        /// request was rejected before the owner installed any registration state.
+        receipt: Option<SourceAuthorityRegistrationReceipt>,
+    },
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -329,6 +355,55 @@ fn record_owner_runtime_drop_observation(
     }
 }
 
+struct SourceVolumeBinding {
+    #[allow(dead_code)]
+    reserve: Option<OwnedReserveAllocation>,
+    #[allow(dead_code)]
+    owner: Option<VolumeOwnershipCapability>,
+    allocation_unit: Option<u64>,
+    readiness: SourceVolumeBindingReadiness,
+    registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceVolumeBindingReadiness {
+    Incomplete,
+    Complete,
+}
+
+struct SourceAuthorityRecord {
+    request: Arc<SourceAuthorityRequest>,
+    receipt: SourceAuthorityRegistrationReceipt,
+    drain_marker: Option<SourceAuthorityDrainMarker>,
+    readiness: SourceRegistrationReadiness,
+}
+
+struct RetiredSourceAuthorityRecord {
+    media_root_identity: String,
+    database_root_identity: String,
+    database_file_identity: String,
+    lease_identity: crate::sample_sources::db::SourceLeaseIdentity,
+    receipt: SourceAuthorityRegistrationReceipt,
+}
+
+impl RetiredSourceAuthorityRecord {
+    fn matches_request(&self, request: &SourceAuthorityRequest) -> bool {
+        self.receipt.registration_id == request.registration_id()
+            && &self.lease_identity == request.lease_identity()
+            && self.media_root_identity == request.media_root().identity()
+            && self.database_root_identity == request.database_root().identity()
+            && self.database_file_identity == request.database_file_identity()
+    }
+}
+
+#[derive(Debug)]
+enum SourceRegistrationReadiness {
+    Registering,
+    Registered,
+    Draining,
+    RecoveryRequired { stage: &'static str, reason: String },
+}
+
 struct OwnerRuntime {
     store: Option<OperationJournalStore>,
     capacity_provider: Option<CapacityProvider>,
@@ -336,6 +411,11 @@ struct OwnerRuntime {
     reserve: Option<OwnedReserveAllocation>,
     volume_owner: Option<VolumeOwnershipCapability>,
     final_profile_guard: Option<WritableProfileGuard>,
+    source_volumes: BTreeMap<VolumeIdentity, SourceVolumeBinding>,
+    source_registrations:
+        HashMap<crate::sample_sources::db::SourceRegistrationId, SourceAuthorityRecord>,
+    retired_source_registrations:
+        HashMap<crate::sample_sources::db::SourceRegistrationId, RetiredSourceAuthorityRecord>,
     #[cfg(test)]
     drop_observer: Option<OwnerRuntimeDropObserver>,
     #[cfg(test)]
@@ -356,6 +436,9 @@ impl OwnerRuntime {
             reserve: None,
             volume_owner: None,
             final_profile_guard: Some(final_profile_guard),
+            source_volumes: BTreeMap::new(),
+            source_registrations: HashMap::new(),
+            retired_source_registrations: HashMap::new(),
             #[cfg(test)]
             drop_observer: None,
             #[cfg(test)]
@@ -383,6 +466,469 @@ impl OwnerRuntime {
     fn install_reserve(&mut self, reserve: OwnedReserveAllocation) {
         debug_assert!(self.reserve.is_none());
         self.reserve = Some(reserve);
+    }
+
+    fn register_source_authority(
+        &mut self,
+        input: SourceAuthorityRegistrationRequest,
+    ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
+        let request = input.request;
+        let registration_id = request.registration_id();
+        if let Some(existing) = self.source_registrations.get(&registration_id) {
+            if existing.request.matches_registration(&request) {
+                return match &existing.readiness {
+                    SourceRegistrationReadiness::Registered => Ok(existing.receipt.clone()),
+                    SourceRegistrationReadiness::Draining => Ok(existing.receipt.clone()),
+                    SourceRegistrationReadiness::Registering => Err(
+                        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                            reason: format!(
+                                "registration {registration_id:?} is still being installed"
+                            ),
+                            receipt: None,
+                        },
+                    ),
+                    SourceRegistrationReadiness::RecoveryRequired { stage, reason } => Err(
+                        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                            reason: format!(
+                                "registration {registration_id:?} remains in {stage}: {reason}"
+                            ),
+                            receipt: None,
+                        },
+                    ),
+                };
+            }
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from(
+                    "registration identity was reused with different source evidence",
+                ),
+            });
+        }
+        if let Some(retired) = self.retired_source_registrations.get(&registration_id) {
+            if retired.matches_request(&request) {
+                return Ok(retired.receipt.clone());
+            }
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from(
+                    "retired registration identity conflicts with retained evidence",
+                ),
+            });
+        }
+
+        let profile_guard = self
+            .final_profile_guard
+            .as_ref()
+            .ok_or_else(|| OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("owner profile capability is unavailable"),
+            })
+            .and_then(|guard| {
+                guard.try_clone().map_err(|error| {
+                    OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                        reason: format!("owner profile capability could not be cloned: {error}"),
+                        receipt: None,
+                    }
+                })
+            })?;
+        request
+            .validate_consuming_boundary(&profile_guard)
+            .map_err(OperationJournalOwnerError::from)?;
+        let profile_volume_id = self
+            .volume_owner
+            .as_ref()
+            .ok_or_else(|| OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("profile volume ownership is unavailable"),
+            })?
+            .volume()
+            .clone();
+        if self.reserve.is_none() {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("profile recovery reserve is unavailable"),
+            });
+        }
+        let roots = [request.media_root(), request.database_root()];
+        let mut volume_ids = BTreeSet::new();
+        let mut allocation_units = BTreeMap::new();
+        let mut work = Vec::new();
+        for root in roots {
+            let descriptor = root.try_clone_descriptor().map_err(|error| {
+                OperationJournalOwnerError::SourceAuthorityConflict {
+                    reason: format!("source volume descriptor could not be duplicated: {error}"),
+                }
+            })?;
+            let facts = descriptor_capacity_facts(&descriptor).map_err(|error| {
+                OperationJournalOwnerError::SourceAuthorityConflict {
+                    reason: format!("source volume facts are unavailable: {error}"),
+                }
+            })?;
+            if let Some(previous) =
+                allocation_units.insert(facts.identity.clone(), facts.allocation_unit)
+                && previous != facts.allocation_unit
+            {
+                return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                    reason: String::from(
+                        "same source volume reported conflicting allocation units",
+                    ),
+                });
+            }
+            if !volume_ids.insert(facts.identity.clone()) {
+                continue;
+            }
+            if let Some(binding) = self.source_volumes.get_mut(&facts.identity) {
+                if binding.allocation_unit != Some(facts.allocation_unit) {
+                    return Err(
+                        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                            reason: format!(
+                                "source volume {identity:?} allocation unit changed",
+                                identity = facts.identity
+                            ),
+                            receipt: None,
+                        },
+                    );
+                }
+                if binding.readiness != SourceVolumeBindingReadiness::Complete {
+                    return Err(
+                        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                            reason: format!(
+                                "source volume {identity:?} has incomplete retained binding",
+                                identity = facts.identity
+                            ),
+                            receipt: None,
+                        },
+                    );
+                }
+                if facts.identity != profile_volume_id {
+                    let Some(owner) = binding.owner.as_ref() else {
+                        return Err(
+                            OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                                reason: format!(
+                                    "source volume {identity:?} has no complete ownership binding",
+                                    identity = facts.identity
+                                ),
+                                receipt: None,
+                            },
+                        );
+                    };
+                    let Some(reserve) = binding.reserve.as_mut() else {
+                        return Err(
+                            OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                                reason: format!(
+                                    "source volume {identity:?} has no complete reserve binding",
+                                    identity = facts.identity
+                                ),
+                                receipt: None,
+                            },
+                        );
+                    };
+                    owner.revalidate().map_err(|error| {
+                        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                            reason: format!(
+                                "source volume {identity:?} ownership is no longer current: {error}",
+                                identity = facts.identity
+                            ),
+                            receipt: None,
+                        }
+                    })?;
+                    reserve.view(&profile_guard).revalidate().map_err(|error| {
+                        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                            reason: format!(
+                                "source volume {identity:?} reserve is no longer current: {error}",
+                                identity = facts.identity
+                            ),
+                            receipt: None,
+                        }
+                    })?;
+                }
+            }
+            work.push((facts.identity, descriptor, root));
+        }
+
+        // Consume the source-owner proof before acquiring a lock, creating a reserve, or
+        // persisting a binding. Every later physical effect revalidates this same deadline-bound
+        // proof and converts it to a drain marker on partial failure.
+        let mut proof = Some(request.accept_confirmation(input.confirmation)?);
+        let volume_identities = volume_ids.iter().cloned().collect::<Vec<_>>();
+        let receipt = SourceAuthorityRegistrationReceipt::new(
+            registration_id,
+            request.lease_identity().clone(),
+            volume_identities,
+        );
+        for volume in &volume_ids {
+            let binding = self
+                .source_volumes
+                .entry(volume.clone())
+                .or_insert_with(|| SourceVolumeBinding {
+                    reserve: None,
+                    owner: None,
+                    allocation_unit: None,
+                    readiness: SourceVolumeBindingReadiness::Incomplete,
+                    registrations: BTreeSet::new(),
+                });
+            binding.allocation_unit = allocation_units.get(volume).copied();
+            if *volume == profile_volume_id {
+                binding.readiness = SourceVolumeBindingReadiness::Complete;
+            }
+            binding.registrations.insert(registration_id);
+        }
+        self.source_registrations.insert(
+            registration_id,
+            SourceAuthorityRecord {
+                request: Arc::clone(&request),
+                receipt: receipt.clone(),
+                drain_marker: None,
+                readiness: SourceRegistrationReadiness::Registering,
+            },
+        );
+
+        for (volume, descriptor, root) in work {
+            if volume == profile_volume_id
+                || self.source_volumes.get(&volume).is_some_and(|binding| {
+                    binding.readiness == SourceVolumeBindingReadiness::Complete
+                        && binding.owner.is_some()
+                        && binding.reserve.is_some()
+                })
+            {
+                continue;
+            }
+            if let Err(error) = proof
+                .as_ref()
+                .expect("registration proof remains until installation completes")
+                .validate_for_physical_use()
+            {
+                return self.retain_source_recovery(
+                    registration_id,
+                    "before-volume-ownership",
+                    error.to_string(),
+                    proof.take(),
+                );
+            }
+            let owner = match super::capacity_volume_owner::acquire_for_descriptor(
+                &descriptor,
+                &profile_guard,
+            ) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "volume-ownership",
+                        error.to_string(),
+                        proof.take(),
+                    );
+                }
+            };
+            self.source_volumes
+                .get_mut(&volume)
+                .expect("source volume placeholder was inserted")
+                .owner = Some(owner);
+            if let Err(error) = proof
+                .as_ref()
+                .expect("registration proof remains until installation completes")
+                .validate_for_physical_use()
+            {
+                return self.retain_source_recovery(
+                    registration_id,
+                    "before-reserve-binding",
+                    error.to_string(),
+                    proof.take(),
+                );
+            }
+            let owner = match self
+                .source_volumes
+                .get(&volume)
+                .and_then(|binding| binding.owner.as_ref())
+                .expect("source volume owner was installed")
+                .try_clone_for_context()
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "owner-context",
+                        format!("source volume owner could not be retained: {error}"),
+                        proof.take(),
+                    );
+                }
+            };
+            match self.store().acquire_owned_source_reserve(
+                owner,
+                root,
+                &profile_guard,
+                proof
+                    .as_ref()
+                    .expect("registration proof remains until installation completes"),
+            ) {
+                Ok(reserve) => {
+                    let binding = self
+                        .source_volumes
+                        .get_mut(&volume)
+                        .expect("source volume placeholder was inserted");
+                    binding.reserve = Some(reserve);
+                    binding.readiness = SourceVolumeBindingReadiness::Complete;
+                }
+                Err(SourceReserveBindingFailure {
+                    error,
+                    volume_owner,
+                    reserve,
+                }) => {
+                    let binding = self
+                        .source_volumes
+                        .get_mut(&volume)
+                        .expect("source volume placeholder was inserted");
+                    binding.owner = Some(volume_owner);
+                    binding.reserve = reserve;
+                    return self.retain_source_recovery(
+                        registration_id,
+                        "reserve-binding",
+                        error.to_string(),
+                        proof.take(),
+                    );
+                }
+            }
+        }
+        let drain_marker = proof
+            .take()
+            .expect("registration proof remains until installation completes")
+            .into_drain_marker();
+        if let Some(record) = self.source_registrations.get_mut(&registration_id) {
+            record.drain_marker = Some(drain_marker);
+            record.readiness = SourceRegistrationReadiness::Registered;
+        }
+        Ok(receipt)
+    }
+
+    fn retain_source_recovery(
+        &mut self,
+        registration_id: crate::sample_sources::db::SourceRegistrationId,
+        stage: &'static str,
+        reason: String,
+        proof: Option<crate::sample_sources::db::SourceAuthorityUseProof>,
+    ) -> Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError> {
+        let record = self
+            .source_registrations
+            .get_mut(&registration_id)
+            .expect("source registration placeholder was inserted");
+        record.drain_marker = proof.map(|proof| proof.into_drain_marker());
+        record.readiness = SourceRegistrationReadiness::RecoveryRequired {
+            stage,
+            reason: reason.clone(),
+        };
+        Err(
+            OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                reason: format!("registration {registration_id:?} at {stage}: {reason}"),
+                receipt: Some(record.receipt.clone()),
+            },
+        )
+    }
+
+    fn begin_source_drain(
+        &mut self,
+        receipt: SourceAuthorityRegistrationReceipt,
+    ) -> Result<(), OperationJournalOwnerError> {
+        let Some(record) = self.source_registrations.get_mut(&receipt.registration_id) else {
+            if self
+                .retired_source_registrations
+                .get(&receipt.registration_id)
+                .is_some_and(|retired| retired.receipt == receipt)
+            {
+                return Ok(());
+            }
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("source registration is not retained by the journal owner"),
+            });
+        };
+        if record.receipt != receipt {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("source drain receipt does not match retained registration"),
+            });
+        }
+        if matches!(&record.readiness, SourceRegistrationReadiness::Registering) {
+            return Err(
+                OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                    reason: String::from("source registration is still being installed"),
+                    receipt: None,
+                },
+            );
+        }
+        if matches!(&record.readiness, SourceRegistrationReadiness::Draining) {
+            return Ok(());
+        }
+        let Some(marker) = record.drain_marker.as_ref() else {
+            return Err(
+                OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                    reason: String::from("source registration has no retained drain marker"),
+                    receipt: None,
+                },
+            );
+        };
+        if let Err(error) = record.request.begin_drain(marker.clone()) {
+            return Err(OperationJournalOwnerError::from(error));
+        }
+        record.drain_marker.take();
+        record.readiness = SourceRegistrationReadiness::Draining;
+        Ok(())
+    }
+
+    fn finalize_source_retirement(
+        &mut self,
+        receipt: SourceAuthorityRegistrationReceipt,
+        acknowledgement: SourceAuthorityRetirementAck,
+    ) -> Result<(), OperationJournalOwnerError> {
+        if let Some(retired) = self
+            .retired_source_registrations
+            .get(&receipt.registration_id)
+        {
+            if retired.receipt == receipt {
+                return Ok(());
+            }
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("source retirement receipt conflicts with retained evidence"),
+            });
+        }
+        let Some(record) = self.source_registrations.get(&receipt.registration_id) else {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from("source registration is not retained by the journal owner"),
+            });
+        };
+        if record.receipt != receipt {
+            return Err(OperationJournalOwnerError::SourceAuthorityConflict {
+                reason: String::from(
+                    "source retirement receipt does not match retained registration",
+                ),
+            });
+        }
+        record
+            .request
+            .finalize_retirement(acknowledgement)
+            .map_err(OperationJournalOwnerError::from)?;
+        let record = self
+            .source_registrations
+            .remove(&receipt.registration_id)
+            .expect("source registration was checked above");
+        for volume in &record.receipt.volume_identities {
+            let remove = if let Some(binding) = self.source_volumes.get_mut(volume) {
+                binding.registrations.remove(&receipt.registration_id);
+                // Keep complete external owner/reserve bindings idle after the last logical
+                // source retires. Dropping them would leave a dirty marker and make a same-volume
+                // source reopen impossible until the deferred clean-handoff contract exists.
+                binding.registrations.is_empty()
+                    && binding.owner.is_none()
+                    && binding.reserve.is_none()
+            } else {
+                false
+            };
+            if remove {
+                self.source_volumes.remove(volume);
+            }
+        }
+        self.retired_source_registrations.insert(
+            receipt.registration_id,
+            RetiredSourceAuthorityRecord {
+                media_root_identity: record.request.media_root().identity().to_owned(),
+                database_root_identity: record.request.database_root().identity().to_owned(),
+                database_file_identity: record.request.database_file_identity().to_owned(),
+                lease_identity: record.request.lease_identity().clone(),
+                receipt: receipt.clone(),
+            },
+        );
+        Ok(())
     }
 
     fn revalidate_capacity_boundary(&mut self) -> Result<PhysicalReserveProof, String> {
@@ -473,6 +1019,12 @@ impl OwnerRuntime {
 
 impl Drop for OwnerRuntime {
     fn drop(&mut self) {
+        // Source registrations retain non-Send authority guards and external reserve/volume
+        // bindings. Release these maps before the journal/profile core so a global shutdown is
+        // visibly conservative and never mistaken for a successful per-source retirement.
+        self.source_registrations.clear();
+        self.retired_source_registrations.clear();
+        drop(std::mem::take(&mut self.source_volumes));
         // Keep this order explicit. The reserve root/descriptor must go first, then SQLite and
         // its profile-child lease, then the cross-process volume lock, and finally the profile
         // guard clone retained solely for this runtime.
@@ -511,13 +1063,13 @@ impl OperationJournalOwner {
     pub fn start(store: OperationJournalStore) -> Result<Self, OperationJournalOwnerStartError> {
         Self::start_inner(
             store,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             None,
         )
     }
@@ -529,8 +1081,10 @@ impl OperationJournalOwner {
         Self::start_inner(store, None, false, false, None)
     }
 
-    #[cfg(test)]
-    fn start_with_capacity_fixture_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    /// Start an owner with a caller-provided fixture registry for cross-crate lifecycle tests.
+    /// This retains the same recovery-only bootstrap and worker ordering as production startup.
+    pub fn start_with_capacity_fixture_for_test(
         store: OperationJournalStore,
         registry_path: std::path::PathBuf,
     ) -> Result<Self, OperationJournalOwnerStartError> {
@@ -573,10 +1127,15 @@ impl OperationJournalOwner {
 
     fn start_inner(
         store: OperationJournalStore,
-        #[cfg(test)] command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
-        #[cfg(test)] panic_on_command: bool,
-        #[cfg(test)] bootstrap_capacity: bool,
-        #[cfg(test)] bootstrap_registry_path: Option<std::path::PathBuf>,
+        #[cfg(any(test, feature = "test-support"))] command_gate: Option<(
+            Arc<std::sync::Barrier>,
+            Arc<std::sync::Barrier>,
+        )>,
+        #[cfg(any(test, feature = "test-support"))] panic_on_command: bool,
+        #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
+        #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<
+            std::path::PathBuf,
+        >,
     ) -> Result<Self, OperationJournalOwnerStartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY);
         let shared = Arc::new(OwnerShared::new(command_tx));
@@ -590,13 +1149,13 @@ impl OperationJournalOwner {
                         store,
                         command_rx,
                         worker_shared,
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         command_gate,
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         panic_on_command,
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         bootstrap_capacity,
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         bootstrap_registry_path,
                     );
                 }));
@@ -701,6 +1260,57 @@ impl OperationJournalClient {
     /// Return the current worker lifecycle without waiting for storage I/O.
     pub fn status(&self) -> OperationJournalOwnerStatus {
         self.shared.status()
+    }
+
+    /// Queue one bounded source-authority registration handshake.
+    ///
+    /// The opaque request carries descriptor-bound evidence and a one-shot source-owner
+    /// confirmation. The worker consumes it only after revalidating the retained roots and file
+    /// identity; it never receives a source lease or SQLite connection.
+    pub fn register_source_authority(
+        &self,
+        request: SourceAuthorityRegistrationRequest,
+    ) -> Result<
+        OperationJournalRequest<SourceAuthorityRegistrationReceipt>,
+        OperationJournalOwnerQueueError,
+    > {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::RegisterSource {
+                request,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue the restrictive source drain transition while retaining its volume resources.
+    pub fn begin_source_drain(
+        &self,
+        receipt: SourceAuthorityRegistrationReceipt,
+    ) -> Result<OperationJournalRequest<()>, OperationJournalOwnerQueueError> {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::BeginSourceDrain {
+                receipt,
+                input,
+                result,
+            }
+        })
+    }
+
+    /// Queue the final source-removal transition after a sealed source-owner retirement ack.
+    pub fn finalize_source_retirement(
+        &self,
+        receipt: SourceAuthorityRegistrationReceipt,
+        acknowledgement: SourceAuthorityRetirementAck,
+    ) -> Result<OperationJournalRequest<()>, OperationJournalOwnerQueueError> {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::FinalizeSourceRetirement {
+                receipt,
+                acknowledgement,
+                input,
+                result,
+            }
+        })
     }
 
     /// Queue one initial intent, moving the bounded record to the worker.
@@ -1171,6 +1781,22 @@ impl Drop for ResultPermit {
 
 #[allow(dead_code)]
 enum JournalCommand {
+    RegisterSource {
+        request: SourceAuthorityRegistrationRequest,
+        input: InputPermit,
+        result: SyncSender<Result<SourceAuthorityRegistrationReceipt, OperationJournalOwnerError>>,
+    },
+    BeginSourceDrain {
+        receipt: SourceAuthorityRegistrationReceipt,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
+    FinalizeSourceRetirement {
+        receipt: SourceAuthorityRegistrationReceipt,
+        acknowledgement: SourceAuthorityRetirementAck,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
     PersistIntent {
         encoded: Vec<u8>,
         input: InputPermit,
@@ -1250,10 +1876,13 @@ fn run_owner(
     store: OperationJournalStore,
     command_rx: Receiver<JournalCommand>,
     shared: Arc<OwnerShared>,
-    #[cfg(test)] command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
-    #[cfg(test)] panic_on_command: bool,
-    #[cfg(test)] bootstrap_capacity: bool,
-    #[cfg(test)] bootstrap_registry_path: Option<std::path::PathBuf>,
+    #[cfg(any(test, feature = "test-support"))] command_gate: Option<(
+        Arc<std::sync::Barrier>,
+        Arc<std::sync::Barrier>,
+    )>,
+    #[cfg(any(test, feature = "test-support"))] panic_on_command: bool,
+    #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
+    #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<std::path::PathBuf>,
 ) {
     let mut runtime = match OwnerRuntime::new(store) {
         Ok(runtime) => runtime,
@@ -1263,11 +1892,11 @@ fn run_owner(
         }
     };
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let bootstrap_capacity = bootstrap_capacity;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let bootstrap_registry_path = bootstrap_registry_path;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if bootstrap_capacity {
         let volume_owner = match runtime
             .store()
@@ -1297,7 +1926,7 @@ fn run_owner(
         runtime.install_reserve(reserve);
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let volume_owner = match runtime.store().acquire_profile_journal_volume_owner() {
             Ok(volume_owner) => volume_owner,
@@ -1324,7 +1953,7 @@ fn run_owner(
         runtime.install_reserve(reserve);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if bootstrap_capacity {
         if let Err(error) = runtime.rebuild_capacity() {
             shared.mark_unavailable(&format!(
@@ -1334,7 +1963,7 @@ fn run_owner(
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     if let Err(error) = runtime.rebuild_capacity() {
         shared.mark_unavailable(&format!(
             "ordinary-claim capacity rebuild bootstrap failed: {error}"
@@ -1356,25 +1985,25 @@ fn run_owner(
             return;
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let mut command_gate = command_gate;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let panic_on_command = panic_on_command;
     loop {
         let command = match command_rx.recv() {
             Ok(command) => command,
             Err(mpsc::RecvError) => break,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some((ready, release)) = command_gate.take() {
             ready.wait();
             release.wait();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if panic_on_command {
             panic!("operation journal owner panic fixture");
         }
-        let panicked = execute_command(command, runtime.store());
+        let panicked = execute_command(command, &mut runtime);
         if panicked {
             shared.mark_unavailable("operation journal owner command panicked");
             while let Ok(command) = command_rx.try_recv() {
@@ -1393,8 +2022,35 @@ fn run_owner(
     }
 }
 
-fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bool {
+fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool {
     match command {
+        JournalCommand::RegisterSource {
+            request,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.register_source_authority(request))
+        }
+        JournalCommand::BeginSourceDrain {
+            receipt,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.begin_source_drain(receipt))
+        }
+        JournalCommand::FinalizeSourceRetirement {
+            receipt,
+            acknowledgement,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.finalize_source_retirement(receipt, acknowledgement)
+            })
+        }
         JournalCommand::PersistIntent {
             encoded,
             input,
@@ -1403,7 +2059,9 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             drop(input);
             execute_store_result(result, || {
                 let record = decode(&encoded)?;
-                Ok::<JournalInsertOutcome, DecodeError>(store.insert_intent_with_outcome(&record))
+                Ok::<JournalInsertOutcome, DecodeError>(
+                    runtime.store().insert_intent_with_outcome(&record),
+                )
             })
         }
         JournalCommand::PersistFull {
@@ -1419,7 +2077,8 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
                         reason: error.to_string(),
                     }
                 })?;
-                store
+                runtime
+                    .store()
                     .persist_full(&record, expected_sequence)
                     .map_err(OperationJournalOwnerError::from)
             })
@@ -1434,7 +2093,8 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             drop(input);
             execute_store_result(result, || {
                 let observation = decode_control_input(&encoded)?;
-                store
+                runtime
+                    .store()
                     .request_cancel_before_publish(operation_id, expected_sequence, observation)
                     .map_err(OperationJournalOwnerError::from)
             })
@@ -1449,7 +2109,8 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             drop(input);
             execute_store_result(result, || {
                 let observation = decode_control_input(&encoded)?;
-                store
+                runtime
+                    .store()
                     .record_retry_pending(operation_id, expected_sequence, observation)
                     .map_err(OperationJournalOwnerError::from)
             })
@@ -1462,7 +2123,7 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
         } => {
             drop(input);
             execute_store_result(result, || {
-                store.validate_for_admission()?;
+                runtime.store().validate_for_admission()?;
                 derive_work_plan(&args, &participants).map_err(|error| {
                     OperationJournalOwnerError::InvalidInput {
                         reason: error.to_string(),
@@ -1479,7 +2140,7 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             result,
         } => {
             drop(input);
-            execute_store_result(result, || store.get(operation_id))
+            execute_store_result(result, || runtime.store().get(operation_id))
         }
         JournalCommand::Recovery {
             cursor,
@@ -1487,7 +2148,7 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             result,
         } => {
             drop(input);
-            execute_store_result(result, || store.scan_recovery_page(cursor))
+            execute_store_result(result, || runtime.store().scan_recovery_page(cursor))
         }
         JournalCommand::GetFull {
             operation_id,
@@ -1496,7 +2157,8 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
         } => {
             drop(input);
             execute_store_result(result, || {
-                store
+                runtime
+                    .store()
                     .get_full(operation_id)
                     .map(|row| row.map(|row| row.into_record()))
             })
@@ -1507,7 +2169,9 @@ fn execute_command(command: JournalCommand, store: &OperationJournalStore) -> bo
             result,
         } => {
             drop(input);
-            execute_store_result(result, || store.scan_coordinator_recovery_page(cursor))
+            execute_store_result(result, || {
+                runtime.store().scan_coordinator_recovery_page(cursor)
+            })
         }
     }
 }
@@ -1543,6 +2207,18 @@ where
 
 fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
     match command {
+        JournalCommand::RegisterSource { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::BeginSourceDrain { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::FinalizeSourceRetirement { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
         JournalCommand::PersistIntent { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
@@ -1620,6 +2296,7 @@ mod tests {
         WaveformOutputSpec, WaveformRenderOutputSpec, WaveformSampleFormat, WaveformSourceSpec,
         decode,
     };
+    use crate::sample_sources::db::SourceDatabase;
     use crate::sample_sources::{SourceId, SourcePlaybackType};
     use crate::test_runtime::TestRuntimeGuard;
     use std::fs;
@@ -1775,6 +2452,274 @@ mod tests {
         assert_eq!(binding_after, binding_before);
         assert_eq!(counts_after, counts_before);
         drop(final_store);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_replays_source_registration_and_retires_exactly_once() {
+        let fixture = fixture("journal-owner-source-authority");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "source-authority-catalog",
+        )
+        .expect("profile-owned source database");
+        let mut authority = database
+            .prepare_source_authority()
+            .expect("source authority");
+        let initial_request = authority.journal_request().expect("journal request");
+        let expired_request = SourceAuthorityRegistrationRequest {
+            request: Arc::clone(&initial_request.request),
+            confirmation: initial_request
+                .confirmation
+                .clone()
+                .with_expired_deadline_for_tests(),
+        };
+        let client = owner.client();
+        let mut expired = client
+            .register_source_authority(expired_request)
+            .expect("expired registration request");
+        assert!(matches!(
+            expired
+                .recv_timeout(Duration::from_secs(2))
+                .expect("expired registration result"),
+            Err(OperationJournalOwnerError::SourceAuthority(
+                SourceAuthorityError::ConfirmationStale
+            ))
+        ));
+        // The request capsule retains the profile-child lease used to derive its descriptor.
+        // Release this test-only failed-attempt handle before asserting same-child reopen; the
+        // journal's retired tombstone keeps identities and the receipt without that capsule.
+        drop(initial_request);
+        let request = authority.journal_request().expect("journal request retry");
+        let duplicate = SourceAuthorityRegistrationRequest {
+            request: Arc::clone(&request.request),
+            confirmation: request.confirmation.clone(),
+        };
+        let mut first = client
+            .register_source_authority(request)
+            .expect("first registration request");
+        let receipt = first
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first registration result")
+            .expect("first registration");
+        let mut replay = client
+            .register_source_authority(duplicate)
+            .expect("duplicate registration request");
+        let replayed = replay
+            .recv_timeout(Duration::from_secs(2))
+            .expect("duplicate registration result")
+            .expect("duplicate registration");
+        assert_eq!(replayed, receipt);
+
+        let mut drain = client
+            .begin_source_drain(receipt.clone())
+            .expect("source drain request");
+        drain
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source drain result")
+            .expect("source drain");
+        let mut replay_drain = client
+            .begin_source_drain(receipt.clone())
+            .expect("duplicate source drain request");
+        replay_drain
+            .recv_timeout(Duration::from_secs(2))
+            .expect("duplicate source drain result")
+            .expect("duplicate source drain");
+        let acknowledgement = authority
+            .close_database(database)
+            .expect("source retirement acknowledgement");
+        let mut finalize = client
+            .finalize_source_retirement(receipt.clone(), acknowledgement.clone())
+            .expect("source finalization request");
+        finalize
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source finalization result")
+            .expect("source finalization");
+        let mut replay_finalize = client
+            .finalize_source_retirement(receipt, acknowledgement)
+            .expect("duplicate source finalization request");
+        replay_finalize
+            .recv_timeout(Duration::from_secs(2))
+            .expect("duplicate source finalization result")
+            .expect("duplicate source finalization");
+        drop(authority);
+
+        // The logical registration is gone, but the complete external volume owner/reserve must
+        // remain idle so a same-volume source reopen can reuse it without reacquiring a dirty
+        // cross-process marker.
+        let reopened_database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "source-authority-catalog",
+        )
+        .expect("reopen source database on retained volume binding");
+        let mut reopened_authority = reopened_database
+            .prepare_source_authority()
+            .expect("reopened source authority");
+        let reopened_request = reopened_authority
+            .journal_request()
+            .expect("reopened journal request");
+        let mut reopened_registration = client
+            .register_source_authority(reopened_request)
+            .expect("reopened source registration request");
+        let reopened_receipt = reopened_registration
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reopened source registration result")
+            .expect("reopened source registration");
+        let mut reopened_drain = client
+            .begin_source_drain(reopened_receipt.clone())
+            .expect("reopened source drain request");
+        reopened_drain
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reopened source drain result")
+            .expect("reopened source drain");
+        let reopened_ack = reopened_authority
+            .close_database(reopened_database)
+            .expect("reopened source retirement acknowledgement");
+        let mut reopened_finalize = client
+            .finalize_source_retirement(reopened_receipt, reopened_ack)
+            .expect("reopened source finalization request");
+        reopened_finalize
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reopened source finalization result")
+            .expect("reopened source finalization");
+        assert!(owner.shutdown());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_rejects_stale_source_proof_before_binding_and_retains_failed_reserve() {
+        let fixture = fixture("journal-owner-source-proof-failure");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "source-proof-failure-catalog",
+        )
+        .expect("profile-owned source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("source authority");
+        let request = authority.journal_request().expect("journal request");
+        let proof = request
+            .request
+            .accept_confirmation(request.confirmation.clone())
+            .expect("source proof");
+        let descriptor = request
+            .request
+            .media_root()
+            .try_clone_descriptor()
+            .expect("source descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("source facts");
+        let volume_owner = super::super::capacity_volume_owner::acquire_fixture_for_test(
+            &descriptor,
+            &registry_path,
+            facts.identity.clone(),
+            fixture.owner.profile_root_identity(),
+        )
+        .expect("source volume owner");
+        let mut authority_slot = Some(authority);
+        let mut abandon_authority = || drop(authority_slot.take());
+        let failure = match store.acquire_owned_source_reserve_with_test_hook(
+            volume_owner,
+            request.request.media_root(),
+            &fixture.owner,
+            &proof,
+            &mut abandon_authority,
+        ) {
+            Ok(_) => panic!("stale proof must reject before durable binding"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("source authority proof"));
+        assert_eq!(failure.volume_owner.volume(), &facts.identity);
+        assert!(failure.reserve.is_some());
+        assert!(failure.volume_owner.revalidate().is_ok());
+        let (binding, _) = store
+            .test_reserve_bootstrap_snapshot(&facts.identity)
+            .expect("source binding snapshot");
+        assert!(
+            binding.is_none(),
+            "proof failure must precede durable binding"
+        );
+        drop(failure);
+        drop(database);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_rejects_incomplete_retained_source_binding_without_reuse() {
+        let fixture = fixture("journal-owner-incomplete-source-binding");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let profile_volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        let profile_volume = profile_volume_owner.volume().clone();
+        runtime.install_volume_owner(profile_volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.owner,
+            "source-incomplete-binding-catalog",
+        )
+        .expect("profile-owned source database");
+        let authority = database
+            .prepare_source_authority()
+            .expect("source authority");
+        let request = authority.journal_request().expect("journal request");
+        let descriptor = request
+            .request
+            .media_root()
+            .try_clone_descriptor()
+            .expect("source descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("source facts");
+        assert_eq!(facts.identity, profile_volume);
+        runtime.source_volumes.insert(
+            profile_volume,
+            SourceVolumeBinding {
+                owner: None,
+                reserve: None,
+                allocation_unit: Some(facts.allocation_unit),
+                readiness: SourceVolumeBindingReadiness::Incomplete,
+                registrations: BTreeSet::new(),
+            },
+        );
+        let error = match runtime.register_source_authority(request) {
+            Ok(_) => panic!("incomplete binding must not be reused"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                receipt: None,
+                reason,
+            } if reason.contains("incomplete retained binding")
+        ));
+        drop(authority);
+        drop(database);
+        drop(runtime);
         drop(fixture);
     }
 

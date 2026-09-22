@@ -19,9 +19,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use wavecrate_library::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use wavecrate_library::filesystem_identity::stable_filesystem_identity;
+use wavecrate_library::operation_journal::{
+    OperationJournalClient, OperationJournalOwnerError, OperationJournalRequest,
+    OperationJournalRequestError,
+};
 use wavecrate_library::sample_sources::db::{
-    SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT, SourceDirectoryEntry,
-    SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceLeaseError, SourceManifestEntry,
+    SOURCE_DIRECTORY_TRUTH_BATCH_LIMIT, SOURCE_DIRECTORY_TRUTH_CLEANUP_LIMIT,
+    SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt, SourceAuthorityRetirementAck,
+    SourceDirectoryEntry, SourceDirectoryTruthPage, SourceDirectoryTruthState, SourceLeaseError,
+    SourceManifestEntry,
 };
 use wavecrate_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use wavecrate_library::sample_sources::{
@@ -63,6 +69,7 @@ const EVENT_CAPACITY: usize = 64;
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(25);
 const DIRECTORY_PAGE_LIMIT: usize = 256;
 const CATALOG_CHILD_PREFIX: &str = "wavecrate-catalog-";
+const SOURCE_AUTHORITY_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default number of elapsed weeks between positive unlocked-rating decay steps.
 pub const DEFAULT_RATING_DECAY_WEEKS: u16 = rating_decay::DEFAULT_RATING_DECAY_WEEKS;
@@ -1322,6 +1329,41 @@ struct RegisteredSource {
     curation_lineage: Option<CurationLineage>,
     watcher: Option<SourceWatcher>,
     watcher_schedule: WatcherSchedule,
+    source_authority: Option<SourceAuthorityRegistration>,
+    source_authority_receipt: Option<SourceAuthorityRegistrationReceipt>,
+    source_authority_pending: Option<PendingSourceAuthority>,
+}
+
+struct PendingSourceAuthority {
+    authority: SourceAuthorityRegistration,
+    result: Option<OperationJournalRequest<SourceAuthorityRegistrationReceipt>>,
+    reason: String,
+}
+
+/// A catalog-owned retry capsule for a source lease that has already retired.
+///
+/// This deliberately retains only the journal receipt, the sealed source-owner acknowledgement,
+/// and one bounded journal result handle. It never retains a source database, source guard, root
+/// descriptor, or other physical authority after the source lease has been consumed.
+struct PendingSourceFinalization {
+    receipt: SourceAuthorityRegistrationReceipt,
+    acknowledgement: SourceAuthorityRetirementAck,
+    result: Option<OperationJournalRequest<()>>,
+    reason: String,
+}
+
+enum RetireSourceOutcome {
+    Removed,
+    Retained {
+        source: RegisteredSource,
+        reason: String,
+    },
+    FinalizationPending {
+        reason: String,
+    },
+    Unresolved {
+        reason: String,
+    },
 }
 
 struct DesiredSource {
@@ -2319,11 +2361,28 @@ impl CatalogService {
     pub fn start(profile_guard: &WritableProfileGuard) -> Result<Self, CatalogStartError> {
         #[cfg(test)]
         {
-            Self::start_inner(profile_guard, None, WatcherMode::Detached)
+            Self::start_inner(profile_guard, None, None, WatcherMode::Detached)
         }
         #[cfg(not(test))]
         {
-            Self::start_inner(profile_guard, None, WatcherMode::Native)
+            Self::start_inner(profile_guard, None, None, WatcherMode::Native)
+        }
+    }
+
+    /// Start a catalog worker with the profile-owned journal client used for source capacity
+    /// registration and explicit source retirement. The journal client is cloneable state only;
+    /// its worker retains the SQLite owner and never receives a source connection or lease.
+    pub fn start_with_journal(
+        profile_guard: &WritableProfileGuard,
+        journal: OperationJournalClient,
+    ) -> Result<Self, CatalogStartError> {
+        #[cfg(test)]
+        {
+            Self::start_inner(profile_guard, None, Some(journal), WatcherMode::Detached)
+        }
+        #[cfg(not(test))]
+        {
+            Self::start_inner(profile_guard, None, Some(journal), WatcherMode::Native)
         }
     }
 
@@ -2335,6 +2394,7 @@ impl CatalogService {
         let service = Self::start_inner(
             profile_guard,
             Some(Arc::clone(&test_gate)),
+            None,
             WatcherMode::Detached,
         )?;
         Ok((service, test_gate))
@@ -2343,6 +2403,7 @@ impl CatalogService {
     fn start_inner(
         profile_guard: &WritableProfileGuard,
         test_gate: Option<Arc<CatalogTestGate>>,
+        journal: Option<OperationJournalClient>,
         watcher_mode: WatcherMode,
     ) -> Result<Self, CatalogStartError> {
         let worker_profile_guard = profile_guard.try_clone()?;
@@ -2352,6 +2413,7 @@ impl CatalogService {
         let admission = Arc::new(Mutex::new(AdmissionState::new()));
         let worker_admission = Arc::clone(&admission);
         let worker_test_gate = test_gate;
+        let worker_journal = journal;
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-catalog"))
             .spawn(move || {
@@ -2361,6 +2423,7 @@ impl CatalogService {
                     worker_events,
                     worker_admission,
                     worker_test_gate,
+                    worker_journal,
                     watcher_mode,
                 )
             })
@@ -2568,9 +2631,11 @@ fn run_worker(
     events: Arc<EventHub>,
     admission: Arc<Mutex<AdmissionState>>,
     test_gate: Option<Arc<CatalogTestGate>>,
+    journal: Option<OperationJournalClient>,
     watcher_mode: WatcherMode,
 ) {
     let mut sources = HashMap::new();
+    let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     loop {
         if let Some(test_gate) = test_gate.as_ref() {
             test_gate.before_receive();
@@ -2630,7 +2695,9 @@ fn run_worker(
             &mut reservation,
             &admission,
             &mut sources,
+            &mut pending_finalizations,
             test_gate.as_ref(),
+            journal.as_ref(),
             watcher_mode,
         ) {
             reservation.finish();
@@ -2638,7 +2705,47 @@ fn run_worker(
         }
         reservation.finish();
     }
-    sources.clear();
+    if let Some(journal) = journal.as_ref() {
+        for (source_id, source) in sources.drain() {
+            match retire_source(
+                source_id.clone(),
+                source,
+                journal,
+                &mut pending_finalizations,
+            ) {
+                RetireSourceOutcome::Removed => {}
+                RetireSourceOutcome::Retained { reason, .. }
+                | RetireSourceOutcome::FinalizationPending { reason }
+                | RetireSourceOutcome::Unresolved { reason } => {
+                    report_source_authority_issue_for_source(
+                        &source_id,
+                        "source retirement remained uncertain during shutdown",
+                        reason,
+                    );
+                }
+            }
+        }
+        let completed_source_finalizations: Vec<_> = pending_finalizations
+            .iter_mut()
+            .filter_map(|(source_id, pending)| {
+                if poll_pending_source_finalization(pending, journal) {
+                    Some(source_id.clone())
+                } else {
+                    report_source_authority_issue_for_source(
+                        source_id,
+                        "source retirement finalization remains uncertain during shutdown",
+                        &pending.reason,
+                    );
+                    None
+                }
+            })
+            .collect();
+        for source_id in completed_source_finalizations {
+            pending_finalizations.remove(&source_id);
+        }
+    } else {
+        sources.clear();
+    }
     if let Some(test_gate) = test_gate.as_ref() {
         test_gate.clear_watcher_signals();
     }
@@ -2661,7 +2768,9 @@ fn handle_command(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    pending_finalizations: &mut HashMap<SourceId, PendingSourceFinalization>,
     test_gate: Option<&Arc<CatalogTestGate>>,
+    journal: Option<&OperationJournalClient>,
     watcher_mode: WatcherMode,
 ) -> bool {
     match command {
@@ -2679,7 +2788,9 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                pending_finalizations,
                 test_gate,
+                journal,
                 watcher_mode,
             );
             false
@@ -2699,7 +2810,9 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                pending_finalizations,
                 test_gate,
+                journal,
                 watcher_mode,
             );
             false
@@ -2897,7 +3010,9 @@ fn handle_command(
                 reservation,
                 admission,
                 sources,
+                pending_finalizations,
                 test_gate,
+                journal,
             );
             false
         }
@@ -3199,7 +3314,9 @@ fn register_source(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    pending_finalizations: &mut HashMap<SourceId, PendingSourceFinalization>,
     test_gate: Option<&Arc<CatalogTestGate>>,
+    journal: Option<&OperationJournalClient>,
     watcher_mode: WatcherMode,
 ) {
     if let Err(error) = validate_canonical_root(&canonical_root) {
@@ -3262,6 +3379,42 @@ fn register_source(
         );
         return;
     }
+    if let Some(mut pending) = pending_finalizations.remove(&source_id) {
+        let Some(journal) = journal else {
+            pending_finalizations.insert(source_id.clone(), pending);
+            emit_failure(
+                reservation,
+                admission,
+                Some(source_id.clone()),
+                Some(lifecycle_generation),
+                CatalogOperation::Register,
+                CatalogError::DatabaseIntegrityUncertain(String::from(
+                    "source retirement finalization cannot be retried without the journal owner",
+                )),
+            );
+            return;
+        };
+        if !poll_pending_source_finalization(&mut pending, journal) {
+            let reason = pending.reason.clone();
+            pending_finalizations.insert(source_id.clone(), pending);
+            report_source_authority_issue_for_source(
+                &source_id,
+                "prior source retirement finalization remains unresolved before replacement",
+                &reason,
+            );
+            emit_failure(
+                reservation,
+                admission,
+                Some(source_id.clone()),
+                Some(lifecycle_generation),
+                CatalogOperation::Register,
+                CatalogError::DatabaseIntegrityUncertain(format!(
+                    "prior source retirement finalization remains unresolved before replacement: {reason}"
+                )),
+            );
+            return;
+        }
+    }
     // The profile child lease is retained by the previous database connection. A different root
     // is an explicit catalog handoff: stop its watcher, consume the old connection, and advance
     // the retained lease while keeping the catalog database and its data in place. Same-root
@@ -3277,12 +3430,78 @@ fn register_source(
             if let Some(mut watcher) = previous.watcher.take() {
                 watcher.close();
             }
-            previous
-                .database
-                .retarget_catalog_root(&canonical_root, profile_guard)
+            retarget_previous_source(
+                source_id.clone(),
+                previous,
+                &canonical_root,
+                profile_guard,
+                journal,
+                pending_finalizations,
+            )
         }
         Some(previous) => {
-            drop(previous);
+            if let Some(journal) = journal {
+                match retire_source(source_id.clone(), previous, journal, pending_finalizations) {
+                    RetireSourceOutcome::Removed => {}
+                    RetireSourceOutcome::FinalizationPending { reason } => {
+                        report_source_authority_issue_for_source(
+                            &source_id,
+                            "same-root replacement could not finalize prior source retirement",
+                            &reason,
+                        );
+                        emit_failure(
+                            reservation,
+                            admission,
+                            Some(source_id.clone()),
+                            Some(lifecycle_generation),
+                            CatalogOperation::Register,
+                            CatalogError::DatabaseIntegrityUncertain(format!(
+                                "same-root replacement could not finalize prior source retirement: {reason}"
+                            )),
+                        );
+                        return;
+                    }
+                    RetireSourceOutcome::Unresolved { reason } => {
+                        report_source_authority_issue_for_source(
+                            &source_id,
+                            "source lease retirement remains unresolved without a sealed acknowledgement",
+                            &reason,
+                        );
+                        emit_failure(
+                            reservation,
+                            admission,
+                            Some(source_id.clone()),
+                            Some(lifecycle_generation),
+                            CatalogOperation::Register,
+                            CatalogError::DatabaseIntegrityUncertain(format!(
+                                "source lease retirement remains unresolved without a sealed acknowledgement: {reason}"
+                            )),
+                        );
+                        return;
+                    }
+                    RetireSourceOutcome::Retained { source, reason } => {
+                        report_source_authority_issue_for_source(
+                            &source_id,
+                            "same-root replacement retained prior source for retirement",
+                            &reason,
+                        );
+                        sources.insert(source_id.clone(), source);
+                        emit_failure(
+                            reservation,
+                            admission,
+                            Some(source_id.clone()),
+                            Some(lifecycle_generation),
+                            CatalogOperation::Register,
+                            CatalogError::SourceIdentityUncertain(format!(
+                                "same-root replacement retained prior source for retirement: {reason}"
+                            )),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                drop(previous);
+            }
             SourceDatabase::open_for_catalog_with_profile_guard(
                 &canonical_root,
                 profile_guard,
@@ -3364,6 +3583,9 @@ fn register_source(
         curation_lineage: None,
         watcher: None,
         watcher_schedule: WatcherSchedule::new(true),
+        source_authority: None,
+        source_authority_receipt: None,
+        source_authority_pending: None,
     };
     if let Err(error) = maintain_catalog_database(&source.database, profile_guard, None, || {
         !publication_is_current(admission, &source_id, lifecycle_generation, None)
@@ -3440,9 +3662,73 @@ fn register_source(
         );
         return;
     }
+    if let Some(journal) = journal {
+        match source.database.prepare_source_authority() {
+            Ok(authority) => match authority.journal_request() {
+                Ok(request) => match journal.register_source_authority(request) {
+                    Ok(mut pending) => match pending.recv_timeout(SOURCE_AUTHORITY_HANDOFF_TIMEOUT)
+                    {
+                        Ok(Ok(receipt)) => {
+                            source.source_authority = Some(authority);
+                            source.source_authority_receipt = Some(receipt);
+                        }
+                        Ok(Err(error)) => {
+                            handle_source_authority_error(&mut source, authority, error, &source_id)
+                        }
+                        Err(error) => retain_pending_source_authority(
+                            &mut source,
+                            authority,
+                            Some(pending),
+                            format!(
+                                "source-capacity registration acknowledgement was not observed: {error}"
+                            ),
+                            &source_id,
+                        ),
+                    },
+                    Err(error) => {
+                        report_source_authority_issue_for_source(
+                            &source_id,
+                            "source-capacity registration was not admitted; no owner effect was acknowledged",
+                            error,
+                        );
+                        drop(authority);
+                    }
+                },
+                Err(error) => {
+                    report_source_authority_issue_for_source(
+                        &source_id,
+                        "source-capacity confirmation could not be prepared; no owner effect was attempted",
+                        error,
+                    );
+                    drop(authority);
+                }
+            },
+            Err(error) => report_source_authority_issue_for_source(
+                &source_id,
+                "source attached without a validated capacity handoff",
+                error,
+            ),
+        }
+    }
     sources.insert(source_id.clone(), source);
     if !publication_is_current(admission, &source_id, lifecycle_generation, None) {
-        sources.remove(&source_id);
+        if let Some(source) = sources.remove(&source_id) {
+            if let Some(journal) = journal {
+                match retire_source(source_id.clone(), source, journal, pending_finalizations) {
+                    RetireSourceOutcome::Removed
+                    | RetireSourceOutcome::FinalizationPending { .. }
+                    | RetireSourceOutcome::Unresolved { .. } => {}
+                    RetireSourceOutcome::Retained { source, reason } => {
+                        report_source_authority_issue_for_source(
+                            &source_id,
+                            "stale registration retained source retirement evidence",
+                            reason,
+                        );
+                        sources.insert(source_id.clone(), source);
+                    }
+                }
+            }
+        }
         if let Some(test_gate) = test_gate {
             test_gate.remove_watcher_signals(&source_id);
         }
@@ -3855,8 +4141,46 @@ fn remove_source(
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
     sources: &mut HashMap<SourceId, RegisteredSource>,
+    pending_finalizations: &mut HashMap<SourceId, PendingSourceFinalization>,
     test_gate: Option<&Arc<CatalogTestGate>>,
+    journal: Option<&OperationJournalClient>,
 ) {
+    if let Some(mut pending) = pending_finalizations.remove(&source_id) {
+        let Some(journal) = journal else {
+            pending_finalizations.insert(source_id.clone(), pending);
+            emit_failure(
+                reservation,
+                admission,
+                Some(source_id.clone()),
+                Some(lifecycle_generation),
+                CatalogOperation::Remove,
+                CatalogError::DatabaseIntegrityUncertain(String::from(
+                    "source retirement finalization cannot be retried without the journal owner",
+                )),
+            );
+            return;
+        };
+        if !poll_pending_source_finalization(&mut pending, journal) {
+            let reason = pending.reason.clone();
+            pending_finalizations.insert(source_id.clone(), pending);
+            report_source_authority_issue_for_source(
+                &source_id,
+                "source retirement finalization remains unresolved before removal retry",
+                &reason,
+            );
+            emit_failure(
+                reservation,
+                admission,
+                Some(source_id.clone()),
+                Some(lifecycle_generation),
+                CatalogOperation::Remove,
+                CatalogError::DatabaseIntegrityUncertain(format!(
+                    "source retirement finalization remains unresolved before removal retry: {reason}"
+                )),
+            );
+            return;
+        }
+    }
     let Some(source) = sources.get(&source_id) else {
         let _ =
             publish_removal_if_current(admission, reservation, &source_id, lifecycle_generation);
@@ -3877,11 +4201,463 @@ fn remove_source(
         );
         return;
     }
-    sources.remove(&source_id);
+    let source = sources
+        .remove(&source_id)
+        .expect("source was checked immediately above");
+    if let Some(journal) = journal {
+        match retire_source(source_id.clone(), source, journal, pending_finalizations) {
+            RetireSourceOutcome::Removed => {}
+            RetireSourceOutcome::FinalizationPending { reason } => {
+                if let Some(test_gate) = test_gate {
+                    test_gate.remove_watcher_signals(&source_id);
+                }
+                report_source_authority_issue_for_source(
+                    &source_id,
+                    "source lease retired but finalization remains pending",
+                    &reason,
+                );
+                emit_failure(
+                    reservation,
+                    admission,
+                    Some(source_id.clone()),
+                    Some(lifecycle_generation),
+                    CatalogOperation::Remove,
+                    CatalogError::DatabaseIntegrityUncertain(format!(
+                        "source lease retired but finalization remains pending: {reason}"
+                    )),
+                );
+                return;
+            }
+            RetireSourceOutcome::Unresolved { reason } => {
+                if let Some(test_gate) = test_gate {
+                    test_gate.remove_watcher_signals(&source_id);
+                }
+                report_source_authority_issue_for_source(
+                    &source_id,
+                    "source lease retirement remains unresolved without a sealed acknowledgement",
+                    &reason,
+                );
+                emit_failure(
+                    reservation,
+                    admission,
+                    Some(source_id.clone()),
+                    Some(lifecycle_generation),
+                    CatalogOperation::Remove,
+                    CatalogError::DatabaseIntegrityUncertain(format!(
+                        "source lease retirement remains unresolved without a sealed acknowledgement: {reason}"
+                    )),
+                );
+                return;
+            }
+            RetireSourceOutcome::Retained { source, reason } => {
+                report_source_authority_issue_for_source(
+                    &source_id,
+                    "source retirement remains pending; keeping the source registered",
+                    &reason,
+                );
+                sources.insert(source_id.clone(), source);
+                emit_failure(
+                    reservation,
+                    admission,
+                    Some(source_id.clone()),
+                    Some(lifecycle_generation),
+                    CatalogOperation::Remove,
+                    CatalogError::SourceIdentityUncertain(format!(
+                        "source retirement remains pending; keeping the source registered: {reason}"
+                    )),
+                );
+                return;
+            }
+        }
+    } else {
+        drop(source);
+    }
     if let Some(test_gate) = test_gate {
         test_gate.remove_watcher_signals(&source_id);
     }
     let _ = publish_removal_if_current(admission, reservation, &source_id, lifecycle_generation);
+}
+
+fn retarget_previous_source(
+    source_id: SourceId,
+    mut previous: RegisteredSource,
+    canonical_root: &Path,
+    profile_guard: &WritableProfileGuard,
+    journal: Option<&OperationJournalClient>,
+    pending_finalizations: &mut HashMap<SourceId, PendingSourceFinalization>,
+) -> Result<SourceDatabase, SourceDbError> {
+    if pending_finalizations.contains_key(&source_id) {
+        let Some(journal) = journal else {
+            return Err(SourceDbError::SourceLease(
+                SourceLeaseError::ControlUnavailable,
+            ));
+        };
+        let resolved = pending_finalizations
+            .get_mut(&source_id)
+            .is_some_and(|pending| poll_pending_source_finalization(pending, journal));
+        if !resolved {
+            return Err(SourceDbError::SourceLease(
+                SourceLeaseError::ControlUnavailable,
+            ));
+        }
+        pending_finalizations.remove(&source_id);
+    }
+    if previous.source_authority_pending.is_some() {
+        return Err(SourceDbError::SourceLease(
+            SourceLeaseError::ControlUnavailable,
+        ));
+    }
+    let mut retarget_context = None;
+    let mut old_receipt = None;
+    if let (Some(authority), Some(receipt), Some(journal)) = (
+        previous.source_authority.take(),
+        previous.source_authority_receipt.take(),
+        journal,
+    ) {
+        let mut drain = journal
+            .begin_source_drain(receipt.clone())
+            .map_err(|_| SourceDbError::SourceLease(SourceLeaseError::ControlUnavailable))?;
+        match drain.recv_timeout(SOURCE_AUTHORITY_HANDOFF_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                return Err(SourceDbError::SourceLease(
+                    SourceLeaseError::ControlUnavailable,
+                ));
+            }
+        }
+        let context = authority
+            .detach_for_retarget()
+            .map_err(|_| SourceDbError::SourceLease(SourceLeaseError::ControlUnavailable))?;
+        retarget_context = Some(context);
+        old_receipt = Some((receipt, journal));
+    }
+
+    let result = if let Some(context) = retarget_context.as_mut() {
+        previous
+            .database
+            .retarget_catalog_root_with_source_authority(canonical_root, profile_guard, context)
+    } else {
+        previous
+            .database
+            .retarget_catalog_root(canonical_root, profile_guard)
+    };
+
+    if let (Some(context), Some((receipt, journal))) = (retarget_context, old_receipt) {
+        match context.acknowledgement_after_retarget_commit() {
+            Ok(acknowledgement) => {
+                let pending = PendingSourceFinalization {
+                    receipt,
+                    acknowledgement,
+                    result: None,
+                    reason: String::from(
+                        "retarget old-generation retirement finalization is pending",
+                    ),
+                };
+                pending_finalizations.insert(source_id.clone(), pending);
+                if let Some(pending) = pending_finalizations.get_mut(&source_id)
+                    && poll_pending_source_finalization(pending, journal)
+                {
+                    pending_finalizations.remove(&source_id);
+                } else if let Some(pending) = pending_finalizations.get(&source_id) {
+                    report_source_authority_issue_for_source(
+                        &source_id,
+                        "retarget old-generation retirement finalization remains pending",
+                        &pending.reason,
+                    );
+                }
+            }
+            Err(error) => report_source_authority_issue_for_source(
+                &source_id,
+                "retarget did not produce a committed old-generation acknowledgement",
+                error,
+            ),
+        }
+    }
+    result
+}
+
+fn report_source_authority_issue(detail: &str, error: impl std::fmt::Display) {
+    eprintln!("wavecrate source-capacity handoff: {detail}: {error}");
+}
+
+fn report_source_authority_issue_for_source(
+    source_id: &SourceId,
+    detail: &str,
+    error: impl std::fmt::Display,
+) {
+    eprintln!("wavecrate source-capacity handoff for {source_id:?}: {detail}: {error}");
+}
+
+fn retain_pending_source_authority(
+    source: &mut RegisteredSource,
+    authority: SourceAuthorityRegistration,
+    result: Option<OperationJournalRequest<SourceAuthorityRegistrationReceipt>>,
+    reason: String,
+    source_id: &SourceId,
+) {
+    eprintln!(
+        "wavecrate source-capacity handoff for {source_id:?}: {reason}; retaining opaque retirement evidence"
+    );
+    source.source_authority_pending = Some(PendingSourceAuthority {
+        authority,
+        result,
+        reason,
+    });
+}
+
+fn handle_source_authority_error(
+    source: &mut RegisteredSource,
+    authority: SourceAuthorityRegistration,
+    error: OperationJournalOwnerError,
+    source_id: &SourceId,
+) {
+    match error {
+        OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+            reason,
+            receipt: Some(receipt),
+        } => {
+            eprintln!(
+                "wavecrate source-capacity handoff for {source_id:?}: partial registration retained: {reason}"
+            );
+            source.source_authority = Some(authority);
+            source.source_authority_receipt = Some(receipt);
+        }
+        error => {
+            report_source_authority_issue_for_source(
+                source_id,
+                "source-capacity registration was rejected before durable owner effects",
+                error,
+            );
+            drop(authority);
+        }
+    }
+}
+
+fn poll_pending_source_authority(source: &mut RegisteredSource) -> Result<(), String> {
+    let Some(mut pending) = source.source_authority_pending.take() else {
+        return Ok(());
+    };
+    let Some(result) = pending.result.as_mut() else {
+        let reason = pending.reason.clone();
+        source.source_authority_pending = Some(pending);
+        return Err(reason);
+    };
+    match result.try_result() {
+        Ok(Ok(receipt)) => {
+            source.source_authority = Some(pending.authority);
+            source.source_authority_receipt = Some(receipt);
+            Ok(())
+        }
+        Ok(Err(error)) => match error {
+            OperationJournalOwnerError::SourceAuthorityRecoveryRequired {
+                reason,
+                receipt: Some(receipt),
+            } => {
+                source.source_authority = Some(pending.authority);
+                source.source_authority_receipt = Some(receipt);
+                eprintln!(
+                    "wavecrate source-capacity handoff: late partial registration retained: {reason}"
+                );
+                Ok(())
+            }
+            error => {
+                report_source_authority_issue(
+                    "late source registration was rejected before durable owner effects",
+                    error,
+                );
+                drop(pending.authority);
+                Ok(())
+            }
+        },
+        Err(OperationJournalRequestError::Empty) => {
+            let reason = format!("source registration remains pending: {}", pending.reason);
+            source.source_authority_pending = Some(pending);
+            Err(reason)
+        }
+        Err(OperationJournalRequestError::Disconnected) => {
+            pending.result = None;
+            pending.reason = format!(
+                "source registration result disconnected: {}",
+                pending.reason
+            );
+            let reason = pending.reason.clone();
+            source.source_authority_pending = Some(pending);
+            Err(reason)
+        }
+    }
+}
+
+/// Poll or submit one bounded source-retirement finalization.
+///
+/// The caller stores the carrier before entering this function. A live request is always polled
+/// first, so a timeout never causes a duplicate command. Known rejection/disconnection clears
+/// only the request handle; the receipt and sealed acknowledgement remain for a later explicit
+/// retry boundary.
+fn poll_pending_source_finalization(
+    pending: &mut PendingSourceFinalization,
+    journal: &OperationJournalClient,
+) -> bool {
+    let request = if let Some(request) = pending.result.take() {
+        request
+    } else {
+        match journal
+            .finalize_source_retirement(pending.receipt.clone(), pending.acknowledgement.clone())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                pending.reason = format!(
+                    "source retirement finalization was not admitted; sealed acknowledgement retained: {error}"
+                );
+                return false;
+            }
+        }
+    };
+    let mut request = request;
+    match request.recv_timeout(SOURCE_AUTHORITY_HANDOFF_TIMEOUT) {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            pending.reason = format!(
+                "source retirement finalization failed; sealed acknowledgement retained: {error}"
+            );
+            false
+        }
+        Err(OperationJournalRequestError::Empty) => {
+            pending.result = Some(request);
+            pending.reason = String::from(
+                "source retirement finalization acknowledgement is pending; sealed acknowledgement retained",
+            );
+            false
+        }
+        Err(OperationJournalRequestError::Disconnected) => {
+            pending.reason = String::from(
+                "source retirement finalization result disconnected; sealed acknowledgement retained",
+            );
+            false
+        }
+    }
+}
+
+/// Retire one source. Failures before the source lease is consumed return the complete source so
+/// the worker can keep its opaque authority and retry evidence. Once the source-owner close has
+/// consumed the database, the sealed acknowledgement is moved into the worker-owned
+/// `pending_finalizations` map before any finalize command is submitted.
+fn retire_source(
+    source_id: SourceId,
+    mut source: RegisteredSource,
+    journal: &OperationJournalClient,
+    pending_finalizations: &mut HashMap<SourceId, PendingSourceFinalization>,
+) -> RetireSourceOutcome {
+    // A source ID can reach this helper again while an earlier generation's sealed
+    // acknowledgement is still pending. Resolve that carrier before consuming the new source;
+    // otherwise inserting the new generation's carrier could discard the older exact proof.
+    if let Some(mut pending) = pending_finalizations.remove(&source_id) {
+        if !poll_pending_source_finalization(&mut pending, journal) {
+            let reason = pending.reason.clone();
+            pending_finalizations.insert(source_id, pending);
+            return RetireSourceOutcome::Retained { source, reason };
+        }
+    }
+    if let Some(mut watcher) = source.watcher.take() {
+        watcher.close();
+    }
+    source.snapshot.take();
+    source.attempt_token.take();
+    source.curation_lineage.take();
+
+    if let Err(reason) = poll_pending_source_authority(&mut source) {
+        report_source_authority_issue(
+            "source registration is unresolved; retaining source authority evidence",
+            &reason,
+        );
+        return RetireSourceOutcome::Retained { source, reason };
+    }
+    let Some(receipt) = source.source_authority_receipt.clone() else {
+        if source.source_authority_pending.is_some() {
+            return RetireSourceOutcome::Retained {
+                source,
+                reason: String::from("source authority has no durable receipt and remains pending"),
+            };
+        }
+        drop(source.source_authority.take());
+        drop(source);
+        return RetireSourceOutcome::Removed;
+    };
+    let Some(mut authority) = source.source_authority.take() else {
+        return RetireSourceOutcome::Retained {
+            source,
+            reason: String::from("source receipt has no source-owner authority guard"),
+        };
+    };
+    let mut drain = match journal.begin_source_drain(receipt.clone()) {
+        Ok(request) => request,
+        Err(error) => {
+            let reason = format!("source drain command was not admitted: {error}");
+            source.source_authority = Some(authority);
+            report_source_authority_issue(&reason, "retaining journal evidence");
+            return RetireSourceOutcome::Retained { source, reason };
+        }
+    };
+    match drain.recv_timeout(SOURCE_AUTHORITY_HANDOFF_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let reason = format!("source drain failed: {error}");
+            source.source_authority = Some(authority);
+            report_source_authority_issue(&reason, "retaining journal evidence");
+            return RetireSourceOutcome::Retained { source, reason };
+        }
+        Err(error) => {
+            let reason = format!("source drain acknowledgement was uncertain: {error}");
+            source.source_authority = Some(authority);
+            report_source_authority_issue(&reason, "retaining journal evidence");
+            return RetireSourceOutcome::Retained { source, reason };
+        }
+    }
+    if !source.database.source_authority_close_ready() {
+        let reason = String::from("source retirement is blocked by retained snapshots");
+        source.source_authority = Some(authority);
+        report_source_authority_issue(&reason, "retaining journal evidence");
+        return RetireSourceOutcome::Retained { source, reason };
+    }
+    let RegisteredSource { database, .. } = source;
+    let acknowledgement = match authority.close_database(database) {
+        Ok(acknowledgement) => acknowledgement,
+        Err(error) => {
+            report_source_authority_issue(
+                "source retirement failed after drain; no retirement acknowledgement emitted",
+                &error,
+            );
+            return RetireSourceOutcome::Unresolved {
+                reason: format!("source retirement failed after drain: {error}"),
+            };
+        }
+    };
+    // The source database and authority wrapper are deliberately gone before this carrier is
+    // stored. The journal receipt plus sealed acknowledgement are sufficient for an exact retry.
+    drop(authority);
+    pending_finalizations.insert(
+        source_id.clone(),
+        PendingSourceFinalization {
+            receipt,
+            acknowledgement,
+            result: None,
+            reason: String::from(
+                "source retirement finalization acknowledgement is pending; sealed acknowledgement retained",
+            ),
+        },
+    );
+    if let Some(pending) = pending_finalizations.get_mut(&source_id)
+        && poll_pending_source_finalization(pending, journal)
+    {
+        pending_finalizations.remove(&source_id);
+        RetireSourceOutcome::Removed
+    } else {
+        RetireSourceOutcome::FinalizationPending {
+            reason: pending_finalizations
+                .get(&source_id)
+                .map(|pending| pending.reason.clone())
+                .unwrap_or_else(|| String::from("source retirement finalization remains pending")),
+        }
+    }
 }
 
 struct CatalogScanWriter<'a> {
@@ -4683,6 +5459,10 @@ mod tests {
     use std::thread;
     use tempfile::TempDir;
     use wavecrate_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
+    use wavecrate_library::operation_journal::{
+        OPERATION_JOURNAL_OWNER_RESULT_CAPACITY, OperationId, OperationJournalOwner,
+        OperationJournalOwnerQueueError, OperationJournalOwnerStatus, OperationJournalStore,
+    };
 
     static TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
@@ -6718,6 +7498,9 @@ mod tests {
             curation_lineage: None,
             watcher: None,
             watcher_schedule: WatcherSchedule::new(false),
+            source_authority: None,
+            source_authority_receipt: None,
+            source_authority_pending: None,
         };
 
         assert!(matches!(
@@ -6778,6 +7561,9 @@ mod tests {
             curation_lineage: None,
             watcher: None,
             watcher_schedule: WatcherSchedule::new(false),
+            source_authority: None,
+            source_authority_receipt: None,
+            source_authority_pending: None,
         };
         assert!(source.publication_fence.is_live());
         assert!(source.publication_fence.validate().is_ok());
@@ -6955,6 +7741,9 @@ mod tests {
             curation_lineage: None,
             watcher: None,
             watcher_schedule: WatcherSchedule::new(false),
+            source_authority: None,
+            source_authority_receipt: None,
+            source_authority_pending: None,
         };
         assert!(publication_is_current(
             &admission,
@@ -7072,6 +7861,9 @@ mod tests {
             curation_lineage: None,
             watcher: None,
             watcher_schedule: WatcherSchedule::new(false),
+            source_authority: None,
+            source_authority_receipt: None,
+            source_authority_pending: None,
         };
 
         let hub = Arc::new(EventHub::new());
@@ -7422,6 +8214,359 @@ mod tests {
             )
         ));
         drop(first);
+    }
+
+    #[test]
+    fn journal_client_registration_reopens_and_removes_source_authority() {
+        let fixture = Fixture::new("catalog-journal-authority");
+        let registry_base = tempfile::tempdir().expect("fixture registry root");
+        let registry_path =
+            fs::canonicalize(registry_base.path()).expect("canonical fixture registry root");
+        let registry_path = registry_path.join("volume-registry");
+        fs::create_dir_all(&registry_path).expect("fixture volume registry");
+        let store = OperationJournalStore::open(&fixture.guard).expect("journal store");
+        let mut journal_owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while journal_owner.status() == OperationJournalOwnerStatus::Initializing {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for journal owner"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            journal_owner.status(),
+            OperationJournalOwnerStatus::Available
+        );
+        let service = CatalogService::start_with_journal(&fixture.guard, journal_owner.client())
+            .expect("catalog service with journal client");
+        let source_id = SourceId::from_string("catalog-journal-authority-source");
+        let register = |generation| CatalogCommand::Register {
+            source_id: source_id.clone(),
+            canonical_root: fixture.root.path().to_path_buf(),
+            lifecycle_generation: generation,
+        };
+        service.submit(register(1)).expect("first registration");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: registered,
+                    lifecycle_generation: 1,
+                } if registered == &source_id
+            )
+        });
+        service.submit(register(2)).expect("same-root reopen");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: registered,
+                    lifecycle_generation: 2,
+                } if registered == &source_id
+            )
+        });
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 2,
+            })
+            .expect("source removal");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed {
+                    source_id: removed,
+                    lifecycle_generation: 2,
+                } if removed == &source_id
+            )
+        });
+        service.shutdown();
+        assert!(journal_owner.shutdown());
+    }
+
+    #[test]
+    fn unavailable_journal_client_does_not_block_catalog_reopen_or_removal() {
+        let fixture = Fixture::new("catalog-journal-unavailable");
+        let registry_base = tempfile::tempdir().expect("fixture registry root");
+        let registry_path =
+            fs::canonicalize(registry_base.path()).expect("canonical fixture registry root");
+        let registry_path = registry_path.join("volume-registry");
+        fs::create_dir_all(&registry_path).expect("fixture volume registry");
+        let store = OperationJournalStore::open(&fixture.guard).expect("journal store");
+        let mut journal_owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        let journal = journal_owner.client();
+        assert!(journal_owner.shutdown(), "fixture owner shutdown");
+        let service = CatalogService::start_with_journal(&fixture.guard, journal)
+            .expect("catalog service with unavailable journal client");
+        let source_id = SourceId::from_string("catalog-journal-unavailable-source");
+        let register = |generation| CatalogCommand::Register {
+            source_id: source_id.clone(),
+            canonical_root: fixture.root.path().to_path_buf(),
+            lifecycle_generation: generation,
+        };
+        service.submit(register(1)).expect("first registration");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: registered,
+                    lifecycle_generation: 1,
+                } if registered == &source_id
+            )
+        });
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+            })
+            .expect("remove after rejected capacity registration");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed {
+                    source_id: removed,
+                    lifecycle_generation: 1,
+                } if removed == &source_id
+            )
+        });
+        service.submit(register(2)).expect("reopen registration");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: registered,
+                    lifecycle_generation: 2,
+                } if registered == &source_id
+            )
+        });
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source_id.clone(),
+                lifecycle_generation: 2,
+            })
+            .expect("reopen removal");
+        receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed {
+                    source_id: removed,
+                    lifecycle_generation: 2,
+                } if removed == &source_id
+            )
+        });
+        service.shutdown();
+    }
+
+    #[test]
+    fn source_finalization_queue_rejection_retains_ack_for_exact_retry() {
+        let fixture = Fixture::new("catalog-source-finalization-retry");
+        let source_id = SourceId::from_string("catalog-source-finalization-retry");
+        let registry_base = tempfile::tempdir().expect("fixture registry root");
+        let registry_path =
+            fs::canonicalize(registry_base.path()).expect("canonical fixture registry root");
+        let registry_path = registry_path.join("volume-registry");
+        fs::create_dir_all(&registry_path).expect("fixture volume registry");
+        let store = OperationJournalStore::open(&fixture.guard).expect("journal store");
+        let mut journal_owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while journal_owner.status() == OperationJournalOwnerStatus::Initializing {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for journal owner"
+            );
+            thread::yield_now();
+        }
+        let client = journal_owner.client();
+        let source_root = tempfile::tempdir().expect("source root");
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.guard,
+            "source-finalization-retry-catalog",
+        )
+        .expect("source database");
+        let mut authority = database
+            .prepare_source_authority()
+            .expect("source authority");
+        let request = authority.journal_request().expect("journal request");
+        let mut registration = client
+            .register_source_authority(request)
+            .expect("source registration request");
+        let receipt = registration
+            .recv_timeout(SOURCE_AUTHORITY_HANDOFF_TIMEOUT)
+            .expect("source registration result")
+            .expect("source registration");
+        let mut drain = client
+            .begin_source_drain(receipt.clone())
+            .expect("source drain request");
+        drain
+            .recv_timeout(SOURCE_AUTHORITY_HANDOFF_TIMEOUT)
+            .expect("source drain result")
+            .expect("source drain");
+        let acknowledgement = authority
+            .close_database(database)
+            .expect("durable source retirement");
+
+        let mut held_results = Vec::new();
+        loop {
+            match client.get(OperationId::new()) {
+                Ok(request) => held_results.push(request),
+                Err(OperationJournalOwnerQueueError::ResultsFull) => break,
+                Err(OperationJournalOwnerQueueError::Full) => thread::yield_now(),
+                Err(error) => panic!("unexpected result-capacity fixture error: {error}"),
+            }
+        }
+        assert_eq!(
+            held_results.len(),
+            OPERATION_JOURNAL_OWNER_RESULT_CAPACITY,
+            "fixture must fill result permits before finalization retry"
+        );
+
+        let mut pending = PendingSourceFinalization {
+            receipt: receipt.clone(),
+            acknowledgement: acknowledgement.clone(),
+            result: None,
+            reason: String::from("initial finalization attempt"),
+        };
+        assert!(
+            !poll_pending_source_finalization(&mut pending, &client),
+            "result-capacity rejection must retain the sealed acknowledgement"
+        );
+        assert!(pending.result.is_none());
+        let mut pending_finalizations = HashMap::new();
+        pending_finalizations.insert(source_id.clone(), pending);
+
+        // A current removal reports the unresolved carrier to its caller, while retaining the
+        // exact pair for retry instead of silently waiting forever.
+        let admission = Arc::new(Mutex::new(AdmissionState::new()));
+        admission.lock().expect("admission lock").sources.insert(
+            source_id.clone(),
+            DesiredSource {
+                lifecycle_generation: 1,
+                active: true,
+                attempt_token: None,
+                last_curation_request_id: None,
+            },
+        );
+        let hub = EventHub::new();
+        let mut reservation = EventReservation {
+            hub: &hub,
+            admission: &admission,
+            remaining: 1,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_read_payload_bytes: 0,
+        };
+        let mut sources = HashMap::new();
+        remove_source(
+            source_id.clone(),
+            1,
+            &mut reservation,
+            &admission,
+            &mut sources,
+            &mut pending_finalizations,
+            None,
+            Some(&client),
+        );
+        let (event, ..) = hub.try_recv().expect("unresolved removal failure event");
+        assert!(matches!(
+            event,
+            CatalogEvent::Failed {
+                source_id: Some(event_source),
+                lifecycle_generation: Some(1),
+                operation: CatalogOperation::Remove,
+                error: CatalogError::DatabaseIntegrityUncertain(_),
+            } if event_source == source_id
+        ));
+        let retained = pending_finalizations
+            .get(&source_id)
+            .expect("unresolved carrier retained after failure event");
+        assert_eq!(retained.receipt, receipt);
+        assert_eq!(retained.acknowledgement, acknowledgement);
+
+        // A second source retirement must resolve the old carrier first; it cannot replace that
+        // sealed proof with a new generation's carrier while the journal result queue is full.
+        drop(reservation);
+        drop(authority);
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.guard,
+            "source-finalization-collision-catalog",
+        )
+        .expect("source database for carrier collision guard");
+        let publication_fence = database
+            .source_publication_fence()
+            .expect("publication fence for carrier collision guard");
+        let replacement_source = RegisteredSource {
+            root: source_root.path().to_path_buf(),
+            lifecycle_generation: 2,
+            database,
+            publication_fence,
+            known_root_identity: None,
+            snapshot: None,
+            attempt_token: None,
+            curation_lineage: None,
+            watcher: None,
+            watcher_schedule: WatcherSchedule::new(false),
+            source_authority: None,
+            source_authority_receipt: None,
+            source_authority_pending: None,
+        };
+        let outcome = retire_source(
+            source_id.clone(),
+            replacement_source,
+            &client,
+            &mut pending_finalizations,
+        );
+        let RetireSourceOutcome::Retained { source, .. } = outcome else {
+            panic!("unresolved old carrier must retain the replacement source");
+        };
+        drop(source);
+        let retained = pending_finalizations
+            .get(&source_id)
+            .expect("old carrier survives replacement retirement attempt");
+        assert_eq!(retained.receipt, receipt);
+        assert_eq!(retained.acknowledgement, acknowledgement);
+        drop(held_results);
+
+        let mut pending = pending_finalizations
+            .remove(&source_id)
+            .expect("retained finalization carrier");
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
+        while !poll_pending_source_finalization(&mut pending, &client) {
+            assert!(
+                Instant::now() < retry_deadline,
+                "exact finalization retry did not complete"
+            );
+            thread::yield_now();
+        }
+
+        // The owner treats an exact receipt/ack pair as an idempotent duplicate. Polling an
+        // already submitted request exercises the late-result path without minting a new proof.
+        let late_result = client
+            .finalize_source_retirement(receipt.clone(), acknowledgement.clone())
+            .expect("duplicate finalization request");
+        let mut late = PendingSourceFinalization {
+            receipt: receipt.clone(),
+            acknowledgement: acknowledgement.clone(),
+            result: Some(late_result),
+            reason: String::from("duplicate finalization result"),
+        };
+        assert!(poll_pending_source_finalization(&mut late, &client));
+        let reopened = SourceDatabase::open_for_catalog_with_profile_guard(
+            source_root.path(),
+            &fixture.guard,
+            "source-finalization-retry-catalog",
+        )
+        .expect("finalization carrier must retain no profile-child lease capsule");
+        drop(reopened);
+        assert!(journal_owner.shutdown());
     }
 
     #[test]

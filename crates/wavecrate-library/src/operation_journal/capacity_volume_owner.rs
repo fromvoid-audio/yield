@@ -769,7 +769,7 @@ fn root_error(path: PathBuf, error: ProfileOwnershipError) -> VolumeOwnershipErr
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn acquire_fixture_for_test(
     descriptor: &File,
     registry_path: &Path,
@@ -785,7 +785,7 @@ pub(super) fn acquire_fixture_for_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn acquire_for_descriptor_fixture_test(
     descriptor: &File,
     registry_path: &Path,
@@ -801,7 +801,7 @@ pub(super) fn acquire_for_descriptor_fixture_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn acquire_fixture_with_clean_marker_for_test(
     descriptor: &File,
     registry_path: &Path,

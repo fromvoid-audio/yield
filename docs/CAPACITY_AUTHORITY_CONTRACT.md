@@ -158,15 +158,69 @@ registration/drain handshake.
 
 OPT-1556's private registration boundary is source-owner-mediated: the source
 owner sends a `Send`-safe owned descriptor/root capsule through a typed command,
-while retaining the `SourceLease` itself. The source owner holds the lease and
-epoch valid until the journal owner drains/unregisters the volume and receives
-an explicit release acknowledgement. The journal owner validates the retained
-descriptor/root inputs and obtains fresh lease-owner confirmation immediately
-before installation and use. Missing confirmation, a rebound lease, or a
-descriptor mismatch keeps the volume unavailable. The current types do not yet
-expose this exact handoff; OPT-1556 owns that private handoff contract. A
-borrowed `&SourceLease`, caller-supplied identity string, invented `Arc`, or
-serialized lease observation is never sufficient authority.
+while retaining the `SourceLease` itself. The source-owner guard is the only
+value that can validate the retained control connection and mint a fresh,
+one-shot installation confirmation; the request never carries `SourceLease`,
+its control connection, or a publication fence. The confirmation is bound to
+the validated owner/epoch and expiry, and a renewed lease requires a fresh
+confirmation. Missing or expired confirmation, a rebound lease, or a descriptor
+mismatch keeps the volume unavailable. A borrowed `&SourceLease`,
+caller-supplied identity string, invented `Arc`, or serialized lease observation
+is never sufficient authority.
+
+The private lifecycle is `Prepared` -> `Registered` -> `Draining` -> `Retired`.
+Draining disables new capacity transitions while retaining the registration,
+reserve, and volume ownership. The source owner then retires its lease through
+the retained control connection and sends a sealed matching retirement
+acknowledgement. The accepted `SourceAuthorityUseProof` becomes a long-lived
+registration and drain marker for this milestone, so its installation deadline
+does not block the restrictive drain; each later physical transition must use a
+new source-owner confirmation. Only after that durable acknowledgement may the journal owner
+remove the registration and release its volume ownership. A failed or uncertain
+retirement emits no acknowledgement and leaves the registration evidence
+unresolved. Milestone 1 defines and tests this handoff/retirement contract.
+
+OPT-1556 now wires the private production path: the session starts the journal
+before the catalog and passes a cloneable client into the catalog worker. The
+catalog worker retains the opaque source registration and non-`Send` guard; one
+bounded command carries the descriptor-bound request and confirmation to the
+journal owner, which revalidates the roots and database-file identity before
+installing the registration.
+
+The journal owner deduplicates descriptor-derived volume identities, including
+the profile/journal volume. It retains one owner lock and reserve per external
+volume and shares that entry across source references. A failed or timed-out
+registration can leave a durable reserve binding, so the owner keeps that state
+recovery-only and never reports a clean registration from an uncertain reply.
+Each acquired volume owner and reserve is retained before the next volume effect,
+so partial multi-volume registration remains actionable evidence rather than an
+implicit rollback. Finalizing the last source reference keeps a complete external
+owner/reserve binding idle for same-runtime reuse; cross-runtime dirty-marker cleanup
+remains deferred to the later clean-handoff contract.
+Removing a source first enters `Draining`, then the source owner drops its
+SQLite connection and durably retires the lease; only the matching sealed ack
+permits final removal. Catalog attachment and browsing remain available when
+capacity registration is unsupported or fails, while ordinary capacity
+admission remains closed.
+
+After the source lease is retired, the catalog stores the receipt and sealed
+acknowledgement in a bounded pending-finalization carrier before submitting the
+journal finalization command. A timeout, queue rejection, or late error retains
+that exact pair for a later replacement/removal boundary retry; an in-flight
+result is polled before another command is submitted. The carrier contains no
+source database, guard, root descriptor, or physical authority. Shutdown makes
+one bounded retry pass and leaves unresolved finalization explicitly uncertain;
+it never publishes successful per-source removal for an unresolved ack.
+
+Profile-child retargeting drains the old registration, detaches only the
+source-owner guard, and advances the owner/epoch in the existing control
+transaction. The old superseded-generation ack is emitted only after that
+transaction commits, including when reopening the new connection fails after
+commit; pre-commit and uncertain failures retain the old registration evidence.
+The bounded integration adds no schema, does not route source writes through
+the journal, does not qualify the provider, and does not enable ordinary
+admission. Registration diagnostics are bounded worker diagnostics; a fresh
+source confirmation remains required for every later physical transition.
 
 ## Readiness and failure states
 

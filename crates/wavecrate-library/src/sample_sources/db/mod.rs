@@ -33,8 +33,19 @@ mod replay_authority;
 pub(crate) use replay_authority::ValidatedReplayAuthority;
 /// SQLite schema management for sample source databases.
 pub mod schema;
+mod source_authority;
 mod source_lease;
 pub(crate) mod sqlite_identity;
+#[allow(unused_imports)]
+pub(crate) use source_authority::{
+    SourceAuthorityConfirmation, SourceAuthorityDrainMarker, SourceAuthorityGuard,
+    SourceAuthorityRequest, SourceAuthorityUseProof, SourceLeaseIdentity, SourceRegistrationId,
+};
+pub use source_authority::{
+    SourceAuthorityError, SourceAuthorityRegistration, SourceAuthorityRegistrationReceipt,
+    SourceAuthorityRegistrationRequest, SourceAuthorityRetargetContext,
+    SourceAuthorityRetirementAck,
+};
 pub use source_lease::{SourceLeaseError, SourcePublicationFence, SourcePublicationFenceError};
 /// Durable per-source tag catalog and sample assignment helpers.
 pub mod tags;
@@ -565,6 +576,29 @@ impl SourceDatabase {
         new_root: impl AsRef<Path>,
         profile_guard: &WritableProfileGuard,
     ) -> Result<Self, SourceDbError> {
+        self.retarget_catalog_root_inner(new_root, profile_guard, None)
+    }
+
+    /// Retarget a profile-child catalog while carrying a drained source-authority generation.
+    ///
+    /// The opaque context is marked only after the durable owner/epoch transaction commits. If
+    /// reopening the new database connection then fails, the caller can still obtain the old
+    /// superseded-generation acknowledgement; pre-commit and uncertain failures cannot mint it.
+    pub fn retarget_catalog_root_with_source_authority(
+        self,
+        new_root: impl AsRef<Path>,
+        profile_guard: &WritableProfileGuard,
+        retarget_context: &mut source_authority::SourceAuthorityRetargetContext,
+    ) -> Result<Self, SourceDbError> {
+        self.retarget_catalog_root_inner(new_root, profile_guard, Some(retarget_context))
+    }
+
+    fn retarget_catalog_root_inner(
+        self,
+        new_root: impl AsRef<Path>,
+        profile_guard: &WritableProfileGuard,
+        mut retarget_context: Option<&mut source_authority::SourceAuthorityRetargetContext>,
+    ) -> Result<Self, SourceDbError> {
         let new_root = new_root.as_ref();
         let source_lease = self
             .source_lease
@@ -588,6 +622,15 @@ impl SourceDatabase {
             .database_file_binding
             .as_deref()
             .ok_or(SourceDbError::ProfileOwnershipRequired)?;
+        if let Some(retarget_context) = retarget_context.as_deref() {
+            retarget_context
+                .validate_retarget_subject(source_lease, expected_database)
+                .map_err(|_error| {
+                    SourceDbError::SourceLease(source_lease::SourceLeaseError::Superseded {
+                        path: expected_database.path().to_path_buf(),
+                    })
+                })?;
+        }
         source_lease
             .prepare_for_mutation(&self.connection)
             .map_err(SourceDbError::from)?;
@@ -623,6 +666,9 @@ impl SourceDatabase {
         source_lease
             .retarget_catalog_root(Arc::clone(&new_media_root), profile_guard)
             .map_err(SourceDbError::from)?;
+        if let Some(retarget_context) = retarget_context.as_deref_mut() {
+            retarget_context.mark_retarget_committed();
+        }
         let source_lease = Arc::new(source_lease);
         let database_root = source_lease.database_root_binding();
         open::open_source_database_with_profile_guard_and_lease(
@@ -1066,6 +1112,14 @@ impl SourceDatabase {
             (None, _) => Ok(()),
             _ => Err(SourceDbError::ProfileOwnershipRequired),
         }
+    }
+
+    /// Return whether this source can enter the final lease-release boundary without dropping a
+    /// database that still has externally retained snapshot fences.
+    pub fn source_authority_close_ready(&self) -> bool {
+        self.source_lease
+            .as_ref()
+            .is_none_or(|lease| Arc::strong_count(lease) <= 2)
     }
 
     pub(crate) fn validate_profile_owned_open(
