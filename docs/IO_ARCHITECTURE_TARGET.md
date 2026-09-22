@@ -1412,6 +1412,63 @@ and revalidates each registered source authority's descriptor identity, lease li
 lifecycle. Partial reserve proofs remain limited to startup recovery and do not authorize this
 gate.
 
+### Typed capacity requirement and estimator matrix
+
+`operation_journal::capacity_estimator::estimate_capacity` derives an authority-free
+`CapacityRequirementMatrix` from a typed command observation. It returns exactly the nine rows
+below in the order defined by `FULL_CAPACITY_ALLOCATION_CLASSES`. A `Known` row is only a checked
+logical byte bound; it is not a volume fact, reservation, provider qualification, or execution
+permission. The later descriptor-bound `full_capacity_planner` still reads live descriptor facts,
+allocation units, protected-floor observations, and shared-object identity before constructing a
+plan.
+
+| Stable class ID | Allocation class | Matrix meaning |
+| --- | --- | --- |
+| `capacity.destination_staging` | `DestinationStaging` | New staged output; known only when the typed envelope exposes checked output bytes. |
+| `capacity.journal_record` | `JournalRecord` | Journal growth; `Unknown` until its bounded record contract is supplied. |
+| `capacity.source_database_commit` | `SourceDatabaseCommit` | Source commit growth; `Unknown` until a family supplies a sound bound. |
+| `capacity.source_wal_shm` | `SourceWalShm` | Source WAL/SHM growth; `Unknown` until a family supplies a sound bound. |
+| `capacity.global_database_commit` | `GlobalDatabaseCommit` | Global commit growth; `Unknown` until a family supplies a sound bound. |
+| `capacity.global_wal_shm` | `GlobalWalShm` | Global WAL/SHM growth; `Unknown` until a family supplies a sound bound. |
+| `capacity.existing_destination` | `ExistingDestination` | Existing destination identity and bytes; `Unknown` until the typed command proves whether retained data participates. |
+| `capacity.existing_recovery_payload` | `ExistingRecoveryPayload` | Existing retained recovery data; `Unknown` until the typed command proves its exact identity and bytes. |
+| `capacity.operation_recovery_payload` | `OperationRecoveryPayload` | Operation-created recovery data; `Unknown` until its owner supplies a checked bound. |
+
+The command-family identifiers are exhaustive and stable: `family.extract` (selection output),
+`family.copy`, `family.import`, `family.create_file`, `family.create_folder`, `family.duplicate`,
+`family.export`, `family.rename`, `family.move`, `family.trash`, `family.delete`,
+`family.restore_retained`, `family.purge_retained`, `family.destructive_edit`, `family.undo`,
+`family.redo`, and `family.external_reconciliation`. The following payload matrix records the
+current outcome for the destination and retained classes; every other class remains an explicit
+`Unknown` row for journal, database, WAL/SHM, and operation-recovery bounds.
+
+| Typed payload | Destination staging | Existing destination/recovery | Contract reason |
+| --- | --- | --- | --- |
+| Copy, Import, DuplicateSame | `Known` checked source/file bytes | `Unknown` | Retained identity is not proven by the envelope. |
+| DecodedEdit, DecodedExport, SelectionNormalize, SelectionOutput::Extract | `Known` checked writer arithmetic | `Unknown` | One bounded output is represented. |
+| DecodedExportBatch with one output | `Known` checked child arithmetic | `Unknown` | The single output boundary is retained. |
+| DecodedExportBatch with multiple outputs; SelectionOutput::ExtractAndTrim | `Unknown` | `Unknown` | Per-output allocation rounding cannot be collapsed into one bound. |
+| Render::Normalize, Render::DuplicateDouble | `Known` checked writer arithmetic | `Unknown` | One whole-file output is represented. |
+| WaveformEdit | `Unknown` | `Unknown` | The typed envelope does not expose a safe output bound. |
+| Namespace::Rename/Move/CreateFolder; Removal; RetainedResolution; History payloads | `Unknown` | `Unknown` | These shapes may stage or retain data; absence is not inferred. |
+| ExternalReconciliation | `Unknown` | `Unknown` | Metadata/reconciliation growth is not bounded here. |
+| CreateFile (argumentless kind) | `Unsupported` | `Unsupported` | The current command model has no typed arguments. |
+
+`CapacityRequirementMatrix::require_known_bytes` is the fail-closed extraction boundary for a
+future descriptor-bound planner. It returns a typed error for an unknown, unsupported,
+not-applicable, or missing row; callers must not filter rows and treat the remainder as zero.
+Unknown and unsupported outcomes remain visible to a later family adapter, which must supply an
+explicit bound or fail closed. The matrix does not wire operation families, open descriptors,
+touch the filesystem, qualify a provider, or enable ordinary admission.
+
+The currently bounded `Known` cases reuse existing checked observations: copy/import file lengths,
+raw WAV selection arithmetic, decoded export arithmetic, render arithmetic, and checked Float32
+decoded-edit output arithmetic. Invalid zero values and checked arithmetic failures reject the
+matrix before a future executable plan can be built. Multi-output payloads remain `Unknown` until
+their per-output allocation boundaries can be represented without losing rounding or retained
+identity. `NotApplicable` is reserved for a future typed shape that proves the class is absent; it
+is never inferred from a missing estimate.
+
 Cancellation rules:
 
 - before `IntentDurable`: cancel as a non-durable `RejectedBeforeIntent` result, without a

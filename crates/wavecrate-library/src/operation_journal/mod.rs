@@ -11,6 +11,7 @@ pub mod cancellation_dispatch;
 pub mod cancellation_effects;
 pub mod cancellation_reconciliation;
 pub mod cancellation_recovery;
+pub mod capacity_estimator;
 #[allow(dead_code)]
 mod capacity_provider;
 #[allow(dead_code)]
@@ -204,6 +205,13 @@ pub use external_commands::{
 pub use full_capacity::{
     FULL_CAPACITY_PLAN_VERSION, FullCapacityAllocation, FullCapacityAllocationClass,
     FullCapacityPlan, FullCapacityValidationError, MAX_FULL_CAPACITY_ALLOCATIONS,
+};
+
+pub use capacity_estimator::{
+    CAPACITY_ESTIMATOR_MATRIX_VERSION, CapacityEstimateDisposition, CapacityEstimateReason,
+    CapacityEstimatorError, CapacityRequirementError, CapacityRequirementEstimate,
+    CapacityRequirementMatrix, FULL_CAPACITY_ALLOCATION_CLASSES, UNIVERSAL_COMMAND_KINDS,
+    estimate_capacity, estimate_command_kind,
 };
 
 pub use full_progress_record::{FullProgressIntentObservation, FullProgressIntentObservationError};

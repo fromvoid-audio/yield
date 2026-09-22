@@ -44,6 +44,23 @@ pub enum FullCapacityAllocationClass {
     OperationRecoveryPayload,
 }
 
+impl FullCapacityAllocationClass {
+    /// Return the stable documentation identifier for this allocation class.
+    pub const fn stable_id(self) -> &'static str {
+        match self {
+            Self::DestinationStaging => "capacity.destination_staging",
+            Self::JournalRecord => "capacity.journal_record",
+            Self::SourceDatabaseCommit => "capacity.source_database_commit",
+            Self::SourceWalShm => "capacity.source_wal_shm",
+            Self::GlobalDatabaseCommit => "capacity.global_database_commit",
+            Self::GlobalWalShm => "capacity.global_wal_shm",
+            Self::ExistingDestination => "capacity.existing_destination",
+            Self::ExistingRecoveryPayload => "capacity.existing_recovery_payload",
+            Self::OperationRecoveryPayload => "capacity.operation_recovery_payload",
+        }
+    }
+}
+
 impl From<CapacityAllocationClass> for FullCapacityAllocationClass {
     fn from(value: CapacityAllocationClass) -> Self {
         match value {
