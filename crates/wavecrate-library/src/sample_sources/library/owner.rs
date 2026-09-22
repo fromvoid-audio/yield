@@ -9,13 +9,18 @@ use thiserror::Error;
 
 use super::connection::LibraryDatabase;
 use super::error::LibraryError;
+use super::registry_limits::{
+    RegistryBoundError, SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, path_bytes,
+    validate_sources_encoded,
+};
 use super::tag_vocabulary::{
     ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyInputError,
     ProfileTagVocabularyLookup, ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor,
     ProfileTagVocabularySetReceipt, validate_delete_input, validate_lookup_labels,
     validate_page_inputs, validate_set_input,
 };
-use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
+use crate::app_dirs::{ProfileChildLease, ProfileOwnershipError, WritableProfileGuard};
 use crate::sample_sources::{SampleSource, UI_PREFERENCES_MAX_BYTES};
 
 /// Maximum number of global-library commands waiting for the owner thread.
@@ -50,6 +55,12 @@ impl SourceRegistrySnapshot {
     /// Return whether this snapshot contains no sources.
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
+    }
+
+    fn validate_for_admission(&self) -> Result<(), GlobalLibraryWriterQueueError> {
+        validate_sources_encoded(&self.sources)
+            .map(|_| ())
+            .map_err(GlobalLibraryWriterQueueError::from_registry_bound_error)
     }
 
     pub(super) fn from_sources(sources: Vec<SampleSource>) -> Self {
@@ -133,12 +144,108 @@ pub enum GlobalLibraryWriterQueueError {
         /// Supplied payload size.
         actual: usize,
     },
+    /// A source-registry request exceeded its descriptor count bound.
+    #[error("source registry contains too many descriptors ({actual}, max {limit})")]
+    SourceRegistryTooManyDescriptors {
+        /// Maximum descriptor count.
+        limit: usize,
+        /// Supplied descriptor count.
+        actual: usize,
+    },
+    /// A source-registry descriptor or path exceeded its bounded size.
+    #[error("source registry descriptor {index} field {field} exceeds {limit} bytes ({actual})")]
+    SourceRegistryFieldTooLarge {
+        /// Descriptor index.
+        index: usize,
+        /// Field whose bound was exceeded.
+        field: &'static str,
+        /// Maximum accepted field size.
+        limit: usize,
+        /// Supplied field size.
+        actual: usize,
+    },
+    /// A source-registry source identity exceeded the journal identity bound.
+    #[error("source registry descriptor {index} source identity exceeds {limit} bytes ({actual})")]
+    SourceRegistrySourceIdTooLarge {
+        /// Descriptor index.
+        index: usize,
+        /// Maximum accepted identity size.
+        limit: usize,
+        /// Supplied identity size.
+        actual: usize,
+    },
+    /// A source-registry descriptor or encoded payload exceeded the aggregate bound.
+    #[error("source registry payload exceeds {limit} bytes ({actual})")]
+    SourceRegistryPayloadTooLarge {
+        /// Maximum accepted encoded size.
+        limit: usize,
+        /// Supplied or observed encoded size.
+        actual: usize,
+    },
+    /// A source-registry path could not fit the descriptor field bound.
+    #[error("source registry path exceeds {limit} bytes ({actual})")]
+    SourceRegistryPathTooLarge {
+        /// Maximum accepted path size.
+        limit: usize,
+        /// Supplied path size.
+        actual: usize,
+    },
     /// A profile vocabulary request was rejected before queue admission.
     #[error("invalid profile tag vocabulary input: {0}")]
     InvalidProfileTagVocabulary(#[from] ProfileTagVocabularyInputError),
     /// The owner is closing or has already closed.
     #[error("global library writer is closed")]
     Closed,
+}
+
+impl GlobalLibraryWriterQueueError {
+    fn from_registry_bound_error(error: RegistryBoundError) -> Self {
+        match error {
+            RegistryBoundError::TooManyDescriptors { actual } => {
+                Self::SourceRegistryTooManyDescriptors {
+                    limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+                    actual,
+                }
+            }
+            RegistryBoundError::AggregateTooLarge { actual } => {
+                Self::SourceRegistryPayloadTooLarge {
+                    limit: SOURCE_REGISTRY_MAX_BYTES,
+                    actual,
+                }
+            }
+            RegistryBoundError::DescriptorTooLarge { index, actual } => {
+                Self::SourceRegistryFieldTooLarge {
+                    index,
+                    field: "descriptor",
+                    limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                    actual,
+                }
+            }
+            RegistryBoundError::FieldTooLarge {
+                index,
+                field,
+                actual,
+            } => Self::SourceRegistryFieldTooLarge {
+                index,
+                field,
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                actual,
+            },
+            RegistryBoundError::SourceIdTooLarge { index, actual } => {
+                Self::SourceRegistrySourceIdTooLarge {
+                    index,
+                    limit: SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,
+                    actual,
+                }
+            }
+            RegistryBoundError::ArithmeticOverflow | RegistryBoundError::Serialization => {
+                Self::SourceRegistryPayloadTooLarge {
+                    limit: SOURCE_REGISTRY_MAX_BYTES,
+                    actual: SOURCE_REGISTRY_MAX_BYTES.saturating_add(1),
+                }
+            }
+        }
+    }
 }
 
 /// Failure to start a profile-owned global-library worker.
@@ -352,6 +459,7 @@ impl GlobalLibraryWriter {
         binding_open_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         post_command_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     ) -> Result<Self, GlobalLibraryWriterStartError> {
+        let global_writer_lease = profile_guard.acquire_named_lease("library.db")?;
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY);
         let commands = Arc::new(Mutex::new(Some(commands)));
@@ -370,6 +478,7 @@ impl GlobalLibraryWriter {
             .spawn(move || {
                 run_owner(
                     worker_profile_guard,
+                    global_writer_lease,
                     command_rx,
                     worker_lifecycle,
                     worker_unavailable,
@@ -498,6 +607,13 @@ impl GlobalLibraryWriter {
         root: PathBuf,
     ) -> Result<Receiver<Result<Option<SampleSource>, LibraryError>>, GlobalLibraryWriterQueueError>
     {
+        let root_bytes = path_bytes(&root);
+        if root_bytes > SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES {
+            return Err(GlobalLibraryWriterQueueError::SourceRegistryPathTooLarge {
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                actual: root_bytes,
+            });
+        }
         self.ensure_available()?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.send(WriterCommand::LookupRetainedSource {
@@ -512,6 +628,7 @@ impl GlobalLibraryWriter {
         &self,
         snapshot: SourceRegistrySnapshot,
     ) -> Result<Receiver<Result<(), LibraryError>>, GlobalLibraryWriterQueueError> {
+        snapshot.validate_for_admission()?;
         self.ensure_available()?;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.send(WriterCommand::ReplaceSourceRegistry {
@@ -856,6 +973,7 @@ impl WriterLifecycle {
 
 fn run_owner(
     profile_guard: WritableProfileGuard,
+    _global_writer_lease: ProfileChildLease,
     command_rx: Receiver<WriterCommand>,
     lifecycle: Arc<std::sync::atomic::AtomicU8>,
     unavailable: Arc<Mutex<Option<GlobalLibraryWriterUnavailable>>>,
@@ -1253,6 +1371,65 @@ mod tests {
     }
 
     #[test]
+    fn source_registry_queue_rejects_oversized_snapshot_before_admission() {
+        let writer = GlobalLibraryWriter::disabled();
+        let sources = (0..=SOURCE_REGISTRY_MAX_DESCRIPTORS)
+            .map(|index| source(Path::new("bounded/root"), &format!("source-{index}")))
+            .collect();
+        let error = writer
+            .replace_source_registry(SourceRegistrySnapshot::new(sources))
+            .expect_err("descriptor lookahead must reject before queue admission");
+        assert!(matches!(
+            error,
+            GlobalLibraryWriterQueueError::SourceRegistryTooManyDescriptors {
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+                actual
+            } if actual == SOURCE_REGISTRY_MAX_DESCRIPTORS + 1
+        ));
+        assert!(matches!(writer.load_source_registry_snapshot(), Ok(_)));
+    }
+
+    #[test]
+    fn source_registry_queue_rejects_escaped_descriptor_over_limit() {
+        let writer = GlobalLibraryWriter::disabled();
+        let escaped = "\"".repeat(SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES / 2 + 1);
+        let oversized = source(Path::new(&escaped), "escaped");
+        let error = writer
+            .replace_source_registry(SourceRegistrySnapshot::new(vec![oversized]))
+            .expect_err("escaped JSON descriptor must fail closed");
+        assert!(matches!(
+            error,
+            GlobalLibraryWriterQueueError::SourceRegistryFieldTooLarge { .. }
+                | GlobalLibraryWriterQueueError::SourceRegistryPayloadTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn source_registry_queue_rejects_aggregate_bytes_before_admission() {
+        let writer = GlobalLibraryWriter::disabled();
+        let root = PathBuf::from("x".repeat(60_000));
+        let within_limit = (0..260)
+            .map(|index| source(&root, &format!("source-{index}")))
+            .collect();
+        writer
+            .replace_source_registry(SourceRegistrySnapshot::new(within_limit))
+            .expect("bounded aggregate passes admission");
+
+        let over_limit = (0..280)
+            .map(|index| source(&root, &format!("source-{index}")))
+            .collect();
+        assert!(matches!(
+            writer.replace_source_registry(SourceRegistrySnapshot::new(over_limit)),
+            Err(
+                GlobalLibraryWriterQueueError::SourceRegistryPayloadTooLarge {
+                    limit: SOURCE_REGISTRY_MAX_BYTES,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
     fn source_registry_snapshot_owns_an_immutable_copy() {
         let temp = tempdir().expect("base");
         let mut original = source(&temp.path().join("original"), "source");
@@ -1283,6 +1460,92 @@ mod tests {
         let replacement = WritableProfileGuard::acquire_current().expect("released ownership");
         drop(replacement);
         drop(profile_guard);
+        drop(base_guard);
+    }
+
+    #[test]
+    fn second_writer_for_cloned_profile_guard_is_rejected_before_open() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let base_path = std::fs::canonicalize(temp.path()).expect("canonical test base");
+        let base_guard = ConfigBaseGuard::set(base_path);
+        let profile_guard = PersistenceProfileGuard::named("single-global-writer");
+        let writable_guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let mut writer = GlobalLibraryWriter::start(&writable_guard).expect("writer start");
+        wait_until_available(&writer);
+        assert!(matches!(
+            GlobalLibraryWriter::start(&writable_guard),
+            Err(GlobalLibraryWriterStartError::ProfileOwnership(
+                ProfileOwnershipError::ProfileChildAlreadyLeased { .. }
+            ))
+        ));
+        let cloned_guard = writable_guard.try_clone().expect("clone profile guard");
+
+        assert!(matches!(
+            GlobalLibraryWriter::start(&cloned_guard),
+            Err(GlobalLibraryWriterStartError::ProfileOwnership(
+                ProfileOwnershipError::ProfileChildAlreadyLeased { .. }
+            ))
+        ));
+        assert_eq!(
+            super::super::connection::test_open_count(
+                &writable_guard
+                    .profile_root()
+                    .join(super::super::LIBRARY_DB_FILE_NAME)
+            ),
+            1
+        );
+
+        assert!(writer.shutdown());
+        let mut replacement =
+            GlobalLibraryWriter::start(&cloned_guard).expect("slot released after shutdown");
+        wait_until_available(&replacement);
+        assert_eq!(
+            super::super::connection::test_open_count(
+                &writable_guard
+                    .profile_root()
+                    .join(super::super::LIBRARY_DB_FILE_NAME)
+            ),
+            2
+        );
+        assert!(replacement.shutdown());
+        drop(cloned_guard);
+        drop(writable_guard);
+        drop(profile_guard);
+        drop(base_guard);
+    }
+
+    #[test]
+    fn separate_profile_writer_slots_are_independent() {
+        let temp = tempdir().expect("base");
+        let _runtime = TestRuntimeGuard::acquire();
+        let base_path = std::fs::canonicalize(temp.path()).expect("canonical test base");
+        let base_guard = ConfigBaseGuard::set(base_path);
+
+        let profile_a = PersistenceProfileGuard::named("independent-a");
+        let writable_a = WritableProfileGuard::acquire_current().expect("profile A ownership");
+        let mut writer_a = GlobalLibraryWriter::start(&writable_a).expect("writer A start");
+        wait_until_available(&writer_a);
+
+        let profile_b = PersistenceProfileGuard::named("independent-b");
+        let writable_b = WritableProfileGuard::acquire_current().expect("profile B ownership");
+        let mut writer_b = GlobalLibraryWriter::start(&writable_b).expect("writer B start");
+        wait_until_available(&writer_b);
+        assert!(matches!(
+            writer_a.status(),
+            GlobalLibraryWriterStatus::Available
+        ));
+        assert!(matches!(
+            writer_b.status(),
+            GlobalLibraryWriterStatus::Available
+        ));
+
+        assert!(writer_b.shutdown());
+        assert!(writer_a.shutdown());
+        drop(writable_b);
+        drop(profile_b);
+        drop(writable_a);
+        drop(profile_a);
         drop(base_guard);
     }
 
@@ -1721,7 +1984,7 @@ mod tests {
             .profile_root()
             .join(super::super::LIBRARY_DB_FILE_NAME);
         fs::write(&path, b"not sqlite").expect("corrupt fixture");
-        let writer = GlobalLibraryWriter::start(&writable_guard).expect("writer start");
+        let mut writer = GlobalLibraryWriter::start(&writable_guard).expect("writer start");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !matches!(
             writer.status(),
@@ -1740,6 +2003,12 @@ mod tests {
             ))
         ));
         assert_eq!(super::super::connection::test_open_count(&path), 1);
+        let _ = writer.shutdown();
+        let mut replacement = GlobalLibraryWriter::start(&writable_guard)
+            .expect("failed initialization releases slot");
+        let _ = replacement.shutdown();
+        assert_eq!(super::super::connection::test_open_count(&path), 2);
+        drop(replacement);
         drop(writer);
         drop(writable_guard);
         drop(profile_guard);

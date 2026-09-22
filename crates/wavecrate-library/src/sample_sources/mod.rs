@@ -54,7 +54,9 @@ pub use library::{
     ProfileTagCategory, ProfileTagVocabularyClient, ProfileTagVocabularyDeleteReceipt,
     ProfileTagVocabularyEntry, ProfileTagVocabularyInputError, ProfileTagVocabularyLookup,
     ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
-    SourceRegistrySnapshot, UI_PREFERENCES_KEY, UI_PREFERENCES_MAX_BYTES,
+    SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, SourceRegistrySnapshot,
+    UI_PREFERENCES_KEY, UI_PREFERENCES_MAX_BYTES,
 };
 pub use source_entry::{
     HiddenDirectoryPolicy, SOURCE_FORMAT_POLICY_VERSION, SourceEntryClassification,

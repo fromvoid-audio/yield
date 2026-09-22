@@ -374,6 +374,40 @@ impl WritableProfileGuard {
         }
         Ok((child_dir, lease))
     }
+
+    /// Reserve one profile-scoped in-process capability without opening another path.
+    ///
+    /// This is used for profile-owned participants whose physical database is the profile root
+    /// itself.  The registry is shared by cloned profile guards, so a second participant cannot
+    /// accidentally open another writable connection for the same logical role.  The returned
+    /// RAII lease remains the only authority for the reservation and releases it on every startup
+    /// failure, worker panic, and normal teardown path.
+    pub(crate) fn acquire_named_lease(
+        &self,
+        name: &str,
+    ) -> Result<ProfileChildLease, ProfileOwnershipError> {
+        self.validate_current()?;
+        let identity = format!("profile-participant:{name}:{}", self.profile_identity);
+        let mut registry = self
+            .catalog_leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !registry.insert(identity.clone()) {
+            return Err(ProfileOwnershipError::ProfileChildAlreadyLeased {
+                path: self.profile_root.join(name),
+            });
+        }
+        let lease = ProfileChildLease {
+            registry: Arc::clone(&self.catalog_leases),
+            identity,
+        };
+        drop(registry);
+        if let Err(error) = self.validate_current() {
+            drop(lease);
+            return Err(error);
+        }
+        Ok(lease)
+    }
 }
 
 /// Open the profile-independent per-user application root used by shared ownership helpers.

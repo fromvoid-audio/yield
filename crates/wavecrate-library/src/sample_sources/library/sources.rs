@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use super::connection::LibraryDatabase;
 use super::error::map_sql_error;
 use super::owner::SourceRegistrySnapshot;
+use super::registry_limits::{
+    RegistryBoundError, SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES, bounded_json,
+    bounded_json_at_limit, validate_sources, validate_sources_encoded,
+};
 use super::telemetry::record_library_db_event;
 use super::{
     KNOWN_SOURCES_KEY, LibraryError, LibraryState, UI_PREFERENCES_KEY, UI_PREFERENCES_MAX_BYTES,
@@ -82,6 +87,7 @@ impl LibraryDatabase {
         snapshot: &SourceRegistrySnapshot,
         event: &'static str,
     ) -> Result<(), LibraryError> {
+        validate_sources_encoded(snapshot.as_slice()).map_err(map_registry_bound_error)?;
         let started_at = Instant::now();
         let tx = self.connection.transaction().map_err(map_sql_error)?;
         let mut mappings = Self::load_known_sources_from(&tx)?;
@@ -94,34 +100,13 @@ impl LibraryDatabase {
 
     pub(super) fn load_sources(&self) -> Result<Vec<SampleSource>, LibraryError> {
         let started_at = Instant::now();
-        let mut stmt = self
-            .connection
-            .prepare(
-                "SELECT id, root, role, metadata_storage, primary_import_folder
-                 FROM sources
-                 ORDER BY sort_order ASC, id ASC",
-            )
-            .map_err(map_sql_error)?;
-        let rows = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let root: String = row.get(1)?;
-                let role: String = row.get(2)?;
-                let metadata_storage: String = row.get(3)?;
-                let primary_import_folder: String = row.get(4)?;
-                Ok(normalized_source(SampleSource {
-                    id: SourceId::from_string(id),
-                    root: PathBuf::from(root),
-                    role: SourceRole::from_stored(&role),
-                    metadata_storage: SourceMetadataStorage::from_stored(&metadata_storage),
-                    primary_import_folder: primary_import_folder_path(primary_import_folder),
-                }))
-            })
-            .map_err(map_sql_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(map_sql_error)?;
-        record_library_db_event("library.load_sources", started_at, Ok(()));
-        Ok(rows)
+        let result = load_sources_from_connection(&self.connection);
+        record_library_db_event(
+            "library.load_sources",
+            started_at,
+            result.as_ref().map(|_| ()),
+        );
+        result
     }
 
     pub(super) fn lookup_known_source_id(
@@ -202,7 +187,13 @@ impl LibraryDatabase {
             upsert_known_source_mapping(mappings, source);
         }
         mappings.sort_by(|a, b| a.root.cmp(&b.root));
-        Self::set_metadata_in_tx(tx, KNOWN_SOURCES_KEY, &serde_json::to_string(&mappings)?)?;
+        validate_known_source_mappings(mappings)?;
+        let payload = bounded_json(mappings).map_err(map_registry_bound_error)?;
+        let payload =
+            String::from_utf8(payload).map_err(|_| LibraryError::SourceRegistryMalformed {
+                field: "known_sources_v1",
+            })?;
+        Self::set_metadata_in_tx(tx, KNOWN_SOURCES_KEY, &payload)?;
         Ok(())
     }
 
@@ -218,23 +209,20 @@ impl LibraryDatabase {
     }
 
     fn load_known_sources_from(conn: &Connection) -> Result<Vec<KnownSourceMapping>, LibraryError> {
-        let Some(value) = Self::get_metadata_from(conn, KNOWN_SOURCES_KEY)? else {
+        let Some(value) =
+            load_bounded_metadata(conn, KNOWN_SOURCES_KEY, SOURCE_REGISTRY_MAX_BYTES)?
+        else {
             return Ok(Vec::new());
         };
-        serde_json::from_str::<Vec<KnownSourceMapping>>(&value).map_err(|source| {
-            LibraryError::MetadataJson {
-                key: KNOWN_SOURCES_KEY,
-                source,
-            }
-        })
-    }
-
-    fn get_metadata_from(conn: &Connection, key: &str) -> Result<Option<String>, LibraryError> {
-        conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(map_sql_error)
+        let mappings =
+            serde_json::from_str::<Vec<KnownSourceMapping>>(&value).map_err(|source| {
+                LibraryError::MetadataJson {
+                    key: KNOWN_SOURCES_KEY,
+                    source,
+                }
+            })?;
+        validate_known_source_mappings(&mappings)?;
+        Ok(mappings)
     }
 
     fn set_metadata_in_tx(
@@ -251,6 +239,84 @@ impl LibraryDatabase {
         .map_err(map_sql_error)?;
         Ok(())
     }
+}
+
+pub(super) fn load_sources_from_connection(
+    connection: &Connection,
+) -> Result<Vec<SampleSource>, LibraryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                length(CAST(id AS BLOB)),
+                CASE WHEN length(CAST(id AS BLOB)) <= ?1 THEN CAST(id AS BLOB) END,
+                length(CAST(root AS BLOB)),
+                CASE WHEN length(CAST(root AS BLOB)) <= ?2 THEN CAST(root AS BLOB) END,
+                length(CAST(role AS BLOB)),
+                CASE WHEN length(CAST(role AS BLOB)) <= ?2 THEN CAST(role AS BLOB) END,
+                length(CAST(metadata_storage AS BLOB)),
+                CASE WHEN length(CAST(metadata_storage AS BLOB)) <= ?2
+                     THEN CAST(metadata_storage AS BLOB) END,
+                length(CAST(primary_import_folder AS BLOB)),
+                CASE WHEN length(CAST(primary_import_folder AS BLOB)) <= ?2
+                     THEN CAST(primary_import_folder AS BLOB) END
+             FROM sources
+             ORDER BY sort_order ASC, id ASC
+             LIMIT ?3",
+        )
+        .map_err(map_sql_error)?;
+    let raw_rows = statement
+        .query_map(
+            [
+                SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES as i64,
+                SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES as i64,
+                (SOURCE_REGISTRY_MAX_DESCRIPTORS + 1) as i64,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                ))
+            },
+        )
+        .map_err(map_sql_error)?;
+    let mut rows = Vec::new();
+    let mut aggregate = 0usize;
+    for (index, raw_row) in raw_rows.enumerate() {
+        if index >= SOURCE_REGISTRY_MAX_DESCRIPTORS {
+            return Err(LibraryError::SourceRegistryTooManyDescriptors {
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+                actual: index.saturating_add(1),
+            });
+        }
+        let raw_row = raw_row.map_err(map_sql_error)?;
+        let source = parse_source_row(index, raw_row)?;
+        let descriptor =
+            validate_sources(std::slice::from_ref(&source)).map_err(map_registry_bound_error)?;
+        aggregate =
+            aggregate
+                .checked_add(descriptor)
+                .ok_or(LibraryError::SourceRegistryTooLarge {
+                    limit: SOURCE_REGISTRY_MAX_BYTES,
+                    actual: SOURCE_REGISTRY_MAX_BYTES.saturating_add(1),
+                })?;
+        if aggregate > SOURCE_REGISTRY_MAX_BYTES {
+            return Err(LibraryError::SourceRegistryTooLarge {
+                limit: SOURCE_REGISTRY_MAX_BYTES,
+                actual: aggregate,
+            });
+        }
+        rows.push(source);
+    }
+    validate_sources_encoded(rows.as_slice()).map_err(map_registry_bound_error)?;
+    Ok(rows)
 }
 
 fn load_bounded_metadata(
@@ -289,6 +355,250 @@ fn load_bounded_metadata(
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| LibraryError::MetadataInvalidUtf8 { key })
+}
+
+fn map_registry_bound_error(error: RegistryBoundError) -> LibraryError {
+    match error {
+        RegistryBoundError::TooManyDescriptors { actual } => {
+            LibraryError::SourceRegistryTooManyDescriptors {
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+                actual,
+            }
+        }
+        RegistryBoundError::AggregateTooLarge { actual } => LibraryError::SourceRegistryTooLarge {
+            limit: SOURCE_REGISTRY_MAX_BYTES,
+            actual,
+        },
+        RegistryBoundError::DescriptorTooLarge { index, actual } => {
+            LibraryError::SourceRegistryFieldTooLarge {
+                index,
+                field: "descriptor",
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                actual,
+            }
+        }
+        RegistryBoundError::FieldTooLarge {
+            index,
+            field,
+            actual,
+        } => LibraryError::SourceRegistryFieldTooLarge {
+            index,
+            field,
+            limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+            actual,
+        },
+        RegistryBoundError::SourceIdTooLarge { index, actual } => {
+            LibraryError::SourceRegistrySourceIdTooLarge {
+                index,
+                limit: SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,
+                actual,
+            }
+        }
+        RegistryBoundError::ArithmeticOverflow => LibraryError::SourceRegistryTooLarge {
+            limit: SOURCE_REGISTRY_MAX_BYTES,
+            actual: SOURCE_REGISTRY_MAX_BYTES.saturating_add(1),
+        },
+        RegistryBoundError::Serialization => LibraryError::SourceRegistryMalformed {
+            field: "source_registry_json",
+        },
+    }
+}
+
+type RawSourceRow = (
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+
+fn parse_source_row(index: usize, row: RawSourceRow) -> Result<SampleSource, LibraryError> {
+    let id = decode_source_text(
+        row.0,
+        row.1,
+        index,
+        "id",
+        SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,
+    )?;
+    let root = decode_source_text(
+        row.2,
+        row.3,
+        index,
+        "root",
+        SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    )?;
+    let role = decode_source_text(
+        row.4,
+        row.5,
+        index,
+        "role",
+        SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    )?;
+    let metadata_storage = decode_source_text(
+        row.6,
+        row.7,
+        index,
+        "metadata_storage",
+        SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    )?;
+    let primary_import_folder = decode_source_text(
+        row.8,
+        row.9,
+        index,
+        "primary_import_folder",
+        SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    )?;
+    Ok(normalized_source(SampleSource {
+        id: SourceId::from_string(id),
+        root: PathBuf::from(root),
+        role: SourceRole::from_stored(&role),
+        metadata_storage: SourceMetadataStorage::from_stored(&metadata_storage),
+        primary_import_folder: primary_import_folder_path(primary_import_folder),
+    }))
+}
+
+fn decode_source_text(
+    actual: Option<i64>,
+    bytes: Option<Vec<u8>>,
+    index: usize,
+    field: &'static str,
+    limit: usize,
+) -> Result<String, LibraryError> {
+    let actual = actual
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(LibraryError::SourceRegistryMalformed { field })?;
+    if actual > limit {
+        if field == "id" {
+            return Err(LibraryError::SourceRegistrySourceIdTooLarge {
+                index,
+                limit,
+                actual,
+            });
+        }
+        return Err(LibraryError::SourceRegistryFieldTooLarge {
+            index,
+            field,
+            limit,
+            actual,
+        });
+    }
+    let bytes = bytes.ok_or(LibraryError::SourceRegistryMalformed { field })?;
+    String::from_utf8(bytes).map_err(|_| LibraryError::SourceRegistryMalformed { field })
+}
+
+fn validate_known_source_mappings(mappings: &[KnownSourceMapping]) -> Result<(), LibraryError> {
+    if mappings.len() > SOURCE_REGISTRY_MAX_DESCRIPTORS {
+        return Err(LibraryError::SourceRegistryTooManyDescriptors {
+            limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+            actual: mappings.len(),
+        });
+    }
+    let mut aggregate = 0usize;
+    for (index, mapping) in mappings.iter().enumerate() {
+        let _encoded = bounded_json_at_limit(mapping, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES)
+            .map_err(|error| match error {
+                RegistryBoundError::AggregateTooLarge { actual } => {
+                    LibraryError::SourceRegistryFieldTooLarge {
+                        index,
+                        field: "descriptor",
+                        limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                        actual,
+                    }
+                }
+                other => map_registry_bound_error(other),
+            })?;
+        let source_id = mapping.source_id.len();
+        if source_id > SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES {
+            return Err(LibraryError::SourceRegistrySourceIdTooLarge {
+                index,
+                limit: SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,
+                actual: source_id,
+            });
+        }
+        let fields = [
+            ("root", mapping.root.len()),
+            ("role", mapping.role.as_deref().unwrap_or_default().len()),
+            (
+                "metadata_storage",
+                mapping
+                    .metadata_storage
+                    .as_deref()
+                    .unwrap_or_default()
+                    .len(),
+            ),
+            (
+                "primary_import_folder",
+                mapping
+                    .primary_import_folder
+                    .as_deref()
+                    .unwrap_or_default()
+                    .len(),
+            ),
+        ];
+        for (field, actual) in fields {
+            if actual > SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES {
+                return Err(LibraryError::SourceRegistryFieldTooLarge {
+                    index,
+                    field,
+                    limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                    actual,
+                });
+            }
+        }
+        let descriptor = source_id
+            .checked_add(mapping.root.len())
+            .and_then(|value| value.checked_add(mapping.role.as_deref().unwrap_or_default().len()))
+            .and_then(|value| {
+                value.checked_add(
+                    mapping
+                        .metadata_storage
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len(),
+                )
+            })
+            .and_then(|value| {
+                value.checked_add(
+                    mapping
+                        .primary_import_folder
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len(),
+                )
+            })
+            .and_then(|value| value.checked_add(128))
+            .ok_or(LibraryError::SourceRegistryTooLarge {
+                limit: SOURCE_REGISTRY_MAX_BYTES,
+                actual: SOURCE_REGISTRY_MAX_BYTES.saturating_add(1),
+            })?;
+        if descriptor > SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES {
+            return Err(LibraryError::SourceRegistryFieldTooLarge {
+                index,
+                field: "descriptor",
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                actual: descriptor,
+            });
+        }
+        aggregate =
+            aggregate
+                .checked_add(descriptor)
+                .ok_or(LibraryError::SourceRegistryTooLarge {
+                    limit: SOURCE_REGISTRY_MAX_BYTES,
+                    actual: SOURCE_REGISTRY_MAX_BYTES.saturating_add(1),
+                })?;
+        if aggregate > SOURCE_REGISTRY_MAX_BYTES {
+            return Err(LibraryError::SourceRegistryTooLarge {
+                limit: SOURCE_REGISTRY_MAX_BYTES,
+                actual: aggregate,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn normalized_source(mut source: SampleSource) -> SampleSource {

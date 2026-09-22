@@ -1,9 +1,43 @@
 # Global-library writer evidence audit
 
 Audited at `8b656c24ff8853511ee0966c817847b44c4d3c93` on 2026-09-22. This is a
-current-head evidence record for OPT-1824. It describes the code that exists at
+historical-head evidence record for OPT-1824. It describes the code that exists at
 that revision and assigns unimplemented target work to the existing issues; it
 does not claim that the target global-library owner is complete.
+
+## OPT-1826 implementation update
+
+OPT-1826 closes the queue, owner-start, and read-only observation gaps listed below.
+The original audit table and test mapping remain evidence for the audited SHA,
+not a description of this later implementation.
+
+- `GlobalLibraryWriter::start` now reserves the `library.db` participant slot in
+  the acquisition-shared `WritableProfileGuard` registry before spawning. A
+  second start through the same or a cloned guard fails before opening another
+  connection. The worker retains the slot through database close; startup
+  failure and unwind release it. The earlier one-connection test proved reuse
+  within one writer instance, not exclusivity across writer instances.
+- Registry commands validate at most 4096 active or retained descriptors,
+  16 MiB of aggregate encoded data, 64 KiB per descriptor/path, and the journal's
+  256-byte source identity limit. Validation accounts for JSON escaping before
+  queue admission and SQL replacement. SQL reads use a 4097-row lookahead and
+  guarded BLOB lengths before owned string allocation. Retained-history overflow
+  rolls back both active rows and metadata. Existing preferences and vocabulary
+  limits stay in force. Delivered observations remain caller-owned; there is no
+  new durable reply ledger.
+- `load_source_registry_snapshot_read_only` observes an existing `library.db`
+  with SQLite read-only/no-follow flags, required-schema checks, one read
+  transaction, and a cooperative two-second deadline. It does not initialize,
+  migrate, checkpoint, or retain a connection or ownership capability. Missing
+  and incompatible databases fail without creation or migration. The result
+  can become stale immediately. Strict filesystem no-write qualification for
+  live WAL/SHM remains OPT-1639.
+
+Focused owner, registry, and read-only tests cover duplicate-start rejection,
+reopen/release, queue bounds, malformed stored payloads, exact retained-history
+rollback, missing/incompatible schema, live-owner observation, and deadline
+rejection. This slice adds no `OperationId` participant semantics, Harvest,
+metadata/index, link, cache/artifact route, or durable shutdown custody.
 
 ## Audit basis
 
