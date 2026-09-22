@@ -18,7 +18,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::app_dirs::WritableProfileGuard;
-use crate::durable_capacity::{VolumeIdentity, descriptor_capacity_facts};
+use crate::durable_capacity::{VolumeFacts, VolumeIdentity, descriptor_capacity_facts};
 use crate::sample_sources::db::{
     SourceAuthorityDrainMarker, SourceAuthorityError, SourceAuthorityRegistrationReceipt,
     SourceAuthorityRegistrationRequest, SourceAuthorityRequest, SourceAuthorityRetirementAck,
@@ -365,6 +365,27 @@ struct SourceVolumeBinding {
     registrations: BTreeSet<crate::sample_sources::db::SourceRegistrationId>,
 }
 
+/// A transient, owner-thread observation of descriptor-derived capacity facts.
+///
+/// The provenance binds every fact to the retained volume lock, profile identity, reserve root,
+/// and reserve descriptor that were revalidated for this observation.  It is intentionally not
+/// cached in [`CapacityProvider`], serialized, or accepted as ordinary-admission authority; a
+/// later capacity transition must obtain a new observation while the retained handles are live.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveDescriptorCapacityObservation {
+    facts: BTreeMap<VolumeIdentity, VolumeFacts>,
+    provenance: BTreeMap<VolumeIdentity, LiveDescriptorCapacityProvenance>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveDescriptorCapacityProvenance {
+    profile_identity: String,
+    owner_generation: u64,
+    reserve_root_identity: String,
+    reserve_file_identity: String,
+    allocation_unit: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceVolumeBindingReadiness {
     Incomplete,
@@ -402,6 +423,74 @@ enum SourceRegistrationReadiness {
     Registered,
     Draining,
     RecoveryRequired { stage: &'static str, reason: String },
+}
+
+fn observe_retained_descriptor_inner(
+    volume_owner: &VolumeOwnershipCapability,
+    reserve: &mut OwnedReserveAllocation,
+    profile_guard: &WritableProfileGuard,
+    #[cfg(test)] facts_reader: Option<
+        &dyn Fn(&mut OwnedReserveAllocation, &WritableProfileGuard) -> Result<VolumeFacts, String>,
+    >,
+) -> Result<
+    (
+        VolumeIdentity,
+        VolumeFacts,
+        LiveDescriptorCapacityProvenance,
+    ),
+    String,
+> {
+    let profile_identity = profile_guard.profile_root_identity().to_owned();
+    if volume_owner.owner_profile_identity() != profile_identity {
+        return Err(String::from(
+            "retained volume owner belongs to a different profile",
+        ));
+    }
+    let expected_volume = volume_owner.volume().clone();
+    let observation = reserve.observation();
+    if observation.volume() != &expected_volume {
+        return Err(String::from(
+            "retained reserve descriptor belongs to a different volume",
+        ));
+    }
+    let provenance = LiveDescriptorCapacityProvenance {
+        profile_identity,
+        owner_generation: volume_owner.owner_generation(),
+        reserve_root_identity: observation.root_identity().to_owned(),
+        reserve_file_identity: observation.file_identity().to_owned(),
+        allocation_unit: observation.allocation_unit(),
+    };
+    volume_owner
+        .revalidate()
+        .map_err(|error| format!("retained volume owner is no longer current: {error}"))?;
+    #[cfg(test)]
+    let facts = match facts_reader {
+        Some(reader) => reader(reserve, profile_guard),
+        None => reserve
+            .view(profile_guard)
+            .fresh_capacity_facts()
+            .map_err(|error| error.to_string()),
+    }
+    .map_err(|error| format!("retained reserve facts are unavailable: {error}"))?;
+    #[cfg(not(test))]
+    let facts = reserve
+        .view(profile_guard)
+        .fresh_capacity_facts()
+        .map_err(|error| format!("retained reserve facts are unavailable: {error}"))?;
+    volume_owner
+        .revalidate()
+        .map_err(|error| format!("retained volume owner changed during observation: {error}"))?;
+    if facts.identity != expected_volume {
+        return Err(String::from(
+            "fresh descriptor facts differ from the retained owner volume",
+        ));
+    }
+    if facts.allocation_unit != provenance.allocation_unit {
+        return Err(String::from(
+            "fresh descriptor allocation unit differs from the retained reserve",
+        ));
+    }
+    Ok((expected_volume, facts, provenance))
 }
 
 struct OwnerRuntime {
@@ -968,8 +1057,126 @@ impl OwnerRuntime {
         Ok(proof)
     }
 
+    /// Observe every retained reserve descriptor while its owner and profile authorities remain
+    /// borrowed on this worker thread. The maps are local until every volume succeeds, so a
+    /// replacement, unsupported descriptor, or allocation-unit mismatch cannot publish a partial
+    /// fact set or alter the provider ledger/readiness.
+    fn refresh_live_descriptor_capacity(
+        &mut self,
+    ) -> Result<LiveDescriptorCapacityObservation, String> {
+        #[cfg(test)]
+        {
+            return self.refresh_live_descriptor_capacity_inner(None);
+        }
+        #[cfg(not(test))]
+        {
+            self.refresh_live_descriptor_capacity_inner()
+        }
+    }
+
+    fn refresh_live_descriptor_capacity_inner(
+        &mut self,
+        #[cfg(test)] facts_reader: Option<
+            &dyn Fn(
+                &mut OwnedReserveAllocation,
+                &WritableProfileGuard,
+            ) -> Result<VolumeFacts, String>,
+        >,
+    ) -> Result<LiveDescriptorCapacityObservation, String> {
+        let profile_guard = self
+            .final_profile_guard
+            .as_ref()
+            .ok_or_else(|| String::from("owner profile guard is not installed"))?;
+        let profile_owner = self
+            .volume_owner
+            .as_ref()
+            .ok_or_else(|| String::from("profile volume ownership is not installed"))?;
+        let profile_reserve = self
+            .reserve
+            .as_mut()
+            .ok_or_else(|| String::from("profile recovery reserve is not installed"))?;
+        #[cfg(test)]
+        let (profile_volume, profile_facts, profile_provenance) =
+            observe_retained_descriptor_inner(
+                profile_owner,
+                profile_reserve,
+                profile_guard,
+                facts_reader,
+            )?;
+        #[cfg(not(test))]
+        let (profile_volume, profile_facts, profile_provenance) =
+            observe_retained_descriptor_inner(profile_owner, profile_reserve, profile_guard)?;
+
+        let mut facts = BTreeMap::new();
+        let mut provenance = BTreeMap::new();
+        facts.insert(profile_volume.clone(), profile_facts.clone());
+        provenance.insert(profile_volume.clone(), profile_provenance);
+
+        if let Some(binding) = self.source_volumes.get(&profile_volume) {
+            if binding.readiness != SourceVolumeBindingReadiness::Complete {
+                return Err(format!(
+                    "profile source volume {profile_volume:?} has an incomplete retained binding"
+                ));
+            }
+            if binding.allocation_unit != Some(profile_facts.allocation_unit) {
+                return Err(format!(
+                    "profile source volume {profile_volume:?} allocation unit differs from the retained reserve"
+                ));
+            }
+        }
+
+        for (volume, binding) in &mut self.source_volumes {
+            if *volume == profile_volume {
+                continue;
+            }
+            if binding.readiness != SourceVolumeBindingReadiness::Complete {
+                return Err(format!(
+                    "source volume {volume:?} has an incomplete retained binding"
+                ));
+            }
+            let owner = binding.owner.as_ref().ok_or_else(|| {
+                format!("source volume {volume:?} has no retained ownership capability")
+            })?;
+            let reserve = binding.reserve.as_mut().ok_or_else(|| {
+                format!("source volume {volume:?} has no retained reserve descriptor")
+            })?;
+            #[cfg(test)]
+            let (observed_volume, observed_facts, observed_provenance) =
+                observe_retained_descriptor_inner(owner, reserve, profile_guard, facts_reader)?;
+            #[cfg(not(test))]
+            let (observed_volume, observed_facts, observed_provenance) =
+                observe_retained_descriptor_inner(owner, reserve, profile_guard)?;
+            if observed_volume != *volume {
+                return Err(format!(
+                    "source volume {volume:?} reserve descriptor resolved to {observed_volume:?}"
+                ));
+            }
+            if binding.allocation_unit != Some(observed_facts.allocation_unit) {
+                return Err(format!(
+                    "source volume {volume:?} allocation unit differs from its retained binding"
+                ));
+            }
+            facts.insert(observed_volume.clone(), observed_facts);
+            provenance.insert(observed_volume, observed_provenance);
+        }
+
+        Ok(LiveDescriptorCapacityObservation { facts, provenance })
+    }
+
+    #[cfg(test)]
+    fn refresh_live_descriptor_capacity_with_reader(
+        &mut self,
+        facts_reader: &dyn Fn(
+            &mut OwnedReserveAllocation,
+            &WritableProfileGuard,
+        ) -> Result<VolumeFacts, String>,
+    ) -> Result<LiveDescriptorCapacityObservation, String> {
+        self.refresh_live_descriptor_capacity_inner(Some(facts_reader))
+    }
+
     fn rebuild_capacity(&mut self) -> Result<(), String> {
         let _proof = self.revalidate_capacity_boundary()?;
+        let _descriptor_observation = self.refresh_live_descriptor_capacity()?;
         let provider = self
             .capacity_provider
             .take()
@@ -2452,6 +2659,342 @@ mod tests {
         assert_eq!(binding_after, binding_before);
         assert_eq!(counts_after, counts_before);
         drop(final_store);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_refreshes_live_descriptor_facts_without_qualifying_admission() {
+        let fixture = fixture("journal-owner-live-descriptor-refresh");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+
+        let observation = runtime
+            .refresh_live_descriptor_capacity()
+            .expect("retained descriptor refresh");
+        assert_eq!(observation.facts.len(), 1);
+        let (volume, facts) = observation.facts.iter().next().expect("profile facts");
+        assert_eq!(volume, &runtime.volume_owner().volume().clone());
+        assert_eq!(facts.identity, *volume);
+        assert!(facts.free_bytes > 0);
+        assert!(facts.allocation_unit > 0);
+        let provenance = observation
+            .provenance
+            .get(volume)
+            .expect("descriptor provenance");
+        assert_eq!(
+            provenance.profile_identity,
+            fixture.owner.profile_root_identity()
+        );
+        assert_eq!(
+            provenance.owner_generation,
+            runtime.volume_owner().owner_generation()
+        );
+        assert!(!provenance.reserve_root_identity.is_empty());
+        assert!(!provenance.reserve_file_identity.is_empty());
+        assert_eq!(provenance.allocation_unit, facts.allocation_unit);
+        assert!(!matches!(
+            runtime.capacity_rebuild_readiness(),
+            CapacityRebuildReadiness::Ready
+        ));
+        assert!(capacity_provider::production_admission_gate().is_err());
+
+        drop(runtime);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_refresh_faults_fail_closed_without_changing_ledger_or_readiness() {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            Unsupported,
+            Offline,
+            WrongIdentity,
+            AllocationUnitChanged,
+        }
+
+        let fixture = fixture("journal-owner-live-descriptor-faults");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+
+        let stale_observation = runtime
+            .refresh_live_descriptor_capacity()
+            .expect("initial live descriptor refresh");
+        let volume = runtime.volume_owner().volume().clone();
+        let class = crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging;
+        let provider = CapacityProvider::unavailable();
+        provider
+            .install_rebuilt_claims(&OrdinaryClaimRebuildSnapshot::for_test(
+                vec![RebuildClaim::for_test(
+                    OperationId::new(),
+                    crate::operation_journal::AdmissionClaimId::new(),
+                    volume.clone(),
+                    class,
+                    4096,
+                    None,
+                    false,
+                )],
+                CapacityRebuildReadiness::ready(),
+            ))
+            .expect("seed provider ledger");
+        runtime.capacity_provider = Some(provider);
+        let readiness =
+            CapacityRebuildReadiness::recovery_only(vec![String::from("retained before fault")]);
+        runtime.capacity_rebuild_readiness = readiness.clone();
+        let outstanding_before = runtime
+            .capacity_provider
+            .as_ref()
+            .expect("provider")
+            .outstanding(&volume, class);
+
+        let faults = [
+            (Fault::Unsupported, "unsupported descriptor backend"),
+            (
+                Fault::Offline,
+                "descriptor is unavailable because the volume is offline",
+            ),
+            (Fault::WrongIdentity, "fresh descriptor facts differ"),
+            (
+                Fault::AllocationUnitChanged,
+                "fresh descriptor allocation unit differs",
+            ),
+        ];
+        for (fault, expected_error) in faults {
+            let reader = move |reserve: &mut OwnedReserveAllocation,
+                               profile_guard: &WritableProfileGuard|
+                  -> Result<VolumeFacts, String> {
+                match fault {
+                    Fault::Unsupported => Err(String::from("unsupported descriptor backend")),
+                    Fault::Offline => Err(String::from(
+                        "descriptor is unavailable because the volume is offline",
+                    )),
+                    Fault::WrongIdentity | Fault::AllocationUnitChanged => {
+                        let facts = reserve
+                            .view(profile_guard)
+                            .fresh_capacity_facts()
+                            .map_err(|error| error.to_string())?;
+                        match fault {
+                            Fault::WrongIdentity => Ok(VolumeFacts {
+                                identity: VolumeIdentity {
+                                    device: facts
+                                        .identity
+                                        .device
+                                        .checked_add(1)
+                                        .expect("fixture device identity increment"),
+                                },
+                                ..facts
+                            }),
+                            Fault::AllocationUnitChanged => Ok(VolumeFacts {
+                                allocation_unit: facts
+                                    .allocation_unit
+                                    .checked_add(1)
+                                    .expect("fixture allocation-unit increment"),
+                                ..facts
+                            }),
+                            Fault::Unsupported | Fault::Offline => unreachable!(),
+                        }
+                    }
+                }
+            };
+
+            let error = runtime
+                .refresh_live_descriptor_capacity_with_reader(&reader)
+                .expect_err("faulted descriptor refresh must fail closed");
+            assert!(
+                error.contains(expected_error),
+                "unexpected fault diagnostic: {error}"
+            );
+            assert_eq!(
+                runtime
+                    .capacity_provider
+                    .as_ref()
+                    .expect("provider retained after failed refresh")
+                    .outstanding(&volume, class),
+                outstanding_before
+            );
+            assert_eq!(runtime.capacity_rebuild_readiness(), &readiness);
+            assert_eq!(stale_observation.facts.len(), 1);
+            assert!(capacity_provider::production_admission_gate().is_err());
+        }
+
+        drop(runtime);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_refresh_rejects_replaced_descriptor_without_changing_live_state() {
+        let fixture = fixture("journal-owner-live-descriptor-replacement");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+
+        runtime
+            .refresh_live_descriptor_capacity()
+            .expect("initial live descriptor refresh");
+
+        let volume = runtime.volume_owner().volume().clone();
+        let class = crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging;
+        let provider = CapacityProvider::unavailable();
+        provider
+            .install_rebuilt_claims(&OrdinaryClaimRebuildSnapshot::for_test(
+                vec![RebuildClaim::for_test(
+                    OperationId::new(),
+                    crate::operation_journal::AdmissionClaimId::new(),
+                    volume.clone(),
+                    class,
+                    4096,
+                    None,
+                    false,
+                )],
+                CapacityRebuildReadiness::ready(),
+            ))
+            .expect("seed provider ledger");
+        runtime.capacity_provider = Some(provider);
+        runtime.capacity_rebuild_readiness =
+            CapacityRebuildReadiness::recovery_only(vec![String::from("retained before refresh")]);
+        let before = runtime
+            .capacity_provider
+            .as_ref()
+            .expect("provider")
+            .outstanding(&volume, class);
+
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        fs::remove_file(&reserve_path).expect("remove retained namespace entry");
+        fs::write(&reserve_path, b"replacement").expect("install replacement namespace entry");
+
+        let error = runtime
+            .refresh_live_descriptor_capacity()
+            .expect_err("replacement must fail closed");
+        assert!(error.contains("retained reserve facts"));
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .expect("provider retained after failed refresh")
+                .outstanding(&volume, class),
+            before
+        );
+        assert_eq!(
+            runtime.capacity_rebuild_readiness(),
+            &CapacityRebuildReadiness::recovery_only(vec![
+                String::from("retained before refresh",)
+            ])
+        );
+
+        drop(runtime);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_refresh_stages_all_retained_volumes_before_publishing_observation() {
+        let fixture = fixture("journal-owner-live-descriptor-atomic-refresh");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("profile volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("profile reserve");
+        runtime.install_reserve(reserve);
+
+        let volume = runtime.volume_owner().volume().clone();
+        let class = crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging;
+        let provider = CapacityProvider::unavailable();
+        provider
+            .install_rebuilt_claims(&OrdinaryClaimRebuildSnapshot::for_test(
+                vec![RebuildClaim::for_test(
+                    OperationId::new(),
+                    crate::operation_journal::AdmissionClaimId::new(),
+                    volume.clone(),
+                    class,
+                    4096,
+                    None,
+                    false,
+                )],
+                CapacityRebuildReadiness::ready(),
+            ))
+            .expect("seed provider ledger");
+        runtime.capacity_provider = Some(provider);
+        runtime.capacity_rebuild_readiness = CapacityRebuildReadiness::ready();
+
+        let invalid_volume = VolumeIdentity {
+            device: volume
+                .device
+                .checked_add(1)
+                .expect("fixture volume increment"),
+        };
+        runtime.source_volumes.insert(
+            invalid_volume,
+            SourceVolumeBinding {
+                owner: None,
+                reserve: None,
+                allocation_unit: Some(4096),
+                readiness: SourceVolumeBindingReadiness::Incomplete,
+                registrations: BTreeSet::new(),
+            },
+        );
+        let error = runtime
+            .refresh_live_descriptor_capacity()
+            .expect_err("incomplete retained volume must reject the complete observation");
+        assert!(error.contains("incomplete retained binding"));
+        assert_eq!(
+            runtime
+                .capacity_provider
+                .as_ref()
+                .expect("provider retained after atomic failure")
+                .outstanding(&volume, class),
+            4096
+        );
+        assert_eq!(
+            runtime.capacity_rebuild_readiness(),
+            &CapacityRebuildReadiness::Ready
+        );
+
+        drop(runtime);
         drop(fixture);
     }
 

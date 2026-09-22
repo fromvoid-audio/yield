@@ -742,6 +742,17 @@ charge-derived protected minimum; explained partial reserve extents are
 accepted only when they satisfy that minimum. Failure keeps the owner on the
 existing unavailable startup path.
 
+OPT-1561 adds the adjacent read-only descriptor observation. After the retained
+owner and reserve proof, the owner borrows each retained reserve view and derives
+fresh device identity, free bytes, and allocation-unit facts from the live handle.
+The owner stages all volume facts and their profile/owner-generation/root/file
+provenance before accepting the observation. Replacement, offline or unsupported
+descriptors, root or marker changes, and allocation-unit changes fail closed with
+the existing ledger and rebuild readiness untouched. This observation is never authority;
+each later capacity boundary must refresh it under the live retained handles. It is never
+cached as admission authority, used as source lease proof, or used to mutate a reserve.
+Production ordinary admission remains disabled until the later readiness and gate issues.
+
 The store's consistent read snapshot pages both immutable ordinary-claim
 relations by canonical UUID key, with a maximum of 256 decoded rows and one
 bounded lookahead per page. It point-validates each claim's operation. An
