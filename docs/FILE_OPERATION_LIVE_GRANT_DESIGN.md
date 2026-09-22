@@ -1,6 +1,6 @@
 # OPT-1857 live effect grant design checkpoint
 
-Status: design and source-gate implementation checkpoint; no journal-issued grant or physical-effect qualification yet.
+Status: design, source gate, and journal issuance checkpoint; no file-owner consumption or physical-effect qualification yet.
 Source head: `28f61b8ea6714f959b9d2cc05047f8930be31f78` (2026-09-22).
 
 The source-gate checkpoint adds a private sendable `SourceEffectPin` from the
@@ -12,6 +12,18 @@ admission without waiting on the journal worker; explicit lease release and
 catalog retarget close admission and wait for admitted effects. Retarget creates
 a fresh gate only after its new generation commits. The pin is not an issued
 grant and is not accepted by the file owner.
+
+The source/journal seam compares the pin and the journal's retained
+`SourceAuthorityRequest` by their shared private lifecycle state, then
+revalidates the registered descriptors and live lease under that gate. A pin
+from another registration, a drained registration, or a replaced root fails
+before issuance. The private `issue_live_chunk_effect` worker command now calls
+it, matches the source fence to the operation's stored participant set, and
+binds an effect ID, output UUID, target registration, bounded range, and
+payload digest to one durable chunk issue. The claim's string output key stays
+exact. A dropped grant cannot be reissued from the durable row. The grant has
+no FileOperationOwner consumer yet, and its root registration remains an
+observation pending owner-side validation.
 
 ## Required result
 
@@ -26,8 +38,8 @@ authorize an ordinary operation family.
 
 | Component | Current evidence | Missing for the grant |
 | --- | --- | --- |
-| Journal/capacity | `OperationJournalOwner::issue_chunk` performs a durable `Claimed -> Issued` transition and returns a private `ChunkWritePermit`. A second issue fails, including after a dropped permit. `begin_chunk_write` validates that permit against the owner-local issue registry but only records a synthetic entry. | The permit has no live source/root authority, file-owner effect identity, or effect custody transition. Issuance alone does not prove bytes were written. |
-| Source owner | `SourceAuthorityGuard` is deliberately `!Send` and retains `Arc<SourceLease>`. `SourceLease` retains the sidecar lock, control SQLite connection, root/database bindings, owner identity, and durable lease epoch. `close_with_source_authority` rejects an extra strong lease owner. | The sendable request/confirmation/use proof carries no strong lease. A private sendable pin must be minted by the live source owner, and retirement must coordinate with it. |
+| Journal/capacity | `issue_live_chunk_effect` checks the live source registration, stored operation participant fence, claim range, capacity provider, and durable `Claimed -> Issued` transition before returning a non-`Clone` grant. A dropped grant cannot be reissued. | No file-owner effect custody or confirmed no-effect disposition exists. Issuance alone does not prove bytes were written. |
+| Source owner | `SourceAuthorityGuard` stays `!Send`; its private sendable pin retains the live lease and validates against the journal's exact registration. The source gate serializes effect entry with release and retarget. | File-owner execution must hold a scoped effect permit and reject stale authority at that boundary. |
 | File owner | `FileOperationOwner` has a bounded queue, exact effect key/fingerprint, duplicate admission record, result custody, root/fence observations, and test-only synthetic live authorizations. Production mutating commands return `Unsupported`. | Production cannot construct or consume a live authorization. `OwnerIdentity`, `SourceFence`, `RootRegistrationRef`, and `EffectId` are observations, not capabilities. |
 
 `SourceLease::release()` invalidates its liveness tokens before changing the
@@ -104,10 +116,18 @@ effect without release serialization would also be a race.
    A live effect has no acceptance until its authority is checked at the
    execution boundary, not merely at queue admission.
 
-This protocol is a design direction. Two implementation decisions remain: the
-smallest gate that serializes every explicit source release with a future
-bounded effect without holding a lock across another owner's queue; and the
-exact producer path that supplies existing live root capabilities to the file
-owner, whose current registrations are test fixtures. A source pin cannot
-replace a destination-root capability. Resolve both in code and tests before
+`ChunkWriteIdentity::output_key` is an arbitrary bounded string, while
+`WriteStagingChunk::output` is a UUID observation. Issuance must retain the
+exact string claim key and bind the supplied output UUID as a separate field;
+parsing or hashing the string into a UUID would change existing claim identity.
+The file-owner command must match its output UUID to the grant, while the
+grant retains the exact string claim key for journal custody and release.
+The grant also binds the target registration and source fences as observations;
+the file owner must check them against its retained registrations. None of
+these observations constructs root authority.
+
+The release/effect gate is implemented. The remaining producer decision is
+how to supply an existing live destination-root capability to the file owner:
+its current root registrations are test fixtures. A source pin cannot replace
+that destination-root capability. Resolve this in code and tests before
 claiming OPT-1857 complete.

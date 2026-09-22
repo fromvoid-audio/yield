@@ -2362,6 +2362,8 @@ fn source_effect_pin_rejects_drain_and_guard_loss() {
         .accept_confirmation(guard.confirm().expect("confirmation"))
         .expect("registered source");
     let pin = guard.pin_for_effect().expect("live source pin");
+    pin.validate_for_issuance(&request, &profile_guard)
+        .expect("issue while registered");
     let in_flight = pin.begin_effect().expect("first effect boundary");
     request
         .begin_drain(proof.into_drain_marker())
@@ -2370,11 +2372,62 @@ fn source_effect_pin_rejects_drain_and_guard_loss() {
         pin.begin_effect(),
         Err(SourceAuthorityError::ConfirmationClosed)
     ));
+    assert!(matches!(
+        pin.validate_for_issuance(&request, &profile_guard),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
     drop(in_flight);
     drop(guard);
     assert!(matches!(
         pin.begin_effect(),
         Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+}
+
+#[test]
+fn source_effect_pin_cannot_join_another_registered_source() {
+    let app_root = tempdir().expect("app root");
+    let source_root_a = tempdir().expect("source root a");
+    let source_root_b = tempdir().expect("source root b");
+    let database_root_a = tempdir().expect("database root a");
+    let database_root_b = tempdir().expect("database root b");
+    let _app_root_guard =
+        AppRootGuard::set(std::fs::canonicalize(app_root.path()).expect("canonical app root"))
+            .expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root_a.path(),
+        &profile_guard,
+        database_root_a.path(),
+    )
+    .expect("source a");
+    let database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root_b.path(),
+        &profile_guard,
+        database_root_b.path(),
+    )
+    .expect("source b");
+    let (request_a, guard_a) = database_a
+        .prepare_source_authority()
+        .expect("authority a")
+        .split();
+    let (request_b, guard_b) = database_b
+        .prepare_source_authority()
+        .expect("authority b")
+        .split();
+    request_a
+        .accept_confirmation(guard_a.confirm().expect("confirmation a"))
+        .expect("register a");
+    request_b
+        .accept_confirmation(guard_b.confirm().expect("confirmation b"))
+        .expect("register b");
+    let pin_a = guard_a.pin_for_effect().expect("pin a");
+    pin_a
+        .validate_for_issuance(&request_a, &profile_guard)
+        .expect("matching registration");
+    assert!(matches!(
+        pin_a.validate_for_issuance(&request_b, &profile_guard),
+        Err(SourceAuthorityError::RegistrationMismatch)
     ));
 }
 
@@ -2400,7 +2453,10 @@ fn source_effect_pin_rejects_replaced_root_at_effect_boundary() {
         .accept_confirmation(guard.confirm().expect("confirmation"))
         .expect("registered source");
     let pin = guard.pin_for_effect().expect("live source pin");
+    pin.validate_for_issuance(&request, &profile_guard)
+        .expect("same live registration");
     std::fs::remove_dir_all(source_root.path()).expect("remove source root");
+    assert!(pin.validate_for_issuance(&request, &profile_guard).is_err());
     assert!(matches!(
         pin.begin_effect(),
         Err(SourceAuthorityError::Lease(
