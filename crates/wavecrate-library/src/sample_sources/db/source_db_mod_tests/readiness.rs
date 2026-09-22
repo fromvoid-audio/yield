@@ -33,7 +33,7 @@ fn catalog_maintenance_handoff_checks_owned_schema_without_repair() {
     .expect("profile-owned source database");
 
     database
-        .validate_catalog_operational_schema(&profile_guard)
+        .validate_operational_schema_with_profile_guard(&profile_guard)
         .expect("current schema is ready for operational service");
     let version_before: i64 = database
         .connection
@@ -44,7 +44,7 @@ fn catalog_maintenance_handoff_checks_owned_schema_without_repair() {
         .execute_batch("DROP TABLE source_tags")
         .expect("damage schema after maintenance");
     assert!(matches!(
-        database.validate_catalog_operational_schema(&profile_guard),
+        database.validate_operational_schema_with_profile_guard(&profile_guard),
         Err(SourceDbError::MaintenanceRequired { .. })
     ));
     let version_after: i64 = database

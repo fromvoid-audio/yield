@@ -97,9 +97,10 @@ pub use util::normalize_relative_path;
 pub use write::{
     ManifestCommitResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId,
     SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
-    SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
-    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult,
+    SourceManifestSnapshotCursor, SourceManifestSnapshotPage, SourceRevision, SourceTagWrite,
+    SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.
@@ -1273,13 +1274,14 @@ impl SourceDatabase {
         Ok(database)
     }
 
-    /// Finish catalog startup maintenance on the retained owner connection.
+    /// Check the retained owner connection after startup maintenance.
     ///
-    /// The catalog calls this before admitting operational commands. It rechecks the
-    /// retained profile, source lease, and database-file binding, then inspects the
-    /// schema without creating or repairing objects. A failed check requires a new
+    /// Catalog registration calls this before admitting operational commands;
+    /// source-owned snapshots use the same check at their read boundary. It rechecks
+    /// the retained profile, source lease, and database-file binding, then inspects
+    /// schema without creating or repairing objects. A failed check requires an
     /// owner-held maintenance attempt; it cannot be retried through a read role.
-    pub fn validate_catalog_operational_schema(
+    pub fn validate_operational_schema_with_profile_guard(
         &self,
         profile_guard: &crate::app_dirs::WritableProfileGuard,
     ) -> Result<(), SourceDbError> {

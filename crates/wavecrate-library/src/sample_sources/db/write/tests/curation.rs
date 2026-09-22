@@ -46,7 +46,21 @@ impl CurationFixture {
         Self::new_with_profile_child(Some(PathBuf::from("curation-profile-bound")))
     }
 
+    fn new_profile_bound_with_extra_files(extra_files: usize) -> Self {
+        Self::new_with_profile_child_and_extra_files(
+            Some(PathBuf::from("curation-profile-bound")),
+            extra_files,
+        )
+    }
+
     fn new_with_profile_child(profile_child: Option<PathBuf>) -> Self {
+        Self::new_with_profile_child_and_extra_files(profile_child, 0)
+    }
+
+    fn new_with_profile_child_and_extra_files(
+        profile_child: Option<PathBuf>,
+        extra_files: usize,
+    ) -> Self {
         let runtime = crate::test_runtime::TestRuntimeGuard::acquire();
         // macOS exposes the default temporary root through /var -> /private/var. Resolve that
         // ambient alias before exercising the no-follow profile capability.
@@ -72,6 +86,11 @@ impl CurationFixture {
         database
             .upsert_file(Path::new("two.wav"), 20, 2)
             .expect("second file");
+        for index in 0..extra_files {
+            database
+                .upsert_file(Path::new(&format!("extra-{index:03}.wav")), 1, 1)
+                .expect("extra file");
+        }
         database
             .begin_source_directory_truth_generation(1, 0)
             .expect("directory generation");
@@ -93,14 +112,14 @@ impl CurationFixture {
             .expect("audit batch")
             .commit_manifest_audit_with_staged_directory_truth(
                 1,
-                2,
+                (2 + extra_files) as u64,
                 10,
                 root_identity.clone(),
                 None,
             )
             .expect("authoritative audit");
         let revision = database.get_revision().expect("audit revision");
-        assert_eq!(revision, 3);
+        assert_eq!(revision, (3 + extra_files) as u64);
 
         Self {
             _runtime: runtime,
@@ -167,6 +186,176 @@ fn metadata_number(database: &SourceDatabase, key: &str) -> u64 {
         .expect("metadata")
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
+}
+
+#[test]
+fn source_writer_manifest_snapshot_pages_are_fenced_and_leave_files_unchanged() {
+    fn file_state(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().expect("modified time")))
+    }
+
+    let fixture = CurationFixture::new_profile_bound();
+    let mut writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-manifest-snapshot"),
+        1,
+    )
+    .expect("source writer");
+    let expected = writer.current_revision().expect("source revision");
+    let database_path = writer.database_for_tests().db_path.clone();
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    let shm_path = PathBuf::from(format!("{}-shm", database_path.display()));
+    let before = [
+        file_state(&database_path),
+        file_state(&wal_path),
+        file_state(&shm_path),
+    ];
+    let changes_before = writer.database_for_tests().connection.total_changes();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let first = writer
+        .read_manifest_snapshot_page(&expected, None, 1, &cancellation)
+        .expect("first page");
+    assert_eq!(first.revision, expected);
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].relative_path, PathBuf::from("one.wav"));
+    first.publication_fence.validate().expect("live page fence");
+    let cursor = first.next_cursor.expect("continuation");
+    let second = writer
+        .read_manifest_snapshot_page(&expected, Some(&cursor), 1, &cancellation)
+        .expect("second page");
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].relative_path, PathBuf::from("two.wav"));
+    assert!(second.next_cursor.is_none());
+    let after = [
+        file_state(&database_path),
+        file_state(&wal_path),
+        file_state(&shm_path),
+    ];
+    assert_eq!(
+        after, before,
+        "owner reads must leave DB and sidecar metadata unchanged"
+    );
+    assert_eq!(
+        writer.database_for_tests().connection.total_changes(),
+        changes_before,
+        "owner reads must execute no SQL mutation"
+    );
+
+    let request = SourceWriterRequest::new(
+        crate::operation_journal::OperationId::from_uuid(uuid::Uuid::from_u128(81)),
+        crate::operation_journal::ParticipantId::from_uuid(uuid::Uuid::from_u128(82)),
+        SourceCommandId::from_uuid(uuid::Uuid::from_u128(83)),
+        expected.clone(),
+        vec![SourceCurationUpdate::SetLocked {
+            path: CurationFixture::path("one.wav"),
+            locked: true,
+        }],
+    )
+    .expect("revision-changing curation");
+    writer.commit_curation(request).expect("commit curation");
+    assert!(matches!(
+        writer.read_manifest_snapshot_page(&expected, Some(&cursor), 1, &cancellation),
+        Err(SourceWriterError::StaleRevision { .. })
+    ));
+    let published_fence = second.publication_fence.clone();
+    writer.close().expect("close source writer");
+    assert!(published_fence.validate().is_err());
+    let reopened_database = SourceDatabase::open_for_catalog_with_profile_guard(
+        fixture._source.path(),
+        &fixture.profile_guard,
+        fixture.profile_child.as_ref().expect("profile child"),
+    )
+    .expect("reopen source database");
+    let reopened = SourceWriter::new(
+        reopened_database,
+        SourceId::from_string("source-manifest-snapshot"),
+        2,
+    )
+    .expect("new lifecycle owner");
+    assert!(matches!(
+        reopened.read_manifest_snapshot_page(&expected, Some(&cursor), 1, &cancellation),
+        Err(SourceWriterError::StaleFence)
+    ));
+    reopened.close().expect("close rebound source writer");
+}
+
+#[test]
+fn source_writer_manifest_snapshot_rejects_cancellation_and_oversized_row() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-manifest-snapshot-budget"),
+        1,
+    )
+    .expect("source writer");
+    let expected = writer.current_revision().expect("source revision");
+    let cancellation = Arc::new(AtomicBool::new(true));
+    assert!(matches!(
+        writer.read_manifest_snapshot_page(&expected, None, 64, &cancellation),
+        Err(SourceWriterError::Database(SourceDbError::Canceled))
+    ));
+    cancellation.store(false, Ordering::Release);
+    writer
+        .database_for_tests()
+        .connection
+        .execute(
+            "UPDATE wav_files SET content_hash = ?1 WHERE path = 'one.wav'",
+            ["x".repeat(16 * 1024 * 1024)],
+        )
+        .expect("seed oversized persisted row");
+    assert!(matches!(
+        writer.read_manifest_snapshot_page(&expected, None, 64, &cancellation),
+        Err(SourceWriterError::SnapshotBudgetExceeded("decoded bytes"))
+    ));
+    writer
+        .database_for_tests()
+        .connection
+        .execute(
+            "UPDATE wav_files SET content_hash = NULL, file_identity = x'FF'
+             WHERE path = 'one.wav'",
+            [],
+        )
+        .expect("seed malformed persisted identity");
+    assert!(matches!(
+        writer.read_manifest_snapshot_page(&expected, None, 64, &cancellation),
+        Err(SourceWriterError::SnapshotMalformed(_))
+    ));
+    writer.close().expect("close source writer");
+}
+
+#[test]
+fn source_writer_manifest_snapshot_caps_page_at_64_and_continues_exactly() {
+    let fixture = CurationFixture::new_profile_bound_with_extra_files(63);
+    let writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-manifest-snapshot-page-bound"),
+        1,
+    )
+    .expect("source writer");
+    let expected = writer.current_revision().expect("source revision");
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let first = writer
+        .read_manifest_snapshot_page(&expected, None, 64, &cancellation)
+        .expect("bounded first page");
+    assert_eq!(first.entries.len(), 64);
+    assert_eq!(
+        first.entries[0].relative_path,
+        PathBuf::from("extra-000.wav")
+    );
+    assert_eq!(first.entries[63].relative_path, PathBuf::from("one.wav"));
+    let second = writer
+        .read_manifest_snapshot_page(&expected, first.next_cursor.as_ref(), 64, &cancellation)
+        .expect("exact continuation");
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].relative_path, PathBuf::from("two.wav"));
+    assert!(second.next_cursor.is_none());
+    assert!(matches!(
+        writer.read_manifest_snapshot_page(&expected, None, 65, &cancellation),
+        Err(SourceWriterError::InvalidRequest(_))
+    ));
+    writer.close().expect("close source writer");
 }
 
 fn continuity_state(database: &SourceDatabase) -> (u64, SourceDirectoryTruthState) {

@@ -289,7 +289,7 @@ filesystem writer calls, UI policy, or a second authority thread.
 | Follow-up | Required decision or implementation |
 | --- | --- |
 | [OPT-1638](https://linear.app/boostnlvp/issue/OPT-1638) | Implemented source-owned curation receipts, versioned codec, schema-v13 migration, exact duplicate replay, live fence validation, and confirmed-rollback/uncertainty readback. Caller routing, source retirement pinning, and broader source-write families remain deferred. |
-| [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639) | Implement bounded revisioned snapshots, migration/no-hidden-write qualification, WAL-aware freshness, and fail-closed read backends. |
+| [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639) | Operational opens are migration-free and an owner-held manifest page API now has exact revision/fence checks plus row, byte, time, and keyset bounds. Caller-facing publication and remaining no-hidden-write/failure tests are still required before acceptance. |
 | [OPT-1640](https://linear.app/boostnlvp/issue/OPT-1640) | Define the competing-writer guard and the source-owner admission/reconciliation boundary. |
 | [OPT-1782](https://linear.app/boostnlvp/issue/OPT-1782)–[OPT-1794](https://linear.app/boostnlvp/issue/OPT-1794) | Migrate individual source metadata, history, playback, and family callers after the owner and receipt contracts exist. |
 | [OPT-1349](https://linear.app/boostnlvp/issue/OPT-1349) | Reuse the completed physical source lease, fence, and readiness rules; a publication fence still cannot renew or transfer a lease. |

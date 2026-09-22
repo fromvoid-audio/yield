@@ -1,4 +1,4 @@
-//! Source-owned revision-fenced curation commands.
+//! Source-owned revision-fenced curation commands and bounded observations.
 //!
 //! This module is deliberately narrower than the operation journal.  A `SourceWriter` owns one
 //! already-authorized [`SourceDatabase`] and records source-participant receipts in that same
@@ -29,6 +29,9 @@ use super::curation::{
     validate_update_values,
 };
 use super::transaction::CurationCommitOutcome;
+
+mod snapshot;
+pub use snapshot::{SourceManifestSnapshotCursor, SourceManifestSnapshotPage};
 
 /// Maximum durable source-participant receipts retained by one source database.
 pub const SOURCE_WRITER_RECEIPT_LIMIT: usize = 256;
@@ -277,6 +280,12 @@ pub enum SourceWriterError {
     /// One physical or lifecycle fence no longer matches the retained source owner.
     #[error("source writer fence is stale")]
     StaleFence,
+    /// A bounded owner read reached its time, row, or byte budget.
+    #[error("source snapshot budget exceeded: {0}")]
+    SnapshotBudgetExceeded(&'static str),
+    /// Required source snapshot data could not be interpreted safely.
+    #[error("source snapshot is malformed: {0}")]
+    SnapshotMalformed(&'static str),
     /// A durable command identity already names different canonical request bytes.
     #[error("source writer command identity conflicts with a retained receipt")]
     ConflictingCommand {

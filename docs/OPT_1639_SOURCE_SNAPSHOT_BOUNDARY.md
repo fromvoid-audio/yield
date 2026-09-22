@@ -1,6 +1,6 @@
 # OPT-1639 source migration and snapshot boundary
 
-Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). The catalog validates schema compatibility on its retained owner connection after startup maintenance and before operational commands. Role-dispatched operational writer opens now require existing compatible schema. This does not yet qualify existing `UiRead` or `BackgroundRead` connections as no-write snapshots.
+Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). The catalog validates schema compatibility on its retained owner connection after startup maintenance and before operational commands. Operational writer opens require existing compatible schema. `SourceWriter::read_manifest_snapshot_page` now provides one bounded owner-held manifest read shape. Existing `UiRead` and `BackgroundRead` connections remain unqualified as no-write snapshots.
 
 ## Current evidence
 
@@ -8,6 +8,7 @@ Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue
 - `sample_sources/db/open/read_only.rs` opens `SQLITE_OPEN_READ_ONLY` and skips writable schema routines. Its returned `SourceDatabase` has no retained profile guard, source lease, or database-file binding. SQLite flags reject SQL writes through that connection; they do not establish that opening a live WAL database leaves the surrounding files untouched.
 - `SourceDatabase::snapshot_to_path_with_write_fence` uses SQLite backup under a source write fence and writes a destination database. It is an export/retarget primitive, not the requested bounded read-only snapshot.
 - The source revision writer from OPT-1638 can provide a committed revision cut. A revision number, copied row, or old publication fence remains an observation, not owner authority.
+- `SourceWriter::read_manifest_snapshot_page` uses its retained source connection and exact `SourceRevision` claim. It validates schema/owner before the read, checks revision inside one transaction, bounds one keyset page to 64 rows, 16 MiB, and two seconds, then revalidates the owner/revision. Its result carries a weak publication fence. No caller-family routing is implied by the existence of this library entrypoint.
 
 ## Chosen ownership boundary
 
@@ -35,7 +36,7 @@ The aggregate limit per request is two seconds, 100,000 decoded rows, and 16 MiB
 
 1. Add a non-mutating schema compatibility check and a typed maintenance-required result. Prove a current operational open leaves schema objects and `user_version` unchanged; prove stale or damaged schema fails without repair. Do not switch existing startup to this check until the owner-held maintenance-to-operation handoff is established.
 2. Establish the maintenance handoff on the retained profile/source owner, then use the compatibility check for operational opens. Registration, role-dispatched writers, the public profile-owned source writer, and the snapshot write-fence reopen are wired. The profile-owned writer test proves an operational open needs prior maintenance and a second live owner is rejected. Catalog startup/retarget Full reopens remain maintenance paths; additional binding proof may be required for the snapshot read.
-3. Add the bounded owner-read command and exact revision/fence result. Test a 64-row page, aggregate row/byte/time limits, keyset continuation, mutation between pages, cancellation, stale generation, and owner loss. Test filesystem sidecar/DB metadata before and after an owner-read with no concurrent writer; do not infer no-write behavior from `SQLITE_OPEN_READ_ONLY` alone.
+3. Add the bounded owner-read command and exact revision/fence result. The source-writer manifest page entrypoint and tests now cover a 64-row page, byte limit, keyset continuation, mutation between pages, cancellation before work and inside SQLite progress, stale generation, malformed durable rows, elapsed-time progress interruption, owner loss after result, and unchanged SQL change count plus DB/WAL/SHM metadata with no concurrent writer. Still prove cancellation/owner loss during a live read, a strict time bound across source-lease control validation, and the caller-facing command/publication path before claiming the complete read contract. Do not infer no-write behavior from `SQLITE_OPEN_READ_ONLY` alone.
 4. Run focused source schema/migration, owner revision, read-role, and snapshot tests. A legacy read caller is not considered migrated merely because the new command exists. Caller routing remains outside OPT-1639.
 
 If the owner-held connection cannot provide a bounded consistent read without crossing the writer transaction or lifecycle boundary, stop and replan before introducing a second connection or changing the source writer contract.

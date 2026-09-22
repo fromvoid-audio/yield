@@ -3602,7 +3602,7 @@ fn register_source(
     }
     if let Err(error) = source
         .database
-        .validate_catalog_operational_schema(profile_guard)
+        .validate_operational_schema_with_profile_guard(profile_guard)
     {
         emit_failure(
             reservation,
