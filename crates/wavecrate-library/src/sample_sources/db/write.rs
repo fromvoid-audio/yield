@@ -8,6 +8,7 @@ mod manifest_audit;
 mod mutation;
 mod paths;
 mod scan_queries;
+mod source_writer;
 mod transaction;
 mod upsert;
 
@@ -17,6 +18,10 @@ pub use command::{
 };
 pub use curation::{
     SOURCE_CURATION_BATCH_LIMIT, SourceCurationCommitReceipt, SourceCurationUpdate,
+};
+pub use source_writer::{
+    SourceCommandId, SourceRevision, SourceWriter, SourceWriterCommandIdentity, SourceWriterError,
+    SourceWriterReceipt, SourceWriterRequest,
 };
 pub use transaction::{
     ManifestCommitResult, SourceDirectoryTruthCommitResult, SourceIndexCommitResult,
