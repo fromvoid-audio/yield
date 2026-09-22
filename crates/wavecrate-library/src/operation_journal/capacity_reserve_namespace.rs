@@ -602,6 +602,35 @@ impl BoundReserveView<'_> {
             non_sparse: true,
         })
     }
+
+    /// Revalidate a reserve that has been safely shortened by the durable active-charge budget.
+    /// The proof still comes from the live descriptor and remains non-serializable; callers must
+    /// compare its allocation with the charge-derived minimum before using it as a boundary.
+    pub(super) fn revalidate_partial_and_prove(
+        &self,
+    ) -> Result<PhysicalReserveProof, ReserveNamespaceFailureReason> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(ReserveNamespaceFailureReason::Observation(
+                super::capacity_reserve::ReserveFailureReason::Unsupported,
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            validate_root(self.root, self.profile_guard)?;
+            let observed = self
+                .reserve
+                .revalidate_partial()
+                .map_err(ReserveNamespaceFailureReason::Observation)?;
+            verify_current_child_binding(self.root, &self.reserve.observation().identity)?;
+            validate_root(self.root, self.profile_guard)?;
+            Ok(PhysicalReserveProof {
+                volume: observed.volume,
+                physical_bytes: observed.allocated_bytes,
+                non_sparse: true,
+            })
+        }
+    }
 }
 
 /// Create the fixed reserve child under an already-owned, live root capability.

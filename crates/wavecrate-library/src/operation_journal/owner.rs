@@ -18,8 +18,8 @@ use thiserror::Error;
 
 use crate::app_dirs::WritableProfileGuard;
 
-use super::capacity_provider;
-use super::capacity_reserve_namespace::OwnedReserveAllocation;
+use super::capacity_provider::{self, CapacityProvider, CapacityRebuildReadiness};
+use super::capacity_reserve_namespace::{OwnedReserveAllocation, PhysicalReserveProof};
 use super::capacity_volume_owner::VolumeOwnershipCapability;
 use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{RetryObservation, UniversalCommandArgs};
@@ -331,6 +331,8 @@ fn record_owner_runtime_drop_observation(
 
 struct OwnerRuntime {
     store: Option<OperationJournalStore>,
+    capacity_provider: Option<CapacityProvider>,
+    capacity_rebuild_readiness: CapacityRebuildReadiness,
     reserve: Option<OwnedReserveAllocation>,
     volume_owner: Option<VolumeOwnershipCapability>,
     final_profile_guard: Option<WritableProfileGuard>,
@@ -347,6 +349,10 @@ impl OwnerRuntime {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             store: Some(store),
+            capacity_provider: None,
+            capacity_rebuild_readiness: CapacityRebuildReadiness::reconciliation_required(vec![
+                String::from("capacity rebuild has not run"),
+            ]),
             reserve: None,
             volume_owner: None,
             final_profile_guard: Some(final_profile_guard),
@@ -379,6 +385,81 @@ impl OwnerRuntime {
         self.reserve = Some(reserve);
     }
 
+    fn revalidate_capacity_boundary(&mut self) -> Result<PhysicalReserveProof, String> {
+        let volume_owner = self
+            .volume_owner
+            .as_ref()
+            .ok_or_else(|| String::from("volume ownership capability is not installed"))?;
+        volume_owner
+            .revalidate()
+            .map_err(|error| error.to_string())?;
+        let profile_guard = self
+            .final_profile_guard
+            .as_ref()
+            .ok_or_else(|| String::from("owner profile guard is not installed"))?;
+        let reserve = self
+            .reserve
+            .as_mut()
+            .ok_or_else(|| String::from("owned reserve is not installed"))?;
+        let proof = reserve
+            .view(profile_guard)
+            .revalidate_partial_and_prove()
+            .map_err(|error| error.to_string())?;
+        if proof.volume() != volume_owner.volume() {
+            return Err(String::from(
+                "physical reserve proof volume differs from the retained owner volume",
+            ));
+        }
+        let minimum = self
+            .store()
+            .minimum_recovery_reserve_bytes(volume_owner.volume())?;
+        if !proof.non_sparse() || proof.physical_bytes() < minimum {
+            return Err(format!(
+                "physical reserve proof does not meet the retained minimum: {} bytes, need at least {minimum}",
+                proof.physical_bytes()
+            ));
+        }
+        Ok(proof)
+    }
+
+    fn rebuild_capacity(&mut self) -> Result<(), String> {
+        let _proof = self.revalidate_capacity_boundary()?;
+        let provider = self
+            .capacity_provider
+            .take()
+            .unwrap_or_else(CapacityProvider::unavailable);
+        let snapshot = match self.store().rebuild_ordinary_claim_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.capacity_provider = Some(provider);
+                return Err(error.to_string());
+            }
+        };
+        let mut readiness = snapshot.readiness().clone();
+        if readiness.can_install() {
+            if let Err(error) = provider.install_rebuilt_claims(&snapshot) {
+                readiness = CapacityRebuildReadiness::reconciliation_required(vec![format!(
+                    "ordinary-claim provider rebuild was rejected: {error}"
+                )]);
+            }
+        }
+        if !readiness.diagnostics().is_empty() {
+            tracing::warn!(
+                diagnostics = ?readiness.diagnostics(),
+                "ordinary claim capacity rebuild retained recovery-only evidence"
+            );
+        }
+        self.capacity_provider = Some(provider);
+        self.capacity_rebuild_readiness = readiness;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn capacity_rebuild_readiness(&self) -> &CapacityRebuildReadiness {
+        &self.capacity_rebuild_readiness
+    }
+
     #[cfg(test)]
     fn install_drop_observer(
         &mut self,
@@ -399,6 +480,7 @@ impl Drop for OwnerRuntime {
         let observer = self.drop_observer.take();
         #[cfg(test)]
         let probe = self.drop_probe.as_ref();
+        self.capacity_provider.take();
         self.reserve.take();
         self.store.take();
         #[cfg(test)]
@@ -1242,6 +1324,24 @@ fn run_owner(
         runtime.install_reserve(reserve);
     }
 
+    #[cfg(test)]
+    if bootstrap_capacity {
+        if let Err(error) = runtime.rebuild_capacity() {
+            shared.mark_unavailable(&format!(
+                "ordinary-claim capacity rebuild bootstrap failed: {error}"
+            ));
+            return;
+        }
+    }
+
+    #[cfg(not(test))]
+    if let Err(error) = runtime.rebuild_capacity() {
+        shared.mark_unavailable(&format!(
+            "ordinary-claim capacity rebuild bootstrap failed: {error}"
+        ));
+        return;
+    }
+
     let starting = shared.lifecycle.compare_exchange(
         OwnerLifecycle::Initializing as u8,
         OwnerLifecycle::Available as u8,
@@ -1490,7 +1590,9 @@ mod tests {
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
         descriptor_capacity_facts,
     };
+    use crate::operation_journal::capacity_provider::{CapacityProvider, CapacityRebuildReadiness};
     use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;
+    use crate::operation_journal::store::{OrdinaryClaimRebuildSnapshot, RebuildClaim};
     use crate::operation_journal::{
         CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation, EvidenceBatchId,
         ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
@@ -1673,6 +1775,98 @@ mod tests {
         assert_eq!(binding_after, binding_before);
         assert_eq!(counts_after, counts_before);
         drop(final_store);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_runtime_rebuild_reuses_live_provider_on_conflicting_snapshot() {
+        let fixture = fixture("journal-owner-rebuild-provider-conflict");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("reserve bootstrap");
+        runtime.install_reserve(reserve);
+
+        let volume = VolumeIdentity { device: 1 };
+        let class = crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging;
+        let provider = CapacityProvider::unavailable();
+        let snapshot = OrdinaryClaimRebuildSnapshot::for_test(
+            vec![RebuildClaim::for_test(
+                OperationId::new(),
+                crate::operation_journal::AdmissionClaimId::new(),
+                volume.clone(),
+                class,
+                4096,
+                None,
+                false,
+            )],
+            CapacityRebuildReadiness::ready(),
+        );
+        provider
+            .install_rebuilt_claims(&snapshot)
+            .expect("seed live provider ledger");
+        runtime.capacity_provider = Some(provider);
+
+        runtime
+            .rebuild_capacity()
+            .expect("conflicting rebuild remains recovery-only");
+        let live_provider = runtime
+            .capacity_provider
+            .as_ref()
+            .expect("provider retained after rebuild");
+        assert_eq!(live_provider.outstanding(&volume, class), 4096);
+        assert!(matches!(
+            runtime.capacity_rebuild_readiness(),
+            CapacityRebuildReadiness::ReconciliationRequired { diagnostics }
+                if diagnostics.iter().any(|diagnostic| diagnostic.contains("rejected"))
+        ));
+        drop(runtime);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_runtime_does_not_read_or_install_after_physical_proof_failure() {
+        let fixture = fixture("journal-owner-rebuild-proof-failure");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut runtime = OwnerRuntime::new(store).expect("owner runtime");
+        let volume_owner = runtime
+            .store()
+            .acquire_profile_journal_volume_owner(Some(&registry_path))
+            .expect("volume owner");
+        runtime.install_volume_owner(volume_owner);
+        let reserve = runtime
+            .store()
+            .bootstrap_profile_journal_reserve(runtime.volume_owner(), Some(&registry_path))
+            .expect("reserve bootstrap");
+        runtime.install_reserve(reserve);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&reserve_path)
+            .expect("open reserve for proof-failure fixture");
+
+        let error = runtime
+            .rebuild_capacity()
+            .expect_err("short reserve must stop rebuild before store read");
+        assert!(error.contains("physical reserve proof"));
+        assert!(runtime.capacity_provider.is_none());
+        drop(runtime);
         drop(fixture);
     }
 

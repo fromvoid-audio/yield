@@ -9,6 +9,7 @@
 //! Unix before returning from open. Windows relies on the bundled SQLite VFS for committed file
 //! content and deliberately makes no independent directory-entry power-loss guarantee.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -29,7 +30,9 @@ use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
 use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimValidationError,
 };
-use super::capacity_provider::{CapacityProvider, CapacityProviderError, ProvisionalCapacityLease};
+use super::capacity_provider::{
+    CapacityProvider, CapacityProviderError, CapacityRebuildReadiness, ProvisionalCapacityLease,
+};
 use super::capacity_reserve_namespace::{
     BoundReserve, OwnedReserveAllocation, PhysicalReserveProof,
 };
@@ -105,6 +108,8 @@ const ORDINARY_CLAIM_SCHEMA_VERSION: u32 = 5;
 const MAX_SCHEMA_OBJECTS: i64 = 8;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
+const MAX_REBUILD_DIAGNOSTICS: usize = 32;
+const MAX_REBUILD_DIAGNOSTIC_CHARS: usize = 256;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep SQLite itself from materializing an arbitrarily large key/value before the recovery
 // scanner can inspect its SQL type and length. This leaves room for the bounded JSON envelope
@@ -560,6 +565,93 @@ pub(crate) struct OrdinaryClaimReleaseReceipt {
     volume: VolumeIdentity,
     allocation_class: FullCapacityAllocationClass,
     allocated_bytes: u64,
+}
+
+/// One private, consistent durable image used to rebuild the owner-thread provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinaryClaimRebuildSnapshot {
+    claims: Vec<RebuildClaim>,
+    readiness: CapacityRebuildReadiness,
+}
+
+/// A claim image can only be constructed by the strict store reader below. Keeping this type in
+/// the store module prevents provider callers from manufacturing release history or capacity
+/// charges from an observation or arbitrary command payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RebuildClaim {
+    operation_id: OperationId,
+    claim_id: AdmissionClaimId,
+    volume: VolumeIdentity,
+    allocation_class: FullCapacityAllocationClass,
+    allocated_bytes: u64,
+    release_id: Option<Uuid>,
+    audit_pending: bool,
+}
+
+impl RebuildClaim {
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn claim_id(&self) -> AdmissionClaimId {
+        self.claim_id
+    }
+
+    pub(crate) fn volume(&self) -> &VolumeIdentity {
+        &self.volume
+    }
+
+    pub(crate) fn allocation_class(&self) -> FullCapacityAllocationClass {
+        self.allocation_class
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    pub(crate) fn release_id(&self) -> Option<Uuid> {
+        self.release_id
+    }
+
+    pub(crate) fn audit_pending(&self) -> bool {
+        self.audit_pending
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation_id: OperationId,
+        claim_id: AdmissionClaimId,
+        volume: VolumeIdentity,
+        allocation_class: FullCapacityAllocationClass,
+        allocated_bytes: u64,
+        release_id: Option<Uuid>,
+        audit_pending: bool,
+    ) -> Self {
+        Self {
+            operation_id,
+            claim_id,
+            volume,
+            allocation_class,
+            allocated_bytes,
+            release_id,
+            audit_pending,
+        }
+    }
+}
+
+impl OrdinaryClaimRebuildSnapshot {
+    pub(crate) fn claims(&self) -> &[RebuildClaim] {
+        &self.claims
+    }
+
+    pub(crate) fn readiness(&self) -> &CapacityRebuildReadiness {
+        &self.readiness
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(claims: Vec<RebuildClaim>, readiness: CapacityRebuildReadiness) -> Self {
+        Self { claims, readiness }
+    }
 }
 
 #[allow(dead_code)]
@@ -1306,6 +1398,32 @@ impl OperationJournalStore {
         Ok(page)
     }
 
+    /// Read one consistent private ordinary-claim image for owner-thread restart rebuilding.
+    ///
+    /// The read transaction uses the existing bounded UUID pages for both claim relations and
+    /// point-validates every referenced legacy operation.  It never changes the durable rows or
+    /// turns a recovery observation into ordinary admission authority.
+    pub(crate) fn rebuild_ordinary_claim_snapshot(
+        &self,
+    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.validate_namespace()?;
+        self.connection.execute_batch("BEGIN")?;
+        let snapshot = match self.rebuild_ordinary_claim_snapshot_inside_transaction() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_namespace_for_precommit() {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        self.connection.execute_batch("ROLLBACK")?;
+        self.validate_namespace()?;
+        Ok(snapshot)
+    }
+
     /// Validate the profile-owned journal boundary before a future admission decision.
     ///
     /// This intentionally performs no operation-ID allocation, persistence, capacity
@@ -1442,6 +1560,37 @@ impl OperationJournalStore {
         )?;
         recovery_reserve_binding::persist(&self.connection, &binding)?;
         Ok(reserve)
+    }
+
+    /// Return the physical reserve extent required by the current durable charge state.
+    ///
+    /// A fully allocated reserve uses the protected floor. A valid active charge may have
+    /// reconstituted only the remaining extent, so owner startup uses this same minimum when it
+    /// checks a fresh physical proof before rebuilding ordinary claims.
+    pub(crate) fn minimum_recovery_reserve_bytes(
+        &self,
+        volume: &VolumeIdentity,
+    ) -> Result<u64, String> {
+        self.validate_namespace()
+            .map_err(|error| error.to_string())?;
+        let active = recovery_reserve::active_charge_snapshot_for_volume(&self.connection, volume)
+            .map_err(|error| error.to_string())?;
+        let Some(snapshot) = active else {
+            return Ok(crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR);
+        };
+        let spent = snapshot
+            .budget_bytes
+            .checked_sub(snapshot.remaining_bytes)
+            .ok_or_else(|| String::from("durable reserve remaining bytes exceed its budget"))?;
+        let minimum = crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+            .checked_sub(spent)
+            .ok_or_else(|| String::from("durable reserve spend exceeds the protected floor"))?;
+        if minimum < snapshot.margin_bytes {
+            return Err(String::from(
+                "durable reserve spend consumes its control margin",
+            ));
+        }
+        Ok(minimum)
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -5033,6 +5182,186 @@ impl OperationJournalStore {
         }
     }
 
+    fn rebuild_ordinary_claim_snapshot_inside_transaction(
+        &self,
+    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.validate_namespace_for_precommit()?;
+        let mut claim_rows = Vec::new();
+        let mut claim_cursor = None;
+        let mut diagnostics = Vec::new();
+        let mut fatal = false;
+        loop {
+            let page = match ordinary_claims::read_page(
+                &self.connection,
+                claim_cursor,
+                ordinary_claims::MAX_PAGE_ROWS,
+            ) {
+                Ok(page) => page,
+                Err(error) => {
+                    push_rebuild_diagnostic(
+                        &mut diagnostics,
+                        format!(
+                            "ordinary-claim page was retained but could not be decoded: {error}"
+                        ),
+                    );
+                    fatal = true;
+                    break;
+                }
+            };
+            claim_rows.extend(page.records().iter().cloned());
+            let Some(next_cursor) = page.next_cursor() else {
+                break;
+            };
+            claim_cursor = Some(next_cursor);
+        }
+
+        let mut release_rows = BTreeMap::new();
+        let mut release_id_owners = BTreeMap::new();
+        let mut conflicting_release_claims = BTreeSet::new();
+        let mut release_cursor = None;
+        if !fatal {
+            loop {
+                let page = match ordinary_claims::read_release_page(
+                    &self.connection,
+                    release_cursor,
+                    ordinary_claims::MAX_PAGE_ROWS,
+                ) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        push_rebuild_diagnostic(
+                            &mut diagnostics,
+                            format!(
+                                "ordinary-claim release page was retained but could not be decoded: {error}"
+                            ),
+                        );
+                        fatal = true;
+                        break;
+                    }
+                };
+                for release in page.records() {
+                    if let Some(previous) = release_rows.insert(release.claim_id(), *release) {
+                        conflicting_release_claims.insert(previous.claim_id());
+                        conflicting_release_claims.insert(release.claim_id());
+                    }
+                    if let Some(previous_claim) =
+                        release_id_owners.insert(release.release_id(), release.claim_id())
+                    {
+                        conflicting_release_claims.insert(previous_claim);
+                        conflicting_release_claims.insert(release.claim_id());
+                    }
+                }
+                let Some(next_cursor) = page.next_cursor() else {
+                    break;
+                };
+                release_cursor = Some(next_cursor);
+            }
+        }
+
+        let claim_ids: BTreeSet<_> = claim_rows.iter().map(|claim| claim.claim_id()).collect();
+        let mut rebuild_claims = Vec::with_capacity(claim_rows.len());
+        for claim in claim_rows {
+            let operation_valid = match self.read_row(claim.operation_id()) {
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    push_rebuild_diagnostic(
+                        &mut diagnostics,
+                        format!(
+                            "ordinary claim {} references missing legacy operation {}",
+                            claim.claim_id(),
+                            claim.operation_id()
+                        ),
+                    );
+                    false
+                }
+                Err(error) => {
+                    push_rebuild_diagnostic(
+                        &mut diagnostics,
+                        format!(
+                            "ordinary claim {} operation {} requires audit: {error}",
+                            claim.claim_id(),
+                            claim.operation_id()
+                        ),
+                    );
+                    false
+                }
+            };
+            let mut audit_pending = !operation_valid;
+            let mut release_id = None;
+            if let Some(release) = release_rows.remove(&claim.claim_id()) {
+                if conflicting_release_claims.contains(&claim.claim_id()) {
+                    push_rebuild_diagnostic(
+                        &mut diagnostics,
+                        format!(
+                            "ordinary claim {} has conflicting durable release identities",
+                            claim.claim_id()
+                        ),
+                    );
+                    audit_pending = true;
+                } else if release.operation_id() != claim.operation_id() {
+                    push_rebuild_diagnostic(
+                        &mut diagnostics,
+                        format!(
+                            "ordinary claim {} release operation {} mismatches claim operation {}",
+                            claim.claim_id(),
+                            release.operation_id(),
+                            claim.operation_id()
+                        ),
+                    );
+                    audit_pending = true;
+                } else if operation_valid {
+                    release_id = Some(release.release_id());
+                }
+            }
+            rebuild_claims.push(RebuildClaim {
+                operation_id: claim.operation_id(),
+                claim_id: claim.claim_id(),
+                volume: claim.volume().clone(),
+                allocation_class: claim.allocation_class(),
+                allocated_bytes: claim.allocated_bytes(),
+                release_id,
+                audit_pending,
+            });
+        }
+
+        for (claim_id, release) in release_rows {
+            if !claim_ids.contains(&claim_id) {
+                push_rebuild_diagnostic(
+                    &mut diagnostics,
+                    format!(
+                        "orphan ordinary-claim release {} has no durable claim row",
+                        release.claim_id()
+                    ),
+                );
+            }
+        }
+
+        if fatal {
+            return Ok(OrdinaryClaimRebuildSnapshot {
+                claims: rebuild_claims,
+                readiness: CapacityRebuildReadiness::reconciliation_required(diagnostics),
+            });
+        }
+        let has_outstanding = rebuild_claims
+            .iter()
+            .any(|claim| claim.release_id().is_none());
+        if diagnostics.is_empty() && has_outstanding {
+            return Ok(OrdinaryClaimRebuildSnapshot {
+                claims: rebuild_claims,
+                readiness: CapacityRebuildReadiness::ready(),
+            });
+        }
+        if diagnostics.is_empty() {
+            push_rebuild_diagnostic(
+                &mut diagnostics,
+                String::from("ordinary-claim rebuild found no outstanding retained claims"),
+            );
+        }
+        Ok(OrdinaryClaimRebuildSnapshot {
+            claims: rebuild_claims,
+            readiness: CapacityRebuildReadiness::recovery_only(diagnostics),
+        })
+    }
+
     fn validate_namespace(&self) -> Result<(), OperationJournalStoreError> {
         if !self.connection.is_autocommit() {
             return Err(audit_error(
@@ -5108,6 +5437,14 @@ impl OperationJournalStore {
         }
         Ok(())
     }
+}
+
+fn push_rebuild_diagnostic(diagnostics: &mut Vec<String>, reason: String) {
+    if diagnostics.len() >= MAX_REBUILD_DIAGNOSTICS {
+        return;
+    }
+    let bounded: String = reason.chars().take(MAX_REBUILD_DIAGNOSTIC_CHARS).collect();
+    diagnostics.push(bounded);
 }
 
 #[allow(dead_code)]
@@ -6480,7 +6817,8 @@ mod tests {
         PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity,
     };
     use crate::operation_journal::capacity_provider::{
-        CapacityProvider, ProvisionalLeaseDisposition,
+        CapacityProvider, CapacityProviderError, CapacityRebuildReadiness,
+        ProvisionalLeaseDisposition,
     };
     use crate::operation_journal::{AdmissionClaim, AdmissionClaimId, AdmissionClaimInventory};
     use crate::operation_journal::{
@@ -11315,6 +11653,21 @@ mod tests {
                 i64::try_from(index).expect("fixture bytes"),
             )
             .expect("insert ordinary claim fixture");
+            store
+                .connection
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (claim_id, operation_id, release_id)
+                         VALUES (?1, ?2, ?3)",
+                        ordinary_claims::RELEASE_TABLE_NAME
+                    ),
+                    params![
+                        Uuid::from_u128(index).to_string(),
+                        Uuid::from_u128(10_000 + index).to_string(),
+                        Uuid::from_u128(20_000 + index).to_string(),
+                    ],
+                )
+                .expect("insert release paging fixture");
         }
 
         let first = store
@@ -11374,6 +11727,21 @@ mod tests {
             page.records()[0].operation_id().as_uuid(),
             Uuid::from_u128(10_001)
         );
+        let rebuild = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild paged ordinary claims and releases");
+        assert_eq!(rebuild.claims().len(), 257);
+        assert!(matches!(
+            rebuild.readiness(),
+            CapacityRebuildReadiness::RecoveryOnly { diagnostics }
+                if diagnostics.len() == MAX_REBUILD_DIAGNOSTICS
+        ));
+        assert!(
+            rebuild
+                .claims()
+                .iter()
+                .all(|claim| claim.release_id().is_none())
+        );
     }
 
     #[test]
@@ -11406,6 +11774,149 @@ mod tests {
             crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload
         );
         assert_eq!(page.records()[0].allocated_bytes(), 4_096);
+    }
+
+    #[test]
+    fn ordinary_claim_rebuild_retains_mismatched_and_orphan_release_evidence() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        store
+            .insert_intent(&intent_record(operation_id))
+            .expect("insert point-validation operation");
+        let claim_id = Uuid::from_u128(4_101);
+        let orphan_claim_id = Uuid::from_u128(4_102);
+        let mismatched_operation_id = OperationId::new();
+        insert_ordinary_claim(
+            &store,
+            claim_id,
+            operation_id.as_uuid(),
+            "9",
+            "OperationRecoveryPayload",
+            4_096,
+        )
+        .expect("insert valid claim");
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {} (claim_id, operation_id, release_id)
+                     VALUES (?1, ?2, ?3)",
+                    ordinary_claims::RELEASE_TABLE_NAME
+                ),
+                params![
+                    claim_id.to_string(),
+                    mismatched_operation_id.to_string(),
+                    Uuid::from_u128(4_103).to_string(),
+                ],
+            )
+            .expect("insert mismatched release evidence");
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign-key checks for orphan fixture");
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {} (claim_id, operation_id, release_id)
+                     VALUES (?1, ?2, ?3)",
+                    ordinary_claims::RELEASE_TABLE_NAME
+                ),
+                params![
+                    orphan_claim_id.to_string(),
+                    OperationId::new().to_string(),
+                    Uuid::from_u128(4_104).to_string(),
+                ],
+            )
+            .expect("insert orphan release evidence");
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("restore foreign-key checks");
+
+        let snapshot = store
+            .rebuild_ordinary_claim_snapshot()
+            .expect("read conservative release snapshot");
+        assert_eq!(snapshot.claims().len(), 1);
+        assert!(matches!(
+            snapshot.readiness(),
+            CapacityRebuildReadiness::RecoveryOnly { diagnostics }
+                if diagnostics.iter().any(|diagnostic| diagnostic.contains("mismatches claim operation"))
+                    && diagnostics.iter().any(|diagnostic| diagnostic.contains("orphan ordinary-claim release"))
+        ));
+        let claim = &snapshot.claims()[0];
+        assert!(claim.audit_pending());
+        assert!(claim.release_id().is_none());
+        let provider = CapacityProvider::unavailable();
+        provider
+            .install_rebuilt_claims(&snapshot)
+            .expect("retain known ambiguous claim charge");
+        assert_eq!(
+            provider.outstanding(
+                &VolumeIdentity { device: 9 },
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload,
+            ),
+            4_096
+        );
+        assert!(matches!(
+            provider.ledger_dispositions().as_slice(),
+            [ProvisionalLeaseDisposition::AuditPending { .. }]
+        ));
+    }
+
+    #[test]
+    fn ordinary_claim_rebuild_rejects_malformed_row_without_mutating_retained_evidence() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let claim_id = Uuid::from_u128(4_201);
+        let operation_id = OperationId::new();
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("enable malformed-row fixture");
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {} (claim_id, operation_id, volume_device, allocation_class,
+                     allocated_bytes) VALUES (?1, ?2, '9', 'DestinationStaging', 0)",
+                    ordinary_claims::TABLE_NAME
+                ),
+                params![claim_id.to_string(), operation_id.to_string()],
+            )
+            .expect("insert malformed claim row");
+        store
+            .connection
+            .pragma_update(None, "ignore_check_constraints", false)
+            .expect("restore malformed-row checks");
+
+        let snapshot = store
+            .rebuild_ordinary_claim_snapshot()
+            .expect("return conservative malformed snapshot");
+        assert!(snapshot.claims().is_empty());
+        assert!(matches!(
+            snapshot.readiness(),
+            CapacityRebuildReadiness::ReconciliationRequired { diagnostics }
+                if diagnostics.iter().any(|diagnostic| diagnostic.contains("could not be decoded"))
+        ));
+        let provider = CapacityProvider::unavailable();
+        assert_eq!(
+            provider.install_rebuilt_claims(&snapshot),
+            Err(CapacityProviderError::RebuildNotReady)
+        );
+        let retained: i64 = store
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE claim_id = ?1",
+                    ordinary_claims::TABLE_NAME
+                ),
+                params![claim_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count retained malformed row");
+        assert_eq!(retained, 1);
     }
 
     #[test]
@@ -13493,6 +14004,100 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_claim_rebuild_reopens_and_preserves_partial_release_identity() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        let mut record = intent_record(operation_id);
+        record
+            .capacity_plan
+            .as_mut()
+            .expect("intent capacity plan")
+            .volumes[0]
+            .logical_bytes = 2;
+        record
+            .capacity_plan
+            .as_mut()
+            .expect("intent capacity plan")
+            .volumes[0]
+            .allocated_bytes = 2;
+        let first_id = AdmissionClaimId::new();
+        let second_id = AdmissionClaimId::new();
+        let claims = AdmissionClaimInventory::new(vec![
+            claim_for_intent(&record, first_id, Some(1)),
+            claim_for_intent(&record, second_id, Some(1)),
+        ])
+        .expect("split claim inventory");
+        let provider = provider_for_intent(&record);
+        drop(
+            store
+                .settle_initial_claims(&record, &provider, &claims)
+                .expect("settle split claims"),
+        );
+
+        let snapshot = store
+            .rebuild_ordinary_claim_snapshot()
+            .expect("read initial rebuild snapshot");
+        assert_eq!(snapshot.claims().len(), 2);
+        assert_eq!(snapshot.readiness(), &CapacityRebuildReadiness::Ready);
+        let rebuilt = CapacityProvider::unavailable();
+        rebuilt
+            .install_rebuilt_claims(&snapshot)
+            .expect("install initial rebuild snapshot");
+        let volume = VolumeIdentity { device: 1 };
+        let class = crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging;
+        assert_eq!(rebuilt.outstanding(&volume, class), 2);
+
+        let request = release_request(operation_id, first_id, Uuid::new_v4());
+        store
+            .release_ordinary_claim(request, &provider)
+            .expect("release first claim");
+        assert_eq!(provider.outstanding(&volume, class), 1);
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let released_snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("read release-aware rebuild snapshot");
+        assert_eq!(released_snapshot.claims().len(), 2);
+        assert_eq!(
+            released_snapshot.readiness(),
+            &CapacityRebuildReadiness::Ready
+        );
+        assert_eq!(
+            released_snapshot
+                .claims()
+                .iter()
+                .filter(|claim| claim.release_id().is_some())
+                .count(),
+            1
+        );
+        let rebuilt_after_release = CapacityProvider::unavailable();
+        rebuilt_after_release
+            .install_rebuilt_claims(&released_snapshot)
+            .expect("install release-aware rebuild snapshot");
+        assert_eq!(rebuilt_after_release.outstanding(&volume, class), 1);
+        rebuilt_after_release
+            .install_rebuilt_claims(&released_snapshot)
+            .expect("replay release-aware rebuild snapshot");
+        assert_eq!(rebuilt_after_release.outstanding(&volume, class), 1);
+
+        assert_eq!(ordinary_claim_count(&reopened), 2);
+        let release_count: i64 = reopened
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {}",
+                    ordinary_claims::RELEASE_TABLE_NAME
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count release evidence");
+        assert_eq!(release_count, 1);
+    }
+
+    #[test]
     fn ordinary_claim_release_transactions_serialize_same_claim_and_preserve_conflict() {
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
@@ -13619,7 +14224,20 @@ mod tests {
             provider.outstanding(&VolumeIdentity { device: 1 }, row_class(&record)),
             1
         );
-        store
+        drop(store);
+        let reopened =
+            OperationJournalStore::open(&fixture.owner).expect("reopen postcommit release");
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild after postcommit release uncertainty");
+        assert_eq!(snapshot.claims().len(), 1);
+        assert!(snapshot.claims()[0].release_id().is_some());
+        let rebuilt = CapacityProvider::unavailable();
+        rebuilt
+            .install_rebuilt_claims(&snapshot)
+            .expect("install postcommit release snapshot");
+        assert_eq!(rebuilt.claim_count(), 0);
+        reopened
             .release_ordinary_claim(request, &provider)
             .expect("retry post-commit release");
         assert_eq!(
@@ -13627,6 +14245,7 @@ mod tests {
             0
         );
 
+        let store = reopened;
         let operation_id = OperationId::new();
         let record = intent_record(operation_id);
         let claims = claims_for_intent(&record);
@@ -13657,7 +14276,31 @@ mod tests {
             store.release_ordinary_claim(request, &provider),
             Err(OrdinaryClaimReleaseError::PersistenceUncertain { .. })
         ));
-        store
+        drop(store);
+        let reopened =
+            OperationJournalStore::open(&fixture.owner).expect("reopen rollback-uncertain release");
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild after rollback release uncertainty");
+        assert_eq!(snapshot.claims().len(), 2);
+        assert!(
+            snapshot
+                .claims()
+                .iter()
+                .find(|claim| claim.operation_id() == record.operation_id)
+                .expect("find rollback-uncertain claim")
+                .release_id()
+                .is_none()
+        );
+        let rebuilt = CapacityProvider::unavailable();
+        rebuilt
+            .install_rebuilt_claims(&snapshot)
+            .expect("install rollback-uncertain release snapshot");
+        assert_eq!(
+            rebuilt.outstanding(&VolumeIdentity { device: 1 }, row_class(&record)),
+            1
+        );
+        reopened
             .release_ordinary_claim(request, &provider)
             .expect("retry rollback uncertainty");
         assert_eq!(
@@ -13707,6 +14350,18 @@ mod tests {
         assert_eq!(store.get(record.operation_id).expect("read rollback"), None);
         assert_eq!(ordinary_claim_count(&store), 0);
         assert_eq!(provider.claim_count(), 0);
+
+        drop(store);
+        let reopened =
+            OperationJournalStore::open(&fixture.owner).expect("reopen rolled-back journal");
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild after confirmed rollback");
+        assert!(snapshot.claims().is_empty());
+        assert!(matches!(
+            snapshot.readiness(),
+            CapacityRebuildReadiness::RecoveryOnly { .. }
+        ));
     }
 
     #[test]
@@ -13817,6 +14472,23 @@ mod tests {
         ));
         drop(second_settlement);
         assert_eq!(provider.claim_count(), 2);
+
+        drop(store);
+        let reopened =
+            OperationJournalStore::open(&fixture.owner).expect("reopen uncertain journal");
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild after uncertain initial settlements");
+        assert_eq!(snapshot.claims().len(), 2);
+        assert_eq!(snapshot.readiness(), &CapacityRebuildReadiness::Ready);
+        let rebuilt = CapacityProvider::unavailable();
+        rebuilt
+            .install_rebuilt_claims(&snapshot)
+            .expect("install claims after uncertain initial settlements");
+        assert_eq!(
+            rebuilt.outstanding(&VolumeIdentity { device: 1 }, row_class(&first)),
+            2
+        );
     }
 
     #[test]

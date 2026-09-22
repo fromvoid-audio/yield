@@ -694,6 +694,49 @@ post-commit uncertainty, rollback uncertainty, journal reopen replay, concurrent
 same-claim serialization, ambiguous retained-token lookup, residual-charge
 retention, final-token replay, and strict v5-to-v6 migration/readback checks.
 
+OPT-1560 rebuilds the private owner-thread capacity ledger after startup using
+the existing journal schema. The owner acquires the live volume capability,
+installs or reopens the reserve, revalidates the retained descriptor, and
+obtains a fresh non-sparse PhysicalReserveProof before reading or installing
+claim capacity. The proof must match the owner volume and meet the active
+charge-derived protected minimum; explained partial reserve extents are
+accepted only when they satisfy that minimum. Failure keeps the owner on the
+existing unavailable startup path.
+
+The store's consistent read snapshot pages both immutable ordinary-claim
+relations by canonical UUID key, with a maximum of 256 decoded rows and one
+bounded lookahead per page. It point-validates each claim's operation. An
+exact durable (claim_id, operation_id, release_id) relation is the only
+release authority. Terminal or settlement observations cannot free a claim.
+Missing operations and mismatched release evidence on a known positive claim
+row remain charged as `AuditPending`. An orphan release has no claim bytes to
+attribute; its immutable evidence remains a bounded diagnostic and keeps
+rebuild recovery-only without fabricating a charge. Other decodable positive
+claim rows remain charged as `AuditPending`; malformed identities,
+amounts, page data, or checked sums produce ReconciliationRequired and leave
+the previous provider ledger unchanged. Diagnostics are bounded to 32 entries
+of 256 characters.
+
+The provider receives a sealed store-owned rebuild image. It stages per-claim
+volume/class/byte maps, residual per-operation tokens, checked aggregate sums,
+and released identities before one atomic install into an empty ledger. An
+identical image may replay only when the actual live ledger still matches,
+including after a release; any changed non-empty ledger is rejected without
+mutation. The owner retains its existing provider on that rejection, so stale
+restart evidence cannot resurrect released capacity or erase newer charges.
+Known recovery charges remain recovery-only and ordinary admission stays
+unqualified. This milestone does not add schema, public commands, physical
+cleanup, reserve replenishment, provider qualification, chunks, or family
+wiring.
+
+The finite restart-rebuild verification set covers fresh and reopened startup
+with proof-before-rebuild, exact residual sums for multiple operations and
+classes/volumes, repeated rebuild and post-release replay, changed-live-ledger
+guards, charge/pre-intent/settlement/initial-release uncertainty, orphan and
+mismatched evidence, malformed/overflow rows, bounded paging beyond 256,
+reserve-proof failure, and recovery access while ordinary capacity remains
+blocked.
+
 The first cancellation freezes a non-executable recovery inventory. A verified
 late publication may refine an already-entered action, advance its recovery
 generation and select the after-publication route, but cannot introduce an action

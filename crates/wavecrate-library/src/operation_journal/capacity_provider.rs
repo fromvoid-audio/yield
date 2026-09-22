@@ -17,7 +17,7 @@ use super::admission_claims::{
 use super::full_capacity::{
     FullCapacityAllocationClass, FullCapacityPlan, MAX_FULL_CAPACITY_ALLOCATIONS,
 };
-use super::store::OrdinaryClaimReleaseReceipt;
+use super::store::{OrdinaryClaimRebuildSnapshot, OrdinaryClaimReleaseReceipt, RebuildClaim};
 use crate::durable_capacity::{PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity};
 use crate::operation_journal::model::OperationId;
 use uuid::Uuid;
@@ -70,14 +70,14 @@ struct ProvisionalLedger {
     fail_disposition: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LedgerCharge {
     charges: BTreeMap<ChargeKey, u64>,
     claims: BTreeMap<AdmissionClaimId, LedgerClaim>,
     disposition: ProvisionalLeaseDisposition,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LedgerClaim {
     volume: VolumeIdentity,
     allocation_class: FullCapacityAllocationClass,
@@ -85,13 +85,52 @@ struct LedgerClaim {
     release_id: Option<Uuid>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ReleasedClaim {
     operation_id: OperationId,
     volume: VolumeIdentity,
     allocation_class: FullCapacityAllocationClass,
     allocated_bytes: u64,
     release_id: Uuid,
+}
+
+/// Private readiness produced while reconstructing the owner-thread capacity ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CapacityRebuildReadiness {
+    /// Every durable claim and release observation was internally consistent.
+    Ready,
+    /// Known claims can be retained, but an actionable ambiguity keeps the provider recovery-only.
+    RecoveryOnly { diagnostics: Vec<String> },
+    /// The durable snapshot is unusable as a complete capacity image; no optimistic install is
+    /// permitted until the retained evidence is explicitly reconciled.
+    ReconciliationRequired { diagnostics: Vec<String> },
+}
+
+impl CapacityRebuildReadiness {
+    pub(crate) fn ready() -> Self {
+        Self::Ready
+    }
+
+    pub(crate) fn recovery_only(diagnostics: Vec<String>) -> Self {
+        Self::RecoveryOnly { diagnostics }
+    }
+
+    pub(crate) fn reconciliation_required(diagnostics: Vec<String>) -> Self {
+        Self::ReconciliationRequired { diagnostics }
+    }
+
+    pub(crate) fn can_install(&self) -> bool {
+        !matches!(self, Self::ReconciliationRequired { .. })
+    }
+
+    pub(crate) fn diagnostics(&self) -> &[String] {
+        match self {
+            Self::Ready => &[],
+            Self::RecoveryOnly { diagnostics } | Self::ReconciliationRequired { diagnostics } => {
+                diagnostics
+            }
+        }
+    }
 }
 
 impl Default for ProvisionalLedger {
@@ -136,6 +175,47 @@ impl CapacityProvider {
             facts: None,
             ledger: Rc::new(RefCell::new(ProvisionalLedger::default())),
         }
+    }
+
+    /// Install a validated restart image without changing provider qualification.
+    ///
+    /// The staged image is grouped deterministically by operation identity.  It is committed to
+    /// the owner-thread ledger only after every claim, release identity, aggregate, and token
+    /// allocation has passed checked validation.  An exact image already present in the live
+    /// ledger is an idempotent replay; any other live image is left untouched and rejected.
+    pub(crate) fn install_rebuilt_claims(
+        &self,
+        snapshot: &OrdinaryClaimRebuildSnapshot,
+    ) -> Result<(), CapacityProviderError> {
+        if !snapshot.readiness().can_install() {
+            return Err(CapacityProviderError::RebuildNotReady);
+        }
+        let mut ledger = self
+            .ledger
+            .try_borrow_mut()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        let canonical = stage_rebuilt_ledger(snapshot.claims(), INITIAL_LEASE_TOKEN)?;
+        if ledger_matches_rebuild(&ledger, &canonical) {
+            return Ok(());
+        }
+        if !ledger.charges_by_token.is_empty() || !ledger.released_claims.is_empty() {
+            return Err(CapacityProviderError::RebuildLedgerConflict);
+        }
+        let staged = stage_rebuilt_ledger(snapshot.claims(), ledger.next_token)?;
+        #[cfg(test)]
+        let fail_release = ledger.fail_release;
+        #[cfg(test)]
+        let fail_disposition = ledger.fail_disposition;
+        ledger.next_token = staged.next_token;
+        ledger.charges_by_token = staged.charges_by_token;
+        ledger.aggregate_charges = staged.aggregate_charges;
+        ledger.released_claims = staged.released_claims;
+        #[cfg(test)]
+        {
+            ledger.fail_release = fail_release;
+            ledger.fail_disposition = fail_disposition;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -472,10 +552,34 @@ impl CapacityProvider {
                 .get_mut(&receipt.claim_id())
                 .expect("validated retained claim");
             claim.release_id = Some(receipt.release_id());
-            entry
+            let all_released = entry
                 .claims
                 .values()
-                .all(|claim| claim.release_id.is_some())
+                .all(|claim| claim.release_id.is_some());
+            if !all_released {
+                let mut remaining_claim_ids = entry
+                    .claims
+                    .iter()
+                    .filter_map(|(claim_id, claim)| claim.release_id.is_none().then_some(*claim_id))
+                    .collect::<Vec<_>>();
+                remaining_claim_ids.sort();
+                entry.disposition = match &entry.disposition {
+                    ProvisionalLeaseDisposition::Durable { operation_id, .. } => {
+                        ProvisionalLeaseDisposition::Durable {
+                            operation_id: *operation_id,
+                            claim_ids: remaining_claim_ids,
+                        }
+                    }
+                    ProvisionalLeaseDisposition::AuditPending { operation_id, .. } => {
+                        ProvisionalLeaseDisposition::AuditPending {
+                            operation_id: *operation_id,
+                            claim_ids: remaining_claim_ids,
+                        }
+                    }
+                    disposition => disposition.clone(),
+                };
+            }
+            all_released
         };
         ledger.released_claims.insert(
             receipt.claim_id(),
@@ -556,6 +660,144 @@ impl CapacityProvider {
     pub(crate) fn allow_disposition_for_test(&self) {
         self.ledger.borrow_mut().fail_disposition = false;
     }
+}
+
+fn stage_rebuilt_ledger(
+    claims: &[RebuildClaim],
+    initial_next_token: u64,
+) -> Result<ProvisionalLedger, CapacityProviderError> {
+    if initial_next_token == 0 {
+        return Err(CapacityProviderError::LeaseTokenExhausted);
+    }
+    let mut by_operation: BTreeMap<OperationId, Vec<&RebuildClaim>> = BTreeMap::new();
+    let mut seen_claims = BTreeSet::new();
+    let mut seen_release_ids = BTreeSet::new();
+    for claim in claims {
+        if claim.operation_id().as_uuid().is_nil()
+            || claim.claim_id().validate().is_err()
+            || claim.allocated_bytes() == 0
+        {
+            return Err(CapacityProviderError::RebuildInvalidClaim);
+        }
+        if !seen_claims.insert(claim.claim_id()) {
+            return Err(CapacityProviderError::RebuildIdentityConflict);
+        }
+        if let Some(release_id) = claim.release_id() {
+            if release_id.is_nil() || !seen_release_ids.insert(release_id) {
+                return Err(CapacityProviderError::RebuildIdentityConflict);
+            }
+        }
+        by_operation
+            .entry(claim.operation_id())
+            .or_default()
+            .push(claim);
+    }
+
+    let mut staged = ProvisionalLedger {
+        next_token: initial_next_token,
+        charges_by_token: BTreeMap::new(),
+        aggregate_charges: BTreeMap::new(),
+        released_claims: BTreeMap::new(),
+        #[cfg(test)]
+        fail_release: false,
+        #[cfg(test)]
+        fail_disposition: false,
+    };
+
+    for (operation_id, operation_claims) in by_operation {
+        let mut charges = BTreeMap::new();
+        let mut retained_claims = BTreeMap::new();
+        let mut claim_ids = Vec::new();
+        let mut audit_pending = false;
+        let mut has_unreleased_claim = false;
+        for claim in operation_claims {
+            if let Some(release_id) = claim.release_id() {
+                staged.released_claims.insert(
+                    claim.claim_id(),
+                    ReleasedClaim {
+                        operation_id,
+                        volume: claim.volume().clone(),
+                        allocation_class: claim.allocation_class(),
+                        allocated_bytes: claim.allocated_bytes(),
+                        release_id,
+                    },
+                );
+                retained_claims.insert(
+                    claim.claim_id(),
+                    LedgerClaim {
+                        volume: claim.volume().clone(),
+                        allocation_class: claim.allocation_class(),
+                        allocated_bytes: claim.allocated_bytes(),
+                        release_id: Some(release_id),
+                    },
+                );
+                continue;
+            }
+            has_unreleased_claim = true;
+            let key = ChargeKey {
+                volume: claim.volume().clone(),
+                allocation_class: claim.allocation_class(),
+            };
+            let aggregate = charges.entry(key.clone()).or_insert(0_u64);
+            *aggregate = (*aggregate)
+                .checked_add(claim.allocated_bytes())
+                .ok_or(CapacityProviderError::ArithmeticOverflow)?;
+            let provider_aggregate = staged.aggregate_charges.entry(key.clone()).or_insert(0);
+            *provider_aggregate = provider_aggregate
+                .checked_add(claim.allocated_bytes())
+                .ok_or(CapacityProviderError::ArithmeticOverflow)?;
+            retained_claims.insert(
+                claim.claim_id(),
+                LedgerClaim {
+                    volume: claim.volume().clone(),
+                    allocation_class: claim.allocation_class(),
+                    allocated_bytes: claim.allocated_bytes(),
+                    release_id: None,
+                },
+            );
+            claim_ids.push(claim.claim_id());
+            audit_pending |= claim.audit_pending();
+        }
+        if !has_unreleased_claim {
+            continue;
+        }
+        claim_ids.sort();
+        let token = staged.next_token;
+        staged.next_token = staged
+            .next_token
+            .checked_add(1)
+            .ok_or(CapacityProviderError::LeaseTokenExhausted)?;
+        staged.charges_by_token.insert(
+            token,
+            LedgerCharge {
+                charges,
+                claims: retained_claims,
+                disposition: if audit_pending {
+                    ProvisionalLeaseDisposition::AuditPending {
+                        operation_id,
+                        claim_ids,
+                    }
+                } else {
+                    ProvisionalLeaseDisposition::Durable {
+                        operation_id,
+                        claim_ids,
+                    }
+                },
+            },
+        );
+    }
+    Ok(staged)
+}
+
+fn ledger_matches_rebuild(current: &ProvisionalLedger, staged: &ProvisionalLedger) -> bool {
+    let mut current_charges: Vec<LedgerCharge> =
+        current.charges_by_token.values().cloned().collect();
+    let mut staged_charges: Vec<LedgerCharge> = staged.charges_by_token.values().cloned().collect();
+    current_charges.sort_by_key(|charge| disposition_operation(&charge.disposition));
+    staged_charges.sort_by_key(|charge| disposition_operation(&charge.disposition));
+    current_charges == staged_charges
+        && current.aggregate_charges == staged.aggregate_charges
+        && current.released_claims == staged.released_claims
 }
 
 pub(crate) fn production_admission_gate() -> Result<(), ()> {
@@ -873,6 +1115,14 @@ pub(crate) enum CapacityProviderError {
     LeaseDispositionConflict,
     #[error("provisional capacity cannot transfer to a durable intent yet")]
     IntentTransferUnavailable,
+    #[error("restart rebuild contains an invalid ordinary claim")]
+    RebuildInvalidClaim,
+    #[error("restart rebuild evidence is not ready for provider installation")]
+    RebuildNotReady,
+    #[error("restart rebuild contains conflicting claim or release identity")]
+    RebuildIdentityConflict,
+    #[error("restart rebuild conflicts with the live owner-thread ledger")]
+    RebuildLedgerConflict,
 }
 
 fn disposition_operation(disposition: &ProvisionalLeaseDisposition) -> Option<OperationId> {
@@ -889,6 +1139,7 @@ mod tests {
     use crate::operation_journal::full_capacity_planner::{
         CapacityAllocationNature, CapacityEstimate, CapacityRequirement, derive_full_capacity_plan,
     };
+    use crate::operation_journal::store::{OrdinaryClaimRebuildSnapshot, RebuildClaim};
     use crate::operation_journal::{
         AdmissionClaim, AdmissionClaimId, FullCapacityAllocation, FullCapacityPlan,
     };
@@ -944,6 +1195,232 @@ mod tests {
 
     fn round_up(bytes: u64, allocation_unit: u64) -> u64 {
         crate::durable_capacity::round_up_allocation(bytes, allocation_unit).expect("test round")
+    }
+
+    fn rebuild_claim(
+        operation_id: OperationId,
+        claim_id: AdmissionClaimId,
+        volume: VolumeIdentity,
+        allocation_class: FullCapacityAllocationClass,
+        allocated_bytes: u64,
+        release_id: Option<Uuid>,
+        audit_pending: bool,
+    ) -> RebuildClaim {
+        RebuildClaim::for_test(
+            operation_id,
+            claim_id,
+            volume,
+            allocation_class,
+            allocated_bytes,
+            release_id,
+            audit_pending,
+        )
+    }
+
+    fn rebuild_snapshot(claims: Vec<RebuildClaim>) -> OrdinaryClaimRebuildSnapshot {
+        OrdinaryClaimRebuildSnapshot::for_test(claims, CapacityRebuildReadiness::ready())
+    }
+
+    #[test]
+    fn restart_rebuild_groups_claims_replays_and_never_resurrects_released_claims() {
+        let first_volume = VolumeIdentity { device: 101 };
+        let second_volume = VolumeIdentity { device: 102 };
+        let first_class = FullCapacityAllocationClass::DestinationStaging;
+        let second_class = FullCapacityAllocationClass::SourceWalShm;
+        let first_operation = OperationId::new();
+        let second_operation = OperationId::new();
+        let first_claim = AdmissionClaimId::new();
+        let second_claim = AdmissionClaimId::new();
+        let third_claim = AdmissionClaimId::new();
+        let initial = rebuild_snapshot(vec![
+            rebuild_claim(
+                first_operation,
+                first_claim,
+                first_volume.clone(),
+                first_class,
+                4096,
+                None,
+                false,
+            ),
+            rebuild_claim(
+                first_operation,
+                second_claim,
+                first_volume.clone(),
+                first_class,
+                8192,
+                None,
+                false,
+            ),
+            rebuild_claim(
+                second_operation,
+                third_claim,
+                second_volume.clone(),
+                second_class,
+                2048,
+                None,
+                false,
+            ),
+        ]);
+        let provider = CapacityProvider::unavailable();
+        provider
+            .install_rebuilt_claims(&initial)
+            .expect("initial rebuild");
+        assert_eq!(provider.claim_count(), 2);
+        assert_eq!(provider.outstanding(&first_volume, first_class), 12288);
+        assert_eq!(provider.outstanding(&second_volume, second_class), 2048);
+        provider
+            .install_rebuilt_claims(&initial)
+            .expect("exact rebuild replay");
+        assert_eq!(provider.claim_count(), 2);
+
+        let release_id = Uuid::new_v4();
+        let receipt = OrdinaryClaimReleaseReceipt::for_test(
+            first_operation,
+            first_claim,
+            release_id,
+            first_volume.clone(),
+            first_class,
+            4096,
+        );
+        provider
+            .release_claim(&receipt)
+            .expect("release one rebuilt claim");
+        let after_release = rebuild_snapshot(vec![
+            rebuild_claim(
+                first_operation,
+                first_claim,
+                first_volume.clone(),
+                first_class,
+                4096,
+                Some(release_id),
+                false,
+            ),
+            rebuild_claim(
+                first_operation,
+                second_claim,
+                first_volume.clone(),
+                first_class,
+                8192,
+                None,
+                false,
+            ),
+            rebuild_claim(
+                second_operation,
+                third_claim,
+                second_volume.clone(),
+                second_class,
+                2048,
+                None,
+                false,
+            ),
+        ]);
+        provider
+            .install_rebuilt_claims(&after_release)
+            .expect("replay after durable release");
+        assert_eq!(provider.outstanding(&first_volume, first_class), 8192);
+        assert_eq!(provider.outstanding(&second_volume, second_class), 2048);
+        assert_eq!(provider.claim_count(), 2);
+    }
+
+    #[test]
+    fn restart_rebuild_rejects_conflicting_live_image_and_near_max_replay_is_idempotent() {
+        let volume = VolumeIdentity { device: 103 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let operation_id = OperationId::new();
+        let first_claim = AdmissionClaimId::new();
+        let second_claim = AdmissionClaimId::new();
+        let first = rebuild_snapshot(vec![rebuild_claim(
+            operation_id,
+            first_claim,
+            volume.clone(),
+            class,
+            4096,
+            None,
+            false,
+        )]);
+        let conflicting = rebuild_snapshot(vec![rebuild_claim(
+            operation_id,
+            second_claim,
+            volume.clone(),
+            class,
+            8192,
+            None,
+            false,
+        )]);
+        let provider = CapacityProvider::unavailable();
+        provider
+            .install_rebuilt_claims(&first)
+            .expect("initial rebuild");
+        provider.ledger.borrow_mut().next_token = u64::MAX;
+        provider
+            .install_rebuilt_claims(&first)
+            .expect("near-max exact replay");
+        assert_eq!(provider.next_token(), u64::MAX);
+        assert_eq!(provider.outstanding(&volume, class), 4096);
+        assert!(matches!(
+            provider.install_rebuilt_claims(&conflicting),
+            Err(CapacityProviderError::RebuildLedgerConflict)
+        ));
+        assert_eq!(provider.outstanding(&volume, class), 4096);
+        assert_eq!(provider.claim_count(), 1);
+    }
+
+    #[test]
+    fn restart_rebuild_rejects_unready_snapshot_without_installing_claims() {
+        let snapshot = OrdinaryClaimRebuildSnapshot::for_test(
+            vec![rebuild_claim(
+                OperationId::new(),
+                AdmissionClaimId::new(),
+                VolumeIdentity { device: 104 },
+                FullCapacityAllocationClass::DestinationStaging,
+                4096,
+                None,
+                true,
+            )],
+            CapacityRebuildReadiness::reconciliation_required(vec![String::from(
+                "malformed durable row",
+            )]),
+        );
+        let provider = CapacityProvider::unavailable();
+        assert_eq!(
+            provider.install_rebuilt_claims(&snapshot),
+            Err(CapacityProviderError::RebuildNotReady)
+        );
+        assert_eq!(provider.claim_count(), 0);
+    }
+
+    #[test]
+    fn restart_rebuild_rejects_checked_aggregate_overflow_before_install() {
+        let operation_id = OperationId::new();
+        let volume = VolumeIdentity { device: 105 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let snapshot = rebuild_snapshot(vec![
+            rebuild_claim(
+                operation_id,
+                AdmissionClaimId::new(),
+                volume.clone(),
+                class,
+                u64::MAX,
+                None,
+                false,
+            ),
+            rebuild_claim(
+                operation_id,
+                AdmissionClaimId::new(),
+                volume.clone(),
+                class,
+                1,
+                None,
+                false,
+            ),
+        ]);
+        let provider = CapacityProvider::unavailable();
+        assert_eq!(
+            provider.install_rebuilt_claims(&snapshot),
+            Err(CapacityProviderError::ArithmeticOverflow)
+        );
+        assert_eq!(provider.claim_count(), 0);
+        assert_eq!(provider.outstanding(&volume, class), 0);
     }
 
     #[test]

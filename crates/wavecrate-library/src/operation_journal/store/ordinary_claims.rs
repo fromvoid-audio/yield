@@ -207,6 +207,22 @@ impl OrdinaryClaimPage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinaryClaimReleasePage {
+    records: Vec<OrdinaryClaimReleaseRecord>,
+    next_cursor: Option<OrdinaryClaimCursor>,
+}
+
+impl OrdinaryClaimReleasePage {
+    pub(crate) fn records(&self) -> &[OrdinaryClaimReleaseRecord] {
+        &self.records
+    }
+
+    pub(crate) fn next_cursor(&self) -> Option<OrdinaryClaimCursor> {
+        self.next_cursor
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum OrdinaryClaimReadError {
     #[error("ordinary-claim SQLite error: {0}")]
@@ -480,6 +496,79 @@ pub(crate) fn read_page(
         })
         .flatten();
     Ok(OrdinaryClaimPage {
+        records,
+        next_cursor,
+    })
+}
+
+pub(crate) fn read_release_page(
+    connection: &Connection,
+    cursor: Option<OrdinaryClaimCursor>,
+    limit: usize,
+) -> Result<OrdinaryClaimReleasePage, OrdinaryClaimReadError> {
+    if limit > MAX_PAGE_ROWS {
+        return Err(OrdinaryClaimReadError::PageLimitExceeded {
+            requested: limit,
+            maximum: MAX_PAGE_ROWS,
+        });
+    }
+    let Some(fetch_limit) = limit.checked_add(1) else {
+        return Err(OrdinaryClaimReadError::PageLimitExceeded {
+            requested: limit,
+            maximum: MAX_PAGE_ROWS,
+        });
+    };
+    if limit == 0 {
+        if let Some(cursor) = cursor {
+            validate_cursor(cursor)?;
+        }
+        return Ok(OrdinaryClaimReleasePage {
+            records: Vec::new(),
+            next_cursor: None,
+        });
+    }
+
+    let fetch_limit = i64::try_from(fetch_limit).expect("bounded ordinary-claim page limit");
+    let mut statement = if cursor.is_some() {
+        connection.prepare(&format!(
+            "SELECT claim_id, operation_id, release_id
+             FROM {RELEASE_TABLE_NAME}
+             WHERE claim_id > ?1
+             ORDER BY claim_id ASC
+             LIMIT ?2"
+        ))?
+    } else {
+        connection.prepare(&format!(
+            "SELECT claim_id, operation_id, release_id
+             FROM {RELEASE_TABLE_NAME}
+             ORDER BY claim_id ASC
+             LIMIT ?1"
+        ))?
+    };
+    let mut rows = match cursor {
+        Some(cursor) => {
+            validate_cursor(cursor)?;
+            statement.query(params![cursor.as_text(), fetch_limit])?
+        }
+        None => statement.query(params![fetch_limit])?,
+    };
+    let mut records = Vec::with_capacity(limit.min(MAX_PAGE_ROWS));
+    let mut has_more = false;
+    while let Some(row) = rows.next()? {
+        if records.len() == limit {
+            has_more = true;
+            break;
+        }
+        records.push(decode_release_row(row)?);
+    }
+    let next_cursor = has_more
+        .then(|| {
+            records
+                .last()
+                .map(|record| OrdinaryClaimCursor::from_claim_id(record.claim_id()))
+        })
+        .flatten();
+    Ok(OrdinaryClaimReleasePage {
         records,
         next_cursor,
     })
