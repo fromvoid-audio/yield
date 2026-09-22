@@ -390,7 +390,7 @@ fn source_snapshot_fence_validation_bounds_control_mutex_wait() {
         drop(control);
     });
     ready_rx.recv().expect("control mutex is held");
-    let cancellation = AtomicBool::new(false);
+    let cancellation = Arc::new(AtomicBool::new(false));
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
     assert!(matches!(
         fence.validate_with_deadline(deadline, &cancellation),

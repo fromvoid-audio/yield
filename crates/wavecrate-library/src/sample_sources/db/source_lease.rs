@@ -395,13 +395,13 @@ impl SourcePublicationFence {
 
     /// Validate this fence without waiting indefinitely for the lease control mutex.
     ///
-    /// This is used by bounded owner reads. SQLite work and filesystem validation still
-    /// require a post-check against the deadline; this method does not make those host
-    /// operations preemptible.
+    /// This is used by bounded owner reads. Control-connection SQL observes the deadline and
+    /// cancellation; synchronous filesystem validation still requires a post-check and cannot
+    /// be preempted by SQLite's progress handler.
     pub(crate) fn validate_with_deadline(
         &self,
         deadline: Instant,
-        cancellation: &AtomicBool,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<(), SourcePublicationFenceError> {
         let source_lease = self
             .source_lease
@@ -434,6 +434,46 @@ fn check_publication_deadline(
         return Err(SourcePublicationFenceError::BudgetExceeded);
     }
     Ok(())
+}
+
+/// Restore the private control connection's ordinary busy policy after one bounded read.
+struct ControlValidationBudgetGuard<'connection>(&'connection Connection);
+
+impl ControlValidationBudgetGuard<'_> {
+    fn install<'connection>(
+        connection: &'connection Connection,
+        deadline: Instant,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<ControlValidationBudgetGuard<'connection>, SourcePublicationFenceError> {
+        const ORDINARY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+        check_publication_deadline(deadline, cancellation)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_millis(1) {
+            return Err(SourcePublicationFenceError::BudgetExceeded);
+        }
+        let busy_timeout = remaining.min(ORDINARY_BUSY_TIMEOUT);
+        connection
+            .busy_timeout(busy_timeout)
+            .map_err(|error| SourcePublicationFenceError::Lease(map_sql_error(error)))?;
+        let cancellation = Arc::clone(cancellation);
+        connection.progress_handler(
+            1_000,
+            Some(move || cancellation.load(Ordering::Acquire) || Instant::now() >= deadline),
+        );
+        Ok(ControlValidationBudgetGuard(connection))
+    }
+}
+
+impl Drop for ControlValidationBudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+        if let Err(error) = self.0.busy_timeout(Duration::from_millis(250)) {
+            tracing::warn!(
+                ?error,
+                "Failed to restore source lease control busy timeout"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1041,7 +1081,7 @@ impl SourceLease {
         expected_owner_identity: &str,
         expected_epoch: i64,
         deadline: Instant,
-        cancellation: &AtomicBool,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<(), SourcePublicationFenceError> {
         self.validate_publication_fence_claim(expected_owner_identity, expected_epoch)?;
         #[cfg(test)]
@@ -1064,12 +1104,14 @@ impl SourceLease {
             }
         };
         check_publication_deadline(deadline, cancellation)?;
-        self.validate_publication_fence_under_control(
+        let _sql_budget = ControlValidationBudgetGuard::install(&control, deadline, cancellation)?;
+        let result = self.validate_publication_fence_under_control(
             &control,
             expected_owner_identity,
             expected_epoch,
-        )?;
-        check_publication_deadline(deadline, cancellation)
+        );
+        check_publication_deadline(deadline, cancellation)?;
+        result
     }
 
     fn validate_publication_fence_claim(
@@ -2214,6 +2256,49 @@ const LEASE_TABLE_SQL: &str = "CREATE TABLE source_lease (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_validation_budget_interrupts_sql_and_restores_connection_policy() {
+        let connection = Connection::open_in_memory().expect("in-memory SQLite");
+        connection
+            .busy_timeout(Duration::from_millis(250))
+            .expect("ordinary control busy policy");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let guard = ControlValidationBudgetGuard::install(
+            &connection,
+            Instant::now() + Duration::from_millis(20),
+            &cancellation,
+        )
+        .expect("install control budget");
+        std::thread::sleep(Duration::from_millis(20));
+        let error = connection
+            .query_row(
+                "WITH RECURSIVE integers(n) AS (
+                   SELECT 1 UNION ALL SELECT n + 1 FROM integers WHERE n < 1000000
+                 ) SELECT sum(n) FROM integers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("elapsed control budget interrupts SQL");
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(sql_error, _)
+                if sql_error.code == rusqlite::ErrorCode::OperationInterrupted
+        ));
+        drop(guard);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .expect("restored busy timeout"),
+            250
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .expect("progress handler was removed"),
+            1
+        );
+    }
 
     #[test]
     fn lease_row_validation_rejects_nonpositive_epoch_and_bad_state() {
