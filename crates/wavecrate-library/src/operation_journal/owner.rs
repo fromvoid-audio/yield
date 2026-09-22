@@ -24,11 +24,13 @@ use crate::app_dirs::WritableProfileGuard;
 use crate::durable_capacity::{
     PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity, descriptor_capacity_facts,
 };
-use crate::file_operation_owner::{EffectId, OutputIdentity, RootRegistrationRef, SourceFence};
+use crate::file_operation_owner::{
+    EffectId, EffectRequest, FileOperationCommand, OutputIdentity, RootRegistrationRef, SourceFence,
+};
 use crate::sample_sources::db::{
     SourceAuthorityDrainMarker, SourceAuthorityError, SourceAuthorityRegistrationReceipt,
     SourceAuthorityRegistrationRequest, SourceAuthorityRequest, SourceAuthorityRetirementAck,
-    SourceEffectPin,
+    SourceEffectPermit, SourceEffectPin,
 };
 
 use super::admission_claims::{AdmissionClaimId, AdmissionClaimInventory};
@@ -882,6 +884,93 @@ impl std::fmt::Debug for LiveChunkEffectGrant {
             .field("issue_id", &self.permit.issue_id)
             .field("effect_id", &self.spec.effect_id)
             .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)] // Private file-owner adapter is not wired to an ordinary operation family.
+impl LiveChunkEffectGrant {
+    pub(crate) fn chunk_id(&self) -> Uuid {
+        self.permit.chunk_id().as_uuid()
+    }
+
+    pub(crate) fn issue_id(&self) -> Uuid {
+        self.permit.issue_id()
+    }
+
+    pub(crate) fn output(&self) -> OutputIdentity {
+        self.spec.output
+    }
+
+    pub(crate) fn offset(&self) -> u64 {
+        self.spec.offset
+    }
+
+    pub(crate) fn logical_bytes(&self) -> u64 {
+        self.spec.logical_bytes
+    }
+
+    pub(crate) fn operation_id(&self) -> OperationId {
+        self.permit.operation_id()
+    }
+
+    pub(crate) fn participant_id(&self) -> super::participants::ParticipantId {
+        self.permit.identity().participant_id()
+    }
+
+    pub(crate) fn effect_id(&self) -> EffectId {
+        self.spec.effect_id
+    }
+
+    pub(crate) fn target(&self) -> RootRegistrationRef {
+        self.spec.target
+    }
+
+    pub(crate) fn source_fences(&self) -> &[SourceFence] {
+        &self.spec.source_fences
+    }
+
+    pub(crate) fn matches_command(&self, command: &FileOperationCommand) -> bool {
+        if command.operation_id() != self.permit.operation_id()
+            || command.participant_id() != self.permit.identity().participant_id()
+            || command.effect_id() != self.spec.effect_id
+            || command.target_registration() != self.spec.target
+            || command.source_fences() != self.spec.source_fences
+        {
+            return false;
+        }
+        let EffectRequest::WriteStagingChunk {
+            chunk_id,
+            issue_id,
+            output,
+            offset,
+            length,
+            payload,
+            ..
+        } = command.effect()
+        else {
+            return false;
+        };
+        chunk_id.as_uuid() == self.permit.chunk_id().as_uuid()
+            && issue_id.as_uuid() == self.permit.issue_id()
+            && *output == self.spec.output
+            && offset.get() == self.spec.offset
+            && length.get() == self.spec.logical_bytes
+            && payload.as_slice().len() as u64 == self.spec.payload_bytes
+            && *blake3::hash(payload.as_slice()).as_bytes() == self.spec.payload_hash
+    }
+
+    pub(crate) fn begin_source_effect(&self) -> Result<SourceEffectPermit, SourceAuthorityError> {
+        self.source_pin.begin_effect()
+    }
+
+    pub(crate) fn queued_backing_bytes(&self) -> Option<usize> {
+        self.spec
+            .queued_bytes()?
+            .checked_add(self.output_key.capacity())
+    }
+
+    pub(crate) fn into_unused_permit(self) -> ChunkWritePermit {
+        self.permit
     }
 }
 
@@ -4900,6 +4989,7 @@ mod tests {
         CapacityAllocationClass, DurableCapacityPlan, PROTECTED_FREE_SPACE_FLOOR, VolumeIdentity,
         descriptor_capacity_facts,
     };
+    use crate::file_operation_owner::{EffectOutcome, FileOperationOwner};
     use crate::operation_journal::capacity_provider::{CapacityProvider, CapacityRebuildReadiness};
     use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;
     use crate::operation_journal::store::{OrdinaryClaimRebuildSnapshot, RebuildClaim};
@@ -7479,7 +7569,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn live_chunk_grant_requires_registered_source_and_cannot_reissue_after_drop() {
+    fn live_chunk_grant_crosses_to_file_owner_once_after_dropped_reply() {
         let fixture = fixture("journal-owner-live-chunk-grant");
         let registry_path = fixture_volume_registry(&fixture);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
@@ -7621,7 +7711,10 @@ mod tests {
                 .state(),
             ChunkClaimState::Claimed
         );
-        let target = RootRegistrationRef::synthetic_for_test();
+        let file_owner = FileOperationOwner::start().expect("file owner");
+        let target = file_owner
+            .register_live_chunk_root_for_test()
+            .expect("registered staging root");
         let effect_id = EffectId::new();
         let output = OutputIdentity::new();
         let wrong_fence = SourceFence::new(
@@ -7649,6 +7742,40 @@ mod tests {
             denied
                 .recv_timeout(Duration::from_secs(2))
                 .expect("wrong issue result")
+                .is_err()
+        );
+        let stale_generation = SourceFence::new(
+            fence.source_id().clone(),
+            fence.root_identity(),
+            fence.database_identity(),
+            fence.lifecycle_generation(),
+            fence.source_revision(),
+            lease_epoch + 1,
+        )
+        .expect("stale generation observation");
+        let stale_generation_spec = LiveChunkEffectSpec::new(
+            effect_id,
+            output,
+            target,
+            vec![stale_generation],
+            0,
+            3,
+            b"abc",
+        )
+        .expect("stale generation effect");
+        let mut stale_generation_issue = client
+            .issue_live_chunk_effect(
+                claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("stale generation pin"),
+                stale_generation_spec,
+            )
+            .expect("stale generation issue queues");
+        assert!(
+            stale_generation_issue
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale generation issue result")
                 .is_err()
         );
         let foreign_participant_fence = SourceFence::new(
@@ -7715,16 +7842,60 @@ mod tests {
         assert_eq!(grant.spec.target, target);
         assert_eq!(grant.spec.payload_bytes, 3);
         assert_eq!(grant.spec.payload_hash, *blake3::hash(b"abc").as_bytes());
-        drop(grant);
+        let changed_payload = file_owner.live_chunk_effect_for_test(&grant, b"abd".to_vec());
+        assert!(FileOperationCommand::for_live_chunk(&grant, changed_payload).is_err());
+        let effect = file_owner.live_chunk_effect_for_test(&grant, b"abc".to_vec());
+        let command =
+            FileOperationCommand::for_live_chunk(&grant, effect).expect("grant-bound file command");
+        let retry_command = command
+            .retry_for_live_chunk()
+            .expect("authority-free retry view");
+        let stopped_owner = FileOperationOwner::start().expect("stopped owner fixture");
+        let _ = stopped_owner.shutdown();
+        let (_rejection, grant) = match stopped_owner.submit_live_chunk(command, grant) {
+            Err(rejected) => rejected,
+            Ok(_) => panic!("stopped owner accepted a grant"),
+        };
+        let dropped_reply = file_owner
+            .submit_live_chunk(
+                retry_command
+                    .retry_for_live_chunk()
+                    .expect("same bounded command"),
+                grant,
+            )
+            .expect("file-owner submission");
+        drop(dropped_reply);
+        let mut retry = file_owner
+            .retry_live_chunk(retry_command)
+            .expect("exact retry admission");
+        let result = retry
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retained effect result");
+        assert!(matches!(
+            result.outcome(),
+            EffectOutcome::Unsupported { .. }
+        ));
+        assert_eq!(file_owner.execution_count_for_test(), 1);
+        let unused_grant = retry
+            .take_unused_live_chunk_grant()
+            .expect("recover confirmed unused grant")
+            .expect("one sealed grant retained");
+        assert!(
+            retry
+                .take_unused_live_chunk_grant()
+                .expect("second recovery request")
+                .is_none()
+        );
+        retry.acknowledge().expect("acknowledge retained result");
 
         let replay_spec =
-            LiveChunkEffectSpec::new(effect_id, output, target, vec![fence], 0, 3, b"abc")
+            LiveChunkEffectSpec::new(effect_id, output, target, vec![fence.clone()], 0, 3, b"abc")
                 .expect("replay observations");
         let mut replay = client
             .issue_live_chunk_effect(
                 claim.chunk_id(),
                 operation_id,
-                registration,
+                registration.clone(),
                 guard.pin_for_effect().expect("second source pin"),
                 replay_spec,
             )
@@ -7739,8 +7910,256 @@ mod tests {
             )
             .contains("already Issued")
         );
-        assert_eq!(owner.synthetic_chunk_write_invocations(), 0);
+        let mut release = client
+            .release_chunk(unused_grant.into_unused_permit(), Uuid::new_v4())
+            .expect("confirmed no-effect release queues");
+        release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("release result")
+            .expect("journal release worker");
+
+        let stale_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                claim.claim().volume().clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("stale claim"),
+            participant_id,
+            String::from("stale-root-output"),
+            facts.allocation_unit,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("stale root chunk request");
+        let mut stale_claim_result = client
+            .claim_chunk(stale_claim.clone())
+            .expect("stale root claim queues");
+        stale_claim_result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale root claim result")
+            .expect("stale root claim worker");
+        let stale_spec = LiveChunkEffectSpec::new(
+            EffectId::new(),
+            OutputIdentity::new(),
+            target,
+            vec![fence.clone()],
+            facts.allocation_unit,
+            3,
+            b"xyz",
+        )
+        .expect("stale root effect");
+        let mut stale_issue = client
+            .issue_live_chunk_effect(
+                stale_claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("stale root source pin"),
+                stale_spec,
+            )
+            .expect("stale root issue queues");
+        let stale_grant = stale_issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale root issue result")
+            .expect("stale root issue worker");
+        let stale_effect = file_owner.live_chunk_effect_for_test(&stale_grant, b"xyz".to_vec());
+        let stale_command = FileOperationCommand::for_live_chunk(&stale_grant, stale_effect)
+            .expect("stale root command");
+        file_owner
+            .retire_root_for_test(target)
+            .expect("retire root before effect");
+        let mut stale_request = file_owner
+            .submit_live_chunk(stale_command, stale_grant)
+            .expect("stale root file request queues");
+        let stale_result = stale_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale root result");
+        assert!(matches!(
+            stale_result.outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        assert_eq!(file_owner.execution_count_for_test(), 1);
+        let stale_unused = stale_request
+            .take_unused_live_chunk_grant()
+            .expect("stale grant recovery")
+            .expect("stale grant retained");
+        stale_request.acknowledge().expect("stale result ack");
+        let mut stale_release = client
+            .release_chunk(stale_unused.into_unused_permit(), Uuid::new_v4())
+            .expect("stale release queues");
+        stale_release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stale release result")
+            .expect("stale release worker");
+        let live_target = file_owner
+            .register_live_chunk_root_for_test()
+            .expect("fresh staging root");
+        let source_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                claim.claim().volume().clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("source claim"),
+            participant_id,
+            String::from("retired-source-output"),
+            facts.allocation_unit * 2,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("source chunk request");
+        let mut source_claim_result = client
+            .claim_chunk(source_claim.clone())
+            .expect("source claim queues");
+        source_claim_result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source claim result")
+            .expect("source claim worker");
+        let source_spec = LiveChunkEffectSpec::new(
+            EffectId::new(),
+            OutputIdentity::new(),
+            live_target,
+            vec![fence.clone()],
+            facts.allocation_unit * 2,
+            3,
+            b"end",
+        )
+        .expect("source retirement effect");
+        let mut source_issue = client
+            .issue_live_chunk_effect(
+                source_claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("source retirement pin"),
+                source_spec,
+            )
+            .expect("source retirement issue queues");
+        let source_grant = source_issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source retirement issue result")
+            .expect("source retirement issue worker");
+        let source_effect = file_owner.live_chunk_effect_for_test(&source_grant, b"end".to_vec());
+        let source_command = FileOperationCommand::for_live_chunk(&source_grant, source_effect)
+            .expect("source retirement command");
+        let uncertain_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                claim.claim().volume().clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("uncertain claim"),
+            participant_id,
+            String::from("uncertain-output"),
+            facts.allocation_unit * 3,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("uncertain chunk request");
+        let mut uncertain_claim_result = client
+            .claim_chunk(uncertain_claim.clone())
+            .expect("uncertain claim queues");
+        uncertain_claim_result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("uncertain claim result")
+            .expect("uncertain claim worker");
+        let uncertain_spec = LiveChunkEffectSpec::new(
+            EffectId::new(),
+            OutputIdentity::new(),
+            live_target,
+            vec![fence],
+            facts.allocation_unit * 3,
+            3,
+            b"odd",
+        )
+        .expect("uncertain effect");
+        let mut uncertain_issue = client
+            .issue_live_chunk_effect(
+                uncertain_claim.chunk_id(),
+                operation_id,
+                registration,
+                guard.pin_for_effect().expect("uncertain source pin"),
+                uncertain_spec,
+            )
+            .expect("uncertain issue queues");
+        let uncertain_grant = uncertain_issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("uncertain issue result")
+            .expect("uncertain issue worker");
+        let uncertain_effect =
+            file_owner.live_chunk_effect_for_test(&uncertain_grant, b"odd".to_vec());
+        let uncertain_command =
+            FileOperationCommand::for_live_chunk(&uncertain_grant, uncertain_effect)
+                .expect("uncertain command");
+        file_owner.force_next_live_chunk_uncertain_for_test();
+        let mut uncertain_request = file_owner
+            .submit_live_chunk(uncertain_command, uncertain_grant)
+            .expect("uncertain file request queues");
+        assert!(matches!(
+            uncertain_request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("uncertain result")
+                .outcome(),
+            EffectOutcome::RetainedUncertain { .. }
+        ));
+        assert!(
+            uncertain_request
+                .take_unused_live_chunk_grant()
+                .expect("uncertain recovery query")
+                .is_none()
+        );
+        uncertain_request
+            .acknowledge()
+            .expect("uncertain result ack");
+        let mut uncertain_reissue = client
+            .issue_chunk(uncertain_claim.chunk_id(), operation_id)
+            .expect("uncertain reissue queues");
+        assert!(
+            uncertain_reissue
+                .recv_timeout(Duration::from_secs(2))
+                .expect("uncertain reissue result")
+                .is_err()
+        );
         drop(guard);
+        let mut source_result = file_owner
+            .submit_live_chunk(source_command, source_grant)
+            .expect("source retirement file request queues");
+        assert!(matches!(
+            source_result
+                .recv_timeout(Duration::from_secs(2))
+                .expect("source retirement result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        assert_eq!(file_owner.execution_count_for_test(), 1);
+        let unused_source = source_result
+            .take_unused_live_chunk_grant()
+            .expect("source grant recovery")
+            .expect("source grant retained");
+        source_result.acknowledge().expect("source result ack");
+        let mut source_release = client
+            .release_chunk(unused_source.into_unused_permit(), Uuid::new_v4())
+            .expect("source release queues");
+        source_release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source release result")
+            .expect("source release worker");
+        assert_eq!(owner.synthetic_chunk_write_invocations(), 0);
+        assert!(matches!(
+            file_owner.shutdown(),
+            crate::file_operation_owner::FileOperationOwnerShutdown::RetirementDeferred { .. }
+        ));
         drop(database);
         let _ = owner.shutdown();
     }

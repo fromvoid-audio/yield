@@ -315,6 +315,10 @@ pub(crate) struct ChunkWriteIdentity {
 
 #[allow(dead_code)]
 impl ChunkWriteIdentity {
+    pub(crate) fn participant_id(&self) -> ParticipantId {
+        self.participant_id
+    }
+
     pub(crate) fn new(
         participant_id: ParticipantId,
         output_key: String,
