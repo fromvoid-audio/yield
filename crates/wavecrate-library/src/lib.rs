@@ -10,6 +10,8 @@ pub mod diagnostics;
 /// Pre-intent durable capacity discovery and accounting.
 pub mod durable_capacity;
 mod env_flags;
+/// Bounded owner-thread command and receipt boundary for future file effects.
+pub mod file_operation_owner;
 /// Stable cross-platform filesystem-object identity helpers.
 pub mod filesystem_identity;
 /// Storage-neutral profile operation identities, intents, phases, and dispositions.
