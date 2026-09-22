@@ -11,7 +11,9 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, types::ValueRef};
 
 use super::*;
 use crate::sample_sources::db::util::parse_relative_path_from_db;
-use crate::sample_sources::db::{SourceManifestEntry, SourcePublicationFence};
+use crate::sample_sources::db::{
+    SourceManifestEntry, SourcePublicationFence, SourcePublicationFenceError,
+};
 
 // One page is strictly below the 100,000-row aggregate request budget.
 const MAX_PAGE_ROWS: usize = 64;
@@ -89,27 +91,33 @@ impl SourceWriter {
             return Err(SourceDbError::Canceled.into());
         }
         let started = Instant::now();
+        let _progress =
+            SnapshotProgressGuard::install(&self.database.connection, cancellation, started);
         let profile_guard = self
             .database
             .profile_guard
             .as_ref()
             .ok_or(SourceDbError::ProfileOwnershipRequired)?;
         self.database
-            .validate_operational_schema_with_profile_guard(profile_guard)?;
-        let current = self.current_revision()?;
+            .validate_operational_schema_with_profile_guard(profile_guard)
+            .map_err(|error| map_snapshot_boundary_error(error, cancellation, started))?;
+        let current = self
+            .current_revision()
+            .map_err(|error| map_snapshot_boundary_error(error, cancellation, started))?;
         ensure_snapshot_revision(expected, &current)?;
         if let Some(cursor) = after {
             ensure_snapshot_revision(&cursor.revision, expected)?;
         }
         check_budget(started, cancellation)?;
-        let publication_fence = self.database.source_publication_fence()?;
+        let publication_fence = self
+            .database
+            .source_publication_fence()
+            .map_err(|error| map_snapshot_boundary_error(error, cancellation, started))?;
         publication_fence
-            .validate()
-            .map_err(|_| SourceWriterError::StaleFence)?;
+            .validate_with_deadline(started + MAX_REQUEST_TIME, cancellation)
+            .map_err(map_snapshot_fence_error)?;
         check_budget(started, cancellation)?;
 
-        let _progress =
-            SnapshotProgressGuard::install(&self.database.connection, cancellation, started);
         let transaction = self
             .database
             .connection
@@ -228,9 +236,11 @@ impl SourceWriter {
             .map_err(|error| map_snapshot_sql(error, cancellation, started))?;
         check_budget(started, cancellation)?;
         publication_fence
-            .validate()
-            .map_err(|_| SourceWriterError::StaleFence)?;
-        let final_revision = self.current_revision()?;
+            .validate_with_deadline(started + MAX_REQUEST_TIME, cancellation)
+            .map_err(map_snapshot_fence_error)?;
+        let final_revision = self
+            .current_revision()
+            .map_err(|error| map_snapshot_boundary_error(error, cancellation, started))?;
         ensure_snapshot_revision(expected, &final_revision)?;
         check_budget(started, cancellation)?;
         if has_more {
@@ -335,6 +345,30 @@ fn map_snapshot_sql(
         }
     }
     map_sql_error(error).into()
+}
+
+fn map_snapshot_fence_error(error: SourcePublicationFenceError) -> SourceWriterError {
+    match error {
+        SourcePublicationFenceError::BudgetExceeded => {
+            SourceWriterError::SnapshotBudgetExceeded("lease validation time")
+        }
+        SourcePublicationFenceError::Canceled => SourceDbError::Canceled.into(),
+        _ => SourceWriterError::StaleFence,
+    }
+}
+
+fn map_snapshot_boundary_error(
+    error: impl Into<SourceWriterError>,
+    cancellation: &Arc<AtomicBool>,
+    started: Instant,
+) -> SourceWriterError {
+    if cancellation.load(Ordering::Acquire) {
+        return SourceDbError::Canceled.into();
+    }
+    if started.elapsed() >= MAX_REQUEST_TIME {
+        return SourceWriterError::SnapshotBudgetExceeded("elapsed time");
+    }
+    error.into()
 }
 
 #[cfg(test)]

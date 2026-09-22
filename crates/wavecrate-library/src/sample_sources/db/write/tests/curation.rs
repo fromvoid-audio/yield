@@ -358,6 +358,64 @@ fn source_writer_manifest_snapshot_caps_page_at_64_and_continues_exactly() {
     writer.close().expect("close source writer");
 }
 
+#[test]
+fn source_snapshot_fence_validation_bounds_control_mutex_wait() {
+    let fixture = CurationFixture::new_profile_bound();
+    let writer = SourceWriter::new(
+        fixture.database,
+        SourceId::from_string("source-manifest-snapshot-control-time"),
+        1,
+    )
+    .expect("source writer");
+    let fence = writer
+        .database_for_tests()
+        .source_publication_fence()
+        .expect("live publication fence");
+    let expected = writer.current_revision().expect("live source revision");
+    let lease = Arc::clone(
+        writer
+            .database_for_tests()
+            .source_lease
+            .as_ref()
+            .expect("retained source lease"),
+    );
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let control = lease
+            .lock_control_connection_for_tests()
+            .expect("control mutex");
+        ready_tx.send(()).expect("announce held mutex");
+        release_rx.recv().expect("wait for release");
+        drop(control);
+    });
+    ready_rx.recv().expect("control mutex is held");
+    let cancellation = AtomicBool::new(false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    assert!(matches!(
+        fence.validate_with_deadline(deadline, &cancellation),
+        Err(crate::sample_sources::SourcePublicationFenceError::BudgetExceeded)
+    ));
+    assert!(matches!(
+        writer.read_manifest_snapshot_page(&expected, None, 1, &Arc::new(AtomicBool::new(false))),
+        Err(SourceWriterError::SnapshotBudgetExceeded(
+            "lease validation time"
+        ))
+    ));
+    cancellation.store(true, Ordering::Release);
+    assert!(matches!(
+        fence.validate_with_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            &cancellation,
+        ),
+        Err(crate::sample_sources::SourcePublicationFenceError::Canceled)
+    ));
+    release_tx.send(()).expect("release control mutex");
+    holder.join().expect("control holder");
+    fence.validate().expect("ordinary validation still works");
+    writer.close().expect("close source writer");
+}
+
 fn continuity_state(database: &SourceDatabase) -> (u64, SourceDirectoryTruthState) {
     (
         database

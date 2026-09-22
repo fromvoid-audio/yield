@@ -6,9 +6,11 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use thiserror::Error;
@@ -229,6 +231,12 @@ pub enum SourcePublicationFenceError {
     /// The fence belongs to a different retained source lease than the receiving operation.
     #[error("source publication fence does not belong to the retained source lease")]
     LeaseMismatch,
+    /// A bounded publication check ran out of its caller's time budget.
+    #[error("source publication fence validation exceeded its time budget")]
+    BudgetExceeded,
+    /// A bounded publication check was canceled before it could validate the owner.
+    #[error("source publication fence validation was canceled")]
+    Canceled,
     /// The retained source ownership proof failed while validating the fence.
     #[error(transparent)]
     Lease(#[from] SourceLeaseError),
@@ -382,6 +390,48 @@ impl SourcePublicationFence {
         }
         result
     }
+
+    /// Validate this fence without waiting indefinitely for the lease control mutex.
+    ///
+    /// This is used by bounded owner reads. SQLite work and filesystem validation still
+    /// require a post-check against the deadline; this method does not make those host
+    /// operations preemptible.
+    pub(crate) fn validate_with_deadline(
+        &self,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<(), SourcePublicationFenceError> {
+        let source_lease = self
+            .source_lease
+            .upgrade()
+            .ok_or(SourcePublicationFenceError::LeaseDropped)?;
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped);
+        }
+        let result = source_lease.validate_publication_fence_with_deadline(
+            &self.owner_identity,
+            self.lease_epoch,
+            deadline,
+            cancellation,
+        );
+        if !self.is_live() {
+            return Err(SourcePublicationFenceError::LeaseDropped);
+        }
+        result
+    }
+}
+
+fn check_publication_deadline(
+    deadline: Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), SourcePublicationFenceError> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(SourcePublicationFenceError::Canceled);
+    }
+    if Instant::now() >= deadline {
+        return Err(SourcePublicationFenceError::BudgetExceeded);
+    }
+    Ok(())
 }
 
 impl SourceLeaseReservation {
@@ -645,6 +695,16 @@ impl SourceLease {
             .lock()
             .map_err(|_| SourceLeaseError::ControlUnavailable)?;
         Ok(control.total_changes())
+    }
+
+    /// Hold the control mutex to prove bounded publication validation under contention.
+    #[cfg(test)]
+    pub(crate) fn lock_control_connection_for_tests(
+        &self,
+    ) -> Result<MutexGuard<'_, Connection>, SourceLeaseError> {
+        self.control_connection
+            .lock()
+            .map_err(|_| SourceLeaseError::ControlUnavailable)
     }
 
     /// Return the retained media-root capability used when this lease was acquired.
@@ -946,20 +1006,72 @@ impl SourceLease {
         expected_owner_identity: &str,
         expected_epoch: i64,
     ) -> Result<(), SourcePublicationFenceError> {
+        self.validate_publication_fence_claim(expected_owner_identity, expected_epoch)?;
+        let control = self.control_connection.lock().map_err(|_| {
+            SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
+        })?;
+        self.validate_publication_fence_under_control(
+            &control,
+            expected_owner_identity,
+            expected_epoch,
+        )
+    }
+
+    fn validate_publication_fence_with_deadline(
+        &self,
+        expected_owner_identity: &str,
+        expected_epoch: i64,
+        deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> Result<(), SourcePublicationFenceError> {
+        self.validate_publication_fence_claim(expected_owner_identity, expected_epoch)?;
+        let control = loop {
+            check_publication_deadline(deadline, cancellation)?;
+            match self.control_connection.try_lock() {
+                Ok(control) => break control,
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(SourcePublicationFenceError::Lease(
+                        SourceLeaseError::ControlUnavailable,
+                    ));
+                }
+            }
+        };
+        check_publication_deadline(deadline, cancellation)?;
+        self.validate_publication_fence_under_control(
+            &control,
+            expected_owner_identity,
+            expected_epoch,
+        )?;
+        check_publication_deadline(deadline, cancellation)
+    }
+
+    fn validate_publication_fence_claim(
+        &self,
+        expected_owner_identity: &str,
+        expected_epoch: i64,
+    ) -> Result<(), SourcePublicationFenceError> {
         if self.owner_identity != expected_owner_identity {
             return Err(SourcePublicationFenceError::OwnerChanged);
         }
         if self.lease_epoch != expected_epoch {
             return Err(SourcePublicationFenceError::EpochChanged);
         }
+        Ok(())
+    }
 
-        let control = self.control_connection.lock().map_err(|_| {
-            SourcePublicationFenceError::Lease(SourceLeaseError::ControlUnavailable)
-        })?;
-        self.validate_control_connection(&control)
+    fn validate_publication_fence_under_control(
+        &self,
+        control: &Connection,
+        expected_owner_identity: &str,
+        expected_epoch: i64,
+    ) -> Result<(), SourcePublicationFenceError> {
+        self.validate_control_connection(control)
             .map_err(SourcePublicationFenceError::Lease)?;
         let row = self
-            .read_current_row(&control)
+            .read_current_row(control)
             .map_err(SourcePublicationFenceError::Lease)?;
         if row.owner_identity != expected_owner_identity {
             return Err(SourcePublicationFenceError::OwnerChanged);
@@ -977,7 +1089,7 @@ impl SourceLease {
                 },
             ));
         }
-        self.validate_control_connection(&control)
+        self.validate_control_connection(control)
             .map_err(SourcePublicationFenceError::Lease)?;
         Ok(())
     }
