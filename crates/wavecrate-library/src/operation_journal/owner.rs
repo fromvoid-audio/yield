@@ -67,6 +67,8 @@ const CONTROL_INPUT_BYTES: usize = 1;
 enum PreparedAdmissionFactsFault {
     LowReserve,
     DiskPressure,
+    DiskPressureBoundary,
+    ExactBoundary,
     Unsupported,
     Replaced,
 }
@@ -1108,7 +1110,10 @@ fn prepared_admission_fault_facts(
         PreparedAdmissionFactsFault::Replaced => Err(String::from(
             "retained reserve facts refer to a replaced descriptor",
         )),
-        PreparedAdmissionFactsFault::LowReserve | PreparedAdmissionFactsFault::DiskPressure => {
+        PreparedAdmissionFactsFault::LowReserve
+        | PreparedAdmissionFactsFault::DiskPressure
+        | PreparedAdmissionFactsFault::DiskPressureBoundary
+        | PreparedAdmissionFactsFault::ExactBoundary => {
             let mut facts = reserve
                 .view(profile_guard)
                 .fresh_capacity_facts()
@@ -1118,6 +1123,12 @@ fn prepared_admission_fault_facts(
                 PreparedAdmissionFactsFault::DiskPressure => {
                     PROTECTED_FREE_SPACE_FLOOR.saturating_add(1)
                 }
+                PreparedAdmissionFactsFault::DiskPressureBoundary => PROTECTED_FREE_SPACE_FLOOR
+                    .checked_add(facts.allocation_unit.saturating_sub(1))
+                    .ok_or_else(|| String::from("prepared admission boundary overflows"))?,
+                PreparedAdmissionFactsFault::ExactBoundary => PROTECTED_FREE_SPACE_FLOOR
+                    .checked_add(facts.allocation_unit)
+                    .ok_or_else(|| String::from("prepared admission boundary overflows"))?,
                 PreparedAdmissionFactsFault::Unsupported
                 | PreparedAdmissionFactsFault::Replaced => {
                     unreachable!()
@@ -2763,6 +2774,19 @@ impl OwnerRuntime {
     }
 
     #[cfg(test)]
+    fn capacity_ledger_snapshot_for_test(&self) -> CapacityLedgerTestSnapshot {
+        let provider = self
+            .capacity_provider
+            .as_ref()
+            .expect("capacity provider must be installed for the diagnostic snapshot");
+        CapacityLedgerTestSnapshot {
+            claims: provider.ledger_claims(),
+            dispositions: provider.ledger_dispositions(),
+            next_token: provider.next_token(),
+        }
+    }
+
+    #[cfg(test)]
     fn install_drop_observer(
         &mut self,
         observer: OwnerRuntimeDropObserver,
@@ -3489,6 +3513,16 @@ impl OperationJournalClient {
         })
     }
 
+    #[cfg(test)]
+    fn inspect_capacity_for_test(
+        &self,
+    ) -> Result<OperationJournalRequest<CapacityLedgerTestSnapshot>, OperationJournalOwnerQueueError>
+    {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::InspectCapacity { input, result }
+        })
+    }
+
     /// Queue one bounded point lookup.
     pub fn get(
         &self,
@@ -3895,6 +3929,21 @@ impl Drop for ResultPermit {
     }
 }
 
+/// Test-only readback of the owner-thread provider image.  This is deliberately a diagnostic
+/// projection: it carries no provider or admission authority and is not compiled for callers.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CapacityLedgerTestSnapshot {
+    claims: Vec<(
+        AdmissionClaimId,
+        VolumeIdentity,
+        super::full_capacity::FullCapacityAllocationClass,
+        u64,
+    )>,
+    dispositions: Vec<capacity_provider::ProvisionalLeaseDisposition>,
+    next_token: u64,
+}
+
 #[allow(dead_code)]
 enum JournalCommand {
     RegisterSource {
@@ -3994,6 +4043,11 @@ enum JournalCommand {
         budget_bytes: u64,
         input: InputPermit,
         result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
+    #[cfg(test)]
+    InspectCapacity {
+        input: InputPermit,
+        result: SyncSender<Result<CapacityLedgerTestSnapshot, OperationJournalOwnerError>>,
     },
     Get {
         operation_id: OperationId,
@@ -4405,6 +4459,15 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 )
             })
         }
+        #[cfg(test)]
+        JournalCommand::InspectCapacity { input, result } => {
+            drop(input);
+            execute_store_result(result, || {
+                Ok::<CapacityLedgerTestSnapshot, OperationJournalOwnerError>(
+                    runtime.capacity_ledger_snapshot_for_test(),
+                )
+            })
+        }
         JournalCommand::Get {
             operation_id,
             input,
@@ -4540,6 +4603,11 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
         }
         #[cfg(test)]
         JournalCommand::InjectActiveRecoveryCharge { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        #[cfg(test)]
+        JournalCommand::InspectCapacity { input, result } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -8217,6 +8285,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn prepared_admission_owner_queue_faults_are_typed_and_side_effect_free() {
+        const SEED: u64 = 0x1567;
+
         let fixture = fixture("journal-owner-prepared-faults");
         let registry_path = fixture_volume_registry(&fixture);
         let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
@@ -8241,6 +8311,10 @@ mod tests {
                 "prepared admission requires",
             ),
             (
+                PreparedAdmissionFactsFault::DiskPressureBoundary,
+                "prepared admission requires",
+            ),
+            (
                 PreparedAdmissionFactsFault::Unsupported,
                 "descriptor refresh was rejected",
             ),
@@ -8250,6 +8324,16 @@ mod tests {
             ),
         ];
         for (fault, expected) in cases {
+            let before_capacity = {
+                let mut request = owner
+                    .client()
+                    .inspect_capacity_for_test()
+                    .expect("capacity snapshot queues");
+                request
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("capacity snapshot result")
+                    .expect("capacity snapshot worker")
+            };
             let before_id = owner.prepared_admission_id_allocations();
             let input = prepared_copy_input(
                 crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
@@ -8274,14 +8358,129 @@ mod tests {
                 before_id,
                 "descriptor rejection must precede operation identity allocation"
             );
+            let after_capacity = {
+                let mut request = owner
+                    .client()
+                    .inspect_capacity_for_test()
+                    .expect("capacity snapshot queues after rejection");
+                request
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("capacity snapshot after rejection result")
+                    .expect("capacity snapshot after rejection worker")
+            };
+            assert_eq!(
+                after_capacity, before_capacity,
+                "seed {SEED:#x} pre-intent fault {fault:?} must leave the owner ledger and token sequence unchanged"
+            );
         }
+        let mut recovery = owner
+            .client()
+            .scan_recovery_page(None)
+            .expect("recovery scan queues");
+        assert!(
+            recovery
+                .recv_timeout(Duration::from_secs(2))
+                .expect("recovery scan result")
+                .expect("recovery scan worker")
+                .entries()
+                .is_empty()
+        );
         assert!(owner.shutdown());
         let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
         let snapshot = reopened
             .rebuild_ordinary_claim_snapshot()
             .expect("rebuild rejected-admission snapshot");
         assert!(snapshot.claims().is_empty());
+        assert!(
+            reopened
+                .scan_recovery_page(None)
+                .expect("recovery page after reopen")
+                .entries()
+                .is_empty()
+        );
         drop(reopened);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_owner_queue_accepts_exact_free_floor_plus_required_boundary() {
+        let fixture = fixture("journal-owner-prepared-exact-boundary");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+        )
+        .with_facts_fault(PreparedAdmissionFactsFault::ExactBoundary);
+        let expected_claim = input.claims.claims()[0].claim_id();
+        let before_id = owner.prepared_admission_id_allocations();
+        let before_capacity = {
+            let mut request = owner
+                .client()
+                .inspect_capacity_for_test()
+                .expect("capacity snapshot queues");
+            request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capacity snapshot result")
+                .expect("capacity snapshot worker")
+        };
+        let mut request = owner
+            .client()
+            .admit_prepared(input)
+            .expect("exact-boundary admission queues");
+        let operation_id = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("exact-boundary admission result")
+            .expect("exact floor plus required bytes must admit");
+        assert_eq!(
+            owner.prepared_admission_id_allocations(),
+            before_id + 1,
+            "the operation identity is allocated only after the exact boundary passes"
+        );
+        let after_capacity = {
+            let mut request = owner
+                .client()
+                .inspect_capacity_for_test()
+                .expect("capacity snapshot queues after admission");
+            request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capacity snapshot after admission result")
+                .expect("capacity snapshot after admission worker")
+        };
+        assert_eq!(after_capacity.next_token, before_capacity.next_token + 1);
+        assert_eq!(after_capacity.claims.len(), 1);
+        assert_eq!(after_capacity.claims[0].0, expected_claim);
+        assert_eq!(after_capacity.claims[0].1, facts.identity);
+        assert_eq!(
+            after_capacity.claims[0].2,
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging
+        );
+        assert_eq!(after_capacity.claims[0].3, facts.allocation_unit);
+        let mut lookup = owner
+            .client()
+            .get(operation_id)
+            .expect("accepted operation lookup queues");
+        assert!(
+            lookup
+                .recv_timeout(Duration::from_secs(2))
+                .expect("accepted operation lookup result")
+                .expect("accepted operation lookup worker")
+                .is_some()
+        );
+        assert!(owner.shutdown());
         drop(fixture);
     }
 

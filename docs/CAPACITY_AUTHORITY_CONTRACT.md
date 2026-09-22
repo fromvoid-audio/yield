@@ -305,6 +305,7 @@ The capacity work is intentionally split as follows:
 | OPT-1563 | Common owner pre-intent gate and typed rejection with no journal row. |
 | OPT-1564 | Durable post-intent chunk claims, owner-held write tickets, and logical release retry. |
 | OPT-1566 | Authority-free typed requirement/estimator matrix for all command families and nine allocation classes; no admission or family wiring. |
+| OPT-1567 | Deterministic pre-intent low-space, same-volume identity, multi-volume coexistence, and allocation-rounding fault coverage; no production admission expansion. |
 | OPT-1565 | Post-intent retry versus partial classification, deferred until capability-bound staging checkpoints exist. |
 | OPT-1568 | Post-intent chunk, release, and restart fault matrix; remains deferred. |
 
@@ -316,6 +317,19 @@ Only checked single-output byte bounds are currently `Known`; metadata, retained
 multi-output rounding, and descriptor-bound rows remain `Unknown` until their payload proves a
 safe bound. `CapacityRequirementMatrix::require_known_bytes` fails closed for unresolved or
 missing rows, so no future planner may filter unknown classes into implicit zero requirements.
+
+OPT-1567 verifies the common pre-intent boundary without changing production behavior. The
+owner-queue fault matrix uses deterministic seed `0x1567` and checks `free == protected_floor`
+(`RecoveryReserveLow`) plus `free == protected_floor + required - 1`
+(`DiskPressureRecoveryOnly`) before any `OperationId`, journal row, provider token, or claim is
+created. The exact `protected_floor + required` case is a successful control. Every rejected case
+compares the owner provider's claim image, dispositions, and token sequence before and after,
+then reopens the journal to confirm an empty ordinary/recovery image. Provider seed cases
+`0x1567` and `0x1568` reverse the bounded two-volume input order and verify same-volume staging
+plus recovery charges, isolated per-volume totals, and atomic rejection when either volume is
+pressured. The planner covers logical `1`, `unit - 1`, `unit`, and `unit + 1` with per-object
+rounding, and uses open-descriptor identity across a Unix rename/reopen; pathname equality and
+physical two-device qualification remain outside this verification leaf.
 
 The implemented OPT-1563 boundary accepts a private prepared template only after it validates
 the participant topology, derived work plan, full claim coverage, bounded arithmetic, and current

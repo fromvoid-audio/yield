@@ -2093,6 +2093,132 @@ mod tests {
     }
 
     #[test]
+    fn seeded_two_volume_pressure_is_atomic_and_order_independent() {
+        const SEEDS: [(u64, bool); 2] = [(0x1567, false), (0x1568, true)];
+        let first_volume = VolumeIdentity { device: 1567 };
+        let second_volume = VolumeIdentity { device: 1568 };
+        let first_class = FullCapacityAllocationClass::DestinationStaging;
+        let first_recovery_class = FullCapacityAllocationClass::OperationRecoveryPayload;
+        let second_class = FullCapacityAllocationClass::DestinationStaging;
+
+        for (seed, reverse_order) in SEEDS {
+            let mut rows = vec![
+                (first_volume.clone(), first_class, 4096, 4096),
+                (first_volume.clone(), first_recovery_class, 4096, 4096),
+                (second_volume.clone(), second_class, 4096, 4096),
+            ];
+            if reverse_order {
+                rows.reverse();
+            }
+            let (plan, claims) = plan_and_claims(&rows);
+
+            let mut exact_fixture = BTreeMap::new();
+            exact_fixture.insert(
+                first_volume.clone(),
+                facts(1567, PROTECTED_FREE_SPACE_FLOOR + 8192, 4096),
+            );
+            exact_fixture.insert(
+                second_volume.clone(),
+                facts(1568, PROTECTED_FREE_SPACE_FLOOR + 4096, 4096),
+            );
+            let exact_provider = CapacityProvider::qualified_fixture(exact_fixture);
+            let exact_lease = exact_provider
+                .admit(&plan, &claims)
+                .unwrap_or_else(|error| panic!("seed {seed:#x} exact boundary: {error}"));
+            assert_eq!(
+                exact_provider.outstanding(&first_volume, first_class),
+                4096,
+                "seed {seed:#x} first-volume staging charge"
+            );
+            assert_eq!(
+                exact_provider.outstanding(&first_volume, first_recovery_class),
+                4096,
+                "seed {seed:#x} first-volume recovery charge"
+            );
+            assert_eq!(
+                exact_provider.outstanding(&second_volume, second_class),
+                4096,
+                "seed {seed:#x} second-volume charge"
+            );
+            assert_eq!(exact_provider.claim_count(), 1);
+            drop(exact_lease);
+            assert_eq!(exact_provider.claim_count(), 0);
+
+            for pressured_volume in [first_volume.clone(), second_volume.clone()] {
+                let mut pressure_fixture = BTreeMap::new();
+                let first_free = if pressured_volume == first_volume {
+                    PROTECTED_FREE_SPACE_FLOOR + 16383
+                } else {
+                    PROTECTED_FREE_SPACE_FLOOR + 16384
+                };
+                let second_free = if pressured_volume == second_volume {
+                    PROTECTED_FREE_SPACE_FLOOR + 8191
+                } else {
+                    PROTECTED_FREE_SPACE_FLOOR + 8192
+                };
+                pressure_fixture.insert(first_volume.clone(), facts(1567, first_free, 4096));
+                pressure_fixture.insert(second_volume.clone(), facts(1568, second_free, 4096));
+                let provider = CapacityProvider::qualified_fixture(pressure_fixture);
+                let baseline_claims = claims_for_plan(&plan);
+                let mut baseline_lease = provider
+                    .admit(&plan, &baseline_claims)
+                    .unwrap_or_else(|error| panic!("seed {seed:#x} baseline admission: {error}"));
+                baseline_lease
+                    .mark_durable(OperationId::new())
+                    .unwrap_or_else(|error| panic!("seed {seed:#x} baseline durable: {error}"));
+                let before_ledger = {
+                    let ledger = provider.ledger.borrow();
+                    (
+                        ledger.next_token,
+                        ledger.charges_by_token.clone(),
+                        ledger.aggregate_charges.clone(),
+                        ledger.released_claims.clone(),
+                    )
+                };
+                let before_totals = (
+                    provider.outstanding(&first_volume, first_class),
+                    provider.outstanding(&first_volume, first_recovery_class),
+                    provider.outstanding(&second_volume, second_class),
+                );
+                let result = provider.admit(&plan, &claims);
+                match result {
+                    Err(CapacityProviderError::DiskPressureRecoveryOnly { volume, .. }) => {
+                        assert_eq!(
+                            volume, pressured_volume,
+                            "seed {seed:#x} pressure must identify the specifically pressured volume"
+                        );
+                    }
+                    other => panic!(
+                        "seed {seed:#x} pressure on {pressured_volume:?} must reject with typed pressure, got {other:?}"
+                    ),
+                }
+                let after_ledger = {
+                    let ledger = provider.ledger.borrow();
+                    (
+                        ledger.next_token,
+                        ledger.charges_by_token.clone(),
+                        ledger.aggregate_charges.clone(),
+                        ledger.released_claims.clone(),
+                    )
+                };
+                assert_eq!(
+                    after_ledger, before_ledger,
+                    "seed {seed:#x} pressure rejection must preserve the exact pre-existing claims, token, dispositions, and release history"
+                );
+                assert_eq!(
+                    (
+                        provider.outstanding(&first_volume, first_class),
+                        provider.outstanding(&first_volume, first_recovery_class),
+                        provider.outstanding(&second_volume, second_class),
+                    ),
+                    before_totals,
+                    "seed {seed:#x} pressure rejection must leave both volume totals unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ordinary_admission_preserves_the_recovery_floor() {
         let volume = VolumeIdentity { device: 3 };
         let (plan, claims) = plan_and_claims(&[(

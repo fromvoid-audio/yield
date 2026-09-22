@@ -410,6 +410,81 @@ mod tests {
         assert_eq!(plan.allocations()[0].allocated_bytes(), 8192);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shared_existing_rename_reopen_deduplicates_by_descriptor_identity() {
+        let temp = temp();
+        let original_path = temp.path().join("existing-before-rename");
+        let renamed_path = temp.path().join("existing-after-rename");
+        let retained = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&original_path)
+            .expect("open retained object before rename");
+        std::fs::rename(&original_path, &renamed_path).expect("rename retained object");
+        let reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&renamed_path)
+            .expect("reopen renamed object");
+
+        let plan = derive_full_capacity_plan(&[
+            requirement(
+                &retained,
+                1567,
+                4096,
+                FullCapacityAllocationClass::ExistingDestination,
+                CapacityEstimate::Known(4097),
+                CapacityAllocationNature::SharedExisting,
+            ),
+            requirement(
+                &reopened,
+                1567,
+                4096,
+                FullCapacityAllocationClass::ExistingDestination,
+                CapacityEstimate::Known(4097),
+                CapacityAllocationNature::SharedExisting,
+            ),
+        ])
+        .expect("renamed object identity should deduplicate");
+        assert_eq!(plan.allocations().len(), 1);
+        assert_eq!(plan.allocations()[0].logical_bytes(), 4097);
+        assert_eq!(plan.allocations()[0].allocated_bytes(), 8192);
+    }
+
+    #[test]
+    fn allocation_rounding_boundaries_are_checked_per_object() {
+        let temp = temp();
+        let descriptor = file(&temp, "rounding-boundaries");
+        let allocation_unit = 4096;
+        let logical_sizes = [1, allocation_unit - 1, allocation_unit, allocation_unit + 1];
+        let requirements = logical_sizes
+            .into_iter()
+            .map(|logical_bytes| {
+                requirement(
+                    &descriptor,
+                    1567,
+                    allocation_unit,
+                    FullCapacityAllocationClass::DestinationStaging,
+                    CapacityEstimate::Known(logical_bytes),
+                    CapacityAllocationNature::NewAllocation,
+                )
+            })
+            .collect::<Vec<_>>();
+        let plan = derive_full_capacity_plan(&requirements).expect("rounding boundary plan");
+        assert_eq!(plan.allocations().len(), 1);
+        assert_eq!(
+            plan.allocations()[0].logical_bytes(),
+            logical_sizes.into_iter().sum::<u64>()
+        );
+        assert_eq!(
+            plan.allocations()[0].allocated_bytes(),
+            allocation_unit * 5,
+            "seed 1567 rounds each object before aggregation"
+        );
+    }
+
     #[test]
     fn distinct_same_sized_existing_objects_are_not_deduplicated() {
         let temp = temp();
