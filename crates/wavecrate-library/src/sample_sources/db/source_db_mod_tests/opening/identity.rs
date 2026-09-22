@@ -2009,3 +2009,411 @@ fn source_database_identity_rejects_replacement_before_mutation() {
         replacement_bytes
     );
 }
+
+#[test]
+fn source_authority_handoff_uses_one_shot_confirmation_and_durable_retirement_ack() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let database_path = database_root.path().join(DB_FILE_NAME);
+    let registration = database
+        .prepare_source_authority()
+        .expect("validated source authority");
+    assert!(matches!(
+        database.prepare_source_authority(),
+        Err(SourceAuthorityError::AlreadyPrepared)
+    ));
+    let (request, mut guard) = registration.split();
+    assert!(!request.database_file_identity().is_empty());
+    assert!(!request.media_root().identity().is_empty());
+    assert!(!request.database_root().identity().is_empty());
+
+    let stale_confirmation = guard.confirm().expect("first live confirmation");
+    let fresh_confirmation = guard.confirm().expect("new live confirmation");
+    assert!(matches!(
+        request.accept_confirmation(stale_confirmation),
+        Err(SourceAuthorityError::ConfirmationStale)
+    ));
+    assert!(matches!(
+        request.accept_confirmation(fresh_confirmation.clone().with_expired_deadline_for_tests()),
+        Err(SourceAuthorityError::ConfirmationStale)
+    ));
+    let proof = request
+        .accept_confirmation(fresh_confirmation)
+        .expect("fresh confirmation");
+    assert!(matches!(
+        guard.confirm(),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+    request
+        .begin_drain(proof.into_drain_marker())
+        .expect("pre-release drain");
+    assert!(matches!(
+        guard.confirm(),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+
+    let acknowledgement = database
+        .close_with_source_authority(&mut guard)
+        .expect("durable source lease retirement");
+    assert_eq!(request.phase_for_tests(), 2);
+    request
+        .finalize_retirement(acknowledgement.clone())
+        .expect("consume retirement acknowledgement");
+    assert_eq!(request.phase_for_tests(), 3);
+    request
+        .finalize_retirement(acknowledgement)
+        .expect("duplicate retirement acknowledgement is idempotent");
+    let state: String = Connection::open(&database_path)
+        .expect("reopen retired source database")
+        .query_row(
+            "SELECT state FROM source_lease WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("retired lease row");
+    assert_eq!(state, "released");
+}
+
+#[cfg(unix)]
+#[test]
+fn source_authority_handoff_rejects_replaced_root_and_invalidates_pending_confirmation() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database
+        .prepare_source_authority()
+        .expect("validated source authority");
+    let (request, guard) = registration.split();
+    let confirmation = guard.confirm().expect("live confirmation");
+    std::fs::remove_dir_all(source_root.path()).expect("remove source root");
+
+    let error = guard
+        .confirm()
+        .expect_err("replaced source root must reject confirmation");
+    assert!(matches!(
+        error,
+        SourceAuthorityError::Lease(
+            SourceLeaseError::SourceRootUnavailable { .. }
+                | SourceLeaseError::SourceRootReplaced { .. }
+                | SourceLeaseError::SourceRootIdentityUnavailable { .. }
+        )
+    ));
+    assert!(matches!(
+        request.accept_confirmation(confirmation),
+        Err(SourceAuthorityError::ConfirmationStale)
+    ));
+}
+
+#[test]
+fn source_authority_handoff_rejects_stale_owner_and_cross_source_guard() {
+    let app_root = tempdir().expect("app root");
+    let source_root_a = tempdir().expect("source root a");
+    let database_root_a = tempdir().expect("database root a");
+    let source_root_b = tempdir().expect("source root b");
+    let database_root_b = tempdir().expect("database root b");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database_a = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root_a.path(),
+        &profile_guard,
+        database_root_a.path(),
+    )
+    .expect("source database a");
+    let database_b = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root_b.path(),
+        &profile_guard,
+        database_root_b.path(),
+    )
+    .expect("source database b");
+    let (request_a, guard_a) = database_a
+        .prepare_source_authority()
+        .expect("authority a")
+        .split();
+    let (request_b, mut guard_b) = database_b
+        .prepare_source_authority()
+        .expect("authority b")
+        .split();
+    let confirmation_a = guard_a.confirm().expect("confirmation a");
+    let confirmation_b = guard_b.confirm().expect("confirmation b");
+    assert!(matches!(
+        request_a.accept_confirmation(confirmation_b.clone()),
+        Err(SourceAuthorityError::RegistrationMismatch)
+    ));
+    let proof_a = request_a
+        .accept_confirmation(confirmation_a)
+        .expect("matching confirmation a");
+    assert!(matches!(
+        request_b.begin_drain(proof_a.into_drain_marker()),
+        Err(SourceAuthorityError::RegistrationMismatch)
+    ));
+
+    database_b
+        .connection
+        .execute(
+            "UPDATE source_lease SET owner_identity = ?1 WHERE singleton = 1",
+            [Uuid::new_v4().to_string()],
+        )
+        .expect("replace owner identity b");
+    assert!(matches!(
+        guard_b.confirm(),
+        Err(SourceAuthorityError::Lease(
+            SourceLeaseError::Superseded { .. }
+        ))
+    ));
+    assert!(matches!(
+        request_b.accept_confirmation(confirmation_b),
+        Err(SourceAuthorityError::ConfirmationStale)
+    ));
+    assert!(matches!(
+        database_a.close_with_source_authority(&mut guard_b),
+        Err(SourceAuthorityError::GuardMismatch)
+    ));
+}
+
+#[test]
+fn source_authority_retarget_context_cannot_cross_source_generations() {
+    let app_root = tempdir().expect("app root");
+    let source_root_a = tempdir().expect("source root a");
+    let replacement_root_a = tempdir().expect("replacement root a");
+    let source_root_b = tempdir().expect("source root b");
+    let replacement_root_b = tempdir().expect("replacement root b");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database_a = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root_a.path(),
+        &profile_guard,
+        "authority-cross-context-a",
+    )
+    .expect("source database a");
+    let registration_a = database_a.prepare_source_authority().expect("authority a");
+    let request_a = registration_a
+        .journal_request()
+        .expect("authority request a");
+    let proof_a = request_a
+        .request
+        .accept_confirmation(request_a.confirmation)
+        .expect("authority proof a");
+    request_a
+        .request
+        .begin_drain(proof_a.into_drain_marker())
+        .expect("drain authority a");
+    let mut context_a = registration_a
+        .detach_for_retarget()
+        .expect("detach authority a");
+
+    let database_b = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root_b.path(),
+        &profile_guard,
+        "authority-cross-context-b",
+    )
+    .expect("source database b");
+    let before_b: (i64, String, String) = database_b
+        .connection
+        .query_row(
+            "SELECT lease_epoch, owner_identity, media_root_identity
+             FROM source_lease WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("lease b before crossed retarget");
+    let error = match database_b.retarget_catalog_root_with_source_authority(
+        replacement_root_b.path(),
+        &profile_guard,
+        &mut context_a,
+    ) {
+        Ok(_) => panic!("authority from source a must not retarget source b"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SourceDbError::SourceLease(SourceLeaseError::Superseded { .. })
+    ));
+    let after_b: (i64, String, String) = Connection::open(
+        profile_guard
+            .profile_root()
+            .join("authority-cross-context-b")
+            .join(DB_FILE_NAME),
+    )
+    .expect("reopen lease b after crossed retarget")
+    .query_row(
+        "SELECT lease_epoch, owner_identity, media_root_identity
+             FROM source_lease WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .expect("lease b after crossed retarget");
+    assert_eq!(after_b, before_b);
+    assert!(matches!(
+        context_a.acknowledgement_after_retarget_commit(),
+        Err(SourceAuthorityError::InvalidLifecycle)
+    ));
+    drop(replacement_root_a);
+}
+
+#[test]
+fn source_authority_handoff_retains_draining_state_when_snapshot_blocks_retirement() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let destination_root = tempdir().expect("snapshot root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database
+        .prepare_source_authority()
+        .expect("validated source authority");
+    let (request, mut guard) = registration.split();
+    let proof = request
+        .accept_confirmation(guard.confirm().expect("confirmation"))
+        .expect("use proof");
+    request
+        .begin_drain(proof.into_drain_marker())
+        .expect("pre-release drain");
+    let snapshot = database
+        .snapshot_to_path_with_write_fence(&destination_root.path().join("snapshot.db"))
+        .expect("snapshot fence");
+
+    let error = database
+        .close_with_source_authority(&mut guard)
+        .expect_err("live snapshot must block retirement");
+    assert!(matches!(
+        error,
+        SourceAuthorityError::Lease(SourceLeaseError::SnapshotsActive)
+    ));
+    assert_eq!(request.phase_for_tests(), 2);
+    drop(snapshot);
+}
+
+#[test]
+fn source_authority_guard_drop_invalidates_pending_use_proof() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database
+        .prepare_source_authority()
+        .expect("validated source authority");
+    let (request, guard) = registration.split();
+    let confirmation = guard.confirm().expect("live confirmation");
+    let proof = request
+        .accept_confirmation(confirmation)
+        .expect("accepted use proof");
+    drop(guard);
+    assert!(matches!(
+        request.begin_drain(proof.into_drain_marker()),
+        Err(SourceAuthorityError::ConfirmationClosed)
+    ));
+    assert_eq!(request.phase_for_tests(), 4);
+}
+
+#[test]
+fn source_authority_expired_use_proof_still_allows_restrictive_drain() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database
+        .prepare_source_authority()
+        .expect("validated source authority");
+    let (request, mut guard) = registration.split();
+    let stale_confirmation = guard.confirm().expect("confirmation");
+    assert!(matches!(
+        request.accept_confirmation(stale_confirmation.with_expired_deadline_for_tests()),
+        Err(SourceAuthorityError::ConfirmationStale)
+    ));
+    let proof = request
+        .accept_confirmation(guard.confirm().expect("fresh confirmation"))
+        .expect("accepted use proof");
+    request
+        .begin_drain(proof.with_expired_deadline_for_tests().into_drain_marker())
+        .expect("expired physical proof still permits restrictive drain");
+    assert_eq!(request.phase_for_tests(), 2);
+    let acknowledgement = database
+        .close_with_source_authority(&mut guard)
+        .expect("durable source lease retirement");
+    request
+        .finalize_retirement(acknowledgement.clone())
+        .expect("consume retirement acknowledgement");
+    request
+        .finalize_retirement(acknowledgement)
+        .expect("duplicate retirement acknowledgement is idempotent");
+    assert_eq!(request.phase_for_tests(), 3);
+}
+
+#[test]
+fn source_authority_confirmation_is_consumed_once_under_concurrent_acceptors() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let database_root = tempdir().expect("database root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_source_write_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        database_root.path(),
+    )
+    .expect("external source database");
+    let registration = database
+        .prepare_source_authority()
+        .expect("validated source authority");
+    let (request, guard) = registration.split();
+    let confirmation = guard.confirm().expect("live confirmation");
+    let request = Arc::new(request);
+    let left_confirmation = confirmation.clone();
+    let (left, right) = std::thread::scope(|scope| {
+        let left_request = Arc::clone(&request);
+        let left = scope.spawn(move || left_request.accept_confirmation(left_confirmation));
+        let right_request = Arc::clone(&request);
+        let right = scope.spawn(move || right_request.accept_confirmation(confirmation));
+        (
+            left.join().expect("left acceptor"),
+            right.join().expect("right acceptor"),
+        )
+    });
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert!(left.is_err() || right.is_err());
+}

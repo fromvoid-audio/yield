@@ -986,7 +986,11 @@ impl Persistence {
             catalog::mark_unavailable(catalog_slot, reason);
             return;
         };
-        let service = match CatalogService::start(writable) {
+        let service_result = match self.journal.as_ref().map(OperationJournalOwner::client) {
+            Some(journal) => CatalogService::start_with_journal(writable, journal),
+            None => CatalogService::start(writable),
+        };
+        let service = match service_result {
             Ok(service) => Arc::new(service),
             Err(error) => {
                 catalog::mark_unavailable(catalog_slot, error.to_string());

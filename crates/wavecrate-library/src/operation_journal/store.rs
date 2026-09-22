@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::app_dirs::{ProfileOwnershipError, WritableProfileGuard};
 use crate::durable_capacity::VolumeIdentity;
 use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
-use crate::sample_sources::db::BoundDatabaseRoot;
 use crate::sample_sources::db::sqlite_identity::{self, DatabaseIdentityError};
+use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityUseProof};
 
 use super::admission_claims::{
     AdmissionClaimId, AdmissionClaimInventory, AdmissionClaimValidationError,
@@ -949,6 +949,15 @@ pub(crate) enum RecoveryReserveContextError {
     Binding(#[from] recovery_reserve_binding::ReserveBindingError),
 }
 
+/// Failure while binding one source-volume reserve, retaining every owner-thread resource that
+/// may have been acquired before the error. The journal owner converts this into a recovery-only
+/// registration state instead of dropping a lock or reserve after an ambiguous write boundary.
+pub(crate) struct SourceReserveBindingFailure {
+    pub(crate) error: RecoveryReserveContextError,
+    pub(crate) volume_owner: VolumeOwnershipCapability,
+    pub(crate) reserve: Option<OwnedReserveAllocation>,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalMutationFault {
@@ -984,12 +993,23 @@ impl PhysicalMutationFault {
 
 #[allow(dead_code)]
 impl<'a> RecoveryReserveContext<'a> {
-    fn into_owned_reserve(self) -> Result<OwnedReserveAllocation, RecoveryReserveContextError> {
-        let RecoveryReserveContext { reserve, .. } = self;
+    fn into_owned_parts(
+        self,
+    ) -> Result<(VolumeOwnershipCapability, OwnedReserveAllocation), RecoveryReserveContextError>
+    {
+        let RecoveryReserveContext {
+            volume_owner,
+            reserve,
+            ..
+        } = self;
         let reserve = reserve
             .into_owned()
             .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
-        Ok(reserve)
+        Ok((volume_owner, reserve))
+    }
+
+    fn into_owned_reserve(self) -> Result<OwnedReserveAllocation, RecoveryReserveContextError> {
+        self.into_owned_parts().map(|(_, reserve)| reserve)
     }
 
     fn validate_binding(&self) -> Result<(), RecoveryReserveContextError> {
@@ -1479,13 +1499,13 @@ impl OperationJournalStore {
     /// bootstrap so the owner runtime retains the lock across every error path.
     pub(crate) fn acquire_profile_journal_volume_owner(
         &self,
-        #[cfg(test)] registry_path: Option<&Path>,
+        #[cfg(any(test, feature = "test-support"))] registry_path: Option<&Path>,
     ) -> Result<VolumeOwnershipCapability, ProfileJournalReserveBootstrapError> {
         self.validate_namespace()?;
         let descriptor = self.database_root.try_clone_descriptor().map_err(|error| {
             ProfileJournalReserveBootstrapError::RootDescriptor(error.to_string())
         })?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let volume_owner = match registry_path {
                 Some(registry_path) => {
@@ -1502,7 +1522,7 @@ impl OperationJournalStore {
             };
             return Ok(volume_owner);
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         super::capacity_volume_owner::acquire_for_descriptor(&descriptor, &self.profile_guard)
             .map_err(ProfileJournalReserveBootstrapError::from)
     }
@@ -1513,10 +1533,10 @@ impl OperationJournalStore {
     pub(crate) fn bootstrap_profile_journal_reserve(
         &self,
         volume_owner: &VolumeOwnershipCapability,
-        #[cfg(test)] registry_path: Option<&Path>,
+        #[cfg(any(test, feature = "test-support"))] registry_path: Option<&Path>,
     ) -> Result<OwnedReserveAllocation, ProfileJournalReserveBootstrapError> {
         self.validate_namespace()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let _ = registry_path;
         volume_owner.revalidate()?;
 
@@ -1682,6 +1702,199 @@ impl OperationJournalStore {
             journal_identity: self.database_identity.clone(),
             profile_identity,
         })
+    }
+
+    /// Bind or reopen one owner-thread reserve for a descriptor-derived source volume.
+    ///
+    /// The returned ownership lock and reserve remain paired with the caller. Existing durable
+    /// bindings are reopened through the same identity and active-charge checks as journal
+    /// startup; a new binding is persisted only after a live reserve proof succeeds.
+    pub(crate) fn acquire_owned_source_reserve(
+        &self,
+        volume_owner: VolumeOwnershipCapability,
+        root: &BoundDatabaseRoot,
+        profile_guard: &WritableProfileGuard,
+        proof: &SourceAuthorityUseProof,
+    ) -> Result<OwnedReserveAllocation, SourceReserveBindingFailure> {
+        let mut no_hook = None;
+        self.acquire_owned_source_reserve_inner(
+            volume_owner,
+            root,
+            profile_guard,
+            proof,
+            &mut no_hook,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_owned_source_reserve_with_test_hook<F>(
+        &self,
+        volume_owner: VolumeOwnershipCapability,
+        root: &BoundDatabaseRoot,
+        profile_guard: &WritableProfileGuard,
+        proof: &SourceAuthorityUseProof,
+        hook: &mut F,
+    ) -> Result<OwnedReserveAllocation, SourceReserveBindingFailure>
+    where
+        F: FnMut(),
+    {
+        let mut callback: Option<&mut dyn FnMut()> = Some(hook);
+        self.acquire_owned_source_reserve_inner(
+            volume_owner,
+            root,
+            profile_guard,
+            proof,
+            &mut callback,
+        )
+    }
+
+    fn acquire_owned_source_reserve_inner(
+        &self,
+        volume_owner: VolumeOwnershipCapability,
+        root: &BoundDatabaseRoot,
+        profile_guard: &WritableProfileGuard,
+        proof: &SourceAuthorityUseProof,
+        after_reserve: &mut Option<&mut dyn FnMut()>,
+    ) -> Result<OwnedReserveAllocation, SourceReserveBindingFailure> {
+        let fail = |error, volume_owner, reserve| SourceReserveBindingFailure {
+            error,
+            volume_owner,
+            reserve,
+        };
+        let validate_proof = || {
+            proof
+                .validate_for_physical_use()
+                .map_err(|error| error.to_string())
+        };
+        if let Err(error) = validate_proof() {
+            return Err(fail(
+                RecoveryReserveContextError::Reserve(format!(
+                    "source authority proof is no longer valid: {error}"
+                )),
+                volume_owner,
+                None,
+            ));
+        }
+        if let Err(error) = self.validate_namespace() {
+            return Err(fail(
+                RecoveryReserveContextError::Store(error),
+                volume_owner,
+                None,
+            ));
+        }
+        if let Err(error) = root
+            .validate_profile_guard(profile_guard)
+            .map_err(OperationJournalStoreError::ProfileOwnership)
+        {
+            return Err(fail(error.into(), volume_owner, None));
+        }
+        if let Err(error) = volume_owner.revalidate() {
+            return Err(fail(error.into(), volume_owner, None));
+        }
+        let binding = match recovery_reserve_binding::read(&self.connection, volume_owner.volume())
+        {
+            Ok(binding) => binding,
+            Err(error) => return Err(fail(error.into(), volume_owner, None)),
+        };
+        if binding.is_some() {
+            if let Err(error) = validate_proof() {
+                return Err(fail(
+                    RecoveryReserveContextError::Reserve(format!(
+                        "source authority proof is no longer valid: {error}"
+                    )),
+                    volume_owner,
+                    None,
+                ));
+            }
+            let context_owner = match volume_owner.try_clone_for_context() {
+                Ok(owner) => owner,
+                Err(error) => return Err(fail(error.into(), volume_owner, None)),
+            };
+            let context = match self.reopen_recovery_reserve(context_owner, root, profile_guard) {
+                Ok(context) => context,
+                Err(error) => return Err(fail(error, volume_owner, None)),
+            };
+            return match context.into_owned_reserve() {
+                Ok(reserve) => Ok(reserve),
+                Err(error) => Err(fail(error, volume_owner, None)),
+            };
+        }
+
+        if let Err(error) = validate_proof() {
+            return Err(fail(
+                RecoveryReserveContextError::Reserve(format!(
+                    "source authority proof is no longer valid: {error}"
+                )),
+                volume_owner,
+                None,
+            ));
+        }
+        let reserve =
+            match super::capacity_reserve_namespace::create_owned_reserve(root, profile_guard) {
+                Ok(reserve) => reserve,
+                Err(error) => {
+                    return Err(fail(
+                        RecoveryReserveContextError::Reserve(error.to_string()),
+                        volume_owner,
+                        None,
+                    ));
+                }
+            };
+        let mut reserve = match reserve.into_owned() {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                return Err(fail(
+                    RecoveryReserveContextError::Reserve(error.to_string()),
+                    volume_owner,
+                    None,
+                ));
+            }
+        };
+        if let Some(hook) = after_reserve.as_mut() {
+            hook();
+        }
+        if let Err(error) = reserve
+            .view(profile_guard)
+            .revalidate_and_prove()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))
+        {
+            return Err(fail(error, volume_owner, Some(reserve)));
+        }
+        if let Err(error) = self.validate_namespace() {
+            return Err(fail(
+                RecoveryReserveContextError::Store(error),
+                volume_owner,
+                Some(reserve),
+            ));
+        }
+        if let Err(error) = volume_owner.revalidate() {
+            return Err(fail(error.into(), volume_owner, Some(reserve)));
+        }
+        if let Err(error) = validate_proof() {
+            return Err(fail(
+                RecoveryReserveContextError::Reserve(format!(
+                    "source authority proof is no longer valid: {error}"
+                )),
+                volume_owner,
+                Some(reserve),
+            ));
+        }
+        let observation = reserve.observation();
+        let binding = match recovery_reserve_binding::ReserveBinding::from_live(
+            volume_owner.volume().clone(),
+            self.profile_guard.profile_root_identity(),
+            observation.root_identity(),
+            observation.file_identity(),
+            observation.allocation_unit(),
+            volume_owner.owner_generation(),
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return Err(fail(error.into(), volume_owner, Some(reserve))),
+        };
+        if let Err(error) = recovery_reserve_binding::persist(&self.connection, &binding) {
+            return Err(fail(error.into(), volume_owner, Some(reserve)));
+        }
+        Ok(reserve)
     }
 
     /// Reopen a previously bound reserve after a crash-like owner restart.

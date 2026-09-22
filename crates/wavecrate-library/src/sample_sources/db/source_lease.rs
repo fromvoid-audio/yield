@@ -277,6 +277,12 @@ pub(crate) struct SourceLease {
     owner_identity: String,
     lease_epoch: i64,
     publication_liveness: Arc<PublicationLiveness>,
+    /// Dedicated invalidation for private source-authority handshakes.
+    ///
+    /// This token only invalidates an already issued handoff when the retained lease is retired
+    /// or superseded. It never grants source or capacity authority on its own.
+    authority_liveness: Arc<AtomicBool>,
+    authority_registration: Mutex<Option<Uuid>>,
     profile_guard: WritableProfileGuard,
 }
 
@@ -490,6 +496,7 @@ impl SourceLeaseReservation {
             .map_err(SourceLeaseError::ProfileOwnership)?;
         let publication_liveness =
             Arc::new(PublicationLiveness::new(owner_identity.clone(), epoch));
+        let authority_liveness = Arc::new(AtomicBool::new(true));
         Ok(Arc::new(SourceLease {
             control_connection: Mutex::new(control),
             database_root: self.database_root,
@@ -502,6 +509,8 @@ impl SourceLeaseReservation {
             owner_identity,
             lease_epoch: epoch,
             publication_liveness,
+            authority_liveness,
+            authority_registration: Mutex::new(None),
             profile_guard,
         }))
     }
@@ -573,6 +582,51 @@ impl SourceLease {
     /// Return the durable epoch held by this source owner.
     pub(crate) fn epoch(&self) -> i64 {
         self.lease_epoch
+    }
+
+    /// Return the durable owner identity held by this source owner.
+    #[allow(dead_code)]
+    pub(crate) fn owner_identity(&self) -> &str {
+        &self.owner_identity
+    }
+
+    /// Return the private invalidation token shared with a source-authority handoff.
+    pub(crate) fn authority_liveness(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.authority_liveness)
+    }
+
+    /// Reserve the one private source-authority slot for this retained lease.
+    pub(crate) fn try_reserve_authority_registration(
+        &self,
+        registration_id: Uuid,
+    ) -> Result<bool, SourceLeaseError> {
+        let mut current = self
+            .authority_registration
+            .lock()
+            .map_err(|_| SourceLeaseError::ControlUnavailable)?;
+        match *current {
+            None => {
+                *current = Some(registration_id);
+                Ok(true)
+            }
+            Some(existing) if existing == registration_id => Ok(true),
+            Some(_) => Ok(false),
+        }
+    }
+
+    /// Release a slot reservation when request construction fails before a guard exists.
+    pub(crate) fn clear_authority_registration(
+        &self,
+        registration_id: Uuid,
+    ) -> Result<(), SourceLeaseError> {
+        let mut current = self
+            .authority_registration
+            .lock()
+            .map_err(|_| SourceLeaseError::ControlUnavailable)?;
+        if current.as_ref() == Some(&registration_id) {
+            *current = None;
+        }
+        Ok(())
     }
 
     /// Return the control connection's SQLite change count for ownership tests.
@@ -660,6 +714,7 @@ impl SourceLease {
         self.publication_liveness
             .live
             .store(false, Ordering::Release);
+        self.authority_liveness.store(false, Ordering::Release);
         let transaction = control
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql_error)?;
@@ -754,6 +809,13 @@ impl SourceLease {
             self.owner_identity.clone(),
             self.lease_epoch,
         ));
+        self.authority_liveness = Arc::new(AtomicBool::new(true));
+        // A committed retarget supersedes the old source-generation registration. The old
+        // journal evidence remains independently drainable, while the new generation may prepare
+        // its own guarded registration against the advanced owner/epoch.
+        if let Ok(mut registration) = self.authority_registration.lock() {
+            *registration = None;
+        }
         Ok(())
     }
 
@@ -913,6 +975,7 @@ impl SourceLease {
         self.publication_liveness
             .live
             .store(false, Ordering::Release);
+        self.authority_liveness.store(false, Ordering::Release);
         let mut control = self
             .control_connection
             .lock()
@@ -947,6 +1010,27 @@ impl SourceLease {
         }
         self.validate_control_connection(&tx)?;
         tx.commit().map_err(map_sql_error)
+    }
+
+    /// Validate the retained source owner through its control connection.
+    ///
+    /// This is the source-owner confirmation boundary. It performs the same retained root,
+    /// database-file, sidecar, durable-row, and expiry checks as the ordinary source connection
+    /// validation, but it does not borrow or move the ordinary SQLite connection.
+    #[allow(dead_code)]
+    pub(crate) fn validate_current_owner(&self) -> Result<i64, SourceLeaseError> {
+        let control = self
+            .control_connection
+            .lock()
+            .map_err(|_| SourceLeaseError::ControlUnavailable)?;
+        let row = self.validate_current_without_expiry(&control)?;
+        let now = lease_now()?;
+        if row.expires_at <= now {
+            return Err(SourceLeaseError::Expired {
+                path: self.database_file_binding.path().to_path_buf(),
+            });
+        }
+        Ok(row.expires_at)
     }
 
     fn validate_current_without_expiry(
@@ -1073,6 +1157,7 @@ impl Drop for SourceLease {
         self.publication_liveness
             .live
             .store(false, Ordering::Release);
+        self.authority_liveness.store(false, Ordering::Release);
         // This uses the retained authorized control connection. It never reopens a pathname.
         // Explicit release remains the fallible shutdown API; a crash or failed cleanup leaves an
         // active durable row for conservative recovery after the sidecar lock is released.

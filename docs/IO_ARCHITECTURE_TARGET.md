@@ -1,7 +1,9 @@
 # Wavecrate End-to-End I/O Architecture Target
 
-Status: target design; documentation-only proposal. No implementation, schema, dependency,
-migration, behavior, or test change is implied by this document.
+Status: target design with the bounded OPT-1556 source-volume handoff implemented.
+The implemented slice changes only the private source registration, journal-owner,
+catalog-worker, and session startup boundaries described below; the remaining target
+flows are still proposal work.
 
 ## Scope, authority, and reading order
 
@@ -33,6 +35,43 @@ The target covers:
 
 It does not authorize implementing all of these flows in one change. Delivery is phased
 in [Phased delivery](#phased-delivery).
+
+### Implemented OPT-1556 boundary
+
+The session opens the operation journal owner before starting the catalog and passes
+only a cloneable `OperationJournalClient` into the catalog worker. The catalog worker
+keeps the source database and its non-`Send` authority guard; the journal owner receives
+an opaque descriptor-bound request plus one expiry-bound confirmation. At the consuming
+boundary it revalidates no-follow roots and database-file identity before retaining one
+volume ownership capability and reserve per distinct external volume. The profile/journal
+volume reuses its existing owner and reserve, and alternate source references sharing a
+volume share the one retained entry.
+
+Removal is ordered as `Draining` -> source-owner lease retirement -> sealed matching ack
+-> journal finalization. Drain retains the registry, reserve, and locks, and source
+snapshot, queue, timeout, or shutdown uncertainty leaves recovery evidence without a
+successful final removal. Catalog attachment remains usable when capacity registration
+is unsupported or fails; ordinary admission remains disabled. Profile-child retargeting
+uses the existing durable owner/epoch transaction and emits the old-generation ack only
+after commit, including a post-commit reopen failure. This bounded handoff adds no schema,
+source-writer routing, provider qualification, or production admission.
+
+Once the source lease has retired, the catalog records the receipt and sealed ack in a
+bounded pending-finalization carrier before sending the journal finalization command. It
+polls an existing request before retrying, preserves the exact ack through queue rejection,
+timeouts, and late errors, and retries at the next affected lifecycle boundary. The carrier
+has no source database, guard, root descriptor, or physical authority. Shutdown performs one
+bounded pass; an unresolved carrier stays uncertain and cannot produce a successful Removed
+event. Retargeted old-generation acknowledgements use the same carrier path.
+
+An incomplete multi-volume registration retains each acquired owner, reserve, and
+bounded failure evidence before the next physical effect; a later retry cannot treat a
+volume key alone as a complete binding. An orphan release record has no claim bytes to
+charge or release, so its immutable evidence remains a bounded recovery diagnostic and
+does not fabricate capacity. A known positive claim with missing or mismatched release
+evidence remains charged and recovery-only. A successful logical source removal leaves
+an idle external volume owner and reserve available for same-runtime reuse; cross-runtime
+dirty-marker cleanup remains a later clean-handoff contract.
 
 ## Current evidence and target recommendations
 
