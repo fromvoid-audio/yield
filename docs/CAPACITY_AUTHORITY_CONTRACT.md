@@ -284,6 +284,63 @@ This logical release does not delete ordinary rows, clean physical data,
 replenish the recovery reserve, rebuild the provider after restart, or enable
 ordinary admission.
 
+OPT-1560 adds the private owner-thread restart rebuild without changing the
+schema. After the owner acquires the profile journal volume lock and installs
+the reserve capsule, it revalidates the retained descriptor and obtains a
+fresh non-sparse PhysicalReserveProof. The proof must match the live volume
+and meet the protected-floor minimum derived from the active durable recovery
+charge; a valid explained partial reserve uses that charge-derived remainder.
+Only then does the owner read claims and install the recovery-only provider
+ledger. A proof failure follows the existing unavailable startup path.
+
+The store reads both ordinary-claim relations in one consistent read
+transaction. Claim and release rows use the existing canonical UUID keyset
+pages, with at most 256 decoded rows plus one SQL lookahead per page. Every
+claim operation is point-validated through the strict journal reader.
+Only an exact durable release tuple for the claim and operation, with its
+stable release identity, excludes a claim from outstanding bytes. Terminal
+operation observations, settlement outcomes, snapshots, and full-progress
+rows do not authorize release. Original claim and release evidence is never
+deleted.
+
+Known positive claim metadata with a missing operation or mismatched release
+remains retained as AuditPending. An orphan release has no claim bytes to
+attribute; its immutable evidence is retained as a bounded diagnostic and
+keeps the rebuild recovery-only without fabricating a charge. These cases
+produce at most 32 diagnostics of 256 characters each. A malformed claim or
+release page,
+unparseable identity, non-positive amount, or checked aggregate overflow yields
+ReconciliationRequired; the provider is left unchanged and no optimistic
+capacity is installed. RecoveryOnly can retain known charges for audit, but
+ordinary qualification and admission remain unavailable.
+
+The private provider rebuild image is sealed by the store. It carries each
+claim's operation, claim identity, volume, allocation class, bytes, exact
+release identity when present, and audit disposition. Staging validates all
+identities, duplicate release IDs, positive bytes, checked per-operation and
+aggregate sums, then installs atomically into an empty ledger. An exact replay
+is accepted only when the current live ledger still has the same canonical
+claims, residual charges, dispositions, and release history; a changed or
+non-empty conflicting ledger is rejected without mutation. This prevents a
+post-rebuild release or admission from being resurrected by a stale snapshot.
+
+The bounded OPT-1560 checklist is:
+
+- run owner acquisition, reserve installation, live proof, journal snapshot,
+  and provider rebuild in that order on the owner thread;
+- page and validate every claim and release relation, including orphan and
+  malformed evidence, while preserving rows and bounded diagnostics;
+- rebuild multi-operation, multi-claim, multi-volume and multi-class residual
+  aggregates with checked arithmetic and exact release history;
+- replay after reopen and after one or more releases, reject a changed live
+  ledger, and retain the provider when a repeated rebuild conflicts;
+- exercise crash/reopen fixtures across charge, pre-intent, settlement,
+  durable-intent, and release commit boundaries, plus a page set larger than
+  256 rows and proof failure;
+- keep recovery evidence and ordinary admission fail-closed; do not qualify
+  production capacity, replenish the reserve, delete physical data, or wire
+  chunks, families, or new public commands.
+
 The bounded OPT-1559 checklist is:
 
 - migrate v5 databases to strict schema v6 and reject unknown objects, columns,
