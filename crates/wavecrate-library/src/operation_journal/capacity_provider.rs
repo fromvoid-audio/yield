@@ -235,6 +235,28 @@ impl CapacityProvider {
         Ok(())
     }
 
+    /// Verify that the owner-thread ledger already represents the current durable image without
+    /// installing or replacing anything. A changed image is a recovery result for the caller;
+    /// admission rejection must never mutate live accounting as a side effect.
+    pub(crate) fn validate_rebuilt_claims(
+        &self,
+        snapshot: &OrdinaryClaimRebuildSnapshot,
+    ) -> Result<(), CapacityProviderError> {
+        if !snapshot.readiness().can_install() {
+            return Err(CapacityProviderError::RebuildNotReady);
+        }
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        let canonical = stage_rebuilt_ledger(snapshot.claims(), INITIAL_LEASE_TOKEN)?;
+        if ledger_matches_rebuild(&ledger, &canonical) {
+            Ok(())
+        } else {
+            Err(CapacityProviderError::RebuildLedgerConflict)
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn qualified_fixture(facts: BTreeMap<VolumeIdentity, VolumeFacts>) -> Self {
         Self {
@@ -252,6 +274,84 @@ impl CapacityProvider {
         if self.qualification == ProviderQualification::Unavailable {
             return Err(CapacityProviderError::Unavailable);
         }
+        let facts = self
+            .facts
+            .as_ref()
+            .ok_or(CapacityProviderError::UnsupportedFacts)?;
+        self.admit_with_facts(plan, claims, &facts.by_volume)
+    }
+
+    /// Admit once against a fresh owner-created descriptor witness. The witness borrows the
+    /// retained owner/profile/reserve authorities and is consumed synchronously; it cannot be
+    /// queued, cloned, or reused as an admission token.
+    pub(crate) fn admit_with_live_witness(
+        &self,
+        plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+        witness: super::owner::LiveAdmissionWitness<'_>,
+    ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
+        self.admit_with_facts(plan, claims, witness.facts())
+    }
+
+    /// Test-only arithmetic seam. Production callers must provide an owner-created witness.
+    #[cfg(test)]
+    fn admit_with_fresh_facts(
+        &self,
+        plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+        facts: &BTreeMap<VolumeIdentity, VolumeFacts>,
+    ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
+        self.admit_with_facts(plan, claims, facts)
+    }
+
+    /// Check stable claim identities before any lease token or ledger mutation is created.
+    pub(crate) fn validate_claim_identities_available(
+        &self,
+        claims: &AdmissionClaimInventory,
+    ) -> Result<(), CapacityProviderError> {
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        for claim in claims.claims() {
+            if ledger.released_claims.contains_key(&claim.claim_id())
+                || ledger
+                    .charges_by_token
+                    .values()
+                    .any(|charge| charge.claims.contains_key(&claim.claim_id()))
+            {
+                return Err(CapacityProviderError::DuplicateClaim {
+                    claim_id: claim.claim_id(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject admission while a previous persistence outcome is still audit-pending. Durable
+    /// ordinary charges may coexist with a new request; an uncertain write cannot.
+    pub(crate) fn validate_recovery_state(&self) -> Result<(), CapacityProviderError> {
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        if ledger.charges_by_token.values().any(|charge| {
+            matches!(
+                charge.disposition,
+                ProvisionalLeaseDisposition::AuditPending { .. }
+            )
+        }) {
+            return Err(CapacityProviderError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    fn admit_with_facts(
+        &self,
+        plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+        facts: &BTreeMap<VolumeIdentity, VolumeFacts>,
+    ) -> Result<ProvisionalCapacityLease, CapacityProviderError> {
         if plan.allocations().len() > MAX_FULL_CAPACITY_ALLOCATIONS {
             return Err(CapacityProviderError::InvalidPlan);
         }
@@ -268,20 +368,17 @@ impl CapacityProvider {
             .validate_against(plan)
             .map_err(|_| CapacityProviderError::InvalidClaims)?;
 
-        let facts = self
-            .facts
-            .as_ref()
-            .ok_or(CapacityProviderError::UnsupportedFacts)?;
         let mut charge_by_key = BTreeMap::new();
         let mut planned_by_volume = BTreeMap::new();
         let mut seen_volumes = BTreeSet::new();
         for allocation in plan.allocations() {
             let volume = allocation.volume().clone();
-            let observed = facts.by_volume.get(&volume).ok_or_else(|| {
-                CapacityProviderError::FactsUnavailable {
-                    volume: volume.clone(),
-                }
-            })?;
+            let observed =
+                facts
+                    .get(&volume)
+                    .ok_or_else(|| CapacityProviderError::FactsUnavailable {
+                        volume: volume.clone(),
+                    })?;
             if observed.identity != volume {
                 return Err(CapacityProviderError::UnsupportedFacts);
             }
@@ -323,7 +420,6 @@ impl CapacityProvider {
 
         for volume in seen_volumes {
             let observed = facts
-                .by_volume
                 .get(&volume)
                 .ok_or(CapacityProviderError::UnsupportedFacts)?;
             if observed.free_bytes <= PROTECTED_FREE_SPACE_FLOOR {
@@ -858,6 +954,78 @@ pub(crate) enum ProvisionalLeaseDisposition {
 }
 
 impl ProvisionalCapacityLease {
+    /// Verify that this exact owner-thread lease still binds the supplied immutable plan and
+    /// claim inventory before a caller consumes it for durable settlement.
+    pub(crate) fn validate_against(
+        &self,
+        provider: &CapacityProvider,
+        plan: &FullCapacityPlan,
+        claims: &AdmissionClaimInventory,
+    ) -> Result<(), CapacityProviderError> {
+        if !Rc::ptr_eq(&self.ledger, &provider.ledger) {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        if !matches!(self.disposition, ProvisionalLeaseDisposition::Provisional) {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        plan.validate()
+            .map_err(|_| CapacityProviderError::InvalidPlan)?;
+        claims
+            .validate_against(plan)
+            .map_err(|_| CapacityProviderError::InvalidClaims)?;
+        let expected = plan
+            .allocations()
+            .iter()
+            .map(|allocation| {
+                (
+                    ChargeKey {
+                        volume: allocation.volume().clone(),
+                        allocation_class: allocation.class(),
+                    },
+                    allocation.allocated_bytes(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if expected != self.charges {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        let mut expected_claim_ids = claims
+            .claims()
+            .iter()
+            .map(AdmissionClaim::claim_id)
+            .collect::<Vec<_>>();
+        expected_claim_ids.sort();
+        let mut actual_claim_ids = self.claim_ids.clone();
+        actual_claim_ids.sort();
+        if expected_claim_ids != actual_claim_ids {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        let Some(entry) = ledger.charges_by_token.get(&self.token) else {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        };
+        if entry.charges != self.charges
+            || entry.claims.len() != claims.claims().len()
+            || claims.claims().iter().any(|claim| {
+                entry
+                    .claims
+                    .get(&claim.claim_id())
+                    .map_or(true, |retained| {
+                        retained.volume != *claim.volume()
+                            || retained.allocation_class != claim.allocation_class()
+                            || retained.allocated_bytes != claim.allocated_bytes()
+                            || retained.release_id.is_some()
+                    })
+            })
+        {
+            return Err(CapacityProviderError::LeaseDispositionConflict);
+        }
+        Ok(())
+    }
+
     pub(crate) fn release(&mut self) -> Result<(), CapacityProviderError> {
         match &self.disposition {
             ProvisionalLeaseDisposition::Released => return Ok(()),
@@ -1089,6 +1257,8 @@ pub(crate) enum CapacityProviderError {
     Unavailable,
     #[error("capacity plan validation failed")]
     InvalidPlan,
+    #[error("admission claim identity is already retained: {claim_id}")]
+    DuplicateClaim { claim_id: AdmissionClaimId },
     #[error("admission claim validation failed")]
     InvalidClaims,
     #[error("capacity facts are unavailable for volume {volume:?}")]
@@ -1128,6 +1298,8 @@ pub(crate) enum CapacityProviderError {
     ClaimReleaseConflict,
     #[error("provisional capacity is retained by a durable or audit-pending intent")]
     LeaseRetained,
+    #[error("capacity admission is blocked by an unresolved persistence outcome")]
+    RecoveryRequired,
     #[error("provisional lease disposition does not match the requested operation")]
     LeaseDispositionConflict,
     #[error("provisional capacity cannot transfer to a durable intent yet")]
@@ -1357,6 +1529,101 @@ mod tests {
             provider.prove_no_live_charges(),
             Err(CapacityProviderError::RebuildLedgerConflict)
         ));
+    }
+
+    #[test]
+    fn fresh_descriptor_facts_can_admit_unqualified_production_provider_once() {
+        let volume = VolumeIdentity { device: 106 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let (plan, claims) = plan_and_claims(&[(volume.clone(), class, 4096, 4096)]);
+        let provider = CapacityProvider::unavailable();
+        let mut observations = BTreeMap::new();
+        observations.insert(
+            volume.clone(),
+            facts(106, PROTECTED_FREE_SPACE_FLOOR + 8192, 4096),
+        );
+        let lease = provider
+            .admit_with_fresh_facts(&plan, &claims, &observations)
+            .expect("fresh retained facts admit one provisional lease");
+        assert_eq!(provider.outstanding(&volume, class), 4096);
+        drop(lease);
+        assert_eq!(provider.outstanding(&volume, class), 0);
+        assert!(matches!(
+            provider.admit(&plan, &claims),
+            Err(CapacityProviderError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn fresh_fact_rejections_leave_provider_ledger_unchanged() {
+        let volume = VolumeIdentity { device: 107 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let (plan, claims) = plan_and_claims(&[(volume.clone(), class, 4096, 4096)]);
+        let provider = CapacityProvider::unavailable();
+
+        let mut low = BTreeMap::new();
+        low.insert(volume.clone(), facts(107, PROTECTED_FREE_SPACE_FLOOR, 4096));
+        assert!(matches!(
+            provider.admit_with_fresh_facts(&plan, &claims, &low),
+            Err(CapacityProviderError::RecoveryReserveLow { .. })
+        ));
+
+        let mut wrong_unit = BTreeMap::new();
+        wrong_unit.insert(
+            volume.clone(),
+            facts(107, PROTECTED_FREE_SPACE_FLOOR + 8192, 8192),
+        );
+        assert!(matches!(
+            provider.admit_with_fresh_facts(&plan, &claims, &wrong_unit),
+            Err(CapacityProviderError::UnsupportedAllocationUnit { .. })
+        ));
+        assert_eq!(provider.claim_count(), 0);
+        assert_eq!(provider.outstanding(&volume, class), 0);
+    }
+
+    #[test]
+    fn provisional_lease_rejects_settlement_through_a_foreign_provider() {
+        let volume = VolumeIdentity { device: 109 };
+        let class = FullCapacityAllocationClass::DestinationStaging;
+        let (plan, claims) = plan_and_claims(&[(volume.clone(), class, 4096, 4096)]);
+        let mut observations = BTreeMap::new();
+        observations.insert(
+            volume.clone(),
+            facts(109, PROTECTED_FREE_SPACE_FLOOR + 8192, 4096),
+        );
+        let provider = CapacityProvider::unavailable();
+        let foreign = CapacityProvider::unavailable();
+        let lease = provider
+            .admit_with_fresh_facts(&plan, &claims, &observations)
+            .expect("test lease");
+        assert_eq!(
+            lease.validate_against(&foreign, &plan, &claims),
+            Err(CapacityProviderError::LeaseDispositionConflict)
+        );
+        drop(lease);
+        assert_eq!(provider.claim_count(), 0);
+        assert_eq!(foreign.claim_count(), 0);
+    }
+
+    #[test]
+    fn audit_pending_ledger_state_blocks_new_prepared_admission() {
+        let provider = CapacityProvider::unavailable();
+        let snapshot = rebuild_snapshot(vec![rebuild_claim(
+            OperationId::new(),
+            AdmissionClaimId::new(),
+            VolumeIdentity { device: 108 },
+            FullCapacityAllocationClass::DestinationStaging,
+            4096,
+            None,
+            true,
+        )]);
+        provider
+            .install_rebuilt_claims(&snapshot)
+            .expect("audit-pending image installs for retention");
+        assert_eq!(
+            provider.validate_recovery_state(),
+            Err(CapacityProviderError::RecoveryRequired)
+        );
     }
 
     #[test]

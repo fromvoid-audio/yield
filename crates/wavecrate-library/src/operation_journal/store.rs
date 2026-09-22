@@ -842,7 +842,7 @@ enum OrdinaryClaimReleaseTransition {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InsertTestBoundary {
+pub(crate) enum InsertTestBoundary {
     BeforeBegin,
     BeforePrecommitValidation,
     Rollback,
@@ -852,7 +852,7 @@ enum InsertTestBoundary {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReleaseTestBoundary {
+pub(crate) enum ReleaseTestBoundary {
     BeforeBegin,
     BeforePrecommitValidation,
     Rollback,
@@ -876,7 +876,7 @@ struct OpenHooks<'a> {
 }
 
 #[cfg(test)]
-enum InsertTestDirective {
+pub(crate) enum InsertTestDirective {
     Continue,
     Fail(OperationJournalStoreError),
     FailAndLeaveForRollback(OperationJournalStoreError),
@@ -885,7 +885,7 @@ enum InsertTestDirective {
 
 #[cfg(test)]
 #[allow(dead_code)]
-enum ReleaseTestDirective {
+pub(crate) enum ReleaseTestDirective {
     Continue,
     Fail(OperationJournalStoreError),
     FailAndLeaveForRollback(OperationJournalStoreError),
@@ -1464,6 +1464,52 @@ impl OperationJournalStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_active_recovery_charge_for_test(
+        &self,
+        operation_id: OperationId,
+        volume: &VolumeIdentity,
+        budget_bytes: u64,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace()?;
+        let charge_id = Uuid::new_v4();
+        let transition_id = Uuid::new_v4();
+        let budget = i64::try_from(budget_bytes).map_err(|_| {
+            OperationJournalStoreError::InconsistentRecord {
+                reason: String::from("test recovery budget exceeds SQLite INTEGER"),
+            }
+        })?;
+        self.connection.execute(
+            &format!(
+                "INSERT INTO {table}
+                 (charge_id, volume_device, active_volume_device, operation_id, purpose,
+                  budget_bytes, margin_bytes, precharge_capacity_bytes, remaining_bytes,
+                  state, transition_sequence)
+                 VALUES (?1, ?2, ?2, ?3, 'OperationRecovery', ?4, 0, ?5, ?4,
+                         'Charged', 1)",
+                table = recovery_reserve::CHARGE_TABLE_NAME
+            ),
+            params![
+                charge_id.to_string(),
+                volume.device.to_string(),
+                operation_id.to_string(),
+                budget,
+                budget,
+            ],
+        )?;
+        self.connection.execute(
+            &format!(
+                "INSERT INTO {table}
+                 (charge_id, transition_id, transition_sequence, kind, amount_bytes,
+                  remaining_bytes, state)
+                 VALUES (?1, ?2, 1, 'Charged', ?3, ?3, 'Charged')",
+                table = recovery_reserve::TRANSITION_TABLE_NAME
+            ),
+            params![charge_id.to_string(), transition_id.to_string(), budget],
+        )?;
+        Ok(())
+    }
+
     /// Read one consistent private ordinary-claim image for owner-thread restart rebuilding.
     ///
     /// The read transaction uses the existing bounded UUID pages for both claim relations and
@@ -1488,6 +1534,50 @@ impl OperationJournalStore {
         self.connection.execute_batch("ROLLBACK")?;
         self.validate_namespace()?;
         Ok(snapshot)
+    }
+
+    /// Read the ordinary-claim image and recovery-reserve history in one consistent admission
+    /// audit. Ordinary durable charges may coexist with a new request, but any active, malformed,
+    /// or otherwise unresolved recovery-reserve row keeps the owner recovery-only. This method
+    /// only observes durable state; it never installs a provider image or changes accounting.
+    pub(crate) fn rebuild_admission_snapshot(
+        &self,
+    ) -> Result<OrdinaryClaimRebuildSnapshot, OperationJournalStoreError> {
+        self.validate_namespace()?;
+        self.connection.execute_batch("BEGIN")?;
+        let result = (|| {
+            let snapshot = self.rebuild_ordinary_claim_snapshot_inside_transaction()?;
+            recovery_reserve::prove_no_active_charges(&self.connection).map_err(|error| {
+                audit_error(
+                    &self.database_path,
+                    format!("recovery reserve admission audit failed: {error}"),
+                )
+            })?;
+            self.validate_namespace_for_precommit()?;
+            Ok(snapshot)
+        })();
+        match result {
+            Ok(snapshot) => {
+                self.connection.execute_batch("ROLLBACK")?;
+                self.validate_namespace()?;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Validate one prepared initial-intent record without touching the journal connection.
+    /// Callers use this before allocating a real operation identity or reserving capacity.
+    pub(crate) fn validate_initial_intent_record(
+        record: &StoredOperationRecord,
+    ) -> Result<(), OperationJournalStoreError> {
+        validate_intent_record(record)?;
+        encode(record)
+            .map(|_| ())
+            .map_err(OperationJournalStoreError::from)
     }
 
     /// Establish structured durable-zero evidence for the orderly volume-owner handoff.
@@ -4882,10 +4972,38 @@ impl OperationJournalStore {
         claims.validate_against(&full_plan)?;
         ordinary_claims::validate_storage_values(claims)
             .map_err(|error| InitialClaimSettlementError::ClaimStorage(error.to_string()))?;
+        let lease = provider.admit(&full_plan, claims)?;
+        self.settle_initial_claims_with_lease(record, claims, provider, lease)
+    }
+
+    /// Settle an already-admitted owner-thread lease against one immutable initial intent.
+    ///
+    /// The caller owns the single provisional admission. This method only pins that lease,
+    /// persists the intent and ordinary rows atomically, and applies the existing committed,
+    /// rollback, or uncertain outcome rules; it never calls the provider a second time.
+    pub(crate) fn settle_initial_claims_with_lease(
+        &self,
+        record: &StoredOperationRecord,
+        claims: &AdmissionClaimInventory,
+        provider: &CapacityProvider,
+        mut lease: ProvisionalCapacityLease,
+    ) -> Result<InitialClaimSettlement, InitialClaimSettlementError> {
+        validate_intent_record(record).map_err(InitialClaimSettlementError::Store)?;
+        let legacy_plan = record
+            .capacity_plan
+            .as_ref()
+            .ok_or(OperationJournalStoreError::MissingCapacityPlan)
+            .map_err(InitialClaimSettlementError::Store)?;
+        let full_plan = FullCapacityPlan::from_legacy(legacy_plan)?;
+        claims.validate_against(&full_plan)?;
+        ordinary_claims::validate_storage_values(claims)
+            .map_err(|error| InitialClaimSettlementError::ClaimStorage(error.to_string()))?;
         let encoded = encode(record)
             .map_err(OperationJournalStoreError::from)
             .map_err(InitialClaimSettlementError::Store)?;
-        let mut lease = provider.admit(&full_plan, claims)?;
+        lease
+            .validate_against(provider, &full_plan, claims)
+            .map_err(InitialClaimSettlementError::Capacity)?;
         lease
             .pin_for_persistence(record.operation_id)
             .map_err(InitialClaimSettlementError::Capacity)?;
@@ -5427,7 +5545,7 @@ impl OperationJournalStore {
     }
 
     #[cfg(test)]
-    fn set_insert_test_hook<F>(&self, hook: F)
+    pub(crate) fn set_insert_test_hook<F>(&self, hook: F)
     where
         F: FnMut(InsertTestBoundary) -> InsertTestDirective + Send + 'static,
     {

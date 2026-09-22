@@ -227,6 +227,25 @@ impl SourceAuthorityRequest {
         Ok(())
     }
 
+    /// Revalidate a source registration immediately before an owner-side capacity transition.
+    /// Descriptor identity alone is not sufficient: the source owner may have dropped or drained
+    /// its guard since registration, so the journal must observe the shared lifecycle state again
+    /// without consuming a fresh physical-use confirmation.
+    pub(crate) fn validate_registered_boundary(
+        &self,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+    ) -> Result<(), SourceAuthorityError> {
+        self.validate_consuming_boundary(profile_guard)?;
+        if !self.state.lease_liveness.load(Ordering::Acquire) {
+            return Err(SourceAuthorityError::ConfirmationStale);
+        }
+        match self.state.phase() {
+            REGISTERED => Ok(()),
+            DRAINING | RETIRED | ABANDONED => Err(SourceAuthorityError::ConfirmationClosed),
+            _ => Err(SourceAuthorityError::InvalidLifecycle),
+        }
+    }
+
     /// Consume a fresh source-owner confirmation for one installation/use proof.
     pub(crate) fn accept_confirmation(
         &self,

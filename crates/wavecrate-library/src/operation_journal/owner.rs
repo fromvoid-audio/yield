@@ -9,6 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -18,34 +20,52 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::app_dirs::WritableProfileGuard;
-use crate::durable_capacity::{VolumeFacts, VolumeIdentity, descriptor_capacity_facts};
+use crate::durable_capacity::{
+    PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity, descriptor_capacity_facts,
+};
 use crate::sample_sources::db::{
     SourceAuthorityDrainMarker, SourceAuthorityError, SourceAuthorityRegistrationReceipt,
     SourceAuthorityRegistrationRequest, SourceAuthorityRequest, SourceAuthorityRetirementAck,
 };
 
-use super::capacity_provider::{self, CapacityProvider, CapacityRebuildReadiness};
+use super::admission_claims::{AdmissionClaimId, AdmissionClaimInventory};
+use super::capacity_provider::{
+    self, CapacityProvider, CapacityProviderError, CapacityRebuildReadiness,
+};
 use super::capacity_reserve_namespace::{OwnedReserveAllocation, PhysicalReserveProof};
 use super::capacity_volume_owner::VolumeOwnershipCapability;
 use super::codec::{CappedWriter, DecodeError, EncodeError, StoredOperationRecord, decode, encode};
 use super::coordinator::{RetryObservation, UniversalCommandArgs};
+use super::full_capacity::{FullCapacityLegacyProjectionError, FullCapacityPlan};
 use super::full_progress_codec::{
     FullProgressCodecError, StoredFullProgressRecord, decode as decode_full_progress,
     encode as encode_full_progress,
 };
-use super::model::{CancellationRequestObservation, MAX_RECORD_BYTES, OperationId};
+use super::model::{
+    CancellationRequestObservation, MAX_RECORD_BYTES, OperationId, OperationIntent, UniversalIntent,
+};
 use super::participants::ParticipantSet;
 use super::store::recovery::{
     CoordinatorRecoveryPage, RecoveryCursor, RecoveryPage, RecoveryScanError,
 };
 use super::store::{
-    FullProgressWriteOutcome, JournalCancelRequestReceipt, JournalInsertOutcome,
+    FullProgressWriteOutcome, InitialClaimSettlementError, JournalCancelRequestReceipt,
+    JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt, JournalInsertWriteStage,
     JournalRetryReceipt, OperationJournalStore, OperationJournalStoreError,
     SourceReserveBindingFailure,
 };
 use super::work_plan::derive_work_plan;
 
 const CONTROL_INPUT_BYTES: usize = 1;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedAdmissionFactsFault {
+    LowReserve,
+    DiskPressure,
+    Unsupported,
+    Replaced,
+}
 
 /// Maximum number of journal commands waiting for the storage owner.
 pub const OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY: usize = 32;
@@ -135,6 +155,180 @@ pub enum OperationJournalOwnerQueueError {
     Closed,
 }
 
+/// Typed rejection from the common prepared-admission boundary.  These values retain only
+/// bounded facts and identities; they never carry a provider lease, descriptor, or other
+/// execution authority across the queue.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PreparedAdmissionError {
+    /// The plan or command envelope cannot be represented by the current initial-intent codec.
+    #[error("prepared admission input is unsupported: {reason}")]
+    Unsupported {
+        /// Bounded explanation of the unsupported input.
+        reason: String,
+    },
+    /// Durable ordinary-claim evidence is not safe to coexist with a new intent.
+    #[error("prepared admission is blocked by journal recovery: {reason}")]
+    RecoveryRequired {
+        /// Bounded recovery diagnostic.
+        reason: String,
+    },
+    /// The retained recovery reserve is below the protected floor.
+    #[error("prepared admission recovery reserve is low on {volume:?}: {free_bytes} bytes free")]
+    RecoveryReserveLow {
+        /// Volume whose protected reserve is low.
+        volume: VolumeIdentity,
+        /// Fresh free-space observation.
+        free_bytes: u64,
+    },
+    /// Existing ledger pressure leaves only recovery-only free space.
+    #[error(
+        "prepared admission requires {required_bytes} bytes on {volume:?}, only {available_bytes} remain"
+    )]
+    DiskPressureRecoveryOnly {
+        /// Volume whose incremental capacity is pressured.
+        volume: VolumeIdentity,
+        /// Checked bytes required by existing and new claims.
+        required_bytes: u64,
+        /// Checked bytes available above the protected floor.
+        available_bytes: u64,
+    },
+    /// The retained descriptor or owner authority could not produce a fresh observation.
+    #[error("prepared admission descriptor refresh was rejected: {reason}")]
+    DescriptorRefreshRejected {
+        /// Bounded stale, replaced, offline, or unsupported-authority diagnostic.
+        reason: String,
+    },
+    /// The stable claim identity already exists in live or durable history.
+    #[error("prepared admission claim identity is already retained: {claim_id}")]
+    DuplicateClaim {
+        /// Existing stable claim identity.
+        claim_id: AdmissionClaimId,
+    },
+    /// The provider or store could not retain an unambiguous typed result.
+    #[error("prepared admission failed: {reason}")]
+    Failed {
+        /// Bounded failure diagnostic.
+        reason: String,
+    },
+}
+
+/// Durable settlement was retained after an operation identity was allocated. Callers must keep
+/// this identity and claim set for owner-thread reconciliation; it is not a pre-ID gate result.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PreparedAdmissionRetainedError {
+    /// The intent committed, but provider disposition/readback acknowledgement was not complete.
+    #[error("prepared admission committed but requires reconciliation for {receipt:?}: {reason}")]
+    Committed {
+        /// Exact durable intent receipt.
+        receipt: JournalInsertReceipt,
+        /// Stable claim identities bound to the retained capacity.
+        claim_ids: Vec<AdmissionClaimId>,
+        /// Bounded reconciliation reason.
+        reason: String,
+    },
+    /// The journal write outcome is uncertain and the provider charge remains retained.
+    #[error(
+        "prepared admission persistence remains uncertain for {operation_id} at {stage:?}: {reason}"
+    )]
+    Uncertain {
+        /// Operation identity supplied to the attempted insert.
+        operation_id: OperationId,
+        /// Stable claim identities retained by the lease.
+        claim_ids: Vec<AdmissionClaimId>,
+        /// Durable write boundary reached by the attempt.
+        stage: JournalInsertWriteStage,
+        /// Sequence selected before a post-insert failure, when known.
+        attempted_sequence: Option<i64>,
+        /// Bounded reconciliation reason.
+        reason: String,
+    },
+}
+
+impl PreparedAdmissionRetainedError {
+    fn from_failure(failure: JournalInsertFailure, claim_ids: Vec<AdmissionClaimId>) -> Self {
+        let operation_id = failure.operation_id();
+        let stage = failure.stage();
+        let attempted_sequence = failure.attempted_sequence();
+        let reason = failure.error().to_string();
+        Self::Uncertain {
+            operation_id,
+            claim_ids,
+            stage,
+            attempted_sequence,
+            reason,
+        }
+    }
+
+    fn from_failure_with_reason(
+        failure: JournalInsertFailure,
+        claim_ids: Vec<AdmissionClaimId>,
+        reason: String,
+    ) -> Self {
+        let operation_id = failure.operation_id();
+        let stage = failure.stage();
+        let attempted_sequence = failure.attempted_sequence();
+        Self::Uncertain {
+            operation_id,
+            claim_ids,
+            stage,
+            attempted_sequence,
+            reason,
+        }
+    }
+}
+
+/// The owner allocated an identity, then confirmed rollback and released the provisional charge.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("prepared admission rolled back for {operation_id}: {reason}")]
+pub struct PreparedAdmissionRolledBackError {
+    /// Operation identity whose intent did not remain durable.
+    pub operation_id: OperationId,
+    /// Bounded rollback reason.
+    pub reason: String,
+}
+
+impl From<CapacityProviderError> for PreparedAdmissionError {
+    fn from(error: CapacityProviderError) -> Self {
+        match error {
+            CapacityProviderError::RecoveryReserveLow { volume, free_bytes } => {
+                Self::RecoveryReserveLow { volume, free_bytes }
+            }
+            CapacityProviderError::DiskPressureRecoveryOnly {
+                volume,
+                required_bytes,
+                available_bytes,
+            } => Self::DiskPressureRecoveryOnly {
+                volume,
+                required_bytes,
+                available_bytes,
+            },
+            CapacityProviderError::DuplicateClaim { claim_id } => Self::DuplicateClaim { claim_id },
+            CapacityProviderError::FactsUnavailable { volume } => Self::DescriptorRefreshRejected {
+                reason: format!("fresh descriptor facts are unavailable for {volume:?}"),
+            },
+            CapacityProviderError::UnsupportedFacts => Self::DescriptorRefreshRejected {
+                reason: String::from("fresh descriptor facts are unsupported"),
+            },
+            CapacityProviderError::UnsupportedAllocationUnit { volume } => {
+                Self::DescriptorRefreshRejected {
+                    reason: format!(
+                        "fresh descriptor allocation unit is unsupported for {volume:?}"
+                    ),
+                }
+            }
+            CapacityProviderError::Unavailable => Self::DescriptorRefreshRejected {
+                reason: String::from("capacity provider is unavailable for live admission"),
+            },
+            CapacityProviderError::RecoveryRequired => Self::RecoveryRequired {
+                reason: String::from("an earlier persistence outcome remains audit-pending"),
+            },
+            other => Self::Failed {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
 /// Failure returned by an admitted journal command.
 #[derive(Debug, Error)]
 pub enum OperationJournalOwnerError {
@@ -166,6 +360,15 @@ pub enum OperationJournalOwnerError {
         /// request was rejected before the owner installed any registration state.
         receipt: Option<SourceAuthorityRegistrationReceipt>,
     },
+    /// The common prepared-admission gate rejected before durable intent allocation.
+    #[error(transparent)]
+    PreparedAdmission(#[from] PreparedAdmissionError),
+    /// The owner allocated an identity but retained an uncertain or committed settlement.
+    #[error(transparent)]
+    PreparedAdmissionRetained(#[from] PreparedAdmissionRetainedError),
+    /// The owner allocated an identity and confirmed rollback before returning the failure.
+    #[error(transparent)]
+    PreparedAdmissionRolledBack(#[from] PreparedAdmissionRolledBackError),
     /// An internally serialized control input could not be decoded on the owner thread.
     #[error("operation journal owner control input could not be decoded: {reason}")]
     InvalidInput {
@@ -261,6 +464,216 @@ pub struct OperationJournalClient {
     shared: Arc<OwnerShared>,
 }
 
+/// A private, authority-free initial-admission template.  It is intentionally separate from
+/// `OperationId`: the owner allocates that identity only after this template, fresh descriptor
+/// facts, current recovery evidence, and the one provisional lease have all passed validation.
+pub(crate) struct PreparedAdmissionInput {
+    intent: OperationIntent,
+    universal_intent: UniversalIntent,
+    args: UniversalCommandArgs,
+    participants: ParticipantSet,
+    plan: FullCapacityPlan,
+    claims: AdmissionClaimInventory,
+    timestamp_unix_ms: i64,
+    #[cfg(test)]
+    facts_fault: Option<PreparedAdmissionFactsFault>,
+}
+
+impl PreparedAdmissionInput {
+    fn validate_shape(&self) -> Result<(), PreparedAdmissionError> {
+        if self.timestamp_unix_ms < 0 {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: String::from("prepared admission timestamp must be non-negative"),
+            });
+        }
+        self.participants
+            .validate_for_new_intent()
+            .map_err(|error| PreparedAdmissionError::Unsupported {
+                reason: error.to_string(),
+            })?;
+        self.args
+            .validate_against_participants(&self.participants)
+            .map_err(|error| PreparedAdmissionError::Unsupported {
+                reason: error.to_string(),
+            })?;
+        derive_work_plan(&self.args, &self.participants).map_err(|error| {
+            PreparedAdmissionError::Unsupported {
+                reason: error.to_string(),
+            }
+        })?;
+        if self.universal_intent.participants() != &self.participants {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: String::from(
+                    "prepared admission universal intent participants do not match its template",
+                ),
+            });
+        }
+        self.universal_intent
+            .validate_for_new_intent(
+                self.validation_operation_id(),
+                self.intent.actor,
+                &self.intent.kind,
+            )
+            .map_err(|error| PreparedAdmissionError::Unsupported {
+                reason: error.to_string(),
+            })?;
+        if self.universal_intent.command_kind() != self.args.command_kind() {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: String::from(
+                    "prepared admission universal intent command does not match its arguments",
+                ),
+            });
+        }
+        if matches!(
+            &self.args,
+            UniversalCommandArgs::DecodedEdit(_)
+                | UniversalCommandArgs::DecodedExport(_)
+                | UniversalCommandArgs::DecodedExportBatch(_)
+        ) {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: String::from(
+                    "full-progress-only command arguments have no initial-intent codec",
+                ),
+            });
+        }
+        self.plan
+            .try_into_legacy()
+            .map_err(|error| match error {
+                FullCapacityLegacyProjectionError::InvalidPlan(error) => {
+                    PreparedAdmissionError::Unsupported {
+                        reason: error.to_string(),
+                    }
+                }
+                FullCapacityLegacyProjectionError::UnsupportedAllocationClass => {
+                    PreparedAdmissionError::Unsupported {
+                        reason: String::from(
+                            "operation recovery payload is not representable in the initial intent plan",
+                        ),
+                    }
+                }
+            })?;
+        self.claims.validate_against(&self.plan).map_err(|error| {
+            PreparedAdmissionError::Unsupported {
+                reason: error.to_string(),
+            }
+        })?;
+        if self.plan.allocations().iter().any(|allocation| {
+            allocation.logical_bytes() > i64::MAX as u64
+                || allocation.allocated_bytes() > i64::MAX as u64
+                || allocation.protected_free_bytes() > i64::MAX as u64
+        }) || self
+            .claims
+            .claims()
+            .iter()
+            .any(|claim| claim.allocated_bytes() > i64::MAX as u64)
+        {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: String::from("prepared admission exceeds SQLite integer bounds"),
+            });
+        }
+        let validation_record =
+            prepared_record(self.validation_operation_id(), self, self.legacy_plan()?).map_err(
+                |error| PreparedAdmissionError::Unsupported {
+                    reason: error.to_string(),
+                },
+            )?;
+        OperationJournalStore::validate_initial_intent_record(&validation_record).map_err(
+            |error| PreparedAdmissionError::Unsupported {
+                reason: error.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn validation_operation_id(&self) -> OperationId {
+        let parent = self.universal_intent.parent_operation_id();
+        [
+            uuid::Uuid::nil(),
+            uuid::Uuid::from_u128(u128::MAX),
+            uuid::Uuid::from_u128(1),
+        ]
+        .into_iter()
+        .find(|candidate| parent.is_none_or(|parent| parent.as_uuid() != *candidate))
+        .map(OperationId::from_uuid)
+        .expect("one validation operation identity must differ from one optional parent")
+    }
+
+    /// Build one validated common-admission template for a future owner adapter. The fields stay
+    /// private so callers cannot forge a partially checked queued command or carry authority in
+    /// the request; the owner repeats the validation at execution time.
+    #[allow(dead_code)]
+    pub(crate) fn try_new(
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        args: UniversalCommandArgs,
+        participants: ParticipantSet,
+        plan: FullCapacityPlan,
+        claims: AdmissionClaimInventory,
+        timestamp_unix_ms: i64,
+    ) -> Result<Self, PreparedAdmissionError> {
+        let prepared = Self {
+            intent,
+            universal_intent,
+            args,
+            participants,
+            plan,
+            claims,
+            timestamp_unix_ms,
+            #[cfg(test)]
+            facts_fault: None,
+        };
+        prepared.validate_shape()?;
+        Ok(prepared)
+    }
+
+    fn legacy_plan(
+        &self,
+    ) -> Result<crate::durable_capacity::DurableCapacityPlan, PreparedAdmissionError> {
+        self.plan.try_into_legacy().map_err(|error| match error {
+            FullCapacityLegacyProjectionError::InvalidPlan(error) => {
+                PreparedAdmissionError::Unsupported {
+                    reason: error.to_string(),
+                }
+            }
+            FullCapacityLegacyProjectionError::UnsupportedAllocationClass => {
+                PreparedAdmissionError::Unsupported {
+                    reason: String::from(
+                        "operation recovery payload is not representable in the initial intent plan",
+                    ),
+                }
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        intent: OperationIntent,
+        universal_intent: UniversalIntent,
+        args: UniversalCommandArgs,
+        participants: ParticipantSet,
+        plan: FullCapacityPlan,
+        claims: AdmissionClaimInventory,
+    ) -> Self {
+        Self {
+            intent,
+            universal_intent,
+            args,
+            participants,
+            plan,
+            claims,
+            timestamp_unix_ms: 1,
+            #[cfg(test)]
+            facts_fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_facts_fault(mut self, fault: PreparedAdmissionFactsFault) -> Self {
+        self.facts_fault = Some(fault);
+        self
+    }
+}
+
 /// The single asynchronous owner of one already-open operation journal.
 ///
 /// The supplied store must have passed the caller's recovery gate before handoff. The owner takes
@@ -268,6 +681,8 @@ pub struct OperationJournalClient {
 pub struct OperationJournalOwner {
     shared: Arc<OwnerShared>,
     worker: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    prepared_admission_id_allocations: Arc<AtomicUsize>,
 }
 
 /// Worker-owned runtime state with an explicit teardown order.
@@ -377,6 +792,22 @@ struct LiveDescriptorCapacityObservation {
     provenance: BTreeMap<VolumeIdentity, LiveDescriptorCapacityProvenance>,
 }
 
+/// A one-shot owner-created witness for one live descriptor observation. The retained authority
+/// references keep the profile, volume locks, and reserve descriptors live for the synchronous
+/// provider call. The witness is deliberately non-Clone and is never queued or persisted.
+pub(crate) struct LiveAdmissionWitness<'a> {
+    observation: LiveDescriptorCapacityObservation,
+    _profile_guard: &'a WritableProfileGuard,
+    _volume_owners: Vec<&'a VolumeOwnershipCapability>,
+    _reserves: Vec<&'a OwnedReserveAllocation>,
+}
+
+impl LiveAdmissionWitness<'_> {
+    pub(super) fn facts(&self) -> &BTreeMap<VolumeIdentity, VolumeFacts> {
+        &self.observation.facts
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LiveDescriptorCapacityProvenance {
     profile_identity: String,
@@ -429,6 +860,7 @@ fn observe_retained_descriptor_inner(
     volume_owner: &VolumeOwnershipCapability,
     reserve: &mut OwnedReserveAllocation,
     profile_guard: &WritableProfileGuard,
+    require_full_floor: bool,
     #[cfg(test)] facts_reader: Option<
         &dyn Fn(&mut OwnedReserveAllocation, &WritableProfileGuard) -> Result<VolumeFacts, String>,
     >,
@@ -463,6 +895,21 @@ fn observe_retained_descriptor_inner(
     volume_owner
         .revalidate()
         .map_err(|error| format!("retained volume owner is no longer current: {error}"))?;
+    if require_full_floor {
+        let proof = reserve
+            .view(profile_guard)
+            .revalidate_and_prove()
+            .map_err(|error| format!("retained reserve full proof is unavailable: {error}"))?;
+        if proof.volume() != &expected_volume
+            || !proof.non_sparse()
+            || proof.physical_bytes() < PROTECTED_FREE_SPACE_FLOOR
+        {
+            return Err(format!(
+                "retained reserve does not meet the full protected physical floor: {} bytes",
+                proof.physical_bytes()
+            ));
+        }
+    }
     #[cfg(test)]
     let facts = match facts_reader {
         Some(reader) => reader(reserve, profile_guard),
@@ -493,6 +940,39 @@ fn observe_retained_descriptor_inner(
     Ok((expected_volume, facts, provenance))
 }
 
+#[cfg(test)]
+fn prepared_admission_fault_facts(
+    fault: PreparedAdmissionFactsFault,
+    reserve: &mut OwnedReserveAllocation,
+    profile_guard: &WritableProfileGuard,
+) -> Result<VolumeFacts, String> {
+    match fault {
+        PreparedAdmissionFactsFault::Unsupported => Err(String::from(
+            "descriptor backend is unsupported for admission",
+        )),
+        PreparedAdmissionFactsFault::Replaced => Err(String::from(
+            "retained reserve facts refer to a replaced descriptor",
+        )),
+        PreparedAdmissionFactsFault::LowReserve | PreparedAdmissionFactsFault::DiskPressure => {
+            let mut facts = reserve
+                .view(profile_guard)
+                .fresh_capacity_facts()
+                .map_err(|error| error.to_string())?;
+            facts.free_bytes = match fault {
+                PreparedAdmissionFactsFault::LowReserve => PROTECTED_FREE_SPACE_FLOOR,
+                PreparedAdmissionFactsFault::DiskPressure => {
+                    PROTECTED_FREE_SPACE_FLOOR.saturating_add(1)
+                }
+                PreparedAdmissionFactsFault::Unsupported
+                | PreparedAdmissionFactsFault::Replaced => {
+                    unreachable!()
+                }
+            };
+            Ok(facts)
+        }
+    }
+}
+
 struct OwnerRuntime {
     store: Option<OperationJournalStore>,
     capacity_provider: Option<CapacityProvider>,
@@ -509,6 +989,8 @@ struct OwnerRuntime {
     drop_observer: Option<OwnerRuntimeDropObserver>,
     #[cfg(test)]
     drop_probe: Option<OwnerRuntimeDropProbe>,
+    #[cfg(test)]
+    prepared_admission_id_allocations: Arc<AtomicUsize>,
 }
 
 impl OwnerRuntime {
@@ -532,7 +1014,19 @@ impl OwnerRuntime {
             drop_observer: None,
             #[cfg(test)]
             drop_probe: None,
+            #[cfg(test)]
+            prepared_admission_id_allocations: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_id_counter(
+        store: OperationJournalStore,
+        prepared_admission_id_allocations: Arc<AtomicUsize>,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::new(store)?;
+        runtime.prepared_admission_id_allocations = prepared_admission_id_allocations;
+        Ok(runtime)
     }
 
     fn store(&self) -> &OperationJournalStore {
@@ -555,6 +1049,194 @@ impl OwnerRuntime {
     fn install_reserve(&mut self, reserve: OwnedReserveAllocation) {
         debug_assert!(self.reserve.is_none());
         self.reserve = Some(reserve);
+    }
+
+    fn admit_prepared(
+        &mut self,
+        prepared: PreparedAdmissionInput,
+    ) -> Result<OperationId, OperationJournalOwnerError> {
+        prepared
+            .validate_shape()
+            .map_err(OperationJournalOwnerError::from)?;
+        let legacy_plan = prepared
+            .legacy_plan()
+            .map_err(OperationJournalOwnerError::from)?;
+        self.store()
+            .validate_for_admission()
+            .map_err(OperationJournalOwnerError::from)?;
+
+        // Re-read the durable ordinary-claim image for every request. Startup readiness is only
+        // a bootstrap observation and cannot authorize a later request after new recovery rows
+        // or settlement evidence arrive.
+        let snapshot = self.store().rebuild_admission_snapshot().map_err(|error| {
+            PreparedAdmissionError::RecoveryRequired {
+                reason: error.to_string(),
+            }
+        })?;
+        match snapshot.readiness() {
+            CapacityRebuildReadiness::ReconciliationRequired { diagnostics } => {
+                return Err(PreparedAdmissionError::RecoveryRequired {
+                    reason: bounded_diagnostics(diagnostics),
+                }
+                .into());
+            }
+            CapacityRebuildReadiness::RecoveryOnly { diagnostics }
+                if !snapshot.proves_durable_zero() =>
+            {
+                return Err(PreparedAdmissionError::RecoveryRequired {
+                    reason: bounded_diagnostics(diagnostics),
+                }
+                .into());
+            }
+            CapacityRebuildReadiness::Ready | CapacityRebuildReadiness::RecoveryOnly { .. } => {}
+        }
+        for claim in prepared.claims.claims() {
+            if snapshot
+                .claims()
+                .iter()
+                .any(|retained| retained.claim_id() == claim.claim_id())
+            {
+                return Err(PreparedAdmissionError::DuplicateClaim {
+                    claim_id: claim.claim_id(),
+                }
+                .into());
+            }
+        }
+
+        #[cfg(test)]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission(prepared.facts_fault)
+            .map_err(|reason| PreparedAdmissionError::DescriptorRefreshRejected { reason })?;
+        #[cfg(not(test))]
+        let observation = self
+            .refresh_live_descriptor_capacity_for_admission()
+            .map_err(|reason| PreparedAdmissionError::DescriptorRefreshRejected { reason })?;
+        let witness = self
+            .live_admission_witness(observation)
+            .map_err(|reason| PreparedAdmissionError::DescriptorRefreshRejected { reason })?;
+        let provider =
+            self.capacity_provider
+                .as_ref()
+                .ok_or_else(|| PreparedAdmissionError::Failed {
+                    reason: String::from("capacity provider is not installed"),
+                })?;
+        // Reconcile the fresh durable image against the existing owner-thread ledger before
+        // arithmetic. An exact image is a no-op; any changed/nonempty conflict remains held and
+        // blocks admission without replacing live accounting.
+        provider
+            .validate_rebuilt_claims(&snapshot)
+            .map_err(|error| PreparedAdmissionError::RecoveryRequired {
+                reason: format!("current durable/live capacity image differs: {error}"),
+            })?;
+        provider
+            .validate_recovery_state()
+            .map_err(PreparedAdmissionError::from)?;
+        provider
+            .validate_claim_identities_available(&prepared.claims)
+            .map_err(PreparedAdmissionError::from)?;
+        let lease = provider
+            .admit_with_live_witness(&prepared.plan, &prepared.claims, witness)
+            .map_err(PreparedAdmissionError::from)?;
+
+        // This is the first operation identity allocation in the path. Everything above is
+        // read-only validation or one owner-thread provisional lease creation.
+        #[cfg(test)]
+        self.prepared_admission_id_allocations
+            .fetch_add(1, Ordering::Relaxed);
+        let operation_id = OperationId::new();
+        let record = prepared_record(operation_id, &prepared, legacy_plan)?;
+        let settlement = self
+            .store()
+            .settle_initial_claims_with_lease(&record, &prepared.claims, provider, lease)
+            .map_err(|error| map_initial_settlement_error(error, &prepared.claims))?;
+        let (outcome, retained_lease) = settlement.into_parts();
+        match outcome {
+            JournalInsertOutcome::Committed(_) => Ok(operation_id),
+            JournalInsertOutcome::Failed(failure) => {
+                let claim_ids = prepared
+                    .claims
+                    .claims()
+                    .iter()
+                    .map(|claim| claim.claim_id())
+                    .collect::<Vec<_>>();
+                if let Some(lease) = retained_lease {
+                    drop(lease);
+                    Err(PreparedAdmissionRetainedError::from_failure(failure, claim_ids).into())
+                } else {
+                    Err(PreparedAdmissionRolledBackError {
+                        operation_id,
+                        reason: failure.error().to_string(),
+                    }
+                    .into())
+                }
+            }
+        }
+    }
+
+    fn live_admission_witness(
+        &self,
+        observation: LiveDescriptorCapacityObservation,
+    ) -> Result<LiveAdmissionWitness<'_>, String> {
+        let profile_guard = self
+            .final_profile_guard
+            .as_ref()
+            .ok_or_else(|| String::from("owner profile guard is not installed"))?;
+        self.validate_source_authorities_for_admission(profile_guard)?;
+        let profile_owner = self
+            .volume_owner
+            .as_ref()
+            .ok_or_else(|| String::from("profile volume ownership is not installed"))?;
+        let profile_reserve = self
+            .reserve
+            .as_ref()
+            .ok_or_else(|| String::from("profile recovery reserve is not installed"))?;
+        let profile_volume = profile_owner.volume().clone();
+        let mut volume_owners = vec![profile_owner];
+        let mut reserves = vec![profile_reserve];
+        for (volume, binding) in &self.source_volumes {
+            if *volume == profile_volume {
+                continue;
+            }
+            if binding.readiness != SourceVolumeBindingReadiness::Complete {
+                return Err(String::from(
+                    "a retained source volume binding is incomplete",
+                ));
+            }
+            volume_owners.push(binding.owner.as_ref().ok_or_else(|| {
+                String::from("a complete source binding has no retained volume owner")
+            })?);
+            reserves.push(binding.reserve.as_ref().ok_or_else(|| {
+                String::from("a complete source binding has no retained reserve")
+            })?);
+        }
+        Ok(LiveAdmissionWitness {
+            observation,
+            _profile_guard: profile_guard,
+            _volume_owners: volume_owners,
+            _reserves: reserves,
+        })
+    }
+
+    fn validate_source_authorities_for_admission(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<(), String> {
+        for (registration_id, record) in &self.source_registrations {
+            if !matches!(record.readiness, SourceRegistrationReadiness::Registered) {
+                return Err(format!(
+                    "source authority {registration_id:?} is not active for capacity admission"
+                ));
+            }
+            record
+                .request
+                .validate_registered_boundary(profile_guard)
+                .map_err(|error| {
+                    format!(
+                        "source authority {registration_id:?} is no longer valid for capacity admission: {error}"
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     fn register_source_authority(
@@ -1183,12 +1865,36 @@ impl OwnerRuntime {
     ) -> Result<LiveDescriptorCapacityObservation, String> {
         #[cfg(test)]
         {
-            return self.refresh_live_descriptor_capacity_inner(None);
+            self.refresh_live_descriptor_capacity_inner(None, false)
         }
         #[cfg(not(test))]
         {
-            self.refresh_live_descriptor_capacity_inner()
+            self.refresh_live_descriptor_capacity_inner(false)
         }
+    }
+
+    #[cfg(test)]
+    fn refresh_live_descriptor_capacity_for_admission(
+        &mut self,
+        fault: Option<PreparedAdmissionFactsFault>,
+    ) -> Result<LiveDescriptorCapacityObservation, String> {
+        if let Some(fault) = fault {
+            let reader = move |reserve: &mut OwnedReserveAllocation,
+                               profile_guard: &WritableProfileGuard|
+                  -> Result<VolumeFacts, String> {
+                prepared_admission_fault_facts(fault, reserve, profile_guard)
+            };
+            self.refresh_live_descriptor_capacity_inner(Some(&reader), true)
+        } else {
+            self.refresh_live_descriptor_capacity_inner(None, true)
+        }
+    }
+
+    #[cfg(not(test))]
+    fn refresh_live_descriptor_capacity_for_admission(
+        &mut self,
+    ) -> Result<LiveDescriptorCapacityObservation, String> {
+        self.refresh_live_descriptor_capacity_inner(true)
     }
 
     fn refresh_live_descriptor_capacity_inner(
@@ -1199,6 +1905,7 @@ impl OwnerRuntime {
                 &WritableProfileGuard,
             ) -> Result<VolumeFacts, String>,
         >,
+        require_full_floor: bool,
     ) -> Result<LiveDescriptorCapacityObservation, String> {
         let profile_guard = self
             .final_profile_guard
@@ -1218,11 +1925,17 @@ impl OwnerRuntime {
                 profile_owner,
                 profile_reserve,
                 profile_guard,
+                require_full_floor,
                 facts_reader,
             )?;
         #[cfg(not(test))]
         let (profile_volume, profile_facts, profile_provenance) =
-            observe_retained_descriptor_inner(profile_owner, profile_reserve, profile_guard)?;
+            observe_retained_descriptor_inner(
+                profile_owner,
+                profile_reserve,
+                profile_guard,
+                require_full_floor,
+            )?;
 
         let mut facts = BTreeMap::new();
         let mut provenance = BTreeMap::new();
@@ -1259,10 +1972,21 @@ impl OwnerRuntime {
             })?;
             #[cfg(test)]
             let (observed_volume, observed_facts, observed_provenance) =
-                observe_retained_descriptor_inner(owner, reserve, profile_guard, facts_reader)?;
+                observe_retained_descriptor_inner(
+                    owner,
+                    reserve,
+                    profile_guard,
+                    require_full_floor,
+                    facts_reader,
+                )?;
             #[cfg(not(test))]
             let (observed_volume, observed_facts, observed_provenance) =
-                observe_retained_descriptor_inner(owner, reserve, profile_guard)?;
+                observe_retained_descriptor_inner(
+                    owner,
+                    reserve,
+                    profile_guard,
+                    require_full_floor,
+                )?;
             if observed_volume != *volume {
                 return Err(format!(
                     "source volume {volume:?} reserve descriptor resolved to {observed_volume:?}"
@@ -1288,7 +2012,7 @@ impl OwnerRuntime {
             &WritableProfileGuard,
         ) -> Result<VolumeFacts, String>,
     ) -> Result<LiveDescriptorCapacityObservation, String> {
-        self.refresh_live_descriptor_capacity_inner(Some(facts_reader))
+        self.refresh_live_descriptor_capacity_inner(Some(facts_reader), false)
     }
 
     fn rebuild_capacity(&mut self) -> Result<(), String> {
@@ -1338,6 +2062,176 @@ impl OwnerRuntime {
     ) {
         self.drop_observer = Some(observer);
         self.drop_probe = Some(probe);
+    }
+}
+
+fn bounded_diagnostics(diagnostics: &[String]) -> String {
+    let mut reason = diagnostics
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if reason.is_empty() {
+        reason.push_str("journal recovery evidence is not ready");
+    }
+    reason.chars().take(512).collect()
+}
+
+fn prepared_record(
+    operation_id: OperationId,
+    prepared: &PreparedAdmissionInput,
+    legacy_plan: crate::durable_capacity::DurableCapacityPlan,
+) -> Result<StoredOperationRecord, OperationJournalOwnerError> {
+    let intent = prepared.intent.clone();
+    let universal_intent = prepared.universal_intent.clone();
+    let args = prepared.args.clone();
+    let timestamp = prepared.timestamp_unix_ms;
+    let record = match args {
+        UniversalCommandArgs::Copy(_)
+        | UniversalCommandArgs::Import(_)
+        | UniversalCommandArgs::DuplicateSame(_) => StoredOperationRecord::new_v6_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::WaveformEdit(_) => StoredOperationRecord::new_v7_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::Namespace(_) => StoredOperationRecord::new_v8_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::Render(_) => StoredOperationRecord::new_v9_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::Removal(_) => StoredOperationRecord::new_v10_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::RetainedResolution(_) => StoredOperationRecord::new_v11_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::SelectionNormalize(_) => StoredOperationRecord::new_v12_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::SelectionOutput(_) => StoredOperationRecord::new_v13_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::History(_) => StoredOperationRecord::new_v14_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::ExternalReconciliation(_) => StoredOperationRecord::new_v15_command(
+            operation_id,
+            intent,
+            universal_intent,
+            args,
+            legacy_plan,
+            timestamp,
+        ),
+        UniversalCommandArgs::DecodedEdit(_)
+        | UniversalCommandArgs::DecodedExport(_)
+        | UniversalCommandArgs::DecodedExportBatch(_) => {
+            return Err(PreparedAdmissionError::Unsupported {
+                reason: String::from(
+                    "full-progress-only command arguments have no initial-intent codec",
+                ),
+            }
+            .into());
+        }
+    };
+    Ok(record)
+}
+
+fn map_initial_settlement_error(
+    error: InitialClaimSettlementError,
+    claims: &AdmissionClaimInventory,
+) -> OperationJournalOwnerError {
+    match error {
+        InitialClaimSettlementError::Store(error) => error.into(),
+        InitialClaimSettlementError::CapacityPlan(error) => PreparedAdmissionError::Unsupported {
+            reason: error.to_string(),
+        }
+        .into(),
+        InitialClaimSettlementError::Claims(error) => PreparedAdmissionError::Unsupported {
+            reason: error.to_string(),
+        }
+        .into(),
+        InitialClaimSettlementError::Capacity(error) => PreparedAdmissionError::from(error).into(),
+        InitialClaimSettlementError::ClaimStorage(reason) => {
+            PreparedAdmissionError::Unsupported { reason }.into()
+        }
+        InitialClaimSettlementError::OutcomeRetained {
+            outcome,
+            lease,
+            source,
+        } => {
+            let claim_ids = claims
+                .claims()
+                .iter()
+                .map(|claim| claim.claim_id())
+                .collect::<Vec<_>>();
+            drop(lease);
+            match outcome {
+                JournalInsertOutcome::Committed(receipt) => {
+                    PreparedAdmissionRetainedError::Committed {
+                        receipt,
+                        claim_ids,
+                        reason: format!("initial settlement retained capacity: {source}"),
+                    }
+                    .into()
+                }
+                JournalInsertOutcome::Failed(failure) => {
+                    PreparedAdmissionRetainedError::from_failure_with_reason(
+                        failure,
+                        claim_ids,
+                        format!("initial settlement retained capacity: {source}"),
+                    )
+                    .into()
+                }
+            }
+        }
     }
 }
 
@@ -1463,8 +2357,13 @@ impl OperationJournalOwner {
     ) -> Result<Self, OperationJournalOwnerStartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(OPERATION_JOURNAL_OWNER_COMMAND_CAPACITY);
         let shared = Arc::new(OwnerShared::new(command_tx));
+        #[cfg(test)]
+        let prepared_admission_id_allocations = Arc::new(AtomicUsize::new(0));
         let panic_shared = Arc::clone(&shared);
         let worker_shared = Arc::clone(&shared);
+        #[cfg(test)]
+        let worker_prepared_admission_id_allocations =
+            Arc::clone(&prepared_admission_id_allocations);
         let worker = thread::Builder::new()
             .name(String::from("wavecrate-operation-journal-owner"))
             .spawn(move || {
@@ -1481,6 +2380,8 @@ impl OperationJournalOwner {
                         bootstrap_capacity,
                         #[cfg(any(test, feature = "test-support"))]
                         bootstrap_registry_path,
+                        #[cfg(test)]
+                        worker_prepared_admission_id_allocations,
                     );
                 }));
                 if result.is_err() {
@@ -1493,6 +2394,8 @@ impl OperationJournalOwner {
         Ok(Self {
             shared,
             worker: Some(worker),
+            #[cfg(test)]
+            prepared_admission_id_allocations,
         })
     }
 
@@ -1506,6 +2409,12 @@ impl OperationJournalOwner {
     /// Return the current worker lifecycle without waiting for storage I/O.
     pub fn status(&self) -> OperationJournalOwnerStatus {
         self.shared.status()
+    }
+
+    #[cfg(test)]
+    fn prepared_admission_id_allocations(&self) -> usize {
+        self.prepared_admission_id_allocations
+            .load(Ordering::Relaxed)
     }
 
     /// Stop new admission, drain accepted commands, release the journal, and join the worker.
@@ -1725,6 +2634,47 @@ impl OperationJournalClient {
         })
     }
 
+    /// Queue one common prepared-admission request. The input is validated before queue
+    /// admission and again on the owner thread; existing family callers remain on `admit_full`
+    /// until their authority adapters are wired by a later milestone.
+    #[allow(dead_code)]
+    pub(crate) fn admit_prepared(
+        &self,
+        prepared: PreparedAdmissionInput,
+    ) -> Result<OperationJournalRequest<OperationId>, OperationJournalOwnerQueueError> {
+        prepared.validate_shape().map_err(|error| {
+            OperationJournalOwnerQueueError::InvalidInput {
+                reason: error.to_string(),
+            }
+        })?;
+        let input_bytes = bounded_prepared_admission_input(&prepared)?;
+        self.submit(input_bytes, move |input, result| {
+            JournalCommand::AdmitPrepared {
+                prepared,
+                input,
+                result,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn inject_active_recovery_charge_for_test(
+        &self,
+        operation_id: OperationId,
+        volume: VolumeIdentity,
+        budget_bytes: u64,
+    ) -> Result<OperationJournalRequest<()>, OperationJournalOwnerQueueError> {
+        self.submit(CONTROL_INPUT_BYTES, move |input, result| {
+            JournalCommand::InjectActiveRecoveryCharge {
+                operation_id,
+                volume,
+                budget_bytes,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one bounded point lookup.
     pub fn get(
         &self,
@@ -1915,6 +2865,34 @@ fn bounded_admission_input(
 ) -> Result<usize, OperationJournalOwnerQueueError> {
     let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
     match serde_json::to_writer(&mut writer, &(args, participants)) {
+        Ok(()) => Ok(writer.finish().len()),
+        Err(_error) if writer.exceeded() => Err(OperationJournalOwnerQueueError::RecordTooLarge {
+            actual: writer.attempted(),
+            maximum: writer.limit(),
+        }),
+        Err(error) => Err(OperationJournalOwnerQueueError::InvalidInput {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+#[allow(dead_code)]
+fn bounded_prepared_admission_input(
+    prepared: &PreparedAdmissionInput,
+) -> Result<usize, OperationJournalOwnerQueueError> {
+    let mut writer = CappedWriter::new(MAX_RECORD_BYTES);
+    match serde_json::to_writer(
+        &mut writer,
+        &(
+            &prepared.intent,
+            &prepared.universal_intent,
+            &prepared.args,
+            &prepared.participants,
+            &prepared.plan,
+            &prepared.claims,
+            prepared.timestamp_unix_ms,
+        ),
+    ) {
         Ok(()) => Ok(writer.finish().len()),
         Err(_error) if writer.exceeded() => Err(OperationJournalOwnerQueueError::RecordTooLarge {
             actual: writer.attempted(),
@@ -2152,6 +3130,19 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<OperationId, OperationJournalOwnerError>>,
     },
+    AdmitPrepared {
+        prepared: PreparedAdmissionInput,
+        input: InputPermit,
+        result: SyncSender<Result<OperationId, OperationJournalOwnerError>>,
+    },
+    #[cfg(test)]
+    InjectActiveRecoveryCharge {
+        operation_id: OperationId,
+        volume: VolumeIdentity,
+        budget_bytes: u64,
+        input: InputPermit,
+        result: SyncSender<Result<(), OperationJournalOwnerError>>,
+    },
     Get {
         operation_id: OperationId,
         input: InputPermit,
@@ -2207,8 +3198,14 @@ fn run_owner(
     #[cfg(any(test, feature = "test-support"))] panic_on_command: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_capacity: bool,
     #[cfg(any(test, feature = "test-support"))] bootstrap_registry_path: Option<std::path::PathBuf>,
+    #[cfg(test)] prepared_admission_id_allocations: Arc<AtomicUsize>,
 ) {
-    let mut runtime = match OwnerRuntime::new(store) {
+    #[cfg(test)]
+    let runtime_result =
+        OwnerRuntime::new_with_id_counter(store, prepared_admission_id_allocations);
+    #[cfg(not(test))]
+    let runtime_result = OwnerRuntime::new(store);
+    let mut runtime = match runtime_result {
         Ok(runtime) => runtime,
         Err(reason) => {
             shared.mark_unavailable(&format!("owner runtime bootstrap failed: {reason}"));
@@ -2465,6 +3462,31 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 Err(OperationJournalOwnerError::CapacityProviderUnavailable)
             })
         }
+        JournalCommand::AdmitPrepared {
+            prepared,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || runtime.admit_prepared(prepared))
+        }
+        #[cfg(test)]
+        JournalCommand::InjectActiveRecoveryCharge {
+            operation_id,
+            volume,
+            budget_bytes,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.store().insert_active_recovery_charge_for_test(
+                    operation_id,
+                    &volume,
+                    budget_bytes,
+                )
+            })
+        }
         JournalCommand::Get {
             operation_id,
             input,
@@ -2570,6 +3592,15 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             drop(input);
             let _ = result.send(Err(error));
         }
+        JournalCommand::AdmitPrepared { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        #[cfg(test)]
+        JournalCommand::InjectActiveRecoveryCharge { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
         JournalCommand::Get { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
@@ -2601,8 +3632,8 @@ mod tests {
     use crate::operation_journal::full_progress_codec::StoredFullProgressRecord;
     use crate::operation_journal::store::{OrdinaryClaimRebuildSnapshot, RebuildClaim};
     use crate::operation_journal::{
-        CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation, EvidenceBatchId,
-        ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
+        AdmissionClaim, CopyCollisionPolicy, CopyEndpoint, CopyIntentArgs, CopySourceExpectation,
+        EvidenceBatchId, ExternalCaptureBoundary, ExternalNativeString, ExternalRawEventKind,
         ExternalRawNativeAccounting, ExternalRawObservation, ExternalRawObservationEnvelope,
         ExternalRawObservationLimits, ExternalRawObservationMetadata,
         ExternalRawObservationProvenance, ExternalRawObservedPath, ExternalRawPathRole,
@@ -4739,6 +5770,500 @@ mod tests {
             snapshot.intent().args().clone(),
             snapshot.intent().participants().clone(),
         )
+    }
+
+    fn prepared_copy_input(
+        class: crate::operation_journal::full_capacity::FullCapacityAllocationClass,
+        volume: VolumeIdentity,
+        allocation_unit: u64,
+    ) -> PreparedAdmissionInput {
+        prepared_copy_input_with_claim_id(
+            class,
+            volume,
+            allocation_unit,
+            crate::operation_journal::AdmissionClaimId::new(),
+        )
+    }
+
+    fn prepared_copy_input_with_claim_id(
+        class: crate::operation_journal::full_capacity::FullCapacityAllocationClass,
+        volume: VolumeIdentity,
+        allocation_unit: u64,
+        claim_id: crate::operation_journal::AdmissionClaimId,
+    ) -> PreparedAdmissionInput {
+        let (args, participants) = valid_full_admission_request();
+        let UniversalCommandArgs::Copy(copy_args) = args else {
+            panic!("copy admission fixture")
+        };
+        let universal_intent = UniversalIntent::new(
+            None,
+            UniversalCommandKind::Copy,
+            "operation.status.prepared-owner-test",
+            participants.clone(),
+        )
+        .expect("prepared copy universal intent");
+        let allocation = crate::operation_journal::FullCapacityAllocation::new(
+            volume.clone(),
+            allocation_unit,
+            class,
+            allocation_unit,
+            allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("prepared allocation");
+        let plan = crate::operation_journal::FullCapacityPlan::new(vec![allocation])
+            .expect("prepared plan");
+        let claim =
+            AdmissionClaim::new(claim_id, volume, class, allocation_unit).expect("prepared claim");
+        let claims = AdmissionClaimInventory::new(vec![claim]).expect("prepared claims");
+        PreparedAdmissionInput::for_test(
+            OperationIntent {
+                actor: OperationActor::User,
+                kind: OperationKind::FileMutation,
+                label: String::from("prepared owner test"),
+            },
+            universal_intent,
+            UniversalCommandArgs::Copy(copy_args),
+            participants,
+            plan,
+            claims,
+        )
+    }
+
+    #[test]
+    fn prepared_admission_rejects_full_only_plan_before_queueing() {
+        let (_fixture, owner) = open_owner("journal-owner-prepared-unsupported");
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload,
+            VolumeIdentity { device: 1 },
+            1,
+        );
+        assert!(matches!(
+            owner.client().admit_prepared(input),
+            Err(OperationJournalOwnerQueueError::InvalidInput { reason })
+                if reason.contains("operation recovery payload")
+        ));
+        drop(owner);
+    }
+
+    #[test]
+    fn prepared_admission_rejects_oversized_record_before_id_allocation() {
+        let (_fixture, owner) = open_owner("journal-owner-prepared-record-bounds");
+        let mut input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            VolumeIdentity { device: 1 },
+            1,
+        );
+        input.intent.label = "x".repeat(crate::operation_journal::MAX_UNIVERSAL_LABEL_BYTES + 1);
+        let before = owner.prepared_admission_id_allocations();
+        assert!(matches!(
+            owner.client().admit_prepared(input),
+            Err(OperationJournalOwnerQueueError::InvalidInput { reason })
+                if reason.contains("label")
+        ));
+        assert_eq!(
+            owner.prepared_admission_id_allocations(),
+            before,
+            "record validation must not mint an operation identity"
+        );
+        drop(owner);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_owner_queue_faults_are_typed_and_side_effect_free() {
+        let fixture = fixture("journal-owner-prepared-faults");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let cases = [
+            (
+                PreparedAdmissionFactsFault::LowReserve,
+                "recovery reserve is low",
+            ),
+            (
+                PreparedAdmissionFactsFault::DiskPressure,
+                "prepared admission requires",
+            ),
+            (
+                PreparedAdmissionFactsFault::Unsupported,
+                "descriptor refresh was rejected",
+            ),
+            (
+                PreparedAdmissionFactsFault::Replaced,
+                "descriptor refresh was rejected",
+            ),
+        ];
+        for (fault, expected) in cases {
+            let before_id = owner.prepared_admission_id_allocations();
+            let input = prepared_copy_input(
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.identity.clone(),
+                facts.allocation_unit,
+            )
+            .with_facts_fault(fault);
+            let mut request = owner
+                .client()
+                .admit_prepared(input)
+                .expect("faulted admission queues");
+            let result = request
+                .recv_timeout(Duration::from_secs(2))
+                .expect("faulted admission result")
+                .expect_err("faulted admission must reject");
+            assert!(
+                format!("{result}").contains(expected),
+                "unexpected typed fault result: {result:?}"
+            );
+            assert_eq!(
+                owner.prepared_admission_id_allocations(),
+                before_id,
+                "descriptor rejection must precede operation identity allocation"
+            );
+        }
+        assert!(owner.shutdown());
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild rejected-admission snapshot");
+        assert!(snapshot.claims().is_empty());
+        drop(reopened);
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_rejects_short_retained_reserve_before_id_allocation() {
+        let fixture = fixture("journal-owner-prepared-short-reserve");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        drop(descriptor);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reserve_path)
+            .expect("open reserve for short-reserve fixture")
+            .set_len(PROTECTED_FREE_SPACE_FLOOR - 1)
+            .expect("shorten reserve descriptor");
+
+        let before_id = owner.prepared_admission_id_allocations();
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity,
+            facts.allocation_unit,
+        );
+        let mut request = owner
+            .client()
+            .admit_prepared(input)
+            .expect("short-reserve admission queues");
+        let result = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("short-reserve admission result")
+            .expect_err("short retained reserve must reject");
+        assert!(matches!(
+            result,
+            OperationJournalOwnerError::PreparedAdmission(
+                PreparedAdmissionError::DescriptorRefreshRejected { .. }
+            )
+        ));
+        assert_eq!(
+            owner.prepared_admission_id_allocations(),
+            before_id,
+            "full physical-floor rejection must precede operation identity allocation"
+        );
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_owner_queue_preserves_uncertain_settlement_identity() {
+        use super::super::store::{InsertTestBoundary, InsertTestDirective};
+
+        let fixture = fixture("journal-owner-prepared-uncertain");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::Commit {
+                InsertTestDirective::ExecuteThenFail(
+                    OperationJournalStoreError::IdentityCheckUnavailable {
+                        reason: String::from("prepared admission commit fault"),
+                    },
+                )
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity,
+            facts.allocation_unit,
+        );
+        let mut request = owner
+            .client()
+            .admit_prepared(input)
+            .expect("uncertain admission queues");
+        let result = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("uncertain admission result")
+            .expect_err("uncertain settlement must be surfaced");
+        assert!(matches!(
+            result,
+            OperationJournalOwnerError::PreparedAdmissionRetained(
+                PreparedAdmissionRetainedError::Uncertain {
+                    stage: JournalInsertWriteStage::CommitOutcomeUnknown,
+                    claim_ids,
+                    ..
+                }
+            ) if claim_ids.len() == 1
+        ));
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_owner_queue_reaudits_recovery_after_startup() {
+        let fixture = fixture("journal-owner-prepared-recovery-audit");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let first_input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+        );
+        let mut first_request = owner
+            .client()
+            .admit_prepared(first_input)
+            .expect("first admission queues");
+        let first_operation = first_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first admission result")
+            .expect("first admission commits");
+
+        let mut recovery_request = owner
+            .client()
+            .inject_active_recovery_charge_for_test(first_operation, facts.identity.clone(), 4096)
+            .expect("inject active recovery evidence");
+        recovery_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery evidence result")
+            .expect("insert active recovery evidence");
+
+        let before_id = owner.prepared_admission_id_allocations();
+        let second_input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity,
+            facts.allocation_unit,
+        );
+        let mut second_request = owner
+            .client()
+            .admit_prepared(second_input)
+            .expect("recovery-blocked admission queues");
+        let result = second_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery-blocked admission result")
+            .expect_err("active recovery evidence must block admission");
+        assert!(matches!(
+            result,
+            OperationJournalOwnerError::PreparedAdmission(
+                PreparedAdmissionError::RecoveryRequired { .. }
+            )
+        ));
+        assert_eq!(
+            owner.prepared_admission_id_allocations(),
+            before_id,
+            "recovery audit must reject before operation identity allocation"
+        );
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_owner_queue_reports_confirmed_rollback_distinctly() {
+        use super::super::store::{InsertTestBoundary, InsertTestDirective};
+
+        let fixture = fixture("journal-owner-prepared-rollback");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("prepared admission rollback fault"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let input = prepared_copy_input(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity,
+            facts.allocation_unit,
+        );
+        let before = owner.prepared_admission_id_allocations();
+        let mut request = owner
+            .client()
+            .admit_prepared(input)
+            .expect("rollback admission queues");
+        let result = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rollback admission result")
+            .expect_err("confirmed rollback must be surfaced");
+        assert!(matches!(
+            result,
+            OperationJournalOwnerError::PreparedAdmissionRolledBack(_)
+        ));
+        assert_eq!(
+            owner.prepared_admission_id_allocations(),
+            before + 1,
+            "rollback is reported only after the post-ID persistence boundary"
+        );
+        assert!(owner.shutdown());
+        drop(fixture);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_admission_uses_fresh_owner_facts_and_settles_once() {
+        let fixture = fixture("journal-owner-prepared-success");
+        let registry_path = fixture_volume_registry(&fixture);
+        let store = OperationJournalStore::open(&fixture.owner).expect("journal store");
+        let mut owner =
+            OperationJournalOwner::start_with_capacity_fixture_for_test(store, registry_path)
+                .expect("journal owner");
+        wait_until_available(&owner);
+        let reserve_path = fixture
+            .owner
+            .profile_root()
+            .join("operation_journal")
+            .join(super::super::capacity_reserve_namespace::RESERVE_FILE_NAME);
+        let descriptor = fs::File::open(&reserve_path).expect("reserve descriptor");
+        let facts = descriptor_capacity_facts(&descriptor).expect("reserve facts");
+        let claim_id = crate::operation_journal::AdmissionClaimId::new();
+        let input = prepared_copy_input_with_claim_id(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+            claim_id,
+        );
+        let mut request = owner
+            .client()
+            .admit_prepared(input)
+            .expect("prepared admission queues");
+        let operation_id = request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prepared admission result")
+            .expect("prepared admission commits");
+        let duplicate = prepared_copy_input_with_claim_id(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+            claim_id,
+        );
+        let mut duplicate_request = owner
+            .client()
+            .admit_prepared(duplicate)
+            .expect("duplicate admission queues");
+        let duplicate_result = duplicate_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("duplicate result")
+            .expect_err("duplicate claim must be rejected");
+        assert!(matches!(
+            duplicate_result,
+            OperationJournalOwnerError::PreparedAdmission(
+                PreparedAdmissionError::DuplicateClaim { .. }
+            )
+        ));
+
+        let second_input = prepared_copy_input_with_claim_id(
+            crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            facts.identity.clone(),
+            facts.allocation_unit,
+            crate::operation_journal::AdmissionClaimId::new(),
+        );
+        let mut second_request = owner
+            .client()
+            .admit_prepared(second_input)
+            .expect("coexisting admission queues");
+        let second_operation = second_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("coexisting admission result")
+            .expect("active ordinary durable claim may coexist");
+        assert_ne!(second_operation, operation_id);
+        assert!(owner.shutdown());
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
+        let snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild ordinary claims");
+        assert!(
+            snapshot
+                .claims()
+                .iter()
+                .any(|claim| claim.operation_id() == operation_id)
+        );
+        assert!(
+            snapshot
+                .claims()
+                .iter()
+                .any(|claim| claim.operation_id() == second_operation)
+        );
+        drop(reopened);
+        drop(fixture);
     }
 
     fn v6_import_record(operation_id: OperationId) -> (StoredOperationRecord, ImportIntentArgs) {
