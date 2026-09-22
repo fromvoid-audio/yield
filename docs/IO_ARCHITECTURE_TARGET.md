@@ -391,6 +391,12 @@ authority, not necessarily one OS thread.
 | **Projection publisher** | Bounded revisioned browser/folder/status projection assembly and application. | Filesystem/SQLite reads during UI application. |
 | **Artifact store** | Capability-bound, atomic no-replace cache/artifact payload claims, identity validation, retention, eviction, and rebuild requests. | Durable user metadata or source membership. |
 
+The current-head evidence for the global-library owner boundary is recorded in
+[`GLOBAL_LIBRARY_WRITER_EVIDENCE_AUDIT.md`](GLOBAL_LIBRARY_WRITER_EVIDENCE_AUDIT.md).
+That audit separates implemented owner routes from the still-unimplemented
+metadata, Harvest, operation-link, cache/artifact, epoch/idempotency, and
+shutdown participant work assigned to the existing follow-up issues.
+
 The universal journal, its recovery records, and every writable participant are profile-owned.
 The durable writable-owner scope is the profile, not the process. The required acquisition
 order is: (1) acquire the profile-wide process lock, (2) open and validate the universal
