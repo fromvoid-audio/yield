@@ -305,6 +305,30 @@ The capacity work is intentionally split as follows:
 | OPT-1563 | Common owner pre-intent gate and typed rejection with no journal row. |
 | OPT-1564–1568 | Chunk claims, typed estimators, and pre/post-intent fault matrices; outside this lifetime decision. |
 
+The implemented OPT-1563 boundary accepts a private prepared template only after it validates
+the participant topology, derived work plan, full claim coverage, bounded arithmetic, and current
+journal evidence. It refreshes retained descriptor facts for each request and evaluates the
+existing owner ledger without replacing it. A valid empty recovery-only snapshot may pass; active
+ordinary durable charges may coexist; audit-pending, malformed, ambiguous, or other unresolved
+recovery evidence rejects with bounded typed context. Provider errors such as
+`RecoveryReserveLow` and `DiskPressureRecoveryOnly` remain typed and retain their volume/byte
+facts.
+
+Before the provider witness is minted, every required retained profile/source volume is
+revalidated through a fresh descriptor-bound full protected-floor proof; startup recovery may
+use the separate partial-proof path, but it cannot authorize this gate. Registered source
+authorities are also revalidated at the consuming boundary for root identity, lease liveness, and
+active lifecycle state.
+
+The initial intent record still carries the legacy eight-class capacity plan. OPT-1563 therefore
+rejects `OperationRecoveryPayload` and full-progress-only command arguments before allocating an
+`OperationId`; it never renames, drops, or defaults a full-plan class. After fresh checks pass, one
+owner-thread provisional lease is consumed by the existing atomic intent-plus-ordinary-claim
+settlement transaction. Duplicate claim identities are checked against both the current ledger
+and durable claim/release history before the ID is allocated. Existing family entry points remain
+fail-closed and production qualification/admission remains disabled pending the later integration
+issues. OPT-1855 tracks the durable all-class initial-intent representation.
+
 OPT-1557's v5 slice now persists immutable ordinary-claim observations in a
 dedicated table without an operation foreign key. Its crate-internal reader
 uses canonical UUID keyset cursors and returns at most 256 rows, with one

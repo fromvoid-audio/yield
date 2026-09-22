@@ -224,6 +224,55 @@ impl FullCapacityPlan {
         Self::new(allocations)
     }
 
+    /// Project this full plan into the legacy intent-plan envelope without dropping a class.
+    ///
+    /// The initial intent record still uses the legacy eight-class codec.  A full-only
+    /// `OperationRecoveryPayload` therefore has to be rejected explicitly until the durable
+    /// all-class plan codec lands; no estimate is silently renamed or discarded.
+    pub(crate) fn try_into_legacy(
+        &self,
+    ) -> Result<DurableCapacityPlan, FullCapacityLegacyProjectionError> {
+        self.validate()
+            .map_err(FullCapacityLegacyProjectionError::InvalidPlan)?;
+        let mut volumes = Vec::with_capacity(self.allocations.len());
+        for allocation in &self.allocations {
+            let allocation_class = match allocation.class() {
+                FullCapacityAllocationClass::DestinationStaging => {
+                    CapacityAllocationClass::DestinationStaging
+                }
+                FullCapacityAllocationClass::JournalRecord => {
+                    CapacityAllocationClass::JournalRecord
+                }
+                FullCapacityAllocationClass::SourceDatabaseCommit => {
+                    CapacityAllocationClass::SourceDatabaseCommit
+                }
+                FullCapacityAllocationClass::SourceWalShm => CapacityAllocationClass::SourceWalShm,
+                FullCapacityAllocationClass::GlobalDatabaseCommit => {
+                    CapacityAllocationClass::GlobalDatabaseCommit
+                }
+                FullCapacityAllocationClass::GlobalWalShm => CapacityAllocationClass::GlobalWalShm,
+                FullCapacityAllocationClass::ExistingDestination => {
+                    CapacityAllocationClass::ExistingDestination
+                }
+                FullCapacityAllocationClass::ExistingRecoveryPayload => {
+                    CapacityAllocationClass::ExistingRecoveryPayload
+                }
+                FullCapacityAllocationClass::OperationRecoveryPayload => {
+                    return Err(FullCapacityLegacyProjectionError::UnsupportedAllocationClass);
+                }
+            };
+            volumes.push(crate::durable_capacity::DurableVolumeCapacity {
+                identity: allocation.volume().clone(),
+                allocation_unit: allocation.allocation_unit(),
+                allocation_class,
+                logical_bytes: allocation.logical_bytes(),
+                allocated_bytes: allocation.allocated_bytes(),
+                protected_free_bytes: allocation.protected_free_bytes(),
+            });
+        }
+        Ok(DurableCapacityPlan { volumes })
+    }
+
     /// Return the full-capacity plan version.
     pub const fn version(&self) -> u16 {
         self.version
@@ -288,6 +337,17 @@ impl FullCapacityPlan {
         }
         Ok(())
     }
+}
+
+/// Why a validated full plan cannot be represented by the current initial-intent codec.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum FullCapacityLegacyProjectionError {
+    /// The full plan failed its own bounded arithmetic or shape validation.
+    #[error("full capacity plan is invalid: {0}")]
+    InvalidPlan(#[source] FullCapacityValidationError),
+    /// The full-only operation-recovery allocation has no legacy class.
+    #[error("operation recovery payload is not representable in the initial intent plan")]
+    UnsupportedAllocationClass,
 }
 
 impl TryFrom<&DurableCapacityPlan> for FullCapacityPlan {
@@ -669,6 +729,35 @@ mod tests {
             FullCapacityPlan::from_legacy(&too_many),
             Err(FullCapacityValidationError::TooManyAllocations { .. })
         ));
+    }
+
+    #[test]
+    fn prepared_projection_preserves_legacy_rows_and_rejects_full_only_class() {
+        let plan = FullCapacityPlan::new(vec![
+            allocation(5, FullCapacityAllocationClass::DestinationStaging, 1, 4096),
+            allocation(5, FullCapacityAllocationClass::JournalRecord, 1, 4096),
+        ])
+        .expect("representable plan");
+        let legacy = plan.try_into_legacy().expect("legacy projection");
+        assert_eq!(legacy.volumes.len(), 2);
+        assert_eq!(legacy.volumes[0].logical_bytes, 1);
+        assert_eq!(legacy.volumes[0].allocated_bytes, 4096);
+        assert_eq!(
+            legacy.volumes[1].allocation_class,
+            CapacityAllocationClass::JournalRecord
+        );
+
+        let full_only = FullCapacityPlan::new(vec![allocation(
+            5,
+            FullCapacityAllocationClass::OperationRecoveryPayload,
+            1,
+            4096,
+        )])
+        .expect("full-only plan");
+        assert_eq!(
+            full_only.try_into_legacy(),
+            Err(FullCapacityLegacyProjectionError::UnsupportedAllocationClass)
+        );
     }
 
     #[test]
