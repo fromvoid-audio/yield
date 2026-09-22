@@ -483,6 +483,11 @@ remote, removable, or otherwise unverified medium can acknowledge a flush withou
 guarantee about the medium's actual power-loss behavior, so Wavecrate never turns a flush call
 into a claim about faulty or remote media.
 
+The [OPT-1631 primitive support matrix](FILE_OPERATION_PRIMITIVE_MATRIX.md)
+records the current platform API candidates, source-local evidence, and the
+separate workflow and volume qualification required before these claims can be
+used by a general `FileOperationOwner`.
+
 `NonAtomicNamespace` is attempted but unverified or unqualified final-name evidence only. It is
 nonterminal and cannot be a successful `FilesystemPublished` result. A successful
 `NonAtomicCopyValidatePublish` final claim therefore records `AtomicNamespace`, not
