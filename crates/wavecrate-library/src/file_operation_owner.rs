@@ -23,6 +23,7 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::operation_journal::owner::LiveChunkEffectGrant;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
 
@@ -117,6 +118,16 @@ impl ChunkId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Rehydrate a chunk observation without granting write authority.
+    pub fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the UUID representation of this observation.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
 }
 
 impl Default for ChunkId {
@@ -134,6 +145,16 @@ impl IssueId {
     /// Generate an issuance identity observation.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Rehydrate an issue observation without granting write authority.
+    pub fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the UUID representation of this observation.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
     }
 }
 
@@ -713,6 +734,12 @@ pub struct LiveCapacityAuthorization {
     protected_floor: u64,
 }
 
+/// Marker for a command whose live authority is carried separately by a sealed journal grant.
+#[derive(Debug, Eq, PartialEq)]
+pub struct JournalGrantAuthorization {
+    _sealed: (),
+}
+
 /// Authorization mode for one effect request.
 #[derive(Debug, Eq, PartialEq)]
 pub enum EffectAuthorization {
@@ -723,6 +750,8 @@ pub enum EffectAuthorization {
         /// Sealed live capacity proof.
         live_capacity: LiveCapacityAuthorization,
     },
+    /// An authority-free command paired with a non-Clone journal grant on the owner queue.
+    JournalGrant(JournalGrantAuthorization),
     /// A live root registration and source fences for observation only.
     ObservationOnly {
         /// Owner-local root registration.
@@ -765,6 +794,54 @@ struct AuthorityFreeCommandView<'a> {
 }
 
 impl FileOperationCommand {
+    #[allow(dead_code)] // Private OPT-1857 producer adapter has no ordinary-family caller yet.
+    pub(crate) fn for_live_chunk(
+        grant: &LiveChunkEffectGrant,
+        effect: EffectRequest,
+    ) -> Result<Self, FileOperationValidationError> {
+        if !matches!(effect, EffectRequest::WriteStagingChunk { .. }) {
+            return Err(FileOperationValidationError::new(
+                "journal chunk grant requires a staging chunk effect",
+            ));
+        }
+        let target = effect.target_binding();
+        let command = Self {
+            operation_id: grant.operation_id(),
+            participant_id: grant.participant_id(),
+            effect_id: grant.effect_id(),
+            source_fences: grant.source_fences().to_vec(),
+            target_registration: grant.target(),
+            expected: target.expected,
+            effect,
+            authorization: EffectAuthorization::JournalGrant(JournalGrantAuthorization {
+                _sealed: (),
+            }),
+        };
+        command.validate_shape()?;
+        if !grant.matches_command(&command) {
+            return Err(FileOperationValidationError::new(
+                "staging chunk command does not match its journal grant",
+            ));
+        }
+        Ok(command)
+    }
+
+    #[allow(dead_code)] // Private OPT-1857 producer adapter has no ordinary-family caller yet.
+    pub(crate) fn retry_for_live_chunk(&self) -> Option<Self> {
+        matches!(self.authorization, EffectAuthorization::JournalGrant(_)).then(|| Self {
+            operation_id: self.operation_id,
+            participant_id: self.participant_id,
+            effect_id: self.effect_id,
+            source_fences: self.source_fences.clone(),
+            target_registration: self.target_registration,
+            expected: self.expected,
+            effect: self.effect.clone(),
+            authorization: EffectAuthorization::JournalGrant(JournalGrantAuthorization {
+                _sealed: (),
+            }),
+        })
+    }
+
     /// Return the coordinator operation identity.
     pub const fn operation_id(&self) -> OperationId {
         self.operation_id
@@ -783,6 +860,14 @@ impl FileOperationCommand {
     /// Return the complete effect payload.
     pub fn effect(&self) -> &EffectRequest {
         &self.effect
+    }
+
+    pub(crate) fn source_fences(&self) -> &[SourceFence] {
+        &self.source_fences
+    }
+
+    pub(crate) fn target_registration(&self) -> RootRegistrationRef {
+        self.target_registration
     }
 
     /// Validate the authority-free shape and encode a collision-safe request fingerprint.
@@ -816,6 +901,7 @@ impl FileOperationCommand {
             EffectAuthorization::ObservationOnly { source_fences, .. } => {
                 *source_fences = source_fences.iter().cloned().collect();
             }
+            EffectAuthorization::JournalGrant(_) => {}
         }
     }
 
@@ -824,6 +910,7 @@ impl FileOperationCommand {
         let source_fences = match &self.authorization {
             EffectAuthorization::Mutating { live_intent, .. } => &live_intent.source_fences,
             EffectAuthorization::ObservationOnly { source_fences, .. } => source_fences,
+            EffectAuthorization::JournalGrant(_) => return Some(0),
         };
         let mut bytes = source_fences
             .capacity()
@@ -912,6 +999,13 @@ impl FileOperationCommand {
                     fence.validate()?;
                 }
             }
+            EffectAuthorization::JournalGrant(_) => {
+                if !matches!(self.effect, EffectRequest::WriteStagingChunk { .. }) {
+                    return Err(FileOperationValidationError::new(
+                        "journal grant is valid only for staging chunk writes",
+                    ));
+                }
+            }
         }
         if !matches!(self.effect, EffectRequest::InspectOwnedObject { .. })
             && matches!(
@@ -975,6 +1069,9 @@ impl FileOperationCommand {
                 live_root_registration: *live_root_registration,
                 source_fences: source_fences.clone(),
             },
+            EffectAuthorization::JournalGrant(_) => {
+                EffectAuthorization::JournalGrant(JournalGrantAuthorization { _sealed: () })
+            }
         };
         Self {
             operation_id: self.operation_id,
@@ -1596,6 +1693,23 @@ impl FileOperationRequest {
         self.acknowledged = true;
         Ok(())
     }
+
+    /// Recover the original sealed permit after a confirmed no-effect result. A retry request
+    /// may do this after the primary reply was dropped; the grant can be taken only once.
+    #[allow(dead_code)] // No ordinary-family rollback producer exists yet.
+    pub(crate) fn take_unused_live_chunk_grant(
+        &self,
+    ) -> Result<Option<LiveChunkEffectGrant>, FileOperationOwnerQueueError> {
+        if !self.received {
+            return Err(FileOperationOwnerQueueError::InvalidInput(
+                FileOperationValidationError::new(
+                    "a result must be consumed before grant recovery",
+                ),
+            ));
+        }
+        self.shared
+            .try_take_unused_live_chunk_grant(self.key, self.fingerprint)
+    }
 }
 
 impl Drop for FileOperationRequest {
@@ -1659,12 +1773,47 @@ impl FileOperationOwner {
     /// Queue one validated bounded effect command.
     pub fn submit(
         &self,
-        mut command: FileOperationCommand,
+        command: FileOperationCommand,
     ) -> Result<FileOperationRequest, FileOperationOwnerQueueError> {
+        self.submit_inner(command, None).map_err(|(error, _)| error)
+    }
+
+    #[allow(dead_code)] // No ordinary-family producer submits live chunks yet.
+    pub(crate) fn submit_live_chunk(
+        &self,
+        command: FileOperationCommand,
+        grant: LiveChunkEffectGrant,
+    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, LiveChunkEffectGrant)> {
+        self.submit_inner(command, Some(grant))
+            .map_err(|(error, grant)| (error, grant.expect("primary grant returned on rejection")))
+    }
+
+    #[allow(dead_code)] // No ordinary-family producer retries live chunks yet.
+    pub(crate) fn retry_live_chunk(
+        &self,
+        command: FileOperationCommand,
+    ) -> Result<FileOperationRequest, FileOperationOwnerQueueError> {
+        self.submit_inner(command, None).map_err(|(error, _)| error)
+    }
+
+    fn submit_inner(
+        &self,
+        mut command: FileOperationCommand,
+        mut grant: Option<LiveChunkEffectGrant>,
+    ) -> Result<FileOperationRequest, (FileOperationOwnerQueueError, Option<LiveChunkEffectGrant>)>
+    {
+        macro_rules! reject {
+            ($error:expr) => {
+                return Err(($error, grant.take()))
+            };
+        }
         command.normalize_storage();
-        let canonical = command.canonical_bytes()?;
+        let canonical = match command.canonical_bytes() {
+            Ok(canonical) => canonical,
+            Err(error) => reject!(FileOperationOwnerQueueError::InvalidInput(error)),
+        };
         if canonical.len() > MAX_RECORD_BYTES {
-            return Err(FileOperationOwnerQueueError::RecordTooLarge {
+            reject!(FileOperationOwnerQueueError::RecordTooLarge {
                 actual: canonical.len(),
             });
         }
@@ -1675,7 +1824,9 @@ impl FileOperationOwner {
             .admission_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.shared.ensure_accepting()?;
+        if let Err(error) = self.shared.ensure_accepting() {
+            reject!(error);
+        }
         let primary = {
             let admissions = self
                 .shared
@@ -1685,22 +1836,55 @@ impl FileOperationOwner {
             if !admissions.contains_key(&key)
                 && admissions.len() >= FILE_OPERATION_OWNER_MAX_RECEIPTS
             {
-                return Err(FileOperationOwnerQueueError::ResultsFull);
+                reject!(FileOperationOwnerQueueError::ResultsFull);
             }
             !admissions.contains_key(&key)
         };
+        match (&command.authorization, grant.as_ref(), primary) {
+            (EffectAuthorization::JournalGrant(_), Some(live), true)
+                if live.matches_command(&command) => {}
+            (EffectAuthorization::JournalGrant(_), None, false) => {}
+            (EffectAuthorization::JournalGrant(_), _, _) => {
+                reject!(FileOperationOwnerQueueError::InvalidInput(
+                    FileOperationValidationError::new(
+                        "journal command requires one exact grant for its primary admission",
+                    ),
+                ));
+            }
+            (_, Some(_), _) => {
+                reject!(FileOperationOwnerQueueError::InvalidInput(
+                    FileOperationValidationError::new(
+                        "journal grant cannot accompany another authorization mode",
+                    ),
+                ));
+            }
+            (_, None, _) => {}
+        }
         let authorization_backing = command.authorization_backing_bytes();
-        let retained_bytes = canonical
+        let retained_bytes = match canonical
             .len()
             .checked_mul(2)
             .and_then(|bytes| authorization_backing.and_then(|extra| bytes.checked_add(extra)))
-            .ok_or_else(|| FileOperationOwnerQueueError::RecordTooLarge { actual: usize::MAX })?;
-        let input = self.shared.reserve_input(retained_bytes)?;
+            .and_then(|bytes| {
+                grant.as_ref().map_or(Some(bytes), |live| {
+                    live.queued_backing_bytes()
+                        .and_then(|extra| bytes.checked_add(extra))
+                })
+            })
+            .ok_or_else(|| FileOperationOwnerQueueError::RecordTooLarge { actual: usize::MAX })
+        {
+            Ok(bytes) => bytes,
+            Err(error) => reject!(error),
+        };
+        let input = match self.shared.reserve_input(retained_bytes) {
+            Ok(input) => input,
+            Err(error) => reject!(error),
+        };
         let result_permit = match self.shared.reserve_result() {
             Ok(permit) => permit,
             Err(error) => {
                 drop(input);
-                return Err(error);
+                reject!(error);
             }
         };
         let canonical = Arc::from(canonical.into_boxed_slice());
@@ -1726,6 +1910,7 @@ impl FileOperationOwner {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let envelope = OwnerCommand::Execute {
             command,
+            grant: grant.take(),
             canonical,
             fingerprint,
             key,
@@ -1752,7 +1937,11 @@ impl FileOperationOwner {
                         .remove(&key);
                 }
                 drop(result_permit);
-                return Err(error);
+                let grant = match envelope {
+                    OwnerCommand::Execute { grant, .. } => grant,
+                    _ => unreachable!("execute envelope"),
+                };
+                return Err((error, grant));
             }
         };
         match sender.try_send(envelope) {
@@ -1766,7 +1955,10 @@ impl FileOperationOwner {
                 _result_permit: Some(result_permit),
             }),
             Err(TrySendError::Full(envelope)) => {
-                drop(envelope);
+                let grant = match envelope {
+                    OwnerCommand::Execute { grant, .. } => grant,
+                    _ => unreachable!("execute envelope"),
+                };
                 if primary {
                     self.shared
                         .admissions
@@ -1775,10 +1967,13 @@ impl FileOperationOwner {
                         .remove(&key);
                 }
                 drop(result_permit);
-                Err(FileOperationOwnerQueueError::Full)
+                Err((FileOperationOwnerQueueError::Full, grant))
             }
             Err(TrySendError::Disconnected(envelope)) => {
-                drop(envelope);
+                let grant = match envelope {
+                    OwnerCommand::Execute { grant, .. } => grant,
+                    _ => unreachable!("execute envelope"),
+                };
                 if primary {
                     self.shared
                         .admissions
@@ -1789,9 +1984,12 @@ impl FileOperationOwner {
                 drop(result_permit);
                 self.shared
                     .mark_unavailable("owner command channel disconnected");
-                Err(FileOperationOwnerQueueError::Unavailable(String::from(
-                    "owner command channel disconnected",
-                )))
+                Err((
+                    FileOperationOwnerQueueError::Unavailable(String::from(
+                        "owner command channel disconnected",
+                    )),
+                    grant,
+                ))
             }
         }
     }
@@ -1885,7 +2083,51 @@ impl FileOperationOwner {
     }
 
     #[cfg(test)]
-    fn retire_root_for_test(&self, registration: RootRegistrationRef) -> Result<(), String> {
+    pub(crate) fn register_live_chunk_root_for_test(&self) -> Result<RootRegistrationRef, String> {
+        self.register_root_for_test(
+            AuthorityFence::Profile(ProfileAuthorityFence {
+                owner: self.shared.owner,
+                generation: 1,
+                lease_epoch: 1,
+            }),
+            "live chunk staging root",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_chunk_effect_for_test(
+        &self,
+        grant: &LiveChunkEffectGrant,
+        payload: Vec<u8>,
+    ) -> EffectRequest {
+        let staging = StagingRoot {
+            binding: RootRoleBinding {
+                registration: grant.target(),
+                authority: AuthorityFence::Profile(ProfileAuthorityFence {
+                    owner: self.shared.owner,
+                    generation: 1,
+                    lease_epoch: 1,
+                }),
+                locator: BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+                expected: ExpectedObject::Exact(OwnedObjectIdentity::new()),
+            },
+        };
+        EffectRequest::WriteStagingChunk {
+            staging,
+            chunk_id: ChunkId::from_uuid(grant.chunk_id()),
+            issue_id: IssueId::from_uuid(grant.issue_id()),
+            output: grant.output(),
+            offset: BoundedOffset::new(grant.offset()),
+            length: PositiveBoundedBytes::new(grant.logical_bytes()).expect("bounded grant"),
+            payload: BoundedBytes::new(payload).expect("bounded payload"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_root_for_test(
+        &self,
+        registration: RootRegistrationRef,
+    ) -> Result<(), String> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.shared
             .try_control(OwnerCommand::RetireRoot {
@@ -2014,8 +2256,15 @@ impl FileOperationOwner {
     }
 
     #[cfg(test)]
-    fn execution_count_for_test(&self) -> usize {
+    pub(crate) fn execution_count_for_test(&self) -> usize {
         self.shared.execution_count.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_next_live_chunk_uncertain_for_test(&self) {
+        self.shared
+            .force_live_chunk_uncertain
+            .store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -2174,6 +2423,7 @@ struct ReceiptEntry {
     fingerprint: RequestFingerprint,
     result: Arc<FileOperationResult>,
     aliases: usize,
+    grant: Option<LiveChunkEffectGrant>,
 }
 
 struct ReceiptTombstone {
@@ -2181,6 +2431,7 @@ struct ReceiptTombstone {
     fingerprint: RequestFingerprint,
     result: Arc<FileOperationResult>,
     aliases: usize,
+    grant: Option<LiveChunkEffectGrant>,
 }
 
 enum AdmissionState {
@@ -2242,6 +2493,7 @@ impl WorkerState {
         match command {
             OwnerCommand::Execute {
                 command,
+                grant,
                 canonical,
                 fingerprint,
                 key,
@@ -2250,6 +2502,7 @@ impl WorkerState {
                 result,
             } => self.execute(
                 command,
+                grant,
                 canonical,
                 fingerprint,
                 key,
@@ -2264,6 +2517,13 @@ impl WorkerState {
                 input,
             } => {
                 self.acknowledge(key, fingerprint, input);
+            }
+            OwnerCommand::TakeUnusedLiveChunkGrant {
+                key,
+                fingerprint,
+                result,
+            } => {
+                self.take_unused_live_chunk_grant(key, fingerprint, result);
             }
             #[cfg(test)]
             OwnerCommand::RegisterRoot {
@@ -2327,6 +2587,7 @@ impl WorkerState {
     fn execute(
         &mut self,
         command: FileOperationCommand,
+        grant: Option<LiveChunkEffectGrant>,
         canonical: Arc<[u8]>,
         fingerprint: RequestFingerprint,
         key: EffectKey,
@@ -2385,17 +2646,46 @@ impl WorkerState {
                 ExecutionStart::Started => {
                     #[cfg(test)]
                     shared.wait_for_execution_start();
-                    match validate_for_owner(&command, shared, &self.registrations) {
-                        Ok(()) => {
-                            #[cfg(test)]
-                            shared.execution_count.fetch_add(1, Ordering::AcqRel);
-                            EffectOutcome::Unsupported {
-                                reason: String::from(
-                                    "no production file-effect producer or qualified backend is available",
-                                ),
-                            }
+                    #[cfg(test)]
+                    let forced_uncertain = grant.is_some()
+                        && shared
+                            .force_live_chunk_uncertain
+                            .swap(false, Ordering::AcqRel);
+                    #[cfg(not(test))]
+                    let forced_uncertain = false;
+                    if forced_uncertain {
+                        EffectOutcome::RetainedUncertain {
+                            reason: String::from("synthetic lost effect boundary"),
                         }
-                        Err(outcome) => outcome,
+                    } else {
+                        match validate_for_owner(
+                            &command,
+                            grant.as_ref(),
+                            shared,
+                            &self.registrations,
+                        ) {
+                            Ok(()) => match grant
+                                .as_ref()
+                                .map(LiveChunkEffectGrant::begin_source_effect)
+                                .transpose()
+                            {
+                                Err(_) => EffectOutcome::SupersededBeforeEffect {
+                                    reason: String::from(
+                                        "live source authority closed before effect",
+                                    ),
+                                },
+                                Ok(_source_permit) => {
+                                    #[cfg(test)]
+                                    shared.execution_count.fetch_add(1, Ordering::AcqRel);
+                                    EffectOutcome::Unsupported {
+                                        reason: String::from(
+                                            "no production file-effect producer or qualified backend is available",
+                                        ),
+                                    }
+                                }
+                            },
+                            Err(outcome) => outcome,
+                        }
                     }
                 }
                 ExecutionStart::AlreadyStarted | ExecutionStart::Missing => {
@@ -2431,6 +2721,7 @@ impl WorkerState {
                 fingerprint,
                 result,
                 aliases,
+                grant,
             },
         );
     }
@@ -2485,6 +2776,7 @@ impl WorkerState {
                             fingerprint: entry.fingerprint,
                             result: entry.result,
                             aliases: 0,
+                            grant: entry.grant,
                         },
                     );
                 }
@@ -2496,11 +2788,45 @@ impl WorkerState {
         }
         drop(input);
     }
+
+    fn take_unused_live_chunk_grant(
+        &mut self,
+        key: EffectKey,
+        fingerprint: RequestFingerprint,
+        result: SyncSender<Option<LiveChunkEffectGrant>>,
+    ) {
+        let entry = if let Some(entry) = self.receipts.get_mut(&key) {
+            Some((&entry.fingerprint, &entry.result, &mut entry.grant))
+        } else {
+            self.tombstones
+                .get_mut(&key)
+                .map(|entry| (&entry.fingerprint, &entry.result, &mut entry.grant))
+        };
+        let Some((retained_fingerprint, receipt, grant)) = entry else {
+            let _ = result.send(None);
+            return;
+        };
+        let confirmed_no_effect = matches!(
+            receipt.outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+                | EffectOutcome::Collision { .. }
+                | EffectOutcome::Unsupported { .. }
+                | EffectOutcome::RetryableBeforeEffect { .. }
+        );
+        if *retained_fingerprint != fingerprint || !confirmed_no_effect {
+            let _ = result.send(None);
+            return;
+        }
+        if let Err(error) = result.send(grant.take()) {
+            *grant = error.0;
+        }
+    }
 }
 
 enum OwnerCommand {
     Execute {
         command: FileOperationCommand,
+        grant: Option<LiveChunkEffectGrant>,
         canonical: Arc<[u8]>,
         fingerprint: RequestFingerprint,
         key: EffectKey,
@@ -2512,6 +2838,11 @@ enum OwnerCommand {
         key: EffectKey,
         fingerprint: RequestFingerprint,
         input: InputPermit,
+    },
+    TakeUnusedLiveChunkGrant {
+        key: EffectKey,
+        fingerprint: RequestFingerprint,
+        result: SyncSender<Option<LiveChunkEffectGrant>>,
     },
     #[cfg(test)]
     RegisterRoot {
@@ -2548,6 +2879,8 @@ struct OwnerShared {
     shutdown_outcome: Mutex<Option<FileOperationOwnerShutdown>>,
     #[cfg(test)]
     execution_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    force_live_chunk_uncertain: AtomicBool,
     #[cfg(test)]
     pause_before_execute: Mutex<bool>,
     #[cfg(test)]
@@ -2619,6 +2952,8 @@ impl OwnerShared {
             shutdown_outcome: Mutex::new(None),
             #[cfg(test)]
             execution_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            force_live_chunk_uncertain: AtomicBool::new(false),
             #[cfg(test)]
             custody_ack: Mutex::new(None),
             #[cfg(test)]
@@ -3121,6 +3456,35 @@ impl OwnerShared {
             }
         }
     }
+
+    fn try_take_unused_live_chunk_grant(
+        &self,
+        key: EffectKey,
+        fingerprint: RequestFingerprint,
+    ) -> Result<Option<LiveChunkEffectGrant>, FileOperationOwnerQueueError> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let command = OwnerCommand::TakeUnusedLiveChunkGrant {
+            key,
+            fingerprint,
+            result: result_tx,
+        };
+        let sender = self
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or(FileOperationOwnerQueueError::Stopped)?;
+        match sender.try_send(command) {
+            Ok(()) => result_rx
+                .recv()
+                .map_err(|_| FileOperationOwnerQueueError::Stopped),
+            Err(TrySendError::Full(_)) => Err(FileOperationOwnerQueueError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(FileOperationOwnerQueueError::Unavailable(
+                String::from("owner command channel disconnected"),
+            )),
+        }
+    }
 }
 
 fn normalize_string(value: String) -> String {
@@ -3257,6 +3621,7 @@ fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
 
 fn validate_for_owner(
     command: &FileOperationCommand,
+    grant: Option<&LiveChunkEffectGrant>,
     shared: &Arc<OwnerShared>,
     registrations: &BTreeMap<RootRegistrationRef, RootRegistrationState>,
 ) -> Result<(), EffectOutcome> {
@@ -3319,6 +3684,13 @@ fn validate_for_owner(
             {
                 return Err(EffectOutcome::SupersededBeforeEffect {
                     reason: String::from("observation authority does not match the request"),
+                });
+            }
+        }
+        EffectAuthorization::JournalGrant(_) => {
+            if !grant.is_some_and(|live| live.matches_command(command)) {
+                return Err(EffectOutcome::SupersededBeforeEffect {
+                    reason: String::from("journal grant no longer matches its exact command"),
                 });
             }
         }
