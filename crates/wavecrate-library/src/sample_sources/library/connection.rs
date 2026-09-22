@@ -116,7 +116,7 @@ fn require_profile_ownership() -> Result<(), LibraryError> {
     Err(LibraryError::ProfileOwnershipRequired)
 }
 
-fn validate_database_entries(database_root: &Path) -> Result<(), LibraryError> {
+pub(super) fn validate_database_entries(database_root: &Path) -> Result<(), LibraryError> {
     for filename in [
         LIBRARY_DB_FILE_NAME,
         LIBRARY_DB_WAL_FILE_NAME,

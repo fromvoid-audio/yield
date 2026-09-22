@@ -276,7 +276,12 @@ fn map_submit_error(error: GlobalLibraryWriterQueueError) -> VocabularySubmitErr
             VocabularySubmitError::Invalid(error)
         }
         GlobalLibraryWriterQueueError::Closed => VocabularySubmitError::Closed,
-        GlobalLibraryWriterQueueError::PayloadTooLarge { .. } => {
+        GlobalLibraryWriterQueueError::PayloadTooLarge { .. }
+        | GlobalLibraryWriterQueueError::SourceRegistryTooManyDescriptors { .. }
+        | GlobalLibraryWriterQueueError::SourceRegistryFieldTooLarge { .. }
+        | GlobalLibraryWriterQueueError::SourceRegistrySourceIdTooLarge { .. }
+        | GlobalLibraryWriterQueueError::SourceRegistryPayloadTooLarge { .. }
+        | GlobalLibraryWriterQueueError::SourceRegistryPathTooLarge { .. } => {
             VocabularySubmitError::Unavailable(error.to_string())
         }
     }

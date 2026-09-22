@@ -78,6 +78,59 @@ pub enum LibraryError {
         /// Metadata key containing invalid bytes.
         key: &'static str,
     },
+    /// The retained source registry exceeded its descriptor count bound.
+    #[error("source registry contains too many descriptors ({actual}, max {limit})")]
+    SourceRegistryTooManyDescriptors {
+        /// Maximum accepted descriptor count.
+        limit: usize,
+        /// Observed descriptor count.
+        actual: usize,
+    },
+    /// A retained source registry payload exceeded its aggregate bound.
+    #[error("source registry payload exceeds {limit} bytes ({actual})")]
+    SourceRegistryTooLarge {
+        /// Maximum accepted encoded or accounted size.
+        limit: usize,
+        /// Observed payload size.
+        actual: usize,
+    },
+    /// One retained source descriptor or path field exceeded its bound.
+    #[error("source registry descriptor {index} field {field} exceeds {limit} bytes ({actual})")]
+    SourceRegistryFieldTooLarge {
+        /// Descriptor index.
+        index: usize,
+        /// Field whose bound was exceeded.
+        field: &'static str,
+        /// Maximum accepted field size.
+        limit: usize,
+        /// Observed field size.
+        actual: usize,
+    },
+    /// A retained source identity exceeded the shared journal identity bound.
+    #[error("source registry descriptor {index} source identity exceeds {limit} bytes ({actual})")]
+    SourceRegistrySourceIdTooLarge {
+        /// Descriptor index.
+        index: usize,
+        /// Maximum accepted identity size.
+        limit: usize,
+        /// Observed identity size.
+        actual: usize,
+    },
+    /// A retained source registry row or metadata value was malformed.
+    #[error("source registry data is malformed in {field}")]
+    SourceRegistryMalformed {
+        /// Field or storage key containing malformed data.
+        field: &'static str,
+    },
+    /// A read-only global library database did not expose the compatible schema.
+    #[error("global library read-only schema is incompatible: {reason}")]
+    ReadOnlySchemaIncompatible {
+        /// Stable reason for rejecting the observation.
+        reason: &'static str,
+    },
+    /// The bounded read-only observation exceeded its cooperative execution budget.
+    #[error("global library read-only observation exceeded its budget")]
+    ReadOnlyObservationBudgetExceeded,
     /// Profile vocabulary input failed a canonical spelling or category policy check.
     #[error("invalid profile tag vocabulary input: {0}")]
     InvalidProfileTagVocabularyInput(#[from] ProfileTagVocabularyInputError),

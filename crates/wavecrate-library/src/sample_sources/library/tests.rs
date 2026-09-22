@@ -861,6 +861,161 @@ fn corrupt_known_source_metadata_is_reported() {
 }
 
 #[test]
+fn source_registry_load_caps_rows_before_collecting_unbounded_history() {
+    let temp = tempdir().unwrap();
+    with_config_home(temp.path(), || {
+        let mut db = LibraryDatabase::open().unwrap();
+        let tx = db.connection.transaction().unwrap();
+        for index in 0..=SOURCE_REGISTRY_MAX_DESCRIPTORS {
+            tx.execute(
+                "INSERT INTO sources
+                 (id, root, sort_order, role, metadata_storage, primary_import_folder)
+                 VALUES (?1, ?2, ?3, 'normal', 'source_folder', 'imports')",
+                rusqlite::params![
+                    format!("source-{index}"),
+                    format!("/bounded/source/{index}"),
+                    index as i64,
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let error = db
+            .load_sources()
+            .expect_err("lookahead row must reject oversized registry");
+        assert!(matches!(
+            error,
+            LibraryError::SourceRegistryTooManyDescriptors {
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+                actual
+            } if actual == SOURCE_REGISTRY_MAX_DESCRIPTORS + 1
+        ));
+    });
+}
+
+#[test]
+fn source_registry_load_rejects_oversized_stored_field_before_string_decode() {
+    let temp = tempdir().unwrap();
+    with_config_home(temp.path(), || {
+        let db = LibraryDatabase::open().unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO sources
+                 (id, root, sort_order, role, metadata_storage, primary_import_folder)
+                 VALUES (?1, ?2, 0, 'normal', 'source_folder', 'imports')",
+                rusqlite::params![
+                    "oversized-source",
+                    "x".repeat(SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES + 1),
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .load_sources()
+            .expect_err("oversized root must fail before String allocation");
+        assert!(matches!(
+            error,
+            LibraryError::SourceRegistryFieldTooLarge {
+                field: "root",
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+                ..
+            }
+        ));
+    });
+}
+
+#[test]
+fn source_registry_retained_history_limit_rolls_back_active_replacement() {
+    let temp = tempdir().unwrap();
+    with_config_home(temp.path(), || {
+        let original = SampleSource::new_with_id(
+            SourceId::from_string("original-source"),
+            normalize_path(Path::new("original/root")),
+        );
+        save(&LibraryState {
+            sources: vec![original.clone()],
+        })
+        .unwrap();
+
+        let mut db = LibraryDatabase::open().unwrap();
+        let mappings: Vec<_> = (0..SOURCE_REGISTRY_MAX_DESCRIPTORS)
+            .map(|index| {
+                serde_json::json!({
+                    "root": format!("retained/root/{index}"),
+                    "source_id": format!("retained-{index}"),
+                })
+            })
+            .collect();
+        let history = serde_json::to_string(&mappings).unwrap();
+        db.set_metadata(KNOWN_SOURCES_KEY, &history).unwrap();
+        let before_metadata: String = db
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [KNOWN_SOURCES_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement = SampleSource::new_with_id(
+            SourceId::from_string("replacement-source"),
+            normalize_path(Path::new("replacement/root")),
+        );
+
+        let error = db
+            .replace_state(&LibraryState {
+                sources: vec![replacement],
+            })
+            .expect_err("retained history cap must reject growth");
+        assert!(matches!(
+            error,
+            LibraryError::SourceRegistryTooManyDescriptors {
+                limit: SOURCE_REGISTRY_MAX_DESCRIPTORS,
+                actual
+            } if actual == SOURCE_REGISTRY_MAX_DESCRIPTORS + 1
+        ));
+        let sources = db.load_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id.as_str(), original.id.as_str());
+        assert_eq!(sources[0].root, original.root);
+        let after_metadata: String = db
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                [KNOWN_SOURCES_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_metadata, before_metadata);
+    });
+}
+
+#[test]
+fn source_registry_oversized_metadata_blob_is_rejected_before_decode() {
+    let temp = tempdir().unwrap();
+    with_config_home(temp.path(), || {
+        let db = LibraryDatabase::open().unwrap();
+        db.set_metadata(
+            KNOWN_SOURCES_KEY,
+            &"x".repeat(SOURCE_REGISTRY_MAX_BYTES + 1),
+        )
+        .unwrap();
+
+        let error = db
+            .load_retained_sources()
+            .expect_err("oversized retained metadata must fail closed");
+        assert!(matches!(
+            error,
+            LibraryError::MetadataTooLarge {
+                key: KNOWN_SOURCES_KEY,
+                limit: SOURCE_REGISTRY_MAX_BYTES,
+                ..
+            }
+        ));
+    });
+}
+
+#[test]
 fn replace_state_rolls_back_sources_when_known_source_metadata_write_fails() {
     let temp = tempdir().unwrap();
     with_config_home(temp.path(), || {

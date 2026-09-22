@@ -391,7 +391,8 @@ authority, not necessarily one OS thread.
 | **Projection publisher** | Bounded revisioned browser/folder/status projection assembly and application. | Filesystem/SQLite reads during UI application. |
 | **Artifact store** | Capability-bound, atomic no-replace cache/artifact payload claims, identity validation, retention, eviction, and rebuild requests. | Durable user metadata or source membership. |
 
-The current-head evidence for the global-library owner boundary is recorded in
+The historical-head audit and OPT-1826 queue/read-boundary implementation update
+for the global-library owner are recorded in
 [`GLOBAL_LIBRARY_WRITER_EVIDENCE_AUDIT.md`](GLOBAL_LIBRARY_WRITER_EVIDENCE_AUDIT.md).
 That audit separates implemented owner routes from the still-unimplemented
 metadata, Harvest, operation-link, cache/artifact, epoch/idempotency, and

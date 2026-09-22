@@ -12,6 +12,8 @@ mod error;
 mod harvest;
 mod migrations;
 mod owner;
+mod read_only;
+mod registry_limits;
 mod schema_checks;
 mod schema_defs;
 mod sources;
@@ -39,6 +41,11 @@ pub use owner::{
     GLOBAL_LIBRARY_WRITER_COMMAND_CAPACITY, GlobalLibraryWriter, GlobalLibraryWriterQueueError,
     GlobalLibraryWriterStartError, GlobalLibraryWriterStatus, GlobalLibraryWriterUnavailable,
     ProfileTagVocabularyClient, SourceRegistrySnapshot,
+};
+pub use read_only::load_source_registry_snapshot_read_only;
+pub use registry_limits::{
+    SOURCE_REGISTRY_MAX_BYTES, SOURCE_REGISTRY_MAX_DESCRIPTOR_BYTES,
+    SOURCE_REGISTRY_MAX_DESCRIPTORS, SOURCE_REGISTRY_MAX_SOURCE_ID_BYTES,
 };
 pub use tag_vocabulary::{
     PROFILE_TAG_VOCABULARY_MAX_LABEL_BYTES, PROFILE_TAG_VOCABULARY_MAX_LOOKUP_LABELS,
