@@ -100,10 +100,17 @@ transaction may be cached, serialized, sent to another thread, or returned as
 authority. A mutable reserve view permits physical spend/reconstitution while
 the owner thread continues to serialize journal transitions.
 
-This split is intentionally a future private refactor of the current
-`BoundReserve` shape. It must not use `Pin`, an unsafe `Send`/`Sync` impl, a
-`'static` borrow, a caller-provided identity token, or a fake fixture provider
-in production.
+OPT-1561 adds a read-only `fresh_capacity_facts()` view method. It revalidates the
+retained root, profile guard, fixed reserve child, and descriptor before deriving
+the current device identity, free bytes, and allocation unit from that already-open
+handle; it repeats the live validation after the observation. The owner stages one
+typed, provenance-bound observation for every retained volume and publishes nothing
+until all volumes pass. The result is transient owner-thread evidence, not a cached
+provider fact, source-lease authority, reserve mutation, or ordinary-admission token.
+
+This split remains private owner-thread state. It must not use `Pin`, an unsafe
+`Send`/`Sync` impl, a `'static` borrow, a caller-provided identity token, or a
+fake fixture provider in production.
 
 ## Startup and reopen
 
@@ -140,12 +147,15 @@ The owner startup sequence is:
 The journal/profile and profile-owned reserve path follow the existing
 profile-first ordering in
 [`IO_ARCHITECTURE_TARGET.md`](IO_ARCHITECTURE_TARGET.md#logical-and-physical-ownership).
-The future provider may report a qualified state only after the complete live
-descriptor and reserve checks. Until OPT-1560 rebuilds claims, OPT-1561 wires
-the provider, OPT-1562 establishes readiness/clean handoff, and OPT-1563 wires
-the gate, `production_admission_gate()` continues to return
-`CapacityProviderUnavailable`; that ordinary-admission result does not
-invalidate a separately verified recovery context.
+OPT-1561 now performs the complete live descriptor observation after the retained
+volume proof and before the owner reads or installs the restart image. A replacement,
+offline/unsupported descriptor, root or marker mismatch, or allocation-unit change
+fails the observation and leaves the provider ledger and rebuild readiness unchanged.
+The successful result remains transient and carries profile, owner-generation, root,
+file, and allocation-unit provenance. It cannot be reused for a later capacity
+transition, and it does not qualify the production provider: until OPT-1562
+establishes clean handoff and OPT-1563 wires the gate,
+`production_admission_gate()` continues to return `CapacityProviderUnavailable`.
 
 ### External source volumes
 

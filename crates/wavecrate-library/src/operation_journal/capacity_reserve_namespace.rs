@@ -583,6 +583,36 @@ impl BoundReserveView<'_> {
         self.observation
     }
 
+    /// Return fresh facts from the retained reserve descriptor after checking its entire
+    /// descriptor-bound namespace.  This is an observation only: it does not create a reserve,
+    /// mutate the namespace, or grant ordinary capacity authority.
+    pub(super) fn fresh_capacity_facts(
+        &self,
+    ) -> Result<VolumeFacts, ReserveNamespaceFailureReason> {
+        // A valid active recovery charge may leave the retained reserve shorter than its full
+        // bootstrap extent.  The owner already checked that charge-derived minimum before this
+        // observation, so use the partial revalidation boundary rather than requiring a fresh
+        // full-floor extent here.
+        self.revalidate_partial_and_prove()?;
+        let facts = descriptor_capacity_facts(self.reserve.file()).map_err(|error| {
+            ReserveNamespaceFailureReason::Observation(
+                ReserveFailureReason::CapacityFactsUnavailable(error.to_string()),
+            )
+        })?;
+        if facts.identity != *self.observation.volume() {
+            return Err(ReserveNamespaceFailureReason::Observation(
+                ReserveFailureReason::VerifiedVolumeMismatch,
+            ));
+        }
+        if facts.allocation_unit != self.observation.allocation_unit() {
+            return Err(ReserveNamespaceFailureReason::Observation(
+                ReserveFailureReason::VerifiedAllocationUnitMismatch,
+            ));
+        }
+        self.revalidate_partial_and_prove()?;
+        Ok(facts)
+    }
+
     pub(super) fn revalidate(&self) -> Result<(), ReserveNamespaceFailureReason> {
         validate_root(self.root, self.profile_guard)?;
         self.reserve
