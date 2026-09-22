@@ -177,6 +177,23 @@ impl CapacityProvider {
         }
     }
 
+    /// Prove that this owner-thread ledger has no live charge that could be lost by a clean
+    /// volume handoff.  Released claim identities are historical evidence and are deliberately
+    /// allowed to remain; a token entry itself remains blocking even when its byte totals happen
+    /// to be zero.
+    pub(crate) fn prove_no_live_charges(&self) -> Result<(), CapacityProviderError> {
+        let ledger = self
+            .ledger
+            .try_borrow()
+            .map_err(|_| CapacityProviderError::LedgerBusy)?;
+        if !ledger.charges_by_token.is_empty()
+            || ledger.aggregate_charges.values().any(|amount| *amount != 0)
+        {
+            return Err(CapacityProviderError::RebuildLedgerConflict);
+        }
+        Ok(())
+    }
+
     /// Install a validated restart image without changing provider qualification.
     ///
     /// The staged image is grouped deterministically by operation identity.  It is committed to
@@ -1320,6 +1337,26 @@ mod tests {
         assert_eq!(provider.outstanding(&first_volume, first_class), 8192);
         assert_eq!(provider.outstanding(&second_volume, second_class), 2048);
         assert_eq!(provider.claim_count(), 2);
+    }
+
+    #[test]
+    fn clean_handoff_requires_empty_live_token_map() {
+        let provider = CapacityProvider::unavailable();
+        provider
+            .prove_no_live_charges()
+            .expect("empty provider ledger is zero");
+        provider.ledger.borrow_mut().charges_by_token.insert(
+            1,
+            LedgerCharge {
+                charges: BTreeMap::new(),
+                claims: BTreeMap::new(),
+                disposition: ProvisionalLeaseDisposition::Provisional,
+            },
+        );
+        assert!(matches!(
+            provider.prove_no_live_charges(),
+            Err(CapacityProviderError::RebuildLedgerConflict)
+        ));
     }
 
     #[test]

@@ -753,6 +753,38 @@ each later capacity boundary must refresh it under the live retained handles. It
 cached as admission authority, used as source lease proof, or used to mutate a reserve.
 Production ordinary admission remains disabled until the later readiness and gate issues.
 
+OPT-1562 defines the private clean-volume handoff at orderly owner shutdown.
+The owner first proves, from a bounded consistent journal scan, that ordinary
+claims are all paired with exact release receipts and that the recovery ledger
+contains no active charge or malformed/ambiguous history. It also requires an
+empty live provider ledger, drained source registrations, complete retained
+volume bindings, and a fresh full-floor non-sparse reserve proof for every
+retained volume. Historical release and valid reconstitution rows remain audit
+evidence; readiness text alone never proves zero.
+
+Only after all volumes pass does the owner revalidate the locks. Each full
+reserve revalidation refreshes the retained descriptor identity and allocation
+unit through its owned handle, so no cached observation authorizes the handoff.
+The owner fences the runtime before attempting each per-volume Clean marker
+write, including shared context clones, then writes and syncs the marker and
+syncs its registry directory while keeping the lock. A failed or uncertain
+write/sync produces no clean receipt and keeps the runtime conservative; the
+bytes may have reached disk, so in-memory Dirty state is never treated as
+rollback proof. Drop and panic paths never report a successful handoff. A
+same-profile restart may update only the exact retained reserve binding's owner
+generation in one checked transaction after repeating the durable-zero and full
+physical-proof checks. Cross-profile lock handoff
+cannot adopt another profile's reserve artifact. This milestone leaves ordinary
+admission, physical cleanup, reserve migration, chunks, and family wiring
+deferred.
+
+The finite OPT-1562 verification set covers active and failed-release claims,
+orphan/conflicting/malformed release evidence, valid reconstituted history,
+stale/replaced roots and descriptors, low or sparse proof, incomplete or active
+source bindings, zero-claim handoff, same-profile generation rebind and restart,
+cross-profile lock contention, marker write/sync uncertainty, and preservation
+of all ledger and reserve evidence on refusal.
+
 The store's consistent read snapshot pages both immutable ordinary-claim
 relations by canonical UUID key, with a maximum of 256 decoded rows and one
 bounded lookahead per page. It point-validates each claim's operation. An

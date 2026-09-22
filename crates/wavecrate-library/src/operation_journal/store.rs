@@ -572,6 +572,10 @@ pub(crate) struct OrdinaryClaimReleaseReceipt {
 pub(crate) struct OrdinaryClaimRebuildSnapshot {
     claims: Vec<RebuildClaim>,
     readiness: CapacityRebuildReadiness,
+    /// Structured evidence for the clean-handoff boundary.  This is kept separate from the
+    /// human diagnostics used by ordinary rebuild readiness, whose synthetic empty-image message
+    /// must not be mistaken for a durable inconsistency.
+    durable_zero: bool,
 }
 
 /// A claim image can only be constructed by the strict store reader below. Keeping this type in
@@ -648,9 +652,20 @@ impl OrdinaryClaimRebuildSnapshot {
         &self.readiness
     }
 
+    pub(crate) fn proves_durable_zero(&self) -> bool {
+        self.durable_zero
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(claims: Vec<RebuildClaim>, readiness: CapacityRebuildReadiness) -> Self {
-        Self { claims, readiness }
+        let durable_zero = claims
+            .iter()
+            .all(|claim| claim.release_id().is_some() && !claim.audit_pending());
+        Self {
+            claims,
+            readiness,
+            durable_zero,
+        }
     }
 }
 
@@ -1418,6 +1433,37 @@ impl OperationJournalStore {
         Ok(page)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_ordinary_claim_for_test(
+        &self,
+        claim_id: Uuid,
+        operation_id: OperationId,
+        volume: &VolumeIdentity,
+        allocation_class: &str,
+        allocated_bytes: u64,
+    ) -> Result<(), OperationJournalStoreError> {
+        self.connection.execute(
+            &format!(
+                "INSERT INTO {table}
+                 (claim_id, operation_id, volume_device, allocation_class, allocated_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                table = ordinary_claims::TABLE_NAME
+            ),
+            params![
+                claim_id.to_string(),
+                operation_id.to_string(),
+                volume.device.to_string(),
+                allocation_class,
+                i64::try_from(allocated_bytes).map_err(|_| {
+                    OperationJournalStoreError::InconsistentRecord {
+                        reason: String::from("test claim bytes exceed SQLite INTEGER"),
+                    }
+                })?,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Read one consistent private ordinary-claim image for owner-thread restart rebuilding.
     ///
     /// The read transaction uses the existing bounded UUID pages for both claim relations and
@@ -1442,6 +1488,44 @@ impl OperationJournalStore {
         self.connection.execute_batch("ROLLBACK")?;
         self.validate_namespace()?;
         Ok(snapshot)
+    }
+
+    /// Establish structured durable-zero evidence for the orderly volume-owner handoff.
+    ///
+    /// The ordinary scanner and recovery-reserve ledger reader each validate their complete
+    /// bounded relation set.  Their user-facing readiness diagnostics are deliberately not used
+    /// as proof; a valid empty/reconstituted history is accepted only through these typed checks.
+    pub(crate) fn prove_clean_handoff_durable(&self) -> Result<(), OperationJournalStoreError> {
+        self.validate_namespace()?;
+        self.connection.execute_batch("BEGIN")?;
+        let result = (|| {
+            let ordinary = self.rebuild_ordinary_claim_snapshot_inside_transaction()?;
+            if !ordinary.proves_durable_zero() {
+                return Err(audit_error(
+                    &self.database_path,
+                    "ordinary claim history retains an unreleased or ambiguous claim",
+                ));
+            }
+            recovery_reserve::prove_no_active_charges(&self.connection).map_err(|error| {
+                audit_error(
+                    &self.database_path,
+                    format!("recovery reserve history is not durably zero: {error}"),
+                )
+            })?;
+            self.validate_namespace_for_precommit()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.connection.execute_batch("ROLLBACK")?;
+                self.validate_namespace()?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Validate the profile-owned journal boundary before a future admission decision.
@@ -1515,7 +1599,7 @@ impl OperationJournalStore {
                         &self.profile_guard,
                     )?
                 }
-                None => super::capacity_volume_owner::acquire_for_descriptor(
+                None => super::capacity_volume_owner::acquire_for_descriptor_after_clean_handoff(
                     &descriptor,
                     &self.profile_guard,
                 )?,
@@ -1523,8 +1607,11 @@ impl OperationJournalStore {
             return Ok(volume_owner);
         }
         #[cfg(not(any(test, feature = "test-support")))]
-        super::capacity_volume_owner::acquire_for_descriptor(&descriptor, &self.profile_guard)
-            .map_err(ProfileJournalReserveBootstrapError::from)
+        super::capacity_volume_owner::acquire_for_descriptor_after_clean_handoff(
+            &descriptor,
+            &self.profile_guard,
+        )
+        .map_err(ProfileJournalReserveBootstrapError::from)
     }
 
     /// Bootstrap or reopen the profile/journal volume reserve using an already-installed owner
@@ -1541,7 +1628,10 @@ impl OperationJournalStore {
         volume_owner.revalidate()?;
 
         let existing = recovery_reserve_binding::read(&self.connection, volume_owner.volume())?;
-        if existing.is_some() {
+        if let Some(binding) = existing {
+            if binding.owner_generation() != volume_owner.owner_generation() {
+                return self.rebind_clean_profile_journal_reserve(volume_owner, binding);
+            }
             let context_owner = volume_owner.try_clone_for_context()?;
             let context = self.reopen_recovery_reserve(
                 context_owner,
@@ -1579,6 +1669,79 @@ impl OperationJournalStore {
             volume_owner.owner_generation(),
         )?;
         recovery_reserve_binding::persist(&self.connection, &binding)?;
+        Ok(reserve)
+    }
+
+    /// Recover a same-profile clean handoff whose marker acquisition advanced the owner
+    /// generation.  The existing binding is opened and fully revalidated before its generation
+    /// is changed; no reserve path or foreign profile artifact may be adopted.
+    fn rebind_clean_profile_journal_reserve(
+        &self,
+        volume_owner: &VolumeOwnershipCapability,
+        binding: recovery_reserve_binding::ReserveBinding,
+    ) -> Result<OwnedReserveAllocation, ProfileJournalReserveBootstrapError> {
+        let profile_identity = self.profile_guard.profile_root_identity();
+        if binding.profile_identity() != profile_identity
+            || binding.volume() != volume_owner.volume()
+            || binding.root_identity() != self.database_root.identity()
+            || binding.namespace_version() != recovery_reserve_binding::NAMESPACE_VERSION
+            || binding.namespace_name() != super::capacity_reserve_namespace::RESERVE_FILE_NAME
+            || binding.protected_floor_bytes()
+                != crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+        {
+            return Err(ProfileJournalReserveBootstrapError::Binding(
+                recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
+                    "clean handoff binding does not match the current profile/root namespace"
+                        .into(),
+                ),
+            ));
+        }
+        if binding.owner_generation() >= volume_owner.owner_generation() {
+            return Err(ProfileJournalReserveBootstrapError::Binding(
+                recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
+                    "stored owner generation is not older than the live clean-marker generation"
+                        .into(),
+                ),
+            ));
+        }
+        self.prove_clean_handoff_durable()?;
+        volume_owner.revalidate()?;
+        let expected =
+            super::capacity_reserve_namespace::ReserveNamespaceObservation::from_binding(
+                binding.root_identity(),
+                binding.file_identity(),
+                binding.volume().clone(),
+                binding.allocation_unit(),
+            )
+            .map_err(|reason| ProfileJournalReserveBootstrapError::Namespace(reason.into()))?;
+        let reserve = super::capacity_reserve_namespace::reopen_owned_reserve(
+            &self.database_root,
+            &self.profile_guard,
+            &expected,
+        )
+        .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
+        let mut reserve = reserve
+            .into_owned()
+            .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
+        let proof = reserve
+            .view(&self.profile_guard)
+            .revalidate_and_prove()
+            .map_err(|error| ProfileJournalReserveBootstrapError::Namespace(error.to_string()))?;
+        if proof.volume() != volume_owner.volume()
+            || !proof.non_sparse()
+            || proof.physical_bytes() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+        {
+            return Err(ProfileJournalReserveBootstrapError::Namespace(
+                "clean handoff reserve proof does not meet the protected floor".into(),
+            ));
+        }
+        volume_owner.revalidate()?;
+        recovery_reserve_binding::rebind_owner_generation(
+            &self.connection,
+            &binding,
+            volume_owner.owner_generation(),
+        )?;
+        volume_owner.revalidate()?;
         Ok(reserve)
     }
 
@@ -1806,6 +1969,21 @@ impl OperationJournalStore {
                     None,
                 ));
             }
+            if binding.as_ref().is_some_and(|binding| {
+                binding.owner_generation() != volume_owner.owner_generation()
+            }) {
+                let binding = binding.expect("source reserve binding was checked above");
+                return match self.rebind_clean_source_reserve(
+                    &volume_owner,
+                    root,
+                    profile_guard,
+                    binding,
+                    proof,
+                ) {
+                    Ok(reserve) => Ok(reserve),
+                    Err(error) => Err(fail(error, volume_owner, None)),
+                };
+            }
             let context_owner = match volume_owner.try_clone_for_context() {
                 Ok(owner) => owner,
                 Err(error) => return Err(fail(error.into(), volume_owner, None)),
@@ -1894,6 +2072,75 @@ impl OperationJournalStore {
         if let Err(error) = recovery_reserve_binding::persist(&self.connection, &binding) {
             return Err(fail(error.into(), volume_owner, Some(reserve)));
         }
+        Ok(reserve)
+    }
+
+    fn rebind_clean_source_reserve(
+        &self,
+        volume_owner: &VolumeOwnershipCapability,
+        root: &BoundDatabaseRoot,
+        profile_guard: &WritableProfileGuard,
+        binding: recovery_reserve_binding::ReserveBinding,
+        proof: &SourceAuthorityUseProof,
+    ) -> Result<OwnedReserveAllocation, RecoveryReserveContextError> {
+        if binding.profile_identity() != profile_guard.profile_root_identity()
+            || binding.volume() != volume_owner.volume()
+            || binding.root_identity() != root.identity()
+            || binding.namespace_version() != recovery_reserve_binding::NAMESPACE_VERSION
+            || binding.namespace_name() != super::capacity_reserve_namespace::RESERVE_FILE_NAME
+            || binding.protected_floor_bytes()
+                != crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+            || binding.owner_generation() >= volume_owner.owner_generation()
+        {
+            return Err(RecoveryReserveContextError::Binding(
+                recovery_reserve_binding::ReserveBindingError::IdentityMismatch(
+                    "source clean-handoff binding does not match the current owner generation"
+                        .into(),
+                ),
+            ));
+        }
+        proof
+            .validate_for_physical_use()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        self.prove_clean_handoff_durable()
+            .map_err(|error| RecoveryReserveContextError::Store(error))?;
+        volume_owner.revalidate()?;
+        let expected =
+            super::capacity_reserve_namespace::ReserveNamespaceObservation::from_binding(
+                binding.root_identity(),
+                binding.file_identity(),
+                binding.volume().clone(),
+                binding.allocation_unit(),
+            )
+            .map_err(|reason| RecoveryReserveContextError::Reserve(reason.into()))?;
+        let reserve =
+            super::capacity_reserve_namespace::reopen_owned_reserve(root, profile_guard, &expected)
+                .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let mut reserve = reserve
+            .into_owned()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        let physical = reserve
+            .view(profile_guard)
+            .revalidate_and_prove()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        if physical.volume() != volume_owner.volume()
+            || !physical.non_sparse()
+            || physical.physical_bytes() < crate::durable_capacity::PROTECTED_FREE_SPACE_FLOOR
+        {
+            return Err(RecoveryReserveContextError::Reserve(
+                "source clean-handoff reserve proof does not meet the protected floor".into(),
+            ));
+        }
+        proof
+            .validate_for_physical_use()
+            .map_err(|error| RecoveryReserveContextError::Reserve(error.to_string()))?;
+        volume_owner.revalidate()?;
+        recovery_reserve_binding::rebind_owner_generation(
+            &self.connection,
+            &binding,
+            volume_owner.owner_generation(),
+        )?;
+        volume_owner.revalidate()?;
         Ok(reserve)
     }
 
@@ -5552,6 +5799,7 @@ impl OperationJournalStore {
             return Ok(OrdinaryClaimRebuildSnapshot {
                 claims: rebuild_claims,
                 readiness: CapacityRebuildReadiness::reconciliation_required(diagnostics),
+                durable_zero: false,
             });
         }
         let has_outstanding = rebuild_claims
@@ -5561,8 +5809,14 @@ impl OperationJournalStore {
             return Ok(OrdinaryClaimRebuildSnapshot {
                 claims: rebuild_claims,
                 readiness: CapacityRebuildReadiness::ready(),
+                durable_zero: false,
             });
         }
+        let durable_zero = diagnostics.is_empty()
+            && !has_outstanding
+            && rebuild_claims
+                .iter()
+                .all(|claim| claim.release_id().is_some() && !claim.audit_pending());
         if diagnostics.is_empty() {
             push_rebuild_diagnostic(
                 &mut diagnostics,
@@ -5572,6 +5826,7 @@ impl OperationJournalStore {
         Ok(OrdinaryClaimRebuildSnapshot {
             claims: rebuild_claims,
             readiness: CapacityRebuildReadiness::recovery_only(diagnostics),
+            durable_zero,
         })
     }
 
@@ -11613,6 +11868,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_journal_has_structured_clean_handoff_zero_proof() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open empty store");
+        store
+            .prove_clean_handoff_durable()
+            .expect("empty journal and recovery history are zero");
+    }
+
+    #[test]
     fn existing_v4_database_migrates_empty_ordinary_claim_table_without_rewriting_rows() {
         let fixture = fixture();
         let record = intent_record(OperationId::new());
@@ -11987,6 +12251,48 @@ mod tests {
             crate::operation_journal::full_capacity::FullCapacityAllocationClass::OperationRecoveryPayload
         );
         assert_eq!(page.records()[0].allocated_bytes(), 4_096);
+    }
+
+    #[test]
+    fn clean_handoff_proof_requires_exact_release_for_every_claim() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let operation_id = OperationId::new();
+        store
+            .insert_intent(&intent_record(operation_id))
+            .expect("insert point-validation operation");
+        let claim_id = Uuid::from_u128(4_050);
+        insert_ordinary_claim(
+            &store,
+            claim_id,
+            operation_id.as_uuid(),
+            "9",
+            "OperationRecoveryPayload",
+            4_096,
+        )
+        .expect("insert retained claim");
+        assert!(matches!(
+            store.prove_clean_handoff_durable(),
+            Err(OperationJournalStoreError::RequiresAudit { .. })
+        ));
+        store
+            .connection
+            .execute(
+                &format!(
+                    "INSERT INTO {} (claim_id, operation_id, release_id)
+                     VALUES (?1, ?2, ?3)",
+                    ordinary_claims::RELEASE_TABLE_NAME
+                ),
+                params![
+                    claim_id.to_string(),
+                    operation_id.to_string(),
+                    Uuid::from_u128(4_051).to_string(),
+                ],
+            )
+            .expect("insert exact release");
+        store
+            .prove_clean_handoff_durable()
+            .expect("exactly released claim permits clean proof");
     }
 
     #[test]
