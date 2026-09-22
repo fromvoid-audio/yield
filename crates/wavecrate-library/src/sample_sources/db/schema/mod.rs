@@ -32,7 +32,6 @@ pub(super) fn apply_schema_fast(
 /// Check an operational connection without creating or repairing source schema objects.
 /// The canonical shape is built in a separate in-memory database; only SELECT and PRAGMA
 /// reads touch `connection`. Startup must still run owner-held maintenance before using this.
-#[allow(dead_code)] // Wired to operational profile-owned opens after the maintenance handoff.
 pub(super) fn verify_current_compatible(connection: &Connection) -> Result<(), SourceDbError> {
     let observed_version = read_schema_version(connection)?;
     if observed_version != SOURCE_DB_SCHEMA_VERSION {

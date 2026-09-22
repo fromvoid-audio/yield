@@ -1,6 +1,6 @@
 # OPT-1639 source migration and snapshot boundary
 
-Status: design checkpoint for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). This records the boundary that implementation must prove; it does not qualify existing `UiRead` or `BackgroundRead` connections as no-write snapshots.
+Status: partial implementation for [OPT-1639](https://linear.app/boostnlvp/issue/OPT-1639). The catalog now validates schema compatibility on its retained owner connection after startup maintenance and before operational commands. This does not yet qualify existing `UiRead` or `BackgroundRead` connections as no-write snapshots.
 
 ## Current evidence
 
@@ -34,7 +34,7 @@ The aggregate limit per request is two seconds, 100,000 decoded rows, and 16 MiB
 ## Acceptance sequence
 
 1. Add a non-mutating schema compatibility check and a typed maintenance-required result. Prove a current operational open leaves schema objects and `user_version` unchanged; prove stale or damaged schema fails without repair. Do not switch existing startup to this check until the owner-held maintenance-to-operation handoff is established.
-2. Establish the maintenance handoff on the retained profile/source owner, then use the compatibility check for operational opens. Prove the lease and database identity remain bound, and competing writable opens do not acquire a second owner.
+2. Establish the maintenance handoff on the retained profile/source owner, then use the compatibility check for operational opens. The registration handoff check is wired; still prove that operational reopen paths never migrate, the lease and database identity remain bound, and competing writable opens do not acquire a second owner.
 3. Add the bounded owner-read command and exact revision/fence result. Test a 64-row page, aggregate row/byte/time limits, keyset continuation, mutation between pages, cancellation, stale generation, and owner loss. Test filesystem sidecar/DB metadata before and after an owner-read with no concurrent writer; do not infer no-write behavior from `SQLITE_OPEN_READ_ONLY` alone.
 4. Run focused source schema/migration, owner revision, read-role, and snapshot tests. A legacy read caller is not considered migrated merely because the new command exists. Caller routing remains outside OPT-1639.
 

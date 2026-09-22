@@ -3600,6 +3600,20 @@ fn register_source(
         );
         return;
     }
+    if let Err(error) = source
+        .database
+        .validate_catalog_operational_schema(profile_guard)
+    {
+        emit_failure(
+            reservation,
+            admission,
+            Some(source_id.clone()),
+            Some(lifecycle_generation),
+            CatalogOperation::Register,
+            catalog_error_from_db_for_source(&source_id, error),
+        );
+        return;
+    }
     if let Some(identity) = source.known_root_identity.as_ref()
         && let Ok(mut snapshot) = read_snapshot_from_database(
             &source.database,

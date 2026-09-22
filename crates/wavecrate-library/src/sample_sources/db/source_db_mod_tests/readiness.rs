@@ -18,6 +18,51 @@ use crate::{
 };
 use tempfile::tempdir;
 
+#[test]
+fn catalog_maintenance_handoff_checks_owned_schema_without_repair() {
+    let app_root = tempdir().expect("app root");
+    let source_root = tempdir().expect("source root");
+    let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
+    let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
+    let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
+    let database = SourceDatabase::open_for_catalog_with_profile_guard(
+        source_root.path(),
+        &profile_guard,
+        "catalog-maintenance-handoff",
+    )
+    .expect("profile-owned source database");
+
+    database
+        .validate_catalog_operational_schema(&profile_guard)
+        .expect("current schema is ready for operational service");
+    let version_before: i64 = database
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("schema stamp");
+    database
+        .connection
+        .execute_batch("DROP TABLE source_tags")
+        .expect("damage schema after maintenance");
+    assert!(matches!(
+        database.validate_catalog_operational_schema(&profile_guard),
+        Err(SourceDbError::MaintenanceRequired { .. })
+    ));
+    let version_after: i64 = database
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("schema stamp after failed check");
+    assert_eq!(version_after, version_before);
+    let table_count: i64 = database
+        .connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_tags'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("damaged table remains absent");
+    assert_eq!(table_count, 0);
+}
+
 struct ControlledReadinessBinding {
     fail: AtomicBool,
 }

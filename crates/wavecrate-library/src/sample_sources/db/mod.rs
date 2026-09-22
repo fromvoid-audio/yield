@@ -1241,6 +1241,21 @@ impl SourceDatabase {
         Ok(database)
     }
 
+    /// Finish catalog startup maintenance on the retained owner connection.
+    ///
+    /// The catalog calls this before admitting operational commands. It rechecks the
+    /// retained profile, source lease, and database-file binding, then inspects the
+    /// schema without creating or repairing objects. A failed check requires a new
+    /// owner-held maintenance attempt; it cannot be retried through a read role.
+    pub fn validate_catalog_operational_schema(
+        &self,
+        profile_guard: &crate::app_dirs::WritableProfileGuard,
+    ) -> Result<(), SourceDbError> {
+        self.validate_profile_owned_open(profile_guard)?;
+        schema::verify_current_compatible(&self.connection)?;
+        self.validate_profile_owned_open(profile_guard)
+    }
+
     /// Open an existing database for UI-owned read access.
     pub fn open_for_ui_read(root: impl AsRef<Path>) -> Result<Self, SourceDbError> {
         Self::open_with_role(root, SourceDatabaseConnectionRole::UiRead)
