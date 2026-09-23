@@ -44,7 +44,7 @@ impl Render for RandomNavigationTooltip {
             .border_color(color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(color(theme.colors.text_primary))
-            .child("Random sample navigation: Down visits an unplayed row; Up follows history.")
+            .child("Random sample navigation: Down visits an unvisited row; Up follows history.")
     }
 }
 
