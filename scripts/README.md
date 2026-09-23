@@ -1,8 +1,9 @@
 # Scripts
 
-For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS/Linux,
-`scripts/gpui-local-ci.ps1` on Windows, and `scripts/install-gpui-local-ci.sh`
-for the macOS/Linux commit hook; see [GPUI local CI](../docs/GPUI_LOCAL_CI.md).
+For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
+`scripts/install-gpui-local-ci.sh` for its automatic commit hook; see
+[GPUI local CI](../docs/GPUI_LOCAL_CI.md). Windows and Linux GPUI validation
+are deferred until the macOS release-ready gate OPT-1863 is complete.
 The older `scripts/ci.sh` lanes below still target the legacy Radiant app and
 are not GPUI acceptance gates.
 

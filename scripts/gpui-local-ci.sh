@@ -2,6 +2,11 @@
 # GPUI-specific local validation. Run from any directory in this checkout.
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "GPUI local CI currently supports macOS only; Windows/Linux validation is deferred until OPT-1863." >&2
+  exit 1
+fi
+
 repo_root="${WAVECRATE_GPUI_CI_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$repo_root"
 
@@ -40,15 +45,10 @@ run cargo test --locked -p wavecrate-library --lib source_database_identity --no
 run cargo test --locked -p wavecrate-library --lib sqlite_wal --no-default-features
 run cargo test --locked -p wavecrate-library --lib app_dirs::storage_usage --no-default-features
 run cargo test --locked -p wavecrate-catalog --lib
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  # The current main-branch session fixture waits for events that do not arrive
-  # on this macOS host, even when run alone. Keep the code compiled and track
-  # the test-suite repair separately; do not report Windows acceptance here.
-  run cargo check --locked -p wavecrate-session
-  echo "[gpui-local-ci] macOS session tests skipped: baseline event timeouts; run scope=session to reproduce"
-else
-  run cargo test --locked -p wavecrate-session --lib
-fi
+# The current main-branch session fixture waits for events that do not arrive
+# on macOS. Keep the code compiled and track the suite repair in OPT-1861.
+run cargo check --locked -p wavecrate-session
+echo "[gpui-local-ci] macOS session tests skipped: baseline event timeouts; run scope=session to reproduce"
 
 if [[ "$scope" == "storage" ]]; then
   run cargo test --locked -p wavecrate-core --lib waveform_edit_effects

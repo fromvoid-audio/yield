@@ -2,6 +2,11 @@
 # Install a post-commit hook for this repository's shared worktrees.
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "GPUI local CI hook installation currently supports macOS only; Windows/Linux is deferred until OPT-1863." >&2
+  exit 1
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
 hook="$common_dir/hooks/post-commit"
