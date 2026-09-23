@@ -15,12 +15,9 @@ release-ready macOS acceptance in OPT-1863. The old PowerShell commands remain
 in `scripts/gpui-local-ci.ps1.deferred` for later reassessment; they have not
 been validated on a Windows host.
 
-The session library tests in current `main` time out waiting for session and
-preference events on this macOS host, including when run individually. The
-automatic macOS lane compiles `wavecrate-session` but marks its tests as a
-visible exception. Run `bash scripts/gpui-local-ci.sh session` to reproduce
-and repair that suite (OPT-1861). A macOS pass excludes session behavior until
-this exception is fixed.
+The full and storage lanes run the `wavecrate-session` library suite. Use
+`bash scripts/gpui-local-ci.sh session` to run that suite by itself. OPT-1861
+records the test fixture repair that restored this coverage on macOS.
 
 Install the macOS automatic trigger once with
 `bash scripts/install-gpui-local-ci.sh`.
