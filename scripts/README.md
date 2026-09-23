@@ -1,5 +1,11 @@
 # Scripts
 
+For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS/Linux,
+`scripts/gpui-local-ci.ps1` on Windows, and `scripts/install-gpui-local-ci.sh`
+for the macOS/Linux commit hook; see [GPUI local CI](../docs/GPUI_LOCAL_CI.md).
+The older `scripts/ci.sh` lanes below still target the legacy Radiant app and
+are not GPUI acceptance gates.
+
 Top-level `scripts/` is intentionally small. `scripts/command-inventory.json`
 is the checked inventory for public entrypoints, compatibility wrappers, and
 dispatcher maps. These are the public entrypoints people should run directly:
