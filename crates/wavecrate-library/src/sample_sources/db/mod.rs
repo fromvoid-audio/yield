@@ -36,6 +36,7 @@ pub mod schema;
 mod source_authority;
 mod source_lease;
 pub(crate) mod sqlite_identity;
+mod starmap_layout;
 #[allow(unused_imports)]
 pub(crate) use source_authority::{
     SourceAuthorityConfirmation, SourceAuthorityDrainMarker, SourceAuthorityGuard,
@@ -48,6 +49,10 @@ pub use source_authority::{
     SourceAuthorityRetirementAck,
 };
 pub use source_lease::{SourceLeaseError, SourcePublicationFence, SourcePublicationFenceError};
+pub use starmap_layout::{
+    STARMAP_LAYOUT_MAX_SAMPLES, StarmapLayoutError, StarmapLayoutLoad, StarmapLayoutPoint,
+    StarmapLayoutRequest, StarmapLayoutSample,
+};
 /// Durable per-source tag catalog and sample assignment helpers.
 pub mod tags;
 mod telemetry;
