@@ -40,6 +40,11 @@ impl RandomNavigationState {
         }
     }
 
+    /// Start a new visit history when the source identity changes.
+    pub fn reset(&mut self, focused: Option<&AudioFileId>, visible_ids: &[AudioFileId]) {
+        self.reset_for_selection(focused, visible_ids);
+    }
+
     /// Choose an unvisited visible row using a caller-supplied random unit.
     ///
     /// The unit is clamped to `0.0..=1.0`; nonfinite values choose the first candidate. After
@@ -169,6 +174,8 @@ mod tests {
             state.next(Some(&ids[2]), &filtered, 0.0),
             Some(ids[0].clone())
         );
+        let reordered = [ids[2].clone(), ids[0].clone()];
+        assert_eq!(state.previous(Some(&ids[0]), &reordered), None);
     }
 
     #[test]

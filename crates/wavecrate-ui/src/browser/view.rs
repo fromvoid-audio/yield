@@ -31,6 +31,27 @@ use super::volume;
 use super::waveform;
 use super::zero_crossing;
 
+struct RandomNavigationTooltip;
+
+impl Render for RandomNavigationTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(color(theme.colors.surface_raised))
+            .border(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border_emphasis))
+            .text_size(px(theme.typography.small_size))
+            .text_color(color(theme.colors.text_primary))
+            .child("Random sample navigation: Down visits an unplayed row; Up follows history.")
+    }
+}
+
+fn random_navigation_tooltip(_: &mut Window, cx: &mut gpui::App) -> gpui::AnyView {
+    cx.new(|_| RandomNavigationTooltip).into()
+}
+
 fn format_file_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -267,6 +288,44 @@ impl Browser {
         }))
     }
 
+    fn render_random_navigation_button(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + 'static {
+        let hover_fill = color(theme.interaction.hover_fill);
+        let pressed_fill = color(theme.interaction.pressed_fill);
+        let foreground = color(if self.random_navigation.enabled() {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
+        div()
+            .id("random-navigation-toggle")
+            .debug_selector(|| String::from("random-navigation-toggle"))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(28.0))
+            .h(px(theme.spacing.control_height))
+            .cursor_pointer()
+            .bg(color(theme.colors.surface_overlay))
+            .border(px(theme.spacing.border_width))
+            .border_color(color(theme.colors.border))
+            .hover(move |style| style.bg(hover_fill))
+            .active(move |style| style.bg(pressed_fill))
+            .text_size(px(theme.typography.small_size))
+            .text_color(foreground)
+            .when(self.hover_help_visible(), |control| {
+                control.tooltip(random_navigation_tooltip)
+            })
+            .child("⚄")
+            .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                view.toggle_random_navigation(cx);
+            }))
+    }
+
     fn render_sample_name_view_mode_button(
         &self,
         theme: Theme,
@@ -277,6 +336,7 @@ impl Browser {
         let mode = self.sample_name_view_mode;
         div()
             .id("sample-name-view-mode")
+            .debug_selector(|| String::from("sample-name-view-mode"))
             .flex()
             .flex_none()
             .items_center()
@@ -1419,38 +1479,43 @@ impl Render for Browser {
                                     .h_full()
                                     .bg(color(theme.colors.surface))
                                     .child({
-                                        let mut column_header = div()
-                                            .flex()
-                                            .flex_none()
-                                            .items_center()
-                                            .h(px(theme.spacing.row_height))
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .w(px(theme.spacing.selected_marker_width))
-                                                    .h_full()
-                                                    .bg(transparent()),
-                                            )
-                                            .child(self.render_column_header(
-                                                "Name",
-                                                SortColumn::Name,
-                                                theme.clone(),
-                                                cx,
-                                                None,
-                                                theme.spacing.row_padding_x,
-                                            ))
-                                            .child(self.render_sample_name_view_mode_button(
-                                                theme.clone(),
-                                                cx,
-                                            ))
-                                            .child(self.render_column_header(
-                                                "Rating",
-                                                SortColumn::Rating,
-                                                theme.clone(),
-                                                cx,
-                                                Some(rating_width),
-                                                theme.spacing.control_gap,
-                                            ));
+                                        let mut column_header =
+                                            div()
+                                                .flex()
+                                                .flex_none()
+                                                .items_center()
+                                                .h(px(theme.spacing.row_height))
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .w(px(theme.spacing.selected_marker_width))
+                                                        .h_full()
+                                                        .bg(transparent()),
+                                                )
+                                                .child(self.render_column_header(
+                                                    "Name",
+                                                    SortColumn::Name,
+                                                    theme.clone(),
+                                                    cx,
+                                                    None,
+                                                    theme.spacing.row_padding_x,
+                                                ))
+                                                .child(self.render_random_navigation_button(
+                                                    theme.clone(),
+                                                    cx,
+                                                ))
+                                                .child(self.render_sample_name_view_mode_button(
+                                                    theme.clone(),
+                                                    cx,
+                                                ))
+                                                .child(self.render_column_header(
+                                                    "Rating",
+                                                    SortColumn::Rating,
+                                                    theme.clone(),
+                                                    cx,
+                                                    Some(rating_width),
+                                                    theme.spacing.control_gap,
+                                                ));
                                         if show_playback_type {
                                             column_header =
                                                 column_header.child(self.render_column_header(
@@ -1702,6 +1767,121 @@ mod tests {
                     .selected_in_order(&view.visible_selection_ids()),
                 [other]
             );
+        });
+    }
+
+    #[gpui::test]
+    fn random_navigation_toggle_sits_beside_name_mode(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("refresh browser header");
+        cx.run_until_parked();
+        let toggle = cx
+            .debug_bounds("random-navigation-toggle")
+            .expect("random navigation toggle");
+        let name_mode = cx
+            .debug_bounds("sample-name-view-mode")
+            .expect("sample name mode");
+        assert!(toggle.origin.x + toggle.size.width <= name_mode.origin.x);
+
+        let center = point(
+            toggle.origin.x + toggle.size.width / 2.0,
+            toggle.origin.y + toggle.size.height / 2.0,
+        );
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+        cx.cx
+            .update(|app| assert!(browser.read(app).random_navigation.enabled()));
+    }
+
+    #[gpui::test]
+    fn random_navigation_uses_visible_visits_then_restores_linear_movement(
+        cx: &mut TestAppContext,
+    ) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/opt1859-random-navigation-fixture");
+            view.root = Some(root.clone());
+            view.entries = ["a.wav", "b.wav", "c.wav"]
+                .into_iter()
+                .map(|name| AudioFile {
+                    path: root.join(name),
+                    relative_path: PathBuf::from(name),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                })
+                .collect();
+            view.view_model = BrowserViewModel::new(&view.entries);
+            view.selected = Some(0);
+            let first = view.entries[0].stable_id();
+
+            view.toggle_random_navigation(cx);
+            view.selection.select_all(&view.visible_selection_ids());
+            view.move_selection(1, false, false, true, cx);
+            let second = view.browser_focus_id().expect("first random jump");
+            assert_ne!(second, first);
+            assert!(view.selection.is_empty());
+            view.move_selection(1, false, false, true, cx);
+            let third = view.browser_focus_id().expect("second random jump");
+            assert_ne!(third, first);
+            assert_ne!(third, second);
+
+            view.move_selection(-1, false, false, true, cx);
+            assert_eq!(view.browser_focus_id(), Some(second.clone()));
+            view.root = Some(PathBuf::from("/tmp/opt1859-other-source"));
+            view.reconcile_selection();
+            view.move_selection(-1, false, false, true, cx);
+            assert_eq!(view.browser_focus_id(), Some(second));
+            view.toggle_random_navigation(cx);
+            view.selected = Some(0);
+            view.move_selection(1, false, false, true, cx);
+            assert_eq!(view.browser_focus_id(), Some(view.entries[1].stable_id()));
+        });
+    }
+
+    #[gpui::test]
+    fn arrow_keys_follow_random_navigation_history(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let first = browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/opt1859-random-keys-fixture");
+            view.root = Some(root.clone());
+            view.entries = ["a.wav", "b.wav"]
+                .into_iter()
+                .map(|name| AudioFile {
+                    path: root.join(name),
+                    relative_path: PathBuf::from(name),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                })
+                .collect();
+            view.view_model = BrowserViewModel::new(&view.entries);
+            view.selected = Some(0);
+            view.toggle_random_navigation(cx);
+            view.entries[0].stable_id()
+        });
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let down = KeyDownEvent {
+                    keystroke: Keystroke::parse("down").expect("down key"),
+                    is_held: false,
+                };
+                view.handle_key_down(&down, window, cx);
+                assert_ne!(view.browser_focus_id(), Some(first.clone()));
+                let up = KeyDownEvent {
+                    keystroke: Keystroke::parse("up").expect("up key"),
+                    is_held: false,
+                };
+                view.handle_key_down(&up, window, cx);
+                assert_eq!(view.browser_focus_id(), Some(first));
+            });
         });
     }
 
