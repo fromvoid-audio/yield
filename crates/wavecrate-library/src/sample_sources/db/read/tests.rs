@@ -10,7 +10,7 @@ use super::super::{
 use super::super::util::{EXACT_SUBTREE_PATH_PREDICATE, exact_subtree_path_bounds};
 
 #[test]
-fn browser_metadata_snapshot_reads_multi_collection_rows_coherently() {
+fn browser_metadata_snapshot_reopens_multi_collection_rows_in_slot_order() {
     let dir = tempdir().unwrap();
     let db = SourceDatabase::open_for_source_write(dir.path()).unwrap();
     db.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
@@ -26,8 +26,10 @@ fn browser_metadata_snapshot_reads_multi_collection_rows_coherently() {
         .unwrap();
     batch.commit().unwrap();
     db.set_last_curated_at(Path::new("one.wav"), 456).unwrap();
+    drop(db);
 
-    let snapshot = db.browser_metadata_snapshot().unwrap();
+    let reopened = SourceDatabase::open_for_ui_read(dir.path()).unwrap();
+    let snapshot = reopened.browser_metadata_snapshot().unwrap();
 
     assert_eq!(snapshot.files.len(), 1);
     let file = &snapshot.files[0];
