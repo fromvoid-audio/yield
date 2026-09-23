@@ -20,8 +20,9 @@ use gpui::{
 use reson::{PlaybackRequestId, PlaybackRuntime};
 use wavecrate_core::{
     AudioFile, AudioFileId, BrowserSelection, BrowserViewModel, FolderScope, FolderTree,
-    FolderTreeRow, PlaybackLoopPolicy, PlaybackNavigationHistory, SortColumn, WaveformEditRegion,
-    WaveformEditSettings, WaveformViewport, parse_playmark_frame_range, playmark_selection_label,
+    FolderTreeRow, PlaybackLoopPolicy, PlaybackNavigationHistory, RandomNavigationState,
+    SortColumn, WaveformEditRegion, WaveformEditSettings, WaveformViewport,
+    parse_playmark_frame_range, playmark_selection_label,
 };
 use wavecrate_design::{Motion, Theme, load_theme_file};
 use wavecrate_library::sample_sources::{SampleSource, SourceId};
@@ -293,6 +294,8 @@ pub(crate) struct Browser {
     beat_guide_count: u8,
     random_audition_sticky: bool,
     random_audition_pending: Option<random_audition::PendingRandomAudition>,
+    random_navigation: RandomNavigationState,
+    random_navigation_scope: Option<(Option<SourceId>, PathBuf)>,
     metronome_enabled: bool,
     playback_metronome_beat_count: Option<u16>,
     playback_metronome_confirmed: bool,
@@ -539,6 +542,8 @@ impl Browser {
             beat_guide_count: DEFAULT_BEAT_COUNT,
             random_audition_sticky: false,
             random_audition_pending: None,
+            random_navigation: RandomNavigationState::default(),
+            random_navigation_scope: None,
             metronome_enabled: false,
             playback_metronome_beat_count: None,
             playback_metronome_confirmed: false,
@@ -927,10 +932,16 @@ impl Browser {
     }
 
     fn reconcile_selection(&mut self) {
+        let visible_ids = self.visible_selection_ids();
+        if self.random_navigation.enabled() {
+            let focused = self.browser_focus_id();
+            self.reconcile_random_navigation_scope(focused.as_ref(), &visible_ids);
+            self.random_navigation
+                .reconcile(focused.as_ref(), &visible_ids);
+        }
         if tag_filter::scope_pending(self) {
             return;
         }
-        let visible_ids = self.visible_selection_ids();
         if self.selection.reconcile(&visible_ids) {
             self.invalidate_file_handoff();
             tag_chips::invalidate(self);
@@ -2125,21 +2136,51 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         if self.view_model.rows().is_empty() {
+            if self.random_navigation.enabled() {
+                let focused = self.browser_focus_id();
+                self.reconcile_random_navigation_scope(focused.as_ref(), &[]);
+                self.random_navigation.reconcile(focused.as_ref(), &[]);
+            }
             return;
         }
+        let focused_id = self.browser_focus_id();
+        let random_enabled = self.random_navigation.enabled();
+        let next_row = if random_enabled {
+            let visible_ids = self.visible_selection_ids();
+            self.reconcile_random_navigation_scope(focused_id.as_ref(), &visible_ids);
+            let target = if direction < 0 {
+                self.random_navigation
+                    .previous(focused_id.as_ref(), &visible_ids)
+            } else {
+                self.random_navigation.next(
+                    focused_id.as_ref(),
+                    &visible_ids,
+                    rand::random::<f32>(),
+                )
+            };
+            let Some(position) = target
+                .as_ref()
+                .and_then(|id| self.view_model.visible_position_for(id))
+            else {
+                return;
+            };
+            self.view_model.rows()[position].clone()
+        } else {
+            let current = focused_id
+                .as_ref()
+                .and_then(|id| self.view_model.visible_position_for(id))
+                .unwrap_or(0) as isize;
+            let next_position =
+                (current + direction).clamp(0, self.view_model.rows().len() as isize - 1) as usize;
+            self.view_model.rows()[next_position].clone()
+        };
         self.invalidate_file_handoff();
-        let current = self
-            .browser_focus_id()
-            .as_ref()
-            .and_then(|id| self.view_model.visible_position_for(id))
-            .unwrap_or(0) as isize;
-        let next_position =
-            (current + direction).clamp(0, self.view_model.rows().len() as isize - 1) as usize;
-        let next_row = self.view_model.rows()[next_position].clone();
         let next = next_row.entry_index;
         let next_id = next_row.id;
-        let focused_id = self.browser_focus_id();
-        if extend {
+        let extend = extend && !random_enabled;
+        if random_enabled {
+            self.selection.focus_pointer(&next_id);
+        } else if extend {
             self.selection.extend_range(
                 self.view_model.rows().iter().map(|row| &row.id),
                 focused_id.as_ref(),
@@ -2161,6 +2202,35 @@ impl Browser {
         } else {
             cx.notify();
         }
+    }
+
+    fn current_random_navigation_scope(&self) -> Option<(Option<SourceId>, PathBuf)> {
+        self.active_source
+            .and_then(|index| self.source_sessions.get(index))
+            .map(|session| (session.source_id.clone(), session.root.clone()))
+            .or_else(|| self.root.as_ref().map(|root| (None, root.clone())))
+    }
+
+    fn reconcile_random_navigation_scope(
+        &mut self,
+        focused: Option<&AudioFileId>,
+        visible_ids: &[AudioFileId],
+    ) {
+        let scope = self.current_random_navigation_scope();
+        if self.random_navigation_scope != scope {
+            self.random_navigation.reset(focused, visible_ids);
+            self.random_navigation_scope = scope;
+        }
+    }
+
+    fn toggle_random_navigation(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.random_navigation.enabled();
+        let visible_ids = self.visible_selection_ids();
+        let focused = self.browser_focus_id();
+        self.random_navigation
+            .set_enabled(enabled, focused.as_ref(), &visible_ids);
+        self.random_navigation_scope = self.current_random_navigation_scope();
+        cx.notify();
     }
 
     fn toggle_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
