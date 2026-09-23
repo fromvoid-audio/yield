@@ -1606,7 +1606,7 @@ mod tests {
         EntityInputHandler, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, TestAppContext,
         VisualTestContext, point, px,
     };
-    use wavecrate_core::{AudioFile, WaveformEditFade, WaveformEditSettings};
+    use wavecrate_core::{AudioFile, BrowserViewModel, WaveformEditFade, WaveformEditSettings};
     use wavecrate_media::WaveformPreview;
 
     use super::super::transport;
@@ -1662,6 +1662,46 @@ mod tests {
                     .update(cx, |input, cx| input.set_content(draft, cx));
                 view.commit_playmark_timing_edit(window, cx, true);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn browser_selection_commands_target_visible_identities(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/opt1763-selection-fixture");
+            view.root = Some(root.clone());
+            view.entries = ["kick.wav", "snare.wav"]
+                .into_iter()
+                .map(|name| AudioFile {
+                    path: root.join(name),
+                    relative_path: PathBuf::from(name),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                })
+                .collect();
+            view.view_model = BrowserViewModel::new(&view.entries);
+            view.selected = Some(0);
+            let focused = view.entries[0].stable_id();
+            let other = view.entries[1].stable_id();
+
+            view.select_all_visible(cx);
+            assert_eq!(
+                view.selection
+                    .selected_in_order(&view.visible_selection_ids()),
+                [focused.clone(), other.clone()]
+            );
+            view.toggle_focused_selection(cx);
+            assert_eq!(view.browser_focus_id(), Some(focused));
+            assert_eq!(
+                view.selection
+                    .selected_in_order(&view.visible_selection_ids()),
+                [other]
+            );
         });
     }
 
