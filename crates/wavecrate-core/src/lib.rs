@@ -16,6 +16,7 @@ mod playback_type_filter;
 mod played_range_history;
 mod playmark_timing;
 mod random_audition;
+mod random_navigation;
 mod rating;
 mod rating_filter;
 mod sample_name;
@@ -48,6 +49,7 @@ pub use playmark_timing::{
     MAX_PLAYMARK_TIMING_CHARACTERS, parse_playmark_frame_range, playmark_selection_label,
 };
 pub use random_audition::{RandomAuditionUnits, random_audition_span_for_units};
+pub use random_navigation::RandomNavigationState;
 pub use rating::{MAX_RATING, MIN_RATING, RatingState, RatingTransition, next_rating_state};
 pub use rating_filter::{RATING_FILTER_LEVELS, RatingFilter};
 pub use sample_name::{SampleNameViewMode, sample_display_name};
