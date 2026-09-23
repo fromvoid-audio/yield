@@ -44,3 +44,6 @@ The trigger requires a local `lockf` or `flock` command and Rust/Cargo. It does
 not publish artifacts, merge code, or change branch state. An installed runner
 is a copy; rerun the installer after updating the scripts. Its result is macOS
 evidence only.
+
+For a private bundle from an exact validated commit, follow
+[GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).
