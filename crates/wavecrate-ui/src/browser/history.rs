@@ -249,6 +249,17 @@ impl Browser {
         self.view_model.set_query(&self.entries, "");
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
+        if let Some(session) = self.source_sessions.get_mut(source_index) {
+            session.selected_folder = selected_folder;
+            session.expanded_folders = expanded;
+            session.folder_scope = folder_scope;
+            session.selected_audio_id = None;
+        }
+        if switching_source || self.catalog_activation.is_none() {
+            // Catalog activation resets the tag filter and its temporary reveal. Install the
+            // history target's reveal after that reset so a filtered file remains visible.
+            let _ = self.begin_catalog_activation(source_index, false, true, false, cx);
+        }
         let target_id = self.entries.get(target_index)?.stable_id();
         if self.view_model.visible_position_for(&target_id).is_none() {
             self.view_model
@@ -263,20 +274,8 @@ impl Browser {
             "{count} audio file{} · cached",
             if count == 1 { "" } else { "s" }
         );
-        if let Some(session) = self.source_sessions.get_mut(source_index) {
-            session.selected_folder = selected_folder;
-            session.expanded_folders = expanded;
-            session.folder_scope = folder_scope;
-            session.selected_audio_id = None;
-        }
         tag_chips::invalidate(self);
         self.start_source_registry_poll(cx);
-        if switching_source || self.catalog_activation.is_none() {
-            // History already owns the accepted replay request. Preserve its transport while
-            // handing the newly active source to the catalog; a catalog failure keeps this
-            // cached projection usable through the existing fallback path.
-            let _ = self.begin_catalog_activation(source_index, false, true, false, cx);
-        }
         Some(target_index)
     }
 }
@@ -354,15 +353,20 @@ fn next_scan_generation_after_history_cancel(current_generation: u64, pending: b
 mod tests {
     use std::{collections::BTreeSet, path::PathBuf};
 
+    use gpui::TestAppContext;
+
     use super::{
         PlaybackHistoryDirection, cached_history_target, history_playback_intent,
         history_shortcut_direction, history_target_can_replay_in_place,
         next_scan_generation_after_history_cancel, playback_history_span,
     };
-    use crate::browser::SourceSession;
     use crate::browser::transport::{PlaybackIntent, PlaybackIntentOrigin};
     use crate::browser::waveform::WaveformPlayRegion;
-    use wavecrate_core::{AudioFile, PlaybackHistoryEntry};
+    use crate::browser::{Browser, SourceSession};
+    use wavecrate_core::{
+        AudioFile, AudioFileCuration, BrowserViewModel, FolderTree, PlaybackHistoryEntry,
+    };
+    use wavecrate_library::sample_sources::SourceId;
 
     fn audio(path: &str, relative_path: &str) -> AudioFile {
         AudioFile {
@@ -514,5 +518,54 @@ mod tests {
         assert!(!history_target_can_replay_in_place(true, false, true));
         assert!(!history_target_can_replay_in_place(true, true, false));
         assert!(!history_target_can_replay_in_place(false, true, true));
+    }
+
+    #[gpui::test]
+    fn history_back_reveals_filtered_cached_file_and_queues_its_region(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/opt1765-history-fixture");
+            let mut hidden = audio(
+                "/tmp/opt1765-history-fixture/sub/hidden.wav",
+                "sub/hidden.wav",
+            );
+            hidden.curation = AudioFileCuration::from_parts(0, false, 0, None, None);
+            let mut current = audio("/tmp/opt1765-history-fixture/current.wav", "current.wav");
+            current.curation = AudioFileCuration::from_parts(1, false, 0, None, None);
+            let entries = vec![hidden.clone(), current.clone()];
+            let mut session = SourceSession::new(root.clone());
+            session.source_id = Some(SourceId::from_string("opt-1765-history-fixture"));
+            session.tree = FolderTree::from_scan(&[], &entries);
+            session.entries = entries.clone();
+            view.source_sessions = vec![session];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.folder_tree = Some(FolderTree::from_scan(&[], &entries));
+            view.entries = entries;
+            view.view_model = BrowserViewModel::new(&view.entries);
+            assert!(view.view_model.toggle_rating_filter(&view.entries, 1));
+            view.selected = Some(1);
+            let hidden_id = hidden.stable_id();
+            assert!(view.view_model.visible_position_for(&hidden_id).is_none());
+            view.playback_history.record(hidden.path.clone(), 0.2, 0.6);
+            view.playback_history.record(current.path.clone(), 0.0, 1.0);
+
+            view.navigate_playback_history(PlaybackHistoryDirection::Back, cx);
+
+            assert_eq!(view.selected_audio_path(), Some(hidden.path.as_path()));
+            assert_eq!(view.view_model.reveal_id(), Some(&hidden_id));
+            assert!(view.view_model.visible_position_for(&hidden_id).is_some());
+            assert_eq!(
+                view.waveform_play_region,
+                WaveformPlayRegion::new(f64::from(0.2_f32), f64::from(0.6_f32))
+            );
+            let pending = view
+                .playback_init_intent
+                .as_ref()
+                .expect("history replay intent waits for preferences or audio output");
+            assert_eq!(pending.origin, PlaybackIntentOrigin::HistoryReplay);
+            assert_eq!(pending.path, hidden.path);
+        });
     }
 }
