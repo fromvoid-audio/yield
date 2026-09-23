@@ -914,6 +914,12 @@ impl Persistence {
         vocabulary_slot: Arc<Mutex<VocabularySlot>>,
         maintenance_admission: Arc<MaintenanceAdmission>,
     ) -> (Self, Option<AppRootGuard>, PersistenceProfileGuard) {
+        #[cfg(test)]
+        let fixture_registry = app_root_override.as_ref().and_then(|root| {
+            root.parent()
+                .and_then(Path::parent)
+                .map(|app_root| app_root.join("volume-registry"))
+        });
         let profile_guard = PersistenceProfileGuard::named(GPUI_DEVELOPMENT_PROFILE);
         let mut persistence = Self {
             writable: None,
@@ -941,10 +947,36 @@ impl Persistence {
             },
             None => None,
         };
+        #[cfg(test)]
+        if persistence.unavailable.is_none() {
+            if let Some(registry) = fixture_registry.as_ref() {
+                if let Err(error) = std::fs::create_dir_all(registry) {
+                    persistence.unavailable = Some(SessionError::Persistence(format!(
+                        "session fixture volume registry unavailable: {error}"
+                    )));
+                }
+            }
+        }
         if persistence.unavailable.is_none() {
             match WritableProfileGuard::acquire_current() {
                 Ok(writable) => match open_session_journal(&writable) {
-                    Ok(journal) => match OperationJournalOwner::start(journal) {
+                    Ok(journal) => match {
+                        #[cfg(test)]
+                        {
+                            match fixture_registry {
+                                Some(registry) => {
+                                    OperationJournalOwner::start_with_capacity_fixture_for_test(
+                                        journal, registry,
+                                    )
+                                }
+                                None => OperationJournalOwner::start(journal),
+                            }
+                        }
+                        #[cfg(not(test))]
+                        {
+                            OperationJournalOwner::start(journal)
+                        }
+                    } {
                         Ok(journal) => match GlobalLibraryWriter::start(&writable) {
                             Ok(writer) => {
                                 vocabulary::install(
@@ -2719,14 +2751,15 @@ mod tests {
 
     fn wait_for_event(service: &SourceRegistryService, predicate: impl Fn(&RegistryEvent) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = Vec::new();
         loop {
             match service.try_recv() {
                 Ok(event) if predicate(&event) => return,
-                Ok(_) => {}
+                Ok(event) => observed.push(format!("{event:?}")),
                 Err(TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
-                        "timed out waiting for session event"
+                        "timed out waiting for session event; observed: {observed:?}"
                     );
                     thread::sleep(Duration::from_millis(5));
                 }
@@ -2740,14 +2773,15 @@ mod tests {
         predicate: impl Fn(&PreferenceEvent) -> bool,
     ) -> PreferenceEvent {
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = Vec::new();
         loop {
             match service.try_recv_preference() {
                 Ok(event) if predicate(&event) => return event,
-                Ok(_) => {}
+                Ok(event) => observed.push(format!("{event:?}")),
                 Err(TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
-                        "timed out waiting for preference event"
+                        "timed out waiting for preference event; observed: {observed:?}"
                     );
                     thread::sleep(Duration::from_millis(5));
                 }
