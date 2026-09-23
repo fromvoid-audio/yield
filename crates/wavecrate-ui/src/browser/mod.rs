@@ -1590,10 +1590,15 @@ impl Browser {
         if self.catalog_activation.is_some() && source_recovery::manual_refresh(self, cx) {
             return;
         }
-        if matches!(
-            catalog::catalog_status(cx),
-            Some(CatalogStatus::Loading | CatalogStatus::Ready)
-        ) && self.begin_catalog_activation(index, true, true, false, cx)
+        if self
+            .source_sessions
+            .get(index)
+            .is_some_and(|session| session.source_id.is_some())
+            && matches!(
+                catalog::catalog_status(cx),
+                Some(CatalogStatus::Loading | CatalogStatus::Ready)
+            )
+            && self.begin_catalog_activation(index, true, true, false, cx)
         {
             return;
         }
