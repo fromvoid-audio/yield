@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install a non-blocking post-commit hook for this repository's shared worktrees.
+# Install a post-commit hook for this repository's shared worktrees.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,10 +39,14 @@ if [[ ! -f "$runner" ]]; then
   exit 0
 fi
 export WAVECRATE_GPUI_CI_SCRIPT="$common_dir/local-ci/bin/gpui-local-ci.sh"
-nohup bash "$runner" "$repo_root" "$commit" >/dev/null 2>&1 </dev/null &
-echo "[gpui-local-ci] started $commit; result: $common_dir/local-ci/runs/$commit/result"
+echo "[gpui-local-ci] checking $commit; log: $common_dir/local-ci/runs/$commit/check.log"
+if bash "$runner" "$repo_root" "$commit"; then
+  echo "[gpui-local-ci] PASS $commit"
+else
+  echo "[gpui-local-ci] FAIL $commit; see $common_dir/local-ci/runs/$commit/check.log" >&2
+fi
 HOOK
 chmod +x "$hook"
 echo "Installed $hook"
-echo "Each commit now starts local GPUI CI in a clean snapshot."
+echo "Each commit now runs local GPUI CI in a clean snapshot before returning."
 echo "Results: $common_dir/local-ci/runs/<commit>/{result,check.log}"

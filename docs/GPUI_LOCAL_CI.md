@@ -28,7 +28,7 @@ exception is fixed.
 Install the macOS/Linux automatic trigger once with
 `bash scripts/install-gpui-local-ci.sh`.
 It installs a `post-commit` hook in this repository's shared Git directory,
-so commits from its worktrees start validation without blocking the commit.
+so commits from its worktrees run validation before the Git command returns.
 The hook runs the **exact committed SHA** in a temporary detached worktree,
 not the dirty working tree. Runs are serialized against a shared Cargo target
 with an OS file lock. The temporary checkout is removed afterward.
