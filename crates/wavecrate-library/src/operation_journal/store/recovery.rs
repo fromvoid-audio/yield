@@ -1540,6 +1540,7 @@ mod tests {
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
         let record = universal_intent_record(OperationId::new());
+        let operation_id = record.operation_id;
         store.insert_intent(&record).expect("insert v3 intent");
 
         let page = store.scan_recovery_page(None).expect("scan v3 intent");
@@ -1550,6 +1551,13 @@ mod tests {
             page.entries()[0].outcome(),
             &RecoveryRowOutcome::Consistent(record)
         );
+        let status = page.entries()[0].status_snapshot();
+        assert_eq!(status.operation_id(), Some(operation_id));
+        assert_eq!(status.sequence(), 1);
+        let observed = status.observed().expect("consistent row projects status");
+        assert_eq!(observed.phase(), OperationPhase::IntentDurable);
+        assert_eq!(observed.disposition(), OperationDisposition::None);
+        assert!(status.retained().is_none());
     }
 
     #[test]
