@@ -10,6 +10,8 @@ use crate::sample_sources::SourceId;
 
 /// Maximum number of visible samples in one layout read.
 pub const STARMAP_LAYOUT_MAX_SAMPLES: usize = 20_000;
+/// Maximum combined UTF-8 bytes in source, model, version, and sample identities.
+pub const STARMAP_LAYOUT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const QUERY_CHUNK_SIZE: usize = 256;
 
 /// One visible browser file and its persisted analysis identity.
@@ -103,6 +105,9 @@ pub enum StarmapLayoutError {
     /// The request exceeded the bounded read contract.
     #[error("starmap request contains more than {STARMAP_LAYOUT_MAX_SAMPLES} samples")]
     TooManySamples,
+    /// The request identities exceeded the bounded read contract.
+    #[error("starmap request identities exceed {STARMAP_LAYOUT_MAX_REQUEST_BYTES} bytes")]
+    TooManyIdentityBytes,
     /// The request contains a missing or mismatched identity.
     #[error("starmap request has an invalid model, layout, source, or sample identity")]
     InvalidIdentity,
@@ -221,6 +226,23 @@ impl SourceDatabase {
 fn validate_request(request: &StarmapLayoutRequest) -> Result<(), StarmapLayoutError> {
     if request.samples.len() > STARMAP_LAYOUT_MAX_SAMPLES {
         return Err(StarmapLayoutError::TooManySamples);
+    }
+    let mut identity_bytes = request
+        .source_id
+        .as_str()
+        .len()
+        .saturating_add(request.model_id.len())
+        .saturating_add(request.umap_version.len());
+    if identity_bytes > STARMAP_LAYOUT_MAX_REQUEST_BYTES {
+        return Err(StarmapLayoutError::TooManyIdentityBytes);
+    }
+    for sample in &request.samples {
+        identity_bytes = identity_bytes
+            .saturating_add(sample.file_id.len())
+            .saturating_add(sample.sample_id.len());
+        if identity_bytes > STARMAP_LAYOUT_MAX_REQUEST_BYTES {
+            return Err(StarmapLayoutError::TooManyIdentityBytes);
+        }
     }
     if request.source_id.as_str().is_empty()
         || request.lifecycle_generation == 0
@@ -429,6 +451,16 @@ mod tests {
         assert!(matches!(
             validate_request(&oversized),
             Err(StarmapLayoutError::TooManySamples)
+        ));
+    }
+
+    #[test]
+    fn request_rejects_unbounded_identity_bytes_before_reading() {
+        let mut oversized = request(0);
+        oversized.model_id = "m".repeat(STARMAP_LAYOUT_MAX_REQUEST_BYTES + 1);
+        assert!(matches!(
+            validate_request(&oversized),
+            Err(StarmapLayoutError::TooManyIdentityBytes)
         ));
     }
 

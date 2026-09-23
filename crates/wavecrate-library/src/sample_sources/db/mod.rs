@@ -50,8 +50,8 @@ pub use source_authority::{
 };
 pub use source_lease::{SourceLeaseError, SourcePublicationFence, SourcePublicationFenceError};
 pub use starmap_layout::{
-    STARMAP_LAYOUT_MAX_SAMPLES, StarmapLayoutError, StarmapLayoutLoad, StarmapLayoutPoint,
-    StarmapLayoutRequest, StarmapLayoutSample,
+    STARMAP_LAYOUT_MAX_REQUEST_BYTES, STARMAP_LAYOUT_MAX_SAMPLES, StarmapLayoutError,
+    StarmapLayoutLoad, StarmapLayoutPoint, StarmapLayoutRequest, StarmapLayoutSample,
 };
 /// Durable per-source tag catalog and sample assignment helpers.
 pub mod tags;
