@@ -549,6 +549,34 @@ pub(super) fn render(
             )
             .child(
                 div()
+                    .id("show-empty-folders")
+                    .debug_selector(|| String::from("show-empty-folders"))
+                    .flex()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .h(px(theme.spacing.control_height))
+                    .cursor_pointer()
+                    .bg(color(theme.colors.surface_overlay))
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .text_size(px(theme.typography.small_size))
+                    .text_color(color(if browser.show_empty_folders {
+                        theme.colors.accent
+                    } else {
+                        theme.colors.text_primary
+                    }))
+                    .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                        view.toggle_empty_folder_visibility(cx)
+                    }))
+                    .child(if browser.show_empty_folders {
+                        "Hide Empty Folders"
+                    } else {
+                        "Show Empty Folders"
+                    }),
+            )
+            .child(
+                div()
                     .w_full()
                     .overflow_hidden()
                     .whitespace_nowrap()
@@ -657,12 +685,228 @@ pub(super) fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::Browser;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::{super::SourceSession, Browser};
     use gpui::{
-        AvailableSpace, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
-        VisualTestContext, point, px, size,
+        AvailableSpace, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext,
+        TouchPhase, VisualTestContext, point, px, size,
     };
-    use wavecrate_core::FolderTreeRow;
+    use wavecrate_core::{AudioFile, BrowserViewModel, FolderTree, FolderTreeRow};
+    use wavecrate_library::sample_sources::SourceId;
+    use wavecrate_media::enumerate_audio_files_with_cancel;
+
+    fn audio(root: &Path, relative_path: &str) -> AudioFile {
+        AudioFile {
+            path: root.join(relative_path),
+            relative_path: PathBuf::from(relative_path),
+            byte_len: 0,
+            duration_seconds: None,
+            sample_rate: None,
+            playback_type: None,
+            curation: None,
+        }
+    }
+
+    #[gpui::test]
+    fn hiding_selected_empty_folder_reconciles_to_visible_ancestor(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/opt1858-empty-folder-fixture");
+            let entries = vec![audio(&root, "kick.wav")];
+            let tree = FolderTree::from_scan(&[PathBuf::from("empty")], &entries);
+            let mut session = SourceSession::new(root.clone());
+            session.entries = entries.clone();
+            session.tree = tree.clone();
+            session.selected_folder = PathBuf::from("empty");
+            view.source_sessions = vec![session];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.entries = entries;
+            view.folder_tree = Some(tree);
+            view.selected_folder = PathBuf::from("empty");
+            view.show_empty_folders = true;
+            view.view_model = BrowserViewModel::new(&view.entries);
+            view.view_model.set_folder_scope(
+                &view.entries,
+                Some(view.selected_folder.clone()),
+                view.folder_scope,
+            );
+            view.rebuild_folder_rows_cache();
+            assert!(
+                view.folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("empty"))
+            );
+
+            view.toggle_empty_folder_visibility(cx);
+
+            assert!(!view.show_empty_folders);
+            assert_eq!(view.selected_folder, Path::new("."));
+            assert_eq!(view.source_sessions[0].selected_folder, Path::new("."));
+            assert!(
+                !view
+                    .folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("empty"))
+            );
+            assert!(view.selection.is_empty());
+            assert!(
+                view.selected_audio_path()
+                    .is_none_or(|path| path == view.entries[0].path)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn shown_empty_folder_can_be_selected(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, _| {
+            view.folder_tree = Some(FolderTree::from_scan(&[PathBuf::from("empty")], &[]));
+            view.show_empty_folders = true;
+            view.rebuild_folder_rows_cache();
+        });
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.select_folder(PathBuf::from("empty"), window, cx);
+                assert_eq!(view.selected_folder, Path::new("empty"));
+                assert!(view.view_model.rows().is_empty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn showing_empty_folders_keeps_cached_rows_while_refresh_starts(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/opt1858-empty-folder-refresh-fixture");
+            let entries = vec![audio(&root, "kick.wav")];
+            let tree = FolderTree::from_scan(&[PathBuf::from("empty")], &entries);
+            let mut session = SourceSession::new(root.clone());
+            session.entries = entries.clone();
+            session.tree = tree.clone();
+            view.source_sessions = vec![session];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.entries = entries;
+            view.folder_tree = Some(tree);
+            view.view_model = BrowserViewModel::new(&view.entries);
+            view.rebuild_folder_rows_cache();
+            let visible_samples = view.view_model.rows().to_vec();
+            assert!(
+                !view
+                    .folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("empty"))
+            );
+
+            view.toggle_empty_folder_visibility(cx);
+
+            assert!(view.show_empty_folders);
+            assert!(
+                view.folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("empty"))
+            );
+            assert!(view.scan_task.is_some());
+            assert!(view.scan_cancel.is_some());
+            assert!(view.folder_tree.is_some());
+            assert_eq!(view.view_model.rows(), visible_samples);
+        });
+    }
+
+    #[gpui::test]
+    fn enabling_empty_folders_refreshes_disk_only_directory_truth(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let directory = tempfile::tempdir().expect("temporary source");
+        let root = fs::canonicalize(directory.path()).expect("canonical temporary source");
+        let mut session = SourceSession::new(root.clone());
+        session.source_id = Some(SourceId::from_string("opt-1858-refresh"));
+        session.tree = FolderTree::from_scan(&[], &[]);
+        fs::create_dir(root.join("new-empty-folder")).expect("new disk-only folder");
+
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, cx| {
+            view.source_sessions = vec![session];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.folder_tree = Some(view.source_sessions[0].tree.clone());
+            view.rebuild_folder_rows_cache();
+            assert!(
+                !view.source_sessions[0]
+                    .tree
+                    .contains(Path::new("new-empty-folder"))
+            );
+            view.toggle_empty_folder_visibility(cx);
+            assert!(
+                view.folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("."))
+            );
+        });
+        let scan = enumerate_audio_files_with_cancel(directory.path(), None)
+            .expect("refresh includes new directory");
+        browser.update(cx, |view, cx| {
+            if let Some(cancellation) = view.scan_cancel.take() {
+                cancellation.store(true, std::sync::atomic::Ordering::Release);
+            }
+            view.scan_task.take();
+            view.scan_generation = view.scan_generation.wrapping_add(1);
+            view.apply_scan_result(scan, Some(0), cx);
+            assert!(
+                view.source_sessions[0]
+                    .tree
+                    .contains(Path::new("new-empty-folder"))
+            );
+            assert!(
+                view.folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("new-empty-folder"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn restored_source_snapshot_hides_empty_rows_and_reconciles_folder(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, _| {
+            let root = PathBuf::from("/tmp/opt1858-restored-snapshot");
+            let entries = vec![audio(&root, "drums/kick.wav")];
+            let tree = FolderTree::from_scan(&[PathBuf::from("empty")], &entries);
+            let mut session = SourceSession::new(root.clone());
+            session.entries = entries.clone();
+            session.tree = tree.clone();
+            session.selected_folder = PathBuf::from("empty");
+            view.source_sessions = vec![session];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.entries = entries;
+            view.folder_tree = Some(tree);
+            view.selected_folder = PathBuf::from("empty");
+            view.rebuild_folder_rows_cache();
+
+            assert!(!view.show_empty_folders);
+            assert!(view.source_sessions[0].tree.contains(Path::new("empty")));
+            assert_eq!(view.selected_folder, Path::new("."));
+            assert_eq!(view.source_sessions[0].selected_folder, Path::new("."));
+            assert!(
+                view.folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("drums"))
+            );
+            assert!(
+                !view
+                    .folder_rows()
+                    .iter()
+                    .any(|row| row.path == Path::new("empty"))
+            );
+        });
+    }
 
     fn draw_sidebar(browser: &gpui::Entity<Browser>, cx: &mut VisualTestContext) {
         cx.draw(
@@ -709,6 +953,9 @@ mod tests {
         let refresh_before = cx
             .debug_bounds("refresh-source")
             .expect("refresh bounds before scrolling");
+        let empty_before = cx
+            .debug_bounds("show-empty-folders")
+            .expect("empty-folder toggle bounds before scrolling");
 
         assert_eq!(source_header.size.height, px(theme.spacing.control_height));
         assert!(folder_list.size.height >= px(theme.spacing.row_height * 4.0));
@@ -729,6 +976,9 @@ mod tests {
         let refresh_after = cx
             .debug_bounds("refresh-source")
             .expect("refresh bounds after scrolling");
+        let empty_after = cx
+            .debug_bounds("show-empty-folders")
+            .expect("empty-folder toggle bounds after scrolling");
         assert!(
             scope_after.top() < scope_before.top(),
             "scope did not scroll: {scope_before:?} -> {scope_after:?}; auxiliary {auxiliary:?}"
@@ -739,7 +989,19 @@ mod tests {
         );
         assert!(scope_after.bottom() <= auxiliary.bottom());
         assert!(refresh_after.bottom() <= auxiliary.bottom());
+        assert!(empty_after.top() < empty_before.top());
+        assert!(empty_after.bottom() <= auxiliary.bottom());
         assert!(scope_after.top() >= auxiliary.top());
         assert!(refresh_after.top() >= auxiliary.top());
+        assert!(empty_after.top() >= auxiliary.top());
+
+        let center = point(
+            empty_after.origin.x + empty_after.size.width / 2.0,
+            empty_after.origin.y + empty_after.size.height / 2.0,
+        );
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+        cx.cx
+            .update(|app| assert!(browser.read(app).show_empty_folders));
     }
 }

@@ -112,15 +112,52 @@ impl FolderTree {
 
     /// Return a flattened visible tree projection for the supplied expanded set.
     pub fn rows(&self, expanded: &BTreeSet<PathBuf>) -> Vec<FolderTreeRow> {
-        let mut expanded = expanded.clone();
-        expanded.insert(PathBuf::from("."));
-        self.rows_with_expanded(&expanded)
+        self.visible_rows(expanded, true)
     }
 
-    fn rows_with_expanded(&self, expanded: &BTreeSet<PathBuf>) -> Vec<FolderTreeRow> {
+    /// Project folder rows while retaining every directory in the authoritative tree.
+    /// The source root is always visible even when it contains no audio.
+    pub fn visible_rows(
+        &self,
+        expanded: &BTreeSet<PathBuf>,
+        show_empty_folders: bool,
+    ) -> Vec<FolderTreeRow> {
+        let mut expanded = expanded.clone();
+        expanded.insert(PathBuf::from("."));
+        self.rows_with_expanded(&expanded, show_empty_folders)
+    }
+
+    /// Find the nearest folder that remains visible under the selected visibility mode.
+    pub fn nearest_visible_ancestor(&self, path: &Path, show_empty_folders: bool) -> PathBuf {
+        let mut candidate = normalize_relative_path(path);
+        loop {
+            if self.folder_is_visible(&candidate, show_empty_folders) {
+                return candidate;
+            }
+            if candidate == Path::new(".") {
+                return candidate;
+            }
+            candidate = candidate
+                .parent()
+                .map(normalize_relative_path)
+                .unwrap_or_else(|| PathBuf::from("."));
+        }
+    }
+
+    fn folder_is_visible(&self, path: &Path, show_empty_folders: bool) -> bool {
+        self.nodes
+            .get(path)
+            .is_some_and(|node| path == Path::new(".") || show_empty_folders || node.contains_audio)
+    }
+
+    fn rows_with_expanded(
+        &self,
+        expanded: &BTreeSet<PathBuf>,
+        show_empty_folders: bool,
+    ) -> Vec<FolderTreeRow> {
         let mut rows = Vec::new();
         let root = PathBuf::from(".");
-        self.append_rows(&root, 0, expanded, &mut rows);
+        self.append_rows(&root, 0, expanded, show_empty_folders, &mut rows);
         rows
     }
 
@@ -129,17 +166,24 @@ impl FolderTree {
         path: &Path,
         depth: usize,
         expanded: &BTreeSet<PathBuf>,
+        show_empty_folders: bool,
         rows: &mut Vec<FolderTreeRow>,
     ) {
         let Some(node) = self.nodes.get(path) else {
             return;
         };
         let normalized = normalize_relative_path(path);
+        if !self.folder_is_visible(&normalized, show_empty_folders) {
+            return;
+        }
         let is_expanded = expanded.contains(&normalized);
         rows.push(FolderTreeRow {
             path: normalized.clone(),
             depth,
-            has_children: !node.children.is_empty(),
+            has_children: node
+                .children
+                .iter()
+                .any(|child| self.folder_is_visible(child, show_empty_folders)),
             expanded: is_expanded,
             contains_audio: node.contains_audio,
             audio_file_count: node.audio_file_count,
@@ -154,7 +198,13 @@ impl FolderTree {
                 .then_with(|| left.cmp(right))
         });
         for child in children {
-            self.append_rows(child, depth.saturating_add(1), expanded, rows);
+            self.append_rows(
+                child,
+                depth.saturating_add(1),
+                expanded,
+                show_empty_folders,
+                rows,
+            );
         }
     }
 
@@ -305,6 +355,42 @@ mod tests {
         assert_eq!(rows[0], (PathBuf::from("."), true));
         assert_eq!(rows[1], (PathBuf::from("drums"), true));
         assert_eq!(rows[2], (PathBuf::from("empty"), false));
+    }
+
+    #[test]
+    fn visible_rows_hide_empty_branches_without_losing_directory_truth() {
+        let tree = FolderTree::from_scan(
+            &[PathBuf::from("empty/child"), PathBuf::from("drums/empty")],
+            &[file("drums/kick.wav")],
+        );
+        let expanded = BTreeSet::from([PathBuf::from("."), PathBuf::from("drums")]);
+        let hidden = tree.visible_rows(&expanded, false);
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|row| row.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("."), Path::new("drums")]
+        );
+        assert!(!hidden[1].has_children);
+        assert!(tree.contains(Path::new("empty/child")));
+        assert_eq!(
+            tree.nearest_visible_ancestor(Path::new("drums/empty"), false),
+            PathBuf::from("drums")
+        );
+        assert_eq!(
+            tree.nearest_visible_ancestor(Path::new("empty/child"), false),
+            PathBuf::from(".")
+        );
+
+        let shown = tree.visible_rows(&expanded, true);
+        assert!(shown.iter().any(|row| row.path == Path::new("empty")));
+        assert!(shown.iter().any(|row| row.path == Path::new("drums/empty")));
+        assert!(shown[1].has_children);
+        assert_eq!(
+            tree.nearest_visible_ancestor(Path::new("empty/child"), true),
+            PathBuf::from("empty/child")
+        );
     }
 
     #[test]
