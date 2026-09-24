@@ -490,6 +490,14 @@ impl Browser {
         None
     }
 
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn ax_frame_setter(
+        &self,
+        _: impl Into<String>,
+    ) -> Option<Rc<dyn Fn(gpui::Bounds<gpui::Pixels>)>> {
+        None
+    }
+
     pub(crate) fn new_window(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut browser = Self::new(cx);
         #[cfg(target_os = "macos")]

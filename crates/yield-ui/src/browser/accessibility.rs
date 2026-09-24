@@ -1,6 +1,6 @@
 //! Native accessibility controls owned by the browser window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -11,7 +11,9 @@ use raw_window_handle::HasWindowHandle;
 use yield_core::{
     COLLECTION_COUNT, PLAYBACK_TYPE_FILTERS, RATING_FILTER_LEVELS, SortColumn, SortDirection,
 };
-use yield_platform::accessibility::{AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole};
+use yield_platform::accessibility::{
+    AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole, AxSlider,
+};
 
 use super::{Browser, tag_library};
 
@@ -23,6 +25,40 @@ pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
 pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
 pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
 pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+const PLAY: &str = "transport-play";
+const STOP: &str = "transport-stop";
+const LOOP: &str = "transport-loop";
+const SIMILAR: &str = "transport-similar-sections";
+const BPM_SNAP: &str = "transport-bpm-snap";
+const ZERO_CROSSING: &str = "transport-zero-crossing";
+const BEAT_GUIDES: &str = "transport-beat-guides";
+const BEAT_COUNT: &str = "transport-beat-count";
+const METRONOME: &str = "transport-metronome";
+const RANDOM_AUDITION: &str = "transport-random-audition";
+const NORMALIZED_AUDITION: &str = "transport-normalized-audition";
+const VOLUME: &str = "transport-volume";
+const WAVEFORM: &str = "transport-waveform";
+const PLAYMARK_TIMING: &str = "transport-playmark-timing";
+
+fn button(id: &'static str, label: &'static str, value: Option<String>, enabled: bool) -> AxChild {
+    AxChild {
+        id: id.into(),
+        role: AxRole::Button,
+        label: label.into(),
+        value,
+        enabled,
+    }
+}
+
+fn toggle(id: &'static str, label: &'static str, on: bool, enabled: bool) -> AxChild {
+    AxChild {
+        id: id.into(),
+        role: AxRole::CheckBox,
+        label: label.into(),
+        value: Some(if on { "On" } else { "Off" }.into()),
+        enabled,
+    }
+}
 
 pub(super) fn sort_id(column: SortColumn) -> &'static str {
     match column {
@@ -98,6 +134,7 @@ pub(super) fn sample_id(path: &Path) -> String {
 pub(super) struct BrowserAccessibility {
     registry: Rc<RefCell<AxRegistry>>,
     last_controls: RefCell<Vec<AxChild>>,
+    last_volume: Cell<Option<f32>>,
     visible_sources: Vec<PathBuf>,
     visible_folders: Vec<PathBuf>,
     visible_samples: Vec<PathBuf>,
@@ -131,7 +168,21 @@ impl BrowserAccessibility {
             cx.notify();
         });
         let mut control_focus = HashMap::new();
-        for id in [RANDOM_NAVIGATION, NAME_VIEW_MODE, TAG_FILTER_TOGGLE] {
+        for id in [
+            RANDOM_NAVIGATION,
+            NAME_VIEW_MODE,
+            TAG_FILTER_TOGGLE,
+            PLAY,
+            STOP,
+            LOOP,
+            SIMILAR,
+            BPM_SNAP,
+            ZERO_CROSSING,
+            BEAT_GUIDES,
+            METRONOME,
+            RANDOM_AUDITION,
+            NORMALIZED_AUDITION,
+        ] {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
         for column in [
@@ -157,6 +208,7 @@ impl BrowserAccessibility {
         Some(Self {
             registry: Rc::new(RefCell::new(registry)),
             last_controls: RefCell::new(Vec::new()),
+            last_volume: Cell::new(None),
             visible_sources: Vec::new(),
             visible_folders: Vec::new(),
             visible_samples: Vec::new(),
@@ -188,6 +240,14 @@ impl BrowserAccessibility {
                             view.search_input.read(cx).focus_handle()
                         } else if event.id == TAG_FILTER_INPUT {
                             view.tag_filter_input.read(cx).focus_handle()
+                        } else if event.id == BEAT_COUNT {
+                            view.beat_count_input.read(cx).focus_handle()
+                        } else if event.id == PLAYMARK_TIMING {
+                            view.playmark_timing_input.read(cx).focus_handle()
+                        } else if event.id == VOLUME {
+                            view.volume_focus_handle.clone()
+                        } else if event.id == WAVEFORM {
+                            view.waveform_focus_handle.clone()
                         } else if let Some(focus) = ax.focus_handle(&event.id) {
                             focus
                         } else {
@@ -264,6 +324,22 @@ impl BrowserAccessibility {
                             || collection_action.is_some()
                             || playback_type_action.is_some()
                             || rating_action.is_some();
+                        let transport_action = matches!(
+                            event.id.as_str(),
+                            PLAY | STOP
+                                | LOOP
+                                | SIMILAR
+                                | BPM_SNAP
+                                | ZERO_CROSSING
+                                | BEAT_GUIDES
+                                | BEAT_COUNT
+                                | METRONOME
+                                | RANDOM_AUDITION
+                                | NORMALIZED_AUDITION
+                                | VOLUME
+                                | WAVEFORM
+                                | PLAYMARK_TIMING
+                        );
                         if !matches!(
                             event.id.as_str(),
                             ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE | SEARCH
@@ -271,6 +347,7 @@ impl BrowserAccessibility {
                             && folder_action.is_none()
                             && sample_action.is_none()
                             && !extra_action
+                            && !transport_action
                         {
                             return;
                         }
@@ -284,14 +361,61 @@ impl BrowserAccessibility {
                         if sample_action.is_some() && super::tag_filter::scope_pending(view) {
                             return;
                         }
+                        if matches!(
+                            event.id.as_str(),
+                            LOOP | ZERO_CROSSING | METRONOME | NORMALIZED_AUDITION | VOLUME
+                        ) && !view.preferences_editable()
+                        {
+                            return;
+                        }
+                        if event.id == RANDOM_AUDITION && !view.random_audition_available() {
+                            return;
+                        }
+                        if event.id == PLAY
+                            && view.selected.is_none()
+                            && view.playing_path.is_none()
+                        {
+                            return;
+                        }
+                        if event.id == WAVEFORM && view.waveform.is_none() {
+                            return;
+                        }
+                        if matches!(event.id.as_str(), BPM_SNAP | BEAT_GUIDES | BEAT_COUNT)
+                            && view.waveform.is_none()
+                        {
+                            return;
+                        }
+                        if event.id == SIMILAR
+                            && (view.waveform.is_none() || view.waveform_play_region.is_none())
+                        {
+                            return;
+                        }
+                        if event.id == STOP
+                            && view.playing_path.is_none()
+                            && view.playback_init_intent.is_none()
+                        {
+                            return;
+                        }
+                        if event.id == PLAYMARK_TIMING
+                            && !view.playmark_timing_editor.as_ref().is_some_and(|editor| {
+                                view.playmark_timing_editor_is_current(editor)
+                            })
+                        {
+                            return;
+                        }
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
-                        if event.id == SEARCH || event.id == TAG_FILTER_INPUT {
+                        if event.id == SEARCH
+                            || event.id == TAG_FILTER_INPUT
+                            || event.id == PLAYMARK_TIMING
+                        {
                             match event.action {
                                 AxAction::SetValue(value) => {
                                     let search_input = if event.id == SEARCH {
                                         view.search_input.clone()
+                                    } else if event.id == PLAYMARK_TIMING {
+                                        view.playmark_timing_input.clone()
                                     } else {
                                         view.tag_filter_input.clone()
                                     };
@@ -305,8 +429,63 @@ impl BrowserAccessibility {
                                     return;
                                 }
                             }
+                        } else if event.id == BEAT_COUNT {
+                            match event.action {
+                                AxAction::SetValue(value) => {
+                                    let input = view.beat_count_input.clone();
+                                    window.defer(cx, move |_, cx| {
+                                        input.update(cx, |input, cx| input.set_content(value, cx));
+                                    });
+                                }
+                                AxAction::Focus => {}
+                                _ => return,
+                            }
+                        } else if event.id == VOLUME {
+                            match event.action {
+                                AxAction::SetValue(value) => {
+                                    let Ok(value) = value.parse::<f32>() else {
+                                        return;
+                                    };
+                                    if !view.set_volume_from_accessibility(value, cx) {
+                                        return;
+                                    }
+                                }
+                                AxAction::Increment => {
+                                    view.change_volume_from_key("arrowright", false, cx);
+                                }
+                                AxAction::Decrement => {
+                                    view.change_volume_from_key("arrowleft", false, cx);
+                                }
+                                AxAction::Focus => {}
+                                AxAction::Press => return,
+                            }
+                        } else if event.id == WAVEFORM {
+                            if event.action != AxAction::Focus {
+                                return;
+                            }
                         } else if event.action == AxAction::Press {
                             match event.id.as_str() {
+                                PLAY => view.toggle_playback(cx),
+                                STOP => {
+                                    view.stop_playback();
+                                    cx.notify();
+                                }
+                                LOOP => view.toggle_loop(cx),
+                                SIMILAR => super::similar_sections::toggle(view, cx),
+                                BPM_SNAP => {
+                                    view.bpm_snap_enabled = !view.bpm_snap_enabled;
+                                    cx.notify();
+                                }
+                                ZERO_CROSSING => super::zero_crossing::toggle_from_accessibility(
+                                    view, window, cx,
+                                ),
+                                BEAT_GUIDES => {
+                                    view.beat_guides_enabled = !view.beat_guides_enabled;
+                                    cx.notify();
+                                }
+                                METRONOME => view.toggle_metronome(cx),
+                                RANDOM_AUDITION => view.request_random_audition(false, cx),
+                                NORMALIZED_AUDITION => view.toggle_normalized_audition(cx),
                                 ADD_SOURCE => view.prompt_for_source(cx),
                                 FOLDER_SCOPE => view.toggle_folder_scope(cx),
                                 REFRESH_SOURCE => view.refresh_active_source(cx),
@@ -523,6 +702,121 @@ impl Browser {
                     enabled: true,
                 },
             ];
+            let has_waveform = self.waveform.is_some();
+            let can_play = self.selected.is_some() || self.playing_path.is_some();
+            controls.extend([
+                button(
+                    PLAY,
+                    "Play or pause sample",
+                    Some(
+                        if self.playing_path.is_some() {
+                            "Playing"
+                        } else {
+                            "Stopped"
+                        }
+                        .into(),
+                    ),
+                    can_play,
+                ),
+                button(
+                    STOP,
+                    "Stop playback",
+                    None,
+                    self.playing_path.is_some() || self.playback_init_intent.is_some(),
+                ),
+                toggle(
+                    LOOP,
+                    "Loop selection",
+                    self.loop_toolbar_enabled(),
+                    self.preferences_editable(),
+                ),
+                toggle(
+                    SIMILAR,
+                    "Find similar sections",
+                    self.similar_sections.enabled(),
+                    has_waveform && self.waveform_play_region.is_some(),
+                ),
+                toggle(
+                    BPM_SNAP,
+                    "Snap selection to beats",
+                    self.bpm_snap_enabled,
+                    has_waveform,
+                ),
+                toggle(
+                    ZERO_CROSSING,
+                    "Snap to zero crossing",
+                    self.zero_crossing.enabled(),
+                    self.preferences_editable(),
+                ),
+                toggle(
+                    BEAT_GUIDES,
+                    "Beat guides",
+                    self.beat_guides_enabled,
+                    has_waveform,
+                ),
+                toggle(
+                    METRONOME,
+                    "Metronome",
+                    self.metronome_toolbar_enabled(),
+                    self.preferences_editable(),
+                ),
+                button(
+                    RANDOM_AUDITION,
+                    "Audition random sample",
+                    None,
+                    self.random_audition_available(),
+                ),
+                toggle(
+                    NORMALIZED_AUDITION,
+                    "Normalize audition volume",
+                    self.normalized_audition.enabled(),
+                    self.preferences_editable(),
+                ),
+                AxChild {
+                    id: VOLUME.into(),
+                    role: AxRole::Slider,
+                    label: "Audition volume".into(),
+                    value: None,
+                    enabled: self.preferences_editable(),
+                },
+                AxChild {
+                    id: WAVEFORM.into(),
+                    role: AxRole::Group,
+                    label: "Sample waveform and selection".into(),
+                    value: self.selected_audio_path().map(|path| {
+                        let sample = path.file_name().unwrap_or_default().to_string_lossy();
+                        match self.waveform_play_region {
+                            Some(region) => format!(
+                                "{sample}, selection {:.1}% to {:.1}%",
+                                region.start * 100.0,
+                                region.end * 100.0
+                            ),
+                            None => format!("{sample}, no selection"),
+                        }
+                    }),
+                    enabled: has_waveform,
+                },
+            ]);
+            if self
+                .playmark_timing_editor
+                .as_ref()
+                .is_some_and(|editor| self.playmark_timing_editor_is_current(editor))
+            {
+                controls.push(AxChild {
+                    id: PLAYMARK_TIMING.into(),
+                    role: AxRole::TextField,
+                    label: "Selection timing".into(),
+                    value: Some(self.playmark_timing_input.read(cx).content().to_owned()),
+                    enabled: true,
+                });
+            }
+            controls.push(AxChild {
+                id: BEAT_COUNT.into(),
+                role: AxRole::TextField,
+                label: "Beats per selection".into(),
+                value: Some(self.beat_count_input.read(cx).content(cx)),
+                enabled: has_waveform,
+            });
             let source_rows = self.source_rows();
             for root in &ax.visible_sources {
                 let Some((_, _, label, selected, error)) =
@@ -761,7 +1055,8 @@ impl Browser {
             }
             controls
         };
-        if *ax.last_controls.borrow() != controls {
+        let controls_changed = *ax.last_controls.borrow() != controls;
+        if controls_changed {
             if let Err(error) = ax.registry.borrow_mut().reconcile(controls.clone()) {
                 eprintln!("browser accessibility reconcile: {error:?}");
                 return;
@@ -769,6 +1064,38 @@ impl Browser {
             *ax.last_controls.borrow_mut() = controls;
         }
         let registry = ax.registry.borrow();
+        let volume = super::volume::quantize_volume(self.volume);
+        if registry.contains(VOLUME) && (controls_changed || ax.last_volume.get() != Some(volume)) {
+            if registry
+                .set_slider(
+                    VOLUME,
+                    AxSlider {
+                        value: f64::from(volume),
+                        min: 0.0,
+                        max: 1.0,
+                    },
+                )
+                .is_ok()
+            {
+                ax.last_volume.set(Some(volume));
+            }
+        } else if !registry.contains(VOLUME) {
+            ax.last_volume.set(None);
+        }
+        for (id, focus) in [
+            (BEAT_COUNT, self.beat_count_input.read(cx).focus_handle()),
+            (
+                PLAYMARK_TIMING,
+                self.playmark_timing_input.read(cx).focus_handle(),
+            ),
+            (VOLUME, self.volume_focus_handle.clone()),
+            (WAVEFORM, self.waveform_focus_handle.clone()),
+        ] {
+            if registry.contains(id) {
+                let _ =
+                    registry.set_focused(id, focus.is_focused(window) && window.is_window_active());
+            }
+        }
         for (id, focus) in [
             (ADD_SOURCE, &ax.add_focus),
             (FOLDER_SCOPE, &ax.scope_focus),
@@ -827,6 +1154,25 @@ impl Browser {
             .inset_0()
             .into_any_element(),
         )
+    }
+
+    pub(super) fn ax_frame_setter(
+        &self,
+        id: impl Into<String>,
+    ) -> Option<Rc<dyn Fn(gpui::Bounds<gpui::Pixels>)>> {
+        let registry = self.accessibility.as_ref()?.registry.clone();
+        let id = id.into();
+        Some(Rc::new(move |bounds| {
+            let _ = registry.borrow().set_frame(
+                &id,
+                AxFrame {
+                    x: f64::from(f32::from(bounds.origin.x)),
+                    y: f64::from(f32::from(bounds.origin.y)),
+                    width: f64::from(f32::from(bounds.size.width)),
+                    height: f64::from(f32::from(bounds.size.height)),
+                },
+            );
+        }))
     }
 }
 

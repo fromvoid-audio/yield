@@ -109,6 +109,9 @@ pub(super) fn render_slider(
     let slider_bounds = Rc::clone(&bounds);
     let mut slider = div()
         .id("volume-slider")
+        .when_some(browser.ax_marker("transport-volume"), |element, marker| {
+            element.child(marker)
+        })
         .relative()
         .flex_none()
         .w(px(SLIDER_WIDTH))
@@ -290,6 +293,18 @@ impl Browser {
             self.sync_runtime_volume();
         }
         cx.notify();
+    }
+
+    pub(super) fn set_volume_from_accessibility(
+        &mut self,
+        value: f32,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.preferences_editable() || !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return false;
+        }
+        self.set_volume(value, cx);
+        true
     }
 
     pub(super) fn apply_preference_volume(&mut self, value: f32) {
