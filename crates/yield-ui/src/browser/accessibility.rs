@@ -301,7 +301,9 @@ impl BrowserAccessibility {
                                     });
                                 }
                                 AxAction::Focus => {}
-                                AxAction::Press => return,
+                                AxAction::Press | AxAction::Increment | AxAction::Decrement => {
+                                    return;
+                                }
                             }
                         } else if event.action == AxAction::Press {
                             match event.id.as_str() {
