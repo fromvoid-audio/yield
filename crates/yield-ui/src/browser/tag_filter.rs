@@ -82,7 +82,7 @@ enum DraftAction {
 /// Runtime state for the desired tag field and its bounded catalog read.
 #[derive(Default)]
 pub(super) struct TagFilterState {
-    desired_enabled: bool,
+    pub(super) desired_enabled: bool,
     requirements: Vec<String>,
     draft_generation: u64,
     input_error: Option<String>,
@@ -926,6 +926,10 @@ pub(super) fn render(
                 .child(
                     div()
                         .id("tag-filter-toggle")
+                        .when_some(
+                            browser.ax_focus(super::accessibility::TAG_FILTER_TOGGLE),
+                            |element, focus| element.track_focus(&focus),
+                        )
                         .flex_none()
                         .h(px(theme.spacing.row_height))
                         .items_center()
@@ -936,13 +940,21 @@ pub(super) fn render(
                         .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                             toggle(view, cx);
                         }))
-                        .child("TAGS"),
+                        .child("TAGS")
+                        .when_some(
+                            browser.ax_marker(super::accessibility::TAG_FILTER_TOGGLE),
+                            |element, marker| element.child(marker),
+                        ),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(browser.tag_filter_input.clone()),
+                        .child(browser.tag_filter_input.clone())
+                        .when_some(
+                            browser.ax_marker(super::accessibility::TAG_FILTER_INPUT),
+                            |element, marker| element.child(marker),
+                        ),
                 ),
         )
         .children(status.into_iter().map(|message| {

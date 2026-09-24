@@ -8,6 +8,9 @@ use std::rc::Rc;
 use async_channel::Receiver;
 use gpui::{Context, FocusHandle, Task, Window, canvas, prelude::*};
 use raw_window_handle::HasWindowHandle;
+use yield_core::{
+    COLLECTION_COUNT, PLAYBACK_TYPE_FILTERS, RATING_FILTER_LEVELS, SortColumn, SortDirection,
+};
 use yield_platform::accessibility::{AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole};
 
 use super::{Browser, tag_library};
@@ -16,6 +19,53 @@ pub(super) const ADD_SOURCE: &str = "browser-add-source";
 pub(super) const FOLDER_SCOPE: &str = "browser-folder-scope";
 pub(super) const REFRESH_SOURCE: &str = "browser-refresh-source";
 pub(super) const SEARCH: &str = "browser-search";
+pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
+pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
+pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+
+pub(super) fn sort_id(column: SortColumn) -> &'static str {
+    match column {
+        SortColumn::Name => "browser-sort-name",
+        SortColumn::Rating => "browser-sort-rating",
+        SortColumn::PlaybackType => "browser-sort-type",
+        SortColumn::Collection => "browser-sort-collection",
+        SortColumn::Extension => "browser-sort-extension",
+        SortColumn::Size => "browser-sort-size",
+        SortColumn::LastPlayed => "browser-sort-last-played",
+    }
+}
+
+pub(super) fn collection_filter_id(slot: usize) -> String {
+    format!("browser-collection-filter-{slot}")
+}
+
+pub(super) fn playback_type_filter_id(index: usize) -> String {
+    format!("browser-type-filter-{index}")
+}
+
+pub(super) fn rating_filter_id(index: usize) -> String {
+    format!("browser-rating-filter-{index}")
+}
+
+fn visible_sort_columns(window: &Window, cx: &Context<Browser>) -> Vec<(SortColumn, &'static str)> {
+    let theme = crate::theme::active(cx);
+    let visibility =
+        super::view::browser_column_visibility(f32::from(window.bounds().size.width), &theme);
+    let mut columns = vec![(SortColumn::Name, "Name"), (SortColumn::Rating, "Rating")];
+    if visibility.playback_type {
+        columns.push((SortColumn::PlaybackType, "Type"));
+    }
+    columns.extend([
+        (SortColumn::Collection, "Collection"),
+        (SortColumn::Extension, "Extension"),
+        (SortColumn::Size, "Size"),
+    ]);
+    if visibility.last_played {
+        columns.push((SortColumn::LastPlayed, "Last Played"));
+    }
+    columns
+}
 
 pub(super) fn source_id(root: &Path) -> String {
     format!("browser-source:{:?}", root.as_os_str())
@@ -80,13 +130,37 @@ impl BrowserAccessibility {
             window.refresh();
             cx.notify();
         });
+        let mut control_focus = HashMap::new();
+        for id in [RANDOM_NAVIGATION, NAME_VIEW_MODE, TAG_FILTER_TOGGLE] {
+            control_focus.insert(id.to_owned(), cx.focus_handle());
+        }
+        for column in [
+            SortColumn::Name,
+            SortColumn::Rating,
+            SortColumn::PlaybackType,
+            SortColumn::Collection,
+            SortColumn::Extension,
+            SortColumn::Size,
+            SortColumn::LastPlayed,
+        ] {
+            control_focus.insert(sort_id(column).to_owned(), cx.focus_handle());
+        }
+        for slot in 0..COLLECTION_COUNT {
+            control_focus.insert(collection_filter_id(slot), cx.focus_handle());
+        }
+        for index in 0..PLAYBACK_TYPE_FILTERS.len() {
+            control_focus.insert(playback_type_filter_id(index), cx.focus_handle());
+        }
+        for index in 0..RATING_FILTER_LEVELS.len() {
+            control_focus.insert(rating_filter_id(index), cx.focus_handle());
+        }
         Some(Self {
             registry: Rc::new(RefCell::new(registry)),
             last_controls: RefCell::new(Vec::new()),
             visible_sources: Vec::new(),
             visible_folders: Vec::new(),
             visible_samples: Vec::new(),
-            control_focus: HashMap::new(),
+            control_focus,
             add_focus: cx.focus_handle(),
             scope_focus: cx.focus_handle(),
             refresh_focus: cx.focus_handle(),
@@ -112,6 +186,8 @@ impl BrowserAccessibility {
                         }
                         let focus = if event.id == SEARCH {
                             view.search_input.read(cx).focus_handle()
+                        } else if event.id == TAG_FILTER_INPUT {
+                            view.tag_filter_input.read(cx).focus_handle()
                         } else if let Some(focus) = ax.focus_handle(&event.id) {
                             focus
                         } else {
@@ -157,12 +233,51 @@ impl BrowserAccessibility {
                                 && event.id == sample_id(&entry.path))
                             .then_some(row.entry_index)
                         });
+                        let sort_action =
+                            visible_sort_columns(window, cx)
+                                .into_iter()
+                                .find_map(|(column, _)| {
+                                    (event.id == sort_id(column)).then_some(column)
+                                });
+                        let collection_action = (0..COLLECTION_COUNT)
+                            .find(|&slot| event.id == collection_filter_id(slot));
+                        let playback_type_action = PLAYBACK_TYPE_FILTERS
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, &kind)| {
+                                (event.id == playback_type_filter_id(index)).then_some(kind)
+                            });
+                        let rating_action =
+                            RATING_FILTER_LEVELS
+                                .iter()
+                                .enumerate()
+                                .find_map(|(index, &level)| {
+                                    (event.id == rating_filter_id(index)).then_some(level)
+                                });
+                        let extra_action = matches!(
+                            event.id.as_str(),
+                            TAG_FILTER_INPUT
+                                | TAG_FILTER_TOGGLE
+                                | RANDOM_NAVIGATION
+                                | NAME_VIEW_MODE
+                        ) || sort_action.is_some()
+                            || collection_action.is_some()
+                            || playback_type_action.is_some()
+                            || rating_action.is_some();
                         if !matches!(
                             event.id.as_str(),
                             ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE | SEARCH
                         ) && source_action.is_none()
                             && folder_action.is_none()
                             && sample_action.is_none()
+                            && !extra_action
+                        {
+                            return;
+                        }
+                        if view.active_source.is_none()
+                            && (collection_action.is_some()
+                                || playback_type_action.is_some()
+                                || rating_action.is_some())
                         {
                             return;
                         }
@@ -172,10 +287,14 @@ impl BrowserAccessibility {
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
-                        if event.id == SEARCH {
+                        if event.id == SEARCH || event.id == TAG_FILTER_INPUT {
                             match event.action {
                                 AxAction::SetValue(value) => {
-                                    let search_input = view.search_input.clone();
+                                    let search_input = if event.id == SEARCH {
+                                        view.search_input.clone()
+                                    } else {
+                                        view.tag_filter_input.clone()
+                                    };
                                     window.defer(cx, move |_, cx| {
                                         search_input
                                             .update(cx, |input, cx| input.set_content(value, cx));
@@ -189,6 +308,9 @@ impl BrowserAccessibility {
                                 ADD_SOURCE => view.prompt_for_source(cx),
                                 FOLDER_SCOPE => view.toggle_folder_scope(cx),
                                 REFRESH_SOURCE => view.refresh_active_source(cx),
+                                TAG_FILTER_TOGGLE => super::tag_filter::toggle(view, cx),
+                                RANDOM_NAVIGATION => view.toggle_random_navigation(cx),
+                                NAME_VIEW_MODE => view.toggle_sample_name_view_mode(cx),
                                 _ => match source_action {
                                     Some((index, true)) => {
                                         view.forget_source(index, window, cx);
@@ -210,7 +332,19 @@ impl BrowserAccessibility {
                                             Some(index) => {
                                                 view.select_entry_from_accessibility(index, cx)
                                             }
-                                            _ => return,
+                                            _ => {
+                                                if let Some(column) = sort_action {
+                                                    view.toggle_sort(column, cx);
+                                                } else if let Some(slot) = collection_action {
+                                                    view.toggle_collection_filter(slot, cx);
+                                                } else if let Some(kind) = playback_type_action {
+                                                    view.toggle_playback_type_filter(kind, cx);
+                                                } else if let Some(level) = rating_action {
+                                                    view.toggle_rating_filter(level, cx);
+                                                } else {
+                                                    return;
+                                                }
+                                            }
                                         },
                                     },
                                 },
@@ -484,6 +618,117 @@ impl Browser {
                 value: None,
                 enabled: true,
             });
+            let active_source = self.active_source.is_some();
+            for slot in 0..COLLECTION_COUNT {
+                controls.push(AxChild {
+                    id: collection_filter_id(slot),
+                    role: AxRole::CheckBox,
+                    label: format!("Collection {} filter", slot + 1),
+                    value: Some(
+                        if self.view_model.collection_filter() == Some(slot) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    enabled: active_source,
+                });
+            }
+            for (index, kind) in PLAYBACK_TYPE_FILTERS.iter().enumerate() {
+                controls.push(AxChild {
+                    id: playback_type_filter_id(index),
+                    role: AxRole::CheckBox,
+                    label: format!("{} filter", if index == 0 { "1-Shot" } else { "Loop" }),
+                    value: Some(
+                        if self.view_model.playback_type_filter().contains_type(*kind) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    enabled: active_source,
+                });
+            }
+            for (index, level) in RATING_FILTER_LEVELS.iter().enumerate() {
+                controls.push(AxChild {
+                    id: rating_filter_id(index),
+                    role: AxRole::CheckBox,
+                    label: format!("Rating {level} filter"),
+                    value: Some(
+                        if self.view_model.rating_filter().contains_level(*level) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    enabled: active_source,
+                });
+            }
+            controls.push(AxChild {
+                id: TAG_FILTER_TOGGLE.into(),
+                role: AxRole::CheckBox,
+                label: "Tag filter".into(),
+                value: Some(
+                    if self.tag_filter.desired_enabled {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                    .into(),
+                ),
+                enabled: true,
+            });
+            controls.push(AxChild {
+                id: TAG_FILTER_INPUT.into(),
+                role: AxRole::TextField,
+                label: "Filter tags".into(),
+                value: Some(self.tag_filter_input.read(cx).content().to_owned()),
+                enabled: true,
+            });
+            for (column, label) in visible_sort_columns(window, cx) {
+                let sort = self.view_model.sort();
+                controls.push(AxChild {
+                    id: sort_id(column).into(),
+                    role: AxRole::Button,
+                    label: format!("Sort by {label}"),
+                    value: Some(
+                        if sort.column == column {
+                            match sort.direction {
+                                SortDirection::Ascending => "Ascending",
+                                SortDirection::Descending => "Descending",
+                            }
+                        } else {
+                            "Not sorted"
+                        }
+                        .into(),
+                    ),
+                    enabled: true,
+                });
+            }
+            controls.push(AxChild {
+                id: RANDOM_NAVIGATION.into(),
+                role: AxRole::CheckBox,
+                label: "Random sample navigation".into(),
+                value: Some(
+                    if self.random_navigation.enabled() {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                    .into(),
+                ),
+                enabled: true,
+            });
+            controls.push(AxChild {
+                id: NAME_VIEW_MODE.into(),
+                role: AxRole::Button,
+                label: "Sample name view".into(),
+                value: Some(self.sample_name_view_mode.label().into()),
+                enabled: true,
+            });
             let browser_focus_id = self.browser_focus_id();
             for path in &ax.visible_samples {
                 let Some(row) = self.view_model.rows().iter().find(|row| {
@@ -537,6 +782,13 @@ impl Browser {
             let _ = registry.set_focused(
                 SEARCH,
                 search_focus.is_focused(window) && window.is_window_active(),
+            );
+        }
+        if registry.contains(TAG_FILTER_INPUT) {
+            let focus = self.tag_filter_input.read(cx).focus_handle();
+            let _ = registry.set_focused(
+                TAG_FILTER_INPUT,
+                focus.is_focused(window) && window.is_window_active(),
             );
         }
         for (id, focus) in &ax.control_focus {

@@ -37,6 +37,36 @@ use crate::theme::ActiveTheme;
 
 #[cfg(target_os = "macos")]
 mod accessibility;
+#[cfg(not(target_os = "macos"))]
+mod accessibility {
+    use yield_core::SortColumn;
+
+    pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
+    pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+    pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
+    pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+
+    pub(super) fn sort_id(column: SortColumn) -> &'static str {
+        match column {
+            SortColumn::Name => "browser-sort-name",
+            SortColumn::Rating => "browser-sort-rating",
+            SortColumn::PlaybackType => "browser-sort-type",
+            SortColumn::Collection => "browser-sort-collection",
+            SortColumn::Extension => "browser-sort-extension",
+            SortColumn::Size => "browser-sort-size",
+            SortColumn::LastPlayed => "browser-sort-last-played",
+        }
+    }
+    pub(super) fn collection_filter_id(slot: usize) -> String {
+        format!("browser-collection-filter-{slot}")
+    }
+    pub(super) fn playback_type_filter_id(index: usize) -> String {
+        format!("browser-type-filter-{index}")
+    }
+    pub(super) fn rating_filter_id(index: usize) -> String {
+        format!("browser-rating-filter-{index}")
+    }
+}
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
