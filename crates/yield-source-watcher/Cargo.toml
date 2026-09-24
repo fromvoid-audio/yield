@@ -1,0 +1,16 @@
+[package]
+name = "yield-source-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+notify.workspace = true
+yield-library.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

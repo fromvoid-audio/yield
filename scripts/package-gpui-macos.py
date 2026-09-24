@@ -15,8 +15,8 @@ import sys
 import tempfile
 
 
-BUNDLE_NAME = "Wavecrate GPUI.app"
-BUNDLE_ID = "org.portalsurfer.wavecrate.gpui.dev"
+BUNDLE_NAME = "Yield.app"
+BUNDLE_ID = "org.portalsurfer.yield.dev"
 
 
 def command(*args: str, cwd: Path) -> str:
@@ -55,15 +55,15 @@ def main() -> int:
         "cargo", "metadata", "--locked", "--no-deps", "--format-version", "1", cwd=root
     ))
     package = next(
-        (package for package in metadata["packages"] if package["name"] == "wavecrate-gpui"),
+        (package for package in metadata["packages"] if package["name"] == "yield"),
         None,
     )
     if package is None:
-        parser.error("cargo metadata has no wavecrate-gpui package")
+        parser.error("cargo metadata has no yield package")
     version = package["version"]
     build_number = command("git", "rev-list", "--count", "HEAD", cwd=root)
     target = Path(metadata["target_directory"])
-    binary = target / "release-local" / "wavecrate-gpui"
+    binary = target / "release-local" / "yield"
     icon = root / "assets" / "logo3.icns"
     font_license = root / "assets" / "fonts" / "IoskeleyMono-LICENSE.txt"
     for required in (icon, font_license):
@@ -71,7 +71,7 @@ def main() -> int:
             parser.error(f"missing bundle asset: {required}")
 
     subprocess.run(
-        ["cargo", "build", "--locked", "--profile", "release-local", "-p", "wavecrate-gpui"],
+        ["cargo", "build", "--locked", "--profile", "release-local", "-p", "yield"],
         cwd=root,
         check=True,
     )
@@ -79,27 +79,27 @@ def main() -> int:
         raise RuntimeError(f"build did not produce {binary}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".wavecrate-gpui-package-", dir=output.parent) as temp:
+    with tempfile.TemporaryDirectory(prefix=".yield-package-", dir=output.parent) as temp:
         staged = Path(temp) / "artifact"
         contents = staged / BUNDLE_NAME / "Contents"
-        executable = contents / "MacOS" / "wavecrate-gpui"
+        executable = contents / "MacOS" / "yield"
         resources = contents / "Resources"
         resources.mkdir(parents=True)
         executable.parent.mkdir(parents=True)
         shutil.copy2(binary, executable)
-        shutil.copy2(icon, resources / "Wavecrate.icns")
+        shutil.copy2(icon, resources / "Yield.icns")
         shutil.copy2(font_license, resources / "IoskeleyMono-LICENSE.txt")
         (contents / "Info.plist").write_bytes(plistlib.dumps({
-            "CFBundleExecutable": "wavecrate-gpui",
+            "CFBundleExecutable": "yield",
             "CFBundleIdentifier": BUNDLE_ID,
-            "CFBundleName": "Wavecrate GPUI",
-            "CFBundleDisplayName": "Wavecrate GPUI",
-            "CFBundleIconFile": "Wavecrate.icns",
+            "CFBundleName": "Yield",
+            "CFBundleDisplayName": "Yield",
+            "CFBundleIconFile": "Yield.icns",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": version,
             "CFBundleVersion": build_number,
             "NSHighResolutionCapable": True,
-            "WavecrateSourceCommit": args.sha,
+            "YieldSourceCommit": args.sha,
         }))
         files = sorted(path for path in staged.rglob("*") if path.is_file())
         manifest = {

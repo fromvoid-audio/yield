@@ -1,6 +1,6 @@
 # Third-party notices
 
-The search input component in `crates/wavecrate-ui` is adapted from the
+The search input component in `crates/yield-ui` is adapted from the
 `gpui` 0.2.2 `examples/input.rs` example by the Zed contributors. That component
 is distributed under Apache License 2.0; the license text is preserved in
 `licenses/GPUI-APACHE-2.0.txt`.

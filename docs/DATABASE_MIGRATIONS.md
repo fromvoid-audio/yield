@@ -67,7 +67,7 @@ fixture proving an older `.wavecrate.db` still opens and shows usable metadata.
 ## Tests
 
 Schema contract tests live in `tests/unit/source_db_migration_tests/` for source
-databases and in `crates/wavecrate-library/src/sample_sources/library/tests.rs`
+databases and in `crates/yield-library/src/sample_sources/library/tests.rs`
 for the global library database.
 
 Use these focused checks after persistence changes:

@@ -1,0 +1,20 @@
+[package]
+name = "yield-catalog"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+warnings = "deny"
+missing_docs = "deny"
+
+[dependencies]
+blake3 = "1.6.1"
+thiserror = "2.0.17"
+yield-library = { path = "../yield-library" }
+yield-scan = { path = "../yield-scan" }
+yield-source-watcher = { path = "../yield-source-watcher" }
+
+[dev-dependencies]
+hound.workspace = true
+tempfile = "3.23.0"
+yield-library = { path = "../yield-library", features = ["test-support"] }

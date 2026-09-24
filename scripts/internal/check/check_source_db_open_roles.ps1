@@ -23,7 +23,7 @@ try {
     }
   }
 
-  $apiPath = Join-Path $rootDir "crates/wavecrate-library/src/sample_sources/db/mod.rs"
+  $apiPath = Join-Path $rootDir "crates/yield-library/src/sample_sources/db/mod.rs"
   Select-String -LiteralPath $apiPath -Pattern $declarationPattern | ForEach-Object {
     $relative = $apiPath.Replace($rootDir + [IO.Path]::DirectorySeparatorChar, "")
     $violations.Add(("{0}:{1}:{2}" -f $relative, $_.LineNumber, $_.Line.Trim()))

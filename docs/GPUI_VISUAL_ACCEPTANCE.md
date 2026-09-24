@@ -6,18 +6,18 @@ still-unimplemented starmap, destructive workflows or release packaging.
 
 ## Reference contract
 
-The default [theme](../themes/wavecrate.json) uses embedded Ioskeley Mono and
+The default [theme](../themes/yield.json) uses embedded Ioskeley Mono and
 logical-pixel geometry. Custom themes retain their own validated tokens.
 
 | Surface or effect | Reference and GPUI evidence |
 | --- | --- |
 | Dark surfaces, accent, selection | [Reference palette](../reference/radiant/src/native_app/app_chrome/palette.rs) and the default theme share accent `#E95843`, quiet selection alpha 8, selected hover alpha 16, and pale marker `#E7E5DF`. |
-| Pointer hover | The reference trailing marker and [GPUI motion](../crates/wavecrate-ui/src/browser/motion.rs) use a 2 logical-pixel pale rail at alpha 180. Hover is event-driven. |
-| Keyboard and pointer focus | The leading focus rail is 6 logical pixels. [Motion tokens](../crates/wavecrate-design/src/motion.rs) retain an 800 ms keyboard hold and 250 ms fade; pointer focus has no hold. |
+| Pointer hover | The reference trailing marker and [GPUI motion](../crates/yield-ui/src/browser/motion.rs) use a 2 logical-pixel pale rail at alpha 180. Hover is event-driven. |
+| Keyboard and pointer focus | The leading focus rail is 6 logical pixels. [Motion tokens](../crates/yield-design/src/motion.rs) retain an 800 ms keyboard hold and 250 ms fade; pointer focus has no hold. |
 | Worker feedback | [Reference status chrome](../reference/radiant/src/native_app/app_chrome/status_bar.rs) and GPUI use a 1.15 Hz pulse with alpha 80–255. |
 | Source loading | The same sources use a 0.45 Hz sweep, 1.5 logical-pixel track, 28% segment with a 28-pixel minimum, track alpha 42 and segment alpha 235. |
 | Overflow and reduced motion | GPUI overflow transitions settle after 260 ms. Disabling motion produces static busy feedback and suppresses decorative frame requests; completed/cancelled work no longer authorizes an ongoing cadence. |
-| Waveform | [Waveform rendering](../crates/wavecrate-ui/src/browser/waveform.rs) retains low/mid/high spectral colors, title/metadata, selection and playhead layers. Measured logical width drives bounded detail requests. |
+| Waveform | [Waveform rendering](../crates/yield-ui/src/browser/waveform.rs) retains low/mid/high spectral colors, title/metadata, selection and playhead layers. Measured logical width drives bounded detail requests. |
 
 The GPUI folder/table overflow ramp remains a surface-specific affordance; it is
 not equated with the reference collection section's separate 12-pixel ramp.

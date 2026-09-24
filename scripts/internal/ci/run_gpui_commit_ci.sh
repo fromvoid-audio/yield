@@ -63,7 +63,7 @@ if [[ -f "$run_dir/result" ]] && grep -q '^PASS ' "$run_dir/result" && grep -qF 
 fi
 
 printf 'RUNNING %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/result"
-tmp_parent="$(mktemp -d "${TMPDIR:-/tmp}/wavecrate-gpui-ci.XXXXXX")"
+tmp_parent="$(mktemp -d "${TMPDIR:-/tmp}/yield-ci.XXXXXX")"
 git -C "$source_checkout" worktree add --detach "$tmp_parent/checkout" "$commit" > "$run_dir/worktree.log" 2>&1
 
 export CARGO_TARGET_DIR="$state_dir/target"

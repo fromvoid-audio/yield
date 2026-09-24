@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "crates/wavecrate-gpui",
-    "crates/wavecrate-core",
-    "crates/wavecrate-media",
-    "crates/wavecrate-design",
-    "crates/wavecrate-ui",
+    "crates/yield",
+    "crates/yield-core",
+    "crates/yield-media",
+    "crates/yield-design",
+    "crates/yield-ui",
     "crates/reson",
-    "crates/wavecrate-analysis",
-    "crates/wavecrate-library",
-    "crates/wavecrate-source-watcher",
-    "crates/wavecrate-platform",
-    "crates/wavecrate-catalog",
-    "crates/wavecrate-session",
-    "crates/wavecrate-scan",
+    "crates/yield-analysis",
+    "crates/yield-library",
+    "crates/yield-source-watcher",
+    "crates/yield-platform",
+    "crates/yield-catalog",
+    "crates/yield-session",
+    "crates/yield-scan",
 ]
-default-members = ["crates/wavecrate-gpui"]
+default-members = ["crates/yield"]
 exclude = ["reference/radiant"]
 resolver = "3"
 
@@ -34,15 +34,15 @@ hound = "3.5.1"
 notify = "6.1.1"
 unicode-segmentation = "1.12.0"
 reson = { path = "crates/reson" }
-wavecrate-analysis = { path = "crates/wavecrate-analysis" }
-wavecrate-library = { path = "crates/wavecrate-library" }
-wavecrate-core = { path = "crates/wavecrate-core" }
-wavecrate-media = { path = "crates/wavecrate-media" }
-wavecrate-design = { path = "crates/wavecrate-design" }
-wavecrate-ui = { path = "crates/wavecrate-ui" }
-wavecrate-session = { path = "crates/wavecrate-session" }
-wavecrate-source-watcher = { path = "crates/wavecrate-source-watcher" }
-wavecrate-platform = { path = "crates/wavecrate-platform" }
+yield-analysis = { path = "crates/yield-analysis" }
+yield-library = { path = "crates/yield-library" }
+yield-core = { path = "crates/yield-core" }
+yield-media = { path = "crates/yield-media" }
+yield-design = { path = "crates/yield-design" }
+yield-ui = { path = "crates/yield-ui" }
+yield-session = { path = "crates/yield-session" }
+yield-source-watcher = { path = "crates/yield-source-watcher" }
+yield-platform = { path = "crates/yield-platform" }
 raw-window-handle = "=0.6.2"
 objc2 = { version = "=0.6.4", default-features = false }
 objc2-app-kit = { version = "=0.3.2", default-features = false }
@@ -55,10 +55,10 @@ tempfile = "3.23.0"
 [profile.dev.package."*"]
 opt-level = 3
 
-[profile.dev.package.wavecrate-ui]
+[profile.dev.package.yield-ui]
 opt-level = 2
 
-[profile.dev.package.wavecrate-media]
+[profile.dev.package.yield-media]
 opt-level = 2
 
 [profile.release-local]

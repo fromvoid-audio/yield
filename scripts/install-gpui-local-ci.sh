@@ -10,7 +10,7 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
 hook="$common_dir/hooks/post-commit"
-marker="# wavecrate-gpui-local-ci"
+marker="# yield-local-ci"
 
 if ! command -v lockf >/dev/null 2>&1 && ! command -v flock >/dev/null 2>&1; then
   echo "Local CI requires lockf or flock" >&2
@@ -23,7 +23,7 @@ for tool in cargo shasum; do
   fi
 done
 
-if [[ -e "$hook" ]] && ! grep -qF "$marker" "$hook"; then
+if [[ -e "$hook" ]] && ! grep -qF "$marker" "$hook" && ! grep -qF '# wavecrate-gpui-local-ci' "$hook"; then
   echo "Existing post-commit hook is not managed by GPUI local CI: $hook" >&2
   exit 1
 fi
@@ -34,7 +34,7 @@ cp "$repo_root/scripts/internal/ci/run_gpui_commit_ci.sh" "$common_dir/local-ci/
 chmod +x "$common_dir/local-ci/bin/"*.sh
 cat > "$hook" <<'HOOK'
 #!/usr/bin/env bash
-# wavecrate-gpui-local-ci
+# yield-local-ci
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 commit="$(git rev-parse HEAD)"
