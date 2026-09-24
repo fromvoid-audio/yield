@@ -33,8 +33,9 @@ pub use edit_intent::{
     WaveformEditIntentAdapterError, waveform_edit_intent, waveform_edit_request,
 };
 pub use edit_preparation::{
-    MAX_WAV_EDIT_DECODED_BYTES, WavEditOperation, WavEditPreparationRequest, prepare_wav_edit,
-    prepare_wav_edit_with_cancel,
+    MAX_WAV_EDIT_DECODED_BYTES, WavEditOperation, WavEditPreparationRequest,
+    WavNormalizationPreparationOutcome, prepare_wav_edit, prepare_wav_edit_with_cancel,
+    prepare_wav_normalization, prepare_wav_normalization_with_cancel,
 };
 pub use edited_wav::{encode_edited_wav, encode_edited_wav_with_cancel};
 pub use similar_sections::{

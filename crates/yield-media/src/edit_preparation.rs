@@ -1,6 +1,6 @@
 //! Revision-checked preparation of whole-file selection edits, without publication.
 
-use std::io::{Seek, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::AtomicBool;
 
 use yield_core::WaveformEditSettings;
@@ -9,6 +9,19 @@ use crate::{WavSpanExportRequest, WaveformDetailContext, WaveformDetailRange, de
 
 /// Hard ceiling for the interleaved decoded buffer used by edit preparation (256 MiB).
 pub const MAX_WAV_EDIT_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
+const NORMALIZED_PEAK_TOLERANCE: f32 = 0.001;
+
+/// Result of preparing a whole-file peak normalization. Skipped results leave the sink empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WavNormalizationPreparationOutcome {
+    /// The caller-owned sink contains a complete unpublished normalized WAV.
+    Prepared,
+    /// The source contains no peak above the reference silence threshold.
+    SkippedSilent,
+    /// The source peak is already within the reference full-scale tolerance.
+    SkippedAlreadyNormalized,
+}
 
 /// Native selection operations supported by unpublished WAV preparation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -325,6 +338,111 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
     recheck(context, &opened, cancellation)
 }
 
+/// Prepare whole-file peak normalization in an empty caller-owned sink.
+///
+/// This uses the edit preparation's bounded decode and revision fence. It does not publish or
+/// replace the source. Silent and already-normalized inputs leave the sink empty; nonfinite
+/// samples are rejected instead of being silently turned into audio. The caller must discard
+/// the sink on any error, including a stale-source error after finalization.
+pub fn prepare_wav_normalization<W: Write + Seek>(
+    context: &WaveformDetailContext,
+    decoded_byte_budget: usize,
+    sink: &mut W,
+) -> Result<WavNormalizationPreparationOutcome, String> {
+    prepare_wav_normalization_with_cancel(context, decoded_byte_budget, sink, None)
+}
+
+/// Prepare whole-file peak normalization with cooperative decode and encoding cancellation.
+pub fn prepare_wav_normalization_with_cancel<W: Write + Seek>(
+    context: &WaveformDetailContext,
+    decoded_byte_budget: usize,
+    sink: &mut W,
+    cancellation: Option<&AtomicBool>,
+) -> Result<WavNormalizationPreparationOutcome, String> {
+    check_cancel(cancellation)?;
+    if sink
+        .stream_position()
+        .map_err(|error| format!("failed to inspect normalization sink: {error}"))?
+        != 0
+        || sink
+            .seek(SeekFrom::End(0))
+            .map_err(|error| format!("failed to inspect normalization sink length: {error}"))?
+            != 0
+    {
+        return Err(String::from("normalization sink must be fresh and empty"));
+    }
+    sink.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind normalization sink: {error}"))?;
+    let sample_count = checked_sample_count(context, decoded_byte_budget)?;
+    crate::edited_wav::checked_spec(
+        sample_count,
+        usize::from(context.spec.channels),
+        context.spec.sample_rate,
+    )?;
+    let whole_source = WavSpanExportRequest::from_frames(context.clone(), 0, context.total_frames)?;
+    let mut opened = detail::open_wav(&context.path, cancellation)?;
+    if crate::WaveformSpec::from_hound(opened.spec) != context.spec
+        || opened.total_frames != context.total_frames
+        || opened.observation.strong_revision().as_ref() != Some(&context.file_revision)
+    {
+        return Err(String::from("stale WAV normalization request"));
+    }
+    crate::span_export::validate_source_and_rewind(&whole_source, &mut opened, cancellation)?;
+    recheck(context, &opened, cancellation)?;
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(sample_count)
+        .map_err(|error| format!("failed to reserve WAV normalization buffer: {error}"))?;
+    match opened.spec.sample_format {
+        hound::SampleFormat::Float => decode_samples(
+            opened.reader.samples::<f32>(),
+            sample_count,
+            &mut samples,
+            |value| value,
+            cancellation,
+        )?,
+        hound::SampleFormat::Int => {
+            let scale = (1_i64 << (opened.spec.bits_per_sample - 1)) as f32;
+            decode_samples(
+                opened.reader.samples::<i32>(),
+                sample_count,
+                &mut samples,
+                |value| value as f32 / scale,
+                cancellation,
+            )?;
+        }
+    }
+    recheck(context, &opened, cancellation)?;
+    let mut peak = 0.0_f32;
+    for block in samples.chunks(4_096) {
+        check_cancel(cancellation)?;
+        for &sample in block {
+            if !sample.is_finite() {
+                return Err(String::from("WAV normalization rejects nonfinite samples"));
+            }
+            peak = peak.max(sample.abs());
+        }
+    }
+    if peak <= f32::EPSILON {
+        return Ok(WavNormalizationPreparationOutcome::SkippedSilent);
+    }
+    if (1.0 - peak).abs() <= NORMALIZED_PEAK_TOLERANCE {
+        return Ok(WavNormalizationPreparationOutcome::SkippedAlreadyNormalized);
+    }
+    check_cancel(cancellation)?;
+    yield_analysis::normalize_peak_in_place(&mut samples);
+    recheck(context, &opened, cancellation)?;
+    crate::encode_edited_wav_with_cancel(
+        &samples,
+        usize::from(context.spec.channels),
+        context.spec.sample_rate,
+        sink,
+        cancellation,
+    )?;
+    recheck(context, &opened, cancellation)?;
+    Ok(WavNormalizationPreparationOutcome::Prepared)
+}
+
 fn checked_sample_count(context: &WaveformDetailContext, budget: usize) -> Result<usize, String> {
     let sample_count = context
         .total_frames
@@ -531,6 +649,94 @@ mod tests {
             reader.spec(),
             reader.samples::<f32>().collect::<Result<_, _>>().unwrap(),
         )
+    }
+
+    fn write_float(path: &Path, samples: &[f32], channels: usize) {
+        let mut encoded = Cursor::new(Vec::new());
+        crate::encode_edited_wav(samples, channels, 48_000, &mut encoded).unwrap();
+        fs::write(path, encoded.into_inner()).unwrap();
+    }
+
+    #[test]
+    fn normalization_skips_silence_and_reference_peak_tolerance_without_writing() {
+        let dir = TempDir::new().unwrap();
+        for (samples, expected) in [
+            (
+                vec![0.0, -0.0, 0.0],
+                WavNormalizationPreparationOutcome::SkippedSilent,
+            ),
+            (
+                vec![0.5, -1.0, 0.25],
+                WavNormalizationPreparationOutcome::SkippedAlreadyNormalized,
+            ),
+            (
+                vec![0.5, -0.9995, 0.25],
+                WavNormalizationPreparationOutcome::SkippedAlreadyNormalized,
+            ),
+        ] {
+            let path = dir.path().join("normalization-skip.wav");
+            write_float(&path, &samples, 1);
+            let source_bytes = fs::read(&path).unwrap();
+            let mut output = Cursor::new(Vec::new());
+            assert_eq!(
+                prepare_wav_normalization(&request(&path).context, 12, &mut output).unwrap(),
+                expected
+            );
+            assert!(output.into_inner().is_empty());
+            assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        }
+    }
+
+    #[test]
+    fn normalization_uses_one_peak_across_interleaved_channels() {
+        let dir = TempDir::new().unwrap();
+        for (channels, samples, expected) in [
+            (1, vec![0.25, -0.5], vec![0.5, -1.0]),
+            (
+                2,
+                vec![0.25, -0.5, 0.125, -0.25],
+                vec![0.5, -1.0, 0.25, -0.5],
+            ),
+            (3, vec![0.25, -2.0, 0.5], vec![0.125, -1.0, 0.25]),
+        ] {
+            let path = dir.path().join(format!("normalization-{channels}.wav"));
+            write_float(&path, &samples, channels);
+            let source_bytes = fs::read(&path).unwrap();
+            let mut output = Cursor::new(Vec::new());
+            assert_eq!(
+                prepare_wav_normalization(&request(&path).context, samples.len() * 4, &mut output,)
+                    .unwrap(),
+                WavNormalizationPreparationOutcome::Prepared
+            );
+            let (spec, actual) = read_output(output);
+            assert_eq!(spec.channels, channels as u16);
+            assert_eq!(spec.sample_rate, 48_000);
+            assert_eq!(actual, expected);
+            assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        }
+    }
+
+    #[test]
+    fn normalization_rejects_nonfinite_and_budget_without_touching_source() {
+        let dir = TempDir::new().unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let path = dir.path().join("normalization-bad.wav");
+            write_float(&path, &[0.25, bad], 1);
+            let source_bytes = fs::read(&path).unwrap();
+            let mut output = Cursor::new(Vec::new());
+            let error = prepare_wav_normalization(&request(&path).context, 8, &mut output)
+                .expect_err("nonfinite input must be rejected");
+            assert!(error.contains("nonfinite"), "{error}");
+            assert!(output.into_inner().is_empty());
+            assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        }
+        let path = dir.path().join("normalization-budget.wav");
+        write_int(&path, &[100, -100], 1, 16);
+        let source_bytes = fs::read(&path).unwrap();
+        let mut output = Cursor::new(Vec::new());
+        assert!(prepare_wav_normalization(&request(&path).context, 4, &mut output).is_err());
+        assert!(output.into_inner().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), source_bytes);
     }
 
     #[test]
