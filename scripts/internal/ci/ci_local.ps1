@@ -44,10 +44,10 @@ function Invoke-NativeStep {
 
 Push-Location $rootDir
 try {
-  Enable-WavecrateCargoCache
+  Enable-YieldCargoCache
   Write-Host "[ci_local] cargo fmt --all -- --check"
   Invoke-NativeStep -Label "cargo fmt --all -- --check" -Command {
-    Invoke-WavecrateCargo fmt --all -- --check
+    Invoke-YieldCargo fmt --all -- --check
   }
 
   if (-not $SkipAgentPreflight) {
@@ -57,15 +57,15 @@ try {
 
   Write-Host "[ci_local] cargo clippy --workspace --all-targets"
   Invoke-NativeStep -Label "cargo clippy --workspace --all-targets" -Command {
-    Invoke-WavecrateCargo clippy --workspace --all-targets
+    Invoke-YieldCargo clippy --workspace --all-targets
   }
 
-  Write-Host "[ci_local] cargo doc -p wavecrate --no-deps (RUSTDOCFLAGS=-D warnings)"
+  Write-Host "[ci_local] cargo doc -p yield --no-deps (RUSTDOCFLAGS=-D warnings)"
   $prevRustdocFlags = $env:RUSTDOCFLAGS
   try {
     $env:RUSTDOCFLAGS = "-D warnings"
-    Invoke-NativeStep -Label "cargo doc --package wavecrate --no-deps" -Command {
-      Invoke-WavecrateCargo doc --package wavecrate --no-deps
+    Invoke-NativeStep -Label "cargo doc --package yield --no-deps" -Command {
+      Invoke-YieldCargo doc --package yield --no-deps
     }
   } finally {
     if ($null -eq $prevRustdocFlags) {
@@ -77,12 +77,12 @@ try {
 
   Write-Host "[ci_local] cargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast"
   Invoke-NativeStep -Label "cargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast" -Command {
-    Invoke-WavecrateCargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast
+    Invoke-YieldCargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast
   }
 
   Write-Host "[ci_local] cargo test --workspace --doc"
   Invoke-NativeStep -Label "cargo test --workspace --doc" -Command {
-    Invoke-WavecrateCargo test --workspace --doc
+    Invoke-YieldCargo test --workspace --doc
   }
 
   Write-Host "[ci_local] OK"

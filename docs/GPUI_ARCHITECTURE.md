@@ -1,51 +1,51 @@
 # GPUI workspace architecture
 
 The repository root is the active GPUI Cargo workspace. `cargo run` starts the
-thin `wavecrate-gpui` executable. The Radiant frontend is archived under
+thin `yield` executable. The Radiant frontend is archived under
 `reference/radiant` and is not a build dependency.
 
 This structure takes its composition-root and domain-ownership approach from
 [Rox's workspace](https://github.com/zealsprince/rox/blob/332b2579b0d72ed4b9e1ca76163e789be7c9732e/Cargo.toml)
 and [architecture](https://github.com/zealsprince/rox/blob/332b2579b0d72ed4b9e1ca76163e789be7c9732e/docs/02-architecture/01-overview.md).
-It adapts the idea to Wavecrate's existing engines and current implementation;
+It adapts the idea to Yield's existing engines and current implementation;
 it does not duplicate Rox's full crate inventory or incorporate its code.
 
 ## Crate ownership
 
 | Crate | Owns | Must not own |
 | --- | --- | --- |
-| `wavecrate-gpui` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
-| `wavecrate-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, waveform viewport/region geometry, display formatting | GPUI types, filesystem calls, audio devices, databases |
-| `wavecrate-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation/similar-section matching, cancellation checks | Window state, input routing, source mutation, persistent source registration |
-| `wavecrate-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
-| `wavecrate-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
-| `wavecrate-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
-| `wavecrate-catalog` | Bounded authoritative source audits, safe WAV display metadata, and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
-| `wavecrate-source-watcher` | Native root/parent watch handles, lexical event classification, and one coalesced lifecycle-fenced hint | Scanning, database access, UI publication, or audit scheduling |
-| `wavecrate-platform` | Bounded native file-drag admission and retained AppKit session lifetime | File discovery, source mutation, GPUI entities, or browser selection |
+| `yield` | Executable entrypoint, launch arguments, composition | Widgets, scanning, decoding, business rules |
+| `yield-core` | Sample identities and metadata, pure folder-tree/scope projection, filtering/sorting projection, focus reconciliation, waveform viewport/region geometry, display formatting | GPUI types, filesystem calls, audio devices, databases |
+| `yield-media` | Read-only folder enumeration (canonical root and relative directory inventory) and bounded waveform preparation/similar-section matching, cancellation checks | Window state, input routing, source mutation, persistent source registration |
+| `yield-design` | GPUI-independent semantic theme schema, default tokens, validation, bounded import | GPUI widgets, filesystem mutation, window state |
+| `yield-ui` | GPUI bootstrap, browser views and interaction, reusable text input, UI task/transport coordination | Filesystem/database authority or realtime audio processing |
+| `yield-session` | App-owned source-registry and typed UI-preference commands, immutable snapshots, isolated development-profile persistence, and synchronous shutdown | Widgets, scan enumeration, source-local files, or view lifetime |
+| `yield-catalog` | Bounded authoritative source audits, safe WAV display metadata, and revision-fenced snapshots in profile-owned catalog databases | Widgets, independent profile acquisition, source-local databases, audio-file mutation, or raw watcher publication |
+| `yield-source-watcher` | Native root/parent watch handles, lexical event classification, and one coalesced lifecycle-fenced hint | Scanning, database access, UI publication, or audit scheduling |
+| `yield-platform` | Bounded native file-drag admission and retained AppKit session lifetime | File discovery, source mutation, GPUI entities, or browser selection |
 | `reson` | Existing audio engine, playback runtime, device/output processing | GPUI views |
-| `wavecrate-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
-| `wavecrate-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
-| `wavecrate-analysis` | Existing decoding, feature extraction and similarity machinery | GPUI views |
+| `yield-library` | Existing database, profile ownership, configuration and source-capability primitives | GPUI views |
+| `yield-scan` | Existing persistent scanning and scan-writer mechanisms | GPUI views |
+| `yield-analysis` | Existing decoding, feature extraction and similarity machinery | GPUI views |
 
 ```mermaid
 flowchart TD
-    Launcher[wavecrate-gpui] --> UI[wavecrate-ui]
-    UI --> Core[wavecrate-core]
-    UI --> Media[wavecrate-media]
+    Launcher[yield] --> UI[yield-ui]
+    UI --> Core[yield-core]
+    UI --> Media[yield-media]
     UI --> Audio[reson]
-    UI --> Session[wavecrate-session]
+    UI --> Session[yield-session]
     Media --> Core
-    Media --> Library[wavecrate-library]
-    Media --> Analysis[wavecrate-analysis]
-    UI --> Design[wavecrate-design]
+    Media --> Library[yield-library]
+    Media --> Analysis[yield-analysis]
+    UI --> Design[yield-design]
     Session --> Library
     Session --> Catalog
-    Catalog[wavecrate-catalog] --> Library
+    Catalog[yield-catalog] --> Library
     Catalog --> Scan
     Catalog --> Watcher
-    Watcher[wavecrate-source-watcher] --> Library
-    Scan[wavecrate-scan] --> Library
+    Watcher[yield-source-watcher] --> Library
+    Scan[yield-scan] --> Library
 ```
 
 GPUI is a UI dependency. Core projections operate on supplied data and use pure
@@ -53,13 +53,13 @@ path identities; canonicalization happens once during background scanning.
 Filtering and sorting must not probe the filesystem. UI selection follows
 sample identity, not the position of a row in the filtered list.
 
-Similar-section matching belongs to `wavecrate-media`: a retained WAV read lease,
+Similar-section matching belongs to `yield-media`: a retained WAV read lease,
 strong source revision and exact frame anchor fence the native profile algorithm.
 It samples bounded neighborhoods rather than retaining decoded PCM. The browser
 owns one active scan and at most one replacement; source/play-selection changes
 cancel ownership, and completion must still match the exact context and anchor.
-Match painting and edit-only pointer selection remain in `wavecrate-ui`, with
-semantic fill/rail/hover colors in `wavecrate-design`.
+Match painting and edit-only pointer selection remain in `yield-ui`, with
+semantic fill/rail/hover colors in `yield-design`.
 
 The platform drag foundation accepts a borrowed window handle and prepared
 absolute paths. It requires the AppKit main thread, an originating-window mouse
@@ -86,7 +86,7 @@ and refresh discard identities no longer visible. Plain pointer focus clears
 explicit membership, while plain arrow focus preserves it. Source and folder
 navigation clear batch membership. These choices remain session-only.
 
-Gain/fade, reverse, mute, trim, crop and whole-file slide preparation belong to `wavecrate-media`.
+Gain/fade, reverse, mute, trim, crop and whole-file slide preparation belong to `yield-media`.
 The service retains a source handle, validates the captured WAV revision before decoding and after encoding,
 and prepares float WAV bytes in a fresh caller-owned sink. Trim removes selected
 frames; crop keeps selected frames. `CropWithSilence` accepts signed frame bounds
@@ -100,7 +100,7 @@ replacement, journal or undo authority; those remain with the durable file owner
 The current media scanner is a read-only browsing service. It returns a canonical
 root and every traversed relative directory, including empty directories, so the
 UI can project a complete folder tree without doing filesystem work while
-rendering. `wavecrate-session` owns only the ordered registry of accepted
+rendering. `yield-session` owns only the ordered registry of accepted
 canonical roots in the isolated `gpui-development` profile. It submits through
 the existing library writer and never opens a source-local database or writes a
 source folder. Persistent scanning, watcher, readiness, journal, and recovery
@@ -127,7 +127,7 @@ Submission and closure share a short admission lock; polling does not wait for
 catalog I/O. Catalog failure leaves the registry and preference lanes usable,
 and session shutdown joins the catalog before releasing the profile guard.
 Browser projections are built from catalog snapshots on background tasks. The
-`wavecrate-source-watcher` adapter captures filesystem hints for catalog-owned
+`yield-source-watcher` adapter captures filesystem hints for catalog-owned
 scheduling. Automatic audits run only when queued commands and retained events
 have drained. Changes during a scan retain a follow-up obligation; watcher
 outages use bounded retries and periodic fallback audits. Each handle owns a distinct
@@ -163,14 +163,14 @@ has focus. Browser focus owns sample navigation and transport keys. Escape from
 search returns focus to browsing. Rendering must give virtual lists definite
 viewport bounds and constrain waveform drawing to its panel.
 
-Theme ownership follows the same boundary. `wavecrate-design` defines a complete
+Theme ownership follows the same boundary. `yield-design` defines a complete
 versioned JSON document and validates every color, font metric, and density
-value without depending on GPUI. `wavecrate-ui` stores the active theme in a
+value without depending on GPUI. `yield-ui` stores the active theme in a
 GPUI global and converts tokens at the rendering edge. Import, reload, and
 reset actions run through bounded background reads; an invalid or stale result
 cannot replace the last valid theme.
 
-The canonical theme is [themes/wavecrate.json](../themes/wavecrate.json). A
+The canonical theme is [themes/yield.json](../themes/yield.json). A
 custom theme must contain the required fields in that document and use schema
 version `1`; the optional `motion` group defaults to the built-in timings for
 older themes. The optional `colors.waveform_playhead` token controls the cursor
@@ -191,8 +191,8 @@ application profile; the optional source path is reread only when the user
 explicitly chooses Reload. A missing source file therefore does not erase the
 restored theme.
 
-Motion timing and deterministic envelopes belong to `wavecrate-design`; GPUI
-frame requests and drawing belong to `wavecrate-ui`. Loading indicators must
+Motion timing and deterministic envelopes belong to `yield-design`; GPUI
+frame requests and drawing belong to `yield-ui`. Loading indicators must
 derive from current pending work, never from the mere existence of a retained
 task handle. Completion, failure, cancellation, and disabled motion must end
 frame requests. Disabled motion retains a static busy cue. Hover styling must
@@ -210,7 +210,7 @@ list viewport and leave pointer and scroll input available to the list.
 
 The browser keeps selected relative folders, expansion sets, direct or descendant
 scope, and scan results in an in-memory session registry. An app-owned
-`SourceRegistryGlobal` persists only canonical roots through `wavecrate-session`
+`SourceRegistryGlobal` persists only canonical roots through `yield-session`
 after a scan succeeds. Restored roots receive their durable IDs and empty
 session data; they do not trigger an automatic scan or audition. Forgetting a
 source stages removal in the same service and keeps it hidden until the command
@@ -233,9 +233,9 @@ Failures retain the last coherent rows. Profile-owned catalog children remain
 leased until the session has closed catalog admission and joined its worker.
 
 Audition output routing is split between the UI and the existing Reson output
-boundary. `wavecrate-session` stores only the optional host, device, sample
+boundary. `yield-session` stores only the optional host, device, sample
 rate, and buffer request in its typed preference stream; it does not enumerate
-hardware or open an audio stream. `wavecrate-ui` discovers choices off the UI
+hardware or open an audio stream. `yield-ui` discovers choices off the UI
 thread and opens `AudioPlayer::from_config` through a single-flight,
 generation-fenced task. A resolved Reson output, including fallback and the
 actual buffer size, is shown separately from the requested settings. Passive
@@ -246,7 +246,7 @@ remains nonblocking.
 
 New persistent workflows must acquire the existing profile/source authorities
 before admitting durable work. Development defaults must remain separate from
-the live Wavecrate profile. The current source registry uses only the isolated
+the live Yield profile. The current source registry uses only the isolated
 `gpui-development` profile and writes no source-local metadata or audio files.
 Theme, motion, autoplay, and loop preferences use the session's separate typed
 preference stream in that profile; sample selection and scan projections remain
@@ -314,8 +314,8 @@ identity and must not be inferred from an unchanged path.
 
 ```sh
 cargo run -- /path/to/samples
-cargo check --locked -p wavecrate-gpui
-cargo test --locked -p wavecrate-core -p wavecrate-design -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
+cargo check --locked -p yield
+cargo test --locked -p yield-core -p yield-design -p yield-media -p yield-ui -p yield
 ./scripts/build-gpui-macos.sh
 ```
 

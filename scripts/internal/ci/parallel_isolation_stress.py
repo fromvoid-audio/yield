@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Wavecrate library test harness repeatedly in fresh parallel processes."""
+"""Run the Yield library test harness repeatedly in fresh parallel processes."""
 
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ from parallel_isolation_windows_job import (
 )
 
 SCHEMA_VERSION = 1
-PROCESS_LEAK_ENV = "WAVECRATE_ISOLATION_INJECT_PROCESS_LEAK"
-GLOBAL_HOOK_LEAK_ENV = "WAVECRATE_ISOLATION_INJECT_GLOBAL_HOOK_LEAK"
+PROCESS_LEAK_ENV = "YIELD_ISOLATION_INJECT_PROCESS_LEAK"
+GLOBAL_HOOK_LEAK_ENV = "YIELD_ISOLATION_INJECT_GLOBAL_HOOK_LEAK"
 INJECTION_ENV_VARS = (PROCESS_LEAK_ENV, GLOBAL_HOOK_LEAK_ENV)
 PROCESS_SENTINEL = (
     "test_isolation_sentinels::"
@@ -48,9 +48,9 @@ QUARANTINED_TESTS = (
     },
 )
 FAILURE_MARKERS = {
-    "WAVECRATE_ISOLATION:process_state_contamination": "process_state_contamination",
-    "WAVECRATE_ISOLATION:mutable_global_control_leak": "mutable_global_control_leak",
-    "WAVECRATE_ISOLATION:leaked_worker": "leaked_worker",
+    "YIELD_ISOLATION:process_state_contamination": "process_state_contamination",
+    "YIELD_ISOLATION:mutable_global_control_leak": "mutable_global_control_leak",
+    "YIELD_ISOLATION:leaked_worker": "leaked_worker",
 }
 FAILED_TEST_RE = re.compile(r"^test (?P<name>.+) \.\.\. FAILED(?: .*)?$")
 FAILURE_SECTION_RE = re.compile(
@@ -129,7 +129,7 @@ def repo_root() -> Path:
         text=True,
     )
     if result.returncode != 0:
-        raise SystemExit("parallel-isolation stress must run inside the Wavecrate repository")
+        raise SystemExit("parallel-isolation stress must run inside the Yield repository")
     return Path(result.stdout.strip()).resolve()
 
 
@@ -143,7 +143,7 @@ def discover_test_binary(root: Path) -> Path:
         "cargo",
         "test",
         "-p",
-        "wavecrate",
+        "yield",
         "--lib",
         "--no-run",
         "--message-format=json",
@@ -159,7 +159,7 @@ def discover_test_binary(root: Path) -> Path:
     if result.returncode != 0:
         sys.stderr.write(result.stdout)
         sys.stderr.write(result.stderr)
-        raise SystemExit(f"failed to compile the Wavecrate library test harness ({result.returncode})")
+        raise SystemExit(f"failed to compile the Yield library test harness ({result.returncode})")
 
     executables: list[Path] = []
     for line in result.stdout.splitlines():
@@ -172,7 +172,7 @@ def discover_test_binary(root: Path) -> Path:
         if (
             message.get("reason") == "compiler-artifact"
             and message.get("profile", {}).get("test") is True
-            and target.get("name") == "wavecrate"
+            and target.get("name") == "yield"
             and "lib" in target.get("kind", [])
             and executable
         ):
@@ -180,7 +180,7 @@ def discover_test_binary(root: Path) -> Path:
 
     if len(executables) != 1:
         raise SystemExit(
-            "expected exactly one Wavecrate library test executable, "
+            "expected exactly one Yield library test executable, "
             f"found {len(executables)}"
         )
     return executables[0]
@@ -239,7 +239,7 @@ def classify_failure(output: str) -> str:
 def failure_evidence(output: str) -> str:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     evidence = next(
-        (line for line in lines if "WAVECRATE_ISOLATION:" in line),
+        (line for line in lines if "YIELD_ISOLATION:" in line),
         None,
     )
     if evidence is None:

@@ -23,7 +23,7 @@
       "scripts/internal/check/check_readiness_executor_boundary.ps1",
       "scripts/internal/check/check_source_db_open_roles.ps1",
       "scripts/internal/check/check_non_blocking_architecture.ps1",
-      "scripts/internal/check/check_wavecrate_facades.ps1",
+      "scripts/internal/check/check_yield_facades.ps1",
       "scripts/internal/check/check_docs_index.ps1",
       "scripts/internal/check/report_file_size_budget_allowlist.ps1",
       "scripts/internal/check/report_size_hotspots.ps1"
@@ -114,22 +114,22 @@
       {
         "label": "PowerShell architecture guardrail targets the GUI boundary test",
         "path": "scripts/internal/check/check_non_blocking_architecture.ps1",
-        "fragment": "test --package wavecrate --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis"
+        "fragment": "test --package yield --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis"
       },
       {
         "label": "Bash architecture guardrail targets the GUI boundary test",
         "path": "scripts/internal/check/check_non_blocking_architecture.sh",
-        "fragment": "test -p wavecrate --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis"
+        "fragment": "test -p yield --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis"
       },
       {
-        "label": "PowerShell architecture guardrail targets the Wavecrate library harness",
+        "label": "PowerShell architecture guardrail targets the Yield library harness",
         "path": "scripts/internal/check/check_non_blocking_architecture.ps1",
-        "fragment": "test --package wavecrate --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow"
+        "fragment": "test --package yield --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow"
       },
       {
-        "label": "Bash architecture guardrail targets the Wavecrate library harness",
+        "label": "Bash architecture guardrail targets the Yield library harness",
         "path": "scripts/internal/check/check_non_blocking_architecture.sh",
-        "fragment": "test -p wavecrate --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow"
+        "fragment": "test -p yield --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow"
       },
       {
         "label": "PowerShell ci agent requires readiness executor boundary guardrails",
@@ -164,12 +164,12 @@
       {
         "label": "PowerShell quick CI validates its package filter against discovered binaries",
         "path": "scripts/internal/ci/ci_quick.ps1",
-        "fragment": "nextest list --package wavecrate --profile quick --lib --tests --list-type binaries-only"
+        "fragment": "nextest list --package yield --profile quick --lib --tests --list-type binaries-only"
       },
       {
         "label": "Bash quick CI validates its package filter against discovered binaries",
         "path": "scripts/internal/ci/ci_quick.sh",
-        "fragment": "nextest list -p wavecrate --profile quick --lib --tests --list-type binaries-only"
+        "fragment": "nextest list -p yield --profile quick --lib --tests --list-type binaries-only"
       },
       {
         "label": "PowerShell workspace quick CI validates its filter against discovered binaries",
@@ -195,96 +195,96 @@
   },
   "perf": {
     "frame_quality": {
-      "warn_jank_env": "WAVECRATE_PERF_WARN_FRAME_JANK_RATIO",
+      "warn_jank_env": "YIELD_PERF_WARN_FRAME_JANK_RATIO",
       "warn_jank_default": 0.10,
-      "warn_missed_present_env": "WAVECRATE_PERF_WARN_MISSED_PRESENT_PROXY_RATIO",
+      "warn_missed_present_env": "YIELD_PERF_WARN_MISSED_PRESENT_PROXY_RATIO",
       "warn_missed_present_default": 0.05,
-      "fail_jank_env": "WAVECRATE_PERF_FAIL_FRAME_JANK_RATIO",
-      "fail_missed_present_env": "WAVECRATE_PERF_FAIL_MISSED_PRESENT_PROXY_RATIO"
+      "fail_jank_env": "YIELD_PERF_FAIL_FRAME_JANK_RATIO",
+      "fail_missed_present_env": "YIELD_PERF_FAIL_MISSED_PRESENT_PROXY_RATIO"
     },
     "scenarios": [
       {
         "key": "browser_filter_churn_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_FILTER_CHURN",
+        "warn_env": "YIELD_PERF_WARN_P95_US_FILTER_CHURN",
         "warn_default": 10000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_FILTER_CHURN",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_FILTER_CHURN",
         "fail_default": null
       },
       {
         "key": "browser_query_churn_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_QUERY_CHURN",
+        "warn_env": "YIELD_PERF_WARN_P95_US_QUERY_CHURN",
         "warn_default": 12000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_QUERY_CHURN",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_QUERY_CHURN",
         "fail_default": null
       },
       {
         "key": "browser_sort_toggle_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_SORT_CHURN",
+        "warn_env": "YIELD_PERF_WARN_P95_US_SORT_CHURN",
         "warn_default": 10000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_SORT_CHURN",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_SORT_CHURN",
         "fail_default": null
       },
       {
         "key": "hover_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_HOVER",
+        "warn_env": "YIELD_PERF_WARN_P95_US_HOVER",
         "warn_default": 8000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_HOVER",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_HOVER",
         "fail_default": null
       },
       {
         "key": "wheel_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_WHEEL",
+        "warn_env": "YIELD_PERF_WARN_P95_US_WHEEL",
         "warn_default": 10000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_WHEEL",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_WHEEL",
         "fail_default": 30000
       },
       {
         "key": "browser_focus_preview_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_FOCUS_PREVIEW",
+        "warn_env": "YIELD_PERF_WARN_P95_US_FOCUS_PREVIEW",
         "warn_default": 10000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_FOCUS_PREVIEW",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_FOCUS_PREVIEW",
         "fail_default": null
       },
       {
         "key": "browser_focus_commit_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_FOCUS_COMMIT",
+        "warn_env": "YIELD_PERF_WARN_P95_US_FOCUS_COMMIT",
         "warn_default": 16000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_FOCUS_COMMIT",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_FOCUS_COMMIT",
         "fail_default": 100000
       },
       {
         "key": "map_pan_proxy_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_MAP_PAN_PROXY",
+        "warn_env": "YIELD_PERF_WARN_P95_US_MAP_PAN_PROXY",
         "warn_default": 12000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_MAP_PAN_PROXY",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_MAP_PAN_PROXY",
         "fail_default": 4000
       },
       {
         "key": "waveform_interaction_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_WAVEFORM",
+        "warn_env": "YIELD_PERF_WARN_P95_US_WAVEFORM",
         "warn_default": 10000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_WAVEFORM",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_WAVEFORM",
         "fail_default": null
       },
       {
         "key": "waveform_pan_zoom_adjacent_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_WAVEFORM_ADJACENT",
+        "warn_env": "YIELD_PERF_WARN_P95_US_WAVEFORM_ADJACENT",
         "warn_default": 12000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_WAVEFORM_ADJACENT",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_WAVEFORM_ADJACENT",
         "fail_default": null
       },
       {
         "key": "volume_drag_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_VOLUME",
+        "warn_env": "YIELD_PERF_WARN_P95_US_VOLUME",
         "warn_default": 8000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_VOLUME",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_VOLUME",
         "fail_default": null
       },
       {
         "key": "idle_cursor_motion_latency",
-        "warn_env": "WAVECRATE_PERF_WARN_P95_US_IDLE_CURSOR",
+        "warn_env": "YIELD_PERF_WARN_P95_US_IDLE_CURSOR",
         "warn_default": 8000,
-        "fail_env": "WAVECRATE_PERF_FAIL_P95_US_IDLE_CURSOR",
+        "fail_env": "YIELD_PERF_FAIL_P95_US_IDLE_CURSOR",
         "fail_default": null
       }
     ]

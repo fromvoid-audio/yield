@@ -158,8 +158,8 @@ pub fn two() {}
 pub fn three() {}
 EOF
   git -C "$repo_dir" init -q
-  git -C "$repo_dir" config user.name "wavecrate-ci"
-  git -C "$repo_dir" config user.email "ci@wavecrate.test"
+  git -C "$repo_dir" config user.name "yield-ci"
+  git -C "$repo_dir" config user.email "ci@yield.test"
   git -C "$repo_dir" add src scripts
   git -C "$repo_dir" commit -qm "seed"
 
@@ -175,17 +175,17 @@ EOF
     --top-files \
     10
 
-  root_gap_section="$(sed -n '/^## Wavecrate-root likely test-gap hotspots (heuristic)/,/^## Radiant sibling likely test-gap hotspots/p' "$output_path")"
+  root_gap_section="$(sed -n '/^## Yield-root likely test-gap hotspots (heuristic)/,/^## Radiant sibling likely test-gap hotspots/p' "$output_path")"
 
   if grep -Fq 'Likely large-file test-gap hotspots (heuristic): 1' "$output_path"; then
-    echo "[guardrails] PASS: cleanup-audit fixture reports one Wavecrate heuristic gap"
+    echo "[guardrails] PASS: cleanup-audit fixture reports one Yield heuristic gap"
   else
     echo "[guardrails] FAIL: cleanup-audit fixture reports unexpected heuristic gap count" >&2
     cat "$output_path" >&2
     failures=$((failures + 1))
   fi
 
-  if grep -Fq '## Wavecrate-root largest Rust files' "$output_path" && grep -Fq '## Radiant sibling largest Rust files' "$output_path"; then
+  if grep -Fq '## Yield-root largest Rust files' "$output_path" && grep -Fq '## Radiant sibling largest Rust files' "$output_path"; then
     echo "[guardrails] PASS: cleanup-audit fixture emits root/standalone sections"
   else
     echo "[guardrails] FAIL: cleanup-audit fixture did not emit root/vendor sections" >&2
@@ -248,7 +248,7 @@ run_docs_index_fixture() {
 - `docs/TROUBLESHOOTING.md`
 - `AGENTS.md`
 - Planning and backlog
-  - live in Linear project `Wavecrate` under team `PORTALSURFER`
+  - live in Linear project `Yield` under team `PORTALSURFER`
 EOF
 
   run_expect_exit_code \
@@ -287,8 +287,8 @@ run_file_size_budget_fixture() {
   chmod +x "$script_path"
 
   git -C "$fixture_dir/repo" init -q
-  git -C "$fixture_dir/repo" config user.name "wavecrate-ci"
-  git -C "$fixture_dir/repo" config user.email "ci@wavecrate.test"
+  git -C "$fixture_dir/repo" config user.name "yield-ci"
+  git -C "$fixture_dir/repo" config user.email "ci@yield.test"
 
   mkdir -p "$fixture_dir/repo/tests"
   cat >"$fixture_dir/repo/src/too_many_lines.rs" <<'EOF'
@@ -308,7 +308,7 @@ EOF
   git -C "$fixture_dir/repo" commit -qm "seed"
 
   run_expect_exit_code \
-    "file-size-budget fixture catches over-limit Wavecrate file" \
+    "file-size-budget fixture catches over-limit Yield file" \
     1 \
     "$repo_dir" \
     "$script_path" \
@@ -382,8 +382,8 @@ run_taste_invariants_fixture() {
   chmod +x "$script_path"
 
   git -C "$repo_dir" init -q
-  git -C "$repo_dir" config user.name "wavecrate-ci"
-  git -C "$repo_dir" config user.email "ci@wavecrate.test"
+  git -C "$repo_dir" config user.name "yield-ci"
+  git -C "$repo_dir" config user.email "ci@yield.test"
 
   cat >"$repo_dir/src/lib.rs" <<'EOF'
 fn main() {
@@ -463,7 +463,7 @@ run_nextest_quick_profile_fixture() {
   local config_path="$fixture_dir/nextest.toml"
   cat >"$config_path" <<'EOF'
 [profile.quick]
-default-filter = 'binary_id(=wavecrate::definitely-missing-binary)'
+default-filter = 'binary_id(=yield::definitely-missing-binary)'
 EOF
 
   run_expect_output \
@@ -478,7 +478,7 @@ EOF
     --config-file \
     "$config_path" \
     --package \
-    wavecrate \
+    yield \
     --profile \
     quick \
     --lib \

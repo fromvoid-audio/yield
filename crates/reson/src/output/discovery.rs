@@ -137,12 +137,12 @@ mod tests {
 
     #[test]
     fn explicit_unavailable_host_does_not_fall_back_to_default_host() {
-        let result = resolve_host(Some("__wavecrate_missing_host__"));
+        let result = resolve_host(Some("__yield_missing_host__"));
 
         assert!(matches!(
             result,
             Err(AudioOutputError::HostUnavailable { host_id })
-                if host_id == "__wavecrate_missing_host__"
+                if host_id == "__yield_missing_host__"
         ));
     }
 }

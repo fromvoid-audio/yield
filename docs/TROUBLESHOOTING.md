@@ -43,7 +43,7 @@ Do not broadly delete `target/` while another Cargo run is active.
 
 Use this when you need a richer reconstruction of runtime actions or DB work.
 
-- enable Wavecrate-owned debug diagnostics for one run:
+- enable Yield-owned debug diagnostics for one run:
   - Windows PowerShell:
     `cargo run --release -- --log`
   - macOS/Linux/WSL:
@@ -55,7 +55,7 @@ Use this when you need a richer reconstruction of runtime actions or DB work.
     `bash scripts/run.sh logs`
 - for sandbox/manual QA runs created through `scripts/run.ps1 sandbox`, use the
   matching sandbox retrieval path so the helper resolves
-  `<config-base>/.wavecrate/profiles/sandbox/logs` instead of the live profile:
+  `<config-base>/.yield/profiles/sandbox/logs` instead of the live profile:
   - Windows PowerShell:
     `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 logs -Sandbox`
   - macOS/Linux/WSL:
@@ -71,7 +71,7 @@ Use this when you need a richer reconstruction of runtime actions or DB work.
 - if you also set `RUST_LOG`, remember that it overrides the default filter;
   leave it unset for the standard debug contract unless you intentionally need a
   custom filter
-- use `WAVECRATE_DEBUG_LOGGING=1` only for non-interactive launch surfaces where
+- use `YIELD_DEBUG_LOGGING=1` only for non-interactive launch surfaces where
   adding `--log` is awkward
 - do not log secrets, tokens, auth headers, raw credentials, or large
   unredacted user payloads while extending diagnostics coverage
@@ -98,9 +98,9 @@ Fix:
 
 - preferred: repair the local keyring backend
 - fallback:
-  - `WAVECRATE_DISABLE_KEYRING=1`
-  - `WAVECRATE_ALLOW_FALLBACK_TOKEN_STORAGE=1`
-  - `WAVECRATE_FALLBACK_KEY=<base64 32-byte key>`
+  - `YIELD_DISABLE_KEYRING=1`
+  - `YIELD_ALLOW_FALLBACK_TOKEN_STORAGE=1`
+  - `YIELD_FALLBACK_KEY=<base64 32-byte key>`
 
 ### Native font fallback issues
 
@@ -120,7 +120,7 @@ Symptoms:
 
 Fix:
 
-- set both `WAVECRATE_SQLITE_EXT` and `WAVECRATE_SQLITE_EXT_ENABLE=1`
+- set both `YIELD_SQLITE_EXT` and `YIELD_SQLITE_EXT_ENABLE=1`
 - keep the extension under the allowed path unless you are intentionally using
   the unsafe mode and matching cargo feature
 
@@ -134,7 +134,7 @@ Fix:
 
 - prefer a non-symlink install path
 - for dev/test-only validation issues, use
-  `WAVECRATE_UPDATER_ALLOW_SYMLINK_ERRORS=1`
+  `YIELD_UPDATER_ALLOW_SYMLINK_ERRORS=1`
 
 ## Guardrail policy
 

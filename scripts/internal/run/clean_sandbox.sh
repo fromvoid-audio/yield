@@ -3,14 +3,14 @@
 # Deletes the repo-local sandbox used by `scripts/run_sandbox.*`.
 #
 # This removes:
-# - <repo>/.sandbox/wavecrate
+# - <repo>/.sandbox/yield
 #
 # Use this when sandbox state gets confusing or you want a fresh sandbox run.
 
 set -euo pipefail
 
 usage() {
-  local entrypoint="${WAVECRATE_RUN_ENTRYPOINT:-scripts/run.sh}"
+  local entrypoint="${YIELD_RUN_ENTRYPOINT:-scripts/run.sh}"
   cat <<EOF
 Usage: ${entrypoint} clean
 
@@ -35,7 +35,7 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 
-SANDBOX_DIR="$ROOT_DIR/.sandbox/wavecrate"
+SANDBOX_DIR="$ROOT_DIR/.sandbox/yield"
 
 if [[ ! -e "$SANDBOX_DIR" ]]; then
   echo "[clean_sandbox] nothing to remove: $SANDBOX_DIR"

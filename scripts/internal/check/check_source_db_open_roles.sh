@@ -16,14 +16,14 @@ if command -v rg >/dev/null 2>&1; then
   violations="$(
     {
       rg -n --glob '*.rs' "$call_pattern" "${scope[@]}" || true
-      rg -n "$declaration_pattern" crates/wavecrate-library/src/sample_sources/db/mod.rs || true
+      rg -n "$declaration_pattern" crates/yield-library/src/sample_sources/db/mod.rs || true
     } | sort -u
   )"
 else
   violations="$(
     {
       grep -REn --include='*.rs' "$call_pattern" "${scope[@]}" || true
-      grep -En "$declaration_pattern" crates/wavecrate-library/src/sample_sources/db/mod.rs || true
+      grep -En "$declaration_pattern" crates/yield-library/src/sample_sources/db/mod.rs || true
     } | sort -u
   )"
 fi

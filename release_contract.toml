@@ -1,5 +1,5 @@
-app_name = "wavecrate"
-repo_slug = "PORTALSURFER/wavecrate"
+app_name = "yield"
+repo_slug = "PORTALSURFER/yield"
 channels = ["nightly", "rc", "stable"]
 targets = [
   "x86_64-pc-windows-msvc",
@@ -34,6 +34,6 @@ optional_dirs = []
 [archive_layout.platform_files]
 windows = ["{APP_NAME}.exe"]
 macos = [
-  "Wavecrate.app/Contents/Info.plist",
-  "Wavecrate.app/Contents/MacOS/{APP_NAME}"
+  "Yield.app/Contents/Info.plist",
+  "Yield.app/Contents/MacOS/{APP_NAME}"
 ]

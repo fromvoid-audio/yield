@@ -3,7 +3,7 @@
 Compatibility wrapper for the main-branch guard.
 
 .DESCRIPTION
-The Wavecrate integration branch is now `main`. This wrapper remains so older
+The Yield integration branch is now `main`. This wrapper remains so older
 hooks or scripts that still call check_next_branch.ps1 continue to enforce the
 current main-branch policy.
 #>

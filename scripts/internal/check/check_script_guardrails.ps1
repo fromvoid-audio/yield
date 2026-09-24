@@ -160,7 +160,7 @@ function Invoke-ExpectOutput {
 }
 
 function New-TempDir {
-  $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("wavecrate-guardrails-" + [System.Guid]::NewGuid().ToString("N"))
+  $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("yield-guardrails-" + [System.Guid]::NewGuid().ToString("N"))
   New-Item -ItemType Directory -Path $tempPath | Out-Null
   return $tempPath
 }
@@ -203,23 +203,23 @@ function Assert-AgentCiCheckDirectory {
   Assert-TextNotContains -Label "agent ci PowerShell does not use stale scripts/check directory" -Text $text -Fragment '"scripts/check"'
 }
 
-function Assert-NoAmbiguousWavecrateCargoPackageShorthand {
+function Assert-NoAmbiguousYieldCargoPackageShorthand {
   $violations = New-Object System.Collections.Generic.List[string]
-  $pattern = '(?m)^\s*Invoke-WavecrateCargo\b[^\r\n]*\s-p(\s|$)'
+  $pattern = '(?m)^\s*Invoke-YieldCargo\b[^\r\n]*\s-p(\s|$)'
   foreach ($scriptPath in Get-ChildItem -Path $scriptsDir -Recurse -Filter "*.ps1") {
     $matches = Select-String -Path $scriptPath.FullName -Pattern $pattern
     foreach ($match in $matches) {
       $relativePath = Resolve-Path -Path $match.Path -Relative
-      $violations.Add(("{0}:{1}: use --package instead of -p when calling Invoke-WavecrateCargo" -f $relativePath, $match.LineNumber))
+      $violations.Add(("{0}:{1}: use --package instead of -p when calling Invoke-YieldCargo" -f $relativePath, $match.LineNumber))
     }
   }
 
   if ($violations.Count -eq 0) {
-    Write-Pass "Invoke-WavecrateCargo calls avoid ambiguous -p package shorthand"
+    Write-Pass "Invoke-YieldCargo calls avoid ambiguous -p package shorthand"
     return
   }
 
-  Add-Failure "Invoke-WavecrateCargo package shorthand can bind as a PowerShell parameter"
+  Add-Failure "Invoke-YieldCargo package shorthand can bind as a PowerShell parameter"
   foreach ($violation in $violations) {
     Write-Host ("  - {0}" -f $violation)
   }
@@ -403,7 +403,7 @@ try {
   }
 
   Assert-AgentCiCheckDirectory -Path (Join-Path $scriptsDir "internal/agent/run_agent_ci_checks.ps1")
-  Assert-NoAmbiguousWavecrateCargoPackageShorthand
+  Assert-NoAmbiguousYieldCargoPackageShorthand
   $inventory = Get-Inventory
   Assert-ScriptInventoryClassifiesTopLevel -Inventory $inventory
   Assert-CompatibilityWrappers -Inventory $inventory
@@ -447,8 +447,8 @@ try {
     )
 
     git -C $repoDir init -q
-    git -C $repoDir config user.name "wavecrate-ci"
-    git -C $repoDir config user.email "ci@wavecrate.test"
+    git -C $repoDir config user.name "yield-ci"
+    git -C $repoDir config user.email "ci@yield.test"
     git -C $repoDir add src/too_many_lines.rs src/blank_lines_count.rs
     git -C $repoDir commit -qm "seed"
 
@@ -456,7 +456,7 @@ try {
     git -C $repoDir add src/too_many_lines.rs
     git -C $repoDir commit -qm "add budget lines"
 
-    Invoke-ExpectExitCode -Label "file size budget catches over-limit Wavecrate file" -ExpectedCode 1 -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/internal/check/check_file_size_budget.ps1") -Arguments @("-All", "-Limit", "3")
+    Invoke-ExpectExitCode -Label "file size budget catches over-limit Yield file" -ExpectedCode 1 -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/internal/check/check_file_size_budget.ps1") -Arguments @("-All", "-Limit", "3")
     Invoke-ExpectExitCode -Label "file size budget passes under limit" -ExpectedCode 0 -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/internal/check/check_file_size_budget.ps1") -Arguments @("-All", "-Limit", "10")
     Invoke-ExpectExitCode -Label "file size budget counts blank lines in project files" -ExpectedCode 1 -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/internal/check/check_file_size_budget.ps1") -Arguments @("-All", "-Limit", "4")
   } finally {
@@ -498,23 +498,23 @@ try {
       "pub fn three() {}"
     )
     git -C $repoDir init -q
-    git -C $repoDir config user.name "wavecrate-ci"
-    git -C $repoDir config user.email "ci@wavecrate.test"
+    git -C $repoDir config user.name "yield-ci"
+    git -C $repoDir config user.email "ci@yield.test"
     git -C $repoDir add src scripts
     git -C $repoDir commit -qm "seed"
 
     $outputPath = Join-Path $repoDir "tmp/cleanup.md"
     Invoke-ExpectExitCode -Label "cleanup audit fixture succeeds" -ExpectedCode 0 -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/internal/check/audit_cleanup_hotspots.ps1") -Arguments @("-Output", $outputPath, "-TestGapMinLines", "3", "-TopFiles", "10")
     $reportText = Get-Content -Path $outputPath -Raw
-    $sectionStart = $reportText.IndexOf("## Wavecrate-root likely test-gap hotspots (heuristic)")
+    $sectionStart = $reportText.IndexOf("## Yield-root likely test-gap hotspots (heuristic)")
     $sectionEnd = $reportText.IndexOf("## Radiant sibling likely test-gap hotspots (standalone gate)")
     $testGapSection = if ($sectionStart -ge 0 -and $sectionEnd -gt $sectionStart) {
       $reportText.Substring($sectionStart, $sectionEnd - $sectionStart)
     } else {
       $reportText
     }
-    Assert-TextContains -Label "cleanup audit fixture reports one Wavecrate heuristic gap" -Text $reportText -Fragment "Likely large-file test-gap hotspots (heuristic): 1"
-    Assert-TextContains -Label "cleanup audit fixture emits root section" -Text $reportText -Fragment "## Wavecrate-root largest Rust files"
+    Assert-TextContains -Label "cleanup audit fixture reports one Yield heuristic gap" -Text $reportText -Fragment "Likely large-file test-gap hotspots (heuristic): 1"
+    Assert-TextContains -Label "cleanup audit fixture emits root section" -Text $reportText -Fragment "## Yield-root largest Rust files"
     Assert-TextContains -Label "cleanup audit fixture emits standalone section" -Text $reportText -Fragment "## Radiant sibling largest Rust files"
     Assert-TextContains -Label "cleanup audit fixture keeps the real gap" -Text $testGapSection -Fragment 'src/real_gap.rs'
     Assert-TextNotContains -Label "cleanup audit fixture skips *_tests.rs files" -Text $testGapSection -Fragment 'src/analysis/ann_index_tests.rs'
@@ -549,7 +549,7 @@ try {
       '- `docs/TROUBLESHOOTING.md`',
       '- `AGENTS.md`',
       '- Planning and backlog',
-      '  - live in Linear project `Wavecrate` under team `PORTALSURFER`'
+      '  - live in Linear project `Yield` under team `PORTALSURFER`'
     )
 
     Invoke-ExpectExitCode -Label "docs index fixture accepts Linear planning pointer" -ExpectedCode 0 -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/internal/check/check_docs_index.ps1")
@@ -599,7 +599,7 @@ try {
     }
 
     $configBase = Join-Path $repoDir "fixture-config"
-    $liveLogsDir = Join-Path $configBase ".wavecrate/logs"
+    $liveLogsDir = Join-Path $configBase ".yield/logs"
     New-Item -ItemType Directory -Path $liveLogsDir -Force | Out-Null
     Set-Content -Path (Join-Path $liveLogsDir "older.log") -Value "older live log"
     Start-Sleep -Milliseconds 20
@@ -608,8 +608,8 @@ try {
 
     Invoke-ExpectOutput -Label "latest log helper resolves live profile log file" -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/run.ps1") -Arguments @("logs") -EnvVars @{
       APPDATA = $configBase
-      WAVECRATE_CONFIG_HOME = ""
-      WAVECRATE_CONFIG_PROFILE = ""
+      YIELD_CONFIG_HOME = ""
+      YIELD_CONFIG_PROFILE = ""
     } -ExpectedSubstrings @(
       "[latest_log] persistence_profile=live",
       "[latest_log] logs_dir=$liveLogsDir",
@@ -621,8 +621,8 @@ try {
     if ($null -ne $windowsPowerShell) {
       Invoke-ExpectOutput -Label "latest log helper resolves live profile log file in Windows PowerShell strict mode" -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/run.ps1") -Arguments @("logs") -PowerShellPath $windowsPowerShell.Path -EnvVars @{
         APPDATA = $configBase
-        WAVECRATE_CONFIG_HOME = ""
-        WAVECRATE_CONFIG_PROFILE = ""
+        YIELD_CONFIG_HOME = ""
+        YIELD_CONFIG_PROFILE = ""
       } -ExpectedSubstrings @(
         "[latest_log] persistence_profile=live",
         "[latest_log] logs_dir=$liveLogsDir",
@@ -651,8 +651,8 @@ try {
       "[cargo-fixture] cwd=$repoDir args=run -- --log --debug-layout"
     )
 
-    $sandboxBase = Join-Path $repoDir ".sandbox/wavecrate"
-    $sandboxDefaultRoot = Join-Path $sandboxBase ".wavecrate/profiles/sandbox"
+    $sandboxBase = Join-Path $repoDir ".sandbox/yield"
+    $sandboxDefaultRoot = Join-Path $sandboxBase ".yield/profiles/sandbox"
     New-Item -ItemType Directory -Path $sandboxDefaultRoot -Force | Out-Null
     $overrideRoot = Join-Path $repoDir "sandbox-override"
     $overrideLogsDir = Join-Path $overrideRoot "logs"
@@ -668,8 +668,8 @@ try {
 
     Invoke-ExpectOutput -Label "latest log helper resolves sandbox profile and app_data_dir override" -WorkDir $repoDir -ScriptPath (Join-Path $repoDir "scripts/run.ps1") -Arguments @("logs", "-Sandbox") -EnvVars @{
       APPDATA = $configBase
-      WAVECRATE_CONFIG_HOME = ""
-      WAVECRATE_CONFIG_PROFILE = ""
+      YIELD_CONFIG_HOME = ""
+      YIELD_CONFIG_PROFILE = ""
     } -ExpectedSubstrings @(
       "[latest_log] persistence_profile=sandbox",
       "[latest_log] app_root=$overrideRootConfigStyle",

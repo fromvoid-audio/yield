@@ -18,28 +18,28 @@ capacity contract does not add that runtime or create a live file-write adapter.
 
 The existing implementation already makes the lifetime problem explicit:
 
-- [`OperationJournalStore`](../crates/wavecrate-library/src/operation_journal/store.rs#L541-L554)
+- [`OperationJournalStore`](../crates/yield-library/src/operation_journal/store.rs#L541-L554)
   owns its SQLite connection, journal-root binding, and a cloned
   `WritableProfileGuard`.
-- [`RecoveryReserveContext<'a>`](../crates/wavecrate-library/src/operation_journal/store.rs#L556-L568)
+- [`RecoveryReserveContext<'a>`](../crates/yield-library/src/operation_journal/store.rs#L556-L568)
   borrows the store and stores a `BoundReserve<'a>` together with a
   `VolumeOwnershipCapability`. It is a command-scoped context, not an owner
   object.
-- [`BoundReserve<'a>`](../crates/wavecrate-library/src/operation_journal/capacity_reserve_namespace.rs#L271-L277)
+- [`BoundReserve<'a>`](../crates/yield-library/src/operation_journal/capacity_reserve_namespace.rs#L271-L277)
   currently owns `ProtectedReserve` while borrowing `BoundDatabaseRoot` and
   `WritableProfileGuard`. Storing it in an object that owns either borrow would
   create a self-referential lifetime.
-- [`PhysicalReserveProof`](../crates/wavecrate-library/src/operation_journal/capacity_reserve_namespace.rs#L279-L302)
+- [`PhysicalReserveProof`](../crates/yield-library/src/operation_journal/capacity_reserve_namespace.rs#L279-L302)
   is deliberately non-serialized and can only come from a retained-handle
   revalidation.
-- [`VolumeOwnershipCapability`](../crates/wavecrate-library/src/operation_journal/capacity_volume_owner.rs#L146-L202)
+- [`VolumeOwnershipCapability`](../crates/yield-library/src/operation_journal/capacity_volume_owner.rs#L146-L202)
   contains an `Rc` marker and is therefore non-`Send`/non-`Sync`; dropping it
   releases the operating-system lock but does not prove a clean handoff.
 
 The owner currently consumes the store and moves it to its worker in
-[`OperationJournalOwner::start`](../crates/wavecrate-library/src/operation_journal/owner.rs#L234-L319).
+[`OperationJournalOwner::start`](../crates/yield-library/src/operation_journal/owner.rs#L234-L319).
 `shutdown` closes admission, joins that worker, and lets the worker drop the
-store in [`run_owner`](../crates/wavecrate-library/src/operation_journal/owner.rs#L333-L402).
+store in [`run_owner`](../crates/yield-library/src/operation_journal/owner.rs#L333-L402).
 The future capacity authority must therefore be installed after the store has
 reached that worker. A caller must never construct a `VolumeOwnershipCapability`
 and send it to the worker.
@@ -169,7 +169,7 @@ establishes clean handoff and OPT-1563 wires the gate,
 ### External source volumes
 
 OPT-1554 does not take ownership of `SourceLease`. The existing
-[`SourceLease`](../crates/wavecrate-library/src/sample_sources/db/source_lease.rs#L263-L281)
+[`SourceLease`](../crates/yield-library/src/sample_sources/db/source_lease.rs#L263-L281)
 is retained by its source owner, which keeps its control connection, source and
 media root capabilities, sidecar lock, epoch, and profile guard. Its owner
 must finish source mutations and retain the lease through the capacity

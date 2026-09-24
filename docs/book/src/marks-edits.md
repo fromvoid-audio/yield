@@ -1,6 +1,6 @@
 # Playmarks, Editmarks, and Edits
 
-Wavecrate has two selection concepts on the waveform: playmarks for auditioning and handoff, and editmarks for destructive editing.
+Yield has two selection concepts on the waveform: playmarks for auditioning and handoff, and editmarks for destructive editing.
 
 ## Playmarks
 

@@ -1,20 +1,20 @@
 [book]
-title = "Wavecrate Documentation"
+title = "Yield Documentation"
 authors = ["PortalSurfer"]
-description = "User and contributor documentation for Wavecrate."
+description = "User and contributor documentation for Yield."
 language = "en"
 src = "docs/book/src"
 
 [build]
-build-dir = "target/mdbook/wavecrate-docs"
+build-dir = "target/mdbook/yield-docs"
 create-missing = false
 
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "light"
-git-repository-url = "https://github.com/PORTALSURFER/wavecrate"
-edit-url-template = "https://github.com/PORTALSURFER/wavecrate/edit/main/{path}"
-site-url = "/wavecrate/docs/"
+git-repository-url = "https://github.com/PORTALSURFER/yield"
+edit-url-template = "https://github.com/PORTALSURFER/yield/edit/main/{path}"
+site-url = "/yield/docs/"
 
 [output.html.search]
 enable = true

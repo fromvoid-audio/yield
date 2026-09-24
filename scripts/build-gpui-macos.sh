@@ -9,7 +9,7 @@ fi
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 manifest="$repo_dir/Cargo.toml"
-cargo build --locked --manifest-path "$manifest" --bin wavecrate-gpui
+cargo build --locked --manifest-path "$manifest" --bin yield
 
 python3 - "$manifest" <<'PY'
 import json
@@ -24,24 +24,24 @@ metadata = json.loads(subprocess.check_output([
     '--manifest-path', sys.argv[1],
 ]))
 target = Path(metadata['target_directory'])
-bundle = target / 'bundle' / 'Wavecrate GPUI.app'
+bundle = target / 'bundle' / 'Yield.app'
 contents = bundle / 'Contents'
-executable = contents / 'MacOS' / 'wavecrate-gpui'
+executable = contents / 'MacOS' / 'yield'
 executable.parent.mkdir(parents=True, exist_ok=True)
-shutil.copy2(target / 'debug' / 'wavecrate-gpui', executable)
+shutil.copy2(target / 'debug' / 'yield', executable)
 resources = contents / 'Resources'
 resources.mkdir(parents=True, exist_ok=True)
-shutil.copy2(Path(sys.argv[1]).parent / 'assets' / 'logo3.icns', resources / 'Wavecrate.icns')
+shutil.copy2(Path(sys.argv[1]).parent / 'assets' / 'logo3.icns', resources / 'Yield.icns')
 shutil.copy2(
     Path(sys.argv[1]).parent / 'assets' / 'fonts' / 'IoskeleyMono-LICENSE.txt',
     resources / 'IoskeleyMono-LICENSE.txt',
 )
 (contents / 'Info.plist').write_bytes(plistlib.dumps({
-    'CFBundleExecutable': 'wavecrate-gpui',
-    'CFBundleIdentifier': 'org.portalsurfer.wavecrate.gpui.dev',
-    'CFBundleName': 'Wavecrate GPUI',
-    'CFBundleDisplayName': 'Wavecrate GPUI',
-    'CFBundleIconFile': 'Wavecrate.icns',
+    'CFBundleExecutable': 'yield',
+    'CFBundleIdentifier': 'org.portalsurfer.yield.dev',
+    'CFBundleName': 'Yield',
+    'CFBundleDisplayName': 'Yield',
+    'CFBundleIconFile': 'Yield.icns',
     'CFBundlePackageType': 'APPL',
     'CFBundleShortVersionString': '0.1.0',
     'CFBundleVersion': '1',

@@ -9,11 +9,11 @@ trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
 # The fixture owns disposable target roots and nested watchdogs. Do not let an
 # enclosing supported validation lane's private recursion proof leak into it.
-unset WAVECRATE_VALIDATION_WATCHDOG_ACTIVE
-unset WAVECRATE_VALIDATION_TARGET_SELECTED
-unset WAVECRATE_VALIDATION_TARGET_LEASE_DIR
-unset WAVECRATE_VALIDATION_TARGET_LEASE_OWNER
-unset WAVECRATE_VALIDATION_TARGET_LEASE_IDENTITY
+unset YIELD_VALIDATION_WATCHDOG_ACTIVE
+unset YIELD_VALIDATION_TARGET_SELECTED
+unset YIELD_VALIDATION_TARGET_LEASE_DIR
+unset YIELD_VALIDATION_TARGET_LEASE_OWNER
+unset YIELD_VALIDATION_TARGET_LEASE_IDENTITY
 unset CARGO_TARGET_DIR
 
 fail() {
@@ -22,12 +22,12 @@ fail() {
 }
 
 run_watchdog() {
-  WAVECRATE_VALIDATION_IDLE_SECONDS=1 \
-    WAVECRATE_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
-    WAVECRATE_VALIDATION_TERM_GRACE_SECONDS=1 \
-    WAVECRATE_VALIDATION_POLL_SECONDS=0.1 \
-    WAVECRATE_VALIDATION_SAMPLE_SECONDS=0 \
-    WAVECRATE_VALIDATION_DIAGNOSTICS_DIR="$FIXTURE_DIR/diagnostics" \
+  YIELD_VALIDATION_IDLE_SECONDS=1 \
+    YIELD_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
+    YIELD_VALIDATION_TERM_GRACE_SECONDS=1 \
+    YIELD_VALIDATION_POLL_SECONDS=0.1 \
+    YIELD_VALIDATION_SAMPLE_SECONDS=0 \
+    YIELD_VALIDATION_DIAGNOSTICS_DIR="$FIXTURE_DIR/diagnostics" \
     python3 "$WATCHDOG" "$@"
 }
 
@@ -76,15 +76,15 @@ done
 slow_diagnostics="$FIXTURE_DIR/slow-diagnostics"
 started_at="$(date +%s)"
 set +e
-WAVECRATE_VALIDATION_IDLE_SECONDS=1 \
-  WAVECRATE_VALIDATION_DIAGNOSTIC_COLLECTION_SECONDS=2 \
-  WAVECRATE_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
-  WAVECRATE_VALIDATION_TERM_GRACE_SECONDS=1 \
-  WAVECRATE_VALIDATION_POLL_SECONDS=0.1 \
-  WAVECRATE_VALIDATION_SAMPLE_SECONDS=3 \
-  WAVECRATE_VALIDATION_SAMPLE_COMMAND="$fake_sample" \
-  WAVECRATE_VALIDATION_TEST_PLATFORM=Darwin \
-  WAVECRATE_VALIDATION_DIAGNOSTICS_DIR="$slow_diagnostics" \
+YIELD_VALIDATION_IDLE_SECONDS=1 \
+  YIELD_VALIDATION_DIAGNOSTIC_COLLECTION_SECONDS=2 \
+  YIELD_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
+  YIELD_VALIDATION_TERM_GRACE_SECONDS=1 \
+  YIELD_VALIDATION_POLL_SECONDS=0.1 \
+  YIELD_VALIDATION_SAMPLE_SECONDS=3 \
+  YIELD_VALIDATION_SAMPLE_COMMAND="$fake_sample" \
+  YIELD_VALIDATION_TEST_PLATFORM=Darwin \
+  YIELD_VALIDATION_DIAGNOSTICS_DIR="$slow_diagnostics" \
   python3 "$WATCHDOG" sh -c \
     "'$FIXTURE_DIR/rustc' 30 & '$FIXTURE_DIR/cargo' 30 & '$FIXTURE_DIR/clang' 30 & wait" \
     >"$FIXTURE_DIR/slow-samples.out" 2>&1
@@ -104,10 +104,10 @@ grep -R -Eq "diagnostic collection budget exhausted|timed out" "$slow_diagnostic
 echo "[validation_watchdog_test] PASS: slow multi-process diagnostics use one global budget"
 
 child_pid_file="$FIXTURE_DIR/cancel-child.pid"
-WAVECRATE_VALIDATION_IDLE_SECONDS=30 \
-  WAVECRATE_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
-  WAVECRATE_VALIDATION_TERM_GRACE_SECONDS=1 \
-  WAVECRATE_VALIDATION_POLL_SECONDS=0.1 \
+YIELD_VALIDATION_IDLE_SECONDS=30 \
+  YIELD_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
+  YIELD_VALIDATION_TERM_GRACE_SECONDS=1 \
+  YIELD_VALIDATION_POLL_SECONDS=0.1 \
   python3 "$WATCHDOG" sh -c "sleep 30 & echo \$! > '$child_pid_file'; wait" &
 wrapper_pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -127,8 +127,8 @@ echo "[validation_watchdog_test] PASS: cancellation cleanup"
 
 prespawn_ready="$FIXTURE_DIR/prespawn-ready"
 prespawn_child="$FIXTURE_DIR/prespawn-child"
-WAVECRATE_VALIDATION_TEST_PRESPAWN_READY_FILE="$prespawn_ready" \
-  WAVECRATE_VALIDATION_TEST_PRESPAWN_SECONDS=2 \
+YIELD_VALIDATION_TEST_PRESPAWN_READY_FILE="$prespawn_ready" \
+  YIELD_VALIDATION_TEST_PRESPAWN_SECONDS=2 \
   python3 "$WATCHDOG" sh -c "echo started > '$prespawn_child'; sleep 30" &
 wrapper_pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -146,23 +146,23 @@ set -e
 echo "[validation_watchdog_test] PASS: pre-spawn cancellation cannot orphan a process group"
 
 target_root="$FIXTURE_DIR/targets"
-export WAVECRATE_VALIDATION_TARGET_ROOT="$target_root"
-export WAVECRATE_VALIDATION_MAX_DEPS_METADATA_BYTES=1
+export YIELD_VALIDATION_TARGET_ROOT="$target_root"
+export YIELD_VALIDATION_MAX_DEPS_METADATA_BYTES=1
 unset CARGO_TARGET_DIR
 # shellcheck source=scripts/internal/validation/use_validation_target.sh
 source "$ROOT_DIR/scripts/internal/validation/use_validation_target.sh"
-export WAVECRATE_VALIDATION_TEST_PLATFORM=Linux
-wavecrate_use_validation_target "$ROOT_DIR"
+export YIELD_VALIDATION_TEST_PLATFORM=Linux
+yield_use_validation_target "$ROOT_DIR"
 [[ -z "${CARGO_TARGET_DIR:-}" ]] || fail "non-Darwin target selection changed CARGO_TARGET_DIR"
 echo "[validation_watchdog_test] PASS: non-Darwin target selection is a no-op"
 
-export WAVECRATE_VALIDATION_TEST_PLATFORM=Darwin
+export YIELD_VALIDATION_TEST_PLATFORM=Darwin
 ambient_target="$FIXTURE_DIR/ambient-target"
 export CARGO_TARGET_DIR="$ambient_target"
-wavecrate_use_validation_target "$ROOT_DIR"
+yield_use_validation_target "$ROOT_DIR"
 first_target="$CARGO_TARGET_DIR"
 [[ "$first_target" != "$ambient_target" ]] || fail "ambient CARGO_TARGET_DIR bypassed isolation"
-wavecrate_release_validation_target
+yield_release_validation_target
 echo "[validation_watchdog_test] PASS: ambient Cargo target cannot bypass isolation"
 mkdir -p "$first_target/debug/deps"
 : >"$first_target/debug/deps/artifact"
@@ -170,10 +170,10 @@ mkdir -p "$first_target/debug/deps"
 run_target_selection() {
   local output_path="$1"
   unset CARGO_TARGET_DIR
-  wavecrate_use_validation_target "$ROOT_DIR"
+  yield_use_validation_target "$ROOT_DIR"
   printf '%s\n' "$CARGO_TARGET_DIR" > "$output_path"
   sleep 0.2
-  wavecrate_release_validation_target
+  yield_release_validation_target
 }
 
 run_target_selection "$FIXTURE_DIR/target-one" &
@@ -192,13 +192,13 @@ find "$target_root" -mindepth 1 -maxdepth 1 -type d -name '.lock-*' | grep -q . 
   && fail "validation target lease survived successful selectors"
 echo "[validation_watchdog_test] PASS: concurrent pathological target rotation"
 
-unset WAVECRATE_VALIDATION_TEST_PLATFORM
+unset YIELD_VALIDATION_TEST_PLATFORM
 unset CARGO_TARGET_DIR
 runner_target_root="$FIXTURE_DIR/runner-targets"
-WAVECRATE_VALIDATION_TARGET_ROOT="$runner_target_root" \
+YIELD_VALIDATION_TARGET_ROOT="$runner_target_root" \
   "$ROOT_DIR/scripts/internal/validation/run_validation_command.sh" sh -c 'sleep 0.2' &
 first_runner=$!
-WAVECRATE_VALIDATION_TARGET_ROOT="$runner_target_root" \
+YIELD_VALIDATION_TARGET_ROOT="$runner_target_root" \
   "$ROOT_DIR/scripts/internal/validation/run_validation_command.sh" sh -c 'sleep 0.2' &
 second_runner=$!
 wait "$first_runner"
@@ -209,15 +209,15 @@ echo "[validation_watchdog_test] PASS: concurrent validation command leases"
 
 marker_diagnostics="$FIXTURE_DIR/marker-diagnostics"
 set +e
-WAVECRATE_VALIDATION_WATCHDOG_ACTIVE=1 \
-  WAVECRATE_VALIDATION_IDLE_SECONDS=1 \
-  WAVECRATE_VALIDATION_DIAGNOSTIC_COLLECTION_SECONDS=1 \
-  WAVECRATE_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
-  WAVECRATE_VALIDATION_TERM_GRACE_SECONDS=1 \
-  WAVECRATE_VALIDATION_POLL_SECONDS=0.1 \
-  WAVECRATE_VALIDATION_SAMPLE_SECONDS=0 \
-  WAVECRATE_VALIDATION_DIAGNOSTICS_DIR="$marker_diagnostics" \
-  WAVECRATE_VALIDATION_TARGET_ROOT="$runner_target_root" \
+YIELD_VALIDATION_WATCHDOG_ACTIVE=1 \
+  YIELD_VALIDATION_IDLE_SECONDS=1 \
+  YIELD_VALIDATION_DIAGNOSTIC_COLLECTION_SECONDS=1 \
+  YIELD_VALIDATION_DIAGNOSTIC_GRACE_SECONDS=1 \
+  YIELD_VALIDATION_TERM_GRACE_SECONDS=1 \
+  YIELD_VALIDATION_POLL_SECONDS=0.1 \
+  YIELD_VALIDATION_SAMPLE_SECONDS=0 \
+  YIELD_VALIDATION_DIAGNOSTICS_DIR="$marker_diagnostics" \
+  YIELD_VALIDATION_TARGET_ROOT="$runner_target_root" \
   "$ROOT_DIR/scripts/internal/validation/run_validation_command.sh" sh -c 'sleep 30' \
   >"$FIXTURE_DIR/untrusted-marker.out" 2>&1
 status=$?
@@ -233,17 +233,17 @@ target_key="$(basename "$first_target")"
 stale_lease="$runner_target_root/.lock-$target_key"
 mkdir -p "$stale_lease"
 printf '%s\t%s\n' "$$" "reused-pid-start-identity" > "$stale_lease/pid"
-WAVECRATE_VALIDATION_TARGET_ROOT="$runner_target_root" \
+YIELD_VALIDATION_TARGET_ROOT="$runner_target_root" \
   "$ROOT_DIR/scripts/internal/validation/run_validation_command.sh" sh -c 'exit 0'
 [[ ! -d "$stale_lease" ]] || fail "stale reused-PID lease was not recovered"
 echo "[validation_watchdog_test] PASS: stale reused-PID lease recovery"
 
-live_identity="$(wavecrate_process_identity "$$")"
+live_identity="$(yield_process_identity "$$")"
 mkdir -p "$stale_lease"
 printf '%s\t%s\n' "$$" "$live_identity" > "$stale_lease/pid"
 set +e
-WAVECRATE_VALIDATION_TARGET_ROOT="$runner_target_root" \
-  WAVECRATE_VALIDATION_LEASE_WAIT_SECONDS=1 \
+YIELD_VALIDATION_TARGET_ROOT="$runner_target_root" \
+  YIELD_VALIDATION_LEASE_WAIT_SECONDS=1 \
   "$ROOT_DIR/scripts/internal/validation/run_validation_command.sh" sh -c 'exit 0' \
   >"$FIXTURE_DIR/lease-timeout.out" 2>&1
 status=$?

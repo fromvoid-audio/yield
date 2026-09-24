@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-Runs Wavecrate in an isolated sandbox config directory.
+Runs Yield in an isolated sandbox config directory.
 
 .DESCRIPTION
-Runs `cargo run --release` with `WAVECRATE_CONFIG_HOME` set to an isolated sandbox
-base directory plus `WAVECRATE_CONFIG_PROFILE=sandbox` so local runs (including
+Runs `cargo run --release` with `YIELD_CONFIG_HOME` set to an isolated sandbox
+base directory plus `YIELD_CONFIG_PROFILE=sandbox` so local runs (including
 agent runs) do not touch real user data.
 
 Derived paths:
-- app root:  <WAVECRATE_CONFIG_HOME>\.wavecrate\profiles\sandbox
+- app root:  <YIELD_CONFIG_HOME>\.yield\profiles\sandbox
 - config:    <app root>\config.toml
 - logs:      <app root>\logs
 #>
@@ -40,14 +40,14 @@ function New-SandboxBase {
   if ($UseTemp) {
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
     $rand = [Guid]::NewGuid().ToString("N").Substring(0, 8)
-    $base = Join-Path $env:TEMP ("wavecrate-sandbox-" + $stamp + "-" + $rand)
+    $base = Join-Path $env:TEMP ("yield-sandbox-" + $stamp + "-" + $rand)
     New-Item -ItemType Directory -Path $base -Force | Out-Null
     return (Resolve-Path $base).Path
   } else {
     if (-not [string]::IsNullOrWhiteSpace($SandboxName)) {
-      $base = Join-Path $rootDir (".sandbox/wavecrate/" + $SandboxName)
+      $base = Join-Path $rootDir (".sandbox/yield/" + $SandboxName)
     } else {
-      $base = Join-Path $rootDir ".sandbox/wavecrate"
+      $base = Join-Path $rootDir ".sandbox/yield"
     }
     New-Item -ItemType Directory -Path $base -Force | Out-Null
     return (Resolve-Path $base).Path
@@ -65,14 +65,14 @@ if ($FixturePreserve -and [string]::IsNullOrWhiteSpace($Fixture)) {
 }
 
 $sandboxBase = New-SandboxBase -Requested $Dir -SandboxName $Name -UseTemp ([bool]$Temp)
-$env:WAVECRATE_CONFIG_HOME = $sandboxBase
-$env:WAVECRATE_CONFIG_PROFILE = "sandbox"
+$env:YIELD_CONFIG_HOME = $sandboxBase
+$env:YIELD_CONFIG_PROFILE = "sandbox"
 
 if (-not [string]::IsNullOrWhiteSpace($Fixture)) {
   $WriteDb = $true
-  Remove-Item Env:WAVECRATE_SOURCE_DB_READ_ONLY -ErrorAction SilentlyContinue
+  Remove-Item Env:YIELD_SOURCE_DB_READ_ONLY -ErrorAction SilentlyContinue
   $fixtureArgs = @(
-    "run", "--quiet", "--bin", "wavecrate-fixture", "--",
+    "run", "--quiet", "--bin", "yield-fixture", "--",
     "provision", "--fixture", $Fixture, "--config-base", $sandboxBase,
     "--profile", "sandbox"
   )
@@ -93,26 +93,26 @@ if (-not [string]::IsNullOrWhiteSpace($Fixture)) {
     throw "fixture provisioning failed with exit code $fixtureStatus"
   }
   Write-Host ("[run_sandbox] fixture={0}" -f $Fixture)
-  Write-Host ("[run_sandbox] fixture_manifest={0}" -f (Join-Path $sandboxBase ".wavecrate/fixtures/$Fixture/fixture-manifest.json"))
+  Write-Host ("[run_sandbox] fixture_manifest={0}" -f (Join-Path $sandboxBase ".yield/fixtures/$Fixture/fixture-manifest.json"))
 }
 
 if ($WriteDb) {
-  Remove-Item Env:WAVECRATE_SOURCE_DB_READ_ONLY -ErrorAction SilentlyContinue
+  Remove-Item Env:YIELD_SOURCE_DB_READ_ONLY -ErrorAction SilentlyContinue
 } else {
-  $env:WAVECRATE_SOURCE_DB_READ_ONLY = "1"
+  $env:YIELD_SOURCE_DB_READ_ONLY = "1"
 }
 
-$appRoot = Join-Path $sandboxBase ".wavecrate\\profiles\\sandbox"
+$appRoot = Join-Path $sandboxBase ".yield\\profiles\\sandbox"
 $configPath = Join-Path $appRoot "config.toml"
 $logsDir = Join-Path $appRoot "logs"
 
 Write-Host ("[run_sandbox] repo_root={0}" -f $rootDir)
-Write-Host ("[run_sandbox] WAVECRATE_CONFIG_HOME={0}" -f $sandboxBase)
-Write-Host ("[run_sandbox] WAVECRATE_CONFIG_PROFILE={0}" -f $env:WAVECRATE_CONFIG_PROFILE)
+Write-Host ("[run_sandbox] YIELD_CONFIG_HOME={0}" -f $sandboxBase)
+Write-Host ("[run_sandbox] YIELD_CONFIG_PROFILE={0}" -f $env:YIELD_CONFIG_PROFILE)
 Write-Host ("[run_sandbox] app_root={0}" -f $appRoot)
 Write-Host ("[run_sandbox] config={0}" -f $configPath)
 Write-Host ("[run_sandbox] logs={0}" -f $logsDir)
-Write-Host "[run_sandbox] CONTRACT: app config/logs will NOT be read/written from your real user profile dirs (it uses WAVECRATE_CONFIG_HOME)."
+Write-Host "[run_sandbox] CONTRACT: app config/logs will NOT be read/written from your real user profile dirs (it uses YIELD_CONFIG_HOME)."
 if ($WriteDb) {
   Write-Host "[run_sandbox] Source DB mode: write-enabled (explicit override)."
 } else {

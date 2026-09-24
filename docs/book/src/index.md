@@ -1,10 +1,10 @@
-# Wavecrate Documentation
+# Yield Documentation
 
-Wavecrate is a local sample-library workstation for producers who need to move quickly through large folders, audition sounds beside a DAW, cut useful regions out of long recordings, and keep a sample library honest over time.
+Yield is a local sample-library workstation for producers who need to move quickly through large folders, audition sounds beside a DAW, cut useful regions out of long recordings, and keep a sample library honest over time.
 
-This book is the public documentation surface for Wavecrate. It is intentionally practical: it explains what the app does, how to start using it, and where to look when something feels stuck.
+This book is the public documentation surface for Yield. It is intentionally practical: it explains what the app does, how to start using it, and where to look when something feels stuck.
 
-![Wavecrate main window](assets/wavecrate-main-window.png)
+![Yield main window](assets/yield-main-window.png)
 
 ## Start Here
 
@@ -18,7 +18,7 @@ This book is the public documentation surface for Wavecrate. It is intentionally
 - Audio, cache, trash-folder, and tooltip controls live in [Settings](settings.md).
 - A visual pass through the current app surface lives in [Screenshots and Feature Tour](screenshots.md).
 
-## What Wavecrate Helps With
+## What Yield Helps With
 
 - Browse local sample folders without hiding the original file layout.
 - Audition samples quickly with keyboard-first navigation.

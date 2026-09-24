@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# Runs Wavecrate in an isolated sandbox config directory so local runs (including
+# Runs Yield in an isolated sandbox config directory so local runs (including
 # agent runs) do not touch real user data.
 #
-# This works by setting `WAVECRATE_CONFIG_HOME` to a sandbox base directory and
-# `WAVECRATE_CONFIG_PROFILE=sandbox`, which routes config/logs/library state into
-# `<WAVECRATE_CONFIG_HOME>/.wavecrate/profiles/sandbox/`.
+# This works by setting `YIELD_CONFIG_HOME` to a sandbox base directory and
+# `YIELD_CONFIG_PROFILE=sandbox`, which routes config/logs/library state into
+# `<YIELD_CONFIG_HOME>/.yield/profiles/sandbox/`.
 
 set -euo pipefail
 
@@ -21,22 +21,22 @@ FIXTURE=""
 FIXTURE_RESET=1
 
 usage() {
-  local entrypoint="${WAVECRATE_RUN_ENTRYPOINT:-scripts/run.sh}"
+  local entrypoint="${YIELD_RUN_ENTRYPOINT:-scripts/run.sh}"
   cat <<EOF
 Usage: ${entrypoint} sandbox [--dir <sandbox_base>] [--name <id>] [--temp] [--clean] [--write-db] [--fixture <name>] [--fixture-preserve] [--] [app args...]
 
 Runs cargo run --release with:
-- WAVECRATE_CONFIG_HOME set to an isolated sandbox base directory
-- WAVECRATE_CONFIG_PROFILE=sandbox
+- YIELD_CONFIG_HOME set to an isolated sandbox base directory
+- YIELD_CONFIG_PROFILE=sandbox
 
 Derived paths:
-- app root:  <WAVECRATE_CONFIG_HOME>/.wavecrate/profiles/sandbox
+- app root:  <YIELD_CONFIG_HOME>/.yield/profiles/sandbox
 - config:    <app root>/config.toml
 - logs:      <app root>/logs
 
 Options:
-  --dir <path>  Use a fixed sandbox base dir (default: <repo>/.sandbox/wavecrate).
-  --name <id>   Use a named sandbox dir under <repo>/.sandbox/wavecrate/<id> (persistent).
+  --dir <path>  Use a fixed sandbox base dir (default: <repo>/.sandbox/yield).
+  --name <id>   Use a named sandbox dir under <repo>/.sandbox/yield/<id> (persistent).
   --temp        Use a temporary sandbox base dir (mktemp) and delete it on exit.
   --clean       Delete the sandbox base dir on exit.
   --write-db    Allow source DB writes (opt out of read-only DB mode).
@@ -88,12 +88,12 @@ fi
 
 if [[ -z "$SANDBOX_BASE" ]]; then
   if (( TEMP == 1 )); then
-    SANDBOX_BASE="$(mktemp -d -t wavecrate-sandbox-XXXXXXXX)"
+    SANDBOX_BASE="$(mktemp -d -t yield-sandbox-XXXXXXXX)"
     CLEAN=1
   elif [[ -n "$NAME" ]]; then
-    SANDBOX_BASE="$ROOT_DIR/.sandbox/wavecrate/$NAME"
+    SANDBOX_BASE="$ROOT_DIR/.sandbox/yield/$NAME"
   else
-    SANDBOX_BASE="$ROOT_DIR/.sandbox/wavecrate"
+    SANDBOX_BASE="$ROOT_DIR/.sandbox/yield"
   fi
 fi
 
@@ -116,36 +116,36 @@ if (( CLEAN == 1 )); then
   trap 'rm -rf "$SANDBOX_BASE"' EXIT
 fi
 
-export WAVECRATE_CONFIG_HOME="$SANDBOX_BASE"
-export WAVECRATE_CONFIG_PROFILE="sandbox"
+export YIELD_CONFIG_HOME="$SANDBOX_BASE"
+export YIELD_CONFIG_PROFILE="sandbox"
 if [[ -n "$FIXTURE" ]]; then
   WRITE_DB=1
-  unset WAVECRATE_SOURCE_DB_READ_ONLY
+  unset YIELD_SOURCE_DB_READ_ONLY
   fixture_args=(provision --fixture "$FIXTURE" --config-base "$SANDBOX_BASE" --profile sandbox)
   if (( FIXTURE_RESET == 0 )); then
     fixture_args+=(--no-reset)
   fi
-  cargo run --quiet --bin wavecrate-fixture -- "${fixture_args[@]}" >/dev/null
+  cargo run --quiet --bin yield-fixture -- "${fixture_args[@]}" >/dev/null
   echo "[run_sandbox] fixture=$FIXTURE"
-  echo "[run_sandbox] fixture_manifest=$SANDBOX_BASE/.wavecrate/fixtures/$FIXTURE/fixture-manifest.json"
+  echo "[run_sandbox] fixture_manifest=$SANDBOX_BASE/.yield/fixtures/$FIXTURE/fixture-manifest.json"
 fi
 if (( WRITE_DB == 1 )); then
-  unset WAVECRATE_SOURCE_DB_READ_ONLY
+  unset YIELD_SOURCE_DB_READ_ONLY
 else
-  export WAVECRATE_SOURCE_DB_READ_ONLY=1
+  export YIELD_SOURCE_DB_READ_ONLY=1
 fi
 
-APP_ROOT="${WAVECRATE_CONFIG_HOME}/.wavecrate/profiles/sandbox"
+APP_ROOT="${YIELD_CONFIG_HOME}/.yield/profiles/sandbox"
 CONFIG_PATH="${APP_ROOT}/config.toml"
 LOGS_DIR="${APP_ROOT}/logs"
 
 echo "[run_sandbox] repo_root=$ROOT_DIR"
-echo "[run_sandbox] WAVECRATE_CONFIG_HOME=$WAVECRATE_CONFIG_HOME"
-echo "[run_sandbox] WAVECRATE_CONFIG_PROFILE=$WAVECRATE_CONFIG_PROFILE"
+echo "[run_sandbox] YIELD_CONFIG_HOME=$YIELD_CONFIG_HOME"
+echo "[run_sandbox] YIELD_CONFIG_PROFILE=$YIELD_CONFIG_PROFILE"
 echo "[run_sandbox] app_root=$APP_ROOT"
 echo "[run_sandbox] config=$CONFIG_PATH"
 echo "[run_sandbox] logs=$LOGS_DIR"
-echo "[run_sandbox] CONTRACT: app config/logs will NOT be read/written from your real user profile dirs (it uses WAVECRATE_CONFIG_HOME)."
+echo "[run_sandbox] CONTRACT: app config/logs will NOT be read/written from your real user profile dirs (it uses YIELD_CONFIG_HOME)."
 if (( WRITE_DB == 1 )); then
   echo "[run_sandbox] Source DB mode: write-enabled (explicit override)."
 else
@@ -159,7 +159,7 @@ else
 fi
 
 echo "[run_sandbox] Can still write:"
-echo "[run_sandbox]   - sandbox dir: $WAVECRATE_CONFIG_HOME"
+echo "[run_sandbox]   - sandbox dir: $YIELD_CONFIG_HOME"
 echo "[run_sandbox]   - cargo build artifacts: $ROOT_DIR/target (and your rustup/cargo caches)"
 if (( TEMP == 1 )); then
   echo "[run_sandbox] Ephemeral mode: sandbox dir will be deleted on exit."

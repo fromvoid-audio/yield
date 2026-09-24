@@ -39,7 +39,7 @@ cp "$ROOT_DIR/scripts/internal/agent/run_agent_hook_checks.sh" "$REPO_DIR/script
 cat > "$REPO_DIR/scripts/internal/check/check_main_branch.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-"${WAVECRATE_AGENT_HOOK_CHECK_COMMAND:?missing fake hook check}"
+"${YIELD_AGENT_HOOK_CHECK_COMMAND:?missing fake hook check}"
 EOF
 chmod +x "$REPO_DIR/scripts/internal/agent/"*.sh "$REPO_DIR/scripts/internal/check/check_main_branch.sh"
 
@@ -48,10 +48,10 @@ git -C "$REPO_DIR" config user.email agent-test@example.invalid
 git -C "$REPO_DIR" config user.name agent-test
 touch "$REPO_DIR/README.md"
 git -C "$REPO_DIR" add README.md
-WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK=1 git -C "$REPO_DIR" commit -m fixture >/dev/null
+YIELD_SKIP_AGENT_PREFLIGHT_HOOK=1 git -C "$REPO_DIR" commit -m fixture >/dev/null
 git init --bare "$REMOTE_DIR" >/dev/null
 git -C "$REPO_DIR" remote add origin "$REMOTE_DIR"
-WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK=1 git -C "$REPO_DIR" push -u origin main >/dev/null
+YIELD_SKIP_AGENT_PREFLIGHT_HOOK=1 git -C "$REPO_DIR" push -u origin main >/dev/null
 
 cat > "$REPO_DIR/.git/hooks/post-merge" <<'EOF'
 #!/usr/bin/env bash
@@ -72,10 +72,10 @@ cat > "$FAKE_FULL_CHECK" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 echo full >> "$FULL_COUNT"
-if [[ -n "\${WAVECRATE_AGENT_TEST_READY_FILE:-}" ]]; then
-  : > "\$WAVECRATE_AGENT_TEST_READY_FILE"
+if [[ -n "\${YIELD_AGENT_TEST_READY_FILE:-}" ]]; then
+  : > "\$YIELD_AGENT_TEST_READY_FILE"
 fi
-sleep "\${WAVECRATE_AGENT_TEST_SLEEP_SECONDS:-0}"
+sleep "\${YIELD_AGENT_TEST_SLEEP_SECONDS:-0}"
 EOF
 chmod +x "$FAKE_HOOK_CHECK" "$FAKE_FULL_CHECK"
 
@@ -91,26 +91,26 @@ if [[ -e "$REPO_DIR/.git/hooks/post-merge" ]]; then
 fi
 # Automatic and explicit checkouts each run only the cheap hook state check.
 # Neither may launch the full preflight command.
-(cd "$REPO_DIR" && WAVECRATE_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" \
-  WAVECRATE_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+(cd "$REPO_DIR" && YIELD_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" \
+  YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
   .git/hooks/post-checkout before after 1)
-(cd "$REPO_DIR" && WAVECRATE_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" \
-  WAVECRATE_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+(cd "$REPO_DIR" && YIELD_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" \
+  YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
   .git/hooks/post-checkout after after 1)
 expect_file_count "$HOOK_COUNT" 2
 expect_file_count "$FULL_COUNT" 0
 
 # Pre-commit and pre-push retain their branch-policy ownership.
-(cd "$REPO_DIR" && WAVECRATE_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" .git/hooks/pre-commit)
-(cd "$REPO_DIR" && WAVECRATE_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" .git/hooks/pre-push)
+(cd "$REPO_DIR" && YIELD_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" .git/hooks/pre-commit)
+(cd "$REPO_DIR" && YIELD_AGENT_HOOK_CHECK_COMMAND="$FAKE_HOOK_CHECK" .git/hooks/pre-push)
 expect_file_count "$HOOK_COUNT" 4
 
 # Two concurrent explicit full-preflight requests coalesce to one owner.
 STATE_DIR="$FIXTURE_DIR/preflight-state"
-WAVECRATE_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
-  WAVECRATE_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
-  WAVECRATE_AGENT_TEST_SLEEP_SECONDS=1 \
-  WAVECRATE_AGENT_PREFLIGHT_TEST_PAUSE_AFTER_LOCK_ACQUIRE_SECONDS=1 \
+YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
+  YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+  YIELD_AGENT_TEST_SLEEP_SECONDS=1 \
+  YIELD_AGENT_PREFLIGHT_TEST_PAUSE_AFTER_LOCK_ACQUIRE_SECONDS=1 \
   "$REPO_DIR/scripts/internal/agent/run_agent_preflight.sh" >"$FIXTURE_DIR/owner.log" 2>&1 &
 owner_pid=$!
 for (( attempt = 0; attempt < 50; attempt++ )); do
@@ -122,8 +122,8 @@ done
 if [[ ! -f "$STATE_DIR/run.lock" ]]; then
   fail "single-flight owner did not publish its lock"
 fi
-WAVECRATE_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
-  WAVECRATE_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
+  YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
   "$REPO_DIR/scripts/internal/agent/run_agent_preflight.sh" >"$FIXTURE_DIR/joiner.log" 2>&1 &
 joiner_pid=$!
 wait "$owner_pid" || fail "single-flight owner failed"
@@ -135,8 +135,8 @@ fi
 
 # A dead owner lock cannot suppress the next explicit full preflight.
 printf '999999\t%s\n' "$STATE_DIR/stale-result" > "$STATE_DIR/run.lock"
-WAVECRATE_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
-  WAVECRATE_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
+YIELD_AGENT_PREFLIGHT_STATE_DIR="$STATE_DIR" \
+  YIELD_AGENT_CI_CHECKS_COMMAND="$FAKE_FULL_CHECK" \
   "$REPO_DIR/scripts/internal/agent/run_agent_preflight.sh" >/dev/null
 expect_file_count "$FULL_COUNT" 2
 if [[ -e "$STATE_DIR/run.lock" ]]; then

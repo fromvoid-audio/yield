@@ -123,7 +123,7 @@ def classify_missing_reason(lines: list[str]) -> str:
         return "startup_profile_missing_after_runtime_start"
     if "The system cannot find the file specified" in text:
         return "launch_path_error"
-    if "Running `target/debug/wavecrate`" not in text:
+    if "Running `target/debug/yield`" not in text:
         return "build_or_launch_timeout"
     if "runtime returned error" in text:
         return "runtime_error_before_first_present"

@@ -48,7 +48,7 @@ function Invoke-NativeStep {
 
 Push-Location $rootDir
 try {
-  Enable-WavecrateCargoCache
+  Enable-YieldCargoCache
   Write-Host "[ci_quick] branch policy"
   Invoke-NativeStep -Label "branch policy" -Command {
     & (Join-Path $rootDir "scripts/check.ps1") main-branch
@@ -57,20 +57,20 @@ try {
   if ($Workspace) {
     Write-Host "[ci_quick] validate quick profile against workspace binary inventory"
     Invoke-NativeStep -Label "validate quick profile against workspace binary inventory" -Command {
-      Invoke-WavecrateCargo nextest list --workspace --profile quick --all-targets --list-type binaries-only | Out-Null
+      Invoke-YieldCargo nextest list --workspace --profile quick --all-targets --list-type binaries-only | Out-Null
     }
     Write-Host "[ci_quick] cargo nextest run --workspace --profile quick --all-targets"
     Invoke-NativeStep -Label "cargo nextest run --workspace --profile quick --all-targets" -Command {
-      Invoke-WavecrateCargo nextest run --workspace --profile quick --all-targets
+      Invoke-YieldCargo nextest run --workspace --profile quick --all-targets
     }
   } else {
-    Write-Host "[ci_quick] validate quick profile against Wavecrate binary inventory"
-    Invoke-NativeStep -Label "validate quick profile against Wavecrate binary inventory" -Command {
-      Invoke-WavecrateCargo nextest list --package wavecrate --profile quick --lib --tests --list-type binaries-only | Out-Null
+    Write-Host "[ci_quick] validate quick profile against Yield binary inventory"
+    Invoke-NativeStep -Label "validate quick profile against Yield binary inventory" -Command {
+      Invoke-YieldCargo nextest list --package yield --profile quick --lib --tests --list-type binaries-only | Out-Null
     }
-    Write-Host "[ci_quick] cargo nextest run --package wavecrate --profile quick --lib --tests"
-    Invoke-NativeStep -Label "cargo nextest run --package wavecrate --profile quick --lib --tests" -Command {
-      Invoke-WavecrateCargo nextest run --package wavecrate --profile quick --lib --tests
+    Write-Host "[ci_quick] cargo nextest run --package yield --profile quick --lib --tests"
+    Invoke-NativeStep -Label "cargo nextest run --package yield --profile quick --lib --tests" -Command {
+      Invoke-YieldCargo nextest run --package yield --profile quick --lib --tests
     }
   }
 

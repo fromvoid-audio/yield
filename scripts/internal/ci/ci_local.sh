@@ -13,10 +13,10 @@ cd "$ROOT_DIR"
 # shellcheck source=scripts/internal/setup_headless_audio.sh
 source "$ROOT_DIR/scripts/internal/setup_headless_audio.sh"
 # Tooling-only Linux fallback for headless agent/CI hosts; not product support.
-wavecrate_setup_headless_audio "ci_local"
+yield_setup_headless_audio "ci_local"
 # shellcheck source=scripts/internal/use_cargo_cache.sh
 source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-wavecrate_enable_cargo_cache
+yield_enable_cargo_cache
 
 SKIP_AGENT_PREFLIGHT=0
 
@@ -56,8 +56,8 @@ fi
 echo "[ci_local] cargo clippy --workspace --all-targets"
 cargo clippy --workspace --all-targets
 
-echo "[ci_local] cargo doc -p wavecrate --no-deps (RUSTDOCFLAGS=-D warnings)"
-RUSTDOCFLAGS="-D warnings" cargo doc -p wavecrate --no-deps
+echo "[ci_local] cargo doc -p yield --no-deps (RUSTDOCFLAGS=-D warnings)"
+RUSTDOCFLAGS="-D warnings" cargo doc -p yield --no-deps
 
 echo "[ci_local] cargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast"
 cargo nextest run --workspace --profile ci-required --all-targets --no-fail-fast

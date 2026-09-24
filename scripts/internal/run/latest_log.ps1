@@ -11,19 +11,19 @@ $ErrorActionPreference = "Stop"
 Prints the resolved log directory, the newest log file, and a tail snippet.
 
 .DESCRIPTION
-Resolution order for the `.wavecrate` root:
-1) `WAVECRATE_CONFIG_HOME` (config base override, if set)
+Resolution order for the `.yield` root:
+1) `YIELD_CONFIG_HOME` (config base override, if set)
 2) `-Sandbox` (uses the repo-local sandbox config base)
 3) OS default config base (`%APPDATA%` on Windows, app-support on macOS, XDG on Linux)
-4) `WAVECRATE_CONFIG_PROFILE` (`live`, `sandbox`, `automated-tests`, or another named profile)
-5) `app_data_dir` in `<app_root>/config.toml` (absolute path expected; overrides `.wavecrate` root)
+4) `YIELD_CONFIG_PROFILE` (`live`, `sandbox`, `automated-tests`, or another named profile)
+5) `app_data_dir` in `<app_root>/config.toml` (absolute path expected; overrides `.yield` root)
 
 This is best-effort and intended for quick diagnostics (humans + agents).
 #>
 
 function Get-SandboxConfigBase {
   $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
-  return (Join-Path $rootDir ".sandbox\\wavecrate")
+  return (Join-Path $rootDir ".sandbox\\yield")
 }
 
 function Test-IsWindowsPlatform {
@@ -43,8 +43,8 @@ function Test-IsMacOSPlatform {
 }
 
 function Get-DefaultConfigBase {
-  if (-not [string]::IsNullOrWhiteSpace($env:WAVECRATE_CONFIG_HOME)) {
-    return $env:WAVECRATE_CONFIG_HOME
+  if (-not [string]::IsNullOrWhiteSpace($env:YIELD_CONFIG_HOME)) {
+    return $env:YIELD_CONFIG_HOME
   }
   if ($script:Sandbox) {
     return (Get-SandboxConfigBase)
@@ -65,8 +65,8 @@ function Get-DefaultConfigBase {
 }
 
 function Get-PersistenceProfile {
-  if (-not [string]::IsNullOrWhiteSpace($env:WAVECRATE_CONFIG_PROFILE)) {
-    return $env:WAVECRATE_CONFIG_PROFILE.Trim()
+  if (-not [string]::IsNullOrWhiteSpace($env:YIELD_CONFIG_PROFILE)) {
+    return $env:YIELD_CONFIG_PROFILE.Trim()
   }
   if ($script:Sandbox) {
     return "sandbox"
@@ -138,9 +138,9 @@ function Get-AppDataDirOverrideFromConfig {
 function Resolve-AppRoot {
   $profile = Get-PersistenceProfile
   $defaultRoot = if ($profile -ieq "live") {
-    Join-Path $configBase ".wavecrate"
+    Join-Path $configBase ".yield"
   } else {
-    Join-Path $configBase (".wavecrate\\profiles\\" + $profile)
+    Join-Path $configBase (".yield\\profiles\\" + $profile)
   }
   $configPath = Join-Path $defaultRoot "config.toml"
 

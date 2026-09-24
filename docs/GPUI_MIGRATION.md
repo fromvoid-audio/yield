@@ -1,16 +1,21 @@
 # GPUI fork and feature parity
 
-This fork targets full current Wavecrate feature parity with GPUI replacing
+The active GPUI repository is `PORTALSURFER/yield`, with the launcher in
+`crates/yield` and supporting `yield-*` crates. This document includes dated
+implementation evidence; paths and links have been updated to the current
+repository names where possible.
+
+This fork targets full current Yield feature parity with GPUI replacing
 Radiant. A working GPUI window or browser is an intermediate milestone, not
 completion of the reimplementation.
 
 ## Baseline
 
-- Upstream: https://github.com/PORTALSURFER/wavecrate.git
+- Archived reference repository: https://github.com/PORTALSURFER/yield-legacy
 - Fork point: `ed024e40e7cee8b4405791b721a068c45183e6de`
-- Local repository: `/Users/portalsurfer/dev/wavecrate-gpui`
+- Local repository: `/Users/portalsurfer/dev/yield`
 - Development branch: `codex/gpui-reimplementation`
-- Private fork repository: https://github.com/PORTALSURFER/wavecrate-gpui
+- Active repository: https://github.com/PORTALSURFER/yield
 - The original checkout and application data remain independent of this fork.
 
 Inherited GitHub release workflows are retained with `.disabled` extensions so
@@ -27,7 +32,7 @@ not become implemented merely because they appear in the target document.
 
 ## Architecture
 
-The root workspace composes `crates/wavecrate-gpui` from the core, media, and UI
+The root workspace composes `crates/yield` from the core, media, and UI
 crates described in `GPUI_ARCHITECTURE.md`. Its dependency tree must not include
 the archived Radiant application or Radiant. Keep the existing library,
 analysis, scan, and Reson audio crates as shared engines. Extract application
@@ -46,7 +51,7 @@ completion cannot replace a newer selection or source. Retain the original
 shutdown and ownership ordering when extracting persistent services.
 
 Development builds must use an independent profile before enabling persistence.
-They must not open the live Wavecrate database or recovery journal by default.
+They must not open the live Yield database or recovery journal by default.
 File mutation features require the existing capability, journal, and undo
 boundaries; a path-based shortcut is not an equivalent implementation.
 
@@ -87,7 +92,7 @@ No profile/database is opened and no source mutations are performed.
 Passed on macOS: `cargo check --locked`, `cargo build --locked`,
 `cargo test --locked` (seven tests), and formatting, using the GPUI manifest.
 The resolved application dependency tree contains neither Radiant nor the root
-Wavecrate package. Focused review found transport completion/initialization races
+Yield package. Focused review found transport completion/initialization races
 and preview allocation risks; the implementation adds request/intent fencing,
 progress polling, background initialization, and WAV-only bounded decoding.
 
@@ -130,8 +135,8 @@ slice does not complete full feature parity.
 
 ### Theme foundation and reference appearance, 2026-09-07
 
-`wavecrate-design` owns the versioned, renderer-independent theme contract.
-The default follows Wavecrate's charcoal/coral palette and embedded Ioskeley
+`yield-design` owns the versioned, renderer-independent theme contract.
+The default follows Yield's charcoal/coral palette and embedded Ioskeley
 Mono font. The GPUI shell uses a compact toolbar, leading source sidebar,
 waveform above the sample table, and bottom status bar. Theme loading, reloading,
 and reset are available from the toolbar settings control.
@@ -318,7 +323,7 @@ broader workspace suite has not been rerun after this targeted fixture repair.
 That failure report is historical: at baseline commit `288430e10`,
 `cargo test --locked --workspace` was rerun after the fixture repair and passed
 all workspace binaries and doc tests, with two tests ignored. The output is
-retained at `/tmp/wavecrate-gpui-workspace-tests.log`.
+retained at `/tmp/yield-gpui-workspace-tests.log`.
 Non-WAV preview and zoom/edit gestures remain outstanding.
 
 ### Waveform seek and loop audition, 2026-09-07
@@ -396,7 +401,7 @@ generation plus source, focus, selection, and visible-projection context fence
 late completions, and browser drop cancels the handoff task.
 
 Validation: 7 focused handoff tests and the full UI library suite passed (41
-passed, one manual waveform benchmark ignored). `cargo check -p wavecrate-ui`,
+passed, one manual waveform benchmark ignored). `cargo check -p yield-ui`,
 `cargo fmt --all -- --check`, and `git diff --check` passed. The signed macOS
 app copied two selected WAV files into Finder; both pasted copies matched their
 sources byte for byte. Reveal selected the focused file despite batch membership,
@@ -411,7 +416,7 @@ paste acceptance remain unverified.
 
 ### Isolated source registry and application shutdown, 2026-09-07
 
-`wavecrate-session` now owns the ordered registry of accepted canonical source
+`yield-session` now owns the ordered registry of accepted canonical source
 roots in the isolated `gpui-development` profile. The browser submits `AddRoot`
 only after a scan succeeds and consumes immutable snapshots through the
 app-owned `SourceRegistryGlobal`; restored roots receive durable IDs and empty
@@ -431,8 +436,8 @@ and scan projections remain session-only. The application Quit menu item and
 Cmd/Ctrl-Q action use the same graceful boundary, so normal exit exercises the
 service shutdown observer.
 
-Validation: `cargo test -p wavecrate-ui --lib` passed 45 tests with one manual
-waveform benchmark ignored, and `cargo check -p wavecrate-ui` passed after the
+Validation: `cargo test -p yield-ui --lib` passed 45 tests with one manual
+waveform benchmark ignored, and `cargo check -p yield-ui` passed after the
 integration. The focused tests cover restored-ID matching, in-flight scan
 preservation, stable-root failure mapping after source reorder, and the
 selection session projection. `cargo fmt --all -- --check` and `git diff --check`
@@ -469,9 +474,9 @@ registry lane; a shared owner failure remains terminal. Passive preference
 snapshots update controls and theme projection without replaying transport
 actions or retargeting current playback.
 
-Validation: `cargo check -p wavecrate-ui` passed; the focused preference state
-run passed 4 tests; and `cargo test -p wavecrate-ui` passed 53 tests with one
-manual waveform benchmark ignored. `cargo fmt -p wavecrate-ui` completed
+Validation: `cargo check -p yield-ui` passed; the focused preference state
+run passed 4 tests; and `cargo test -p yield-ui` passed 53 tests with one
+manual waveform benchmark ignored. `cargo fmt -p yield-ui` completed
 successfully and `git diff --check` passed. The locked full-workspace suite and
 signed macOS build passed. Live disposable-profile checks confirmed custom
 theme, motion, autoplay, and loop restoration after restart with the source
@@ -500,9 +505,9 @@ Runtime queue failures retain the latest intent, show an explicit status, and
 retry only within a bounded budget on a fresh runtime or later user change; a
 rejected preference submission leaves the prior volume and audio state intact.
 
-Validation: `cargo check -p wavecrate-ui` passed; `cargo test -p wavecrate-ui`
+Validation: `cargo check -p yield-ui` passed; `cargo test -p yield-ui`
 passed 58 tests with one manual waveform benchmark ignored; `cargo fmt -p
-wavecrate-ui` completed successfully; and `git diff --check` passed. The
+yield-ui` completed successfully; and `git diff --check` passed. The
 focused volume tests cover non-finite and endpoint clamping, pointer
 quantization, reference keyboard steps, fine keyboard steps, and bounded
 quantization. Session tests passed 30 cases, including immediate shutdown and
@@ -571,7 +576,7 @@ quit cleanly. Audible quality and Windows input acceptance remain unverified.
 
 ### Profile-owned catalog foundation, 2026-09-08
 
-Added the GPUI-free `wavecrate-catalog` worker with bounded commands and completion
+Added the GPUI-free `yield-catalog` worker with bounded commands and completion
 events. It clones an existing writable profile capability, retains exclusive
 leases on profile-child catalog databases, and never opens a source-local
 database. Snapshots require matching source/lifecycle/root identity and an exact
@@ -1104,7 +1109,7 @@ The sortable column and automatic transport policy follow separately.
 ### Sortable Type column and responsive metadata widths
 
 Type now appears between Rating and Col, displaying Loop, 1-Shot, or a dash.
-Its explicit ascending rank matches Wavecrate: Loop, OneShot, then unknown;
+Its explicit ascending rank matches Yield: Loop, OneShot, then unknown;
 descending reverses that order with the existing deterministic name/path ties.
 
 The optional theme width defaults to the reference 76 pixels and accepts bounded
@@ -1246,13 +1251,13 @@ compilation and formatting passed. Native audible/interaction acceptance remains
 pending; running instances and existing application bundles were preserved.
 
 A clean-tree executable build of 9c5542b1c passed. The separate macOS bundle
-`target/qa/Wavecrate Parity Preview 9c5542b.app` passed strict ad-hoc signature
+`target/qa/Yield Parity Preview 9c5542b.app` passed strict ad-hoc signature
 verification. It was not launched for native acceptance; existing bundles and
 application instances were preserved.
 
 ### Bounded native tag input
 
-The core crate now parses tag submissions using Wavecrate's native ASCII
+The core crate now parses tag submissions using Yield's native ASCII
 normalization and newline/comma/semicolon separators. It preserves first-seen
 order while deduplicating normalized labels. Input is bounded to 64 KiB,
 individual normalized labels to 1024 bytes, and submissions to 64 distinct tags;
@@ -1435,7 +1440,7 @@ existing theme focus tokens; filename search retains its boxed appearance. UI
 compilation, formatting and diff checks passed for this appearance adjustment.
 
 A clean `0a111c48f` build was packaged and signature-verified at
-`target/qa/Wavecrate Tag Preview 0a111c4.app`, then opened against a fresh three-file
+`target/qa/Yield Tag Preview 0a111c4.app`, then opened against a fresh three-file
 fixture and isolated profile. The native input check was interrupted by detected
 concurrent user interaction, so it is not counted as passed. The running preview
 and its profile were preserved for manual testing.
@@ -1463,7 +1468,7 @@ issues. Native chip interaction remains unverified; existing running previews we
 preserved. Completion and assigned-tag filtering remain in progress.
 
 A clean detached checkout of `2e4b38c19` produced
-`target/qa/Wavecrate Chip Preview 2e4b38c.app`. Compilation and strict ad-hoc signature
+`target/qa/Yield Chip Preview 2e4b38c.app`. Compilation and strict ad-hoc signature
 verification passed. This separate bundle was not launched by the agent; existing
 preview sessions remain untouched.
 
@@ -1528,12 +1533,12 @@ bounded a shutdown wait. The explicit SQL-path-outside-manifest guard was review
 but does not yet have a catalog injection test.
 
 A clean detached checkout of `8e3796cca` passed
-`cargo check --locked -p wavecrate-gpui`, independently of the in-progress sidebar
+`cargo check --locked -p yield`, independently of the in-progress sidebar
 changes in the main worktree. Its checkout remained clean after verification.
 
 ### Bounded source-watcher adapter
 
-`wavecrate-source-watcher` now owns native recursive root and nonrecursive parent
+`yield-source-watcher` now owns native recursive root and nonrecursive parent
 watch handles. Callbacks perform lexical event classification and coalesce one
 lifecycle-fenced hint, with separate descendant, root-ambiguity, overflow, and
 backend-error evidence. They retain no event path queue and perform no database,
@@ -1574,7 +1579,7 @@ formatting and diff whitespace checks passed. Native visual/input acceptance of
 this slice remains separate from these automated checks.
 
 The filter acceptance checkout was advanced to clean commit `092c97c74` and the
-GPUI executable rebuilt there. `Wavecrate Filter Preview 092c97c.app` was packaged
+GPUI executable rebuilt there. `Yield Filter Preview 092c97c.app` was packaged
 under `target/qa` and passed strict ad-hoc signature verification. It was not
 launched or used for native acceptance by the agent; existing previews remain
 untouched.
@@ -1608,7 +1613,7 @@ without explicit refresh commands after the initial audit. Its backend sources
 were byte-compared with the committed candidate. This validates native event to
 catalog convergence; visual/audible app acceptance remains separate.
 
-`Wavecrate Watcher Preview f334852.app` was built from the clean watcher acceptance
+`Yield Watcher Preview f334852.app` was built from the clean watcher acceptance
 checkout at `f33485214`, packaged under `target/qa`, and passed strict ad-hoc
 signature verification. The agent did not launch it or modify existing previews.
 
@@ -1637,7 +1642,7 @@ deduplication and identical replay after restoring a composite checkpoint.
 Formatting, UI check and diff checks passed. Native visual/input acceptance is
 still separate from automated verification.
 
-`Wavecrate Completion Preview bc501c1.app` was built from clean commit `bc501c166`
+`Yield Completion Preview bc501c1.app` was built from clean commit `bc501c166`
 in its isolated acceptance checkout and passed strict ad-hoc signature checks.
 The agent did not launch it or alter existing previews.
 
@@ -1716,7 +1721,7 @@ A deterministic SQL-progress test cancels before the grouped read emits its firs
 row, then successfully reuses the same database connection. The backend is ready
 for the native Tag Editor library panel; that panel remains follow-on UI work.
 
-`Wavecrate Recovery Preview ba50dab.app` was built from the clean detached
+`Yield Recovery Preview ba50dab.app` was built from the clean detached
 `ba50dabf1` acceptance checkout and passed strict ad-hoc signature verification.
 The agent did not launch it; existing previews remain preserved.
 
@@ -1744,7 +1749,7 @@ Metadata requests use the existing source-registry poll lane, preserve in-flight
 
 Validation so far: an isolated snapshot passed the full UI suite (217 tests, one existing ignored test). After the final drag-lifecycle change, all six focused panel tests passed with normal lint settings. Independent review found a continuation-page recovery deadlock when the profile vocabulary changed revision. The panel now clears its old target and restarts through the normal refresh path; a production-helper regression covers that transition. Review found no additional evidence-backed issues. Native preview acceptance is pending.
 
-The combined UI suite subsequently passed 231 tests with one existing ignored test, including the profile-revision restart regression and normalized-audition work in progress. The panel slice was committed separately as `5c9282f86`. A clean detached snapshot built `target/qa/Wavecrate Tag Library Preview 5c9282f.app` in 14.19 seconds; strict ad-hoc signature verification passed. The agent did not launch this preview or modify existing preview apps. Native interaction acceptance remains pending.
+The combined UI suite subsequently passed 231 tests with one existing ignored test, including the profile-revision restart regression and normalized-audition work in progress. The panel slice was committed separately as `5c9282f86`. A clean detached snapshot built `target/qa/Yield Tag Library Preview 5c9282f.app` in 14.19 seconds; strict ad-hoc signature verification passed. The agent did not launch this preview or modify existing preview apps. Native interaction acceptance remains pending.
 
 ### Normalized audition integration
 
@@ -1754,7 +1759,7 @@ Live gain updates use playback-ID-scoped commands and bounded retries on the exi
 
 Validation: the full UI suite passed 231 tests with one existing ignored test before the last loop-disable correction. After that correction and compact icon rendering, all 13 normalized-audition tests, both focused transport regressions, the UI check, formatting, and diff checks passed. Independent review found no additional actionable lifecycle or persistence issue. Native audible acceptance remains pending. The peak reader fences its file revision, but the later runtime WAV path open is not atomically bound to that captured file object; this source-open race remains a known limitation.
 
-A clean detached `35a451c63` snapshot built `target/qa/Wavecrate Normalized Preview 35a451c.app` in 17.26 seconds. Strict ad-hoc signature verification passed. This preview includes the accepted tag panel and normalized-audition integration; it was not launched by the agent, and existing previews were preserved.
+A clean detached `35a451c63` snapshot built `target/qa/Yield Normalized Preview 35a451c.app` in 17.26 seconds. Strict ad-hoc signature verification passed. This preview includes the accepted tag panel and normalized-audition integration; it was not launched by the agent, and existing previews were preserved.
 
 ### Display-name projection foundation
 
@@ -1780,7 +1785,7 @@ Dictionary requests survive panel/source/page changes. Category writes also reta
 
 Validation: two dictionary-state tests, nine tag-panel tests, the completion refresh regression, UI test compilation, formatting and diff checks passed. Request retention across panel resets was code-reviewed; no new end-to-end GPUI lifecycle fixture was added. Backend session tests cover stale revision rejection. Native interaction acceptance remains pending, and this scoped undo does not implement global assignment deletion or application-wide undo.
 
-A clean detached `cd1830f82` snapshot built `target/qa/Wavecrate Dictionary Preview cd1830f.app` in 19.74 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
+A clean detached `cd1830f82` snapshot built `target/qa/Yield Dictionary Preview cd1830f.app` in 19.74 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
 
 ### Catalog display-label delivery
 
@@ -1800,11 +1805,11 @@ Validation: all 12 display-label UI tests, 36 curation-focused UI tests, the UI 
 
 Independent review found playback-history cache flicker and unrelated-source curation blocking. Both were corrected with exact non-tag receipt rebasing and lifecycle-scoped pending checks. Focused re-review approved the fixes with no introduced lifecycle or request-gating issue.
 
-A clean detached `ac4344fc7` snapshot built `target/qa/Wavecrate Label Preview ac4344f.app` in 15.01 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
+A clean detached `ac4344fc7` snapshot built `target/qa/Yield Label Preview ac4344f.app` in 15.01 seconds. Strict ad-hoc signature verification passed. The agent did not launch this preview or replace existing preview apps.
 
 ### Native file-drag platform foundation
 
-`wavecrate-platform` now provides bounded AppKit copy-drag admission for up to 256 prepared absolute UTF-8 paths and 1 MiB of path data. It borrows the actual window handle, checks the originating mouse event and current primary-button state, and retains native view/source/items/URLs/session objects until completion. Rejected resources are released outside the session-state borrow; completion notifications are nonblocking. File URLs explicitly represent files, and generic drag images require no source-file probing.
+`yield-platform` now provides bounded AppKit copy-drag admission for up to 256 prepared absolute UTF-8 paths and 1 MiB of path data. It borrows the actual window handle, checks the originating mouse event and current primary-button state, and retains native view/source/items/URLs/session objects until completion. Rejected resources are released outside the session-state borrow; completion notifications are nonblocking. File URLs explicitly represent files, and generic drag images require no source-file probing.
 
 Validation: nine platform tests, strict all-target Clippy, macOS checking and checking against the already installed `x86_64-unknown-linux-gnu` target passed. Independent review identified the stale-event/late-start issue; the current-button guard fixed it. Browser integration and native OS drag acceptance are still pending, and other platforms currently return a typed unsupported error.
 
@@ -1822,7 +1827,7 @@ Capture-phase presses, pointer release, Escape, and source/selection/projection 
 
 Validation: the broader UI suite passed 262 tests with one existing ignored test before the final review corrections. After correcting retry allocations and replacement-link acceptance, all 13 focused drag tests, the UI check, formatting and diff checks passed. Independent re-review confirmed both findings resolved with no new issue. Native macOS drag acceptance remains pending.
 
-A clean detached `ed4f6fcc0` snapshot built `target/qa/Wavecrate Drag Preview ed4f6fc.app` in 43.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
+A clean detached `ed4f6fcc0` snapshot built `target/qa/Yield Drag Preview ed4f6fc.app` in 43.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
 
 ### Source and folder directory opening
 
@@ -1852,7 +1857,7 @@ The toolbar now exposes the transient native-default BPM snap toggle and a 2–3
 
 Validation: the integrated UI suite passed 285 tests with one existing ignored test; focused waveform and numeric-input tests, the UI check, formatting and diff checks passed. Primary acceptance corrected an unbounded numeric-filter input scan and duplicate focus ownership before integration. Native visual and interaction acceptance remains pending.
 
-A clean detached `e5fb7b212` snapshot built `target/qa/Wavecrate BPM Preview e5fb7b2.app` in 19.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
+A clean detached `e5fb7b212` snapshot built `target/qa/Yield BPM Preview e5fb7b2.app` in 19.63 seconds. Strict ad-hoc signature verification passed. The agent did not launch it or replace existing previews.
 
 ### Selection beat guides
 
@@ -1942,7 +1947,7 @@ Right-button movement uses root mouse events because GPUI's built-in drag helper
 
 Validation: the full UI suite passed 304 tests with one existing ignored test; targeted waveform/snap tests, UI checking, combined application/test compilation, formatting and diff checks passed. Actual GPUI pointer tests cover right-button create/release, outside release, click-clear, button loss and canceled late completion while asserting unchanged play range, accepted playback intent and epoch. Test setup starts no audio device, source registry or media worker. Independent review approved implementation and coverage with no remaining findings. GPUI test support is dev-only; its upstream transitive graph adds packages without changing existing package versions. Native secondary-drag acceptance remains manual because the available UI automation cannot hold a right-button drag. Fade/gain controls and destructive application remain separate work.
 
-A clean detached `fbe4ccf41` snapshot built `target/qa/Wavecrate Edit Preview fbe4ccf.app` in 21.07 seconds and passed strict ad-hoc signature verification. Native checks against the isolated two-second sine fixture confirmed primary drag selection, arrow-key sliding, secondary-click isolation, and immediate waveform keyboard focus after toggling zero snap. Audio stayed idle and Last Played remained Never. The preview quit cleanly; `target/qa/zero-snap-native/edit-fbe4ccf.png` records the final state. This check does not claim native right-button drag acceptance.
+A clean detached `fbe4ccf41` snapshot built `target/qa/Yield Edit Preview fbe4ccf.app` in 21.07 seconds and passed strict ad-hoc signature verification. Native checks against the isolated two-second sine fixture confirmed primary drag selection, arrow-key sliding, secondary-click isolation, and immediate waveform keyboard focus after toggling zero snap. Audio stayed idle and Last Played remained Never. The preview quit cleanly; `target/qa/zero-snap-native/edit-fbe4ccf.png` records the final state. This check does not claim native right-button drag acceptance.
 
 The same clean `fbe4ccf41` preview also passed native tag-library and display-label checks in the disposable profile: the `TAGS` control opened the panel; creating `qa-sine` with a Sound Type category assigned it to the selected fixture; dragging it to Character retained the assignment; dictionary removal retained that assignment and exposed Undo; Undo restored the definition and category. Assignment and restored category survived a clean quit/reopen. Label mode showed `qa-sine`, then fell back to `crossings-100hz` after assignment removal. Screenshots are `target/qa/zero-snap-native/tags-fbe4ccf.png` and `labels-fbe4ccf.png`. The QA app quit cleanly and no live profile or audio playback was used.
 
@@ -1958,7 +1963,7 @@ The preview scales raw signal lanes before nonlinear waveform shaping. Static an
 
 The final UI suite passed 313 tests with one existing ignored benchmark; scoped formatting and diff checks passed. Verification covers both-button GPUI pointer routing, release, button-loss cancellation and playback isolation, native handle geometry and gain mapping, zero/boost/narrow previews, cache sharing and invalidation, and zoomed peak fallback. Independent review found no additional gesture/correctness issue and identified cache-hit path copying. Primary inspection of GPUI's owned paint API led to removing avoidable retrieval copies with shared geometry; pointer-identity regressions verify the correction. The review agent could not complete a follow-up due to its usage limit. Destructive file application and fade controls are still separate work.
 
-The Windows run [34296691111](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34296691111) passed at `fbe4ccf41`, including core/media/platform tests, application/browser test compilation, and browser tests. This confirms the directory-handle and closed-fixture-writer corrections on Windows; it predates the gain UI and fade-resize helper.
+The Windows run [34296691111](https://github.com/PORTALSURFER/yield/actions/runs/34296691111) passed at `fbe4ccf41`, including core/media/platform tests, application/browser test compilation, and browser tests. This confirms the directory-handle and closed-fixture-writer corrections on Windows; it predates the gain UI and fade-resize helper.
 
 ### Fade gesture and visual-envelope core
 
@@ -1966,7 +1971,7 @@ Core now exposes all six fade-handle gestures and native visual-envelope evaluat
 
 Visual gain uses the native shader's inner/outer precedence and S-curve, including independent outer gain and no synthetic two-millisecond visual fade. Extreme unrepresentable outer spans do not produce nonfinite output. All 139 core tests passed, including six new gesture tests exercising both directions and all handle kinds and three visual-envelope tests; core checking, formatting and diff checks passed. These are renderer-neutral foundations; GPUI fade controls follow separately.
 
-A clean `5d7cd4bc5` snapshot built `target/qa/Wavecrate Gain Preview 5d7cd4b.app` in 20.64 seconds and passed strict ad-hoc signature verification. This bundle was not launched for native gain-drag acceptance.
+A clean `5d7cd4bc5` snapshot built `target/qa/Yield Gain Preview 5d7cd4b.app` in 20.64 seconds and passed strict ad-hoc signature verification. This bundle was not launched for native gain-drag acceptance.
 
 ### Fade-shaped waveform preview, 2026-09-09
 
@@ -1988,7 +1993,7 @@ Runtime progress now carries the configured metronome beat count together with p
 
 Closing the macOS red window button previously removed the window while leaving the application process, Dock running indicator and menu bar active. This was reproduced with the isolated `61ad8563f` preview; explicit Quit then exited normally. The launcher now retains a GPUI window-closed observer and calls the existing application quit path only when no windows remain, preserving the source-registry and browser worker shutdown observers.
 
-Application checking passed. A clean, signature-verified preview built from `edfba3ee8` was launched with the isolated QA profile and closed through its actual native close button. The process exited with status zero and a subsequent process query found neither the old nor fixed preview running. The fixed preview is `target/qa/Wavecrate Close Preview edfba3e.app`. No live profile or audio session was used.
+Application checking passed. A clean, signature-verified preview built from `edfba3ee8` was launched with the isolated QA profile and closed through its actual native close button. The process exited with status zero and a subsequent process query found neither the old nor fixed preview running. The fixed preview is `target/qa/Yield Close Preview edfba3e.app`. No live profile or audio session was used.
 
 ### Random audition range foundation, 2026-09-09
 
@@ -2006,7 +2011,7 @@ Output resume retains the complete admitted or confirmed configuration on its in
 
 ### Native metronome toolbar and shutdown smoke, 2026-09-09
 
-A clean `95aa470aa` snapshot built `target/qa/Wavecrate Metronome Preview 95aa470.app` in 25.58 seconds and passed strict ad-hoc signature verification. With the isolated QA profile, native toolbar clicks showed metronome enabled and disabled while audio remained idle. Closing the native window then exited with status zero; no Wavecrate preview process remained. This is idle UI/shutdown smoke evidence, not audible click/phase acceptance. Windows run `34322675452` targets the same revision and includes the new explicit Reson test step.
+A clean `95aa470aa` snapshot built `target/qa/Yield Metronome Preview 95aa470.app` in 25.58 seconds and passed strict ad-hoc signature verification. With the isolated QA profile, native toolbar clicks showed metronome enabled and disabled while audio remained idle. Closing the native window then exited with status zero; no Yield preview process remained. This is idle UI/shutdown smoke evidence, not audible click/phase acceptance. Windows run `34322675452` targets the same revision and includes the new explicit Reson test step.
 
 ### Extraction final-claim ownership design review, 2026-09-09
 
@@ -2019,7 +2024,7 @@ The native random toolbar control now plays a random section of the selected sam
 Random selections remain in focus: a covered range retains the view, a fitting off-screen range pans, and a wider range zooms. Competing waveform gestures are canceled while committed edit effects remain intact. Independent review found and verified this viewport correction; no further findings remained. All 351 UI tests passed with one existing benchmark ignored, along with application checking, formatting and diff checks. Tests cover candidates/scope, stale and failed loads, one-time completion, cancellation, viewport focus and actual GPUI Command-over-Shift toolbar routing. Audible random playback acceptance remains manual. The UI directly uses the already locked rand 0.9.5 package; no package versions changed.
 
 
-A clean `6d6a6ae00` snapshot built `target/qa/Wavecrate Random Preview 6d6a6ae.app` in 34.55 seconds and passed strict ad-hoc signature verification. This preview has not been launched for native random-audition acceptance.
+A clean `6d6a6ae00` snapshot built `target/qa/Yield Random Preview 6d6a6ae.app` in 34.55 seconds and passed strict ad-hoc signature verification. This preview has not been launched for native random-audition acceptance.
 
 
 ### Windows shutdown and metronome validation, 2026-09-09
@@ -2039,7 +2044,7 @@ Validation: 354 UI tests, 68 media tests and 21 design tests passed; the UI and 
 Native smoke of clean `6a51d547c` confirmed missing-playmark feedback, a completed scan and primary-click edit selection on the isolated two-second sine fixture. Secondary click changed the selection state but its handles appeared only after another toolbar action invalidated the view. Root right-release handlers now explicitly notify even when no drag was installed (match selection commits on press). Independent review confirmed this is an event-bounded redraw correction, with no extra mutation or idle loop. The first preview closed through its native close button with exit status zero; no preview process remained.
 
 
-The redraw correction passed all three Similar Sections regressions and eight root pointer tests. A clean, strict-signature-verified `161e1b2f0` preview built in 23.81 seconds. Native secondary click immediately displayed the matched edit handles without an unrelated redraw; disabling removed the green marks while retaining the edit selection. Audio remained idle and Last Played stayed Never. The native close button exited with status zero and no Wavecrate preview process remained. Evidence: `target/qa/zero-snap-native/similar-right-161e1b2.png`; bundle: `target/qa/Wavecrate Similar Preview 161e1b2.app`. This verifies idle native interaction and shutdown, not audible transport or external-drive timing.
+The redraw correction passed all three Similar Sections regressions and eight root pointer tests. A clean, strict-signature-verified `161e1b2f0` preview built in 23.81 seconds. Native secondary click immediately displayed the matched edit handles without an unrelated redraw; disabling removed the green marks while retaining the edit selection. Audio remained idle and Last Played stayed Never. The native close button exited with status zero and no Yield preview process remained. Evidence: `target/qa/zero-snap-native/similar-right-161e1b2.png`; bundle: `target/qa/Yield Similar Preview 161e1b2.app`. This verifies idle native interaction and shutdown, not audible transport or external-drive timing.
 
 
 ### Playmark timing foundation, 2026-09-09
@@ -2054,7 +2059,7 @@ The read-only playmark label now displays duration or beat-relative BPM using th
 
 Windows run `34326573383` succeeded at `0427c65f7407e4ab9223e2241c0cacc921d36fac`, adding random-audition coverage to the previously validated shutdown/metronome changes. Run `34331156363` targets `2665c45aea3de1f50230b8c3126a1948097da6a9` for Similar Sections and the read-only playmark label; it does not include the in-progress runtime span work.
 
-The clean `a7f88617d` timing preview built in 22.92 seconds and passed strict ad-hoc signature verification. A native screenshot shows the centered `426 ms` label. The app state changed during interaction and Last Played became Today, so further native actions were paused; this is visual label evidence only, not controlled transport acceptance. Bundle: `target/qa/Wavecrate Timing Preview a7f8861.app`.
+The clean `a7f88617d` timing preview built in 22.92 seconds and passed strict ad-hoc signature verification. A native screenshot shows the centered `426 ms` label. The app state changed during interaction and Last Played became Today, so further native actions were paused; this is visual label evidence only, not controlled transport acceptance. Bundle: `target/qa/Yield Timing Preview a7f8861.app`.
 
 
 ### Live span runtime foundation, 2026-09-09
@@ -2103,7 +2108,7 @@ Draft ownership includes source, path, waveform generation and original selectio
 Validation: all 376 UI tests passed, with one existing benchmark ignored; application checking and diff checks passed. Focused coverage includes duration/BPM commits, no-op edits, stale generation/selection rejection, Escape/IME, invalid blur, geometry and input bounds. A failing blur test was traced to its inactive GPUI test window and fixed by activating that window before drawing; no production focus workaround was needed. Native pointer/keyboard smoke testing and audible acceptance remain pending.
 
 
-The clean `ebabb2dfd` macOS timing-editor preview built in 29.58 seconds and passed strict ad-hoc signature verification. Using the isolated zero-snap QA profile/fixture, native pointer/keyboard smoke testing created a 488 ms selection, opened its compact label input, committed `250ms` with the left boundary preserved, retained invalid `oops` on Enter with an error status, and cancelled back to `250 ms` with Escape. Playback stayed stopped. Closing the window exited with code 0 and no matching process remained. Bundle: `target/qa/Wavecrate Timing Edit Preview ebabb2d.app`.
+The clean `ebabb2dfd` macOS timing-editor preview built in 29.58 seconds and passed strict ad-hoc signature verification. Using the isolated zero-snap QA profile/fixture, native pointer/keyboard smoke testing created a 488 ms selection, opened its compact label input, committed `250ms` with the left boundary preserved, retained invalid `oops` on Enter with an error status, and cancelled back to `250 ms` with Escape. Playback stayed stopped. Closing the window exited with code 0 and no matching process remained. Bundle: `target/qa/Yield Timing Edit Preview ebabb2d.app`.
 
 The background-targeted click-away attempt left the invalid draft without delivering validation; the preview appeared inactive, consistent with GPUI suppressing blur paths for inactive windows. Native foreground blur acceptance is therefore not claimed. The activated GPUI focus regression passes. Audible active-span acceptance remains outstanding.
 
@@ -2120,7 +2125,7 @@ Validation passed: eight core history regressions, seven UI ownership/state regr
 
 The clean `0a854ef9f` GPUI preview built in 25.62 seconds and passed strict ad-hoc signature verification. It opened the isolated QA profile and WAV fixture through Launch Services and quit with exit status zero; no matching application process remained. The stopped screenshot did not establish native played-rail rendering or audible acceptance, so those checks remain open. The preview again appeared inactive to the background automation interface; no native foreground blur acceptance is claimed.
 
-Windows run [34345404423](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34345404423) passed at `f699e72d60bb6eab4115a295a19ef9f23d1b1ead`: audio/core/media/platform tests, GPUI application/browser compilation and browser interaction tests all succeeded. This verifies the timing-editor checkpoint; the later played-range rail and edited-WAV encoder are not covered by that run.
+Windows run [34345404423](https://github.com/PORTALSURFER/yield/actions/runs/34345404423) passed at `f699e72d60bb6eab4115a295a19ef9f23d1b1ead`: audio/core/media/platform tests, GPUI application/browser compilation and browser interaction tests all succeeded. This verifies the timing-editor checkpoint; the later played-range rail and edited-WAV encoder are not covered by that run.
 
 ### Edited WAV encoding prerequisite
 
@@ -2128,7 +2133,7 @@ Media now exposes a caller-owned-buffer encoder matching the active native edit 
 
 Validation: six focused encoder tests passed, covering exact stereo float bits/header format, the existing gain/outer-fade transform round trip, invalid layouts and size overflow, occupied sinks, cancellation and write/seek/finalization failures. Application checking, formatting and diff checks passed. The initial round-trip fixture used the inner-fade parameter for an outer extension; the fixture was corrected to use the documented outward-extension parameter, with no production transform change. Durable edit/export integration remains separate and blocked by the qualified publication/ownership requirements described above.
 
-Windows run [34350335713](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34350335713) passed at `8da81b1016268f35a575c9b6074c99fe9d4e306a`, covering the played-range rail and edited-WAV encoder. It predates the preparation API below.
+Windows run [34350335713](https://github.com/PORTALSURFER/yield/actions/runs/34350335713) passed at `8da81b1016268f35a575c9b6074c99fe9d4e306a`, covering the played-range rail and edited-WAV encoder. It predates the preparation API below.
 
 ### Revision-fenced gain/fade edit preparation
 
@@ -2180,7 +2185,7 @@ Validation: all 21 journal-recovery tests passed, including two new production-p
 
 Extracted the native journal's renderer-neutral capacity plan types, allocation
 rounding/aggregation and descriptor-derived volume facts into
-`wavecrate-library::durable_capacity`. Serialized fields, legacy defaults and
+`yield-library::durable_capacity`. Serialized fields, legacy defaults and
 protected-space accounting are preserved. The archived native shape adapter is
 unchanged; active journal admission/completion wiring is still pending. Capacity
 plans are observations and logical claims, not physical reservations or permission
@@ -2214,14 +2219,14 @@ auxiliary settings action; validation is recorded separately below.
 
 | Reference control | GPUI implementation / boundary |
 | --- | --- |
-| Audio backend, output, sample rate and errors | [Audio output panel](../crates/wavecrate-ui/src/browser/audio_output.rs) enumerates, applies and persists all three through `SetAudioOutput`. |
-| Volume and normalized audition | [Toolbar](../crates/wavecrate-ui/src/browser/view.rs) and [ordered preferences](../crates/wavecrate-session/src/preferences.rs); audible acceptance remains OPT-1492. |
-| Global hover-help toggle | [Persisted Help tips On/Off](../crates/wavecrate-ui/src/browser/preferences.rs); [shortcut help](../crates/wavecrate-ui/src/browser/shortcut_help.rs) remains independent. |
-| Rating decay | [General panel](../crates/wavecrate-ui/src/browser/general_settings.rs), [durable preferences](../crates/wavecrate-session/src/preferences.rs), [browser continuation](../crates/wavecrate-ui/src/browser/rating_decay.rs), and [catalog owner](../crates/wavecrate-catalog/src/rating_decay.rs) implement the validated 1–52 week setting and bounded maintenance. |
-| Trash folder choose/clear | [General panel](../crates/wavecrate-ui/src/browser/general_settings.rs) and [typed SetTrashFolder](../crates/wavecrate-session/src/preferences.rs) persist the destination. [Maintenance admission](../crates/wavecrate-session/src/maintenance.rs) protects it from cache cleanup. Physical file moves remain OPT-1481; choosing a destination does not move sample files. |
-| Global storage usage | [General panel](../crates/wavecrate-ui/src/browser/general_settings.rs) calls [request_storage_usage](../crates/wavecrate-session/src/maintenance.rs), which measures database sidecars and cache through the [held profile capability](../crates/wavecrate-library/src/app_dirs/storage_usage.rs). |
-| Clear rebuildable caches | [clear_rebuildable_cache](../crates/wavecrate-session/src/maintenance.rs) uses the [disposable-cache namespace owner](../crates/wavecrate-library/src/app_dirs/storage_usage.rs), with cancellation, protection admission and explicit incomplete outcomes. |
-| Theme, motion, autoplay and loop | Existing [settings strip](../crates/wavecrate-ui/src/browser/view.rs) and [preference projection](../crates/wavecrate-ui/src/browser/preferences.rs) preserve ordered persistence and blocked-profile behavior. |
+| Audio backend, output, sample rate and errors | [Audio output panel](../crates/yield-ui/src/browser/audio_output.rs) enumerates, applies and persists all three through `SetAudioOutput`. |
+| Volume and normalized audition | [Toolbar](../crates/yield-ui/src/browser/view.rs) and [ordered preferences](../crates/yield-session/src/preferences.rs); audible acceptance remains OPT-1492. |
+| Global hover-help toggle | [Persisted Help tips On/Off](../crates/yield-ui/src/browser/preferences.rs); [shortcut help](../crates/yield-ui/src/browser/shortcut_help.rs) remains independent. |
+| Rating decay | [General panel](../crates/yield-ui/src/browser/general_settings.rs), [durable preferences](../crates/yield-session/src/preferences.rs), [browser continuation](../crates/yield-ui/src/browser/rating_decay.rs), and [catalog owner](../crates/yield-catalog/src/rating_decay.rs) implement the validated 1–52 week setting and bounded maintenance. |
+| Trash folder choose/clear | [General panel](../crates/yield-ui/src/browser/general_settings.rs) and [typed SetTrashFolder](../crates/yield-session/src/preferences.rs) persist the destination. [Maintenance admission](../crates/yield-session/src/maintenance.rs) protects it from cache cleanup. Physical file moves remain OPT-1481; choosing a destination does not move sample files. |
+| Global storage usage | [General panel](../crates/yield-ui/src/browser/general_settings.rs) calls [request_storage_usage](../crates/yield-session/src/maintenance.rs), which measures database sidecars and cache through the [held profile capability](../crates/yield-library/src/app_dirs/storage_usage.rs). |
+| Clear rebuildable caches | [clear_rebuildable_cache](../crates/yield-session/src/maintenance.rs) uses the [disposable-cache namespace owner](../crates/yield-library/src/app_dirs/storage_usage.rs), with cancellation, protection admission and explicit incomplete outcomes. |
+| Theme, motion, autoplay and loop | Existing [settings strip](../crates/yield-ui/src/browser/view.rs) and [preference projection](../crates/yield-ui/src/browser/preferences.rs) preserve ordered persistence and blocked-profile behavior. |
 
 The General controls sit below the theme strip, with Close and Escape/focus
 restoration. The Audio panel retains its device and error routes. Shortcut help
@@ -2283,7 +2288,7 @@ The catalog (91), session (56) and Unix storage (14) suites passed. The final
 Unix-only follow-up `84c6abaa9` rechecks cancellation, profile ownership and cache
 identity after terminal counting, with a deterministic replacement regression.
 
-[Windows CI run 34691785444](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34691785444)
+[Windows CI run 34691785444](https://github.com/PORTALSURFER/yield/actions/runs/34691785444)
 passed on `840979eabc622a293f2eeed48199b74464541688`: 9 native cache tests,
 83 catalog tests, 55 session tests, shared audio/core/media/platform suites,
 GPUI application compilation and 392 UI tests (one existing ignored).

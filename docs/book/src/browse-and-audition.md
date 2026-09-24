@@ -1,10 +1,10 @@
 # Browse and Audition
 
-Wavecrate is designed for fast listening passes. Select a sample, hear it, move on, and make lightweight decisions before the creative thread disappears.
+Yield is designed for fast listening passes. Select a sample, hear it, move on, and make lightweight decisions before the creative thread disappears.
 
 ## Main Browsing Surface
 
-![Wavecrate main window](assets/wavecrate-main-window.png)
+![Yield main window](assets/yield-main-window.png)
 
 The main surface has three working areas:
 
@@ -36,10 +36,10 @@ Use the browser tools together:
 
 ## DAW Companion Loop
 
-Wavecrate is meant to sit beside your DAW:
+Yield is meant to sit beside your DAW:
 
 1. Keep the track playing in the DAW.
-2. Audition candidate samples in Wavecrate.
+2. Audition candidate samples in Yield.
 3. Mark the region that starts to fit.
 4. Copy or drag the selected clip into the DAW.
 5. Return to browsing without reorganizing folders mid-session.
