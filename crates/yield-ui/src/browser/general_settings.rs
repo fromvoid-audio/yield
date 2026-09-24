@@ -48,6 +48,35 @@ enum PendingMaintenance {
 }
 
 impl GeneralSettings {
+    pub(super) fn picking(&self) -> bool {
+        self.picking
+    }
+
+    pub(super) fn maintenance_busy(&self) -> bool {
+        self.maintenance.is_some()
+    }
+
+    pub(super) fn storage_label(&self) -> String {
+        self.storage
+            .map(|usage| {
+                format!(
+                    "{} total · Database {} · Cache {}",
+                    format_bytes(usage.total_bytes()),
+                    format_bytes(usage.database_bytes),
+                    format_bytes(usage.cache_bytes)
+                )
+            })
+            .unwrap_or_else(|| "Not measured".into())
+    }
+
+    pub(super) fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub(super) fn maintenance_status(&self) -> &str {
+        &self.maintenance_status
+    }
+
     pub(super) fn invalidate_picker(&mut self) {
         self.picker_generation = self.picker_generation.wrapping_add(1);
         self.picking = false;
@@ -58,13 +87,19 @@ impl Browser {
     pub(super) fn close_general_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.theme_settings_open = false;
         self.general_settings.invalidate_picker();
-        if let Some(previous) = self.general_settings.previous_focus.take() {
-            window.focus(&previous);
-        }
+        let restore = self
+            .general_settings
+            .previous_focus
+            .take()
+            .unwrap_or_else(|| {
+                self.ax_focus("settings-open")
+                    .unwrap_or_else(|| self.focus_handle.clone())
+            });
+        window.focus(&restore);
         cx.notify();
     }
 
-    fn change_rating_decay(&mut self, delta: i16, cx: &mut Context<Self>) {
+    pub(super) fn change_rating_decay(&mut self, delta: i16, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -80,6 +115,10 @@ impl Browser {
     }
 
     fn choose_trash_folder(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.choose_trash_folder_from_accessibility(cx);
+    }
+
+    pub(super) fn choose_trash_folder_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable()
             || self.general_settings.picking
             || self.general_settings.maintenance.is_some()
@@ -134,6 +173,10 @@ impl Browser {
     }
 
     fn clear_trash_folder(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_trash_folder_from_accessibility(cx);
+    }
+
+    pub(super) fn clear_trash_folder_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() || self.general_settings.maintenance.is_some() {
             return;
         }
@@ -170,7 +213,7 @@ impl Browser {
         cx.notify();
     }
 
-    fn clear_rebuildable_cache(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn clear_rebuildable_cache(&mut self, cx: &mut Context<Self>) {
         if self.general_settings.maintenance.is_some()
             || !self.preferences.loaded()
             || !self.preferences_editable()
@@ -303,7 +346,7 @@ impl Browser {
                     .child("GENERAL")
                     .child(div().flex_1())
                     .child(
-                        control("general-settings-close", "Close", true, &theme).on_click(
+                        control(self, "general-settings-close", "Close", true, &theme).on_click(
                             cx.listener(|view, _, window, cx| {
                                 view.close_general_settings(window, cx)
                             }),
@@ -317,7 +360,7 @@ impl Browser {
                     .gap(px(theme.spacing.control_gap))
                     .child(div().w(px(120.0)).child("Rating Decay"))
                     .child(
-                        control("rating-decay-decrease", "−", decrease_enabled, &theme).when(
+                        control(self, "rating-decay-decrease", "−", decrease_enabled, &theme).when(
                             decrease_enabled,
                             |button| {
                                 button.on_click(
@@ -331,7 +374,7 @@ impl Browser {
                         self.general_settings.rating_decay_weeks
                     ))
                     .child(
-                        control("rating-decay-increase", "+", increase_enabled, &theme).when(
+                        control(self, "rating-decay-increase", "+", increase_enabled, &theme).when(
                             increase_enabled,
                             |button| {
                                 button.on_click(
@@ -358,6 +401,7 @@ impl Browser {
                     )
                     .child(
                         control(
+                            self,
                             "choose-trash-folder",
                             if self.general_settings.picking {
                                 "Choosing…"
@@ -372,7 +416,7 @@ impl Browser {
                         }),
                     )
                     .child(
-                        control("clear-trash-folder", "Clear", trash_editable, &theme)
+                        control(self, "clear-trash-folder", "Clear", trash_editable, &theme)
                             .when(trash_editable, |button| {
                                 button.on_click(cx.listener(Self::clear_trash_folder))
                             }),
@@ -384,23 +428,10 @@ impl Browser {
                     .items_center()
                     .gap(px(theme.spacing.control_gap))
                     .child(div().w(px(120.0)).child("Global Storage"))
-                    .child(
-                        div().flex_1().child(
-                            self.general_settings
-                                .storage
-                                .map(|usage| {
-                                    format!(
-                                        "{} total · Database {} · Cache {}",
-                                        format_bytes(usage.total_bytes()),
-                                        format_bytes(usage.database_bytes),
-                                        format_bytes(usage.cache_bytes)
-                                    )
-                                })
-                                .unwrap_or_else(|| "Not measured".into()),
-                        ),
-                    )
+                    .child(div().flex_1().child(self.general_settings.storage_label()))
                     .child(
                         control(
+                            self,
                             "refresh-global-storage",
                             "Refresh",
                             !maintenance_busy,
@@ -421,6 +452,7 @@ impl Browser {
                     .child(div().w(px(120.0)).child("Maintenance"))
                     .child(
                         control(
+                            self,
                             "clear-rebuildable-cache",
                             "Clear Rebuildable Caches",
                             clear_enabled,
@@ -438,6 +470,11 @@ impl Browser {
                 |panel| {
                     panel.child(
                         div()
+                            .relative()
+                            .when_some(
+                                self.ax_marker("settings-maintenance-status"),
+                                |element, marker| element.child(marker),
+                            )
                             .w_full()
                             .overflow_hidden()
                             .child(self.general_settings.maintenance_status.clone()),
@@ -447,6 +484,11 @@ impl Browser {
             .when(!self.general_settings.status.is_empty(), |panel| {
                 panel.child(
                     div()
+                        .relative()
+                        .when_some(
+                            self.ax_marker("settings-general-status"),
+                            |element, marker| element.child(marker),
+                        )
                         .w_full()
                         .overflow_hidden()
                         .child(self.general_settings.status.clone()),
@@ -456,13 +498,31 @@ impl Browser {
 }
 
 fn control(
+    browser: &Browser,
     id: &'static str,
     label: &'static str,
     enabled: bool,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
+    let ax_id = match id {
+        "general-settings-close" => "settings-close",
+        "rating-decay-decrease" => "settings-rating-decay-decrease",
+        "rating-decay-increase" => "settings-rating-decay-increase",
+        "choose-trash-folder" => "settings-trash-choose",
+        "clear-trash-folder" => "settings-trash-clear",
+        "refresh-global-storage" => "settings-storage-refresh",
+        "clear-rebuildable-cache" => "settings-cache-clear",
+        _ => id,
+    };
     div()
         .id(id)
+        .relative()
+        .when_some(browser.ax_focus(ax_id), |element, focus| {
+            element.track_focus(&focus)
+        })
+        .when_some(browser.ax_marker(ax_id), |element, marker| {
+            element.child(marker)
+        })
         .flex_none()
         .flex()
         .items_center()
@@ -470,6 +530,11 @@ fn control(
         .px(px(theme.spacing.control_gap))
         .border(px(theme.spacing.border_width))
         .border_color(color(theme.colors.border_emphasis))
+        .focus({
+            let focus_color = color(theme.interaction.focus_outline);
+            let focus_width = theme.interaction.focus_outline_width;
+            move |style| style.border(px(focus_width)).border_color(focus_color)
+        })
         .text_color(color(if enabled {
             theme.colors.text_primary
         } else {
