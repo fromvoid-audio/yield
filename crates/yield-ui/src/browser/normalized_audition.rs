@@ -529,6 +529,10 @@ impl Browser {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_normalized_audition(cx);
+    }
+
+    pub(super) fn toggle_normalized_audition(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;

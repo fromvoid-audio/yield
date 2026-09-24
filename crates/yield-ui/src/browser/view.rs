@@ -1100,6 +1100,13 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("play-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-play"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(self.ax_marker("transport-play"), |element, marker| {
+                                element.child(marker)
+                            })
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1120,6 +1127,13 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("stop-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-stop"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(self.ax_marker("transport-stop"), |element, marker| {
+                                element.child(marker)
+                            })
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1140,6 +1154,13 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("loop-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-loop"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(self.ax_marker("transport-loop"), |element, marker| {
+                                element.child(marker)
+                            })
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1164,6 +1185,15 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("similar-sections-toolbar")
+                            .relative()
+                            .when_some(
+                                self.ax_focus("transport-similar-sections"),
+                                |element, focus| element.track_focus(&focus),
+                            )
+                            .when_some(
+                                self.ax_marker("transport-similar-sections"),
+                                |element, marker| element.child(marker),
+                            )
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1195,6 +1225,13 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("bpm-snap-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-bpm-snap"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(self.ax_marker("transport-bpm-snap"), |element, marker| {
+                                element.child(marker)
+                            })
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1216,6 +1253,15 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("zero-crossing-toolbar")
+                            .relative()
+                            .when_some(
+                                self.ax_focus("transport-zero-crossing"),
+                                |element, focus| element.track_focus(&focus),
+                            )
+                            .when_some(
+                                self.ax_marker("transport-zero-crossing"),
+                                |element, marker| element.child(marker),
+                            )
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1237,6 +1283,14 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("beat-guides-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-beat-guides"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(
+                                self.ax_marker("transport-beat-guides"),
+                                |element, marker| element.child(marker),
+                            )
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1258,6 +1312,10 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("bpm-beat-count-toolbar")
+                            .relative()
+                            .when_some(self.ax_marker("transport-beat-count"), |element, marker| {
+                                element.child(marker)
+                            })
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1274,6 +1332,13 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("metronome-toolbar")
+                            .relative()
+                            .when_some(self.ax_focus("transport-metronome"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(self.ax_marker("transport-metronome"), |element, marker| {
+                                element.child(marker)
+                            })
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1295,6 +1360,15 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("random-audition-toolbar")
+                            .relative()
+                            .when_some(
+                                self.ax_focus("transport-random-audition"),
+                                |element, focus| element.track_focus(&focus),
+                            )
+                            .when_some(
+                                self.ax_marker("transport-random-audition"),
+                                |element, marker| element.child(marker),
+                            )
                             .debug_selector(|| String::from("random-audition-toolbar"))
                             .flex_none()
                             .flex()
@@ -1349,6 +1423,15 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("normalized-audition-toolbar")
+                            .relative()
+                            .when_some(
+                                self.ax_focus("transport-normalized-audition"),
+                                |element, focus| element.track_focus(&focus),
+                            )
+                            .when_some(
+                                self.ax_marker("transport-normalized-audition"),
+                                |element, marker| element.child(marker),
+                            )
                             .flex_none()
                             .flex()
                             .items_center()

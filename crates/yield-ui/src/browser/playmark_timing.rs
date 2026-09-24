@@ -222,6 +222,7 @@ pub(super) fn render_overlay(
     background: Hsla,
     text_color: Hsla,
     editor_input: Option<Entity<SearchInput>>,
+    editor_ax_frame: Option<std::rc::Rc<dyn Fn(Bounds<Pixels>)>>,
 ) -> impl IntoElement {
     canvas(
         move |bounds, window, cx| {
@@ -236,6 +237,9 @@ pub(super) fn render_overlay(
                 return None;
             };
             let input = editor_input.map(|input| {
+                if let Some(set_frame) = editor_ax_frame.as_ref() {
+                    set_frame(layout.rect);
+                }
                 let mut element = div()
                     .id("playmark-timing-editor")
                     .w(layout.rect.size.width)

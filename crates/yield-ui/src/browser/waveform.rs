@@ -1616,6 +1616,10 @@ pub(super) fn render_waveform(
         .map(|region| (region, edit_settings));
     let mut bars = div()
         .id("waveform")
+        .when_some(
+            browser.ax_marker("transport-waveform"),
+            |element, marker| element.child(marker),
+        )
         .debug_selector(|| String::from("waveform"))
         .flex()
         .items_center()
@@ -1835,6 +1839,7 @@ pub(super) fn render_waveform(
                     .as_ref()
                     .filter(|editor| browser.playmark_timing_editor_is_current(editor))
                     .map(|_| browser.playmark_timing_input.clone()),
+                browser.ax_frame_setter("transport-playmark-timing"),
             ));
         }
     }

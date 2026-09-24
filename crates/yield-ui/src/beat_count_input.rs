@@ -64,6 +64,17 @@ impl BeatCountInput {
         self.count
     }
 
+    /// Return the visible draft, including an incomplete numeric edit.
+    pub(crate) fn content(&self, cx: &App) -> String {
+        self.input.read(cx).content().to_owned()
+    }
+
+    /// Route an accessibility edit through the same draft parser as typing.
+    pub(crate) fn set_content(&mut self, content: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_content(content, cx));
+    }
+
     /// Return the input's focus handle for toolbar focus routing.
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()

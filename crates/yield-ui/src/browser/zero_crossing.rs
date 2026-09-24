@@ -755,6 +755,19 @@ pub(super) fn toggle_from_toolbar(
     window: &mut Window,
     cx: &mut Context<Browser>,
 ) {
+    toggle(browser, window, cx);
+}
+
+/// Toggle zero-crossing snapping from a native accessibility action.
+pub(super) fn toggle_from_accessibility(
+    browser: &mut Browser,
+    window: &mut Window,
+    cx: &mut Context<Browser>,
+) {
+    toggle(browser, window, cx);
+}
+
+fn toggle(browser: &mut Browser, window: &mut Window, cx: &mut Context<Browser>) {
     if !browser.preferences_editable() {
         browser.mark_preferences_edit_blocked(cx);
         return;
