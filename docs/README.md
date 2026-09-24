@@ -22,21 +22,21 @@ Machine-consumed check allowlists do not live here anymore. They now live under
 - `docs/TARGET.md`
   - product target, architecture ownership, runtime contracts, recovery rules,
     automation surfaces, data formats, UI/performance direction, and the
-    Wavecrate/Radiant ownership boundary
+    Yield/Radiant ownership boundary
 - `docs/TROUBLESHOOTING.md`
   - common failure modes, diagnostics, and guardrail-change workflow
 - `docs/book/src/`
-  - public mdBook source for user-facing Wavecrate documentation
+  - public mdBook source for user-facing Yield documentation
 
 ## Live operational files
 
 - Planning and backlog
-  - live in Linear project `Wavecrate` under team `PORTALSURFER`
+  - live in Linear project `Yield` under team `PORTALSURFER`
 - Public docs build
   - build locally with `mdbook build` or `bash scripts/check.sh mdbook`
   - preview locally with `mdbook serve --hostname 127.0.0.1 --port 3011`
   - generated output belongs under `target/mdbook/` locally and is published
-    through the PortalSurfer site path `/wavecrate/docs/`
+    through the PortalSurfer site path `/yield/docs/`
 - `tmp/database_system_audit_plan.md`
   - database-system audit notes and follow-up context
 - `tmp/source_runtime_test_isolation_audit_plan.md`

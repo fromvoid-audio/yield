@@ -23,7 +23,7 @@ for tool in cargo shasum; do
   fi
 done
 
-if [[ -e "$hook" ]] && ! grep -qF "$marker" "$hook" && ! grep -qF '# wavecrate-gpui-local-ci' "$hook"; then
+if [[ -e "$hook" ]] && ! grep -qF "$marker" "$hook" && ! grep -qE '^# [a-z]+-gpui-local-ci$' "$hook"; then
   echo "Existing post-commit hook is not managed by GPUI local CI: $hook" >&2
   exit 1
 fi
@@ -43,7 +43,7 @@ runner="$common_dir/local-ci/bin/run_gpui_commit_ci.sh"
 if [[ ! -f "$runner" ]]; then
   exit 0
 fi
-export WAVECRATE_GPUI_CI_SCRIPT="$common_dir/local-ci/bin/gpui-local-ci.sh"
+export YIELD_GPUI_CI_SCRIPT="$common_dir/local-ci/bin/gpui-local-ci.sh"
 echo "[gpui-local-ci] checking $commit; log: $common_dir/local-ci/runs/$commit/check.log"
 if bash "$runner" "$repo_root" "$commit"; then
   echo "[gpui-local-ci] PASS $commit"

@@ -842,9 +842,9 @@ mod tests {
         time::Duration,
     };
 
-    const CONFIG_HOME_ENV: &str = "WAVECRATE_CONFIG_HOME";
-    const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
-    const OWNER_HELPER_MODE_ENV: &str = "WAVECRATE_PROFILE_OWNER_HELPER_MODE";
+    const CONFIG_HOME_ENV: &str = "YIELD_CONFIG_HOME";
+    const CONFIG_PROFILE_ENV: &str = "YIELD_CONFIG_PROFILE";
+    const OWNER_HELPER_MODE_ENV: &str = "YIELD_PROFILE_OWNER_HELPER_MODE";
 
     fn test_runtime() -> TestRuntimeGuard {
         TestRuntimeGuard::acquire()

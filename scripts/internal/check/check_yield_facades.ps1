@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Enforces Wavecrate facade-size and export-ownership guardrails.
+Enforces Yield facade-size and export-ownership guardrails.
 
 .DESCRIPTION
 Protects native-app and app-core facade modules from quiet root-surface growth.
@@ -17,9 +17,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ($Help) {
-  Write-Host "Usage: scripts/internal/check/check_wavecrate_facades.ps1"
+  Write-Host "Usage: scripts/internal/check/check_yield_facades.ps1"
   Write-Host ""
-  Write-Host "Fails when selected Wavecrate/app-core facades grow or when test/legacy crossings bypass their owners."
+  Write-Host "Fails when selected Yield/app-core facades grow or when test/legacy crossings bypass their owners."
   exit 0
 }
 
@@ -31,7 +31,7 @@ function Convert-ToRepoPath {
   $fullPath = (Resolve-Path -LiteralPath $Path).Path
   $prefix = $rootDir.TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
   if (-not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "[wavecrate_facades] Path is outside repository root: $Path"
+    throw "[yield_facades] Path is outside repository root: $Path"
   }
   return $fullPath.Substring($prefix.Length).Replace("\", "/")
 }
@@ -168,15 +168,15 @@ try {
   }
 
   if ($violations.Count -gt 0) {
-    Write-Host "[wavecrate_facades] Facade guardrail violations detected:"
-    Write-Host "[wavecrate_facades] Keep root facades small, route legacy app crossings through app_core::app_api, and keep test_support out of production imports."
+    Write-Host "[yield_facades] Facade guardrail violations detected:"
+    Write-Host "[yield_facades] Keep root facades small, route legacy app crossings through app_core::app_api, and keep test_support out of production imports."
     foreach ($violation in ($violations | Sort-Object)) {
       Write-Host (" - {0}" -f $violation)
     }
     exit 1
   }
 
-  Write-Host "[wavecrate_facades] OK"
+  Write-Host "[yield_facades] OK"
   exit 0
 } finally {
   Pop-Location

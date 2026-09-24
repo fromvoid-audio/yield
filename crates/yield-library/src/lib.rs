@@ -3,7 +3,7 @@
 
 //! Shared application-directory and library-storage helpers.
 
-/// Application directory helpers anchored to the `.wavecrate` root.
+/// Application directory helpers anchored to the `.yield` root.
 pub mod app_dirs;
 /// Shared structured debug diagnostics helpers for storage-owned seams.
 pub mod diagnostics;

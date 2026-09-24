@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_nul_and_aggregate_path_bytes() {
-        let nul = PathBuf::from(OsString::from("/tmp/wavecrate\0file.wav"));
+        let nul = PathBuf::from(OsString::from("/tmp/yield\0file.wav"));
         assert_eq!(
             validate_paths(&[nul]).unwrap_err(),
             FileDragError::PathContainsNul { index: 0 }

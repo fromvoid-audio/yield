@@ -18,7 +18,7 @@ if [[ -f "$ROOT_DIR/scripts/internal/git_diff_env.sh" ]]; then
   # shellcheck source=scripts/internal/git_diff_env.sh
   source "$ROOT_DIR/scripts/internal/git_diff_env.sh"
 else
-  wavecrate_git() {
+  yield_git() {
     git "$@"
   }
 fi
@@ -57,7 +57,7 @@ done
 ALLOWLIST_PATH="$ROOT_DIR/scripts/internal/check/allowlists/app_core_dependency_boundary_allowlist.txt"
 
 git_has_commit() {
-  wavecrate_git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1
+  yield_git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1
 }
 
 is_allowlisted() {
@@ -128,7 +128,7 @@ scan_diff_stream() {
 scan_git_diff() {
   local label="$1"
   shift
-  wavecrate_git diff --unified=0 --diff-filter=AMR "$@" -- src/app_core \
+  yield_git diff --unified=0 --diff-filter=AMR "$@" -- src/app_core \
     | scan_diff_stream "$label"
 }
 

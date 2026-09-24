@@ -1,6 +1,6 @@
 # Sample Files and Source Operations
 
-Wavecrate keeps source browsing, file moves, and source maintenance close to the sample list. Most file and source operations are available from the relevant context menu.
+Yield keeps source browsing, file moves, and source maintenance close to the sample list. Most file and source operations are available from the relevant context menu.
 
 ## Sample Actions
 
@@ -28,7 +28,7 @@ Use file shortcuts when the sample browser owns the current interaction:
 - `Command-A` selects all listed samples.
 - `Delete` or `Backspace` deletes the selected item.
 
-Wavecrate preserves source safety rules during moves. If a target source is protected, Wavecrate prompts before routing the operation through the primary destination.
+Yield preserves source safety rules during moves. If a target source is protected, Yield prompts before routing the operation through the primary destination.
 
 ## Source Actions
 
@@ -37,11 +37,11 @@ Right-click a source in the Sources list to open source actions.
 - **Open in Finder/Explorer/File Manager:** open the source folder in the system file browser.
 - **Copy Path:** copy the source root path.
 - **New Folder:** create a folder under the source root.
-- **Protect Source** or **Unprotect Source:** change whether Wavecrate treats the source as protected original material.
+- **Protect Source** or **Unprotect Source:** change whether Yield treats the source as protected original material.
 - **Set as Primary** or **Clear Primary:** choose the primary writable destination used by protected-source workflows.
 - **Refresh Source:** rescan the source folder tree.
 - **Process Source:** prioritize automatic cache and similarity-artifact reconciliation for this source.
-- **Remove Source:** remove the source from Wavecrate.
+- **Remove Source:** remove the source from Yield.
 
 ## Folder Actions
 
@@ -58,6 +58,6 @@ Folder locks are useful when a subtree should stay visible for auditioning but s
 
 ## Move Conflicts
 
-When a move would collide with an existing file or folder, Wavecrate opens a conflict prompt. Choose the resolution for the current item, or apply the same resolution to the remaining conflicts when that option is available.
+When a move would collide with an existing file or folder, Yield opens a conflict prompt. Choose the resolution for the current item, or apply the same resolution to the remaining conflicts when that option is available.
 
 Use this prompt deliberately. File moves and deletes affect files on disk.

@@ -144,7 +144,7 @@ impl ReadinessMembership {
     /// count separately through `add` or `remove` so the durable member cardinality stays exact.
     pub(crate) fn toggle(&mut self, identity: &str, content_generation: &str) {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"wavecrate-readiness-membership-v1");
+        hasher.update(b"yield-readiness-membership-v1");
         hasher.update(&[0]);
         hasher.update(identity.as_bytes());
         hasher.update(&[0]);

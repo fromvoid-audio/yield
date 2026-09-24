@@ -29,7 +29,7 @@ const LEGACY_COLUMN_COUNT: usize = 18;
 const MAX_LEGACY_JOURNAL_SCHEMA_COLUMNS: usize = 32;
 const MAX_LEGACY_JOURNAL_SCHEMA_NAME_BYTES: usize = 256;
 const LEGACY_DEDUP_FINGERPRINT_VERSION: u8 = 1;
-const LEGACY_DEDUP_FINGERPRINT_DOMAIN: &[u8] = b"wavecrate.legacy-journal.dedup\0";
+const LEGACY_DEDUP_FINGERPRINT_DOMAIN: &[u8] = b"yield.legacy-journal.dedup\0";
 
 const LEGACY_COLUMNS: [&str; LEGACY_COLUMN_COUNT] = [
     "id",

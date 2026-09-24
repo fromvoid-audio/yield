@@ -1,4 +1,4 @@
-# Wavecrate End-to-End I/O Architecture Target
+# Yield End-to-End I/O Architecture Target
 
 Status: target design with the bounded OPT-1556 source-volume handoff implemented.
 The implemented slice changes only the private source registration, journal-owner,
@@ -7,7 +7,7 @@ flows are still proposal work.
 
 ## Scope, authority, and reading order
 
-This document describes the ideal end-to-end ownership and ordering of Wavecrate's
+This document describes the ideal end-to-end ownership and ordering of Yield's
 filesystem I/O, source-database I/O, global-library persistence, Harvest persistence,
 rating/history persistence, browser projection, readiness/source processing, and
 rebuildable artifacts. It is the detailed I/O authority for those concerns.
@@ -146,7 +146,7 @@ on their exact timings or messages.
 
 ## Terminology
 
-- **Physical source**: one configured filesystem root and its source-local `.wavecrate.db`.
+- **Physical source**: one configured filesystem root and its source-local `.yield.db`.
 - **Source identity**: a stable identity for the physical root, not merely its current path.
 - **Source revision**: a monotonically increasing committed revision for source membership,
   path, identity, and structural directory truth. It is assigned only by the source DB
@@ -230,7 +230,7 @@ These are normative target invariants.
 8. Cross-database work is an idempotent saga. No transaction pretends SQLite can atomically
    commit a source DB and the global library DB; each participant has an idempotent step,
    durable intent, a retry disposition, and a reconciliation query.
-9. One writer owner serializes writes for each physical source DB across all Wavecrate
+9. One writer owner serializes writes for each physical source DB across all Yield
    processes sharing a profile. The initial durable policy is one profile-wide process lock
    plus a per-source lease/epoch as defense in depth. Other code sends typed commands to that
    owner and cannot open competing writable connections for the same physical database.
@@ -347,7 +347,7 @@ uses wrappers over strings or integers:
 | `TransactionOwnedObject` | Operation ID plus `FilesystemIdentity` and reopened/content-verified evidence | Safe adoption or intentional destructive-edit replacement only. |
 | `SourceRevision` | Monotonic committed source revision | Manifest, directory truth, browser delta, and readiness wake. |
 | `LifecycleGeneration` | Source/session generation | Removed/replaced roots, shutdown, and reopened source instances. |
-| `SampleIdentity` | Stable Wavecrate sample identity where available | Metadata, rating, history, Harvest, and artifact ownership across path changes. |
+| `SampleIdentity` | Stable Yield sample identity where available | Metadata, rating, history, Harvest, and artifact ownership across path changes. |
 | `ContentGeneration` | Content identity/fingerprint plus file generation | Hash, metadata, waveform, analysis, and cache validity. |
 | `ArtifactKey` | Kind, identity, generation, algorithm/version/settings | Rebuildable artifact storage and deduplication. |
 | `ProjectionRevision` | Projection version plus source revision | Browser application and gap fallback. |
@@ -509,7 +509,7 @@ and records `WholePublicationNonAtomic`. `PowerLossSynchronized`
 means that the platform-specific file and namespace synchronization sequence below completed
 and produced evidence; it is not implied by visibility or namespace atomicity. A faulty,
 remote, removable, or otherwise unverified medium can acknowledge a flush without making a
-guarantee about the medium's actual power-loss behavior, so Wavecrate never turns a flush call
+guarantee about the medium's actual power-loss behavior, so Yield never turns a flush call
 into a claim about faulty or remote media.
 
 The [OPT-1631 primitive support matrix](FILE_OPERATION_PRIMITIVE_MATRIX.md)
@@ -1167,7 +1167,7 @@ actions.
 
 ### External filesystem operations
 
-External changes do not have a Wavecrate operation ID at capture time. The watcher assigns
+External changes do not have a Yield operation ID at capture time. The watcher assigns
 an evidence batch ID, retains raw events, and the coordinator creates a reconciliation
 operation whose actor is `ExternalFs`. The operation never claims to know whether a
 filesystem event was atomic or complete; it observes current truth within the affected
@@ -1285,7 +1285,7 @@ and diagnostics. It never returns a success result before commit has completed.
   observed together are one bounded source transaction.
 - Schema/migration work is admitted as maintenance by the owner and follows
   `docs/DATABASE_MIGRATIONS.md`; UI-read and background-read roles never migrate.
-- WAL/SHM, `.wavecrate.db`, legacy DB names, and recovery sidecars stay inside verified
+- WAL/SHM, `.yield.db`, legacy DB names, and recovery sidecars stay inside verified
   source/database roots and obey the same no-follow/capability rules.
 
 ### WAL maintenance and reader snapshots
@@ -1312,9 +1312,9 @@ Readers have explicit classes and different guarantees:
 
 | Reader class | Target budget and behavior | Status when it prevents progress |
 | --- | --- | --- |
-| Owner Wavecrate reader | Bounded and cancellable; initial budget is 2 seconds, 100,000 rows, or 16 MiB per snapshot, whichever comes first. It closes at a safe boundary and resumes from a new snapshot. | `WalReaderBudgetExpired` or `WalCheckpointCatchUp` with the last good view retained. |
-| Losing-process Wavecrate reader | Read-only and subject to the same bounded lifetime/row/byte budgets. It cannot open the journal writable, recover, admit durable work, or retain a snapshot across waits. | `ProfileOwnedByAnotherProcess` plus `WalReaderBudgetExpired`/`WalCheckpointCatchUp` as applicable; continue read-only with stale data. |
-| External/unknown reader | Ungoverned by Wavecrate; it may retain a WAL snapshot indefinitely. Wavecrate uses passive checkpoints, never blocks or kills the reader, and measures the retained frames. | `ExternalReaderRetainingWal` and, at the hard watermark, `WalHardWatermark`; pause/reject WAL-growing work while preserving recovery capacity. |
+| Owner Yield reader | Bounded and cancellable; initial budget is 2 seconds, 100,000 rows, or 16 MiB per snapshot, whichever comes first. It closes at a safe boundary and resumes from a new snapshot. | `WalReaderBudgetExpired` or `WalCheckpointCatchUp` with the last good view retained. |
+| Losing-process Yield reader | Read-only and subject to the same bounded lifetime/row/byte budgets. It cannot open the journal writable, recover, admit durable work, or retain a snapshot across waits. | `ProfileOwnedByAnotherProcess` plus `WalReaderBudgetExpired`/`WalCheckpointCatchUp` as applicable; continue read-only with stale data. |
+| External/unknown reader | Ungoverned by Yield; it may retain a WAL snapshot indefinitely. Yield uses passive checkpoints, never blocks or kills the reader, and measures the retained frames. | `ExternalReaderRetainingWal` and, at the hard watermark, `WalHardWatermark`; pause/reject WAL-growing work while preserving recovery capacity. |
 
 The initial target also reserves a non-sparse 256 MiB recovery reserve on every distinct
 affected writable volume. Ordinary user work, background writes, and routine maintenance are
@@ -1548,11 +1548,11 @@ legal durable overlay such as `RetryPending`, `PartialNeedsRetry`, or `AuditRequ
 | Class | Examples | Coordinator result / durable disposition | User-facing status |
 | --- | --- | --- | --- |
 | `TransientContention` | SQLite busy/locked, temporary sharing violation | Before intent: `RejectedBeforeIntent`; after intent: backoff with durable retry lease and `RetryPending` | “Waiting for library access…” |
-| `QueueSaturated` | Bounded lane or coordinator queue is full | `RejectedBeforeIntent`; coalesce only when the latest intent subsumes the earlier request | “Not started; Wavecrate is busy.” with Retry |
-| `ProfileOwnedByAnotherProcess` | Universal journal/profile lock held by a live owner | `RejectedBeforeIntent`; do not open the journal writable, mutate recovery, admit durable work, open writers, or acquire source leases; remain bounded read-only or forward a typed command | “This profile is writable in another Wavecrate process.” with retry/read-only actions |
-| `WritableSourceOwnedByAnotherProcess` | Independently live source lease/epoch conflict after this process established profile ownership | `RejectedBeforeIntent`; do not open that source writable; retry ownership or continue with read-only access | “Source is writable in another Wavecrate process.” with retry/read-only actions |
+| `QueueSaturated` | Bounded lane or coordinator queue is full | `RejectedBeforeIntent`; coalesce only when the latest intent subsumes the earlier request | “Not started; Yield is busy.” with Retry |
+| `ProfileOwnedByAnotherProcess` | Universal journal/profile lock held by a live owner | `RejectedBeforeIntent`; do not open the journal writable, mutate recovery, admit durable work, open writers, or acquire source leases; remain bounded read-only or forward a typed command | “This profile is writable in another Yield process.” with retry/read-only actions |
+| `WritableSourceOwnedByAnotherProcess` | Independently live source lease/epoch conflict after this process established profile ownership | `RejectedBeforeIntent`; do not open that source writable; retry ownership or continue with read-only access | “Source is writable in another Yield process.” with retry/read-only actions |
 | `TransientAvailability` | Source temporarily offline, removable volume absent | Before intent: `RejectedBeforeIntent`; after intent: retry on source availability with `RetryPending` | “Waiting for source…” |
-| `CapabilityDenied` | Protected source policy, unsafe symlink/path, permission | `RejectedBeforeIntent`; no blind retry; request user action | “Wavecrate cannot safely access this location.” |
+| `CapabilityDenied` | Protected source policy, unsafe symlink/path, permission | `RejectedBeforeIntent`; no blind retry; request user action | “Yield cannot safely access this location.” |
 | `Collision` | Destination exists or changed during plan, including an entry appearing after planning | Before intent: `RejectedBeforeIntent` and re-plan with explicit policy; after intent: preserve source and complete staging, classify by filesystem identity, and use `RetryPending`/`AuditRequired` unless a transaction-owned reopened final may be adopted | “The destination changed; choose how to handle the existing file.” |
 | `InputInvalid` | Invalid range/name/format or unsupported audio | `RejectedBeforeIntent`; specific correction and no fake progress | Specific correction; no fake progress. |
 | `VerificationFailed` | Output identity, size, or containment mismatch | After intent, preserve staged data and use `RetryPending`, `PartialNeedsRetry` only with a durable incomplete checkpoint, or `AuditRequired` | “Output needs verification.” |
@@ -1571,7 +1571,7 @@ legal durable overlay such as `RetryPending`, `PartialNeedsRetry`, or `AuditRequ
 | `ArtifactDeferred` | Cache or analysis write failed/evicted | Retryable readiness deficit | “Available; analysis is pending.” |
 | `ExternalReaderRetainingWal` | External/unknown reader prevents passive WAL checkpoint progress | Before intent: `RejectedBeforeIntent`; after intent: never block or kill the reader, pause WAL-growing work at the hard watermark, and retain recovery reserve with a legal retry overlay | “Another process is retaining database history.” with retry/close-other-process guidance |
 | `WalHardWatermark` | WAL reaches the initial 64 MiB write-admission watermark | Before intent: `RejectedBeforeIntent`; after intent: pause/reject new WAL-growing work and allow only already-admitted bounded commits that fit reserved capacity and recovery-only work | “Database maintenance is catching up; new work is paused.” |
-| `WalReaderBudgetExpired` | Governed Wavecrate snapshot exceeds its time/row/byte budget | Cancel/close at a safe boundary and resume from a new snapshot | “Library view is catching up.” |
+| `WalReaderBudgetExpired` | Governed Yield snapshot exceeds its time/row/byte budget | Cancel/close at a safe boundary and resume from a new snapshot | “Library view is catching up.” |
 | `RecoveryReserveLow` | Writable-volume free space reaches the non-sparse 256 MiB reserve floor or cannot fit an existing required reservation | Before intent: `RejectedBeforeIntent` after provisional-claim release; after intent: recovery-only admission with `RetryPending` unless a durable incomplete checkpoint proves `PartialNeedsRetry` | “Storage is reserved for recovery; new work is paused.” |
 | `DiskPressureRecoveryOnly` | A conservative per-volume peak claim cannot fit above the protected floor | Before intent: `RejectedBeforeIntent` after provisional-claim release; after intent: allow only bounded recovery or already-admitted work whose claim fits, with `RetryPending` unless a durable incomplete checkpoint proves `PartialNeedsRetry`; any reserve use requires a serialized durable charge | “Storage is reserved for recovery; new work is paused.” |
 | `DiskPressure` | Insufficient space above the reserve for staging, journal, database, or artifacts | Before intent: `RejectedBeforeIntent`; after intent: pause low-priority writes, preserve durable data, and use a legal retry/partial overlay after safe checkpoint/space recovery | “Storage is low; background work is paused.” with recovery guidance |
@@ -1874,7 +1874,7 @@ watcher callback alone.
   fail closed rather than become a pathname fallback.
 - External readers and hostile or faulty media can defeat retention and flush expectations;
   recovery must protect reserved capacity and report those observations rather than promise
-  guarantees Wavecrate cannot control. Reserve reconstitution failures can keep ordinary
+  guarantees Yield cannot control. Reserve reconstitution failures can keep ordinary
   admission closed, so the charge ledger and actionable status must be more durable than the
   recovery worker.
 - Watcher backends may expose incomplete or non-replayable cursors; continuity loss can widen

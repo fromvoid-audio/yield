@@ -1,4 +1,4 @@
-# Wavecrate I/O Target Alignment Estimate
+# Yield I/O Target Alignment Estimate
 
 Snapshot: 2026-08-05
 

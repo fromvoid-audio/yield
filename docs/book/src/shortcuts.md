@@ -1,6 +1,6 @@
 # Keyboard Shortcuts
 
-Wavecrate shortcuts are focus-aware. A key can mean one thing in the waveform, another in the sample browser, and nothing while a text field owns keyboard input.
+Yield shortcuts are focus-aware. A key can mean one thing in the waveform, another in the sample browser, and nothing while a text field owns keyboard input.
 
 Press `Command-/` in the app to open the current context-aware shortcut overlay.
 

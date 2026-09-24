@@ -1262,7 +1262,7 @@ mod tests {
             ("backup_root", "Backup"),
         ] {
             let path = if cfg!(windows) {
-                format!(r"C:\wavecrate\{suffix}")
+                format!(r"C:\yield\{suffix}")
             } else {
                 format!("/Volumes/{suffix}")
             };
@@ -1384,7 +1384,7 @@ mod tests {
             ("backup_root", "Backup"),
         ] {
             let path = if cfg!(windows) {
-                format!(r"C:\wavecrate\{suffix}")
+                format!(r"C:\yield\{suffix}")
             } else {
                 format!("/Volumes/{suffix}")
             };

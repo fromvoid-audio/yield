@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn legacy_reserved_prefix_rows_rekey_before_update_and_delete() {
         let directory = tempfile::tempdir().expect("source root");
-        let relative_path = PathBuf::from("~wavecrate-nu~ff.wav");
+        let relative_path = PathBuf::from("~yield-nu~ff.wav");
         {
             let database =
                 SourceDatabase::open_for_source_write(directory.path()).expect("source database");

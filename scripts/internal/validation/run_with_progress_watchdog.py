@@ -20,9 +20,9 @@ STALL_EXIT_CODE = 124
 
 
 def release_validation_target_lease() -> None:
-    lease_text = os.environ.get("WAVECRATE_VALIDATION_TARGET_LEASE_DIR")
-    owner_text = os.environ.get("WAVECRATE_VALIDATION_TARGET_LEASE_OWNER")
-    identity_text = os.environ.get("WAVECRATE_VALIDATION_TARGET_LEASE_IDENTITY")
+    lease_text = os.environ.get("YIELD_VALIDATION_TARGET_LEASE_DIR")
+    owner_text = os.environ.get("YIELD_VALIDATION_TARGET_LEASE_OWNER")
+    identity_text = os.environ.get("YIELD_VALIDATION_TARGET_LEASE_IDENTITY")
     if not lease_text or owner_text != str(os.getpid()) or not identity_text:
         return
     lease = Path(lease_text)
@@ -162,14 +162,14 @@ def write_diagnostics(
     run_and_record(destination / "rustc-version.txt", ["rustc", "-Vv"], deadline)
     run_and_record(destination / "cargo-version.txt", ["cargo", "-Vv"], deadline)
     diagnostic_platform = os.environ.get(
-        "WAVECRATE_VALIDATION_TEST_PLATFORM", platform.system()
+        "YIELD_VALIDATION_TEST_PLATFORM", platform.system()
     )
     if diagnostic_platform == "Darwin":
         run_and_record(destination / "macos-version.txt", ["sw_vers"], deadline)
         sample_seconds = int(
-            float(os.environ.get("WAVECRATE_VALIDATION_SAMPLE_SECONDS", "3"))
+            float(os.environ.get("YIELD_VALIDATION_SAMPLE_SECONDS", "3"))
         )
-        sample_command = os.environ.get("WAVECRATE_VALIDATION_SAMPLE_COMMAND", "sample")
+        sample_command = os.environ.get("YIELD_VALIDATION_SAMPLE_COMMAND", "sample")
         if sample_seconds > 0:
             for item in processes.values():
                 executable = Path(item.command.split(None, 1)[0]).name
@@ -243,16 +243,16 @@ def main() -> int:
 
     atexit.register(release_validation_target_lease)
     command = sys.argv[1:]
-    idle_seconds = env_seconds("WAVECRATE_VALIDATION_IDLE_SECONDS", 300)
-    diagnostic_grace = env_seconds("WAVECRATE_VALIDATION_DIAGNOSTIC_GRACE_SECONDS", 120)
+    idle_seconds = env_seconds("YIELD_VALIDATION_IDLE_SECONDS", 300)
+    diagnostic_grace = env_seconds("YIELD_VALIDATION_DIAGNOSTIC_GRACE_SECONDS", 120)
     diagnostic_collection = env_seconds(
-        "WAVECRATE_VALIDATION_DIAGNOSTIC_COLLECTION_SECONDS", 30
+        "YIELD_VALIDATION_DIAGNOSTIC_COLLECTION_SECONDS", 30
     )
-    term_grace = env_seconds("WAVECRATE_VALIDATION_TERM_GRACE_SECONDS", 10)
-    poll_seconds = env_seconds("WAVECRATE_VALIDATION_POLL_SECONDS", 5)
+    term_grace = env_seconds("YIELD_VALIDATION_TERM_GRACE_SECONDS", 10)
+    poll_seconds = env_seconds("YIELD_VALIDATION_POLL_SECONDS", 5)
     diagnostics_root = Path(
         os.environ.get(
-            "WAVECRATE_VALIDATION_DIAGNOSTICS_DIR",
+            "YIELD_VALIDATION_DIAGNOSTICS_DIR",
             str(Path.cwd() / "target" / "validation-diagnostics"),
         )
     )
@@ -268,10 +268,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, record_signal)
 
     try:
-        ready_file = os.environ.get("WAVECRATE_VALIDATION_TEST_PRESPAWN_READY_FILE")
+        ready_file = os.environ.get("YIELD_VALIDATION_TEST_PRESPAWN_READY_FILE")
         if ready_file:
             Path(ready_file).write_text("ready\n", encoding="utf-8")
-            time.sleep(env_seconds("WAVECRATE_VALIDATION_TEST_PRESPAWN_SECONDS", 1))
+            time.sleep(env_seconds("YIELD_VALIDATION_TEST_PRESPAWN_SECONDS", 1))
         if interrupted_signal:
             return 128 + interrupted_signal
 

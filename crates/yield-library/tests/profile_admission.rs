@@ -43,10 +43,10 @@ fn expect_library_profile_required<T>(result: Result<T, LibraryError>) {
 fn assert_no_source_database_files_at(root: &std::path::Path) {
     for name in [
         DB_FILE_NAME,
-        ".wavecrate_samples.db",
-        ".wavecrate.db-wal",
-        ".wavecrate.db-shm",
-        ".wavecrate.db-journal",
+        ".yield_samples.db",
+        ".yield.db-wal",
+        ".yield.db-shm",
+        ".yield.db-journal",
     ] {
         assert!(
             !root.join(name).exists(),

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Target used for standardized database debug events.
-pub const DB_EVENT_TARGET: &str = "wavecrate::debug::db";
+pub const DB_EVENT_TARGET: &str = "yield::debug::db";
 
 static DEBUG_LOGGING_ENABLED: AtomicBool = AtomicBool::new(false);
 

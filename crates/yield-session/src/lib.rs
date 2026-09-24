@@ -2498,7 +2498,7 @@ mod tests {
     };
     use yield_library::sample_sources::{SourceId, SourceMetadataStorage};
 
-    const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "WAVECRATE_SESSION_OWNER_PROFILE_ROOT";
+    const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "YIELD_SESSION_OWNER_PROFILE_ROOT";
     const FULL_PROGRESS_FIXTURE_OPERATION_ID: &str = "00000000-0000-0000-0000-0000000000cd";
     const FULL_PROGRESS_FIXTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2627,7 +2627,7 @@ mod tests {
     fn profile_root(temp: &TempDir) -> PathBuf {
         let root = temp
             .path()
-            .join(".wavecrate")
+            .join(".yield")
             .join(PROFILE_DIR_NAME)
             .join(GPUI_DEVELOPMENT_PROFILE);
         fs::create_dir_all(&root).expect("profile root");
@@ -2970,12 +2970,12 @@ mod tests {
 
         let development_db = temp
             .path()
-            .join(".wavecrate")
+            .join(".yield")
             .join(PROFILE_DIR_NAME)
             .join(GPUI_DEVELOPMENT_PROFILE)
             .join("library.db");
         assert!(development_db.is_file());
-        assert!(!temp.path().join(".wavecrate/library.db").exists());
+        assert!(!temp.path().join(".yield/library.db").exists());
 
         let mut reopened =
             SourceRegistryService::start_inner(Some(profile_root)).expect("reopen service");
@@ -4647,7 +4647,7 @@ mod tests {
             Err(ShutdownError::Session(SessionError::Persistence(_)))
         ));
         assert!(invalid_root.is_file());
-        assert!(!temp.path().join(".wavecrate").exists());
+        assert!(!temp.path().join(".yield").exists());
     }
 
     #[cfg(unix)]

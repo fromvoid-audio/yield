@@ -23,8 +23,8 @@ pub(super) fn exact_subtree_path_bounds(path: &str) -> (String, String) {
 
 pub(super) const INDEX_PATH_ENCODING_PLAIN: i64 = 0;
 const INDEX_PATH_ENCODING_LOSSLESS: i64 = 1;
-const INDEX_NON_UNICODE_COMPONENT_PREFIX: &str = "~wavecrate-nu~";
-const INDEX_ESCAPED_COMPONENT_PREFIX: &str = "~wavecrate-escaped~";
+const INDEX_NON_UNICODE_COMPONENT_PREFIX: &str = "~yield-nu~";
+const INDEX_ESCAPED_COMPONENT_PREFIX: &str = "~yield-escaped~";
 
 pub(super) fn source_index_plain_path_needs_rekey(path: &str) -> bool {
     path.split('/').any(|component| {
@@ -389,7 +389,7 @@ mod tests {
     fn source_index_path_encoding_escapes_reserved_unicode_components() {
         let path = PathBuf::from_iter([
             std::ffi::OsString::from("folder"),
-            std::ffi::OsString::from("~wavecrate-nu~ff.wav"),
+            std::ffi::OsString::from("~yield-nu~ff.wav"),
         ]);
         let (encoded, encoding) = normalize_source_index_path(&path).unwrap();
         assert_eq!(encoding, INDEX_PATH_ENCODING_LOSSLESS);
@@ -420,8 +420,8 @@ mod tests {
     fn source_index_path_encoding_does_not_alias_reserved_unicode_names() {
         use std::os::unix::ffi::OsStringExt;
 
-        let raw = PathBuf::from(OsString::from_vec(b"~wavecrate-nu~ff".to_vec()));
-        let invalid = PathBuf::from(OsString::from_vec(b"~wavecrate-nu~\xFF".to_vec()));
+        let raw = PathBuf::from(OsString::from_vec(b"~yield-nu~ff".to_vec()));
+        let invalid = PathBuf::from(OsString::from_vec(b"~yield-nu~\xFF".to_vec()));
         let (raw_key, raw_encoding) = normalize_source_index_path(&raw).unwrap();
         let (invalid_key, invalid_encoding) = normalize_source_index_path(&invalid).unwrap();
         assert_ne!(
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn lossless_path_rejects_encoded_separator_inside_component() {
         let error = parse_source_index_path_from_db(
-            "valid/~wavecrate-escaped~612f62",
+            "valid/~yield-escaped~612f62",
             INDEX_PATH_ENCODING_LOSSLESS,
         )
         .unwrap_err();
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn canonical_directory_path_rejects_noncanonical_aliases() {
-        let escaped_alias = "valid/~wavecrate-escaped~616c696173";
+        let escaped_alias = "valid/~yield-escaped~616c696173";
         assert_eq!(
             parse_source_index_path_from_db(escaped_alias, INDEX_PATH_ENCODING_LOSSLESS).unwrap(),
             Path::new("valid/alias")
@@ -456,7 +456,7 @@ mod tests {
                 .is_err()
         );
 
-        let reserved_prefix_plain = "valid/~wavecrate-escaped~616c696173";
+        let reserved_prefix_plain = "valid/~yield-escaped~616c696173";
         assert_eq!(
             parse_source_index_path_from_db(reserved_prefix_plain, INDEX_PATH_ENCODING_PLAIN)
                 .unwrap(),
@@ -474,7 +474,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn canonical_directory_path_rejects_noncanonical_hex_case() {
-        let uppercase_hex = "valid/~wavecrate-escaped~6B69636B5C726177";
+        let uppercase_hex = "valid/~yield-escaped~6B69636B5C726177";
         assert_eq!(
             parse_source_index_path_from_db(uppercase_hex, INDEX_PATH_ENCODING_LOSSLESS).unwrap(),
             Path::new(r"valid/kick\raw")

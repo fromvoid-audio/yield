@@ -198,8 +198,8 @@ def validate_release_metadata(
     body = str(release.get("body") or "").strip()
     if not body:
         errors.append(f"RC release {rc_tag} must have a non-empty release log body")
-    elif f"Wavecrate {rc_version}" not in body:
-        errors.append(f"RC release body must be release-bound to Wavecrate {rc_version}")
+    elif f"Yield {rc_version}" not in body:
+        errors.append(f"RC release body must be release-bound to Yield {rc_version}")
 
     asset_names = release_asset_names(release)
     missing = [name for name in required_assets if name not in asset_names]
@@ -230,7 +230,7 @@ class local_asset_dir:
             return self.args.asset_dir
         if not self.args.repo:
             raise SystemExit("Missing --repo or GITHUB_REPOSITORY for live GitHub asset downloads")
-        self.temp = tempfile.TemporaryDirectory(prefix="wavecrate-promoted-rc-")
+        self.temp = tempfile.TemporaryDirectory(prefix="yield-promoted-rc-")
         asset_dir = Path(self.temp.name)
         patterns = []
         for asset in self.required_assets:
@@ -319,7 +319,7 @@ def verify_checksum_signature(checksum_path: Path, signature_path: Path, checksu
     if len(public_key) != 32:
         return ["checksum public key must decode to a 32-byte Ed25519 public key"]
 
-    with tempfile.TemporaryDirectory(prefix="wavecrate-rc-signature-") as temp:
+    with tempfile.TemporaryDirectory(prefix="yield-rc-signature-") as temp:
         pub_der = Path(temp) / "checksum-public-key.der"
         sig_bin = Path(temp) / "checksums.sig"
         pub_der.write_bytes(ED25519_SPKI_PREFIX + public_key)

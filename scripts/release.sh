@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-repo_slug="${WAVECRATE_GITHUB_REPO:-PORTALSURFER/wavecrate}"
+repo_slug="${YIELD_GITHUB_REPO:-PORTALSURFER/yield}"
 
 usage() {
   cat <<'EOF'
@@ -44,9 +44,9 @@ repo_root() {
 ensure_repo_root() {
   local root
   root="$(repo_root)"
-  [[ "$PWD" == "$root" ]] || die "run from the Wavecrate repo root: $root"
+  [[ "$PWD" == "$root" ]] || die "run from the Yield repo root: $root"
   [[ -f Cargo.toml && -d scripts/internal/release && -d .github/workflows ]] \
-    || die "current directory does not look like the Wavecrate repo root"
+    || die "current directory does not look like the Yield repo root"
 }
 
 ensure_clean_worktree() {
@@ -79,10 +79,10 @@ origin_github_repo_slug() {
 ensure_origin_matches_repo_slug() {
   local target_slug origin_slug
   target_slug="$(normalize_repo_slug "$repo_slug")" \
-    || die "WAVECRATE_GITHUB_REPO must be an owner/repo slug"
+    || die "YIELD_GITHUB_REPO must be an owner/repo slug"
   if origin_slug="$(origin_github_repo_slug)"; then
     [[ "$origin_slug" == "$target_slug" ]] \
-      || die "origin remote resolves release refs from $origin_slug, but workflows target $target_slug; set WAVECRATE_GITHUB_REPO to $origin_slug or update origin before release orchestration"
+      || die "origin remote resolves release refs from $origin_slug, but workflows target $target_slug; set YIELD_GITHUB_REPO to $origin_slug or update origin before release orchestration"
   fi
 }
 
@@ -217,11 +217,11 @@ workflow_url() {
 }
 
 require_gh() {
-  local gh_bin="${WAVECRATE_RELEASE_GH_BIN:-gh}"
+  local gh_bin="${YIELD_RELEASE_GH_BIN:-gh}"
   if [[ "$gh_bin" == */* ]]; then
     [[ -x "$gh_bin" ]] || die "gh CLI not found or not executable: $gh_bin"
   else
-    command -v "$gh_bin" >/dev/null 2>&1 || die "gh CLI not found; install gh or set WAVECRATE_RELEASE_GH_BIN"
+    command -v "$gh_bin" >/dev/null 2>&1 || die "gh CLI not found; install gh or set YIELD_RELEASE_GH_BIN"
   fi
   "$gh_bin" auth status >/dev/null 2>&1 || die "gh CLI is not authenticated; run gh auth login"
   printf '%s\n' "$gh_bin"
@@ -249,7 +249,7 @@ run_prepare_train_dry_run_at_ref() {
   local target_sha="$1"
   shift
   local temp_root worktree status
-  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/wavecrate-release-dry-run.XXXXXX")" \
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/yield-release-dry-run.XXXXXX")" \
     || die "failed to create temporary dry-run worktree"
   worktree="$temp_root/source"
 
@@ -280,7 +280,7 @@ run_prepare_train_dry_run_at_ref() {
 prepare() {
   local bump=""
   local source_ref="main"
-  local workflow_ref="${WAVECRATE_RELEASE_WORKFLOW_REF:-main}"
+  local workflow_ref="${YIELD_RELEASE_WORKFLOW_REF:-main}"
   local dry_run=1
   local explicit_dry_run=0
   local push=0
@@ -412,7 +412,7 @@ stable() {
   die "stable releases are temporarily disabled; continue publishing release candidates"
 
   # Preserve the promotion implementation below so it can be re-enabled once
-  # Wavecrate is ready for stable publication.
+  # Yield is ready for stable publication.
   [[ -n "$version" && -n "$branch" ]] || die "stable requires --version and --branch"
   validate_version "$version"
   validate_branch_for_version "$branch" "$version"

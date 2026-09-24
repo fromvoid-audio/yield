@@ -8,13 +8,13 @@ Environment sanity checks for local development and agent runs.
 .DESCRIPTION
 Checks the common footguns called out in README:
 - `CPAL_ASIO_DIR` (Windows ASIO builds)
-- `WAVECRATE_NATIVE_FONT_PATH` (UI projection font override)
+- `YIELD_NATIVE_FONT_PATH` (UI projection font override)
 - presence of `git lfs`
 Also checks toolchain sanity:
 - pinned Rust toolchain vs rust-toolchain.toml
 - rustfmt/clippy present for the pinned toolchain
 - presence of `rg` (ripgrep)
-Also prints developer diagnostic `.wavecrate/logs` locations for each OS.
+Also prints developer diagnostic `.yield/logs` locations for each OS.
 Linux/WSL paths are contributor/agent tooling hints, not shipped app support.
 #>
 
@@ -158,14 +158,14 @@ if ($null -eq $git) {
   }
 }
 
-Write-Info "Checking WAVECRATE_NATIVE_FONT_PATH..."
-$fontPath = $env:WAVECRATE_NATIVE_FONT_PATH
+Write-Info "Checking YIELD_NATIVE_FONT_PATH..."
+$fontPath = $env:YIELD_NATIVE_FONT_PATH
 if ([string]::IsNullOrWhiteSpace($fontPath)) {
-  Write-Info "WAVECRATE_NATIVE_FONT_PATH: not set (OK)"
+  Write-Info "YIELD_NATIVE_FONT_PATH: not set (OK)"
 } elseif (Test-Path -LiteralPath $fontPath -PathType Leaf) {
-  Write-Info "WAVECRATE_NATIVE_FONT_PATH: OK ($fontPath)"
+  Write-Info "YIELD_NATIVE_FONT_PATH: OK ($fontPath)"
 } else {
-  Write-Err "WAVECRATE_NATIVE_FONT_PATH is set but not a file: $fontPath"
+  Write-Err "YIELD_NATIVE_FONT_PATH is set but not a file: $fontPath"
 }
 
 Write-Info "Checking CPAL_ASIO_DIR (Windows ASIO builds)..."
@@ -186,20 +186,20 @@ if ([string]::IsNullOrWhiteSpace($asioDir)) {
 
 Write-Info "Expected developer diagnostic log locations:"
 Write-Info "  Supported app installs:"
-Write-Info "    macOS:   `$HOME/Library/Application Support/.wavecrate/logs"
+Write-Info "    macOS:   `$HOME/Library/Application Support/.yield/logs"
 if ($isWindowsHost -and -not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
-  $windowsLogDir = Join-Path (Join-Path $env:APPDATA ".wavecrate") "logs"
+  $windowsLogDir = Join-Path (Join-Path $env:APPDATA ".yield") "logs"
   Write-Info ("    Windows: {0}" -f $windowsLogDir)
 } else {
-  Write-Info "    Windows: %APPDATA%\.wavecrate\logs"
+  Write-Info "    Windows: %APPDATA%\.yield\logs"
 }
 Write-Info "  Developer/agent tooling only; Linux is not a shipped app install target:"
-Write-Info "    Linux:   `$HOME/.config/.wavecrate/logs"
+Write-Info "    Linux:   `$HOME/.config/.yield/logs"
 if ($isLinuxHost -and (Test-Path -LiteralPath "/proc/version")) {
   try {
     $procVersion = Get-Content -LiteralPath "/proc/version" -Raw
     if ($procVersion -match "(?i)microsoft") {
-      Write-Info "    WSL hint: /mnt/c/Users/<you>/AppData/Roaming/.wavecrate/logs"
+      Write-Info "    WSL hint: /mnt/c/Users/<you>/AppData/Roaming/.yield/logs"
     }
   } catch {
     # best-effort WSL detection; ignore errors

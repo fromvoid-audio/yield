@@ -1,4 +1,4 @@
-//! Analysis-crate application directory helpers anchored to a single `.wavecrate` folder.
+//! Analysis-crate application directory helpers anchored to a single `.yield` folder.
 //!
 //! The analysis crate only uses this module for ANN index cache placement and
 //! associated tests. Keeping a local copy avoids a dependency cycle back into
@@ -24,7 +24,7 @@ mod overrides;
 pub use overrides::ConfigBaseGuard;
 
 /// Name of the application directory that lives under the OS config root.
-pub const APP_DIR_NAME: &str = ".wavecrate";
+pub const APP_DIR_NAME: &str = ".yield";
 /// Name of the directory that stores explicit non-live persistence profiles.
 pub const PROFILE_DIR_NAME: &str = "profiles";
 /// Canonical non-live profile name used for sandbox/manual QA runs.
@@ -32,7 +32,7 @@ pub const SANDBOX_PROFILE_NAME: &str = "sandbox";
 /// Canonical non-live profile name used for automated validation runs.
 pub const AUTOMATED_PROFILE_NAME: &str = "automated-tests";
 
-const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
+const CONFIG_PROFILE_ENV: &str = "YIELD_CONFIG_PROFILE";
 const TEST_EXECUTABLE_DIR_NAME: &str = "deps";
 
 static CONFIG_BASE_OVERRIDE: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
@@ -59,7 +59,7 @@ thread_local! {
 
 /// Ensure tests do not touch real user config directories.
 pub fn ensure_test_config_base() {
-    if std::env::var_os("WAVECRATE_CONFIG_HOME").is_some() {
+    if std::env::var_os("YIELD_CONFIG_HOME").is_some() {
         return;
     }
     let test_base = LazyLock::force(&TEST_CONFIG_BASE).clone();
@@ -164,7 +164,7 @@ impl Drop for PersistenceProfileGuard {
     }
 }
 
-/// Return the root `.wavecrate` directory, creating it if needed.
+/// Return the root `.yield` directory, creating it if needed.
 pub fn app_root_dir() -> Result<PathBuf, AppDirError> {
     if should_auto_isolate_test_config_base() {
         ensure_test_config_base();
@@ -211,7 +211,7 @@ fn config_base_dir() -> Option<PathBuf> {
     {
         return Some(path);
     }
-    if let Ok(path) = std::env::var("WAVECRATE_CONFIG_HOME") {
+    if let Ok(path) = std::env::var("YIELD_CONFIG_HOME") {
         return Some(PathBuf::from(path));
     }
     BaseDirs::new().map(|dirs| dirs.config_dir().to_path_buf())
@@ -237,7 +237,7 @@ fn effective_profile() -> ProfileSelection {
 }
 
 fn should_auto_isolate_test_config_base() -> bool {
-    std::env::var_os("WAVECRATE_CONFIG_HOME").is_none()
+    std::env::var_os("YIELD_CONFIG_HOME").is_none()
         && effective_profile() != ProfileSelection::Live
         && running_under_test_harness()
 }

@@ -7,9 +7,9 @@ cd "$ROOT_DIR"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/internal/check/check_wavecrate_facades.sh
+Usage: scripts/internal/check/check_yield_facades.sh
 
-Fails when selected Wavecrate/app-core facades grow or when test/legacy
+Fails when selected Yield/app-core facades grow or when test/legacy
 crossings bypass their owners.
 USAGE
 }
@@ -21,7 +21,7 @@ if (( $# > 0 )); then
       exit 0
       ;;
     *)
-      echo "[wavecrate_facades] Unknown argument: $1" >&2
+      echo "[yield_facades] Unknown argument: $1" >&2
       exit 2
       ;;
   esac
@@ -100,10 +100,10 @@ while IFS= read -r -d '' file; do
 done < <(find src/app_core -type f -name '*.rs' -print0)
 
 if (( ${#violations[@]} > 0 )); then
-  echo "[wavecrate_facades] Facade guardrail violations detected:"
-  echo "[wavecrate_facades] Keep root facades small, route legacy app crossings through app_core::app_api, and keep test_support out of production imports."
+  echo "[yield_facades] Facade guardrail violations detected:"
+  echo "[yield_facades] Keep root facades small, route legacy app crossings through app_core::app_api, and keep test_support out of production imports."
   printf ' - %s\n' "${violations[@]}" | sort
   exit 1
 fi
 
-echo "[wavecrate_facades] OK"
+echo "[yield_facades] OK"

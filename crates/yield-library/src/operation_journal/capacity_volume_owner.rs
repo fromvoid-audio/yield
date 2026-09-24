@@ -394,7 +394,7 @@ fn production_registry_root() -> Result<RegistryRoot, VolumeOwnershipError> {
                 path,
                 reason: String::from("no qualified identity-safe per-user application root"),
             },
-            other => root_error(PathBuf::from(".wavecrate"), other),
+            other => root_error(PathBuf::from(".yield"), other),
         })?;
     open_registry_child(app_path, app_capability)
 }
@@ -1469,9 +1469,9 @@ mod tests {
         drop(fixture);
     }
 
-    const VOLUME_OWNER_HELPER_ROOT: &str = "WAVECRATE_VOLUME_OWNER_HELPER_ROOT";
-    const VOLUME_OWNER_HELPER_VOLUME: &str = "WAVECRATE_VOLUME_OWNER_HELPER_VOLUME";
-    const VOLUME_OWNER_HELPER_PROFILE: &str = "WAVECRATE_VOLUME_OWNER_HELPER_PROFILE";
+    const VOLUME_OWNER_HELPER_ROOT: &str = "YIELD_VOLUME_OWNER_HELPER_ROOT";
+    const VOLUME_OWNER_HELPER_VOLUME: &str = "YIELD_VOLUME_OWNER_HELPER_VOLUME";
+    const VOLUME_OWNER_HELPER_PROFILE: &str = "YIELD_VOLUME_OWNER_HELPER_PROFILE";
 
     #[cfg(unix)]
     #[test]

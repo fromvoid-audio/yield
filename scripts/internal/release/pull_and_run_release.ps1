@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-Fast-forwards both development repos and runs Wavecrate in release sandbox mode.
+Fast-forwards both development repos and runs Yield in release sandbox mode.
 
 .DESCRIPTION
 Verifies that the main repo is on local `main` tracking `origin/main`,
 provisions the canonical Radiant sibling at its recorded revision, requires
-the Wavecrate worktree to be clean, then delegates to
+the Yield worktree to be clean, then delegates to
 `scripts/run.ps1 sandbox`.
 
 This script accepts the same sandbox options as `scripts/run.ps1 sandbox`. Any
@@ -26,8 +26,8 @@ $ErrorActionPreference = "Stop"
 
 if ($Help) {
   Write-Host "Usage: scripts/internal/release/pull_and_run_release.ps1 [-Dir <path> | -Name <name> | -Temp] [-Clean] [-WriteDb] [-- <app args...>]"
-  Write-Host "Fast-forward Wavecrate, provision the pinned Radiant sibling, then run scripts/run.ps1 sandbox."
-  Write-Host "Wavecrate must be clean; the Radiant provisioning helper refuses dirty checkouts."
+  Write-Host "Fast-forward Yield, provision the pinned Radiant sibling, then run scripts/run.ps1 sandbox."
+  Write-Host "Yield must be clean; the Radiant provisioning helper refuses dirty checkouts."
   exit 0
 }
 

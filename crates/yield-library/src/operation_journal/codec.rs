@@ -4679,7 +4679,7 @@ mod tests {
         let staged = serde_json::json!({
             "participant_id": source_participant,
             "source_id": "source-a",
-            "relative_path": ".wavecrate_delete_staging/folder/retained",
+            "relative_path": ".yield_delete_staging/folder/retained",
             "expectation": {
                 "Directory": {
                     "source_revision": 7,
@@ -6019,7 +6019,7 @@ mod tests {
 
         let mut bad_alias = fixture.clone();
         bad_alias["universal_command_args"]["RetainedResolution"]["Restore"]["observation"]["original_relative"] =
-            Value::from(".WAVECRATE_DELETE_STAGING/recreated");
+            Value::from(".YIELD_DELETE_STAGING/recreated");
         assert!(matches!(
             decode(&serde_json::to_vec(&bad_alias).expect("bad alias bytes")),
             Err(DecodeError::Malformed { .. })

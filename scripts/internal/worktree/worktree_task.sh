@@ -31,7 +31,7 @@ Then (unless --no-run) launches:
 
 Defaults:
 - base ref: HEAD
-- paired paths: <repo>/.worktrees/<id>/wavecrate and
+- paired paths: <repo>/.worktrees/<id>/yield and
   <repo>/.worktrees/<id>/radiant
 EOF
 }
@@ -76,7 +76,7 @@ if [[ -z "$NAME" ]]; then
 fi
 
 if [[ -z "$WORKTREE_PATH" ]]; then
-  WORKTREE_PATH="$ROOT_DIR/.worktrees/$NAME/wavecrate"
+  WORKTREE_PATH="$ROOT_DIR/.worktrees/$NAME/yield"
 fi
 
 PAIR_ROOT="$(dirname "$WORKTREE_PATH")"

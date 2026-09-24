@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Build Wavecrate and, on macOS, wrap the exact binary in a uniquely identified
+# Build Yield and, on macOS, wrap the exact binary in a uniquely identified
 # app bundle that Launch Services and accessibility automation can address.
 
 set -euo pipefail
@@ -15,9 +15,9 @@ usage() {
   cat <<'EOF'
 Usage: scripts/build.sh [--release|--debug] [--variant <name>] [--no-build] [-- <cargo args>]
 
-Builds the Wavecrate binary. On macOS, the exact binary is also copied into a
+Builds the Yield binary. On macOS, the exact binary is also copied into a
 branch-specific app bundle under target/app-bundles so Launch Services and UI
-automation do not fall back to an installed Wavecrate build.
+automation do not fall back to an installed Yield build.
 
 Options:
   --release         Build the optimized release profile (default).
@@ -56,7 +56,7 @@ done
 cd "$ROOT_DIR"
 
 if (( SKIP_BUILD == 0 )); then
-  cargo_command=(cargo build --bin wavecrate)
+  cargo_command=(cargo build --bin yield)
   if [[ "$PROFILE" == "release" ]]; then
     cargo_command+=(--release)
   fi
@@ -70,9 +70,9 @@ if (( SKIP_BUILD == 0 )); then
 fi
 
 profile_dir="$PROFILE"
-binary_path="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/${profile_dir}/wavecrate"
+binary_path="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/${profile_dir}/yield"
 [[ -x "$binary_path" ]] || {
-  echo "[build][error] Wavecrate binary not found at $binary_path" >&2
+  echo "[build][error] Yield binary not found at $binary_path" >&2
   exit 1
 }
 
@@ -99,12 +99,12 @@ VARIANT="$(printf '%s' "$VARIANT" | tr -cs '[:alnum:]' '-' | sed 's/^-//; s/-$//
 }
 
 identifier_suffix="$(printf '%s' "$VARIANT" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')"
-display_name="Wavecrate $VARIANT"
-bundle_identifier="org.portalsurfer.wavecrate.dev.$identifier_suffix"
+display_name="Yield $VARIANT"
+bundle_identifier="org.portalsurfer.yield.dev.$identifier_suffix"
 bundle_root="$ROOT_DIR/target/app-bundles/$identifier_suffix"
 bundle_path="$bundle_root/$display_name.app"
 contents_path="$bundle_path/Contents"
-executable_path="$contents_path/MacOS/wavecrate"
+executable_path="$contents_path/MacOS/yield"
 info_path="$contents_path/Info.plist"
 
 mkdir -p "$contents_path/MacOS"
@@ -131,7 +131,7 @@ cat > "$info_path" <<EOF
   <key>CFBundleDisplayName</key>
   <string>$display_name</string>
   <key>CFBundleExecutable</key>
-  <string>wavecrate</string>
+  <string>yield</string>
   <key>CFBundleIdentifier</key>
   <string>$bundle_identifier</string>
   <key>CFBundleInfoDictionaryVersion</key>

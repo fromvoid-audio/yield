@@ -22,8 +22,7 @@ use yield_library::sample_sources::reconciliation::RootIdentity;
 /// These names are compared lexically in the callback. The callback does not inspect metadata or
 /// follow symlinks. A caller can replace this list on [`SourceWatchSpec`] when a source database
 /// uses different local artifact names.
-pub const DEFAULT_IGNORED_FILE_NAME_PREFIXES: &[&str] =
-    &[".wavecrate.db", ".wavecrate_samples.db", "._"];
+pub const DEFAULT_IGNORED_FILE_NAME_PREFIXES: &[&str] = &[".yield.db", ".yield_samples.db", "._"];
 
 /// The maximum number of pending hints retained by one watcher handle.
 ///
@@ -649,9 +648,9 @@ mod tests {
         assert!(signal.take_hint().is_none());
 
         for name in [
-            ".wavecrate.db",
-            ".wavecrate.db-wal",
-            ".wavecrate_samples.db-shm",
+            ".yield.db",
+            ".yield.db-wal",
+            ".yield_samples.db-shm",
             "._kick.wav",
         ] {
             let path = root.join(name);
@@ -775,7 +774,7 @@ mod tests {
 
         let mut artifact = event(
             EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
-            &[&root.join(".wavecrate.db-wal")],
+            &[&root.join(".yield.db-wal")],
         );
         artifact.attrs.set_flag(Flag::Rescan);
         signal.record_notify_result(Ok(artifact), Instant::now());
@@ -841,7 +840,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary source root");
         let canonical_root = root.path().canonicalize().expect("canonical source root");
         let watcher = SourceWatcher::start(spec(&canonical_root)).expect("native watcher");
-        fs::write(canonical_root.join("kick.wav"), b"wavecrate watcher smoke").expect("write file");
+        fs::write(canonical_root.join("kick.wav"), b"yield watcher smoke").expect("write file");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         let accepted_evidence = loop {

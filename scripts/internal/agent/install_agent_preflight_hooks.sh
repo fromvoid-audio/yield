@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
-# Install local git hooks that keep Wavecrate on its main-integration workflow
+# Install local git hooks that keep Yield on its main-integration workflow
 # and run bounded repository-state checks after
 # branch/source updates.
 #
-# Hooks installed for wavecrate:
+# Hooks installed for yield:
 # - post-checkout: run bounded repository-state checks
 # - pre-commit / pre-push: verify local `main` tracks `origin/main`; feature branches are allowed for PR work
 #
-# To temporarily disable hook execution, set WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK=1.
+# To temporarily disable hook execution, set YIELD_SKIP_AGENT_PREFLIGHT_HOOK=1.
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/internal/agent/install_agent_preflight_hooks.sh [--force]
 
-Install local git hooks that keep Wavecrate aligned with its main-integration
+Install local git hooks that keep Yield aligned with its main-integration
 workflow and run bounded repository-state checks after repo-level source updates.
 The standalone Radiant sibling is intentionally allowed to be dirty or on a
 feature branch for live development. Full agent preflight remains explicit.
@@ -105,7 +105,7 @@ write_hook "$ROOT_HOOK_DIR" "post-checkout" "run_agent_hook_checks.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK:-0}" == "1" ]]; then
+if [[ "${YIELD_SKIP_AGENT_PREFLIGHT_HOOK:-0}" == "1" ]]; then
   exit 0
 fi
 
@@ -131,7 +131,7 @@ write_hook "$ROOT_HOOK_DIR" "pre-commit" "check_main_branch.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK:-0}" == "1" ]]; then
+if [[ "${YIELD_SKIP_AGENT_PREFLIGHT_HOOK:-0}" == "1" ]]; then
   exit 0
 fi
 
@@ -153,7 +153,7 @@ write_hook "$ROOT_HOOK_DIR" "pre-push" "check_main_branch.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK:-0}" == "1" ]]; then
+if [[ "${YIELD_SKIP_AGENT_PREFLIGHT_HOOK:-0}" == "1" ]]; then
   exit 0
 fi
 
@@ -175,4 +175,4 @@ echo "[agent_hook_install] Installed hooks:"
 echo "[agent_hook_install]   - $ROOT_HOOK_DIR/post-checkout"
 echo "[agent_hook_install]   - $ROOT_HOOK_DIR/pre-commit"
 echo "[agent_hook_install]   - $ROOT_HOOK_DIR/pre-push"
-echo "[agent_hook_install] Override with: export WAVECRATE_SKIP_AGENT_PREFLIGHT_HOOK=1"
+echo "[agent_hook_install] Override with: export YIELD_SKIP_AGENT_PREFLIGHT_HOOK=1"

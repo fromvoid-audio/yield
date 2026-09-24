@@ -13,7 +13,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 # shellcheck source=scripts/internal/use_cargo_cache.sh
 source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-wavecrate_enable_cargo_cache
+yield_enable_cargo_cache
 
 usage() {
   cat <<'USAGE'
@@ -58,10 +58,10 @@ if (( WORKSPACE == 1 )); then
   echo "[ci_quick] cargo nextest run --workspace --profile quick --all-targets"
   cargo nextest run --workspace --profile quick --all-targets
 else
-  echo "[ci_quick] validate quick profile against Wavecrate binary inventory"
-  cargo nextest list -p wavecrate --profile quick --lib --tests --list-type binaries-only >/dev/null
-  echo "[ci_quick] cargo nextest run -p wavecrate --profile quick --lib --tests"
-  cargo nextest run -p wavecrate --profile quick --lib --tests
+  echo "[ci_quick] validate quick profile against Yield binary inventory"
+  cargo nextest list -p yield --profile quick --lib --tests --list-type binaries-only >/dev/null
+  echo "[ci_quick] cargo nextest run -p yield --profile quick --lib --tests"
+  cargo nextest run -p yield --profile quick --lib --tests
 fi
 
 echo "[ci_quick] OK"

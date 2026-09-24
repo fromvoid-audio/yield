@@ -35,7 +35,7 @@ target/
 staging
 profile.kernel.etl
 bundle-staging
-.wavecrate_delete_staging/
+.yield_delete_staging/
 assets/ml/panns_cnn14_16k/*.bpk
 assets/ml/panns_cnn14_16k/*.onnx
 assets/ml/panns_cnn14_16k/*.onnx.data
@@ -56,4 +56,4 @@ assets/ml/panns_cnn14_16k/*.pth
 /model.json
 /profile.json.gz
 /flamegraph.svg
-assets/wavecrate-editorial-terminal-clean-master.png
+assets/yield-editorial-terminal-clean-master.png

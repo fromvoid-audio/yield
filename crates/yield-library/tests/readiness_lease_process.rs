@@ -21,10 +21,10 @@ use yield_library::sample_sources::{
 };
 
 const SOURCE_ID: &str = "process-lease-source";
-const CLAIM_NOW_ENV: &str = "WAVECRATE_READINESS_CLAIM_NOW";
-const SOURCE_ROOT_ENV: &str = "WAVECRATE_READINESS_SOURCE_ROOT";
-const RESULT_PATH_ENV: &str = "WAVECRATE_READINESS_RESULT_PATH";
-const START_PATH_ENV: &str = "WAVECRATE_READINESS_START_PATH";
+const CLAIM_NOW_ENV: &str = "YIELD_READINESS_CLAIM_NOW";
+const SOURCE_ROOT_ENV: &str = "YIELD_READINESS_SOURCE_ROOT";
+const RESULT_PATH_ENV: &str = "YIELD_READINESS_RESULT_PATH";
+const START_PATH_ENV: &str = "YIELD_READINESS_START_PATH";
 
 fn analysis_target() -> ReadinessTarget {
     ReadinessTarget::file(

@@ -14,7 +14,7 @@ use super::{
 
 /// Ensure tests do not touch real user config directories.
 pub fn ensure_test_config_base() {
-    if std::env::var_os("WAVECRATE_CONFIG_HOME").is_some() {
+    if std::env::var_os("YIELD_CONFIG_HOME").is_some() {
         return;
     }
     let test_base = std::sync::LazyLock::force(&TEST_CONFIG_BASE).clone();
@@ -26,7 +26,7 @@ pub fn ensure_test_config_base() {
     }
 }
 
-/// Return the root `.wavecrate` directory, creating it if needed.
+/// Return the root `.yield` directory, creating it if needed.
 pub fn app_root_dir() -> Result<PathBuf, AppDirError> {
     if should_auto_isolate_test_config_base() {
         ensure_test_config_base();
@@ -67,7 +67,7 @@ pub fn persistence_mode() -> super::PersistenceMode {
     persistence_mode_from_selection(&effective_profile())
 }
 
-/// Override the resolved application root directory (the `.wavecrate` folder).
+/// Override the resolved application root directory (the `.yield` folder).
 pub fn set_app_root_override(path: PathBuf) -> Result<(), AppDirError> {
     create_dir(&path)?;
     if TEST_CONFIG_OVERRIDE.with(|override_path| override_path.borrow().is_some())
@@ -85,7 +85,7 @@ pub fn set_app_root_override(path: PathBuf) -> Result<(), AppDirError> {
     Ok(())
 }
 
-/// Return the base directory used for `.wavecrate` when no override is set.
+/// Return the base directory used for `.yield` when no override is set.
 pub fn config_base_dir_path() -> Option<PathBuf> {
     config_base_dir()
 }
@@ -101,7 +101,7 @@ pub(super) fn config_base_dir() -> Option<PathBuf> {
     {
         return Some(path);
     }
-    if let Ok(path) = std::env::var("WAVECRATE_CONFIG_HOME") {
+    if let Ok(path) = std::env::var("YIELD_CONFIG_HOME") {
         return Some(PathBuf::from(path));
     }
     BaseDirs::new().map(|dirs| dirs.config_dir().to_path_buf())
@@ -151,7 +151,7 @@ fn effective_profile() -> ProfileSelection {
 }
 
 fn should_auto_isolate_test_config_base() -> bool {
-    std::env::var_os("WAVECRATE_CONFIG_HOME").is_none()
+    std::env::var_os("YIELD_CONFIG_HOME").is_none()
         && effective_profile() != ProfileSelection::Live
         && running_under_test_harness()
 }

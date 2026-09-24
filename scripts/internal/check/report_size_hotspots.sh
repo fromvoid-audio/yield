@@ -12,7 +12,7 @@ if [[ -f "$ROOT_DIR/scripts/internal/git_diff_env.sh" ]]; then
   # shellcheck source=scripts/internal/git_diff_env.sh
   source "$ROOT_DIR/scripts/internal/git_diff_env.sh"
 else
-  wavecrate_git() {
+  yield_git() {
     git "$@"
   }
 fi
@@ -60,7 +60,7 @@ scope_for_file() {
 }
 
 collect_files() {
-  wavecrate_git ls-files -- scripts/internal \
+  yield_git ls-files -- scripts/internal \
     | grep -E '\.(ps1|sh|py|json|cmd)$' || true
 
 }

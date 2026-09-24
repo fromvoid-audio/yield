@@ -218,11 +218,7 @@ pub fn staged_relative_for_target(
     let file_name = target_relative
         .file_name()
         .ok_or_else(|| SourceDbError::InvalidRelativePath(target_relative.to_path_buf()))?;
-    let staged_name = format!(
-        "{}.wavecrate_pending_{}",
-        file_name.to_string_lossy(),
-        op_id
-    );
+    let staged_name = format!("{}.yield_pending_{}", file_name.to_string_lossy(), op_id);
     Ok(target_relative.with_file_name(staged_name))
 }
 

@@ -240,7 +240,7 @@ impl SourceRegistryGlobal {
             let shutdown_result = service.shutdown();
             log_shutdown_curation_failures(&service);
             if let Err(error) = shutdown_result {
-                eprintln!("wavecrate source registry shutdown failed: {error}");
+                eprintln!("yield source registry shutdown failed: {error}");
             }
         }
     }
@@ -262,7 +262,7 @@ fn log_shutdown_curation_failures(service: &SourceRegistryService) {
             }) => {
                 if let Some(failure) = outcome.failure() {
                     eprintln!(
-                        "wavecrate curation operation failed during shutdown: source={source_id} request={request_id} committed_batches={} error={}",
+                        "yield curation operation failed during shutdown: source={source_id} request={request_id} committed_batches={} error={}",
                         outcome.committed_batches().len(),
                         failure.error(),
                     );

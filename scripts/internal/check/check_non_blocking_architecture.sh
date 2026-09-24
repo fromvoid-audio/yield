@@ -11,13 +11,13 @@ cd "$ROOT_DIR"
 RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
 # shellcheck source=scripts/internal/use_cargo_cache.sh
 source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-wavecrate_enable_cargo_cache
+yield_enable_cargo_cache
 
 usage() {
   cat <<'EOF'
 Usage: scripts/internal/check/check_non_blocking_architecture.sh
 
-Run required Radiant and Wavecrate non-blocking architecture guardrails.
+Run required Radiant and Yield non-blocking architecture guardrails.
 EOF
 }
 
@@ -48,13 +48,13 @@ run_step "Radiant synthetic blocking-token fixture" \
 run_step "Radiant app/runtime/example guardrails" \
   cargo test --manifest-path "$RADIANT_DIR/Cargo.toml" --test generic_surface_guardrails source_quality::runtime::commands_and_app
 
-run_step "Wavecrate app-facing blocking guardrail" \
-  cargo test -p wavecrate --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis
+run_step "Yield app-facing blocking guardrail" \
+  cargo test -p yield --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis
 
-run_step "Wavecrate strict slow-handler diagnostics harness" \
-  cargo test -p wavecrate --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow
+run_step "Yield strict slow-handler diagnostics harness" \
+  cargo test -p yield --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow
 
-run_step "Wavecrate readiness persistence boundary" \
+run_step "Yield readiness persistence boundary" \
   bash -c '
     set -euo pipefail
     supervisor_source="$(
@@ -71,7 +71,7 @@ ${similarity_source}"
     fi
   '
 
-run_step "Wavecrate source-processing service boundary" \
+run_step "Yield source-processing service boundary" \
   bash -c '
     set -euo pipefail
     service_dir="src/native_app/source_processing/supervisor"

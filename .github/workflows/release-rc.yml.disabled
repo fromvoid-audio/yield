@@ -1,4 +1,4 @@
-name: Wavecrate RC release
+name: Yield RC release
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: wavecrate-rc-${{ inputs.version }}
+  group: yield-rc-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -83,7 +83,7 @@ jobs:
           fi
           build_number="$(git rev-list --count "$target_sha")"
           build_date="$(date -u '+%Y-%m-%d')"
-          portal_build_id="wavecrate-${release_version}"
+          portal_build_id="yield-${release_version}"
           released_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
           echo "target_version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -171,7 +171,7 @@ jobs:
         env:
           BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
           TARGET_SHA: ${{ needs.resolve.outputs.target_sha }}
-          WAVECRATE_MACOS_SIGNING: ${{ matrix.platform == 'macos' && '1' || '0' }}
+          YIELD_MACOS_SIGNING: ${{ matrix.platform == 'macos' && '1' || '0' }}
           APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
           APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_PASSWORD }}
           APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
@@ -249,7 +249,7 @@ jobs:
             --output dist/github-release-body.md
       - name: Sign release checksums
         env:
-          CHECKSUMS_SIGNING_KEY: ${{ secrets.WAVECRATE_CHECKSUMS_ED25519_KEY || secrets.SEMPAL_CHECKSUMS_ED25519_KEY }}
+          CHECKSUMS_SIGNING_KEY: ${{ secrets.YIELD_CHECKSUMS_ED25519_KEY || secrets.SEMPAL_CHECKSUMS_ED25519_KEY }}
           RELEASE_VERSION: ${{ needs.resolve.outputs.release_version }}
         run: |
           scripts/internal/release/sign_release_checksums.sh \
@@ -260,7 +260,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.resolve.outputs.release_tag }}
-          name: Wavecrate ${{ needs.resolve.outputs.release_version }}
+          name: Yield ${{ needs.resolve.outputs.release_version }}
           target_commitish: ${{ needs.resolve.outputs.target_sha }}
           body_path: dist/github-release-body.md
           prerelease: true
@@ -302,7 +302,7 @@ jobs:
           PORTALSURFER_RELEASE_UPLOAD_TOKEN: ${{ secrets.PORTALSURFER_RELEASE_UPLOAD_TOKEN }}
           PORTALSURFER_RELEASE_UPLOAD_URL: ${{ secrets.PORTALSURFER_RELEASE_UPLOAD_URL }}
         run: |
-          upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/wavecrate/api/v1/release-uploads}"
+          upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/yield/api/v1/release-uploads}"
           upload_base="${upload_base%/}"
           scripts/internal/release/verify_published_release.py \
             --surface portalsurfer \
@@ -323,7 +323,7 @@ jobs:
           SUMMARY_STATUS: ${{ job.status }}
           PORTALSURFER_RELEASE_UPLOAD_URL: ${{ secrets.PORTALSURFER_RELEASE_UPLOAD_URL }}
         run: |
-          upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/wavecrate/api/v1/release-uploads}"
+          upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/yield/api/v1/release-uploads}"
           upload_base="${upload_base%/}"
           scripts/internal/release/write_release_step_summary.sh \
             --title "RC release publication" \

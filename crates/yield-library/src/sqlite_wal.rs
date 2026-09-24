@@ -187,7 +187,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let outside_wal = outside.path().join("outside-wal");
         std::fs::write(&outside_wal, b"outside").unwrap();
-        let db_path = dir.path().join(".wavecrate.db");
+        let db_path = dir.path().join(".yield.db");
         let wal_path = wal_path_for(&db_path);
         std::os::unix::fs::symlink(&outside_wal, &wal_path).unwrap();
 

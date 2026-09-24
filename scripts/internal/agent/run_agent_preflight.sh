@@ -37,7 +37,7 @@ while (( $# > 0 )); do
   esac
 done
 
-STATE_DIR="${WAVECRATE_AGENT_PREFLIGHT_STATE_DIR:-}"
+STATE_DIR="${YIELD_AGENT_PREFLIGHT_STATE_DIR:-}"
 if [[ -z "$STATE_DIR" ]]; then
   GIT_COMMON_DIR="$(git rev-parse --git-common-dir)"
   if [[ "$GIT_COMMON_DIR" == /* ]]; then
@@ -78,8 +78,8 @@ while :; do
   if ln "$CANDIDATE_LOCK" "$LOCK_FILE" 2>/dev/null; then
     rm -f "$CANDIDATE_LOCK"
     OWNER=1
-    if [[ "${WAVECRATE_AGENT_PREFLIGHT_TEST_PAUSE_AFTER_LOCK_ACQUIRE_SECONDS:-0}" != "0" ]]; then
-      sleep "$WAVECRATE_AGENT_PREFLIGHT_TEST_PAUSE_AFTER_LOCK_ACQUIRE_SECONDS"
+    if [[ "${YIELD_AGENT_PREFLIGHT_TEST_PAUSE_AFTER_LOCK_ACQUIRE_SECONDS:-0}" != "0" ]]; then
+      sleep "$YIELD_AGENT_PREFLIGHT_TEST_PAUSE_AFTER_LOCK_ACQUIRE_SECONDS"
     fi
     break
   fi
@@ -112,7 +112,7 @@ while :; do
   rm -f "$LOCK_FILE"
 done
 
-CHECKS_COMMAND="${WAVECRATE_AGENT_CI_CHECKS_COMMAND:-$ROOT_DIR/scripts/internal/agent/run_agent_ci_checks.sh}"
+CHECKS_COMMAND="${YIELD_AGENT_CI_CHECKS_COMMAND:-$ROOT_DIR/scripts/internal/agent/run_agent_ci_checks.sh}"
 if [[ ! -x "$CHECKS_COMMAND" ]]; then
   echo "[agent_preflight] ERROR: missing executable full-check command: $CHECKS_COMMAND" >&2
   exit 1

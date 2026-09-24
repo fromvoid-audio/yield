@@ -7,7 +7,7 @@ This lane avoids `cargo-nextest` and the broader GUI contract/integration
 wrappers so it can run in constrained Windows environments where Application
 Control blocks the `cargo-nextest.exe` binary. It keeps the edit loop grounded
 by running the normal compile smoke gate, Radiant's required non-blocking
-guardrails and no-default core/API tests, and Wavecrate's default non-ignored
+guardrails and no-default core/API tests, and Yield's default non-ignored
 library test suite.
 #>
 
@@ -46,7 +46,7 @@ function Invoke-NativeStep {
 
 Push-Location $rootDir
 try {
-  Enable-WavecrateCargoCache
+  Enable-YieldCargoCache
   $radiantDir = (& (Join-Path $rootDir 'scripts/radiant.ps1') locate | Where-Object { $_ -like 'RADIANT_DIR=*' } | ForEach-Object { $_.Substring(13) })
   if (-not $radiantDir) { throw "Radiant sibling is missing or invalid" }
   Write-Host "[ci_agent] branch policy"
@@ -68,25 +68,25 @@ try {
 
   Write-Host "[ci_agent] cargo test --manifest-path $radiantDir/Cargo.toml --lib --no-default-features"
   Invoke-NativeStep -Label "cargo test --manifest-path $radiantDir/Cargo.toml --lib --no-default-features" -Command {
-    Invoke-WavecrateCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --lib --no-default-features
+    Invoke-YieldCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --lib --no-default-features
   }
 
   Write-Host "[ci_agent] cargo test --manifest-path $radiantDir/Cargo.toml --test app_runtime_api --no-default-features"
   Invoke-NativeStep -Label "cargo test --manifest-path $radiantDir/Cargo.toml --test app_runtime_api --no-default-features" -Command {
-    Invoke-WavecrateCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --test app_runtime_api --no-default-features
+    Invoke-YieldCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --test app_runtime_api --no-default-features
   }
 
-  Write-Host "[ci_agent] cargo test -p wavecrate --test controller_browser_integration --features legacy-controller"
-  Invoke-NativeStep -Label "cargo test -p wavecrate --test controller_browser_integration --features legacy-controller" -Command {
-    Invoke-WavecrateCargo test -p wavecrate --test controller_browser_integration --features legacy-controller
+  Write-Host "[ci_agent] cargo test -p yield --test controller_browser_integration --features legacy-controller"
+  Invoke-NativeStep -Label "cargo test -p yield --test controller_browser_integration --features legacy-controller" -Command {
+    Invoke-YieldCargo test -p yield --test controller_browser_integration --features legacy-controller
   }
 
-  Write-Host "[ci_agent] cargo test -p wavecrate --lib -- --skip known isolated legacy failures"
-  Invoke-NativeStep -Label "cargo test -p wavecrate --lib -- --skip known isolated legacy failures" -Command {
-    $wavecrateLibArgs = @(
+  Write-Host "[ci_agent] cargo test -p yield --lib -- --skip known isolated legacy failures"
+  Invoke-NativeStep -Label "cargo test -p yield --lib -- --skip known isolated legacy failures" -Command {
+    $yieldLibArgs = @(
       "test",
       "-p",
-      "wavecrate",
+      "yield",
       "--lib",
       "--",
       "--skip",
@@ -94,7 +94,7 @@ try {
       "--skip",
       "rating_previous_random_history_entry_restores_waveform_for_replacement"
     )
-    & cargo @(Get-WavecrateCargoConfigOverrideArgs) @wavecrateLibArgs
+    & cargo @(Get-YieldCargoConfigOverrideArgs) @yieldLibArgs
   }
 
   Write-Host "[ci_agent] cargo test selection export background jobs -- --ignored --test-threads=1"
@@ -102,14 +102,14 @@ try {
     $selectionExportArgs = @(
       "test",
       "-p",
-      "wavecrate",
+      "yield",
       "--lib",
       "selection_export_tests",
       "--",
       "--ignored",
       "--test-threads=1"
     )
-    & cargo @(Get-WavecrateCargoConfigOverrideArgs) @selectionExportArgs
+    & cargo @(Get-YieldCargoConfigOverrideArgs) @selectionExportArgs
   }
 
   Write-Host "[ci_agent] OK"

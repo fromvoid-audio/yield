@@ -33,7 +33,7 @@ SEGMENT_NAME_BY_SCENARIO = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate Wavecrate perf-guard benchmark reports."
+        description="Evaluate Yield perf-guard benchmark reports."
     )
     parser.add_argument(
         "--contract",

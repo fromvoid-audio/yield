@@ -1,8 +1,8 @@
 # macOS Nightly Signing
 
-Wavecrate nightly releases should be unattended after the Apple credentials are
+Yield nightly releases should be unattended after the Apple credentials are
 stored in GitHub repository secrets. The nightly workflow builds the app from
-`main`, packages macOS artifacts as `Wavecrate.app`, signs with Developer ID,
+`main`, packages macOS artifacts as `Yield.app`, signs with Developer ID,
 submits to Apple notarization, staples the ticket, then publishes the same
 notarized zip to GitHub and PortalSurfer.
 
@@ -58,5 +58,5 @@ scripts/internal/release/build_release_zip.sh \
   --build-date "$(date -u +%Y-%m-%d)"
 ```
 
-Set `WAVECRATE_MACOS_SIGNING=1` only when intentionally testing the full
+Set `YIELD_MACOS_SIGNING=1` only when intentionally testing the full
 sign-and-notarize flow locally.

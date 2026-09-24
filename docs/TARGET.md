@@ -280,25 +280,25 @@ Local files created by Yield should be understandable and user-recoverable:
 
 Diagnostic bundles should avoid exposing full audio content by default. If a diagnostic bundle includes paths, filenames, metadata, or audio excerpts, Yield should make that clear before the user shares it.
 
-Diagnostic bundles should exclude source-local `.wavecrate.db` files because they may contain user library metadata. Defining a workflow for including source metadata in diagnostic bundles is a non-goal for the current target.
+Diagnostic bundles should exclude source-local `.yield.db` files because they may contain user library metadata. Defining a workflow for including source metadata in diagnostic bundles is a non-goal for the current target.
 
 ## Storage Locations
 
 Yield should split storage between source-local state and global application state.
 
-Source-specific information should live in the folder of that source. Each indexed source folder should contain a special Yield source database file named `.wavecrate.db`. This keeps source metadata close to the real files and makes a source folder more portable between machines or Yield installations while avoiding confusion with the global `.wavecrate` configuration folder.
+Source-specific information should live in the folder of that source. Each indexed source folder should contain a special Yield source database file named `.yield.db`. This keeps source metadata close to the real files and makes a source folder more portable between machines or Yield installations while avoiding confusion with the global `.yield` configuration folder.
 
-Source onboarding should avoid noisy implementation details in the main add-source flow. The facts that Yield creates or updates `.wavecrate.db` in the selected folder and may write embedded Sample ID metadata to supported files should be documented, but the add-source UI does not need to mention those implementation details by default. The source-add flow does not need a separate destructive-nature warning because non-YOLO destructive safety prompts cover destructive operations when the user actually triggers them; adding a source is not a separate read-only mode.
+Source onboarding should avoid noisy implementation details in the main add-source flow. The facts that Yield creates or updates `.yield.db` in the selected folder and may write embedded Sample ID metadata to supported files should be documented, but the add-source UI does not need to mention those implementation details by default. The source-add flow does not need a separate destructive-nature warning because non-YOLO destructive safety prompts cover destructive operations when the user actually triggers them; adding a source is not a separate read-only mode.
 
-The `.wavecrate.db` file is internal source metadata and should be hidden from the normal sample browser, folder tree, and `all files` visibility mode. Yield should mark the file as operating-system hidden where the platform supports that behavior. Diagnostics, source repair flows, logs, and support UI may mention the file when relevant, but reveal actions should reveal the source folder rather than selecting or opening `.wavecrate.db` directly.
+The `.yield.db` file is internal source metadata and should be hidden from the normal sample browser, folder tree, and `all files` visibility mode. Yield should mark the file as operating-system hidden where the platform supports that behavior. Diagnostics, source repair flows, logs, and support UI may mention the file when relevant, but reveal actions should reveal the source folder rather than selecting or opening `.yield.db` directly.
 
-The `.wavecrate.db` file should be excluded from ordinary copy, move, trash, delete, rename, batch, drag, clipboard, export, and handoff operations that target visible sample/folder items. It should only be manipulated by explicit source maintenance, repair, migration, backup, or diagnostics workflows.
+The `.yield.db` file should be excluded from ordinary copy, move, trash, delete, rename, batch, drag, clipboard, export, and handoff operations that target visible sample/folder items. It should only be manipulated by explicit source maintenance, repair, migration, backup, or diagnostics workflows.
 
-If a user copies, moves, backs up, syncs, or transfers an entire source folder outside Yield, the `.wavecrate.db` file should travel with that folder as source-local metadata. Yield should be able to relink or reopen the moved/copied source folder and use the carried `.wavecrate.db` to preserve file metadata where file identity and paths can be reconciled safely.
+If a user copies, moves, backs up, syncs, or transfers an entire source folder outside Yield, the `.yield.db` file should travel with that folder as source-local metadata. Yield should be able to relink or reopen the moved/copied source folder and use the carried `.yield.db` to preserve file metadata where file identity and paths can be reconciled safely.
 
-Yield should not provide a separate user-facing backup command for `.wavecrate.db` or source metadata in the current target. Normal external whole-folder backup, sync, or transfer is the intended backup path, and diagnostics may explain that source metadata travels with the source folder through `.wavecrate.db`.
+Yield should not provide a separate user-facing backup command for `.yield.db` or source metadata in the current target. Normal external whole-folder backup, sync, or transfer is the intended backup path, and diagnostics may explain that source metadata travels with the source folder through `.yield.db`.
 
-When Yield itself copies a folder inside a source, it should exclude `.wavecrate.db` from the copy. In-app folder copy should create ordinary copied files and folders, then let Yield register/reconcile copied audio as new independent file identities instead of carrying source-local database state into the copied folder. This applies only to folders below a configured source root; copying the configured source root itself should not be available as an ordinary in-app folder action.
+When Yield itself copies a folder inside a source, it should exclude `.yield.db` from the copy. In-app folder copy should create ordinary copied files and folders, then let Yield register/reconcile copied audio as new independent file identities instead of carrying source-local database state into the copied folder. This applies only to folders below a configured source root; copying the configured source root itself should not be available as an ordinary in-app folder action.
 
 If a copied source folder is added while the original source is still indexed, Yield should treat the copied folder as an independent source rather than rejecting it as a duplicate source. Any duplicated embedded Sample IDs or duplicate audio content inside the copied source should be handled by the normal file-level duplicate-ID conflict and exact-audio duplicate systems, not by blocking source addition.
 
@@ -339,9 +339,9 @@ historical deletions. Aggregate diagnostics expose the retained count, authorita
 candidate generations, oldest diagnostic staging time and age, destinations considered, and
 candidates pruned without per-file logging.
 
-Global application state should live in a user-level `.wavecrate` folder. On Windows, the initial target should be a conventional user config/home location such as `%USERPROFILE%\.wavecrate`, similar in spirit to `.cargo`, `.codex`, and other developer/user configuration folders. Future macOS and Linux support should map this same logical root to the platform's appropriate user config/home location.
+Global application state should live in a user-level `.yield` folder. On Windows, the initial target should be a conventional user config/home location such as `%USERPROFILE%\.yield`, similar in spirit to `.cargo`, `.codex`, and other developer/user configuration folders. Future macOS and Linux support should map this same logical root to the platform's appropriate user config/home location.
 
-The global `.wavecrate` folder should contain app-wide state such as:
+The global `.yield` folder should contain app-wide state such as:
 
 - application settings and preferences
 - configured source list and source database references
@@ -353,9 +353,9 @@ The global `.wavecrate` folder should contain app-wide state such as:
 - session undo/recovery files
 - logs, diagnostics, and diagnostic bundle staging
 
-Caches, logs, handoff staging, and recovery files should not be scattered across arbitrary sample-library folders. They should live under the global `.wavecrate` root unless there is a specific source-local reason to store a compact reference or source-owned database record.
+Caches, logs, handoff staging, and recovery files should not be scattered across arbitrary sample-library folders. They should live under the global `.yield` root unless there is a specific source-local reason to store a compact reference or source-owned database record.
 
-Cache payloads should live under the global `.wavecrate` folder in the current target. Source-local `.wavecrate.db` files may store cache references, status, fingerprints, and invalidation state for files in that source, but waveform, analysis, similarity, map, handoff, and other cache payloads should not be written next to the source database.
+Cache payloads should live under the global `.yield` folder in the current target. Source-local `.yield.db` files may store cache references, status, fingerprints, and invalidation state for files in that source, but waveform, analysis, similarity, map, handoff, and other cache payloads should not be written next to the source database.
 
 Settings should report the current on-disk footprint of the global `library.db` (including active SQLite sidecars) and rebuildable cache, with the filesystem traversal performed outside the GUI thread. This read-only usage insight excludes source-local databases, logs, configuration, and handoff staging so the displayed scope stays consistent with the cache-maintenance surface.
 
@@ -794,9 +794,9 @@ Users should be able to create, edit, rename, and remove tags inside user-extens
 
 User-created tags inside user-extensible categories should be global by default. If a user creates a custom Sound Type tag such as `zap` while working in one source, that tag should become available as a suggestion, filter, structured-search token, display-name component, and generated-filename component for all sources.
 
-User-extensible value dictionaries should be global regardless of whether the category is single-value per file or multi-value per file. Prefix, Sound Type, Character, and Tuning/Scale values should all be shared across sources through the global `.wavecrate` dictionary.
+User-extensible value dictionaries should be global regardless of whether the category is single-value per file or multi-value per file. Prefix, Sound Type, Character, and Tuning/Scale values should all be shared across sources through the global `.yield` dictionary.
 
-The global `.wavecrate` state should own tag category definitions and the user-extensible tag dictionary. Each source database should store which global tags are assigned to files in that source, plus source-local file metadata. Source databases should not silently fork tag definitions into incompatible per-source dictionaries.
+The global `.yield` state should own tag category definitions and the user-extensible tag dictionary. Each source database should store which global tags are assigned to files in that source, plus source-local file metadata. Source databases should not silently fork tag definitions into incompatible per-source dictionaries.
 
 Creating a new value in the global dictionary should be an undoable dictionary transaction. If the user undoes creation after assigning that value to files, the file assignments should remain intact as selection-local/local-only values that are no longer normal global dictionary suggestions.
 
@@ -1095,7 +1095,7 @@ An extracted file should be treated as a new independent sample after creation. 
 
 Keyboard extraction, internal extraction-drag into the browser, explicit "extract to file", and extraction from a saved region should use durable extraction by default.
 
-Transient handoff staging exists only to satisfy operating-system clipboard or drag-and-drop APIs that require a file path before the receiving application accepts the drop or paste. Transient staged files should be ordinary WAV files in the first supported format target, and later ordinary AIFF/AIF files where that format is explicitly supported. They should live in a Yield-managed handoff temp folder under the global `.wavecrate` root.
+Transient handoff staging exists only to satisfy operating-system clipboard or drag-and-drop APIs that require a file path before the receiving application accepts the drop or paste. Transient staged files should be ordinary WAV files in the first supported format target, and later ordinary AIFF/AIF files where that format is explicitly supported. They should live in a Yield-managed handoff temp folder under the global `.yield` root.
 
 Transient staged files should not be deleted immediately at the moment a paste/drop appears to succeed, because the receiving DAW or operating-system shell may still need to read the file path. Yield should keep them for a short internally defined grace period and then clean them up automatically when they are no longer needed. The grace period does not need to be user-configurable in the current target. If the user quits Yield after copying or dragging a staged handoff file, the staged file should remain available through the normal grace period so clipboard or drop consumers can still read it after the app exits. Cleanup should remove stale staged files from previous sessions on the next launch or during normal cache/staging maintenance, and cleanup failures should be logged and visible in diagnostics.
 
@@ -1103,7 +1103,7 @@ Transient staged handoff files should use predictable, user-readable filenames w
 
 Transient staged handoff files should contain the rendered audio and only the minimal required or safely useful WAV metadata. They should not inherit durable Yield metadata such as tags, rating, label, Prefix, BPM, Tuning/Scale, temporary color collections, or embedded Yield Sample ID by default. Durable extraction owns metadata inheritance; transient handoff staging should avoid creating metadata side effects.
 
-Transient staged handoff files should not be indexed as library samples. They should live outside indexed source folders under the global `.wavecrate` handoff staging area. If a path edge case or user configuration would otherwise place staging near an indexed source, Yield should still treat the staged file as temporary handoff data, not as a new source sample. Users who want an indexed file should use durable extraction, export, or copy/import workflows.
+Transient staged handoff files should not be indexed as library samples. They should live outside indexed source folders under the global `.yield` handoff staging area. If a path edge case or user configuration would otherwise place staging near an indexed source, Yield should still treat the staged file as temporary handoff data, not as a new source sample. Users who want an indexed file should use durable extraction, export, or copy/import workflows.
 
 Yield may reuse an existing transient staged handoff file for repeated copy or drag operations when it is still valid. Reuse is allowed only when the source file identity and fingerprint, selection range, audition/render settings, write format, cache/staging version, and resulting audio payload still match. If any relevant input changes, Yield should render a fresh staged file.
 
@@ -1316,7 +1316,7 @@ Removing a source from Yield should remove it from the indexed source list but s
 
 Configured sources can be reordered directly in the source list with a primary-pointer drag. The active gesture should show a source-row ghost that follows the pointer and a precise insertion line at the pending destination. The drop commits only the source-list order: stable source identity, role, selected source, loaded tree state, processing state, and source contents remain unchanged. The new order must persist across restart, and source-row reordering must remain distinct from dropping samples or folders onto a source.
 
-Source items should have a context menu with a platform-native file-manager action. The visible label should be "Open in Explorer" on Windows, "Open in Finder" on macOS, and "Open in File Manager" on fallback platforms. This should open the source root folder in the platform file manager so users can inspect files, manually back up `.wavecrate.db`, or manage the folder outside Yield.
+Source items should have a context menu with a platform-native file-manager action. The visible label should be "Open in Explorer" on Windows, "Open in Finder" on macOS, and "Open in File Manager" on fallback platforms. This should open the source root folder in the platform file manager so users can inspect files, manually back up `.yield.db`, or manage the folder outside Yield.
 
 Sample rows should have a context menu with a platform-native reveal action. The visible label should be "Reveal in Explorer" on Windows, "Reveal in Finder" on macOS, and "Reveal in File Manager" on fallback platforms. This should open the containing folder and select the specific audio file where the platform supports file selection. If the file is missing or unavailable, Yield should show the missing-file state and offer source reconciliation or cleanup actions instead of opening an invalid path.
 
@@ -1332,7 +1332,7 @@ When multiple rows are selected, "Copy Path" should copy only one path: the focu
 
 If the root folder for a configured source is moved, renamed, deleted, disconnected, or otherwise unavailable outside Yield, Yield should mark the source as broken or missing in the source list and folder tree. The UI should not silently drop the source, delete its metadata, or pretend the source is empty.
 
-Yield should not allow a configured source root to be copied, moved, or renamed through ordinary in-app folder commands. Source-root location and duplication workflows should go through explicit source relink, remove, source-swap, backup, or export/source-management flows so `.wavecrate.db` ownership, file watching, scan state, and source identity stay clear. Ordinary in-app folder copy/move/rename remains available for folders inside a source root.
+Yield should not allow a configured source root to be copied, moved, or renamed through ordinary in-app folder commands. Source-root location and duplication workflows should go through explicit source relink, remove, source-swap, backup, or export/source-management flows so `.yield.db` ownership, file watching, scan state, and source identity stay clear. Ordinary in-app folder copy/move/rename remains available for folders inside a source root.
 
 A broken or missing source should keep its source metadata and source database reference available for repair where possible. Yield should provide clear actions to:
 
@@ -1559,7 +1559,7 @@ Pasting into Explorer should create one or more audio files in the target direct
 
 Clipboard handoff should preserve the exact audio the user intended to copy. For a waveform selection, that means the selected range. For browser selections, that means the selected whole files.
 
-Temporary clipboard or DAW handoff staging files, for operations that still genuinely require transient staging, should live under the global `.wavecrate` handoff staging area. Waveform-selection clipboard copy and Explorer drops are different: Yield should create the final ordinary audio file in the active Yield folder or Explorer drop target directory rather than leaving the user with a temporary staged file.
+Temporary clipboard or DAW handoff staging files, for operations that still genuinely require transient staging, should live under the global `.yield` handoff staging area. Waveform-selection clipboard copy and Explorer drops are different: Yield should create the final ordinary audio file in the active Yield folder or Explorer drop target directory rather than leaving the user with a temporary staged file.
 
 Drag-and-drop should mirror clipboard handoff behavior.
 
@@ -2004,7 +2004,7 @@ Generated display names should update automatically whenever the structured meta
 
 Generated display names are derived values, not manually authored names. The durable source of truth is the metadata, naming template, Sample ID, real disk filename, folder location, and any explicit apply-to-disk rename transaction. Yield should persist generated-name cache/index projections so the speed gain is retained after restart, but those projections remain rebuildable derived state rather than user-authored metadata.
 
-The naming template should be configured only through a user-editable config file in the current target. Yield should not provide an in-app naming-template editor, in-app template builder, or normal settings control for editing the template. Yield should load the naming template at launch from the global `.wavecrate` configuration area, falling back to the built-in default only when the config file is missing. Editing the config file while Yield is running does not need to hot-reload the template.
+The naming template should be configured only through a user-editable config file in the current target. Yield should not provide an in-app naming-template editor, in-app template builder, or normal settings control for editing the template. Yield should load the naming template at launch from the global `.yield` configuration area, falling back to the built-in default only when the config file is missing. Editing the config file while Yield is running does not need to hot-reload the template.
 
 The config-file template syntax should be a string template with named tokens, such as `{prefix}_{playback-type}_{sound-type}_{character}_{bpm}_{label}_{number}`. Supported initial tokens should match the structured metadata fields used by the default naming order. Literal text should be allowed in templates, for example `{prefix}_drum_{sound-type}_{number}`. Unknown tokens should make the template invalid rather than being silently ignored. Yield should own token normalization, separator cleanup, empty-token omission, uniqueness numbering, and validation errors so a user-edited template cannot create malformed generated names.
 
@@ -2162,7 +2162,7 @@ Database updates that touch both filesystem state and metadata state should be t
 
 ## Cache and Storage Lifecycle
 
-Yield may create local caches for generated display names, compact waveform summaries, analysis outputs, similarity indexes, map projections, thumbnails or visual summaries, handoff staging, and undo/recovery. Cache payloads should be stored under the global `.wavecrate` root. Source-local `.wavecrate.db` files should only store cache references, cache status, fingerprints, and invalidation metadata where needed.
+Yield may create local caches for generated display names, compact waveform summaries, analysis outputs, similarity indexes, map projections, thumbnails or visual summaries, handoff staging, and undo/recovery. Cache payloads should be stored under the global `.yield` root. Source-local `.yield.db` files should only store cache references, cache status, fingerprints, and invalidation metadata where needed.
 
 Caches should be treated as rebuildable unless explicitly documented otherwise. Generated display-name caches and compact waveform summaries may persist across restarts for speed, but they are still rebuildable projections of source files, metadata, and naming rules. Decoded playback buffers are bounded process-local state, not a persistent per-file library cache. User-authored metadata, ratings, tags, labels, naming-template inputs, source configuration, Sample IDs, and undo state for the current session are not disposable caches.
 

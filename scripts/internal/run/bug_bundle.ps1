@@ -22,12 +22,12 @@ Note: logs and config may contain local paths. Review before sharing.
 
 function Get-SandboxConfigBase {
   $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
-  return (Join-Path $rootDir ".sandbox\\wavecrate")
+  return (Join-Path $rootDir ".sandbox\\yield")
 }
 
 function Get-DefaultConfigBase {
-  if (-not [string]::IsNullOrWhiteSpace($env:WAVECRATE_CONFIG_HOME)) {
-    return $env:WAVECRATE_CONFIG_HOME
+  if (-not [string]::IsNullOrWhiteSpace($env:YIELD_CONFIG_HOME)) {
+    return $env:YIELD_CONFIG_HOME
   }
   $sandboxBase = Get-SandboxConfigBase
   if ($script:Sandbox -or (Test-Path -LiteralPath $sandboxBase -PathType Container)) {
@@ -49,8 +49,8 @@ function Get-DefaultConfigBase {
 }
 
 function Get-PersistenceProfile {
-  if (-not [string]::IsNullOrWhiteSpace($env:WAVECRATE_CONFIG_PROFILE)) {
-    return $env:WAVECRATE_CONFIG_PROFILE.Trim()
+  if (-not [string]::IsNullOrWhiteSpace($env:YIELD_CONFIG_PROFILE)) {
+    return $env:YIELD_CONFIG_PROFILE.Trim()
   }
   if ($script:Sandbox) {
     return "sandbox"
@@ -91,9 +91,9 @@ function Resolve-AppRoot {
   $base = Get-DefaultConfigBase
   $profile = Get-PersistenceProfile
   $defaultRoot = if ($profile -ieq "live") {
-    Join-Path $base ".wavecrate"
+    Join-Path $base ".yield"
   } else {
-    Join-Path $base (".wavecrate\\profiles\\" + $profile)
+    Join-Path $base (".yield\\profiles\\" + $profile)
   }
   $configPath = Join-Path $defaultRoot "config.toml"
 
@@ -111,7 +111,7 @@ $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
 $sandboxBase = Get-SandboxConfigBase
 $configBase = Get-DefaultConfigBase
 $usedSandbox = $false
-if ([string]::IsNullOrWhiteSpace($env:WAVECRATE_CONFIG_HOME) -and ($configBase -eq $sandboxBase)) {
+if ([string]::IsNullOrWhiteSpace($env:YIELD_CONFIG_HOME) -and ($configBase -eq $sandboxBase)) {
   $usedSandbox = $true
 }
 
@@ -120,8 +120,8 @@ $logsDir = Join-Path $appRoot "logs"
 $configPath = Join-Path $appRoot "config.toml"
 $timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
 
-$bundleRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wavecrate-bug-bundle-" + $timestamp)
-$bundleDir = Join-Path $bundleRoot ("wavecrate-bug-bundle-" + $timestamp)
+$bundleRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("yield-bug-bundle-" + $timestamp)
+$bundleDir = Join-Path $bundleRoot ("yield-bug-bundle-" + $timestamp)
 New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
 
 New-Item -ItemType Directory -Path (Join-Path $bundleDir "meta") -Force | Out-Null
@@ -170,7 +170,7 @@ if (Test-Path -LiteralPath $logsDir -PathType Container) {
 }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-$zipPath = Join-Path $OutDir ("wavecrate-bug-bundle-" + $timestamp + ".zip")
+$zipPath = Join-Path $OutDir ("yield-bug-bundle-" + $timestamp + ".zip")
 
 Compress-Archive -Path $bundleDir -DestinationPath $zipPath -Force
 Remove-Item -LiteralPath $bundleRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -1,8 +1,8 @@
-//! Application directory helpers anchored to a single `.wavecrate` folder.
+//! Application directory helpers anchored to a single `.yield` folder.
 //!
 //! The helpers centralize where config and log files live across platforms,
 //! defaulting to the OS config directory (e.g., `%APPDATA%` on Windows) and
-//! allowing a `WAVECRATE_CONFIG_HOME` override for tests or portable setups.
+//! allowing a `YIELD_CONFIG_HOME` override for tests or portable setups.
 //! Test executables default to an isolated `automated-tests` profile unless
 //! they explicitly request the live profile or another config root.
 
@@ -37,7 +37,7 @@ pub use storage_usage::{
 };
 
 /// Name of the application directory that lives under the OS config root.
-pub const APP_DIR_NAME: &str = ".wavecrate";
+pub const APP_DIR_NAME: &str = ".yield";
 /// Name of the directory that stores explicit non-live persistence profiles.
 pub const PROFILE_DIR_NAME: &str = "profiles";
 /// Canonical non-live profile name used for sandbox/manual QA runs.
@@ -45,7 +45,7 @@ pub const SANDBOX_PROFILE_NAME: &str = "sandbox";
 /// Canonical non-live profile name used for automated validation runs.
 pub const AUTOMATED_PROFILE_NAME: &str = "automated-tests";
 
-const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
+const CONFIG_PROFILE_ENV: &str = "YIELD_CONFIG_PROFILE";
 const TEST_EXECUTABLE_DIR_NAME: &str = "deps";
 
 #[cfg(test)]

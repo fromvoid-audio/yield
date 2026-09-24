@@ -15,11 +15,11 @@ fi
 
 # shellcheck source=scripts/internal/validation/use_validation_target.sh
 source "$ROOT_DIR/scripts/internal/validation/use_validation_target.sh"
-wavecrate_use_validation_target "$ROOT_DIR"
+yield_use_validation_target "$ROOT_DIR"
 
-if wavecrate_has_enclosing_validation_watchdog; then
+if yield_has_enclosing_validation_watchdog; then
   exec "$@"
 fi
 
-export WAVECRATE_VALIDATION_WATCHDOG_ACTIVE=1
+export YIELD_VALIDATION_WATCHDOG_ACTIVE=1
 exec python3 "$ROOT_DIR/scripts/internal/validation/run_with_progress_watchdog.py" "$@"

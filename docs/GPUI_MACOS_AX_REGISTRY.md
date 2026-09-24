@@ -1,6 +1,6 @@
 # GPUI macOS accessibility child registry
 
-`wavecrate_platform::accessibility::AxRegistry` extends the single-control native bridge proved in `GPUI_MACOS_AX_BRIDGE_PROOF.md`. One registry owns the AX children installed on the real GPUI `NSView` for one window. The owning GPUI entity keeps the registry and its bounded event receiver alive for that window's lifetime.
+`yield_platform::accessibility::AxRegistry` extends the single-control native bridge proved in `GPUI_MACOS_AX_BRIDGE_PROOF.md`. One registry owns the AX children installed on the real GPUI `NSView` for one window. The owning GPUI entity keeps the registry and its bounded event receiver alive for that window's lifetime.
 
 ## Owner contract
 
@@ -17,7 +17,7 @@ The bridge is macOS-only and contains no browser, waveform, transport, or Settin
 On macOS, build and run:
 
 ```sh
-cargo build -p wavecrate-platform --example ax_registry_probe
+cargo build -p yield-platform --example ax_registry_probe
 target/debug/examples/ax_registry_probe
 ```
 

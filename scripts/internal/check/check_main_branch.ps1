@@ -4,7 +4,7 @@ Verifies that the current repository uses main as its integration branch.
 
 .DESCRIPTION
 Requires local `main` to track `origin/main`. Agent work should be committed and
-pushed directly to `main` for ordinary Wavecrate work.
+pushed directly to `main` for ordinary Yield work.
 #>
 
 param(

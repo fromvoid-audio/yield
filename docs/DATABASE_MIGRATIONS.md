@@ -1,18 +1,18 @@
 # Database Migration Contract
 
-Wavecrate treats persisted SQLite state as a user-trust surface. Schema changes
+Yield treats persisted SQLite state as a user-trust surface. Schema changes
 must preserve existing ratings, tags, collection state, curation timestamps,
 file-operation recovery state, analysis status, and cache references wherever
 the old data can be interpreted safely.
 
 ## Database Families
 
-- Source databases live in each indexed source folder as `.wavecrate.db`.
+- Source databases live in each indexed source folder as `.yield.db`.
   They own source-local file metadata, tags assigned to files in that source,
   ratings, curation state, scan status, pending rename records, file-operation
   recovery state, revision-fenced versioned readiness targets/artifact completions, readiness-owned
   job metadata, and source-local analysis/cache references.
-- The global library database lives under Wavecrate's app config directory as
+- The global library database lives under Yield's app config directory as
   `library.db`. It owns configured source references and global analysis/cache
   state that is not source-local.
 
@@ -20,8 +20,8 @@ the old data can be interpreted safely.
 
 Source-local database writes must stay inside the configured source/database
 root. Writable opens, read-only opens, legacy filename migration, and SQLite
-WAL/SHM sidecar handling must reject symlinked `.wavecrate.db`,
-`.wavecrate_samples.db`, and related sidecar paths before handing the path to
+WAL/SHM sidecar handling must reject symlinked `.yield.db`,
+`.yield_samples.db`, and related sidecar paths before handing the path to
 SQLite or filesystem rename operations. Existing regular DB files and newly
 created DB parents must resolve under the canonical database root.
 
@@ -62,7 +62,7 @@ from a read-only UI or worker path must either:
 - avoid the feature-specific query when the required table or column is absent.
 
 Do not add direct `SELECT new_column` reads to read-only paths without a legacy
-fixture proving an older `.wavecrate.db` still opens and shows usable metadata.
+fixture proving an older `.yield.db` still opens and shows usable metadata.
 
 ## Tests
 
@@ -73,10 +73,10 @@ for the global library database.
 Use these focused checks after persistence changes:
 
 ```sh
-cargo test -p wavecrate-library source_db_migration_tests
-cargo test -p wavecrate-library sample_sources::db::read
-cargo test -p wavecrate-library sample_sources::library
-cargo check -p wavecrate-library
+cargo test -p yield-library source_db_migration_tests
+cargo test -p yield-library sample_sources::db::read
+cargo test -p yield-library sample_sources::library
+cargo check -p yield-library
 ```
 
 Run the broader wrapper lane for release-risk or cross-module persistence work:

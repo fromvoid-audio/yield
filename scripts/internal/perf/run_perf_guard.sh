@@ -13,7 +13,7 @@ cd "$ROOT_DIR"
 # shellcheck source=scripts/internal/setup_headless_audio.sh
 source "$ROOT_DIR/scripts/internal/setup_headless_audio.sh"
 # Tooling-only Linux fallback for headless perf hosts; not product support.
-wavecrate_setup_headless_audio "perf_guard"
+yield_setup_headless_audio "perf_guard"
 
 RADIANT_DIR="$("$ROOT_DIR/scripts/radiant.sh" locate | sed -n 's/^RADIANT_DIR=//p')"
 RADIANT_RUNTIME_FILE="$RADIANT_DIR/src/gui_runtime/native_vello.rs"
@@ -23,20 +23,20 @@ if [ ! -f "$RADIANT_RUNTIME_FILE" ]; then
   exit 1
 fi
 
-OUT_PATH="${WAVECRATE_PERF_GUARD_OUT:-target/perf/bench.json}"
-GUI_ROWS="${WAVECRATE_PERF_GUARD_GUI_ROWS:-2500}"
-GUI_INTERACTION_ROWS="${WAVECRATE_PERF_GUARD_GUI_INTERACTION_ROWS:-1500}"
-GUI_INTERACTION_ITERS="${WAVECRATE_PERF_GUARD_GUI_INTERACTION_ITERS:-24}"
-WARMUP_ITERS="${WAVECRATE_PERF_GUARD_WARMUP_ITERS:-3}"
-MEASURE_ITERS="${WAVECRATE_PERF_GUARD_MEASURE_ITERS:-16}"
-RUNS="${WAVECRATE_PERF_GUARD_RUNS:-1}"
-PERF_STATE_ROOT="${WAVECRATE_PERF_GUARD_STATE_ROOT:-$ROOT_DIR/target/perf/runtime}"
-STARTUP_PROFILE_RAW="${WAVECRATE_PERF_GUARD_STARTUP_PROFILE:-0}"
-STARTUP_TIMEOUT_SECS="${WAVECRATE_PERF_GUARD_STARTUP_TIMEOUT_SECS:-6}"
-STARTUP_REQUIRE_VALID_RAW="${WAVECRATE_PERF_GUARD_STARTUP_REQUIRE_VALID_RUNS:-0}"
-STARTUP_LOCK_ENV_OUT="${WAVECRATE_PERF_GUARD_STARTUP_LOCK_ENV_OUT:-}"
-STARTUP_LOCK_ENV_IN="${WAVECRATE_PERF_GUARD_STARTUP_LOCK_ENV_IN:-$ROOT_DIR/scripts/internal/perf/locks/startup_thresholds.env}"
-FRAME_QUALITY_LOCK_ENV_OUT="${WAVECRATE_PERF_GUARD_FRAME_QUALITY_LOCK_ENV_OUT:-}"
+OUT_PATH="${YIELD_PERF_GUARD_OUT:-target/perf/bench.json}"
+GUI_ROWS="${YIELD_PERF_GUARD_GUI_ROWS:-2500}"
+GUI_INTERACTION_ROWS="${YIELD_PERF_GUARD_GUI_INTERACTION_ROWS:-1500}"
+GUI_INTERACTION_ITERS="${YIELD_PERF_GUARD_GUI_INTERACTION_ITERS:-24}"
+WARMUP_ITERS="${YIELD_PERF_GUARD_WARMUP_ITERS:-3}"
+MEASURE_ITERS="${YIELD_PERF_GUARD_MEASURE_ITERS:-16}"
+RUNS="${YIELD_PERF_GUARD_RUNS:-1}"
+PERF_STATE_ROOT="${YIELD_PERF_GUARD_STATE_ROOT:-$ROOT_DIR/target/perf/runtime}"
+STARTUP_PROFILE_RAW="${YIELD_PERF_GUARD_STARTUP_PROFILE:-0}"
+STARTUP_TIMEOUT_SECS="${YIELD_PERF_GUARD_STARTUP_TIMEOUT_SECS:-6}"
+STARTUP_REQUIRE_VALID_RAW="${YIELD_PERF_GUARD_STARTUP_REQUIRE_VALID_RUNS:-0}"
+STARTUP_LOCK_ENV_OUT="${YIELD_PERF_GUARD_STARTUP_LOCK_ENV_OUT:-}"
+STARTUP_LOCK_ENV_IN="${YIELD_PERF_GUARD_STARTUP_LOCK_ENV_IN:-$ROOT_DIR/scripts/internal/perf/locks/startup_thresholds.env}"
+FRAME_QUALITY_LOCK_ENV_OUT="${YIELD_PERF_GUARD_FRAME_QUALITY_LOCK_ENV_OUT:-}"
 CARGO_BIN="${CARGO_BIN:-cargo}"
 
 lowercase() {
@@ -77,7 +77,7 @@ mkdir -p "$(dirname "$OUT_PATH")"
 mkdir -p "$PERF_STATE_ROOT/config" "$PERF_STATE_ROOT/data" "$PERF_STATE_ROOT/state"
 
 if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || [ "$RUNS" -lt 1 ]; then
-  echo "[perf_guard] ERROR: WAVECRATE_PERF_GUARD_RUNS must be an integer >= 1" >&2
+  echo "[perf_guard] ERROR: YIELD_PERF_GUARD_RUNS must be an integer >= 1" >&2
   exit 1
 fi
 
@@ -95,15 +95,15 @@ if (( startup_profile_enabled == 1 )) && ! command -v timeout >/dev/null 2>&1; t
 fi
 
 if (( startup_profile_enabled == 1 )); then
-  startup_binary="${ROOT_DIR}/target/debug/wavecrate"
-  echo "[perf_guard] building wavecrate startup binary for profile capture"
-  "$CARGO_BIN" build --bin wavecrate >/dev/null
+  startup_binary="${ROOT_DIR}/target/debug/yield"
+  echo "[perf_guard] building yield startup binary for profile capture"
+  "$CARGO_BIN" build --bin yield >/dev/null
   if [[ "$RUNS" -ge 3 ]]; then
     startup_min_valid_runs_default=3
   else
     startup_min_valid_runs_default=1
   fi
-  STARTUP_MIN_VALID_RUNS="${WAVECRATE_PERF_GUARD_STARTUP_MIN_VALID_RUNS:-$startup_min_valid_runs_default}"
+  STARTUP_MIN_VALID_RUNS="${YIELD_PERF_GUARD_STARTUP_MIN_VALID_RUNS:-$startup_min_valid_runs_default}"
 fi
 
 if [[ "$RUNS" -ge 3 ]]; then
@@ -111,7 +111,7 @@ if [[ "$RUNS" -ge 3 ]]; then
 else
   frame_quality_min_runs_default=1
 fi
-FRAME_QUALITY_LOCK_MIN_RUNS="${WAVECRATE_PERF_GUARD_FRAME_QUALITY_LOCK_MIN_RUNS:-$frame_quality_min_runs_default}"
+FRAME_QUALITY_LOCK_MIN_RUNS="${YIELD_PERF_GUARD_FRAME_QUALITY_LOCK_MIN_RUNS:-$frame_quality_min_runs_default}"
 
 for run in $(seq 1 "$RUNS"); do
   run_out="$OUT_PATH"
@@ -119,8 +119,8 @@ for run in $(seq 1 "$RUNS"); do
     run_out="${OUT_PATH%.json}.run${run}.json"
   fi
   REPORT_PATHS+=("$run_out")
-  echo "[perf_guard] running wavecrate-bench interaction profile (run ${run}/${RUNS})"
-  "$CARGO_BIN" run -p wavecrate-bench-cli --bin wavecrate-bench -- \
+  echo "[perf_guard] running yield-bench interaction profile (run ${run}/${RUNS})"
+  "$CARGO_BIN" run -p yield-bench-cli --bin yield-bench -- \
     --out "$run_out" \
     --no-analysis \
     --no-similarity \
@@ -164,33 +164,33 @@ if [[ -n "$FRAME_QUALITY_LOCK_ENV_OUT" ]]; then
 fi
 
 if (( startup_profile_enabled == 1 )); then
-  startup_summary_out="${WAVECRATE_PERF_GUARD_STARTUP_SUMMARY_OUT:-${OUT_PATH%.json}.startup_summary.json}"
+  startup_summary_out="${YIELD_PERF_GUARD_STARTUP_SUMMARY_OUT:-${OUT_PATH%.json}.startup_summary.json}"
   startup_summary_cmd=(
     python3
     scripts/internal/perf/perf_startup_summary.py
     --output
     "$startup_summary_out"
     --warn-first-present-ms
-    "${WAVECRATE_PERF_WARN_STARTUP_FIRST_PRESENT_MS:-800}"
+    "${YIELD_PERF_WARN_STARTUP_FIRST_PRESENT_MS:-800}"
     --min-valid-runs
     "$STARTUP_MIN_VALID_RUNS"
   )
-  if [[ -n "${WAVECRATE_PERF_FAIL_STARTUP_FIRST_PRESENT_MS:-}" ]]; then
+  if [[ -n "${YIELD_PERF_FAIL_STARTUP_FIRST_PRESENT_MS:-}" ]]; then
     startup_summary_cmd+=(
       --fail-first-present-ms
-      "$WAVECRATE_PERF_FAIL_STARTUP_FIRST_PRESENT_MS"
+      "$YIELD_PERF_FAIL_STARTUP_FIRST_PRESENT_MS"
     )
   fi
-  if [[ -n "${WAVECRATE_PERF_WARN_STARTUP_FIRST_PRESENT_SPREAD_MS:-}" ]]; then
+  if [[ -n "${YIELD_PERF_WARN_STARTUP_FIRST_PRESENT_SPREAD_MS:-}" ]]; then
     startup_summary_cmd+=(
       --warn-first-present-spread-ms
-      "$WAVECRATE_PERF_WARN_STARTUP_FIRST_PRESENT_SPREAD_MS"
+      "$YIELD_PERF_WARN_STARTUP_FIRST_PRESENT_SPREAD_MS"
     )
   fi
-  if [[ -n "${WAVECRATE_PERF_FAIL_STARTUP_FIRST_PRESENT_SPREAD_MS:-}" ]]; then
+  if [[ -n "${YIELD_PERF_FAIL_STARTUP_FIRST_PRESENT_SPREAD_MS:-}" ]]; then
     startup_summary_cmd+=(
       --fail-first-present-spread-ms
-      "$WAVECRATE_PERF_FAIL_STARTUP_FIRST_PRESENT_SPREAD_MS"
+      "$YIELD_PERF_FAIL_STARTUP_FIRST_PRESENT_SPREAD_MS"
     )
   fi
   if (( startup_require_valid_runs == 1 )); then
@@ -199,7 +199,7 @@ if (( startup_profile_enabled == 1 )); then
   startup_summary_cmd+=("${STARTUP_LOG_PATHS[@]}")
   "${startup_summary_cmd[@]}"
   if [[ -n "$STARTUP_LOCK_ENV_OUT" ]]; then
-    STARTUP_LOCK_MIN_VALID_RUNS="${WAVECRATE_PERF_GUARD_STARTUP_LOCK_MIN_VALID_RUNS:-$STARTUP_MIN_VALID_RUNS}"
+    STARTUP_LOCK_MIN_VALID_RUNS="${YIELD_PERF_GUARD_STARTUP_LOCK_MIN_VALID_RUNS:-$STARTUP_MIN_VALID_RUNS}"
     python3 scripts/internal/perf/perf_startup_lock_thresholds.py \
       --summary "$startup_summary_out" \
       --out "$STARTUP_LOCK_ENV_OUT" \

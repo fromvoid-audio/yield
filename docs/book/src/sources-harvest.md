@@ -1,10 +1,10 @@
 # Sources, Locks, and Harvest
 
-Sources are the roots Wavecrate indexes. A source can be an ordinary sample folder, a protected project folder, or a folder that participates in the Harvest workflow.
+Sources are the roots Yield indexes. A source can be an ordinary sample folder, a protected project folder, or a folder that participates in the Harvest workflow.
 
 ## Ordinary Sources
 
-An ordinary source is a local folder you allow Wavecrate to index and work with directly. Wavecrate can read files, track metadata, and perform file operations you explicitly request.
+An ordinary source is a local folder you allow Yield to index and work with directly. Yield can read files, track metadata, and perform file operations you explicitly request.
 
 Use ordinary sources for:
 
@@ -15,7 +15,7 @@ Use ordinary sources for:
 
 ## Protected and Locked Sources
 
-Protected sources are for original project material, long recordings, Ableton folders, field recordings, or anything where you do not want Wavecrate to casually mutate the original.
+Protected sources are for original project material, long recordings, Ableton folders, field recordings, or anything where you do not want Yield to casually mutate the original.
 
 Protected behavior keeps the workflow creative while reducing risk:
 
@@ -28,7 +28,7 @@ Locked folders are stricter. Use locking when a source should be visible and aud
 
 ## Harvest Concepts
 
-Harvest is Wavecrate's way of tracking how raw material turns into reusable samples.
+Harvest is Yield's way of tracking how raw material turns into reusable samples.
 
 - **Origin:** the original file or recording.
 - **Derivative:** a new file created from an origin, usually by extraction or a protected-source edit.

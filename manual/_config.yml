@@ -1,6 +1,6 @@
-# GitHub Pages configuration for Wavecrate documentation site
+# GitHub Pages configuration for Yield documentation site
 # Uses custom layout and styling to match the app's dark theme.
-title: Wavecrate
+title: Yield
 description: Audio sample triage
 markdown: kramdown
 theme: null

@@ -12,7 +12,7 @@ Related contracts are the [I/O architecture target](IO_ARCHITECTURE_TARGET.md), 
 
 ## Implemented OPT-1638 boundary
 
-The first source-writer slice is implemented in `wavecrate-library`. Schema version 13
+The first source-writer slice is implemented in `yield-library`. Schema version 13
 adds the source-local `source_participant_curation_receipts` relation. It retains a
 versioned, deny-unknown request codec and structured curation receipt, with a 256-row
 and 16 MiB combined request/receipt budget and a per-record `MAX_RECORD_BYTES` limit.
@@ -263,15 +263,15 @@ This inventory separates built paths from the proposed owner boundary:
 
 | Current path | Evidence and contract status |
 | --- | --- |
-| `wavecrate-session/src/lib.rs::Persistence::start` / `shutdown` | Profile ownership and journal start before catalog; shutdown closes catalog, global writer, journal, then the final writable guard. This is the lifecycle ordering the source owner must join. |
-| `wavecrate-catalog/src/lib.rs::RegisteredSource`, `run_worker`, `retire_source`, and `retarget_previous_source` | Catalog currently serializes a source registration and retains `SourceDatabase` plus publication fence/authority state. Retirement and retargeting are existing handoff exceptions, not proof that every caller uses the proposed typed command envelope. |
-| `wavecrate-catalog/src/lib.rs::run_worker` shutdown and panic paths | The current worker has no panic-retention boundary, and the existing shutdown/retirement paths can drop the actual source lease when they finish. OPT-1857 must extend these lifecycle boundaries with a real lease-held async grant; a counter or non-owning fence cannot provide that retention. |
-| `wavecrate-catalog/src/lib.rs::CatalogScanWriter` | Direct `SourceWriteBatch` access is a current catalog scan path. It is a migration exception that must be routed through the source owner before being treated as the general contract. |
-| `wavecrate-library/src/sample_sources/db/write/curation.rs` | Curation already checks an expected source revision and root/profile authority in a bounded transaction, but its receipt lacks durable operation/participant identity. |
-| `wavecrate-library/src/sample_sources/db/write/transaction.rs` and source directory/index writers | Direct source transactions and raw revision bumps remain built source-local writers; they do not receive the proposed lifecycle/operation envelope yet. |
-| `wavecrate-catalog/src/lib.rs::read_snapshot_from_database` | The current catalog audit path reads source identity, revision, and bounded snapshot state. Its result is an observation and must retain the exact revision/lifecycle cut for the proposed FreshAsOf contract. |
-| `wavecrate-library/src/sample_sources/db/read/metadata_queries.rs::browser_metadata_snapshot`, `browser_metadata_for_paths_at_revision`, and `browser_metadata_page` | These are the current browser metadata snapshot and keyset-page callers. `browser_metadata_snapshot` has no post-read freshness check; the future snapshot backend must report that boundary rather than imply a perpetually current projection. |
-| `wavecrate-library/src/sample_sources/db/open/read_only.rs` and catalog projections | These are read observations. They do not own a source lease and cannot be promoted to write authority. |
+| `yield-session/src/lib.rs::Persistence::start` / `shutdown` | Profile ownership and journal start before catalog; shutdown closes catalog, global writer, journal, then the final writable guard. This is the lifecycle ordering the source owner must join. |
+| `yield-catalog/src/lib.rs::RegisteredSource`, `run_worker`, `retire_source`, and `retarget_previous_source` | Catalog currently serializes a source registration and retains `SourceDatabase` plus publication fence/authority state. Retirement and retargeting are existing handoff exceptions, not proof that every caller uses the proposed typed command envelope. |
+| `yield-catalog/src/lib.rs::run_worker` shutdown and panic paths | The current worker has no panic-retention boundary, and the existing shutdown/retirement paths can drop the actual source lease when they finish. OPT-1857 must extend these lifecycle boundaries with a real lease-held async grant; a counter or non-owning fence cannot provide that retention. |
+| `yield-catalog/src/lib.rs::CatalogScanWriter` | Direct `SourceWriteBatch` access is a current catalog scan path. It is a migration exception that must be routed through the source owner before being treated as the general contract. |
+| `yield-library/src/sample_sources/db/write/curation.rs` | Curation already checks an expected source revision and root/profile authority in a bounded transaction, but its receipt lacks durable operation/participant identity. |
+| `yield-library/src/sample_sources/db/write/transaction.rs` and source directory/index writers | Direct source transactions and raw revision bumps remain built source-local writers; they do not receive the proposed lifecycle/operation envelope yet. |
+| `yield-catalog/src/lib.rs::read_snapshot_from_database` | The current catalog audit path reads source identity, revision, and bounded snapshot state. Its result is an observation and must retain the exact revision/lifecycle cut for the proposed FreshAsOf contract. |
+| `yield-library/src/sample_sources/db/read/metadata_queries.rs::browser_metadata_snapshot`, `browser_metadata_for_paths_at_revision`, and `browser_metadata_page` | These are the current browser metadata snapshot and keyset-page callers. `browser_metadata_snapshot` has no post-read freshness check; the future snapshot backend must report that boundary rather than imply a perpetually current projection. |
+| `yield-library/src/sample_sources/db/open/read_only.rs` and catalog projections | These are read observations. They do not own a source lease and cannot be promoted to write authority. |
 | `sample_sources/db/file_ops_journal/reconcile.rs` | This is source-local recovery evidence with its own semantics, not a general source writer or durable participant receipt store. It must not be widened as a shortcut. |
 
 The source SQL owner is therefore a migration boundary, not a claim that current

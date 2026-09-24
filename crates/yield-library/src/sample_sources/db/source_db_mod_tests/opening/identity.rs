@@ -22,11 +22,11 @@ use crate::sample_sources::readiness::{
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const SOURCE_LEASE_HELPER_BASE_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_BASE";
-const SOURCE_LEASE_HELPER_PROFILE_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_PROFILE";
-const SOURCE_LEASE_HELPER_SOURCE_ROOT_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_SOURCE_ROOT";
-const SOURCE_LEASE_HELPER_DATABASE_ROOT_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_DATABASE_ROOT";
-const SOURCE_LEASE_HELPER_MODE_ENV: &str = "WAVECRATE_SOURCE_LEASE_HELPER_MODE";
+const SOURCE_LEASE_HELPER_BASE_ENV: &str = "YIELD_SOURCE_LEASE_HELPER_BASE";
+const SOURCE_LEASE_HELPER_PROFILE_ENV: &str = "YIELD_SOURCE_LEASE_HELPER_PROFILE";
+const SOURCE_LEASE_HELPER_SOURCE_ROOT_ENV: &str = "YIELD_SOURCE_LEASE_HELPER_SOURCE_ROOT";
+const SOURCE_LEASE_HELPER_DATABASE_ROOT_ENV: &str = "YIELD_SOURCE_LEASE_HELPER_DATABASE_ROOT";
+const SOURCE_LEASE_HELPER_MODE_ENV: &str = "YIELD_SOURCE_LEASE_HELPER_MODE";
 
 struct SourceLeaseHelperProcess {
     child: Child,
@@ -1212,10 +1212,8 @@ fn source_database_identity_lease_rejects_sidecar_replacement() {
         database_root.path(),
     )
     .expect("external source database");
-    let lock_path = database_root.path().join(".wavecrate-source-lease.lock");
-    let displaced = database_root
-        .path()
-        .join(".wavecrate-source-lease.lock.old");
+    let lock_path = database_root.path().join(".yield-source-lease.lock");
+    let displaced = database_root.path().join(".yield-source-lease.lock.old");
     std::fs::rename(&lock_path, &displaced).expect("displace source lease sidecar");
     let replacement_bytes = b"replacement source lease sidecar";
     std::fs::write(&lock_path, replacement_bytes).expect("replacement source lease sidecar");
@@ -1344,7 +1342,7 @@ fn source_database_identity_rejects_replacement_before_sqlite_open() {
 
     let child_path = profile_guard.profile_root().join(profile_child);
     let database_path = child_path.join(DB_FILE_NAME);
-    let replacement_path = child_path.join(".wavecrate.db.displaced");
+    let replacement_path = child_path.join(".yield.db.displaced");
     let replacement_bytes = b"replacement bytes must remain untouched";
     let gate_database_path = database_path.clone();
     let gate_replacement_path = replacement_path.clone();
@@ -1430,7 +1428,7 @@ fn source_database_identity_lease_does_not_recreate_database_with_existing_sidec
     let app_root_path = std::fs::canonicalize(app_root.path()).expect("canonical app root");
     let _app_root_guard = AppRootGuard::set(app_root_path).expect("app root override");
     let profile_guard = WritableProfileGuard::acquire_current().expect("profile owner");
-    let lock_path = database_root.path().join(".wavecrate-source-lease.lock");
+    let lock_path = database_root.path().join(".yield-source-lease.lock");
     let lock_bytes = b"preexisting source lease diagnostic";
     std::fs::write(&lock_path, lock_bytes).expect("preexisting lease sidecar");
     let database_path = database_root.path().join(DB_FILE_NAME);
@@ -1515,7 +1513,7 @@ fn source_database_identity_lease_bootstraps_fresh_sidecar_on_current_legacy_sch
         .expect("seed current legacy source row");
     drop(legacy);
     let database_path = database_root.path().join(DB_FILE_NAME);
-    let lease_path = database_root.path().join(".wavecrate-source-lease.lock");
+    let lease_path = database_root.path().join(".yield-source-lease.lock");
     let legacy_row: String = Connection::open(&database_path)
         .expect("inspect current legacy source database")
         .query_row(
@@ -1755,7 +1753,7 @@ fn source_database_identity_rejects_replacement_before_readiness_mutation() {
         .profile_root()
         .join("identity-before-readiness")
         .join(DB_FILE_NAME);
-    let displaced_path = database_path.with_file_name(".wavecrate.db.displaced");
+    let displaced_path = database_path.with_file_name(".yield.db.displaced");
     let replacement_bytes = b"replacement readiness database remains unchanged";
     let mut readiness = database.readiness_store().expect("owned readiness store");
     std::fs::rename(&database_path, &displaced_path).expect("displace open database");
@@ -1825,7 +1823,7 @@ fn source_database_identity_rejects_replacement_during_readiness_write() {
         .profile_root()
         .join(profile_child)
         .join(DB_FILE_NAME);
-    let displaced_path = database_path.with_file_name(".wavecrate.db.displaced");
+    let displaced_path = database_path.with_file_name(".yield.db.displaced");
     let replacement_bytes = b"replacement during readiness write remains unchanged";
     database
         .connection
@@ -1979,7 +1977,7 @@ fn source_database_identity_rejects_replacement_before_mutation() {
         .profile_root()
         .join("identity-before-mutation")
         .join(DB_FILE_NAME);
-    let displaced_path = database_path.with_file_name(".wavecrate.db.displaced");
+    let displaced_path = database_path.with_file_name(".yield.db.displaced");
     let replacement_bytes = b"replacement database remains unchanged";
     std::fs::rename(&database_path, &displaced_path).expect("displace open database");
     std::fs::write(&database_path, replacement_bytes).expect("write replacement");

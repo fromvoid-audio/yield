@@ -53,7 +53,7 @@ case "$EVENT" in
     ;;
 esac
 
-CHECK_COMMAND="${WAVECRATE_AGENT_HOOK_CHECK_COMMAND:-$ROOT_DIR/scripts/internal/check/check_main_branch.sh}"
+CHECK_COMMAND="${YIELD_AGENT_HOOK_CHECK_COMMAND:-$ROOT_DIR/scripts/internal/check/check_main_branch.sh}"
 if [[ ! -x "$CHECK_COMMAND" ]]; then
   echo "[agent_hook_checks] ERROR: missing executable state check: $CHECK_COMMAND" >&2
   exit 1

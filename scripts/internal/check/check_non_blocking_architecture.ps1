@@ -3,7 +3,7 @@
 Runs the required non-blocking app architecture guardrails.
 
 .DESCRIPTION
-This check pins the Radiant and Wavecrate tests that enforce the locked-down
+This check pins the Radiant and Yield tests that enforce the locked-down
 app-facing runtime contract. It is intentionally deterministic: static
 guardrails and a controlled strict-diagnostics harness are required, while
 flaky timing benchmarks remain outside this lane.
@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 if ($Help) {
   Write-Host "Usage: scripts/internal/check/check_non_blocking_architecture.ps1"
   Write-Host ""
-  Write-Host "Run required Radiant and Wavecrate non-blocking architecture guardrails."
+  Write-Host "Run required Radiant and Yield non-blocking architecture guardrails."
   exit 0
 }
 
@@ -46,25 +46,25 @@ function Invoke-NativeStep {
 
 Push-Location $rootDir
 try {
-  Enable-WavecrateCargoCache
+  Enable-YieldCargoCache
 
   Invoke-NativeStep -Label "Radiant synthetic blocking-token fixture" -Command {
-    Invoke-WavecrateCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --lib guardrail_reports_file_line_and_guidance_for_blocking_tokens
+    Invoke-YieldCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --lib guardrail_reports_file_line_and_guidance_for_blocking_tokens
   }
 
   Invoke-NativeStep -Label "Radiant app/runtime/example guardrails" -Command {
-    Invoke-WavecrateCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --test generic_surface_guardrails source_quality::runtime::commands_and_app
+    Invoke-YieldCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') --test generic_surface_guardrails source_quality::runtime::commands_and_app
   }
 
-  Invoke-NativeStep -Label "Wavecrate app-facing blocking guardrail" -Command {
-    Invoke-WavecrateCargo test --package wavecrate --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis
+  Invoke-NativeStep -Label "Yield app-facing blocking guardrail" -Command {
+    Invoke-YieldCargo test --package yield --no-default-features --test gui_boundary native_app_ui_update_paths_do_not_call_blocking_business_apis
   }
 
-  Invoke-NativeStep -Label "Wavecrate strict slow-handler diagnostics harness" -Command {
-    Invoke-WavecrateCargo test --package wavecrate --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow
+  Invoke-NativeStep -Label "Yield strict slow-handler diagnostics harness" -Command {
+    Invoke-YieldCargo test --package yield --no-default-features --lib rapid_navigation_harness_keeps_ui_responsive_while_business_work_is_slow
   }
 
-  Invoke-NativeStep -Label "Wavecrate readiness persistence boundary" -Command {
+  Invoke-NativeStep -Label "Yield readiness persistence boundary" -Command {
     $supervisorFiles = @(
       (Join-Path $rootDir "src/native_app/source_processing/supervisor.rs")
     ) + @(
@@ -81,7 +81,7 @@ try {
     }
   }
 
-  Invoke-NativeStep -Label "Wavecrate source-processing service boundary" -Command {
+  Invoke-NativeStep -Label "Yield source-processing service boundary" -Command {
     $serviceDir = Join-Path $rootDir "src/native_app/source_processing/supervisor"
     $serviceFiles = Get-ChildItem $serviceDir -File -Filter "*.rs"
     $wildcardImports = $serviceFiles | Select-String -Pattern "^use super::\*;"

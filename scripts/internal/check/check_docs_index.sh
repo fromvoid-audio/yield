@@ -21,7 +21,7 @@ required=(
   "docs/TROUBLESHOOTING.md"
 )
 required_phrases=(
-  'Linear project `Wavecrate` under team `PORTALSURFER`'
+  'Linear project `Yield` under team `PORTALSURFER`'
 )
 
 if [[ ! -f "$DOCS_README" ]]; then

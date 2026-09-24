@@ -18,12 +18,12 @@ use crate::operation_journal::{
 };
 use crate::test_runtime::TestRuntimeGuard;
 
-const CONFIG_HOME_ENV: &str = "WAVECRATE_CONFIG_HOME";
-const CONFIG_PROFILE_ENV: &str = "WAVECRATE_CONFIG_PROFILE";
+const CONFIG_HOME_ENV: &str = "YIELD_CONFIG_HOME";
+const CONFIG_PROFILE_ENV: &str = "YIELD_CONFIG_PROFILE";
 const PROFILE_NAME: &str = "operation-journal-restart";
 const OPERATION_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
-const CANCEL_HELPER_ENV: &str = "WAVECRATE_JOURNAL_HELPER_CANCEL";
-const RETRY_HELPER_ENV: &str = "WAVECRATE_JOURNAL_HELPER_RETRY";
+const CANCEL_HELPER_ENV: &str = "YIELD_JOURNAL_HELPER_CANCEL";
+const RETRY_HELPER_ENV: &str = "YIELD_JOURNAL_HELPER_RETRY";
 
 #[derive(Clone, Copy)]
 enum HelperMode {

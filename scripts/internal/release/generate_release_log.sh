@@ -28,7 +28,7 @@ Options:
   --cliff-config <path>          git-cliff config path. Defaults to cliff.toml.
 
 Manual notes can be supplied with RELEASE_NOTES.
-Set WAVECRATE_RELEASE_LOG_DISABLE_GIT_CLIFF=1 to force the deterministic git-log fallback.
+Set YIELD_RELEASE_LOG_DISABLE_GIT_CLIFF=1 to force the deterministic git-log fallback.
 USAGE
 }
 
@@ -279,7 +279,7 @@ done
 
 if [[ -z "$range" ]]; then
   echo "- No code changes since the previous release boundary; this run refreshed release artifacts from the same target commit." > "$changes_file"
-elif [[ "${WAVECRATE_RELEASE_LOG_DISABLE_GIT_CLIFF:-0}" != "1" && -f "$CLIFF_CONFIG" && "$(command -v git-cliff || true)" ]]; then
+elif [[ "${YIELD_RELEASE_LOG_DISABLE_GIT_CLIFF:-0}" != "1" && -f "$CLIFF_CONFIG" && "$(command -v git-cliff || true)" ]]; then
   if ! git cliff --config "$CLIFF_CONFIG" --tag "$VERSION" "$range" > "$changes_file"; then
     git log --no-merges --pretty=format:'- %s' "$range" > "$changes_file"
   fi
@@ -300,7 +300,7 @@ if [[ "$CHANNEL" == "rc" ]]; then
 fi
 
 {
-  echo "# Wavecrate ${VERSION}"
+  echo "# Yield ${VERSION}"
   echo
   echo "## Release Metadata"
   echo
