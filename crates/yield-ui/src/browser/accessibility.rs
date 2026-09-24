@@ -45,6 +45,7 @@ const THEME_CHOOSE: &str = "settings-theme-choose";
 const THEME_RELOAD: &str = "settings-theme-reload";
 const THEME_RESET: &str = "settings-theme-reset";
 const MOTION: &str = "settings-motion";
+const TEXT_SCALE: &str = "settings-text-scale";
 const AUTOPLAY: &str = "settings-autoplay";
 const HELP_TIPS: &str = "settings-help-tips";
 const RATING_DECAY_DECREASE: &str = "settings-rating-decay-decrease";
@@ -62,6 +63,7 @@ const SETTINGS_ORDER: &[&str] = &[
     THEME_RELOAD,
     THEME_RESET,
     MOTION,
+    TEXT_SCALE,
     AUTOPLAY,
     HELP_TIPS,
     SETTINGS_CLOSE,
@@ -674,7 +676,7 @@ impl Browser {
         let busy = self.general_settings.maintenance_busy();
         match id {
             SETTINGS_CLOSE | THEME_RESET => true,
-            THEME_CHOOSE | MOTION | AUTOPLAY | HELP_TIPS => editable,
+            THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | HELP_TIPS => editable,
             THEME_RELOAD => editable && self.theme_load.pending_path.is_none(),
             RATING_DECAY_DECREASE => {
                 editable
@@ -707,6 +709,7 @@ impl Browser {
             THEME_RELOAD => self.reload_theme_from_accessibility(cx),
             THEME_RESET => self.reset_theme_from_accessibility(cx),
             MOTION => self.toggle_motion_from_accessibility(cx),
+            TEXT_SCALE => self.toggle_text_scale_from_accessibility(cx),
             AUTOPLAY => self.toggle_autoplay_from_accessibility(cx),
             HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
             RATING_DECAY_DECREASE => self.change_rating_decay(-1, cx),
@@ -1020,6 +1023,12 @@ impl Browser {
                         true,
                     ),
                     toggle(MOTION, "Animations", theme.motion.enabled, editable),
+                    button(
+                        TEXT_SCALE,
+                        "Text size",
+                        Some(format!("{}%", self.general_settings.text_scale_percent)),
+                        editable,
+                    ),
                     toggle(
                         AUTOPLAY,
                         "Autoplay selection",

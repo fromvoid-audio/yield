@@ -18,6 +18,10 @@ const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Default interval between positive-rating decay steps, in weeks.
 pub const DEFAULT_RATING_DECAY_WEEKS: u16 = 4;
+/// Default in-app text size as a percentage of the authored theme.
+pub const DEFAULT_TEXT_SCALE_PERCENT: u16 = 100;
+/// Enlarged in-app text size for accessibility verification.
+pub const ENLARGED_TEXT_SCALE_PERCENT: u16 = 200;
 /// Shortest supported rating-decay interval.
 pub const MIN_RATING_DECAY_WEEKS: u16 = 1;
 /// Longest supported rating-decay interval.
@@ -37,6 +41,10 @@ fn default_autoplay_selection() -> bool {
 
 fn default_output_volume() -> f32 {
     1.0
+}
+
+fn default_text_scale_percent() -> u16 {
+    DEFAULT_TEXT_SCALE_PERCENT
 }
 
 /// The optional, renderer-neutral audio output routing persisted with the UI preferences.
@@ -107,6 +115,9 @@ pub struct UiPreferences {
     /// Optional absolute path used by an explicit theme reload action.
     #[serde(default)]
     pub theme_source_path: Option<PathBuf>,
+    /// In-app text scale; the authored theme remains unchanged.
+    #[serde(default = "default_text_scale_percent")]
+    pub text_scale_percent: u16,
     /// Whether a newly focused sample may start playback.
     #[serde(default = "default_autoplay_selection")]
     pub autoplay_selection: bool,
@@ -139,6 +150,7 @@ impl Default for UiPreferences {
             schema_version: UI_PREFERENCES_SCHEMA_VERSION,
             theme: Theme::default(),
             theme_source_path: None,
+            text_scale_percent: default_text_scale_percent(),
             autoplay_selection: true,
             help_tooltips_enabled: true,
             rating_decay_weeks: DEFAULT_RATING_DECAY_WEEKS,
@@ -161,6 +173,7 @@ impl UiPreferences {
         }
         let theme = validate_theme(self.theme)
             .map_err(|error| PreferenceError::InvalidTheme(error.to_string()))?;
+        validate_text_scale_percent(self.text_scale_percent)?;
         if let Some(path) = self.theme_source_path.as_deref() {
             validate_theme_source_path(path)?;
         }
@@ -229,6 +242,9 @@ pub enum PreferenceError {
     /// The output volume was not a finite value in the inclusive 0..=1 range.
     #[error("output volume must be finite and between 0 and 1")]
     InvalidOutputVolume,
+    /// The in-app text scale is not one of the supported sizes.
+    #[error("text scale must be 100% or 200%")]
+    InvalidTextScale,
     /// An audio output host or device name was empty, contained a NUL, or exceeded its bound.
     #[error(
         "audio output {field} must be non-empty, contain no NUL bytes, and be at most {MAX_AUDIO_OUTPUT_NAME_BYTES} bytes"
@@ -287,6 +303,17 @@ fn validate_output_volume(volume: f32) -> Result<(), PreferenceError> {
     Ok(())
 }
 
+fn validate_text_scale_percent(percent: u16) -> Result<(), PreferenceError> {
+    if matches!(
+        percent,
+        DEFAULT_TEXT_SCALE_PERCENT | ENLARGED_TEXT_SCALE_PERCENT
+    ) {
+        Ok(())
+    } else {
+        Err(PreferenceError::InvalidTextScale)
+    }
+}
+
 fn validate_audio_output_name(
     value: Option<&str>,
     field: &'static str,
@@ -338,6 +365,8 @@ pub enum PreferencePatch {
     },
     /// Change only the motion-enabled flag inside the current theme.
     SetMotionEnabled(bool),
+    /// Change the in-app text scale without editing the authored theme.
+    SetTextScalePercent(u16),
     /// Change the selection autoplay preference.
     SetAutoplaySelection(bool),
     /// Change the reference rating-decay interval.
@@ -371,6 +400,10 @@ impl PreferencePatch {
                 preferences.theme_source_path = source_path;
             }
             Self::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = enabled,
+            Self::SetTextScalePercent(percent) => {
+                validate_text_scale_percent(percent)?;
+                preferences.text_scale_percent = percent;
+            }
             Self::SetAutoplaySelection(enabled) => preferences.autoplay_selection = enabled,
             Self::SetRatingDecayWeeks(weeks) => {
                 validate_rating_decay_weeks(weeks)?;
@@ -699,6 +732,42 @@ mod tests {
         );
         PreferencePatch::Reset.apply(&mut preferences).unwrap();
         assert!(!preferences.normalized_audition_enabled);
+    }
+
+    #[test]
+    fn text_scale_defaults_for_old_payloads_and_persists_at_supported_sizes() {
+        let mut payload = serde_json::to_value(UiPreferences::default()).expect("encode");
+        payload
+            .as_object_mut()
+            .expect("object")
+            .remove("text_scale_percent");
+        let mut preferences = UiPreferences::from_payload(
+            &serde_json::to_string(&payload).expect("encode old payload"),
+        )
+        .expect("decode old payload");
+        assert_eq!(preferences.text_scale_percent, DEFAULT_TEXT_SCALE_PERCENT);
+
+        assert!(
+            PreferencePatch::SetTextScalePercent(ENLARGED_TEXT_SCALE_PERCENT)
+                .apply(&mut preferences)
+                .expect("set enlarged text")
+        );
+        assert_eq!(
+            UiPreferences::from_payload(&preferences.to_payload().expect("persist"))
+                .expect("restore")
+                .text_scale_percent,
+            ENLARGED_TEXT_SCALE_PERCENT
+        );
+        let before = preferences.clone();
+        assert_eq!(
+            PreferencePatch::SetTextScalePercent(150).apply(&mut preferences),
+            Err(PreferenceError::InvalidTextScale)
+        );
+        assert_eq!(preferences, before);
+        PreferencePatch::Reset
+            .apply(&mut preferences)
+            .expect("reset");
+        assert_eq!(preferences.text_scale_percent, DEFAULT_TEXT_SCALE_PERCENT);
     }
 
     #[test]
