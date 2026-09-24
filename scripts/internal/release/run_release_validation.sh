@@ -16,6 +16,6 @@ cargo test --test release_contract
 cargo test --test release_workflow_helpers
 
 echo "[release_validation] Run scanner tests used by release-time source validation."
-cargo test -p wavecrate-scan --lib
+cargo test -p yield-scan --lib
 
 echo "[release_validation] OK"

@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a bug in Wavecrate
+about: Report a bug in Yield
 labels: bug
 ---
 
@@ -32,4 +32,3 @@ What actually happened:
 
 - Attach a bundle from `scripts/run.sh bug-bundle` / `scripts/run.ps1 bug-bundle` when useful (review before sharing; may contain local paths).
 - If you used the sandbox runner, mention whether it was persistent (`<repo>/.sandbox/wavecrate`) or ephemeral (`--temp/-Temp`).
-

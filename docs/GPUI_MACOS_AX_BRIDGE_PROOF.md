@@ -9,7 +9,7 @@ or release accessibility acceptance.
 
 GPUI's public `Window: HasWindowHandle` returns an AppKit handle containing its
 real `NSView` on macOS (`gpui-0.2.2/src/platform/mac/window.rs`). The proof in
-`crates/wavecrate-platform/examples/ax_bridge_probe.rs` retains that view for
+`crates/yield-platform/examples/ax_bridge_probe.rs` retains that view for
 the root GPUI entity's lifetime and attaches one `NSAccessibilityElement`
 subclass through `NSView.setAccessibilityChildren`. Pinned GPUI has no exposed
 semantic-tree API, and its `PlatformWindow` is crate-private; neither a GPUI
@@ -37,10 +37,10 @@ From another terminal, get the process id with `pgrep -fl ax_bridge_probe` and
 run the companion native AX inspector:
 
 ```sh
-swift crates/wavecrate-platform/examples/ax_bridge_inspect.swift <pid> press
-swift crates/wavecrate-platform/examples/ax_bridge_inspect.swift <pid> focus
-swift crates/wavecrate-platform/examples/ax_bridge_inspect.swift <pid> click
-swift crates/wavecrate-platform/examples/ax_bridge_inspect.swift <pid> close
+swift crates/yield-platform/examples/ax_bridge_inspect.swift <pid> press
+swift crates/yield-platform/examples/ax_bridge_inspect.swift <pid> focus
+swift crates/yield-platform/examples/ax_bridge_inspect.swift <pid> click
+swift crates/yield-platform/examples/ax_bridge_inspect.swift <pid> close
 ```
 
 On 2026-09-24, `AXUIElement` enumerated `AXWindow > AXButton` with label

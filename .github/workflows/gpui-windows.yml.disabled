@@ -48,55 +48,55 @@ jobs:
         run: ./scripts/internal/release/setup_windows_asio_sdk.ps1
       - name: Check production GPUI application
         if: inputs.scope != 'storage'
-        run: cargo check --locked -p wavecrate-gpui
+        run: cargo check --locked -p yield
       - name: Check production storage library
         if: inputs.scope == 'storage'
-        run: cargo check --locked -p wavecrate-library --no-default-features
+        run: cargo check --locked -p yield-library --no-default-features
       - name: Check production profile admission
         shell: pwsh
         run: |
-          cargo test --locked -p wavecrate-library --test profile_admission --no-default-features
+          cargo test --locked -p yield-library --test profile_admission --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-library --lib app_dirs::profile_ownership --no-default-features
+          cargo test --locked -p yield-library --lib app_dirs::profile_ownership --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-library --test readiness_lease_process --features test-support
+          cargo test --locked -p yield-library --test readiness_lease_process --features test-support
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test operation journal
-        run: cargo test --locked -p wavecrate-library --lib operation_journal --no-default-features
+        run: cargo test --locked -p yield-library --lib operation_journal --no-default-features
       - name: Test bounded legacy journal reader
-        run: cargo test --locked -p wavecrate-library --lib file_ops_journal::reader --no-default-features
+        run: cargo test --locked -p yield-library --lib file_ops_journal::reader --no-default-features
       - name: Test source mutation ownership
         shell: pwsh
         run: |
-          cargo test --locked -p wavecrate-library --lib profile_mutation_guard --no-default-features
+          cargo test --locked -p yield-library --lib profile_mutation_guard --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-library --lib readiness --no-default-features
+          cargo test --locked -p yield-library --lib readiness --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-library --lib source_database_identity --no-default-features
+          cargo test --locked -p yield-library --lib source_database_identity --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-library --lib sqlite_wal --no-default-features
+          cargo test --locked -p yield-library --lib sqlite_wal --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test profile-owned settings maintenance
         shell: pwsh
         run: |
-          cargo test --locked -p wavecrate-library --lib app_dirs::storage_usage --no-default-features
+          cargo test --locked -p yield-library --lib app_dirs::storage_usage --no-default-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-session -p wavecrate-catalog --lib
+          cargo test --locked -p yield-session -p yield-catalog --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test durable waveform edit adapters
         if: inputs.scope == 'storage'
         shell: pwsh
         run: |
-          cargo test --locked -p wavecrate-core --lib waveform_edit_effects
+          cargo test --locked -p yield-core --lib waveform_edit_effects
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p wavecrate-media --lib edit_intent
+          cargo test --locked -p yield-media --lib edit_intent
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test audio, core, media and native platform
         if: inputs.scope != 'storage'
-        run: cargo test --locked -p reson -p wavecrate-core -p wavecrate-media -p wavecrate-platform --lib
+        run: cargo test --locked -p reson -p yield-core -p yield-media -p yield-platform --lib
       - name: Compile GPUI application and browser tests
         if: inputs.scope != 'storage'
-        run: cargo test --locked -p wavecrate-gpui -p wavecrate-ui --no-run
+        run: cargo test --locked -p yield -p yield-ui --no-run
       - name: Test browser state and interactions
         if: inputs.scope != 'storage'
-        run: cargo test --locked -p wavecrate-ui --lib
+        run: cargo test --locked -p yield-ui --lib

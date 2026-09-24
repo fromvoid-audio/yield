@@ -7545,7 +7545,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavecrate-analysis"
+name = "yield-analysis"
 version = "0.19.1"
 dependencies = [
  "blake3",
@@ -7570,24 +7570,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavecrate-catalog"
+name = "yield-catalog"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "hound",
  "tempfile",
  "thiserror 2.0.20",
- "wavecrate-library",
- "wavecrate-scan",
- "wavecrate-source-watcher",
+ "yield-library",
+ "yield-scan",
+ "yield-source-watcher",
 ]
 
 [[package]]
-name = "wavecrate-core"
+name = "yield-core"
 version = "0.1.0"
 
 [[package]]
-name = "wavecrate-design"
+name = "yield-design"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -7596,14 +7596,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavecrate-gpui"
+name = "yield"
 version = "0.1.0"
 dependencies = [
- "wavecrate-ui",
+ "yield-ui",
 ]
 
 [[package]]
-name = "wavecrate-library"
+name = "yield-library"
 version = "0.19.1"
 dependencies = [
  "blake3",
@@ -7625,20 +7625,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavecrate-media"
+name = "yield-media"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "hound",
  "tempfile",
- "wavecrate-analysis",
- "wavecrate-core",
- "wavecrate-library",
+ "yield-analysis",
+ "yield-core",
+ "yield-library",
  "windows 0.62.2",
 ]
 
 [[package]]
-name = "wavecrate-platform"
+name = "yield-platform"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
@@ -7652,7 +7652,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wavecrate-scan"
+name = "yield-scan"
 version = "0.19.1"
 dependencies = [
  "blake3",
@@ -7664,12 +7664,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
- "wavecrate-library",
+ "yield-library",
  "windows 0.62.2",
 ]
 
 [[package]]
-name = "wavecrate-session"
+name = "yield-session"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
@@ -7677,22 +7677,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "wavecrate-catalog",
- "wavecrate-design",
- "wavecrate-library",
+ "yield-catalog",
+ "yield-design",
+ "yield-library",
 ]
 
 [[package]]
-name = "wavecrate-source-watcher"
+name = "yield-source-watcher"
 version = "0.1.0"
 dependencies = [
  "notify",
  "tempfile",
- "wavecrate-library",
+ "yield-library",
 ]
 
 [[package]]
-name = "wavecrate-ui"
+name = "yield-ui"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
@@ -7702,13 +7702,13 @@ dependencies = [
  "reson",
  "tempfile",
  "unicode-segmentation",
- "wavecrate-catalog",
- "wavecrate-core",
- "wavecrate-design",
- "wavecrate-library",
- "wavecrate-media",
- "wavecrate-platform",
- "wavecrate-session",
+ "yield-catalog",
+ "yield-core",
+ "yield-design",
+ "yield-library",
+ "yield-media",
+ "yield-platform",
+ "yield-session",
  "windows 0.62.2",
 ]
 

@@ -1,5 +1,10 @@
 # GPUI fork and feature parity
 
+Current product name: **Yield**. The active GPUI repository is
+`PORTALSURFER/yield`, with the launcher in `crates/yield` and supporting
+`yield-*` crates. The baseline and dated evidence below retain the historical
+Wavecrate names and URLs used when those checks were recorded.
+
 This fork targets full current Wavecrate feature parity with GPUI replacing
 Radiant. A working GPUI window or browser is an intermediate milestone, not
 completion of the reimplementation.

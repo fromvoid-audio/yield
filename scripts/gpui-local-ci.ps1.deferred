@@ -20,7 +20,7 @@ try {
 
     Run-Cargo -CargoArgs @('fmt', '--all', '--check')
     if ($Scope -eq 'session') {
-        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-session', '--lib')
+        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-session', '--lib')
         Write-Host "[gpui-local-ci] PASS head=$head scope=$Scope host=Windows"
         return
     }
@@ -28,30 +28,30 @@ try {
     if ($Scope -eq 'full') {
         & (Join-Path $repoRoot 'scripts/internal/release/setup_windows_asio_sdk.ps1')
         if (-not $?) { throw 'ASIO setup failed' }
-        Run-Cargo -CargoArgs @('check', '--locked', '-p', 'wavecrate-gpui')
+        Run-Cargo -CargoArgs @('check', '--locked', '-p', 'yield')
     } else {
-        Run-Cargo -CargoArgs @('check', '--locked', '-p', 'wavecrate-library', '--no-default-features')
+        Run-Cargo -CargoArgs @('check', '--locked', '-p', 'yield-library', '--no-default-features')
     }
 
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--test', 'profile_admission', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'app_dirs::profile_ownership', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--test', 'readiness_lease_process', '--features', 'test-support')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'operation_journal', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'file_ops_journal::reader', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'profile_mutation_guard', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'readiness', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'source_database_identity', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'sqlite_wal', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-library', '--lib', 'app_dirs::storage_usage', '--no-default-features')
-    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-session', '-p', 'wavecrate-catalog', '--lib')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--test', 'profile_admission', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'app_dirs::profile_ownership', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--test', 'readiness_lease_process', '--features', 'test-support')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'operation_journal', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'file_ops_journal::reader', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'profile_mutation_guard', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'readiness', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'source_database_identity', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'sqlite_wal', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-library', '--lib', 'app_dirs::storage_usage', '--no-default-features')
+    Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-session', '-p', 'yield-catalog', '--lib')
 
     if ($Scope -eq 'storage') {
-        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-core', '--lib', 'waveform_edit_effects')
-        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-media', '--lib', 'edit_intent')
+        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-core', '--lib', 'waveform_edit_effects')
+        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-media', '--lib', 'edit_intent')
     } else {
-        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'reson', '-p', 'wavecrate-core', '-p', 'wavecrate-media', '-p', 'wavecrate-platform', '--lib')
-        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-gpui', '-p', 'wavecrate-ui', '--no-run')
-        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'wavecrate-ui', '--lib')
+        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'reson', '-p', 'yield-core', '-p', 'yield-media', '-p', 'yield-platform', '--lib')
+        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield', '-p', 'yield-ui', '--no-run')
+        Run-Cargo -CargoArgs @('test', '--locked', '-p', 'yield-ui', '--lib')
     }
 
     Write-Host "[gpui-local-ci] PASS head=$head scope=$Scope host=Windows"

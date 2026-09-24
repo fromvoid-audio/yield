@@ -1,6 +1,6 @@
 # GPUI browser accessibility adapter
 
-The Wavecrate browser attaches one `AxRegistry` to its real macOS GPUI window. The registry follows the browser entity's lifetime. AX callbacks enqueue bounded events; the browser rechecks current identities and dispatches them on its GPUI window context.
+The Yield browser attaches one `AxRegistry` to its real macOS GPUI window. The registry follows the browser entity's lifetime. AX callbacks enqueue bounded events; the browser rechecks current identities and dispatches them on its GPUI window context.
 
 This slice exposes Search, Add source, visible source rows and their Forget buttons, visible folder rows and their expand buttons, Folder scope, Refresh source, and visible sample rows. Names, selection, counts, scope, errors, and enablement come from the same browser state as the drawn controls. GPUI `uniform_list` supplies the actual visible row ranges; prepaint canvases supply each control's actual frame. Unchanged AX snapshots are not reconciled again on every browser render.
 
