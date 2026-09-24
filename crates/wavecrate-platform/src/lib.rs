@@ -13,6 +13,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, atomic::AtomicBool};
 
 #[cfg(target_os = "macos")]
+pub mod accessibility;
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "windows", test))]
 mod utf16_paths;
