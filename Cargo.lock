@@ -7695,6 +7695,7 @@ dependencies = [
 name = "wavecrate-ui"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "gpui",
  "rand 0.9.5",
  "raw-window-handle",

@@ -73,7 +73,7 @@ pub fn run(initial_root: Option<PathBuf>) {
                 ..Default::default()
             },
             move |window, cx| {
-                let view = cx.new(browser::Browser::new);
+                let view = cx.new(|cx| browser::Browser::new_window(window, cx));
                 window.focus(&view.read(cx).focus_handle(cx));
                 if let Some(root) = initial_root {
                     view.update(cx, |view, cx| view.start_scan(root, cx));

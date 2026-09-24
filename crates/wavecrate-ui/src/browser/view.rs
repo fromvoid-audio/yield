@@ -538,6 +538,8 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "macos")]
+        self.sync_browser_accessibility(window, cx);
         if self.playmark_timing_blur_subscription.is_none() {
             let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
             self.playmark_timing_blur_subscription =
@@ -682,6 +684,8 @@ impl Render for Browser {
                         cx.processor({
                             let list_theme = theme.clone();
                             move |view, range: std::ops::Range<usize>, window, cx| {
+                                #[cfg(target_os = "macos")]
+                                view.update_ax_sample_range(range.clone(), window, cx);
                                 if let Some(context) = view.catalog_metadata.context() {
                                     let metadata_paths = range
                                         .clone()
@@ -720,6 +724,7 @@ impl Render for Browser {
                                         let row = view.view_model.rows()[visible_index].clone();
                                         let index = row.entry_index;
                                         let entry = view.entries[index].clone();
+                                        let sample_ax_id = view.ax_sample_id(&entry.path);
                                         let (sample_name, _) =
                                             view.sample_name_display(&entry.relative_path);
                                         let selected = view.sample_row_is_selected_with_focus(
@@ -761,6 +766,7 @@ impl Render for Browser {
                                         let sample_row = div()
                                             .group(row_group.clone())
                                             .id(index)
+                                            .when_some(sample_ax_id.as_deref().and_then(|id| view.ax_focus(id)), |element, focus| element.track_focus(&focus))
                                             .flex()
                                             .flex_none()
                                             .w_full()
@@ -907,7 +913,8 @@ impl Render for Browser {
                                                 ))
                                                 .opacity(0.0)
                                                 .group_hover(row_group, |style| style.opacity(1.0)),
-                                        );
+                                        )
+                                        .when_some(sample_ax_id.and_then(|id| view.ax_marker(id)), |element, marker| element.child(marker));
                                         let drag = view.file_drag_row_payload(
                                             cx.entity(),
                                             visible_index,
