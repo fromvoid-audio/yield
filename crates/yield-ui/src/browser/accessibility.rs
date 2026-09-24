@@ -100,6 +100,15 @@ fn toggle(id: &'static str, label: &'static str, on: bool, enabled: bool) -> AxC
     }
 }
 
+fn text_scale_button(percent: u16, enabled: bool) -> AxChild {
+    button(
+        TEXT_SCALE,
+        "Text size",
+        Some(format!("{percent}%")),
+        enabled,
+    )
+}
+
 pub(super) fn sort_id(column: SortColumn) -> &'static str {
     match column {
         SortColumn::Name => "browser-sort-name",
@@ -1023,12 +1032,7 @@ impl Browser {
                         true,
                     ),
                     toggle(MOTION, "Animations", theme.motion.enabled, editable),
-                    button(
-                        TEXT_SCALE,
-                        "Text size",
-                        Some(format!("{}%", self.general_settings.text_scale_percent)),
-                        editable,
-                    ),
+                    text_scale_button(self.general_settings.text_scale_percent, editable),
                     toggle(
                         AUTOPLAY,
                         "Autoplay selection",
@@ -1474,5 +1478,32 @@ impl Browser {
 impl Drop for BrowserAccessibility {
     fn drop(&mut self) {
         let _ = self.registry.borrow_mut().reconcile(Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_text_scale_exposes_keyboard_order_and_readable_ax_values() {
+        let position = SETTINGS_ORDER
+            .iter()
+            .position(|id| *id == TEXT_SCALE)
+            .expect("text scale participates in settings keyboard navigation");
+        assert_eq!(SETTINGS_ORDER[position - 1], MOTION);
+        assert_eq!(SETTINGS_ORDER[position + 1], AUTOPLAY);
+
+        for (percent, enabled) in [(100, true), (200, false)] {
+            let control = text_scale_button(percent, enabled);
+            assert_eq!(control.id, TEXT_SCALE);
+            assert_eq!(control.role, AxRole::Button);
+            assert_eq!(control.label, "Text size");
+            assert_eq!(
+                control.value.as_deref(),
+                Some(format!("{percent}%").as_str())
+            );
+            assert_eq!(control.enabled, enabled);
+        }
     }
 }
