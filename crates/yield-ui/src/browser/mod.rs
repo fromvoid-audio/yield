@@ -1902,6 +1902,10 @@ impl Browser {
     }
 
     fn choose_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_theme_from_accessibility(cx);
+    }
+
+    fn choose_theme_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -1936,6 +1940,14 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_theme_settings_from_accessibility(window, cx);
+    }
+
+    fn toggle_theme_settings_from_accessibility(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.theme_settings_open {
             self.close_general_settings(window, cx);
         } else {
@@ -1945,7 +1957,15 @@ impl Browser {
             self.audio_output_dropdown = None;
             self.cancel_audio_output_options();
             self.refresh_global_storage(cx);
-            window.focus(&self.focus_handle);
+            let first = if self.preferences_editable() {
+                "settings-theme-choose"
+            } else {
+                "settings-theme-reset"
+            };
+            let focus = self
+                .ax_focus(first)
+                .unwrap_or_else(|| self.focus_handle.clone());
+            window.focus(&focus);
             cx.notify();
         }
     }
@@ -1956,6 +1976,10 @@ impl Browser {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_motion_from_accessibility(cx);
+    }
+
+    fn toggle_motion_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -1980,6 +2004,10 @@ impl Browser {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_help_tooltips_from_accessibility(cx);
+    }
+
+    fn toggle_help_tooltips_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -1993,6 +2021,10 @@ impl Browser {
     }
 
     fn toggle_autoplay(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_autoplay_from_accessibility(cx);
+    }
+
+    fn toggle_autoplay_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -2101,6 +2133,10 @@ impl Browser {
     }
 
     fn reload_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_theme_from_accessibility(cx);
+    }
+
+    fn reload_theme_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.mark_preferences_edit_blocked(cx);
             return;
@@ -2117,6 +2153,10 @@ impl Browser {
     }
 
     fn reset_theme(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_theme_from_accessibility(cx);
+    }
+
+    fn reset_theme_from_accessibility(&mut self, cx: &mut Context<Self>) {
         if !self.preferences_editable() {
             self.reset_preferences(cx);
             return;
@@ -2415,6 +2455,15 @@ impl Browser {
         }
         if self.theme_settings_open && key == "escape" {
             self.close_general_settings(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if !secondary
+            && !alt
+            && !function
+            && self.handle_settings_accessibility_key(key, shift, window, cx)
+        {
             cx.stop_propagation();
             return;
         }

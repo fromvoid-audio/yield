@@ -382,6 +382,8 @@ impl Browser {
     }
 
     fn render_theme_settings(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let focus_color = color(theme.interaction.focus_outline);
+        let focus_width = theme.interaction.focus_outline_width;
         let reload_pending = self.theme_load.pending_path.is_some();
         let settings_editable = self.preferences_editable();
         let reset_label = if settings_editable {
@@ -401,12 +403,21 @@ impl Browser {
         };
         let reload = div()
             .id("reload-theme")
+            .relative()
+            .when_some(self.ax_focus("settings-theme-reload"), |element, focus| {
+                element.track_focus(&focus)
+            })
+            .when_some(
+                self.ax_marker("settings-theme-reload"),
+                |element, marker| element.child(marker),
+            )
             .flex()
             .items_center()
             .h(px(theme.spacing.control_height))
             .px(px(theme.spacing.control_gap))
             .border(px(theme.spacing.border_width))
             .border_color(color(theme.colors.border_emphasis))
+            .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
             .bg(reload_fill)
             .text_color(reload_text)
             .when(!reload_pending && settings_editable, |element| {
@@ -433,12 +444,21 @@ impl Browser {
             .child(
                 div()
                     .id("choose-theme")
+                    .relative()
+                    .when_some(self.ax_focus("settings-theme-choose"), |element, focus| {
+                        element.track_focus(&focus)
+                    })
+                    .when_some(
+                        self.ax_marker("settings-theme-choose"),
+                        |element, marker| element.child(marker),
+                    )
                     .flex()
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
+                    .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
                     .when(settings_editable, |element| {
                         element
                             .cursor_pointer()
@@ -455,6 +475,13 @@ impl Browser {
             .child(
                 div()
                     .id("reset-theme")
+                    .relative()
+                    .when_some(self.ax_focus("settings-theme-reset"), |element, focus| {
+                        element.track_focus(&focus)
+                    })
+                    .when_some(self.ax_marker("settings-theme-reset"), |element, marker| {
+                        element.child(marker)
+                    })
                     .flex()
                     .items_center()
                     .h(px(theme.spacing.control_height))
@@ -462,18 +489,27 @@ impl Browser {
                     .cursor_pointer()
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
+                    .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
                     .on_click(cx.listener(Self::reset_theme))
                     .child(reset_label),
             )
             .child(
                 div()
                     .id("toggle-animations")
+                    .relative()
+                    .when_some(self.ax_focus("settings-motion"), |element, focus| {
+                        element.track_focus(&focus)
+                    })
+                    .when_some(self.ax_marker("settings-motion"), |element, marker| {
+                        element.child(marker)
+                    })
                     .flex()
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
+                    .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
                     .when(settings_editable, |element| {
                         element
                             .cursor_pointer()
@@ -497,12 +533,20 @@ impl Browser {
             .child(
                 div()
                     .id("toggle-autoplay")
+                    .relative()
+                    .when_some(self.ax_focus("settings-autoplay"), |element, focus| {
+                        element.track_focus(&focus)
+                    })
+                    .when_some(self.ax_marker("settings-autoplay"), |element, marker| {
+                        element.child(marker)
+                    })
                     .flex()
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
+                    .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
                     .text_color(if settings_editable {
                         color(if self.autoplay_selection {
                             theme.colors.accent
@@ -526,12 +570,20 @@ impl Browser {
             .child(
                 div()
                     .id("toggle-help-tooltips")
+                    .relative()
+                    .when_some(self.ax_focus("settings-help-tips"), |element, focus| {
+                        element.track_focus(&focus)
+                    })
+                    .when_some(self.ax_marker("settings-help-tips"), |element, marker| {
+                        element.child(marker)
+                    })
                     .flex()
                     .items_center()
                     .h(px(theme.spacing.control_height))
                     .px(px(theme.spacing.control_gap))
                     .border(px(theme.spacing.border_width))
                     .border_color(color(theme.colors.border_emphasis))
+                    .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
                     .text_color(if settings_editable {
                         color(if self.help_tooltips_enabled {
                             theme.colors.accent
@@ -553,11 +605,19 @@ impl Browser {
                     }),
             )
             .child(div().flex_1())
-            .child(format!(
-                "{} · {}",
-                self.theme_status,
-                self.preference_status()
-            ))
+            .child(
+                div()
+                    .relative()
+                    .when_some(
+                        self.ax_marker("settings-theme-status"),
+                        |element, marker| element.child(marker),
+                    )
+                    .child(format!(
+                        "{} · {}",
+                        self.theme_status,
+                        self.preference_status()
+                    )),
+            )
     }
 }
 
@@ -1515,6 +1575,13 @@ impl Render for Browser {
                     .child(
                         div()
                             .id("theme-settings")
+                            .relative()
+                            .when_some(self.ax_focus("settings-open"), |element, focus| {
+                                element.track_focus(&focus)
+                            })
+                            .when_some(self.ax_marker("settings-open"), |element, marker| {
+                                element.child(marker)
+                            })
                             .debug_selector(|| String::from("theme-settings"))
                             .flex_none()
                             .flex()
@@ -1525,6 +1592,11 @@ impl Render for Browser {
                             .bg(color(theme.colors.surface_overlay))
                             .border(px(theme.spacing.border_width))
                             .border_color(color(theme.colors.border_emphasis))
+                            .focus({
+                                let focus_color = color(theme.interaction.focus_outline);
+                                let focus_width = theme.interaction.focus_outline_width;
+                                move |style| style.border(px(focus_width)).border_color(focus_color)
+                            })
                             .text_size(px(theme.typography.small_size))
                             // Keep the input focused until the click handler records it for
                             // General Settings' Escape restoration. Without this, GPUI's

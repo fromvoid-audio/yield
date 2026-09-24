@@ -39,8 +39,46 @@ const NORMALIZED_AUDITION: &str = "transport-normalized-audition";
 const VOLUME: &str = "transport-volume";
 const WAVEFORM: &str = "transport-waveform";
 const PLAYMARK_TIMING: &str = "transport-playmark-timing";
+const SETTINGS_OPEN: &str = "settings-open";
+const SETTINGS_CLOSE: &str = "settings-close";
+const THEME_CHOOSE: &str = "settings-theme-choose";
+const THEME_RELOAD: &str = "settings-theme-reload";
+const THEME_RESET: &str = "settings-theme-reset";
+const MOTION: &str = "settings-motion";
+const AUTOPLAY: &str = "settings-autoplay";
+const HELP_TIPS: &str = "settings-help-tips";
+const RATING_DECAY_DECREASE: &str = "settings-rating-decay-decrease";
+const RATING_DECAY_INCREASE: &str = "settings-rating-decay-increase";
+const TRASH_CHOOSE: &str = "settings-trash-choose";
+const TRASH_CLEAR: &str = "settings-trash-clear";
+const STORAGE_REFRESH: &str = "settings-storage-refresh";
+const CACHE_CLEAR: &str = "settings-cache-clear";
+const THEME_STATUS: &str = "settings-theme-status";
+const GENERAL_STATUS: &str = "settings-general-status";
+const MAINTENANCE_STATUS: &str = "settings-maintenance-status";
 
-fn button(id: &'static str, label: &'static str, value: Option<String>, enabled: bool) -> AxChild {
+const SETTINGS_ORDER: &[&str] = &[
+    THEME_CHOOSE,
+    THEME_RELOAD,
+    THEME_RESET,
+    MOTION,
+    AUTOPLAY,
+    HELP_TIPS,
+    SETTINGS_CLOSE,
+    RATING_DECAY_DECREASE,
+    RATING_DECAY_INCREASE,
+    TRASH_CHOOSE,
+    TRASH_CLEAR,
+    STORAGE_REFRESH,
+    CACHE_CLEAR,
+];
+
+fn button(
+    id: &'static str,
+    label: impl Into<String>,
+    value: Option<String>,
+    enabled: bool,
+) -> AxChild {
     AxChild {
         id: id.into(),
         role: AxRole::Button,
@@ -183,6 +221,9 @@ impl BrowserAccessibility {
             RANDOM_AUDITION,
             NORMALIZED_AUDITION,
         ] {
+            control_focus.insert(id.to_owned(), cx.focus_handle());
+        }
+        for id in SETTINGS_ORDER.iter().copied().chain([SETTINGS_OPEN]) {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
         for column in [
@@ -340,6 +381,8 @@ impl BrowserAccessibility {
                                 | WAVEFORM
                                 | PLAYMARK_TIMING
                         );
+                        let settings_action = event.id == SETTINGS_OPEN
+                            || SETTINGS_ORDER.contains(&event.id.as_str());
                         if !matches!(
                             event.id.as_str(),
                             ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE | SEARCH
@@ -348,6 +391,7 @@ impl BrowserAccessibility {
                             && sample_action.is_none()
                             && !extra_action
                             && !transport_action
+                            && !settings_action
                         {
                             return;
                         }
@@ -359,6 +403,9 @@ impl BrowserAccessibility {
                             return;
                         }
                         if sample_action.is_some() && super::tag_filter::scope_pending(view) {
+                            return;
+                        }
+                        if settings_action && !view.settings_control_enabled(&event.id) {
                             return;
                         }
                         if matches!(
@@ -406,7 +453,15 @@ impl BrowserAccessibility {
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
-                        if event.id == SEARCH
+                        if settings_action {
+                            match event.action {
+                                AxAction::Focus => {}
+                                AxAction::Press => {
+                                    view.perform_settings_action(&event.id, window, cx)
+                                }
+                                _ => return,
+                            }
+                        } else if event.id == SEARCH
                             || event.id == TAG_FILTER_INPUT
                             || event.id == PLAYMARK_TIMING
                         {
@@ -554,6 +609,116 @@ impl BrowserAccessibility {
 }
 
 impl Browser {
+    pub(super) fn handle_settings_accessibility_key(
+        &mut self,
+        key: &str,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.theme_settings_open {
+            return false;
+        }
+        let Some(ax) = self.accessibility.as_ref() else {
+            return false;
+        };
+        let current = SETTINGS_ORDER.iter().copied().find(|id| {
+            ax.focus_handle(id)
+                .is_some_and(|focus| focus.is_focused(window))
+        });
+        if key.eq_ignore_ascii_case("tab") {
+            let available = SETTINGS_ORDER
+                .iter()
+                .copied()
+                .filter(|id| self.settings_control_enabled(id))
+                .collect::<Vec<_>>();
+            if available.is_empty() {
+                return false;
+            }
+            let next = current
+                .and_then(|id| available.iter().position(|item| *item == id))
+                .map(|index| {
+                    if shift {
+                        (index + available.len() - 1) % available.len()
+                    } else {
+                        (index + 1) % available.len()
+                    }
+                })
+                .unwrap_or(if shift { available.len() - 1 } else { 0 });
+            if let Some(focus) = ax.focus_handle(available[next]) {
+                window.focus(&focus);
+                cx.notify();
+                return true;
+            }
+        }
+        if matches!(
+            key.to_ascii_lowercase().as_str(),
+            "enter" | "return" | "space"
+        ) {
+            if let Some(id) = current {
+                self.perform_settings_action(id, window, cx);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn settings_control_enabled(&self, id: &str) -> bool {
+        if id == SETTINGS_OPEN {
+            return true;
+        }
+        if !self.theme_settings_open {
+            return false;
+        }
+        let editable = self.preferences_editable();
+        let busy = self.general_settings.maintenance_busy();
+        match id {
+            SETTINGS_CLOSE | THEME_RESET => true,
+            THEME_CHOOSE | MOTION | AUTOPLAY | HELP_TIPS => editable,
+            THEME_RELOAD => editable && self.theme_load.pending_path.is_none(),
+            RATING_DECAY_DECREASE => {
+                editable
+                    && self.general_settings.rating_decay_weeks
+                        > yield_session::MIN_RATING_DECAY_WEEKS
+            }
+            RATING_DECAY_INCREASE => {
+                editable
+                    && self.general_settings.rating_decay_weeks
+                        < yield_session::MAX_RATING_DECAY_WEEKS
+            }
+            TRASH_CHOOSE => editable && !busy && !self.general_settings.picking(),
+            TRASH_CLEAR => editable && !busy,
+            STORAGE_REFRESH => !busy,
+            CACHE_CLEAR => {
+                !busy && self.preferences.loaded() && editable && !self.preferences.has_pending()
+            }
+            _ => false,
+        }
+    }
+
+    fn perform_settings_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_control_enabled(id) {
+            return;
+        }
+        match id {
+            SETTINGS_OPEN => self.toggle_theme_settings_from_accessibility(window, cx),
+            SETTINGS_CLOSE => self.close_general_settings(window, cx),
+            THEME_CHOOSE => self.choose_theme_from_accessibility(cx),
+            THEME_RELOAD => self.reload_theme_from_accessibility(cx),
+            THEME_RESET => self.reset_theme_from_accessibility(cx),
+            MOTION => self.toggle_motion_from_accessibility(cx),
+            AUTOPLAY => self.toggle_autoplay_from_accessibility(cx),
+            HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
+            RATING_DECAY_DECREASE => self.change_rating_decay(-1, cx),
+            RATING_DECAY_INCREASE => self.change_rating_decay(1, cx),
+            TRASH_CHOOSE => self.choose_trash_folder_from_accessibility(cx),
+            TRASH_CLEAR => self.clear_trash_folder_from_accessibility(cx),
+            STORAGE_REFRESH => self.refresh_global_storage(cx),
+            CACHE_CLEAR => self.clear_rebuildable_cache(cx),
+            _ => {}
+        }
+    }
+
     pub(super) fn ax_source_ids(&self, root: &Path) -> (Option<String>, Option<String>) {
         if self.accessibility.is_some() {
             (Some(source_id(root)), Some(forget_id(root)))
@@ -817,6 +982,127 @@ impl Browser {
                 value: Some(self.beat_count_input.read(cx).content(cx)),
                 enabled: has_waveform,
             });
+            controls.push(button(
+                SETTINGS_OPEN,
+                "General settings",
+                Some(
+                    if self.theme_settings_open {
+                        "Open"
+                    } else {
+                        "Closed"
+                    }
+                    .into(),
+                ),
+                true,
+            ));
+            if self.theme_settings_open {
+                let editable = self.preferences_editable();
+                let busy = self.general_settings.maintenance_busy();
+                let weeks = self.general_settings.rating_decay_weeks;
+                let weeks_value = Some(format!("{weeks} weeks"));
+                let theme = crate::theme::active(cx);
+                controls.extend([
+                    button(THEME_CHOOSE, "Choose theme file", None, editable),
+                    button(
+                        THEME_RELOAD,
+                        "Reload theme file",
+                        None,
+                        editable && self.theme_load.pending_path.is_none(),
+                    ),
+                    button(
+                        THEME_RESET,
+                        if editable {
+                            "Reset theme"
+                        } else {
+                            "Reset saved settings"
+                        },
+                        None,
+                        true,
+                    ),
+                    toggle(MOTION, "Animations", theme.motion.enabled, editable),
+                    toggle(
+                        AUTOPLAY,
+                        "Autoplay selection",
+                        self.autoplay_selection,
+                        editable,
+                    ),
+                    toggle(HELP_TIPS, "Help tips", self.help_tooltips_enabled, editable),
+                    button(SETTINGS_CLOSE, "Close general settings", None, true),
+                    button(
+                        RATING_DECAY_DECREASE,
+                        "Decrease rating decay",
+                        weeks_value.clone(),
+                        editable && weeks > yield_session::MIN_RATING_DECAY_WEEKS,
+                    ),
+                    button(
+                        RATING_DECAY_INCREASE,
+                        "Increase rating decay",
+                        weeks_value,
+                        editable && weeks < yield_session::MAX_RATING_DECAY_WEEKS,
+                    ),
+                    button(
+                        TRASH_CHOOSE,
+                        "Choose trash folder",
+                        Some(
+                            self.general_settings
+                                .trash_folder
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "None".into()),
+                        ),
+                        editable && !busy && !self.general_settings.picking(),
+                    ),
+                    button(TRASH_CLEAR, "Clear trash folder", None, editable && !busy),
+                    button(
+                        STORAGE_REFRESH,
+                        "Refresh global storage usage",
+                        Some(self.general_settings.storage_label()),
+                        !busy,
+                    ),
+                    button(
+                        CACHE_CLEAR,
+                        "Clear rebuildable caches",
+                        None,
+                        !busy
+                            && self.preferences.loaded()
+                            && editable
+                            && !self.preferences.has_pending(),
+                    ),
+                    AxChild {
+                        id: THEME_STATUS.into(),
+                        role: AxRole::Group,
+                        label: "Theme status".into(),
+                        value: Some(format!(
+                            "{} · {}",
+                            self.theme_status,
+                            self.preference_status()
+                        )),
+                        enabled: true,
+                    },
+                ]);
+                for (id, label, status) in [
+                    (
+                        GENERAL_STATUS,
+                        "General settings status",
+                        self.general_settings.status(),
+                    ),
+                    (
+                        MAINTENANCE_STATUS,
+                        "Maintenance status",
+                        self.general_settings.maintenance_status(),
+                    ),
+                ] {
+                    if !status.is_empty() {
+                        controls.push(AxChild {
+                            id: id.into(),
+                            role: AxRole::Group,
+                            label: label.into(),
+                            value: Some(status.into()),
+                            enabled: true,
+                        });
+                    }
+                }
+            }
             let source_rows = self.source_rows();
             for root in &ax.visible_sources {
                 let Some((_, _, label, selected, error)) =
