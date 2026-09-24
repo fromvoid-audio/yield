@@ -15,6 +15,7 @@ use super::{Browser, tag_library};
 pub(super) const ADD_SOURCE: &str = "browser-add-source";
 pub(super) const FOLDER_SCOPE: &str = "browser-folder-scope";
 pub(super) const REFRESH_SOURCE: &str = "browser-refresh-source";
+pub(super) const SEARCH: &str = "browser-search";
 
 pub(super) fn source_id(root: &Path) -> String {
     format!("browser-source:{:?}", root.as_os_str())
@@ -109,7 +110,9 @@ impl BrowserAccessibility {
                         if tag_library::is_open(view) || !ax.registry.borrow().contains(&event.id) {
                             return;
                         }
-                        let focus = if let Some(focus) = ax.focus_handle(&event.id) {
+                        let focus = if event.id == SEARCH {
+                            view.search_input.read(cx).focus_handle()
+                        } else if let Some(focus) = ax.focus_handle(&event.id) {
                             focus
                         } else {
                             return;
@@ -156,7 +159,7 @@ impl BrowserAccessibility {
                         });
                         if !matches!(
                             event.id.as_str(),
-                            ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE
+                            ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE | SEARCH
                         ) && source_action.is_none()
                             && folder_action.is_none()
                             && sample_action.is_none()
@@ -169,7 +172,19 @@ impl BrowserAccessibility {
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
-                        if event.action == AxAction::Press {
+                        if event.id == SEARCH {
+                            match event.action {
+                                AxAction::SetValue(value) => {
+                                    let search_input = view.search_input.clone();
+                                    window.defer(cx, move |_, cx| {
+                                        search_input
+                                            .update(cx, |input, cx| input.set_content(value, cx));
+                                    });
+                                }
+                                AxAction::Focus => {}
+                                AxAction::Press => return,
+                            }
+                        } else if event.action == AxAction::Press {
                             match event.id.as_str() {
                                 ADD_SOURCE => view.prompt_for_source(cx),
                                 FOLDER_SCOPE => view.toggle_folder_scope(cx),
@@ -349,20 +364,29 @@ impl Browser {
         self.sync_browser_accessibility(window, cx);
     }
 
-    pub(super) fn sync_browser_accessibility(&self, window: &Window, _cx: &mut Context<Self>) {
+    pub(super) fn sync_browser_accessibility(&self, window: &Window, cx: &mut Context<Self>) {
         let Some(ax) = self.accessibility.as_ref() else {
             return;
         };
         let controls = if tag_library::is_open(self) {
             Vec::new()
         } else {
-            let mut controls = vec![AxChild {
-                id: ADD_SOURCE.into(),
-                role: AxRole::Button,
-                label: "Add source folder".into(),
-                value: None,
-                enabled: true,
-            }];
+            let mut controls = vec![
+                AxChild {
+                    id: SEARCH.into(),
+                    role: AxRole::TextField,
+                    label: "Search samples".into(),
+                    value: Some(self.search_input.read(cx).content().to_owned()),
+                    enabled: true,
+                },
+                AxChild {
+                    id: ADD_SOURCE.into(),
+                    role: AxRole::Button,
+                    label: "Add source folder".into(),
+                    value: None,
+                    enabled: true,
+                },
+            ];
             let source_rows = self.source_rows();
             for root in &ax.visible_sources {
                 let Some((_, _, label, selected, error)) =
@@ -507,6 +531,13 @@ impl Browser {
                 let _ =
                     registry.set_focused(id, focus.is_focused(window) && window.is_window_active());
             }
+        }
+        if registry.contains(SEARCH) {
+            let search_focus = self.search_input.read(cx).focus_handle();
+            let _ = registry.set_focused(
+                SEARCH,
+                search_focus.is_focused(window) && window.is_window_active(),
+            );
         }
         for (id, focus) in &ax.control_focus {
             if registry.contains(id) {

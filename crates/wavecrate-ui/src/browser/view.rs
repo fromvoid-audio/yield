@@ -1298,12 +1298,16 @@ impl Render for Browser {
                         div()
                             .min_w(px(80.0))
                             .w(px(220.0))
+                            .relative()
                             .overflow_hidden()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(Self::invalidate_file_handoff_from_search_mouse),
                             )
-                            .child(self.search_input.clone()),
+                            .child(self.search_input.clone())
+                            .when_some(self.ax_marker("browser-search"), |element, marker| {
+                                element.child(marker)
+                            }),
                     )
                     .child(
                         div()
