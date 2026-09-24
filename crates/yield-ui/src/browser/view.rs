@@ -72,9 +72,9 @@ fn current_unix_epoch_seconds() -> i64 {
 const MIN_SAMPLE_NAME_WIDTH: f32 = 192.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct BrowserColumnVisibility {
-    playback_type: bool,
-    last_played: bool,
+pub(super) struct BrowserColumnVisibility {
+    pub(super) playback_type: bool,
+    pub(super) last_played: bool,
 }
 
 fn base_browser_min_window_width(theme: &Theme) -> f32 {
@@ -88,7 +88,10 @@ fn base_browser_min_window_width(theme: &Theme) -> f32 {
         + MIN_SAMPLE_NAME_WIDTH
 }
 
-fn browser_column_visibility(window_width: f32, theme: &Theme) -> BrowserColumnVisibility {
+pub(super) fn browser_column_visibility(
+    window_width: f32,
+    theme: &Theme,
+) -> BrowserColumnVisibility {
     if !window_width.is_finite() {
         return BrowserColumnVisibility::default();
     }
@@ -247,6 +250,10 @@ impl Browser {
         let pressed_fill = color(theme.interaction.pressed_fill);
         let mut header = div()
             .id(label)
+            .when_some(
+                self.ax_focus(super::accessibility::sort_id(column)),
+                |element, focus| element.track_focus(&focus),
+            )
             .flex()
             .items_center()
             .h(px(theme.spacing.row_height))
@@ -275,7 +282,11 @@ impl Browser {
             )
             .when(selected, |header| {
                 header.child(div().flex_none().whitespace_nowrap().child(marker))
-            });
+            })
+            .when_some(
+                self.ax_marker(super::accessibility::sort_id(column)),
+                |element, marker| element.child(marker),
+            );
         if let Some(width) = width {
             header = header.flex_none().w(px(width));
         } else {
@@ -300,6 +311,10 @@ impl Browser {
         });
         div()
             .id("random-navigation-toggle")
+            .when_some(
+                self.ax_focus(super::accessibility::RANDOM_NAVIGATION),
+                |element, focus| element.track_focus(&focus),
+            )
             .debug_selector(|| String::from("random-navigation-toggle"))
             .flex()
             .flex_none()
@@ -319,6 +334,10 @@ impl Browser {
                 control.tooltip(random_navigation_tooltip)
             })
             .child("⚄")
+            .when_some(
+                self.ax_marker(super::accessibility::RANDOM_NAVIGATION),
+                |element, marker| element.child(marker),
+            )
             .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                 view.toggle_random_navigation(cx);
             }))
@@ -334,6 +353,10 @@ impl Browser {
         let mode = self.sample_name_view_mode;
         div()
             .id("sample-name-view-mode")
+            .when_some(
+                self.ax_focus(super::accessibility::NAME_VIEW_MODE),
+                |element, focus| element.track_focus(&focus),
+            )
             .debug_selector(|| String::from("sample-name-view-mode"))
             .flex()
             .flex_none()
@@ -349,6 +372,10 @@ impl Browser {
             .text_size(px(theme.typography.small_size))
             .text_color(color(theme.colors.text_muted))
             .child(mode.label())
+            .when_some(
+                self.ax_marker(super::accessibility::NAME_VIEW_MODE),
+                |element, marker| element.child(marker),
+            )
             .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                 view.toggle_sample_name_view_mode(cx);
             }))

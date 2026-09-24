@@ -1271,6 +1271,10 @@ pub(super) fn render_collection_filters(
             let label = format!("Collection {}", slot + 1);
             div()
                 .id(("collection-filter", slot))
+                .when_some(
+                    browser.ax_focus(&super::accessibility::collection_filter_id(slot)),
+                    |element, focus| element.track_focus(&focus),
+                )
                 .flex()
                 .flex_none()
                 .w_full()
@@ -1285,6 +1289,10 @@ pub(super) fn render_collection_filters(
                 .hover(move |style| style.bg(hover_fill))
                 .active(move |style| style.bg(pressed_fill))
                 .when(!active_source, |element| element.opacity(0.45))
+                .when_some(
+                    browser.ax_marker(super::accessibility::collection_filter_id(slot)),
+                    |element, marker| element.child(marker),
+                )
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     if active_source {
                         view.toggle_collection_filter(slot, cx);
@@ -1364,6 +1372,10 @@ pub(super) fn render_playback_type_filters(
             let label = playback_type_filter_label(playback_type);
             div()
                 .id(("playback-type-filter", index))
+                .when_some(
+                    browser.ax_focus(&super::accessibility::playback_type_filter_id(index)),
+                    |element, focus| element.track_focus(&focus),
+                )
                 .flex()
                 .flex_none()
                 .w(px(chip_width))
@@ -1380,6 +1392,10 @@ pub(super) fn render_playback_type_filters(
                 .hover(move |style| style.bg(hover_fill))
                 .active(move |style| style.bg(pressed_fill))
                 .when(!active_source, |element| element.opacity(0.45))
+                .when_some(
+                    browser.ax_marker(super::accessibility::playback_type_filter_id(index)),
+                    |element, marker| element.child(marker),
+                )
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     if active_source {
                         view.toggle_playback_type_filter(playback_type, cx);
@@ -1426,6 +1442,10 @@ pub(super) fn render_rating_filters(
             let marker_color = color(rating_filter_color(level, &theme));
             div()
                 .id(("rating-filter", index))
+                .when_some(
+                    browser.ax_focus(&super::accessibility::rating_filter_id(index)),
+                    |element, focus| element.track_focus(&focus),
+                )
                 .flex()
                 .flex_none()
                 .w(px(chip_width))
@@ -1443,6 +1463,10 @@ pub(super) fn render_rating_filters(
                 .hover(move |style| style.bg(hover_fill))
                 .active(move |style| style.bg(pressed_fill))
                 .when(!active_source, |element| element.opacity(0.45))
+                .when_some(
+                    browser.ax_marker(super::accessibility::rating_filter_id(index)),
+                    |element, marker| element.child(marker),
+                )
                 .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
                     if active_source {
                         view.toggle_rating_filter(level, cx);
