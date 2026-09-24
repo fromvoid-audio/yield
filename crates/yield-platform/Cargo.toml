@@ -16,6 +16,7 @@ objc2 = { workspace = true, features = ["std"] }
 async-channel = "=2.5.0"
 objc2-app-kit = { workspace = true, features = [
     "std",
+    "NSAccessibility",
     "NSAccessibilityConstants",
     "NSAccessibilityElement",
     "NSAccessibilityProtocols",
