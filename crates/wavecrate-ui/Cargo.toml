@@ -26,6 +26,9 @@ gpui = { workspace = true, features = ["test-support"] }
 wavecrate-catalog = { path = "../wavecrate-catalog" }
 tempfile.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+async-channel = "=2.5.0"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",

@@ -136,7 +136,11 @@ pub(super) fn render(
                             source_rows.len(),
                             cx.processor({
                                 let list_theme = theme.clone();
-                                move |view, range: std::ops::Range<usize>, _window, cx| {
+                                move |view, range: std::ops::Range<usize>, window, cx| {
+                                    #[cfg(target_os = "macos")]
+                                    view.update_ax_source_range(range.clone(), window, cx);
+                                    #[cfg(not(target_os = "macos"))]
+                                    let _ = window;
                                     let source_rows = view.source_rows();
                                     range
                                         .filter_map(|visible_index| {
@@ -148,12 +152,14 @@ pub(super) fn render(
                                                 color(list_theme.interaction.pressed_fill);
                                             let row_group =
                                                 format!("source-row:{}", root.to_string_lossy());
+                                            let (source_ax_id, forget_ax_id) = view.ax_source_ids(&root);
                                             let scanning = view.source_scan_is_pending(&root);
                                             let focused = motion_frame.focus_alpha > 0
                                                 && view.focus_matches_source(&root);
                                             let source_row = div()
                                                 .group(row_group.clone())
                                                 .id(("source-row", index))
+                                                .when_some(source_ax_id.as_deref().and_then(|id| view.ax_focus(id)), |element, focus| element.track_focus(&focus))
                                                 .flex()
                                                 .flex_none()
                                                 .w_full()
@@ -217,6 +223,8 @@ pub(super) fn render(
                                                 .child(
                                                     div()
                                                         .id(("forget-source", index))
+                                                        .relative()
+                                                        .when_some(forget_ax_id.as_deref().and_then(|id| view.ax_focus(id)), |element, focus| element.track_focus(&focus))
                                                         .flex_none()
                                                         .w(px(24.0))
                                                         .items_center()
@@ -232,9 +240,11 @@ pub(super) fn render(
                                                                 view.forget_source(index, window, cx);
                                                             },
                                                         ))
-                                                        .child("×"),
+                                                        .child("×")
+                                                        .when_some(forget_ax_id.and_then(|id| view.ax_marker(id)), |element, marker| element.child(marker)),
                                                 )
-                                                .child(hover_rail(row_group, &list_theme));
+                                                .child(hover_rail(row_group, &list_theme))
+                                                .when_some(source_ax_id.and_then(|id| view.ax_marker(id)), |element, marker| element.child(marker));
                                             let source_row = if focused {
                                                 source_row.child(
                                                     div()
@@ -321,11 +331,17 @@ pub(super) fn render(
                     folder_rows.len(),
                     cx.processor({
                         let list_theme = theme.clone();
-                        move |view, range: std::ops::Range<usize>, _window, cx| {
+                        move |view, range: std::ops::Range<usize>, window, cx| {
+                            #[cfg(target_os = "macos")]
+                            view.update_ax_folder_range(range.clone(), window, cx);
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = window;
                             let folder_rows = view.folder_rows();
                             range
                                 .filter_map(|visible_index| {
                                     let row = folder_rows.get(visible_index).cloned()?;
+                                    let (folder_ax_id, toggle_ax_id) =
+                                        view.ax_folder_ids(&row.path);
                                     let path_for_select = row.path.clone();
                                     let path_for_toggle = row.path.clone();
                                     let path_for_context = row.path.clone();
@@ -341,6 +357,13 @@ pub(super) fn render(
                                     {
                                         div()
                                             .id(("folder-toggle", visible_index))
+                                            .relative()
+                                            .when_some(
+                                                toggle_ax_id
+                                                    .as_deref()
+                                                    .and_then(|id| view.ax_focus(id)),
+                                                |element, focus| element.track_focus(&focus),
+                                            )
                                             .flex_none()
                                             .w(px(18.0))
                                             .items_center()
@@ -357,6 +380,10 @@ pub(super) fn render(
                                                 },
                                             ))
                                             .child(if row.expanded { "▾" } else { "▸" })
+                                            .when_some(
+                                                toggle_ax_id.and_then(|id| view.ax_marker(id)),
+                                                |element, marker| element.child(marker),
+                                            )
                                     } else {
                                         div()
                                             .id(("folder-toggle", visible_index))
@@ -375,6 +402,12 @@ pub(super) fn render(
                                     let folder_row = div()
                                         .group(row_group.clone())
                                         .id(("folder-row", visible_index))
+                                        .when_some(
+                                            folder_ax_id
+                                                .as_deref()
+                                                .and_then(|id| view.ax_focus(id)),
+                                            |element, focus| element.track_focus(&focus),
+                                        )
                                         .flex()
                                         .flex_none()
                                         .w_full()
@@ -448,7 +481,11 @@ pub(super) fn render(
                                                 .text_color(color(list_theme.colors.text_disabled))
                                                 .child(row.audio_file_count.to_string()),
                                         )
-                                        .child(hover_rail(row_group, &list_theme));
+                                        .child(hover_rail(row_group, &list_theme))
+                                        .when_some(
+                                            folder_ax_id.and_then(|id| view.ax_marker(id)),
+                                            |element, marker| element.child(marker),
+                                        );
                                     Some(if focused {
                                         folder_row.child(
                                             div()
@@ -509,6 +546,11 @@ pub(super) fn render(
                     .child(
                         div()
                             .id("folder-scope")
+                            .relative()
+                            .when_some(
+                                browser.ax_focus("browser-folder-scope"),
+                                |element, focus| element.track_focus(&focus),
+                            )
                             .debug_selector(|| String::from("folder-scope"))
                             .flex()
                             .flex_1()
@@ -524,11 +566,20 @@ pub(super) fn render(
                             .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                                 view.toggle_folder_scope(cx)
                             }))
-                            .child(scope_label),
+                            .child(scope_label)
+                            .when_some(
+                                browser.ax_marker("browser-folder-scope"),
+                                |element, marker| element.child(marker),
+                            ),
                     )
                     .child(
                         div()
                             .id("refresh-source")
+                            .relative()
+                            .when_some(
+                                browser.ax_focus("browser-refresh-source"),
+                                |element, focus| element.track_focus(&focus),
+                            )
                             .debug_selector(|| String::from("refresh-source"))
                             .flex()
                             .flex_1()
@@ -544,7 +595,11 @@ pub(super) fn render(
                             .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
                                 view.refresh_active_source(cx)
                             }))
-                            .child("Refresh"),
+                            .child("Refresh")
+                            .when_some(
+                                browser.ax_marker("browser-refresh-source"),
+                                |element, marker| element.child(marker),
+                            ),
                     ),
             )
             .child(
@@ -614,6 +669,10 @@ pub(super) fn render(
                 .child(
                     div()
                         .id("add-source-sidebar")
+                        .relative()
+                        .when_some(browser.ax_focus("browser-add-source"), |element, focus| {
+                            element.track_focus(&focus)
+                        })
                         .flex()
                         .items_center()
                         .justify_center()
@@ -623,7 +682,11 @@ pub(super) fn render(
                         .text_size(px(theme.typography.title_size))
                         .text_color(color(theme.colors.accent))
                         .on_click(cx.listener(Browser::choose_folder))
-                        .child("+"),
+                        .child("+")
+                        .when_some(
+                            browser.ax_marker("browser-add-source"),
+                            |element, marker| element.child(marker),
+                        ),
                 ),
         )
         .child(source_list)

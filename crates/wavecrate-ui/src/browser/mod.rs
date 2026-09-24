@@ -35,6 +35,8 @@ use crate::beat_count_input::{BeatCountChanged, BeatCountInput, DEFAULT_BEAT_COU
 use crate::search_input::{SearchChanged, SearchInput, SearchInputOptions, SearchInputRejected};
 use crate::theme::ActiveTheme;
 
+#[cfg(target_os = "macos")]
+mod accessibility;
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
@@ -244,6 +246,8 @@ struct PlaymarkTimingEditorState {
 }
 
 pub(crate) struct Browser {
+    #[cfg(target_os = "macos")]
+    accessibility: Option<accessibility::BrowserAccessibility>,
     focus_handle: FocusHandle,
     waveform_focus_handle: FocusHandle,
     volume_focus_handle: FocusHandle,
@@ -431,6 +435,42 @@ pub(crate) struct Browser {
 }
 
 impl Browser {
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn ax_source_ids(&self, _: &Path) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn ax_folder_ids(&self, _: &Path) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn ax_sample_id(&self, _: &Path) -> Option<String> {
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn ax_focus(&self, _: &str) -> Option<FocusHandle> {
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn ax_marker(&self, _: impl Into<String>) -> Option<gpui::AnyElement> {
+        None
+    }
+
+    pub(crate) fn new_window(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut browser = Self::new(cx);
+        #[cfg(target_os = "macos")]
+        {
+            browser.accessibility = accessibility::BrowserAccessibility::new(window, cx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
+        browser
+    }
+
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(SearchInput::new);
         let search_subscription =
@@ -492,6 +532,8 @@ impl Browser {
         );
         let motion_settings = Motion::default();
         let mut browser = Self {
+            #[cfg(target_os = "macos")]
+            accessibility: None,
             focus_handle: cx.focus_handle(),
             waveform_focus_handle: cx.focus_handle(),
             volume_focus_handle: cx.focus_handle(),
@@ -1002,6 +1044,23 @@ impl Browser {
         }
         tag_chips::invalidate(self);
         self.select_entry(index, Some(motion::FocusTrigger::Pointer), origin, cx);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_entry_from_accessibility(&mut self, index: usize, cx: &mut Context<Self>) {
+        if tag_filter::scope_pending(self) {
+            return;
+        }
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        self.selection.focus_pointer(&entry.stable_id());
+        self.select_entry(
+            index,
+            Some(motion::FocusTrigger::Keyboard),
+            SelectionOrigin::Intentional,
+            cx,
+        );
     }
 
     fn restore_projection_focus(
@@ -1775,6 +1834,10 @@ impl Browser {
     }
 
     fn choose_folder(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_for_source(cx);
+    }
+
+    fn prompt_for_source(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
