@@ -5,7 +5,8 @@ use std::{path::PathBuf, sync::mpsc::TryRecvError, time::Duration};
 use gpui::{ClickEvent, Context, Div, FocusHandle, PathPromptOptions, Window, div, prelude::*, px};
 use yield_design::Theme;
 use yield_session::{
-    DEFAULT_RATING_DECAY_WEEKS, MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS, PreferencePatch,
+    DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT, ENLARGED_TEXT_SCALE_PERCENT,
+    MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS, PreferencePatch,
 };
 
 use super::{Browser, source_registry::SourceRegistryGlobal};
@@ -13,6 +14,7 @@ use crate::theme::color;
 use yield_session::{CacheClearOutcome, GlobalStorageUsage, MaintenanceRequest};
 
 pub(super) struct GeneralSettings {
+    pub(super) text_scale_percent: u16,
     pub(super) rating_decay_weeks: u16,
     pub(super) trash_folder: Option<PathBuf>,
     pub(super) previous_focus: Option<FocusHandle>,
@@ -28,6 +30,7 @@ pub(super) struct GeneralSettings {
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
+            text_scale_percent: DEFAULT_TEXT_SCALE_PERCENT,
             rating_decay_weeks: DEFAULT_RATING_DECAY_WEEKS,
             trash_folder: None,
             previous_focus: None,
@@ -84,6 +87,31 @@ impl GeneralSettings {
 }
 
 impl Browser {
+    pub(super) fn toggle_text_scale(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_text_scale_from_accessibility(cx);
+    }
+
+    pub(super) fn toggle_text_scale_from_accessibility(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let percent = if self.general_settings.text_scale_percent == DEFAULT_TEXT_SCALE_PERCENT {
+            ENLARGED_TEXT_SCALE_PERCENT
+        } else {
+            DEFAULT_TEXT_SCALE_PERCENT
+        };
+        if self.submit_preference_patch(PreferencePatch::SetTextScalePercent(percent), cx) {
+            self.apply_preference_projection(cx);
+            cx.notify();
+        }
+    }
+
     pub(super) fn close_general_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.theme_settings_open = false;
         self.general_settings.invalidate_picker();

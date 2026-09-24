@@ -60,9 +60,10 @@ pub use maintenance::{
 };
 
 pub use preferences::{
-    AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, MAX_RATING_DECAY_WEEKS,
-    MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
-    PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
+    AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT,
+    ENLARGED_TEXT_SCALE_PERCENT, MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS, PreferenceError,
+    PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
+    UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 

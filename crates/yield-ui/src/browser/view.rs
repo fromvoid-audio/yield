@@ -532,6 +532,38 @@ impl Browser {
             )
             .child(
                 div()
+                    .id("toggle-text-scale")
+                    .relative()
+                    .when_some(self.ax_focus("settings-text-scale"), |element, focus| {
+                        element.track_focus(&focus)
+                    })
+                    .when_some(self.ax_marker("settings-text-scale"), |element, marker| {
+                        element.child(marker)
+                    })
+                    .flex()
+                    .items_center()
+                    .h(px(theme.spacing.control_height))
+                    .px(px(theme.spacing.control_gap))
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border_emphasis))
+                    .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
+                    .when(settings_editable, |element| {
+                        element
+                            .cursor_pointer()
+                            .on_click(cx.listener(Self::toggle_text_scale))
+                    })
+                    .text_color(if settings_editable {
+                        color(theme.colors.text_primary)
+                    } else {
+                        color(theme.colors.text_disabled)
+                    })
+                    .child(format!(
+                        "Text {}%",
+                        self.general_settings.text_scale_percent
+                    )),
+            )
+            .child(
+                div()
                     .id("toggle-autoplay")
                     .relative()
                     .when_some(self.ax_focus("settings-autoplay"), |element, focus| {

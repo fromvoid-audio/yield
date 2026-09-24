@@ -331,6 +331,7 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
             preferences.theme_source_path = source_path.clone();
         }
         PreferencePatch::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = *enabled,
+        PreferencePatch::SetTextScalePercent(percent) => preferences.text_scale_percent = *percent,
         PreferencePatch::SetAutoplaySelection(enabled) => preferences.autoplay_selection = *enabled,
         PreferencePatch::SetRatingDecayWeeks(weeks) => preferences.rating_decay_weeks = *weeks,
         PreferencePatch::SetTrashFolder(path) => preferences.trash_folder = path.clone(),
@@ -488,11 +489,12 @@ impl Browser {
         }
     }
 
-    fn apply_preference_projection(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn apply_preference_projection(&mut self, cx: &mut Context<Self>) {
         let effective = self.preferences.effective();
         let autoplay_was_enabled = self.autoplay_selection;
         self.autoplay_selection = effective.autoplay_selection;
         self.help_tooltips_enabled = effective.help_tooltips_enabled;
+        self.general_settings.text_scale_percent = effective.text_scale_percent;
         self.general_settings.rating_decay_weeks = effective.rating_decay_weeks;
         self.general_settings.trash_folder = effective.trash_folder.clone();
         self.playback_policy
@@ -522,9 +524,11 @@ impl Browser {
         if preserve_inflight_theme {
             return;
         }
+        let displayed_theme =
+            crate::theme::with_text_scale(&effective.theme, effective.text_scale_percent);
         let active_theme = crate::theme::active(cx).clone();
-        if active_theme != effective.theme {
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(effective.theme.clone())));
+        if active_theme != displayed_theme {
+            cx.set_global(crate::theme::ActiveTheme(Arc::new(displayed_theme)));
             self.search_input
                 .update(cx, |input, cx| input.theme_changed(cx));
             self.playmark_timing_input
@@ -646,6 +650,18 @@ mod tests {
         assert_eq!(effective.theme, imported);
         assert!(!effective.autoplay_selection);
         assert!(effective.loop_enabled);
+    }
+
+    #[test]
+    fn text_scale_stays_visible_while_persistence_is_pending() {
+        let mut state = PreferenceState::new();
+        state.queue_for_test(1, PreferencePatch::SetTextScalePercent(200));
+        assert_eq!(state.effective().text_scale_percent, 200);
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        assert_eq!(state.effective().text_scale_percent, 200);
+        state.mark_applied_for_test(1, 1);
+        state.mark_persisted_for_test(1);
+        assert!(!state.has_pending());
     }
 
     #[test]
