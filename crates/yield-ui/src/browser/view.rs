@@ -382,6 +382,8 @@ impl Browser {
     }
 
     fn render_theme_settings(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let enlarged =
+            self.general_settings.text_scale_percent == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
         let focus_color = color(theme.interaction.focus_outline);
         let focus_width = theme.interaction.focus_outline_width;
         let reload_pending = self.theme_load.pending_path.is_some();
@@ -403,6 +405,7 @@ impl Browser {
         };
         let reload = div()
             .id("reload-theme")
+            .flex_none()
             .relative()
             .when_some(self.ax_focus("settings-theme-reload"), |element, focus| {
                 element.track_focus(&focus)
@@ -428,13 +431,18 @@ impl Browser {
             .child("Reload");
         div()
             .flex()
+            .flex_wrap()
             .flex_none()
+            .debug_selector(|| String::from("theme-settings-strip"))
+            .w_full()
+            .min_w_0()
             .items_center()
             .gap(px(theme.spacing.control_gap))
-            .h(px(
+            .min_h(px(
                 theme.spacing.control_height + theme.spacing.panel_padding * 2.0
             ))
             .px(px(theme.spacing.panel_padding))
+            .py(px(theme.spacing.panel_padding))
             .bg(color(theme.colors.surface_overlay))
             .border_b(px(theme.spacing.border_width))
             .border_color(color(theme.colors.border))
@@ -444,6 +452,7 @@ impl Browser {
             .child(
                 div()
                     .id("choose-theme")
+                    .flex_none()
                     .relative()
                     .when_some(self.ax_focus("settings-theme-choose"), |element, focus| {
                         element.track_focus(&focus)
@@ -475,6 +484,7 @@ impl Browser {
             .child(
                 div()
                     .id("reset-theme")
+                    .flex_none()
                     .relative()
                     .when_some(self.ax_focus("settings-theme-reset"), |element, focus| {
                         element.track_focus(&focus)
@@ -496,6 +506,7 @@ impl Browser {
             .child(
                 div()
                     .id("toggle-animations")
+                    .flex_none()
                     .relative()
                     .when_some(self.ax_focus("settings-motion"), |element, focus| {
                         element.track_focus(&focus)
@@ -533,6 +544,8 @@ impl Browser {
             .child(
                 div()
                     .id("toggle-text-scale")
+                    .flex_none()
+                    .debug_selector(|| String::from("toggle-text-scale"))
                     .relative()
                     .when_some(self.ax_focus("settings-text-scale"), |element, focus| {
                         element.track_focus(&focus)
@@ -565,6 +578,7 @@ impl Browser {
             .child(
                 div()
                     .id("toggle-autoplay")
+                    .flex_none()
                     .relative()
                     .when_some(self.ax_focus("settings-autoplay"), |element, focus| {
                         element.track_focus(&focus)
@@ -602,6 +616,8 @@ impl Browser {
             .child(
                 div()
                     .id("toggle-help-tooltips")
+                    .flex_none()
+                    .debug_selector(|| String::from("toggle-help-tooltips"))
                     .relative()
                     .when_some(self.ax_focus("settings-help-tips"), |element, focus| {
                         element.track_focus(&focus)
@@ -636,10 +652,11 @@ impl Browser {
                         "Help tips Off"
                     }),
             )
-            .child(div().flex_1())
+            .child(div().when(!enlarged, |spacer| spacer.flex_1()))
             .child(
                 div()
                     .relative()
+                    .when(enlarged, |status| status.w_full().flex_none())
                     .when_some(
                         self.ax_marker("settings-theme-status"),
                         |element, marker| element.child(marker),
@@ -2400,6 +2417,66 @@ mod tests {
                     .is_focused(window)
             );
         });
+    }
+
+    #[gpui::test]
+    fn enlarged_settings_controls_wrap_within_narrow_viewport(cx: &mut TestAppContext) {
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(480.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .expect("open narrow test window")
+        });
+        let browser = window.root(cx).expect("browser root");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|_, app| {
+            browser.update(app, |view, cx| {
+                view.theme_settings_open = true;
+                view.general_settings.text_scale_percent = 200;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| assert_eq!(window.bounds().size.width, px(480.0)));
+        cx.refresh().expect("enlarged settings layout");
+        let strip = cx
+            .debug_bounds("theme-settings-strip")
+            .expect("settings strip");
+        let text_scale = cx
+            .debug_bounds("toggle-text-scale")
+            .expect("text scale bounds");
+        let help_tips = cx
+            .debug_bounds("toggle-help-tooltips")
+            .expect("help tips bounds");
+        assert!(
+            help_tips.origin.y > text_scale.origin.y,
+            "controls did not wrap: text {text_scale:?}, help {help_tips:?}, strip {strip:?}"
+        );
+
+        for selector in ["toggle-text-scale", "toggle-help-tooltips"] {
+            let bounds = cx.debug_bounds(selector).expect("settings control bounds");
+            assert!(
+                bounds.origin.x >= strip.origin.x,
+                "{selector} starts outside strip"
+            );
+            assert!(
+                bounds.origin.x + bounds.size.width <= strip.origin.x + strip.size.width,
+                "{selector} ends outside strip: {bounds:?}, strip {strip:?}"
+            );
+            assert!(
+                bounds.origin.y + bounds.size.height <= strip.origin.y + strip.size.height,
+                "{selector} is below strip: {bounds:?}, strip {strip:?}"
+            );
+        }
     }
 
     #[gpui::test]
