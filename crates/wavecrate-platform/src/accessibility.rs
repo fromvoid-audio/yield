@@ -7,13 +7,16 @@
 
 use async_channel::{Receiver, Sender};
 use objc2::rc::Retained;
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send};
+use objc2::runtime::{AnyObject, Sel};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAccessibility, NSAccessibilityButtonRole, NSAccessibilityCheckBoxRole,
-    NSAccessibilityElement, NSAccessibilityGroupRole, NSAccessibilityListRole,
-    NSAccessibilityMenuItemRole, NSAccessibilityPopUpButtonRole, NSAccessibilityRadioButtonRole,
+    NSAccessibility, NSAccessibilityActionName, NSAccessibilityAttributeName,
+    NSAccessibilityButtonRole, NSAccessibilityCheckBoxRole, NSAccessibilityElement,
+    NSAccessibilityGroupRole, NSAccessibilityListRole, NSAccessibilityMenuItemRole,
+    NSAccessibilityPopUpButtonRole, NSAccessibilityPressAction, NSAccessibilityRadioButtonRole,
     NSAccessibilityRole, NSAccessibilityRowRole, NSAccessibilitySliderRole,
-    NSAccessibilityStaticTextRole, NSAccessibilityTextFieldRole, NSView,
+    NSAccessibilityStaticTextRole, NSAccessibilityTextFieldRole, NSAccessibilityValueAttribute,
+    NSView,
 };
 use objc2_foundation::{NSArray, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
@@ -23,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Maximum number of AX children accepted by one GPUI window registry.
 pub const MAX_AX_CHILDREN: usize = 2_048;
 const MAX_PENDING_ACTIONS: usize = 64;
+const MAX_EDIT_VALUE_BYTES: usize = 16 * 1024;
 
 /// Native role represented by a GPUI-drawn control.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,12 +127,14 @@ impl AxFrame {
 }
 
 /// An action requested through native accessibility.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AxAction {
     /// Activate a button-like control.
     Press,
     /// Move keyboard focus to the owning GPUI control.
     Focus,
+    /// Replace an editable field's complete value.
+    SetValue(String),
 }
 
 /// An AX action to dispatch on the owning GPUI window context.
@@ -167,6 +173,7 @@ struct ChildIvars {
     alive: AtomicBool,
     enabled: AtomicBool,
     pressable: AtomicBool,
+    editable: AtomicBool,
     focused: AtomicBool,
 }
 
@@ -181,19 +188,83 @@ define_class!(
     struct NativeChild;
 
     impl NativeChild {
-        #[unsafe(method(accessibilityPerformPress))]
-        fn perform_press(&self) -> bool {
+        #[unsafe(method(isAccessibilitySelectorAllowed:))]
+        fn selector_allowed(&self, selector: Sel) -> bool {
+            if selector == sel!(setAccessibilityValue:) {
+                let ivars = self.ivars();
+                return (ivars.alive.load(Ordering::Acquire)
+                    && ivars.enabled.load(Ordering::Acquire)
+                    && ivars.editable.load(Ordering::Acquire))
+                    .into();
+            }
+            unsafe { msg_send![super(self), isAccessibilitySelectorAllowed: selector] }
+        }
+
+        #[unsafe(method(setAccessibilityValue:))]
+        fn set_ax_value(&self, value: Option<&AnyObject>) {
+            if !self.ivars().editable.load(Ordering::Acquire)
+                || !self.ivars().alive.load(Ordering::Acquire)
+                || !self.ivars().enabled.load(Ordering::Acquire)
+            {
+                return;
+            }
+            let Some(value) = value.and_then(|value| value.downcast_ref::<NSString>()) else {
+                return;
+            };
+            self.queue_value(value);
+        }
+
+        #[unsafe(method(accessibilityActionNames))]
+        fn action_names(&self) -> *mut NSArray<NSAccessibilityActionName> {
+            let actions = if self.ivars().alive.load(Ordering::Acquire)
+                && self.ivars().enabled.load(Ordering::Acquire)
+                && self.ivars().pressable.load(Ordering::Acquire)
+            {
+                // SAFETY: AppKit exports this immutable action name for process lifetime.
+                NSArray::from_slice(&[unsafe { NSAccessibilityPressAction }])
+            } else {
+                NSArray::from_slice(&[])
+            };
+            Retained::autorelease_return(actions)
+        }
+
+        #[unsafe(method(accessibilityIsAttributeSettable:))]
+        fn value_is_settable(&self, attribute: &NSAccessibilityAttributeName) -> bool {
+            self.can_edit_value(attribute)
+        }
+
+        #[unsafe(method(accessibilitySetValue:forAttribute:))]
+        fn set_value_for_attribute(
+            &self,
+            value: Option<&AnyObject>,
+            attribute: &NSAccessibilityAttributeName,
+        ) {
+            if !self.can_edit_value(attribute) {
+                return;
+            }
+            let Some(value) = value.and_then(|value| value.downcast_ref::<NSString>()) else {
+                return;
+            };
+            self.queue_value(value);
+        }
+
+        #[unsafe(method(accessibilityPerformAction:))]
+        fn perform_action(&self, action: &NSAccessibilityActionName) {
+            // SAFETY: AppKit exports this immutable action name for process lifetime.
+            if !unsafe { action.isEqualToString(NSAccessibilityPressAction) } {
+                return;
+            }
             let ivars = self.ivars();
             if !ivars.alive.load(Ordering::Acquire)
                 || !ivars.enabled.load(Ordering::Acquire)
                 || !ivars.pressable.load(Ordering::Acquire)
             {
-                return false.into();
+                return;
             }
-            ivars.events.try_send(AxEvent {
+            let _ = ivars.events.try_send(AxEvent {
                 id: ivars.id.clone(),
                 action: AxAction::Press,
-            }).is_ok()
+            });
         }
 
         #[unsafe(method(setAccessibilityFocused:))]
@@ -220,6 +291,26 @@ define_class!(
 );
 
 impl NativeChild {
+    fn queue_value(&self, value: &NSString) {
+        let value = value.to_string();
+        if value.len() <= MAX_EDIT_VALUE_BYTES {
+            let _ = self.ivars().events.try_send(AxEvent {
+                id: self.ivars().id.clone(),
+                action: AxAction::SetValue(value),
+            });
+        }
+    }
+
+    fn can_edit_value(&self, attribute: &NSAccessibilityAttributeName) -> bool {
+        // SAFETY: AppKit exports this immutable attribute name for process lifetime.
+        let is_value = unsafe { attribute.isEqualToString(NSAccessibilityValueAttribute) };
+        let ivars = self.ivars();
+        is_value
+            && ivars.alive.load(Ordering::Acquire)
+            && ivars.enabled.load(Ordering::Acquire)
+            && ivars.editable.load(Ordering::Acquire)
+    }
+
     fn new(marker: MainThreadMarker, id: String, events: Sender<AxEvent>) -> Retained<Self> {
         let this = marker.alloc().set_ivars(ChildIvars {
             id,
@@ -227,6 +318,7 @@ impl NativeChild {
             alive: AtomicBool::new(true),
             enabled: AtomicBool::new(false),
             pressable: AtomicBool::new(false),
+            editable: AtomicBool::new(false),
             focused: AtomicBool::new(false),
         });
         // SAFETY: Initialize the freshly allocated subclass through its
@@ -302,7 +394,10 @@ impl AxRegistry {
             child.setAccessibilityLabel(Some(&NSString::from_str(&control.label)));
             let value = control.value.as_deref().map(NSString::from_str);
             // SAFETY: NSString is an Objective-C object suitable for AXValue.
-            unsafe { child.setAccessibilityValue(value.as_deref().map(|value| &***value)) };
+            let value = value.as_deref().map(|value| &***value);
+            // Reconciliation writes the value owned by GPUI without feeding it
+            // back through the native edit callback.
+            let _: () = unsafe { msg_send![super(&*child), setAccessibilityValue: value] };
             child.setAccessibilityEnabled(control.enabled);
             child
                 .ivars()
@@ -312,6 +407,10 @@ impl AxRegistry {
                 .ivars()
                 .pressable
                 .store(control.role.pressable(), Ordering::Release);
+            child
+                .ivars()
+                .editable
+                .store(control.role == AxRole::TextField, Ordering::Release);
             order.push(control.id.clone());
             next.insert(control.id, child);
         }
@@ -369,6 +468,7 @@ impl AxRegistry {
     fn retire(child: &NativeChild) {
         child.ivars().alive.store(false, Ordering::Release);
         child.ivars().enabled.store(false, Ordering::Release);
+        child.ivars().editable.store(false, Ordering::Release);
         child.ivars().focused.store(false, Ordering::Release);
         // SAFETY: A retired AX child no longer belongs to the GPUI view.
         unsafe { child.setAccessibilityParent(None) };

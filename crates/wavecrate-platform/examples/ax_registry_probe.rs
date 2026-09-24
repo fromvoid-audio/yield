@@ -86,6 +86,7 @@ mod macos {
                                     window.refresh();
                                     cx.notify();
                                 }
+                                AxAction::SetValue(_) => {}
                             }
                         })
                         .is_err()

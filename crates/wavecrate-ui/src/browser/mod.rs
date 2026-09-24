@@ -485,6 +485,7 @@ impl Browser {
                 view.refresh_collection_filter_counts();
                 view.reconcile_selection();
                 view.restore_explicit_projection_focus(previous_id, previous_position, cx);
+                cx.notify();
             });
         let playmark_timing_input =
             cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::playmark_timing()));
