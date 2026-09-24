@@ -12,11 +12,12 @@ use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, s
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityActionName, NSAccessibilityAttributeName,
     NSAccessibilityButtonRole, NSAccessibilityCheckBoxRole, NSAccessibilityDecrementAction,
-    NSAccessibilityElement, NSAccessibilityGroupRole, NSAccessibilityIncrementAction,
-    NSAccessibilityListRole, NSAccessibilityMenuItemRole, NSAccessibilityPopUpButtonRole,
+    NSAccessibilityElement, NSAccessibilityFocusedUIElementChangedNotification,
+    NSAccessibilityGroupRole, NSAccessibilityIncrementAction, NSAccessibilityListRole,
+    NSAccessibilityMenuItemRole, NSAccessibilityPopUpButtonRole, NSAccessibilityPostNotification,
     NSAccessibilityPressAction, NSAccessibilityRadioButtonRole, NSAccessibilityRole,
     NSAccessibilityRowRole, NSAccessibilitySliderRole, NSAccessibilityStaticTextRole,
-    NSAccessibilityTextFieldRole, NSAccessibilityValueAttribute, NSView,
+    NSAccessibilityTextFieldRole, NSAccessibilityValueAttribute, NSApplication, NSView,
 };
 use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
@@ -479,6 +480,9 @@ impl AxRegistry {
             // back through the native edit callback.
             let _: () = unsafe { msg_send![super(&*child), setAccessibilityValue: value] };
             child.setAccessibilityEnabled(control.enabled);
+            if !control.enabled && child.ivars().focused.swap(false, Ordering::AcqRel) {
+                Self::clear_app_focus_if_child(&child);
+            }
             child
                 .ivars()
                 .enabled
@@ -575,7 +579,26 @@ impl AxRegistry {
             .children
             .get(id)
             .ok_or(AxRegistryError::UnknownIdentity)?;
-        child.ivars().focused.store(focused, Ordering::Release);
+        let focused = focused
+            && child.ivars().alive.load(Ordering::Acquire)
+            && child.ivars().enabled.load(Ordering::Acquire);
+        let previous = child.ivars().focused.swap(focused, Ordering::AcqRel);
+        if focused && !previous {
+            let app = NSApplication::sharedApplication(
+                MainThreadMarker::new().ok_or(AxRegistryError::NotMainThread)?,
+            );
+            // SAFETY: The live child belongs to this application's focused window.
+            unsafe { app.setAccessibilityApplicationFocusedUIElement(Some(&**child)) };
+            // SAFETY: This is a live AppKit accessibility element on the main thread.
+            unsafe {
+                NSAccessibilityPostNotification(
+                    &**child,
+                    NSAccessibilityFocusedUIElementChangedNotification,
+                )
+            };
+        } else if !focused && previous {
+            Self::clear_app_focus_if_child(child);
+        }
         Ok(())
     }
 
@@ -584,7 +607,36 @@ impl AxRegistry {
         self.children.contains_key(id)
     }
 
+    fn clear_app_focus_if_child(child: &NativeChild) {
+        let Some(marker) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(marker);
+        if app
+            .accessibilityApplicationFocusedUIElement()
+            .as_ref()
+            .is_some_and(|focused| {
+                std::ptr::eq(
+                    &**focused,
+                    (child as *const NativeChild).cast::<AnyObject>(),
+                )
+            })
+        {
+            // SAFETY: Clearing the focus target prevents an inactive or retired
+            // child from remaining the application's reported AX focus.
+            unsafe { app.setAccessibilityApplicationFocusedUIElement(None) };
+            // SAFETY: The AppKit application is live on the main thread.
+            unsafe {
+                NSAccessibilityPostNotification(
+                    &*app,
+                    NSAccessibilityFocusedUIElementChangedNotification,
+                )
+            };
+        }
+    }
+
     fn retire(child: &NativeChild) {
+        Self::clear_app_focus_if_child(child);
         child.ivars().alive.store(false, Ordering::Release);
         child.ivars().enabled.store(false, Ordering::Release);
         child.ivars().editable.store(false, Ordering::Release);
