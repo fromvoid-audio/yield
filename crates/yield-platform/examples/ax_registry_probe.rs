@@ -84,7 +84,9 @@ mod macos {
                                     window.refresh();
                                     cx.notify();
                                 }
-                                AxAction::SetValue(_) => {}
+                                AxAction::SetValue(_)
+                                | AxAction::Increment
+                                | AxAction::Decrement => {}
                             }
                         })
                         .is_err()

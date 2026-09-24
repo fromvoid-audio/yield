@@ -11,17 +11,17 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityActionName, NSAccessibilityAttributeName,
-    NSAccessibilityButtonRole, NSAccessibilityCheckBoxRole, NSAccessibilityElement,
-    NSAccessibilityGroupRole, NSAccessibilityListRole, NSAccessibilityMenuItemRole,
-    NSAccessibilityPopUpButtonRole, NSAccessibilityPressAction, NSAccessibilityRadioButtonRole,
-    NSAccessibilityRole, NSAccessibilityRowRole, NSAccessibilitySliderRole,
-    NSAccessibilityStaticTextRole, NSAccessibilityTextFieldRole, NSAccessibilityValueAttribute,
-    NSView,
+    NSAccessibilityButtonRole, NSAccessibilityCheckBoxRole, NSAccessibilityDecrementAction,
+    NSAccessibilityElement, NSAccessibilityGroupRole, NSAccessibilityIncrementAction,
+    NSAccessibilityListRole, NSAccessibilityMenuItemRole, NSAccessibilityPopUpButtonRole,
+    NSAccessibilityPressAction, NSAccessibilityRadioButtonRole, NSAccessibilityRole,
+    NSAccessibilityRowRole, NSAccessibilitySliderRole, NSAccessibilityStaticTextRole,
+    NSAccessibilityTextFieldRole, NSAccessibilityValueAttribute, NSView,
 };
-use objc2_foundation::{NSArray, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Maximum number of AX children accepted by one GPUI window registry.
 pub const MAX_AX_CHILDREN: usize = 2_048;
@@ -103,6 +103,28 @@ pub struct AxChild {
     pub enabled: bool,
 }
 
+/// Numeric state for a GPUI-owned native slider.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxSlider {
+    /// Current value in the inclusive slider range.
+    pub value: f64,
+    /// Lowest allowed value.
+    pub min: f64,
+    /// Highest allowed value.
+    pub max: f64,
+}
+
+impl AxSlider {
+    fn valid(self) -> bool {
+        [self.value, self.min, self.max]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.min <= self.value
+            && self.value <= self.max
+            && self.min < self.max
+    }
+}
+
 /// Bounds in GPUI window coordinates, with origin at the upper left.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AxFrame {
@@ -133,8 +155,12 @@ pub enum AxAction {
     Press,
     /// Move keyboard focus to the owning GPUI control.
     Focus,
-    /// Replace an editable field's complete value.
+    /// Replace an editable field's text or an adjustable slider's numeric value.
     SetValue(String),
+    /// Increase an adjustable slider by the owning control's step.
+    Increment,
+    /// Decrease an adjustable slider by the owning control's step.
+    Decrement,
 }
 
 /// An AX action to dispatch on the owning GPUI window context.
@@ -163,6 +189,10 @@ pub enum AxRegistryError {
     DuplicateIdentity,
     /// A frame contained an invalid coordinate or negative size.
     InvalidFrame,
+    /// Slider value or bounds are invalid.
+    InvalidSlider,
+    /// Slider configuration targeted a non-slider control.
+    NotSlider,
     /// The control identity is no longer registered.
     UnknownIdentity,
 }
@@ -174,6 +204,10 @@ struct ChildIvars {
     enabled: AtomicBool,
     pressable: AtomicBool,
     editable: AtomicBool,
+    slider_role: AtomicBool,
+    slider_configured: AtomicBool,
+    slider_min: AtomicU64,
+    slider_max: AtomicU64,
     focused: AtomicBool,
 }
 
@@ -194,7 +228,8 @@ define_class!(
                 let ivars = self.ivars();
                 return (ivars.alive.load(Ordering::Acquire)
                     && ivars.enabled.load(Ordering::Acquire)
-                    && ivars.editable.load(Ordering::Acquire))
+                    && (ivars.editable.load(Ordering::Acquire)
+                        || ivars.slider_configured.load(Ordering::Acquire)))
                     .into();
             }
             unsafe { msg_send![super(self), isAccessibilitySelectorAllowed: selector] }
@@ -202,26 +237,29 @@ define_class!(
 
         #[unsafe(method(setAccessibilityValue:))]
         fn set_ax_value(&self, value: Option<&AnyObject>) {
-            if !self.ivars().editable.load(Ordering::Acquire)
-                || !self.ivars().alive.load(Ordering::Acquire)
+            if !self.ivars().alive.load(Ordering::Acquire)
                 || !self.ivars().enabled.load(Ordering::Acquire)
             {
                 return;
             }
-            let Some(value) = value.and_then(|value| value.downcast_ref::<NSString>()) else {
-                return;
-            };
-            self.queue_value(value);
+            self.queue_ax_value(value);
         }
 
         #[unsafe(method(accessibilityActionNames))]
         fn action_names(&self) -> *mut NSArray<NSAccessibilityActionName> {
-            let actions = if self.ivars().alive.load(Ordering::Acquire)
-                && self.ivars().enabled.load(Ordering::Acquire)
-                && self.ivars().pressable.load(Ordering::Acquire)
+            let ivars = self.ivars();
+            let actions = if ivars.alive.load(Ordering::Acquire)
+                && ivars.enabled.load(Ordering::Acquire)
             {
-                // SAFETY: AppKit exports this immutable action name for process lifetime.
-                NSArray::from_slice(&[unsafe { NSAccessibilityPressAction }])
+                if ivars.pressable.load(Ordering::Acquire) {
+                    // SAFETY: AppKit exports this immutable action name for process lifetime.
+                    NSArray::from_slice(&[unsafe { NSAccessibilityPressAction }])
+                } else if ivars.slider_configured.load(Ordering::Acquire) {
+                    // SAFETY: AppKit exports these immutable action names for process lifetime.
+                    NSArray::from_slice(&unsafe { [NSAccessibilityIncrementAction, NSAccessibilityDecrementAction] })
+                } else {
+                    NSArray::from_slice(&[])
+                }
             } else {
                 NSArray::from_slice(&[])
             };
@@ -242,28 +280,37 @@ define_class!(
             if !self.can_edit_value(attribute) {
                 return;
             }
-            let Some(value) = value.and_then(|value| value.downcast_ref::<NSString>()) else {
-                return;
-            };
-            self.queue_value(value);
+            self.queue_ax_value(value);
         }
 
         #[unsafe(method(accessibilityPerformAction:))]
         fn perform_action(&self, action: &NSAccessibilityActionName) {
-            // SAFETY: AppKit exports this immutable action name for process lifetime.
-            if !unsafe { action.isEqualToString(NSAccessibilityPressAction) } {
-                return;
-            }
             let ivars = self.ivars();
             if !ivars.alive.load(Ordering::Acquire)
                 || !ivars.enabled.load(Ordering::Acquire)
-                || !ivars.pressable.load(Ordering::Acquire)
             {
                 return;
             }
+            // SAFETY: AppKit exports these immutable action names for process lifetime.
+            let requested = if ivars.pressable.load(Ordering::Acquire)
+                && unsafe { action.isEqualToString(NSAccessibilityPressAction) }
+            {
+                Some(AxAction::Press)
+            } else if ivars.slider_configured.load(Ordering::Acquire)
+                && unsafe { action.isEqualToString(NSAccessibilityIncrementAction) }
+            {
+                Some(AxAction::Increment)
+            } else if ivars.slider_configured.load(Ordering::Acquire)
+                && unsafe { action.isEqualToString(NSAccessibilityDecrementAction) }
+            {
+                Some(AxAction::Decrement)
+            } else {
+                None
+            };
+            let Some(action) = requested else { return };
             let _ = ivars.events.try_send(AxEvent {
                 id: ivars.id.clone(),
-                action: AxAction::Press,
+                action,
             });
         }
 
@@ -291,6 +338,27 @@ define_class!(
 );
 
 impl NativeChild {
+    fn queue_ax_value(&self, value: Option<&AnyObject>) {
+        let ivars = self.ivars();
+        if ivars.editable.load(Ordering::Acquire) {
+            if let Some(value) = value.and_then(|value| value.downcast_ref::<NSString>()) {
+                self.queue_value(value);
+            }
+        } else if ivars.slider_configured.load(Ordering::Acquire)
+            && let Some(value) = value.and_then(|value| value.downcast_ref::<NSNumber>())
+        {
+            let number = value.as_f64();
+            let min = f64::from_bits(ivars.slider_min.load(Ordering::Acquire));
+            let max = f64::from_bits(ivars.slider_max.load(Ordering::Acquire));
+            if number.is_finite() && (min..=max).contains(&number) {
+                let _ = ivars.events.try_send(AxEvent {
+                    id: ivars.id.clone(),
+                    action: AxAction::SetValue(number.to_string()),
+                });
+            }
+        }
+    }
+
     fn queue_value(&self, value: &NSString) {
         let value = value.to_string();
         if value.len() <= MAX_EDIT_VALUE_BYTES {
@@ -308,7 +376,8 @@ impl NativeChild {
         is_value
             && ivars.alive.load(Ordering::Acquire)
             && ivars.enabled.load(Ordering::Acquire)
-            && ivars.editable.load(Ordering::Acquire)
+            && (ivars.editable.load(Ordering::Acquire)
+                || ivars.slider_configured.load(Ordering::Acquire))
     }
 
     fn new(marker: MainThreadMarker, id: String, events: Sender<AxEvent>) -> Retained<Self> {
@@ -319,6 +388,10 @@ impl NativeChild {
             enabled: AtomicBool::new(false),
             pressable: AtomicBool::new(false),
             editable: AtomicBool::new(false),
+            slider_role: AtomicBool::new(false),
+            slider_configured: AtomicBool::new(false),
+            slider_min: AtomicU64::new(0),
+            slider_max: AtomicU64::new(0),
             focused: AtomicBool::new(false),
         });
         // SAFETY: Initialize the freshly allocated subclass through its
@@ -373,6 +446,9 @@ impl AxRegistry {
             if control.id.trim().is_empty() || control.label.trim().is_empty() {
                 return Err(AxRegistryError::EmptyIdentityOrLabel);
             }
+            if control.role == AxRole::Slider && control.value.is_some() {
+                return Err(AxRegistryError::InvalidSlider);
+            }
             if !seen.insert(control.id.as_str()) {
                 return Err(AxRegistryError::DuplicateIdentity);
             }
@@ -392,6 +468,10 @@ impl AxRegistry {
             });
             child.setAccessibilityRole(Some(control.role.native()));
             child.setAccessibilityLabel(Some(&NSString::from_str(&control.label)));
+            child
+                .ivars()
+                .slider_configured
+                .store(false, Ordering::Release);
             let value = control.value.as_deref().map(NSString::from_str);
             // SAFETY: NSString is an Objective-C object suitable for AXValue.
             let value = value.as_deref().map(|value| &***value);
@@ -411,6 +491,10 @@ impl AxRegistry {
                 .ivars()
                 .editable
                 .store(control.role == AxRole::TextField, Ordering::Release);
+            child
+                .ivars()
+                .slider_role
+                .store(control.role == AxRole::Slider, Ordering::Release);
             order.push(control.id.clone());
             next.insert(control.id, child);
         }
@@ -449,6 +533,41 @@ impl AxRegistry {
         Ok(())
     }
 
+    /// Set a slider's numeric value and bounds after reconciling its `AxChild`.
+    /// Call this after each reconciliation that includes the slider.
+    pub fn set_slider(&self, id: &str, slider: AxSlider) -> Result<(), AxRegistryError> {
+        MainThreadMarker::new().ok_or(AxRegistryError::NotMainThread)?;
+        if !slider.valid() {
+            return Err(AxRegistryError::InvalidSlider);
+        }
+        let child = self
+            .children
+            .get(id)
+            .ok_or(AxRegistryError::UnknownIdentity)?;
+        let ivars = child.ivars();
+        if !ivars.slider_role.load(Ordering::Acquire) {
+            return Err(AxRegistryError::NotSlider);
+        }
+        ivars.slider_configured.store(false, Ordering::Release);
+        let value = NSNumber::new_f64(slider.value);
+        let min = NSNumber::new_f64(slider.min);
+        let max = NSNumber::new_f64(slider.max);
+        // SAFETY: Numeric objects are valid AppKit slider accessibility values.
+        unsafe {
+            let _: () = msg_send![super(&**child), setAccessibilityValue: &*value];
+            child.setAccessibilityMinValue(Some(&min));
+            child.setAccessibilityMaxValue(Some(&max));
+        }
+        ivars
+            .slider_min
+            .store(slider.min.to_bits(), Ordering::Release);
+        ivars
+            .slider_max
+            .store(slider.max.to_bits(), Ordering::Release);
+        ivars.slider_configured.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Update AX focus from the owning GPUI focus handle and window activity.
     pub fn set_focused(&self, id: &str, focused: bool) -> Result<(), AxRegistryError> {
         MainThreadMarker::new().ok_or(AxRegistryError::NotMainThread)?;
@@ -469,6 +588,11 @@ impl AxRegistry {
         child.ivars().alive.store(false, Ordering::Release);
         child.ivars().enabled.store(false, Ordering::Release);
         child.ivars().editable.store(false, Ordering::Release);
+        child
+            .ivars()
+            .slider_configured
+            .store(false, Ordering::Release);
+        child.ivars().slider_role.store(false, Ordering::Release);
         child.ivars().focused.store(false, Ordering::Release);
         // SAFETY: A retired AX child no longer belongs to the GPUI view.
         unsafe { child.setAccessibilityParent(None) };
