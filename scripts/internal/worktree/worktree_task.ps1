@@ -16,7 +16,7 @@ Then (unless -NoRun) launches:
 
 Defaults:
 - base ref: HEAD
-- paired paths: <repo>\.worktrees\<id>\wavecrate and <repo>\.worktrees\<id>\radiant
+- paired paths: <repo>\.worktrees\<id>\yield and <repo>\.worktrees\<id>\radiant
 #>
 
 param(
@@ -45,7 +45,7 @@ try {
   }
 
   if ([string]::IsNullOrWhiteSpace($Path)) {
-    $Path = Join-Path $rootDir (".worktrees\\" + $Name + "\\wavecrate")
+    $Path = Join-Path $rootDir (".worktrees\\" + $Name + "\\yield")
   }
   $pairRoot = Split-Path -Parent $Path
   $radiantPath = Join-Path $pairRoot "radiant"

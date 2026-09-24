@@ -1,6 +1,6 @@
 # Metadata, Tags, and Collections
 
-Wavecrate supports lightweight metadata so a fast audition pass can leave useful traces without requiring a permanent folder move.
+Yield supports lightweight metadata so a fast audition pass can leave useful traces without requiring a permanent folder move.
 
 ## Ratings
 
@@ -54,4 +54,4 @@ The sample browser can switch between disk filenames and metadata labels.
 - **Disk** shows the file name from disk.
 - **Label** shows the metadata label when one is available.
 
-Use disk names when checking actual file organization. Use labels when you want the browser to reflect the musical or production name you assigned inside Wavecrate.
+Use disk names when checking actual file organization. Use labels when you want the browser to reflect the musical or production name you assigned inside Yield.

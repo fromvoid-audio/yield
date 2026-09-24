@@ -2,28 +2,28 @@
 
 ## Install
 
-1. Open the Wavecrate download page.
+1. Open the Yield download page.
 2. Download the latest macOS or Windows stable, RC, or nightly bundle.
 3. Unzip the bundle.
-4. Launch Wavecrate.
+4. Launch Yield.
 5. Add a sample folder from the Sources panel.
 
-Wavecrate works with ordinary local folders. It does not upload your samples or require a cloud library.
+Yield works with ordinary local folders. It does not upload your samples or require a cloud library.
 
-Wavecrate app builds currently support macOS and Windows. Linux is not currently supported for app installs.
+Yield app builds currently support macOS and Windows. Linux is not currently supported for app installs.
 
-On Windows, Wavecrate is a manual ZIP install. Extract the `wavecrate/` folder to
-a location you manage and run `wavecrate.exe` from that folder. To update, close
-Wavecrate and replace the extracted folder with the newer ZIP contents. To
-remove Wavecrate, delete the extracted folder; app settings, logs, source
-metadata, and caches remain in the `.wavecrate` app data folder until you remove
+On Windows, Yield is a manual ZIP install. Extract the `yield/` folder to
+a location you manage and run `yield.exe` from that folder. To update, close
+Yield and replace the extracted folder with the newer ZIP contents. To
+remove Yield, delete the extracted folder; app settings, logs, source
+metadata, and caches remain in the `.yield` app data folder until you remove
 that state deliberately.
 
-> Safety warning: Wavecrate includes destructive actions that can modify, rename, move, or delete files when you choose those commands. Keep backups for important sample folders.
+> Safety warning: Yield includes destructive actions that can modify, rename, move, or delete files when you choose those commands. Keep backups for important sample folders.
 
 ## Add Your First Source
 
-Use the plus button in the Sources panel, or drag a folder onto the Sources panel. Wavecrate indexes supported audio files and stores source metadata beside the source so browsing is fast after the first pass.
+Use the plus button in the Sources panel, or drag a folder onto the Sources panel. Yield indexes supported audio files and stores source metadata beside the source so browsing is fast after the first pass.
 
 After a source is added:
 
@@ -41,11 +41,11 @@ After a source is added:
 6. Press `E` to extract a useful selected region.
 7. Rate or tag the result so you can find it later.
 
-## Where Wavecrate Stores Settings
+## Where Yield Stores Settings
 
-On supported app platforms, Wavecrate keeps app data in a `.wavecrate` folder inside the operating system config directory.
+On supported app platforms, Yield keeps app data in a `.yield` folder inside the operating system config directory.
 
-- macOS: `~/Library/Application Support/.wavecrate/`
-- Windows: `%APPDATA%\\.wavecrate\\`
+- macOS: `~/Library/Application Support/.yield/`
+- Windows: `%APPDATA%\\.yield\\`
 
 Use **Options -> Open config folder** in the app when you need logs, settings, or support context.

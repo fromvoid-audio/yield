@@ -177,7 +177,7 @@ fn lossless_raw_path_key_does_not_alias_a_unicode_sample_path() {
         OsString::from_vec(b"raw-\xFF".to_vec()),
         OsString::from("sample.wav"),
     ]);
-    let unicode_path = PathBuf::from("~wavecrate-nu~7261772dff/sample.wav");
+    let unicode_path = PathBuf::from("~yield-nu~7261772dff/sample.wav");
     std::fs::create_dir_all(directory.path().join(&raw_path).parent().unwrap()).unwrap();
     std::fs::create_dir_all(directory.path().join(&unicode_path).parent().unwrap()).unwrap();
     std::fs::write(directory.path().join(&raw_path), b"raw").unwrap();
@@ -468,7 +468,7 @@ fn targeted_sync_persists_and_recovers_a_supported_file_availability_diagnostic(
 fn failed_type_probes_never_persist_internal_database_or_appledouble_paths() {
     let directory = tempdir().unwrap();
     let sidecar_relative = PathBuf::from("._sidecar.flac");
-    let database_relative = PathBuf::from(".wavecrate.db");
+    let database_relative = PathBuf::from(".yield.db");
     let sidecar = directory.path().join(&sidecar_relative);
     let database_path = directory.path().join(&database_relative);
     std::fs::write(&sidecar, b"sidecar").unwrap();
@@ -499,10 +499,7 @@ fn failed_type_probes_never_persist_internal_database_or_appledouble_paths() {
 #[test]
 fn failed_type_probes_preserve_descendants_below_reserved_name_directories() {
     let directory = tempdir().unwrap();
-    let reserved_directories = [
-        PathBuf::from("nested/.wavecrate.db"),
-        PathBuf::from("._assets"),
-    ];
+    let reserved_directories = [PathBuf::from("nested/.yield.db"), PathBuf::from("._assets")];
     for reserved in &reserved_directories {
         std::fs::create_dir_all(directory.path().join(reserved)).unwrap();
         std::fs::write(directory.path().join(reserved).join("sample.wav"), b"wav").unwrap();

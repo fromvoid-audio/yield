@@ -1325,10 +1325,7 @@ mod tests {
     fn reserved_prefix_unicode_directory_path_round_trips_through_storage() {
         let root = tempfile::tempdir().unwrap();
         let db = SourceDatabase::open_for_source_write(root.path()).unwrap();
-        let expected = directory(
-            "~wavecrate-nu~café/~wavecrate-escaped~東京",
-            "dir-reserved-unicode",
-        );
+        let expected = directory("~yield-nu~café/~yield-escaped~東京", "dir-reserved-unicode");
 
         db.begin_source_directory_truth_generation(1, 1).unwrap();
         db.stage_source_directory_truth_entries(1, std::slice::from_ref(&expected))
@@ -1401,14 +1398,14 @@ mod tests {
     #[test]
     fn malformed_persisted_lossless_directory_paths_require_audit() {
         for (path, expected_description) in [
-            ("valid/~wavecrate-escaped~2f", "encoded slash/root"),
+            ("valid/~yield-escaped~2f", "encoded slash/root"),
             (
-                "valid/~wavecrate-escaped~612f62",
+                "valid/~yield-escaped~612f62",
                 "encoded slash inside component",
             ),
-            ("valid/~wavecrate-escaped~2e2e", "encoded parent"),
+            ("valid/~yield-escaped~2e2e", "encoded parent"),
             (
-                "valid/~wavecrate-escaped~616c696173",
+                "valid/~yield-escaped~616c696173",
                 "escaped ordinary plain path alias",
             ),
         ] {
@@ -1458,8 +1455,8 @@ mod tests {
     #[test]
     fn finalization_rejects_corrupt_staging_rows_before_publication() {
         for (path, path_encoding, directory_identity) in [
-            ("valid/~wavecrate-escaped~2f", 1, "dir-valid"),
-            ("valid/~wavecrate-escaped~616c696173", 1, "dir-valid"),
+            ("valid/~yield-escaped~2f", 1, "dir-valid"),
+            ("valid/~yield-escaped~616c696173", 1, "dir-valid"),
             ("valid", 0, "\u{1}"),
         ] {
             let root = tempfile::tempdir().unwrap();

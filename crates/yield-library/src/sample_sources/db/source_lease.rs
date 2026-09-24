@@ -23,7 +23,7 @@ use super::sqlite_identity::DatabaseFileBinding;
 use super::{SourceDatabaseIdentityError, schema};
 
 /// Filename for the physical-source ownership sidecar.
-pub(crate) const SOURCE_LEASE_LOCK_FILE_NAME: &str = ".wavecrate-source-lease.lock";
+pub(crate) const SOURCE_LEASE_LOCK_FILE_NAME: &str = ".yield-source-lease.lock";
 
 const LEASE_DURATION_SECONDS: i64 = 300;
 const LEASE_RENEWAL_THRESHOLD_SECONDS: i64 = 60;

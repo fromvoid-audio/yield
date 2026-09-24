@@ -10112,7 +10112,7 @@ mod tests {
                         "staged": {
                             "participant_id": source_participant,
                             "source_id": "owner-source",
-                            "relative_path": ".wavecrate_delete_staging/folder/item",
+                            "relative_path": ".yield_delete_staging/folder/item",
                             "expectation": {
                                 "Directory": {
                                     "source_revision": 7,

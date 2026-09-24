@@ -1,19 +1,19 @@
 ---
 layout: default
-title: Wavecrate
+title: Yield
 permalink: /
 description: Sample manager with fast waveform review and destructive in-place edits.
 ---
 
-# Wavecrate
+# Yield
 
-Wavecrate is a focused sample-library workstation for browsing large folders, auditioning sounds quickly, carving useful ranges out of longer recordings, tagging the keepers, and handing material to a DAW without breaking the creative flow.
+Yield is a focused sample-library workstation for browsing large folders, auditioning sounds quickly, carving useful ranges out of longer recordings, tagging the keepers, and handing material to a DAW without breaking the creative flow.
 
-[![Wavecrate nightly release](https://github.com/PORTALSURFER/wavecrate/actions/workflows/release-build.yml/badge.svg)](https://github.com/PORTALSURFER/wavecrate/actions/workflows/release-build.yml)
+[![Yield nightly release](https://github.com/PORTALSURFER/yield/actions/workflows/release-build.yml/badge.svg)](https://github.com/PORTALSURFER/yield/actions/workflows/release-build.yml)
 
 <div class="download-hero">
   <div class="download-copy">Download the latest Windows or macOS portable bundle.</div>
-  <a class="download-link" href="https://github.com/portalsurfer/wavecrate/releases/latest" id="release-link">
+  <a class="download-link" href="https://github.com/portalsurfer/yield/releases/latest" id="release-link">
     View latest releases
   </a>
 </div>
@@ -34,8 +34,8 @@ Wavecrate is a focused sample-library workstation for browsing large folders, au
 </div>
 
 <figure class="appshot">
-  <img src="{{ '/assets/screenshot.png' | relative_url }}" alt="Wavecrate showing a source folder, collections, a waveform preview, and a sortable sample list" />
-  <figcaption>Wavecrate browsing a Freesound folder with waveform preview, collections, metadata filters, and sample rows visible.</figcaption>
+  <img src="{{ '/assets/screenshot.png' | relative_url }}" alt="Yield showing a source folder, collections, a waveform preview, and a sortable sample list" />
+  <figcaption>Yield browsing a Freesound folder with waveform preview, collections, metadata filters, and sample rows visible.</figcaption>
 </figure>
 
 ## Quick usage guide
@@ -43,7 +43,7 @@ Wavecrate is a focused sample-library workstation for browsing large folders, au
 <div class="quick-guide">
   <section>
     <h3>Add sources</h3>
-    <p>Click the plus button in Sources or drop a folder into the sidebar. Wavecrate indexes supported audio, keeps folder navigation local, and remembers source state between launches.</p>
+    <p>Click the plus button in Sources or drop a folder into the sidebar. Yield indexes supported audio, keeps folder navigation local, and remembers source state between launches.</p>
   </section>
   <section>
     <h3>Browse and audition</h3>
@@ -59,23 +59,23 @@ Wavecrate is a focused sample-library workstation for browsing large folders, au
   </section>
   <section>
     <h3>Edit in place, carefully</h3>
-    <p>Use trim, crop, fade, mute, gain, normalize, and delete when you want to work fast on the current file. These are destructive in-place edits; Wavecrate adds confirmations and undo-oriented recovery where it owns the operation, but you should still keep backups and choose deliberately.</p>
+    <p>Use trim, crop, fade, mute, gain, normalize, and delete when you want to work fast on the current file. These are destructive in-place edits; Yield adds confirmations and undo-oriented recovery where it owns the operation, but you should still keep backups and choose deliberately.</p>
   </section>
   <section>
     <h3>Find related sounds</h3>
-    <p>Wavecrate maintains similarity data automatically. Use Find Similar or the map view to jump through related samples inside the active browser scope.</p>
+    <p>Yield maintains similarity data automatically. Use Find Similar or the map view to jump through related samples inside the active browser scope.</p>
   </section>
 </div>
 
 ## Quick links
-- [Usage guide](/wavecrate/usage)
-- [Changelog](https://github.com/portalsurfer/wavecrate/blob/main/CHANGELOG.md)
-- [Latest downloads](https://github.com/portalsurfer/wavecrate/releases)
-- [Source on GitHub](https://github.com/portalsurfer/wavecrate)
+- [Usage guide](/yield/usage)
+- [Changelog](https://github.com/portalsurfer/yield/blob/main/CHANGELOG.md)
+- [Latest downloads](https://github.com/portalsurfer/yield/releases)
+- [Source on GitHub](https://github.com/portalsurfer/yield)
 
 ## Hotkeys
 
-<p class="hotkey-note">Press <kbd>Command-/</kbd> in Wavecrate to open the context-aware shortcut help overlay.</p>
+<p class="hotkey-note">Press <kbd>Command-/</kbd> in Yield to open the context-aware shortcut help overlay.</p>
 
 <div class="hotkey-list">
   <section class="hotkey-card">
@@ -152,7 +152,7 @@ Wavecrate is a focused sample-library workstation for browsing large folders, au
     if (!link) {
       return;
     }
-    fetch("https://api.github.com/repos/PORTALSURFER/wavecrate/releases?per_page=10")
+    fetch("https://api.github.com/repos/PORTALSURFER/yield/releases?per_page=10")
       .then(function (response) {
         if (!response.ok) {
           throw new Error("release fetch failed");
@@ -166,7 +166,7 @@ Wavecrate is a focused sample-library workstation for browsing large folders, au
         var match = null;
         // Current public downloads are Windows/macOS only; historical Linux assets are ignored here.
         var assetPattern =
-          /^wavecrate-\d+\.\d+\.\d+-(windows|macos)-(x86_64|aarch64)\.zip$/i;
+          /^yield-\d+\.\d+\.\d+-(windows|macos)-(x86_64|aarch64)\.zip$/i;
         for (var i = 0; i < releases.length; i += 1) {
           var release = releases[i];
           if (!release || release.draft) {

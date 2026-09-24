@@ -30,7 +30,7 @@ child and parent before the GPUI entity releases its view.
 From this worktree, build and run:
 
 ```sh
-cargo run -p wavecrate-platform --example ax_bridge_probe
+cargo run -p yield-platform --example ax_bridge_probe
 ```
 
 From another terminal, get the process id with `pgrep -fl ax_bridge_probe` and

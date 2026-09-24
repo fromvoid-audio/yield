@@ -54,11 +54,11 @@ documents `AT_NODELETEBUSY` and `AT_UNIQUE` for `unlinkat`.
 On macOS 26.6.2 (25G83), APFS Data volume `/dev/disk3s5`, run:
 
 ```sh
-cc -Wall -Wextra -Werror scripts/qa/macos_publication_probe.c -o /private/tmp/wavecrate-publication-probe
-/private/tmp/wavecrate-publication-probe
+cc -Wall -Wextra -Werror scripts/qa/macos_publication_probe.c -o /private/tmp/yield-publication-probe
+/private/tmp/yield-publication-probe
 ```
 
-The probe creates and removes its own `/private/tmp/wavecrate-publication-probe.*`
+The probe creates and removes its own `/private/tmp/yield-publication-probe.*`
 fixture. On this host it observed:
 
 - A held directory fd stayed on the original directory after its path was

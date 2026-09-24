@@ -1,4 +1,4 @@
-//! Derived application subdirectories below the resolved `.wavecrate` root.
+//! Derived application subdirectories below the resolved `.yield` root.
 
 use std::path::PathBuf;
 
@@ -13,12 +13,12 @@ pub(super) fn create_app_subdir(name: &str) -> Result<PathBuf, AppDirError> {
     Ok(path)
 }
 
-/// Return the logs directory inside the `.wavecrate` root, creating it if needed.
+/// Return the logs directory inside the `.yield` root, creating it if needed.
 pub fn logs_dir() -> Result<PathBuf, AppDirError> {
     create_app_subdir("logs")
 }
 
-/// Return the global handoff staging directory inside the `.wavecrate` root.
+/// Return the global handoff staging directory inside the `.yield` root.
 pub fn handoff_staging_dir() -> Result<PathBuf, AppDirError> {
     create_app_subdir("handoff_staging")
 }

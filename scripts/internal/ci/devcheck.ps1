@@ -51,7 +51,7 @@ function Invoke-NativeStep {
 
 Push-Location $rootDir
 try {
-  Enable-WavecrateCargoCache
+  Enable-YieldCargoCache
   $radiantDir = (& (Join-Path $rootDir 'scripts/radiant.ps1') locate | Where-Object { $_ -like 'RADIANT_DIR=*' } | ForEach-Object { $_.Substring(13) })
   if (-not $radiantDir) { throw "Radiant sibling is missing or invalid" }
   Write-Host "[devcheck] branch policy"
@@ -61,28 +61,28 @@ try {
 
   Write-Host "[devcheck] cargo check --manifest-path $radiantDir/Cargo.toml"
   Invoke-NativeStep -Label "cargo check --manifest-path $radiantDir/Cargo.toml" -Command {
-    Invoke-WavecrateCargo check --manifest-path (Join-Path $radiantDir 'Cargo.toml')
+    Invoke-YieldCargo check --manifest-path (Join-Path $radiantDir 'Cargo.toml')
   }
 
   Write-Host "[devcheck] cargo check --manifest-path $radiantDir/Cargo.toml --example generic_native --no-default-features"
   Invoke-NativeStep -Label "cargo check --manifest-path $radiantDir/Cargo.toml --example generic_native --no-default-features" -Command {
-    Invoke-WavecrateCargo check --manifest-path (Join-Path $radiantDir 'Cargo.toml') --example generic_native --no-default-features
+    Invoke-YieldCargo check --manifest-path (Join-Path $radiantDir 'Cargo.toml') --example generic_native --no-default-features
   }
 
   if ($AppOnly) {
-    Write-Host "[devcheck] cargo check --package wavecrate --lib --bin wavecrate"
-    Invoke-NativeStep -Label "cargo check --package wavecrate --lib --bin wavecrate" -Command {
-      Invoke-WavecrateCargo check --package wavecrate --lib --bin wavecrate
+    Write-Host "[devcheck] cargo check --package yield --lib --bin yield"
+    Invoke-NativeStep -Label "cargo check --package yield --lib --bin yield" -Command {
+      Invoke-YieldCargo check --package yield --lib --bin yield
     }
   } elseif ($Workspace) {
     Write-Host "[devcheck] cargo check --workspace --tests --bins"
     Invoke-NativeStep -Label "cargo check --workspace --tests --bins" -Command {
-      Invoke-WavecrateCargo check --workspace --tests --bins
+      Invoke-YieldCargo check --workspace --tests --bins
     }
   } else {
-    Write-Host "[devcheck] cargo check --package wavecrate --tests --bins"
-    Invoke-NativeStep -Label "cargo check --package wavecrate --tests --bins" -Command {
-      Invoke-WavecrateCargo check --package wavecrate --tests --bins
+    Write-Host "[devcheck] cargo check --package yield --tests --bins"
+    Invoke-NativeStep -Label "cargo check --package yield --tests --bins" -Command {
+      Invoke-YieldCargo check --package yield --tests --bins
     }
   }
 

@@ -3,14 +3,14 @@
 set -euo pipefail
 
 usage() {
-  local entrypoint="${WAVECRATE_RUN_ENTRYPOINT:-scripts/run.sh}"
+  local entrypoint="${YIELD_RUN_ENTRYPOINT:-scripts/run.sh}"
   cat <<EOF
 Usage: ${entrypoint} <sandbox|clean|logs|bug-bundle> [args...]
 
 Commands:
-  sandbox      Run Wavecrate with an isolated sandbox profile.
+  sandbox      Run Yield with an isolated sandbox profile.
   clean        Delete the repo-local sandbox profile.
-  logs         Print the newest resolved Wavecrate log.
+  logs         Print the newest resolved Yield log.
   bug-bundle   Create a small diagnostic bundle.
 EOF
 }

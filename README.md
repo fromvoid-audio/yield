@@ -1,7 +1,7 @@
 # Yield
 
-A private GPUI reimplementation of the original Wavecrate sample manager, now named Yield.
-Full current feature parity is the target; the migration is in progress.
+A private sample manager built with GPUI. Full feature parity with the archived
+frontend is the target; the reimplementation is in progress.
 
 ## Workspace
 
@@ -28,11 +28,11 @@ See [crate boundaries and dependency direction](docs/GPUI_ARCHITECTURE.md).
 The original frontend is preserved in [reference/radiant](reference/radiant/README.md)
 and excluded from the active build.
 
-Existing application profiles and source-local metadata keep their `.wavecrate`
-paths and on-disk identifiers so Yield opens the same libraries and preferences.
-The `WAVECRATE_*` environment overrides remain supported for existing setups.
+Development profiles live under `.yield`, and source-local metadata uses Yield
+filenames and identifiers. This development rename starts with fresh storage;
+older data is not imported automatically.
 
-The current GPUI frontend uses the original Wavecrate editorial-terminal
+The current GPUI frontend uses an editorial-terminal
 palette and compact layout. Theme tokens are defined independently in
 `yield-design`; the complete schema and a copyable default document are in
 [themes/yield.json](themes/yield.json). Open the gear settings control

@@ -1,5 +1,5 @@
 // OPT-1869: disposable macOS syscall probe. Never run against user files.
-// cc -Wall -Wextra -Werror scripts/qa/macos_publication_probe.c -o /tmp/wavecrate-publication-probe
+// cc -Wall -Wextra -Werror scripts/qa/macos_publication_probe.c -o /tmp/yield-publication-probe
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -36,7 +36,7 @@ static void expect_entry(int dir, const char *name, const char *bytes) {
 }
 
 int main(void) {
-    char fixture[] = "/private/tmp/wavecrate-publication-probe.XXXXXX";
+    char fixture[] = "/private/tmp/yield-publication-probe.XXXXXX";
     if (mkdtemp(fixture) == NULL) {
         perror("mkdtemp");
         return 1;

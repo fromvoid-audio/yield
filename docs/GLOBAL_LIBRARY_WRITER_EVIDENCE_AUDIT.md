@@ -44,7 +44,7 @@ metadata/index, link, cache/artifact route, or durable shutdown custody.
 The implementation boundary is `GlobalLibraryWriter::start` and `run_owner` in
 `crates/yield-library/src/sample_sources/library/owner.rs`. The owner clones
 the already acquired `WritableProfileGuard`, opens one profile-bound
-`LibraryDatabase` connection on the `wavecrate-global-library-writer` thread,
+`LibraryDatabase` connection on the `yield-global-library-writer` thread,
 and exposes typed queue methods rather than the SQLite connection. The queue is
 a nonblocking `sync_channel` with capacity 32. The session startup path is
 `Persistence::start` in `crates/yield-session/src/lib.rs`: profile ownership,

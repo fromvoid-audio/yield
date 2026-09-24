@@ -12,7 +12,7 @@ is the checked inventory for public entrypoints, compatibility wrappers, and
 dispatcher maps. These are the public entrypoints people should run directly:
 
 - `bootstrap.{sh,ps1}`: set up the repo and install hooks.
-- `build.sh`: build Wavecrate and create a uniquely identified, ad-hoc-signed
+- `build.sh`: build Yield and create a uniquely identified, ad-hoc-signed
   macOS app bundle that can be targeted independently by UI automation.
 - repo-root `run.{sh,ps1}`: compatibility wrappers for `cargo run`.
 - `run.ps1 logs debug-overlays` or `run.ps1 logs debug-layout`: convenience

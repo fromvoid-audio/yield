@@ -60,7 +60,7 @@ this decision. OPT-1360 retains broad durability and SLO certification.
 
 ## Validation
 
-On macOS, `cargo test --locked -p wavecrate-library file_ops_journal --lib`
+On macOS, `cargo test --locked -p yield-library file_ops_journal --lib`
 passed all 26 tests. Production-finalizer regressions cover repeated unsupported
 publication and cleanup, missing/replaced target and source roots, and a late
 unrelated destination collision. They assert retained staging identity/bytes,

@@ -1506,7 +1506,7 @@ fn digest_targets_in_transaction(
     )?;
     let mut rows = statement.query(params![source_id, MAX_READINESS_TARGET_TEXT_BYTES as i64])?;
     let mut hasher = Hasher::new();
-    hash_bytes(&mut hasher, b"wavecrate-readiness-target-set-v1");
+    hash_bytes(&mut hasher, b"yield-readiness-target-set-v1");
     let mut target_count = 0_i64;
     while let Some(row) = rows.next()? {
         cancellation_checkpoint(cancel)?;

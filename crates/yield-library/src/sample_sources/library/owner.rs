@@ -2287,7 +2287,7 @@ mod tests {
         drop(base_guard);
         let _ = Connection::open(
             temp.path()
-                .join(".wavecrate")
+                .join(".yield")
                 .join("profiles")
                 .join("shutdown")
                 .join("library.db"),

@@ -24,14 +24,14 @@ use super::participants::{
 };
 
 /// The fixed source-relative directory used by the legacy retained-delete journal.
-pub const RETAINED_RECOVERY_DIRECTORY: &str = ".wavecrate_delete_staging";
+pub const RETAINED_RECOVERY_DIRECTORY: &str = ".yield_delete_staging";
 /// Maximum bytes accepted for one isolated selected legacy journal-entry JSON value.
 ///
 /// This is intentionally a per-call hashing bound separate from [`super::model::MAX_RECORD_BYTES`].
 /// The caller must isolate one complete entry before calling the helper; oversized entries are
 /// rejected and preserved for a future bounded streaming capture path rather than truncated.
 pub const MAX_RETAINED_SELECTED_ENTRY_JSON_BYTES: usize = 64 * 1024;
-const RETAINED_ENTRY_FINGERPRINT_DOMAIN: &[u8] = b"wavecrate-retained-delete-selected-entry-v1\0";
+const RETAINED_ENTRY_FINGERPRINT_DOMAIN: &[u8] = b"yield-retained-delete-selected-entry-v1\0";
 
 /// UUID identity used by the legacy retained-folder journal.
 ///
@@ -144,7 +144,7 @@ pub enum RetainedResolutionStage {
 /// The fixed legacy source-local recovery-root identity used by retained-folder entries.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RetainedRecoveryRootKind {
-    /// The legacy `.wavecrate_delete_staging` source-local directory.
+    /// The legacy `.yield_delete_staging` source-local directory.
     LegacyDeleteStaging,
 }
 
@@ -177,7 +177,7 @@ pub enum RetainedRestoreConflictPolicy {
 /// directory may be absent or independently recreated, so this intent deliberately carries no
 /// fabricated original physical identity. `staged` retains the source-database endpoint that
 /// binds the existing retained directory. It is required to use the source-relative locator
-/// `.wavecrate_delete_staging/<staged_relative>` and to identify a directory at the fenced source
+/// `.yield_delete_staging/<staged_relative>` and to identify a directory at the fenced source
 /// revision. It contains no legacy metadata snapshot, prepared merge plan, restore stamp, or
 /// filesystem handle.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -855,8 +855,8 @@ mod tests {
     #[test]
     fn retained_observation_rejects_reserved_aliases_and_ineligible_stage() {
         let (_, _, staged, staged_relative) = fixture();
-        let aliased_original = StoredRelativePath::new(".WAVECRATE_DELETE_STAGING/old")
-            .expect("aliased original path");
+        let aliased_original =
+            StoredRelativePath::new(".YIELD_DELETE_STAGING/old").expect("aliased original path");
         assert_eq!(
             RetainedFolderObservation::new(
                 aliased_original,

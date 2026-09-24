@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-TEST_ROOT="$(mktemp -d -t wavecrate-fixture-dispatch-XXXXXXXX)"
+TEST_ROOT="$(mktemp -d -t yield-fixture-dispatch-XXXXXXXX)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 FAKE_BIN="$TEST_ROOT/bin"
@@ -11,18 +11,18 @@ CALLS="$TEST_ROOT/cargo-calls.txt"
 mkdir -p "$FAKE_BIN"
 cat >"$FAKE_BIN/cargo" <<'SH'
 #!/usr/bin/env bash
-if [[ -n "${WAVECRATE_SOURCE_DB_READ_ONLY:-}" ]]; then
-  echo "fixture/app cargo inherited WAVECRATE_SOURCE_DB_READ_ONLY" >&2
+if [[ -n "${YIELD_SOURCE_DB_READ_ONLY:-}" ]]; then
+  echo "fixture/app cargo inherited YIELD_SOURCE_DB_READ_ONLY" >&2
   exit 91
 fi
-printf '%s\n' "$*" >>"$WAVECRATE_FIXTURE_TEST_CALLS"
+printf '%s\n' "$*" >>"$YIELD_FIXTURE_TEST_CALLS"
 exit 0
 SH
 chmod +x "$FAKE_BIN/cargo"
 
 export PATH="$FAKE_BIN:$PATH"
-export WAVECRATE_FIXTURE_TEST_CALLS="$CALLS"
-export WAVECRATE_SOURCE_DB_READ_ONLY=1
+export YIELD_FIXTURE_TEST_CALLS="$CALLS"
+export YIELD_SOURCE_DB_READ_ONLY=1
 
 "$ROOT_DIR/scripts/internal/run/run_sandbox.sh" \
   --dir "$TEST_ROOT/sandbox" \
@@ -32,17 +32,17 @@ export WAVECRATE_SOURCE_DB_READ_ONLY=1
   --log >/dev/null
 
 grep -Fq \
-  "run --quiet --bin wavecrate-fixture -- provision --fixture small-multi-source --config-base $TEST_ROOT/sandbox --profile sandbox --no-reset" \
+  "run --quiet --bin yield-fixture -- provision --fixture small-multi-source --config-base $TEST_ROOT/sandbox --profile sandbox --no-reset" \
   "$CALLS"
 grep -Fq "run --release -- --log" "$CALLS"
 
 : >"$CALLS"
-export WAVECRATE_SOURCE_DB_READ_ONLY=1
+export YIELD_SOURCE_DB_READ_ONLY=1
 "$ROOT_DIR/scripts/internal/run/run_sandbox.sh" \
   --dir "$TEST_ROOT/reset" \
   --fixture empty >/dev/null
 grep -Fxq \
-  "run --quiet --bin wavecrate-fixture -- provision --fixture empty --config-base $TEST_ROOT/reset --profile sandbox" \
+  "run --quiet --bin yield-fixture -- provision --fixture empty --config-base $TEST_ROOT/reset --profile sandbox" \
   "$CALLS"
 
 set +e

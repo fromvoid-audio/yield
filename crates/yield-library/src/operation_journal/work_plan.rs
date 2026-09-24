@@ -3196,7 +3196,7 @@ mod tests {
         let staged = NamespaceEntryEndpoint::new(
             source,
             source_id.clone(),
-            StoredRelativePath::new(".wavecrate_delete_staging/drums/kick").expect("staged path"),
+            StoredRelativePath::new(".yield_delete_staging/drums/kick").expect("staged path"),
             NamespaceEntryExpectation::Directory(
                 NamespaceDirectoryExpectation::new(7, "staged-directory", None)
                     .expect("staged expectation"),

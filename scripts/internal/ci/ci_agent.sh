@@ -5,7 +5,7 @@
 # This lane avoids cargo-nextest and the broader GUI contract wrappers so it
 # can run in constrained environments while still providing a real compile +
 # Radiant required non-blocking guardrails, no-default core/API tests, and
-# Wavecrate library-test cycle.
+# Yield library-test cycle.
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ cd "$ROOT_DIR"
 RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
 # shellcheck source=scripts/internal/use_cargo_cache.sh
 source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-wavecrate_enable_cargo_cache
+yield_enable_cargo_cache
 
 usage() {
   cat <<'USAGE'
@@ -57,11 +57,11 @@ cargo test --manifest-path "$RADIANT_DIR/Cargo.toml" --lib --no-default-features
 echo "[ci_agent] cargo test --manifest-path $RADIANT_DIR/Cargo.toml --test app_runtime_api --no-default-features"
 cargo test --manifest-path "$RADIANT_DIR/Cargo.toml" --test app_runtime_api --no-default-features
 
-echo "[ci_agent] cargo test -p wavecrate --test controller_browser_integration --features legacy-controller"
-cargo test -p wavecrate --test controller_browser_integration --features legacy-controller
+echo "[ci_agent] cargo test -p yield --test controller_browser_integration --features legacy-controller"
+cargo test -p yield --test controller_browser_integration --features legacy-controller
 
-echo "[ci_agent] cargo test -p wavecrate --lib -- --skip known isolated legacy failures"
-cargo test -p wavecrate --lib -- \
+echo "[ci_agent] cargo test -p yield --lib -- --skip known isolated legacy failures"
+cargo test -p yield --lib -- \
   --skip prepare_auto_rename_requests_logs_looped_provenance \
   --skip rating_previous_random_history_entry_restores_waveform_for_replacement
 

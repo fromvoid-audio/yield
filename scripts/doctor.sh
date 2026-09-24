@@ -107,15 +107,15 @@ else
   warn "git not found on PATH"
 fi
 
-info "Checking WAVECRATE_NATIVE_FONT_PATH..."
-if [[ -n "${WAVECRATE_NATIVE_FONT_PATH:-}" ]]; then
-  if [[ -f "$WAVECRATE_NATIVE_FONT_PATH" ]]; then
-    info "WAVECRATE_NATIVE_FONT_PATH: OK ($WAVECRATE_NATIVE_FONT_PATH)"
+info "Checking YIELD_NATIVE_FONT_PATH..."
+if [[ -n "${YIELD_NATIVE_FONT_PATH:-}" ]]; then
+  if [[ -f "$YIELD_NATIVE_FONT_PATH" ]]; then
+    info "YIELD_NATIVE_FONT_PATH: OK ($YIELD_NATIVE_FONT_PATH)"
   else
-    err "WAVECRATE_NATIVE_FONT_PATH is set but not a file: $WAVECRATE_NATIVE_FONT_PATH"
+    err "YIELD_NATIVE_FONT_PATH is set but not a file: $YIELD_NATIVE_FONT_PATH"
   fi
 else
-  info "WAVECRATE_NATIVE_FONT_PATH: not set (OK)"
+  info "YIELD_NATIVE_FONT_PATH: not set (OK)"
 fi
 
 info "Checking CPAL_ASIO_DIR (Windows ASIO builds)..."
@@ -135,12 +135,12 @@ fi
 
 info "Expected developer diagnostic log locations:"
 info "  Supported app installs:"
-info "    macOS:   \$HOME/Library/Application Support/.wavecrate/logs"
-info "    Windows: %APPDATA%\\.wavecrate\\logs"
+info "    macOS:   \$HOME/Library/Application Support/.yield/logs"
+info "    Windows: %APPDATA%\\.yield\\logs"
 info "  Developer/agent tooling only; Linux is not a shipped app install target:"
-info "    Linux:   \$HOME/.config/.wavecrate/logs"
+info "    Linux:   \$HOME/.config/.yield/logs"
 if (( is_wsl == 1 )); then
-  info "    WSL hint: /mnt/c/Users/<you>/AppData/Roaming/.wavecrate/logs"
+  info "    WSL hint: /mnt/c/Users/<you>/AppData/Roaming/.yield/logs"
 fi
 
 if (( failures > 0 )); then

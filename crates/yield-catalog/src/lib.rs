@@ -4377,7 +4377,7 @@ fn retarget_previous_source(
 }
 
 fn report_source_authority_issue(detail: &str, error: impl std::fmt::Display) {
-    eprintln!("wavecrate source-capacity handoff: {detail}: {error}");
+    eprintln!("yield source-capacity handoff: {detail}: {error}");
 }
 
 fn report_source_authority_issue_for_source(
@@ -4385,7 +4385,7 @@ fn report_source_authority_issue_for_source(
     detail: &str,
     error: impl std::fmt::Display,
 ) {
-    eprintln!("wavecrate source-capacity handoff for {source_id:?}: {detail}: {error}");
+    eprintln!("yield source-capacity handoff for {source_id:?}: {detail}: {error}");
 }
 
 fn retain_pending_source_authority(
@@ -4396,7 +4396,7 @@ fn retain_pending_source_authority(
     source_id: &SourceId,
 ) {
     eprintln!(
-        "wavecrate source-capacity handoff for {source_id:?}: {reason}; retaining opaque retirement evidence"
+        "yield source-capacity handoff for {source_id:?}: {reason}; retaining opaque retirement evidence"
     );
     source.source_authority_pending = Some(PendingSourceAuthority {
         authority,
@@ -4417,7 +4417,7 @@ fn handle_source_authority_error(
             receipt: Some(receipt),
         } => {
             eprintln!(
-                "wavecrate source-capacity handoff for {source_id:?}: partial registration retained: {reason}"
+                "yield source-capacity handoff for {source_id:?}: partial registration retained: {reason}"
             );
             source.source_authority = Some(authority);
             source.source_authority_receipt = Some(receipt);
@@ -4456,7 +4456,7 @@ fn poll_pending_source_authority(source: &mut RegisteredSource) -> Result<(), St
                 source.source_authority = Some(pending.authority);
                 source.source_authority_receipt = Some(receipt);
                 eprintln!(
-                    "wavecrate source-capacity handoff: late partial registration retained: {reason}"
+                    "yield source-capacity handoff: late partial registration retained: {reason}"
                 );
                 Ok(())
             }
@@ -8579,7 +8579,7 @@ mod tests {
         let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
         assert_eq!(snapshot.manifest, Vec::<SourceManifestEntry>::new());
         assert!(snapshot.directories.is_empty());
-        assert!(!fixture.root.path().join(".wavecrate.db").exists());
+        assert!(!fixture.root.path().join(".yield.db").exists());
         service
             .submit(CatalogCommand::ReadSnapshot {
                 source_id,

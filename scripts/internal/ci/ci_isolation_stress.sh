@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Repeat the Wavecrate library harness in fresh explicitly parallel processes.
+# Repeat the Yield library harness in fresh explicitly parallel processes.
 
 set -euo pipefail
 
@@ -8,7 +8,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 # shellcheck source=scripts/internal/use_cargo_cache.sh
 source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-wavecrate_enable_cargo_cache
+yield_enable_cargo_cache
 
 usage() {
   cat <<'USAGE'
@@ -21,7 +21,7 @@ Options:
   --output PATH        JSONL report path (default: timestamped target artifact).
   -h, --help           Show this help.
 
-This opt-in lane verifies its injected leak sentinels, then runs the Wavecrate
+This opt-in lane verifies its injected leak sentinels, then runs the Yield
 library suite repeatedly. It stops at the first unexpected failure and never
 retries a failing iteration until green.
 USAGE

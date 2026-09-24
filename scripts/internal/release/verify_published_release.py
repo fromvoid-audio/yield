@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify published Wavecrate release assets after public upload."""
+"""Verify published Yield release assets after public upload."""
 
 from __future__ import annotations
 
@@ -443,8 +443,8 @@ def validate_release_metadata(
     if not body:
         release_label = args.tag or args.portal_build_id or args.version
         errors.append(f"{args.source} release {release_label} must have a non-empty release log body")
-    elif f"Wavecrate {args.version}" not in body:
-        errors.append(f"{args.source} release body must be release-bound to Wavecrate {args.version}")
+    elif f"Yield {args.version}" not in body:
+        errors.append(f"{args.source} release body must be release-bound to Yield {args.version}")
 
     asset_names = release_asset_names(release)
     missing = [name for name in required_assets if name not in asset_names]
@@ -496,7 +496,7 @@ class local_asset_dir:
     def __enter__(self) -> Path:
         if self.args.asset_dir:
             return self.args.asset_dir
-        self.temp = tempfile.TemporaryDirectory(prefix="wavecrate-published-release-")
+        self.temp = tempfile.TemporaryDirectory(prefix="yield-published-release-")
         asset_dir = Path(self.temp.name)
         if self.args.surface == "portalsurfer":
             self.download_portalsurfer_assets(asset_dir)
@@ -643,7 +643,7 @@ def verify_checksum_signature(checksum_path: Path, signature_path: Path, checksu
     if len(public_key) != 32:
         return ["checksum public key must decode to a 32-byte Ed25519 public key"]
 
-    with tempfile.TemporaryDirectory(prefix="wavecrate-published-signature-") as temp:
+    with tempfile.TemporaryDirectory(prefix="yield-published-signature-") as temp:
         pub_der = Path(temp) / "checksum-public-key.der"
         sig_bin = Path(temp) / "checksums.sig"
         pub_der.write_bytes(ED25519_SPKI_PREFIX + public_key)
@@ -702,7 +702,7 @@ def validate_zip_manifest(
         return [f"{zip_asset.name} contains an invalid update-manifest.json: {error}"]
 
     expected = {
-        "app": "wavecrate",
+        "app": "yield",
         "channel": args.channel,
         "target": zip_asset.target,
         "platform": zip_asset.platform,
@@ -849,9 +849,9 @@ def download_url(url: str, path: Path, verification_token: str = "") -> None:
 
 
 def request_for_url(url: str, verification_token: str = "") -> urllib.request.Request:
-    headers = {"User-Agent": "wavecrate-release-verifier"}
+    headers = {"User-Agent": "yield-release-verifier"}
     if verification_token:
-        headers["X-Wavecrate-Release-Verification"] = hashlib.sha256(
+        headers["X-Yield-Release-Verification"] = hashlib.sha256(
             verification_token.encode("utf-8")
         ).hexdigest()
     return urllib.request.Request(url, headers=headers)
@@ -893,7 +893,7 @@ def fetch_portalsurfer_download_token(args: argparse.Namespace) -> str:
 
 
 def portalsurfer_gate_url(args: argparse.Namespace) -> str:
-    releases_base = (args.portal_catalog_url or "https://portalsurfer.org/wavecrate/api/v1/releases").rstrip("/")
+    releases_base = (args.portal_catalog_url or "https://portalsurfer.org/yield/api/v1/releases").rstrip("/")
     build_id = urllib.parse.quote(str(args.portal_build_id), safe="")
     return f"{releases_base}/{build_id}/gate?donation_amount=0.00"
 
@@ -909,12 +909,12 @@ def portalsurfer_download_url(url: str, download_token: str) -> str:
 def resolve_portalsurfer_url(args: argparse.Namespace, url: str) -> str:
     if urllib.parse.urlparse(url).scheme:
         return url
-    base = args.portal_catalog_url or "https://portalsurfer.org/wavecrate/api/v1/releases"
+    base = args.portal_catalog_url or "https://portalsurfer.org/yield/api/v1/releases"
     return urllib.parse.urljoin(base, url)
 
 
 def ensure_portalsurfer_origin(args: argparse.Namespace, url: str) -> None:
-    catalog_url = args.portal_catalog_url or "https://portalsurfer.org/wavecrate/api/v1/releases"
+    catalog_url = args.portal_catalog_url or "https://portalsurfer.org/yield/api/v1/releases"
     if normalized_url_origin(url) != normalized_url_origin(catalog_url):
         raise SystemExit(
             "Refusing to send PortalSurfer release verification credentials to a different origin: "

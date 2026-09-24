@@ -16,7 +16,7 @@ pub enum PersistenceMode {
     Sandbox,
     /// Use the dedicated automated-validation profile.
     Automated,
-    /// Use another named non-live profile under `.wavecrate/profiles/<name>`.
+    /// Use another named non-live profile under `.yield/profiles/<name>`.
     Named(String),
 }
 
@@ -41,7 +41,7 @@ impl std::fmt::Display for PersistenceMode {
 /// Resolved persistence selection for the current thread/process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPersistence {
-    /// Base config directory before `.wavecrate`/profile expansion.
+    /// Base config directory before `.yield`/profile expansion.
     pub config_base: PathBuf,
     /// Fully resolved app root used for config, logs, and library state.
     pub app_root: PathBuf,

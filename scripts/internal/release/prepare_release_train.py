@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a Wavecrate release train branch and package versions."""
+"""Prepare a Yield release train branch and package versions."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 PACKAGE_HEADER_RE = re.compile(r"^\[package\]\s*$")
 TABLE_HEADER_RE = re.compile(r"^\[.*\]\s*$")
 VERSION_LINE_RE = re.compile(r'^version\s*=\s*"([^"]+)"\s*$')
-RELEASE_PACKAGE_RE = re.compile(r"^wavecrate($|-)")
+RELEASE_PACKAGE_RE = re.compile(r"^yield($|-)")
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class ReleasePackage:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Prepare release/X.Y by aligning Wavecrate package versions and Cargo.lock."
+        description="Prepare release/X.Y by aligning Yield package versions and Cargo.lock."
     )
     parser.add_argument(
         "--version",
@@ -79,7 +79,7 @@ def main() -> int:
 
     packages = release_packages(repo)
     if not packages:
-        raise SystemExit("No Wavecrate release packages were found in the workspace.")
+        raise SystemExit("No Yield release packages were found in the workspace.")
     reject_prerelease_versions(packages)
     changed_manifests = update_release_manifests(packages, version, dry_run=args.dry_run)
 
@@ -102,8 +102,8 @@ def main() -> int:
                 *(str(package.manifest_path.relative_to(repo)) for package in packages),
                 "Cargo.lock",
             )
-            git("commit", "-m", f"Prepare Wavecrate {version} release train")
-            print(f"[release-train] committed Wavecrate {version} release train prep")
+            git("commit", "-m", f"Prepare Yield {version} release train")
+            print(f"[release-train] committed Yield {version} release train prep")
         else:
             print("[release-train] no manifest or lockfile changes were needed")
 
@@ -274,7 +274,7 @@ def validate_release_package_versions(version: str, packages: list[ReleasePackag
     ]
     if mismatches:
         raise SystemExit(
-            f"Wavecrate release package versions must all be {version}; mismatches: "
+            f"Yield release package versions must all be {version}; mismatches: "
             + ", ".join(mismatches)
         )
 

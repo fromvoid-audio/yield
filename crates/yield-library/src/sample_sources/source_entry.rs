@@ -277,7 +277,7 @@ fn is_source_database_artifact(relative_path: &Path) -> bool {
     let Some(name) = relative_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    [".wavecrate.db", ".wavecrate_samples.db"]
+    [".yield.db", ".yield_samples.db"]
         .iter()
         .any(|database_name| {
             name == *database_name
@@ -393,7 +393,7 @@ mod tests {
             SourceEntryClassification::Rejected(SourceEntryRejection::UnsupportedType)
         );
         assert_eq!(
-            classify_source_entry(Path::new(".wavecrate.db-wal"), SourceEntryFileType::File),
+            classify_source_entry(Path::new(".yield.db-wal"), SourceEntryFileType::File),
             SourceEntryClassification::Rejected(SourceEntryRejection::SourceDatabase)
         );
     }
@@ -461,9 +461,9 @@ mod tests {
     #[test]
     fn path_only_rejections_cover_internal_database_and_apple_double_names() {
         for path in [
-            ".wavecrate.db",
-            ".wavecrate.db-wal",
-            ".wavecrate_samples.db-shm",
+            ".yield.db",
+            ".yield.db-wal",
+            ".yield_samples.db-shm",
             "nested/._loop.flac",
         ] {
             assert!(is_rejected_source_file_path(Path::new(path)), "{path}");

@@ -1,6 +1,6 @@
 # Reference appearance and animation acceptance
 
-OPT-1490 compares the active GPUI browser against the user's Wavecrate reference
+OPT-1490 compares the active GPUI browser against the user's Yield reference
 screenshot and the retained active Radiant implementation. It does not add the
 still-unimplemented starmap, destructive workflows or release packaging.
 
@@ -24,7 +24,7 @@ not equated with the reference collection section's separate 12-pixel ramp.
 
 ## Native fixture
 
-Validation uses a separate `Wavecrate Visual 1490.app`, isolated profile and a
+Validation uses a separate `Yield Visual 1490.app`, isolated profile and a
 generated four-second mono WAV on the development Mac (Apple M5 Pro). No live
 library or DAW session is part of this check. Local screenshots and observations
 are retained under the Codex task's `artifacts/opt1490-native` directory.

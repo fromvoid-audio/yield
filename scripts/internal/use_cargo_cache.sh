@@ -2,13 +2,13 @@
 
 # Shared local Cargo cache setup for repository scripts.
 #
-# Scripts should source this file and call `wavecrate_enable_cargo_cache` before
+# Scripts should source this file and call `yield_enable_cargo_cache` before
 # invoking Cargo so local runs use direct `rustc` by default and can opt in to
 # `sccache` when needed.
 
 set -euo pipefail
 
-wavecrate_ensure_cargo_available() {
+yield_ensure_cargo_available() {
   if command -v cargo >/dev/null 2>&1; then
     return 0
   fi
@@ -29,7 +29,7 @@ wavecrate_ensure_cargo_available() {
   shopt -u nullglob
 }
 
-wavecrate_is_sccache_wrapper() {
+yield_is_sccache_wrapper() {
   local wrapper="${1:-}"
   if [[ -z "$wrapper" ]]; then
     return 1
@@ -40,11 +40,11 @@ wavecrate_is_sccache_wrapper() {
   [[ "$file_name" == "sccache" || "$file_name" == "sccache.exe" ]]
 }
 
-wavecrate_clear_sccache_wrapper() {
+yield_clear_sccache_wrapper() {
   local reason="$1"
 
-  if wavecrate_is_sccache_wrapper "${RUSTC_WRAPPER:-}" ||
-    wavecrate_is_sccache_wrapper "${CARGO_BUILD_RUSTC_WRAPPER:-}"; then
+  if yield_is_sccache_wrapper "${RUSTC_WRAPPER:-}" ||
+    yield_is_sccache_wrapper "${CARGO_BUILD_RUSTC_WRAPPER:-}"; then
     unset RUSTC_WRAPPER
     unset CARGO_BUILD_RUSTC_WRAPPER
     echo "[cargo-cache] $reason; falling back to direct rustc"
@@ -54,16 +54,16 @@ wavecrate_clear_sccache_wrapper() {
   echo "[cargo-cache] $reason"
 }
 
-wavecrate_enable_cargo_cache() {
-  wavecrate_ensure_cargo_available
+yield_enable_cargo_cache() {
+  yield_ensure_cargo_available
 
-  if [[ "${WAVECRATE_DISABLE_SCCACHE:-0}" == "1" ]]; then
-    wavecrate_clear_sccache_wrapper "sccache disabled by WAVECRATE_DISABLE_SCCACHE=1"
+  if [[ "${YIELD_DISABLE_SCCACHE:-0}" == "1" ]]; then
+    yield_clear_sccache_wrapper "sccache disabled by YIELD_DISABLE_SCCACHE=1"
     return 0
   fi
 
-  if [[ "${WAVECRATE_ENABLE_SCCACHE:-0}" != "1" ]]; then
-    wavecrate_clear_sccache_wrapper "sccache disabled by default"
+  if [[ "${YIELD_ENABLE_SCCACHE:-0}" != "1" ]]; then
+    yield_clear_sccache_wrapper "sccache disabled by default"
     return 0
   fi
 

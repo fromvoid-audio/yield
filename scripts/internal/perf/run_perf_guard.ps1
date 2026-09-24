@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 Runs the local runtime performance guard on Windows.
 
 .DESCRIPTION
-Executes the GUI-focused `wavecrate-bench` workspace package with the same
+Executes the GUI-focused `yield-bench` workspace package with the same
 benchmark inputs used by local CI, then validates the generated JSON report
 against the repository's warning and fail thresholds.
 
@@ -138,7 +138,7 @@ function Invoke-PerfBenchRun {
     [int]$MeasureIters
   )
 
-  cargo run -p wavecrate-bench-cli --bin wavecrate-bench -- `
+  cargo run -p yield-bench-cli --bin yield-bench -- `
     --out $OutputPath `
     --no-analysis `
     --no-similarity `
@@ -149,7 +149,7 @@ function Invoke-PerfBenchRun {
     --warmup-iters $WarmupIters `
     --measure-iters $MeasureIters
   if ($LASTEXITCODE -ne 0) {
-    throw "[perf_guard] ERROR: wavecrate-bench failed with exit code $LASTEXITCODE."
+    throw "[perf_guard] ERROR: yield-bench failed with exit code $LASTEXITCODE."
   }
 }
 
@@ -215,22 +215,22 @@ function Invoke-StartupProfileRun {
 }
 
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
-$outPath = Get-EnvString -Name "WAVECRATE_PERF_GUARD_OUT" -Default "target/perf/bench.json"
-$guiRows = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_GUI_ROWS" -Default 2500
-$guiInteractionRows = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_GUI_INTERACTION_ROWS" -Default 1500
-$guiInteractionIters = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_GUI_INTERACTION_ITERS" -Default 24
-$warmupIters = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_WARMUP_ITERS" -Default 3
-$measureIters = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_MEASURE_ITERS" -Default 16
-$runs = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_RUNS" -Default 1
-$startupProfileEnabled = Get-BoolEnvFlag -Name "WAVECRATE_PERF_GUARD_STARTUP_PROFILE"
-$startupTimeoutSecs = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_STARTUP_TIMEOUT_SECS" -Default 6
-$startupRequireValidRuns = Get-BoolEnvFlag -Name "WAVECRATE_PERF_GUARD_STARTUP_REQUIRE_VALID_RUNS"
-$startupLockEnvOut = [Environment]::GetEnvironmentVariable("WAVECRATE_PERF_GUARD_STARTUP_LOCK_ENV_OUT")
-$startupLockEnvIn = Get-EnvString -Name "WAVECRATE_PERF_GUARD_STARTUP_LOCK_ENV_IN" -Default (Join-Path $rootDir "scripts\internal\perf\locks\startup_thresholds.env")
-$startupLockMinValidRuns = Get-OptionalEnvInt -Name "WAVECRATE_PERF_GUARD_STARTUP_LOCK_MIN_VALID_RUNS"
+$outPath = Get-EnvString -Name "YIELD_PERF_GUARD_OUT" -Default "target/perf/bench.json"
+$guiRows = Get-EnvInt -Name "YIELD_PERF_GUARD_GUI_ROWS" -Default 2500
+$guiInteractionRows = Get-EnvInt -Name "YIELD_PERF_GUARD_GUI_INTERACTION_ROWS" -Default 1500
+$guiInteractionIters = Get-EnvInt -Name "YIELD_PERF_GUARD_GUI_INTERACTION_ITERS" -Default 24
+$warmupIters = Get-EnvInt -Name "YIELD_PERF_GUARD_WARMUP_ITERS" -Default 3
+$measureIters = Get-EnvInt -Name "YIELD_PERF_GUARD_MEASURE_ITERS" -Default 16
+$runs = Get-EnvInt -Name "YIELD_PERF_GUARD_RUNS" -Default 1
+$startupProfileEnabled = Get-BoolEnvFlag -Name "YIELD_PERF_GUARD_STARTUP_PROFILE"
+$startupTimeoutSecs = Get-EnvInt -Name "YIELD_PERF_GUARD_STARTUP_TIMEOUT_SECS" -Default 6
+$startupRequireValidRuns = Get-BoolEnvFlag -Name "YIELD_PERF_GUARD_STARTUP_REQUIRE_VALID_RUNS"
+$startupLockEnvOut = [Environment]::GetEnvironmentVariable("YIELD_PERF_GUARD_STARTUP_LOCK_ENV_OUT")
+$startupLockEnvIn = Get-EnvString -Name "YIELD_PERF_GUARD_STARTUP_LOCK_ENV_IN" -Default (Join-Path $rootDir "scripts\internal\perf\locks\startup_thresholds.env")
+$startupLockMinValidRuns = Get-OptionalEnvInt -Name "YIELD_PERF_GUARD_STARTUP_LOCK_MIN_VALID_RUNS"
 
 if ($runs -lt 1) {
-  throw "[perf_guard] ERROR: WAVECRATE_PERF_GUARD_RUNS must be an integer >= 1."
+  throw "[perf_guard] ERROR: YIELD_PERF_GUARD_RUNS must be an integer >= 1."
 }
 
 if ($startupProfileEnabled -and (Test-Path $startupLockEnvIn)) {
@@ -243,11 +243,11 @@ if ($startupProfileEnabled -and (Test-Path $startupLockEnvIn)) {
     $name = $null
     $value = $null
     $isDefaultAssignment = $false
-    if ($line -match '^:\s*"\$\{(?<name>WAVECRATE_PERF_[A-Z0-9_]+):=(?<value>[^}]*)\}"\s*$') {
+    if ($line -match '^:\s*"\$\{(?<name>YIELD_PERF_[A-Z0-9_]+):=(?<value>[^}]*)\}"\s*$') {
       $name = $Matches["name"]
       $value = $Matches["value"]
       $isDefaultAssignment = $true
-    } elseif ($line -match '^(?:export\s+)?(?<name>WAVECRATE_PERF_[A-Z0-9_]+)=(?<value>.*)$') {
+    } elseif ($line -match '^(?:export\s+)?(?<name>YIELD_PERF_[A-Z0-9_]+)=(?<value>.*)$') {
       $name = $Matches["name"]
       $value = $Matches["value"].Trim(' "')
     }
@@ -272,21 +272,21 @@ $validationContract = Get-ValidationContract
 $reportPaths = New-Object System.Collections.Generic.List[string]
 $startupLogPaths = New-Object System.Collections.Generic.List[string]
 $canonicalReportPath = Join-Path $rootDir $outPath
-$startupSummaryOut = Get-EnvString -Name "WAVECRATE_PERF_GUARD_STARTUP_SUMMARY_OUT" -Default ([System.IO.Path]::ChangeExtension($canonicalReportPath, $null) + ".startup_summary.json")
+$startupSummaryOut = Get-EnvString -Name "YIELD_PERF_GUARD_STARTUP_SUMMARY_OUT" -Default ([System.IO.Path]::ChangeExtension($canonicalReportPath, $null) + ".startup_summary.json")
 
 if ($startupProfileEnabled) {
-  $startupBinary = Join-Path $rootDir "target\debug\wavecrate.exe"
-  Write-Host "[perf_guard] building wavecrate startup binary for profile capture"
-  cargo build --bin wavecrate | Out-Null
+  $startupBinary = Join-Path $rootDir "target\debug\yield.exe"
+  Write-Host "[perf_guard] building yield startup binary for profile capture"
+  cargo build --bin yield | Out-Null
   if ($LASTEXITCODE -ne 0) {
-    throw "[perf_guard] ERROR: cargo build --bin wavecrate failed with exit code $LASTEXITCODE."
+    throw "[perf_guard] ERROR: cargo build --bin yield failed with exit code $LASTEXITCODE."
   }
   if ($runs -ge 3) {
     $startupMinValidRunsDefault = 3
   } else {
     $startupMinValidRunsDefault = 1
   }
-  $startupMinValidRuns = Get-EnvInt -Name "WAVECRATE_PERF_GUARD_STARTUP_MIN_VALID_RUNS" -Default $startupMinValidRunsDefault
+  $startupMinValidRuns = Get-EnvInt -Name "YIELD_PERF_GUARD_STARTUP_MIN_VALID_RUNS" -Default $startupMinValidRunsDefault
 } else {
   $startupMinValidRuns = 1
 }
@@ -299,7 +299,7 @@ try {
       $runOut = [System.IO.Path]::ChangeExtension($canonicalReportPath, $null) + ".run$run.json"
     }
     $reportPaths.Add($runOut)
-    Write-Host "[perf_guard] running wavecrate-bench interaction profile (run $run/$runs)"
+    Write-Host "[perf_guard] running yield-bench interaction profile (run $run/$runs)"
     Invoke-PerfBenchRun `
       -OutputPath $runOut `
       -GuiRows $guiRows `
@@ -337,25 +337,25 @@ try {
       "--output",
       $startupSummaryOut,
       "--warn-first-present-ms",
-      (Get-EnvDouble -Name "WAVECRATE_PERF_WARN_STARTUP_FIRST_PRESENT_MS" -Default 800.0).ToString([System.Globalization.CultureInfo]::InvariantCulture),
+      (Get-EnvDouble -Name "YIELD_PERF_WARN_STARTUP_FIRST_PRESENT_MS" -Default 800.0).ToString([System.Globalization.CultureInfo]::InvariantCulture),
       "--min-valid-runs",
       $startupMinValidRuns.ToString()
     )
-    $startupFailMs = Get-OptionalEnvDouble -Name "WAVECRATE_PERF_FAIL_STARTUP_FIRST_PRESENT_MS"
+    $startupFailMs = Get-OptionalEnvDouble -Name "YIELD_PERF_FAIL_STARTUP_FIRST_PRESENT_MS"
     if ($null -ne $startupFailMs) {
       $startupSummaryArgs += @(
         "--fail-first-present-ms",
         $startupFailMs.ToString([System.Globalization.CultureInfo]::InvariantCulture)
       )
     }
-    $startupWarnSpreadMs = Get-OptionalEnvDouble -Name "WAVECRATE_PERF_WARN_STARTUP_FIRST_PRESENT_SPREAD_MS"
+    $startupWarnSpreadMs = Get-OptionalEnvDouble -Name "YIELD_PERF_WARN_STARTUP_FIRST_PRESENT_SPREAD_MS"
     if ($null -ne $startupWarnSpreadMs) {
       $startupSummaryArgs += @(
         "--warn-first-present-spread-ms",
         $startupWarnSpreadMs.ToString([System.Globalization.CultureInfo]::InvariantCulture)
       )
     }
-    $startupFailSpreadMs = Get-OptionalEnvDouble -Name "WAVECRATE_PERF_FAIL_STARTUP_FIRST_PRESENT_SPREAD_MS"
+    $startupFailSpreadMs = Get-OptionalEnvDouble -Name "YIELD_PERF_FAIL_STARTUP_FIRST_PRESENT_SPREAD_MS"
     if ($null -ne $startupFailSpreadMs) {
       $startupSummaryArgs += @(
         "--fail-first-present-spread-ms",

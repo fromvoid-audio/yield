@@ -741,7 +741,7 @@ fn normalize_tag_page_prefix(prefix: &str) -> Result<String, SourceDbError> {
 
 fn tag_page_paths_signature(paths: &[String]) -> u64 {
     let mut hasher = DefaultHasher::new();
-    "wavecrate-source-tag-page-v1".hash(&mut hasher);
+    "yield-source-tag-page-v1".hash(&mut hasher);
     "paths".hash(&mut hasher);
     paths.hash(&mut hasher);
     hasher.finish()
@@ -749,7 +749,7 @@ fn tag_page_paths_signature(paths: &[String]) -> u64 {
 
 fn tag_page_paths_and_ids_signature(paths: &[String], tag_ids: &[i64]) -> u64 {
     let mut hasher = DefaultHasher::new();
-    "wavecrate-source-tag-page-v1".hash(&mut hasher);
+    "yield-source-tag-page-v1".hash(&mut hasher);
     "selected-tag-ids".hash(&mut hasher);
     paths.hash(&mut hasher);
     tag_ids.hash(&mut hasher);
@@ -758,7 +758,7 @@ fn tag_page_paths_and_ids_signature(paths: &[String], tag_ids: &[i64]) -> u64 {
 
 fn tag_page_prefix_signature(prefix: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    "wavecrate-source-tag-page-v1".hash(&mut hasher);
+    "yield-source-tag-page-v1".hash(&mut hasher);
     "vocabulary".hash(&mut hasher);
     prefix.hash(&mut hasher);
     hasher.finish()

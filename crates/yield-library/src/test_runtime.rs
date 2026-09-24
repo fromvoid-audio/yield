@@ -222,7 +222,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    const TEST_ENV: &str = "WAVECRATE_TEST_RUNTIME_GUARD_REGRESSION";
+    const TEST_ENV: &str = "YIELD_TEST_RUNTIME_GUARD_REGRESSION";
 
     #[test]
     fn nested_scopes_restore_unset_and_empty_values_exactly() {

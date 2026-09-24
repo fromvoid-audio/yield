@@ -108,9 +108,9 @@ pub use write::{
 };
 
 /// Hidden filename used for per-source databases.
-pub const DB_FILE_NAME: &str = ".wavecrate.db";
+pub const DB_FILE_NAME: &str = ".yield.db";
 /// Previous hidden filename used for per-source databases.
-pub const LEGACY_DB_FILE_NAME: &str = ".wavecrate_samples.db";
+pub const LEGACY_DB_FILE_NAME: &str = ".yield_samples.db";
 /// Metadata key for the last completed scan timestamp.
 pub const META_LAST_SCAN_COMPLETED_AT: &str = "last_scan_completed_at";
 /// Metadata key storing the last completed periodic source-manifest audit timestamp.
@@ -159,7 +159,7 @@ pub const SOURCE_TAG_PAGE_MAX_PREFIX_BYTES: usize = 1024;
 /// Maximum number of entries returned by one bounded source-tag page request.
 pub const SOURCE_TAG_PAGE_MAX_PAGE_SIZE: usize = 64;
 /// Env var that enables read-only source DB opening by default.
-pub const SOURCE_DB_READ_ONLY_ENV: &str = "WAVECRATE_SOURCE_DB_READ_ONLY";
+pub const SOURCE_DB_READ_ONLY_ENV: &str = "YIELD_SOURCE_DB_READ_ONLY";
 
 /// Durable identity and source revision committed by one complete manifest audit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1027,7 +1027,7 @@ impl SourceDatabase {
     /// Open (or create) a source database stored outside the source root.
     ///
     /// `root` remains the audio root used for relative paths and scans, while
-    /// `database_root` owns the `.wavecrate.db` file.
+    /// `database_root` owns the `.yield.db` file.
     /// Open a writable external source database for general source-owned mutations.
     /// Normal builds reject this path-only entrypoint with
     /// [`SourceDbError::ProfileOwnershipRequired`].
@@ -1223,7 +1223,7 @@ impl SourceDatabase {
     /// Open a scan database in one direct child of an already-owned profile root.
     ///
     /// The child is created and retained through the profile capability, so callers cannot
-    /// accidentally create a source-local `.wavecrate.db` while building an app-owned catalog.
+    /// accidentally create a source-local `.yield.db` while building an app-owned catalog.
     /// The returned database retains the descriptor-bound child capability and a cloned profile
     /// owner for its lifetime.
     pub fn open_for_catalog_with_profile_guard(

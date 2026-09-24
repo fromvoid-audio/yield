@@ -30,7 +30,7 @@ state_dir="$common_dir/local-ci"
 mkdir -p "$state_dir/runs" "$state_dir/target"
 run_dir="$state_dir/runs/$commit"
 mkdir -p "$run_dir"
-ci_script="${WAVECRATE_GPUI_CI_SCRIPT:-$source_checkout/scripts/gpui-local-ci.sh}"
+ci_script="${YIELD_GPUI_CI_SCRIPT:-$source_checkout/scripts/gpui-local-ci.sh}"
 ci_script_hash="$(shasum -a 256 "$ci_script" | awk '{print $1}')"
 host="$(uname -s)"
 
@@ -67,7 +67,7 @@ tmp_parent="$(mktemp -d "${TMPDIR:-/tmp}/yield-ci.XXXXXX")"
 git -C "$source_checkout" worktree add --detach "$tmp_parent/checkout" "$commit" > "$run_dir/worktree.log" 2>&1
 
 export CARGO_TARGET_DIR="$state_dir/target"
-export WAVECRATE_GPUI_CI_CHECKOUT="$tmp_parent/checkout"
+export YIELD_GPUI_CI_CHECKOUT="$tmp_parent/checkout"
 set +e
 bash "$ci_script" full > "$run_dir/check.log" 2>&1
 result=$?

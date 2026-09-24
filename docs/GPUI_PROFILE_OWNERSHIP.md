@@ -63,7 +63,7 @@ UI dependency graph. Ownership tests read diagnostics through the retained lock
 handle, matching Windows exclusive-lock semantics.
 The complete library unit suite subsequently passed 536 tests (one subprocess
 helper ignored outside dispatch). Windows validation passed in
-[`34702160315`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34702160315),
+[`34702160315`](https://github.com/PORTALSURFER/yield/actions/runs/34702160315),
 against `1a8fbafa5`, including production profile admission, profile-owned
 settings maintenance, audio/core/media/platform tests, GPUI compilation, and
 browser state/interaction tests. The earlier run was cancelled after the test
@@ -107,14 +107,14 @@ A subprocess test commits an intent, is forcibly terminated, and proves that a
 new profile owner can reopen the acknowledged record. The restart addition passed
 32 store tests (plus one ignored subprocess helper), GPUI compilation, formatting,
 and diff checks on macOS. Windows storage validation passed in
-[`34709638982`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34709638982)
+[`34709638982`](https://github.com/PORTALSURFER/yield/actions/runs/34709638982)
 at `87887937b`, including the subprocess restart test and participant model.
 
 The initial storage checkpoint passed 45 focused journal tests, GPUI compilation,
 formatting, and diff checks on macOS. Tests cover normal reopen persistence,
 retained ownership, duplicate IDs, malformed/oversized records, and replacement
 both during opening and before writes. Windows storage validation passed in
-[`34707094509`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34707094509)
+[`34707094509`](https://github.com/PORTALSURFER/yield/actions/runs/34707094509)
 at store commit `3534c37b6`, including journal tests and production profile
 admission. Phase updates, participant execution, and recovery execution remain
 open; later checkpoints below cover persisted participants and session lifecycle.
@@ -129,7 +129,7 @@ that deferred rows appear on the next page. All 55 operation-journal module test
 and GPUI compilation passed for this addition. This is read-only observation,
 not legacy-file import, replay, participant reconciliation, or recovery admission.
 Windows storage validation for recovery paging passed in
-[`34708286537`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34708286537)
+[`34708286537`](https://github.com/PORTALSURFER/yield/actions/runs/34708286537)
 at `e17684aa2`.
 
 The pure participant model adds bounded descriptors, source identity/revision/lease
@@ -150,7 +150,7 @@ The V3 addition passed 82 focused journal tests and GPUI compilation on macOS.
 An additional recovery regression passed after review: an unsupported V3 phase
 remains byte-for-byte unchanged while a later valid intent stays observable.
 Windows storage validation passed on `aa135f587` in
-[`34711107753`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34711107753).
+[`34711107753`](https://github.com/PORTALSURFER/yield/actions/runs/34711107753).
 Retry/cancellation metadata, typed command arguments, full multi-class capacity
 claims, execution transitions, and recovery execution remain unfinished.
 
@@ -168,7 +168,7 @@ losing profile process leaving the journal untouched.
 All 61 session tests and GPUI compilation passed on macOS; the pending-recovery
 test also passed after review of the user-facing status wording. Windows storage
 validation passed on `42610b214` in
-[`34711763569`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34711763569).
+[`34711763569`](https://github.com/PORTALSURFER/yield/actions/runs/34711763569).
 
 A profile acquisition UUID is not a monotonic source-lease epoch. The physical
 lease foundation below supplies OPT-1336's independent source-conflict contract;
@@ -188,7 +188,7 @@ The addition passed 283 source database tests, including four ownership
 regressions, plus two WAL tests and GPUI compilation on macOS. Windows CI now
 includes the portable ownership and WAL regressions. After gating Unix-only test
 imports, Windows storage validation passed on `449082c4d` in
-[`34713357213`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34713357213).
+[`34713357213`](https://github.com/PORTALSURFER/yield/actions/runs/34713357213).
 
 Readiness writes now borrow the retained ownership context through
 `SourceDatabase::readiness_store()`. Publication, work claims and completion,
@@ -202,7 +202,7 @@ production admission regression, and GPUI compilation. The ownership regression
 invalidates the retained binding from a SQLite update hook after a real row
 write and verifies rollback. Windows storage validation, including that portable
 regression, passed on `9aa0a74e1` in
-[`34714685207`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34714685207).
+[`34714685207`](https://github.com/PORTALSURFER/yield/actions/runs/34714685207).
 These checks establish profile
 ownership, not physical source lease or main database-file identity authority.
 
@@ -223,7 +223,7 @@ snapshot rejection with no output. The earlier local pass covered a 51-test sour
 database subset, 47 readiness tests, and 35 journal store tests (one subprocess
 helper ignored). GPUI compilation and formatting passed. Windows storage
 validation passed on `10bd70527` in
-[`34717029864`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34717029864);
+[`34717029864`](https://github.com/PORTALSURFER/yield/actions/runs/34717029864);
 local Windows cross-compilation lacked the MSVC tools and headers. This
 milestone does not implement physical source leases or qualify WAL durability.
 
@@ -279,7 +279,7 @@ on macOS. Tests include independent-profile subprocess conflicts, abrupt-owner
 expiry recovery, unchanged malformed-state retention, actual control-connection
 write counts for healthy renewal, and implicit drop with an outstanding SQLite
 transaction. Windows storage validation passed on `c6dc01b11` in
-[`34723711255`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34723711255),
+[`34723711255`](https://github.com/PORTALSURFER/yield/actions/runs/34723711255),
 including production admission, journal, source identity/lease and session/catalog
 checks. This completes OPT-1336's ownership foundation; OPT-1349 publication
 fencing is recorded below; OPT-1337 coordinator execution remains unfinished.
@@ -309,7 +309,7 @@ publication tests, and all 396 UI tests (one existing ignored). The receipt
 regression uses an actual committed curation outcome and verifies it remains
 unchanged when delivered as non-projectable. GPUI compilation, formatting and
 diff checks passed. Windows storage validation passed on `c383a2ade` in
-[`34749559530`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34749559530),
+[`34749559530`](https://github.com/PORTALSURFER/yield/actions/runs/34749559530),
 including production admission, source identity/publication fence tests and
 catalog/session checks. Queued delivery and readiness claim fencing were added
 in the following extensions.
@@ -332,7 +332,7 @@ background projection checks rejects the projection while a live owner succeeds;
 and an expired receive deadline stops stale-event draining without consuming a
 fresh queued event. Formatting and diff checks passed. Windows storage validation
 passed on exact `7df74e1ca` in
-[`34750834289`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34750834289),
+[`34750834289`](https://github.com/PORTALSURFER/yield/actions/runs/34750834289),
 including production admission, journal/source mutation ownership and
 catalog/session checks. Native Windows UI validation is outside that storage run.
 
@@ -359,7 +359,7 @@ The no-default production library check and seven profile-admission tests passed
 the test-support readiness process fixture passed (one helper ignored).
 GPUI compilation, formatting and diff checks passed. Windows acceptance passed
 on `84ab021fc` in
-[`34752500946`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34752500946).
+[`34752500946`](https://github.com/PORTALSURFER/yield/actions/runs/34752500946).
 That run selected the full readiness suite (55 passed), including all three new
 claim-fence regressions. The earlier successful `b9c83f399` baseline run used a
 narrower filter and is not the regression acceptance evidence.
@@ -385,7 +385,7 @@ and the full library suite (667 passed, three existing ignored). Production
 no-default compilation, seven profile-admission tests, the readiness process
 fixture (one passed, one helper ignored), GPUI compilation, formatting and diff
 checks passed. Windows storage acceptance passed on exact `fb278b708` in
-[`34752810963`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34752810963).
+[`34752810963`](https://github.com/PORTALSURFER/yield/actions/runs/34752810963).
 Logs confirm both new origin regressions passed within the 57-test readiness
 selection. Diagnostic and data-preservation acceptance is recorded below; no readiness executor
 has been ported from the excluded reference application in this work.
@@ -428,7 +428,7 @@ The parallel library run encountered a failure in the unchanged cwd-sensitive
 `test_runtime::tests::panic_unwind_restores_environment_and_current_directory`.
 That test passed alone, and the complete library suite passed with one test
 thread. Windows storage acceptance passed on exact `2981d22e4` in
-[`34755296770`](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34755296770).
+[`34755296770`](https://github.com/PORTALSURFER/yield/actions/runs/34755296770).
 The logs confirm the portable missing-media and first-lease preservation
 regressions passed within 28 source identity tests, and the catalog mapping and
 retry-policy regressions passed within 90 catalog tests. The run also passed
@@ -489,7 +489,7 @@ default features, GPUI compilation, formatting and diff checks. Coverage include
 strict V4 decoding, stale/conflicting requests, exact replay, rollback, recovery
 cursor movement, and acknowledged cancellation surviving abrupt process exit.
 Independent review found no meaningful issues.
-[Windows storage validation](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34756869645)
+[Windows storage validation](https://github.com/PORTALSURFER/yield/actions/runs/34756869645)
 passed at exact commit `c800405dbc3f9263d4cc58ed31d2cdf7a4c032e5`, including
 88 journal tests and the abrupt cancellation restart regression, 90 catalog tests
 and 60 session tests. This storage run is not native Windows UI acceptance. Full
@@ -526,7 +526,7 @@ tests (one helper ignored), 61 session tests (one helper ignored), the productio
 library check without default features, GPUI compilation, formatting and diff
 checks. Review identified and repaired V3/V4 foreign-field classification and
 retained retry chronology gaps; dedicated regressions cover both.
-[Windows storage validation](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34758799969)
+[Windows storage validation](https://github.com/PORTALSURFER/yield/actions/runs/34758799969)
 passed on exact `8fb486ff436e03d6e295f64439d5ede6fafce727`: 97 journal tests,
 including retry restart and both review regressions, 90 catalog tests and 60
 session tests. This is storage validation, not native Windows UI acceptance.
@@ -560,7 +560,7 @@ default features, GPUI compilation, formatting and diff checks. Regressions cove
 4,096-row paging, signed rowids through `i64::MAX`, concurrent same-length updates,
 weak cursor invalidation after reopening, and reads that do not renew the lease.
 The dedicated Windows reader step passed all 12 tests in
-[storage run 34760528283](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34760528283)
+[storage run 34760528283](https://github.com/PORTALSURFER/yield/actions/runs/34760528283)
 on exact `d0704c333daefa17d1aee4463b0d414fa5a64287`; the full storage run
 passed as well. This is storage-scope acceptance, not native Windows UI acceptance.
 
@@ -585,7 +585,7 @@ unchanged. Local validation passed: 111 journal tests (one helper ignored),
 including three focused status tests and the key-retention regression, production
 library compilation without default features, GPUI compilation, formatting and
 diff checks.
-[Windows storage validation](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34761336321)
+[Windows storage validation](https://github.com/PORTALSURFER/yield/actions/runs/34761336321)
 passed on exact `7e6e39d997b17a2984d8a4811b7f048549e11292`, including
 101 journal tests and the status, legacy-field and key-retention regressions.
 This is storage-scope acceptance, not native Windows UI acceptance.
@@ -614,7 +614,7 @@ tests (one helper ignored), GPUI compilation, formatting and diff checks passed.
 Fault coverage includes confirmed/unconfirmed rollback, commit errors with and
 without a persisted row, post-commit acknowledgement failure, duplicate rows,
 actual pre-commit namespace replacement and the V5 Copy adapter. Windows storage
-validation [34762689278](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34762689278)
+validation [34762689278](https://github.com/PORTALSURFER/yield/actions/runs/34762689278)
 passed at exact commit `6b1344049c18c4f28638b17b839bfddf159ce09a`. Logs confirm
 107 journal tests (one helper ignored), including the conservative commit outcome,
 unconfirmed rollback, duplicate and V5 Copy outcome regressions. The namespace
@@ -653,7 +653,7 @@ intent/retry/cancellation/recovery round trip. The broader journal suite passed
 128 tests (one helper ignored) before the final two regression replacements;
 61 session tests (one helper ignored), production library compilation without
 default features and GPUI compilation also passed. Windows storage validation
-[34764655033](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34764655033)
+[34764655033](https://github.com/PORTALSURFER/yield/actions/runs/34764655033)
 passed at exact commit `96ff3439acaa681dd6528989d21b235b31068c4e`. Its logs confirm
 all nine owner regressions within 116 journal tests (one helper ignored), including
 the shutdown race and successful V5 retry/cancel round trip. The full storage run
@@ -688,7 +688,7 @@ Local validation passed 135 journal tests (one helper ignored), including ten
 owner tests, plus production library compilation without default features, GPUI
 compilation, formatting and diff checks. Independent compatibility and durability
 review found no meaningful issues. Windows storage validation
-[34766605426](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34766605426)
+[34766605426](https://github.com/PORTALSURFER/yield/actions/runs/34766605426)
 passed at exact commit `54e91717e118bd207461e68573ef80b5f346993d`. Its logs confirm
 the V6 compatibility, owner Import and retry/cancel regressions within 123 journal
 tests (one helper ignored), plus 12 legacy reader, 90 catalog and 60 session tests
@@ -738,7 +738,7 @@ pending; its storage lane now includes the core edit-settings and media adapter
 tests.
 
 The first V7 Windows run
-[34768644704](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34768644704)
+[34768644704](https://github.com/PORTALSURFER/yield/actions/runs/34768644704)
 passed 130 journal tests (one helper ignored), the legacy reader, lifecycle checks
 and all 16 core edit-settings tests. Its adapter timestamp fixture failed because
 it assumed `SystemTime` could represent one nanosecond on Windows. Rust documents
@@ -748,7 +748,7 @@ the shared checked-duration arithmetic separately. All five adapter tests pass
 locally after this repair; a new exact-commit Windows run is required.
 
 The repaired V7 Windows storage run
-[34769426219](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34769426219)
+[34769426219](https://github.com/PORTALSURFER/yield/actions/runs/34769426219)
 passed at exact commit `c093ef7e1265faa4c664d1344902d0a63b7e046a`. Its logs confirm
 all five media adapter tests and 16 core edit-settings tests, including platform
 precision and exact-duration limits. It also passed 130 journal tests (one helper
@@ -794,7 +794,7 @@ helper now starts its protocol message on a new line and explicitly uses one
 child test thread. All three abrupt-restart tests and the full serialized suite
 pass without changing their timeout, strict parsing, abrupt-kill or reopen checks.
 Windows storage validation
-[34771230509](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34771230509)
+[34771230509](https://github.com/PORTALSURFER/yield/actions/runs/34771230509)
 passed at exact commit `10bfc6bb4ca25f4d9a12dc4f8902e0ca2ca7ae71`. Logs confirm
 145 journal tests (one helper ignored), including all nine namespace tests, V8
 codec/store/owner coverage and all three abrupt-restart regressions. The lane
@@ -833,7 +833,7 @@ independent review found no remaining issues. The existing V1 default and SQLite
 schema remain unchanged.
 
 Windows storage validation
-[34773388901](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34773388901)
+[34773388901](https://github.com/PORTALSURFER/yield/actions/runs/34773388901)
 passed at exact commit `ba0ceacf21d2d6c7a205a2ac5a60eb8ee2871953`. Logs confirm
 161 journal tests (one helper ignored), including all ten render tests and V9
 compatibility, malformed-record, store replay and owner persistence coverage.
@@ -876,7 +876,7 @@ and its focused regression passed. No other findings were reported. This adds
 no filesystem executor. The V1 default and SQLite schema remain unchanged.
 
 Windows storage validation
-[34775353882](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34775353882)
+[34775353882](https://github.com/PORTALSURFER/yield/actions/runs/34775353882)
 passed at exact commit `e6b292c5403ec8e5cfe32e1e9d90a0e1b4ff2164`. Logs confirm
 173 journal tests (one helper ignored), including all six removal tests and V10
 codec, prior-version rejection, owner persistence, retry/cancellation and restart
@@ -892,7 +892,7 @@ legacy retained-folder record. The original location is only a bounded relative
 path: the deleted directory may be absent or independently recreated. The staged
 directory supplies the observed physical identity, source revision and fenced
 SourceDatabase participant. Its source-relative path must match
-`.wavecrate_delete_staging/<staged_relative>`, with composed path bounds checked.
+`.yield_delete_staging/<staged_relative>`, with composed path bounds checked.
 Original paths in the reserved recovery namespace, including ASCII case aliases,
 are rejected. These lexical checks do not replace live capability-bound
 containment and identity checks.
@@ -924,7 +924,7 @@ GPUI compilation, formatting and diff checks passed. Independent review found no
 meaningful correctness issues. The V1 default and SQLite schema remain unchanged.
 
 Windows storage validation
-[34777623562](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34777623562)
+[34777623562](https://github.com/PORTALSURFER/yield/actions/runs/34777623562)
 passed at exact commit `5e30d9a761a9e3a297284de19d6fef8b85ddf5c8`. Logs confirm
 187 journal tests (one helper ignored), including all eight retained-observation
 tests and V11 codec, owner persistence, retry/cancellation and restart coverage.
@@ -962,7 +962,7 @@ and diff checks passed. Primary review found no remaining issue in the new typed
 contract and version wiring. The V1 default and SQLite schema remain unchanged.
 
 Windows storage validation
-[34778990457](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34778990457)
+[34778990457](https://github.com/PORTALSURFER/yield/actions/runs/34778990457)
 passed at exact commit `c8a8b71b50994a645c58251a525d280982036147`. Logs confirm
 198 journal tests (one helper ignored), plus 12 legacy-reader, 90 catalog,
 60 session (one helper ignored), 16 core edit-settings and five media-adapter
@@ -985,7 +985,7 @@ features, GPUI compilation, formatting and diff checks. Independent compatibilit
 review found no meaningful issues.
 
 Windows storage validation
-[34866551245](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34866551245)
+[34866551245](https://github.com/PORTALSURFER/yield/actions/runs/34866551245)
 passed at exact commit `6c75d2fd8f04b62f2e111f9ea34ddcc67e9e45ab`, including both
 frozen compatibility baselines and 200 journal tests (one helper ignored).
 The lane also passed the catalog, session, core edit-settings and media-adapter
@@ -1029,7 +1029,7 @@ passed. Primary review checked the version gates, participant binding, output
 arithmetic and resolved metadata/fade semantics.
 
 Windows storage validation
-[34871875304](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34871875304)
+[34871875304](https://github.com/PORTALSURFER/yield/actions/runs/34871875304)
 passed at exact commit `6381dd2e1cd32c6b3804a95659d7fb94c0dd3a97`. Logs confirm
 212 journal tests (one helper ignored), including V13 codec, generic owner,
 selection-output and compound restart coverage. The lane also passed 12 legacy
@@ -1071,7 +1071,7 @@ Filesystem execution and live recovery-material retention remain outside this
 initial intent contract.
 
 Windows storage validation
-[34877410904](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34877410904)
+[34877410904](https://github.com/PORTALSURFER/yield/actions/runs/34877410904)
 passed at exact commit `c96cda4711f0311f03bf2115a72f153630424719`. The lane passed
 223 journal tests (one helper ignored), including history codec, direction/absence,
 directory-only moves, generic owner and restart/retry/cancel coverage. It also
@@ -1106,7 +1106,7 @@ allocation bounds, participant bindings and codec compatibility, and repaired th
 provenance preallocation and nullable-key issues before acceptance.
 
 Windows storage validation
-[34881198244](https://github.com/PORTALSURFER/wavecrate-gpui/actions/runs/34881198244)
+[34881198244](https://github.com/PORTALSURFER/yield/actions/runs/34881198244)
 passed at exact commit `692bc3aaf6bd7bfdca9b21d0a3cb3eba138ad5d9`, after gating
 Unix-only test imports found by the first Windows run. The lane passed 233 journal
 tests (one helper ignored), including V15 raw-evidence, nullable-field, owner and
@@ -1328,9 +1328,9 @@ outside this slice.
 
 The next private OPT-1338 ownership slice adds a per-user cooperating-process lock for one
 descriptor-derived volume. Its registry is rooted at the canonical macOS OS-account application
-directory (`Library/Application Support/.wavecrate`), independent of the selected profile and
+directory (`Library/Application Support/.yield`), independent of the selected profile and
 process configuration overrides; the account home, `Library`, and `Application Support` parents
-must already exist, while only the final `.wavecrate` child may be created through the retained
+must already exist, while only the final `.yield` child may be created through the retained
 no-follow parent. A fixed `volume-<device>.lock` entry is created beneath a retained
 `volume-ownership` directory, where `<device>` is the canonical live volume identity rather than
 caller path text. The retained registry and lock identities are revalidated before use and the

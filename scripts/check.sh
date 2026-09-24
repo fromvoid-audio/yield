@@ -50,7 +50,7 @@ case "$command" in
   source-db-open-roles) exec "$script_dir/check_source_db_open_roles.sh" "$@" ;;
   taste) exec "$script_dir/check_rust_taste_invariants.sh" "$@" ;;
   workflow-toolchain) exec "$script_dir/check_workflow_toolchain_pinning.sh" "$@" ;;
-  wavecrate-facades) exec "$script_dir/check_wavecrate_facades.sh" "$@" ;;
+  yield-facades) exec "$script_dir/check_yield_facades.sh" "$@" ;;
   -h|--help) usage ;;
   *)
     echo "Unknown check command: $command" >&2

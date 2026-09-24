@@ -16,13 +16,13 @@ from pathlib import Path
 from typing import Any
 
 
-USER_AGENT = "wavecrate-release-changelog-assembler"
+USER_AGENT = "yield-release-changelog-assembler"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a site-wide Wavecrate changelog by concatenating the "
+            "Build a site-wide Yield changelog by concatenating the "
             "markdown logs bound to each PortalSurfer release."
         )
     )
@@ -91,7 +91,7 @@ def changelog_url(catalog_url: str | None, release: dict[str, Any]) -> str | Non
 
 
 def release_version(build_id: str) -> str:
-    prefix = "wavecrate-"
+    prefix = "yield-"
     return build_id[len(prefix) :] if build_id.startswith(prefix) else build_id
 
 
@@ -105,8 +105,8 @@ def release_header_versions(release: dict[str, Any]) -> list[str]:
         versions.add(version.strip())
     changelog = release.get("changelog") or {}
     title = changelog.get("title")
-    if isinstance(title, str) and title.startswith("Wavecrate "):
-        versions.add(title.removeprefix("Wavecrate ").strip())
+    if isinstance(title, str) and title.startswith("Yield "):
+        versions.add(title.removeprefix("Yield ").strip())
     build_number = release.get("build_number")
     suffix = build_id.rsplit("-", 1)[-1]
     if (
@@ -124,7 +124,7 @@ def assert_bound_header(build_id: str, body: str, versions: list[str]) -> None:
         escaped = re.escape(version)
         patterns.extend(
             [
-                rf"(?m)^#{{1,6}}\s+Wavecrate\s+{escaped}\s*$",
+                rf"(?m)^#{{1,6}}\s+Yield\s+{escaped}\s*$",
                 rf"(?m)^#{{1,6}}\s+\[{escaped}\](?:\s+-\s+.*)?$",
             ]
         )
@@ -152,7 +152,7 @@ def current_release_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "version": args.current_version,
         "released_at": args.current_released_at,
         "changelog": {
-            "title": f"Wavecrate {release_version(args.current_build_id)}",
+            "title": f"Yield {release_version(args.current_build_id)}",
             "format": "markdown",
         },
     }
@@ -189,13 +189,13 @@ def existing_changelog_body(url: str, *, request_delay_seconds: float) -> str:
 
 def release_heading_pattern() -> re.Pattern[str]:
     return re.compile(
-        r"(?m)^(?=(?:#\s+Wavecrate\s+(?!Changelog\b)|##\s+\[nightly-))"
+        r"(?m)^(?=(?:#\s+Yield\s+(?!Changelog\b)|##\s+\[nightly-))"
     )
 
 
 def strip_global_changelog_header(body: str) -> str:
     body = body.strip()
-    if not body.startswith("# Wavecrate Changelog"):
+    if not body.startswith("# Yield Changelog"):
         return body
     match = release_heading_pattern().search(body)
     if match is None:
@@ -222,7 +222,7 @@ def remove_release_sections(body: str, versions: list[str]) -> str:
 
 
 def starts_with_release_bound_section(body: str) -> bool:
-    return body.startswith("# Wavecrate ") or body.startswith("## [nightly-")
+    return body.startswith("# Yield ") or body.startswith("## [nightly-")
 
 
 def main() -> int:
@@ -269,7 +269,7 @@ def main() -> int:
         )
 
     output: list[str] = [
-        "# Wavecrate Changelog",
+        "# Yield Changelog",
         "",
         f"- Latest release: {args.current_build_id}",
         f"- Latest build: {current_release.get('build_number')}",
@@ -288,14 +288,14 @@ def main() -> int:
         if previous_body and not starts_with_release_bound_section(previous_body):
             raise SystemExit(
                 "Existing full changelog is not release-bound. Repair it so "
-                "each historical log starts with '# Wavecrate ...' "
+                "each historical log starts with '# Yield ...' "
                 "before the nightly workflow maintains it."
             )
         output.append(current_body)
         if previous_body:
             output.extend(["", previous_body])
         Path(args.output).write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
-        print(f"Assembled current Wavecrate release log into {args.output}")
+        print(f"Assembled current Yield release log into {args.output}")
         return 0
 
     written = 0
@@ -313,7 +313,7 @@ def main() -> int:
         if body is None:
             output.extend(
                 [
-                    f"## Wavecrate {release_version(build_id)}",
+                    f"## Yield {release_version(build_id)}",
                     "",
                     "Release log unavailable.",
                     "",
@@ -330,7 +330,7 @@ def main() -> int:
         raise SystemExit("No release logs were written to the full changelog.")
 
     Path(args.output).write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
-    print(f"Assembled {written} Wavecrate release log(s) into {args.output}")
+    print(f"Assembled {written} Yield release log(s) into {args.output}")
     return 0
 
 

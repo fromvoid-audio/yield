@@ -404,7 +404,7 @@ fn wav_file_metadata(path: &std::path::Path) -> Result<(f32, u32, usize), String
 }
 
 fn test_audio_output_enabled() -> bool {
-    std::env::var("WAVECRATE_TEST_AUDIO_OUTPUT")
+    std::env::var("YIELD_TEST_AUDIO_OUTPUT")
         .ok()
         .is_some_and(|value| {
             matches!(

@@ -36,7 +36,7 @@ if ($null -eq $psRunner) {
 }
 $psExe = $psRunner.Path
 
-$stateDir = $env:WAVECRATE_AGENT_PREFLIGHT_STATE_DIR
+$stateDir = $env:YIELD_AGENT_PREFLIGHT_STATE_DIR
 if ([string]::IsNullOrWhiteSpace($stateDir)) {
   $gitCommonDir = (& git -C $rootDir rev-parse --git-common-dir).Trim()
   if ([System.IO.Path]::IsPathRooted($gitCommonDir)) {
@@ -53,7 +53,7 @@ try {
 } finally {
   $sha256.Dispose()
 }
-$mutexName = "Wavecrate.AgentPreflight.$(([System.BitConverter]::ToString($hashBytes)).Replace('-', ''))"
+$mutexName = "Yield.AgentPreflight.$(([System.BitConverter]::ToString($hashBytes)).Replace('-', ''))"
 $mutex = [System.Threading.Mutex]::new($false, $mutexName)
 $resultFile = Join-Path $stateDir "last-result"
 $ownsMutex = $false

@@ -9044,8 +9044,7 @@ mod tests {
         let source = NamespaceEntryEndpoint::new(
             copy_args.source().participant_id(),
             SourceId::from_string("source-a"),
-            StoredRelativePath::new(".wavecrate_delete_staging/folder/retained")
-                .expect("staged path"),
+            StoredRelativePath::new(".yield_delete_staging/folder/retained").expect("staged path"),
             NamespaceEntryExpectation::Directory(
                 NamespaceDirectoryExpectation::new(7, "staged-directory", None)
                     .expect("staged expectation"),

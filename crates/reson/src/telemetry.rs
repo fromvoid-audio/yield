@@ -4,14 +4,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const RESON_PLAYBACK_TELEMETRY_ENV: &str = "RESON_PLAYBACK_TELEMETRY";
-const WAVECRATE_HOTPATH_TELEMETRY_ENV: &str = "WAVECRATE_HOTPATH_TELEMETRY";
+const YIELD_HOTPATH_TELEMETRY_ENV: &str = "YIELD_HOTPATH_TELEMETRY";
 
 static PLAYBACK_TELEMETRY_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn playback_telemetry_enabled() -> bool {
     *PLAYBACK_TELEMETRY_ENABLED.get_or_init(|| {
-        env_var_truthy(RESON_PLAYBACK_TELEMETRY_ENV)
-            || env_var_truthy(WAVECRATE_HOTPATH_TELEMETRY_ENV)
+        env_var_truthy(RESON_PLAYBACK_TELEMETRY_ENV) || env_var_truthy(YIELD_HOTPATH_TELEMETRY_ENV)
     })
 }
 

@@ -534,8 +534,8 @@ fn source_index_migration_adds_lossless_path_encoding_to_legacy_tables() {
             path, classification, file_size, modified_ns, format_policy_version
         ) VALUES
             ('notes.txt', 'unsupported_non_audio', 5, 10, 1),
-            ('~wavecrate-nu~ff.wav', 'unsupported_non_audio', 6, 11, 1),
-            ('folder/~wavecrate-escaped~name.txt', 'unsupported_non_audio', 7, 12, 1);",
+            ('~yield-nu~ff.wav', 'unsupported_non_audio', 6, 11, 1),
+            ('folder/~yield-escaped~name.txt', 'unsupported_non_audio', 7, 12, 1);",
     )
     .unwrap();
 
@@ -556,8 +556,8 @@ fn source_index_migration_adds_lossless_path_encoding_to_legacy_tables() {
         0
     );
     for (legacy_path, file_size) in [
-        ("~wavecrate-nu~ff.wav", 6_i64),
-        ("folder/~wavecrate-escaped~name.txt", 7_i64),
+        ("~yield-nu~ff.wav", 6_i64),
+        ("folder/~yield-escaped~name.txt", 7_i64),
     ] {
         let (canonical_path, path_encoding) =
             normalize_source_index_path(Path::new(legacy_path)).unwrap();
@@ -589,7 +589,7 @@ fn source_index_migration_adds_lossless_path_encoding_to_legacy_tables() {
         "INSERT INTO source_index_entries (
             path, path_encoding, classification, file_size, modified_ns, format_policy_version
          ) VALUES (?1, 0, 'unsupported_non_audio', 99, 99, 1)",
-        ["~wavecrate-nu~ff.wav"],
+        ["~yield-nu~ff.wav"],
     )
     .unwrap();
     ensure_source_index_schema(&conn).unwrap();
@@ -601,8 +601,7 @@ fn source_index_migration_adds_lossless_path_encoding_to_legacy_tables() {
         3,
         "a legacy/canonical collision must converge to one canonical row"
     );
-    let (canonical_path, _) =
-        normalize_source_index_path(Path::new("~wavecrate-nu~ff.wav")).unwrap();
+    let (canonical_path, _) = normalize_source_index_path(Path::new("~yield-nu~ff.wav")).unwrap();
     assert_eq!(
         conn.query_row(
             "SELECT file_size FROM source_index_entries WHERE path = ?1",

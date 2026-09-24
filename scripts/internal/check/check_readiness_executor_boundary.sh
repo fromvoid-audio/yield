@@ -44,13 +44,13 @@ else
 fi
 
 require_literal Cargo.toml 'default = []' \
-  "The default Wavecrate feature set must remain free of legacy-controller."
+  "The default Yield feature set must remain free of legacy-controller."
 require_literal src/lib.rs 'pub mod readiness_execution;' \
   "The readiness executor must remain an explicit library API."
 require_literal tools/gui-test-cli/Cargo.toml 'features = ["legacy-controller"]' \
   "gui-test-cli must opt into legacy-controller explicitly."
 require_literal tools/bench-cli/Cargo.toml 'features = ["legacy-controller"]' \
-  "wavecrate-bench-cli must opt into legacy-controller explicitly."
+  "yield-bench-cli must opt into legacy-controller explicitly."
 
 for declaration in 'mod app;' 'pub mod app_core;' 'pub mod gui_test;'; do
   if ! grep -F -B2 -- "$declaration" src/lib.rs \

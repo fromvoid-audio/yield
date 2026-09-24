@@ -139,7 +139,7 @@ impl SourceRole {
 /// Where a source's Yield metadata database is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SourceMetadataStorage {
-    /// Store `.wavecrate.db` inside the source folder.
+    /// Store `.yield.db` inside the source folder.
     #[default]
     SourceFolder,
     /// Store source metadata in Yield's app data folder.

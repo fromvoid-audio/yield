@@ -14,7 +14,7 @@ if [[ -f "$ROOT_DIR/scripts/internal/git_diff_env.sh" ]]; then
   # shellcheck source=scripts/internal/git_diff_env.sh
   source "$ROOT_DIR/scripts/internal/git_diff_env.sh"
 else
-  wavecrate_git() {
+  yield_git() {
     git "$@"
   }
 fi
@@ -95,7 +95,7 @@ is_allowlisted() {
 }
 
 git_has_commit() {
-  wavecrate_git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1
+  yield_git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1
 }
 
 collect_files() {
@@ -107,13 +107,13 @@ collect_files() {
   if (( CHECK_ALL == 1 )); then
     while IFS= read -r path; do
       raw_files+=("$path")
-    done < <(wavecrate_git ls-files -- "${PROJECT_TRACKED_PATHS[@]}" || true)
+    done < <(yield_git ls-files -- "${PROJECT_TRACKED_PATHS[@]}" || true)
     COLLECT_SCOPE="all"
   elif [[ -n "$base" ]] && git_has_commit "$base" && git_has_commit "$head"; then
     while IFS= read -r path; do
       raw_files+=("$path")
     done < <(
-      wavecrate_git diff --name-only --diff-filter=AM "$base...$head" -- "${PROJECT_TRACKED_PATHS[@]}" \
+      yield_git diff --name-only --diff-filter=AM "$base...$head" -- "${PROJECT_TRACKED_PATHS[@]}" \
         || true
     )
     COLLECT_SCOPE="diff(base...head)"
@@ -122,7 +122,7 @@ collect_files() {
     while IFS= read -r path; do
       raw_files+=("$path")
     done < <(
-      wavecrate_git show --name-only --pretty=format: "$head" -- "${PROJECT_TRACKED_PATHS[@]}" || true
+      yield_git show --name-only --pretty=format: "$head" -- "${PROJECT_TRACKED_PATHS[@]}" || true
     )
     COLLECT_SCOPE="diff(head)"
   else
@@ -138,12 +138,12 @@ collect_files() {
     while IFS= read -r path; do
       staged+=("$path")
     done < <(
-      wavecrate_git diff --name-only --diff-filter=AM --cached -- "${PROJECT_TRACKED_PATHS[@]}" || true
+      yield_git diff --name-only --diff-filter=AM --cached -- "${PROJECT_TRACKED_PATHS[@]}" || true
     )
     while IFS= read -r path; do
       unstaged+=("$path")
     done < <(
-      wavecrate_git diff --name-only --diff-filter=AM -- "${PROJECT_TRACKED_PATHS[@]}" || true
+      yield_git diff --name-only --diff-filter=AM -- "${PROJECT_TRACKED_PATHS[@]}" || true
     )
     staged_count="${#staged[@]}"
     unstaged_count="${#unstaged[@]}"

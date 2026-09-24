@@ -2,11 +2,11 @@
 
 # Prints the resolved log directory, the newest log file, and a tail snippet.
 #
-# Resolution order for the `.wavecrate` root:
-# 1) `WAVECRATE_CONFIG_HOME` (config base override, if set)
+# Resolution order for the `.yield` root:
+# 1) `YIELD_CONFIG_HOME` (config base override, if set)
 # 2) OS default config base (`XDG_CONFIG_HOME` or `~/.config`, macOS app-support, Windows APPDATA via WSL hint)
-# 3) `WAVECRATE_CONFIG_PROFILE` (`live`, `sandbox`, `automated-tests`, or another named profile)
-# 4) `app_data_dir` in `<app_root>/config.toml` (absolute path expected; overrides `.wavecrate` root)
+# 3) `YIELD_CONFIG_PROFILE` (`live`, `sandbox`, `automated-tests`, or another named profile)
+# 4) `app_data_dir` in `<app_root>/config.toml` (absolute path expected; overrides `.yield` root)
 #
 # This is best-effort and intended for quick diagnostics (humans + agents).
 
@@ -19,20 +19,20 @@ LINES=200
 USE_SANDBOX=0
 
 usage() {
-  local entrypoint="${WAVECRATE_RUN_ENTRYPOINT:-scripts/run.sh}"
+  local entrypoint="${YIELD_RUN_ENTRYPOINT:-scripts/run.sh}"
   cat <<EOF
 Usage: ${entrypoint} logs [--lines <n>] [--sandbox]
 
 Prints:
-- resolved .wavecrate root (best-effort)
+- resolved .yield root (best-effort)
 - resolved logs dir
 - newest *.log file under logs dir (if any)
 - tail snippet from that newest log (default: 200 lines)
 
 Sandbox behavior:
-- If WAVECRATE_CONFIG_HOME is set, it is always used.
-- Otherwise, if <repo>/.sandbox/wavecrate exists, this script prefers it.
-- Pass --sandbox to force using <repo>/.sandbox/wavecrate.
+- If YIELD_CONFIG_HOME is set, it is always used.
+- Otherwise, if <repo>/.sandbox/yield exists, this script prefers it.
+- Pass --sandbox to force using <repo>/.sandbox/yield.
 EOF
 }
 
@@ -52,11 +52,11 @@ while (( $# > 0 )); do
 done
 
 os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
-sandbox_config_home="${ROOT_DIR}/.sandbox/wavecrate"
+sandbox_config_home="${ROOT_DIR}/.sandbox/yield"
 
 default_config_base_dir() {
-  if [[ -n "${WAVECRATE_CONFIG_HOME:-}" ]]; then
-    printf "%s" "$WAVECRATE_CONFIG_HOME"
+  if [[ -n "${YIELD_CONFIG_HOME:-}" ]]; then
+    printf "%s" "$YIELD_CONFIG_HOME"
     return 0
   fi
   if (( USE_SANDBOX == 1 )) || [[ -d "$sandbox_config_home" ]]; then
@@ -78,8 +78,8 @@ default_config_base_dir() {
 }
 
 current_persistence_profile() {
-  if [[ -n "${WAVECRATE_CONFIG_PROFILE:-}" ]]; then
-    printf "%s" "${WAVECRATE_CONFIG_PROFILE}"
+  if [[ -n "${YIELD_CONFIG_PROFILE:-}" ]]; then
+    printf "%s" "${YIELD_CONFIG_PROFILE}"
     return 0
   fi
   if (( USE_SANDBOX == 1 )); then
@@ -91,7 +91,7 @@ current_persistence_profile() {
 
 config_base_dir="$(default_config_base_dir)"
 used_sandbox_config_home="false"
-if [[ -z "${WAVECRATE_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
+if [[ -z "${YIELD_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
   used_sandbox_config_home="true"
 fi
 
@@ -121,7 +121,7 @@ extract_app_data_dir_from_config() {
 resolve_app_root_dir() {
   local profile
   profile="$(current_persistence_profile)"
-  local default_root="${config_base_dir}/.wavecrate"
+  local default_root="${config_base_dir}/.yield"
   if [[ "$profile" != "live" ]]; then
     default_root="${default_root}/profiles/${profile}"
   fi

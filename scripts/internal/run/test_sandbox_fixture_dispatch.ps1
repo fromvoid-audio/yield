@@ -2,24 +2,24 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
-$testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wavecrate-fixture-dispatch-" + [Guid]::NewGuid().ToString("N"))
+$testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("yield-fixture-dispatch-" + [Guid]::NewGuid().ToString("N"))
 $fakeBin = Join-Path $testRoot "bin"
 $calls = Join-Path $testRoot "cargo-calls.txt"
 New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
 $oldPath = $env:PATH
-$oldReadOnly = $env:WAVECRATE_SOURCE_DB_READ_ONLY
+$oldReadOnly = $env:YIELD_SOURCE_DB_READ_ONLY
 
 try {
   $fakeCargo = Join-Path $fakeBin "cargo.cmd"
   Set-Content -LiteralPath $fakeCargo -Value @(
     "@echo off",
-    'if not "%WAVECRATE_SOURCE_DB_READ_ONLY%"=="" exit /b 91',
-    'echo %*>>"%WAVECRATE_FIXTURE_TEST_CALLS%"',
+    'if not "%YIELD_SOURCE_DB_READ_ONLY%"=="" exit /b 91',
+    'echo %*>>"%YIELD_FIXTURE_TEST_CALLS%"',
     "exit /b 0"
   )
   $env:PATH = $fakeBin + [System.IO.Path]::PathSeparator + $oldPath
-  $env:WAVECRATE_FIXTURE_TEST_CALLS = $calls
-  $env:WAVECRATE_SOURCE_DB_READ_ONLY = "1"
+  $env:YIELD_FIXTURE_TEST_CALLS = $calls
+  $env:YIELD_SOURCE_DB_READ_ONLY = "1"
 
   & (Join-Path $rootDir "scripts/run.ps1") sandbox `
     -Dir (Join-Path $testRoot "sandbox") `
@@ -31,18 +31,18 @@ try {
   }
 
   $recorded = Get-Content -LiteralPath $calls -Raw
-  if ($recorded -notlike "*run --quiet --bin wavecrate-fixture -- provision --fixture small-multi-source*") {
+  if ($recorded -notlike "*run --quiet --bin yield-fixture -- provision --fixture small-multi-source*") {
     throw "fixture provision command was not dispatched"
   }
   if ($recorded -notlike "*--profile sandbox --no-reset*") {
     throw "fixture preserve/profile arguments were not dispatched"
   }
   if ($recorded -notlike "*run --release -- --log*") {
-    throw "Wavecrate launch was not dispatched after fixture provisioning"
+    throw "Yield launch was not dispatched after fixture provisioning"
   }
 
   Clear-Content -LiteralPath $calls
-  $env:WAVECRATE_SOURCE_DB_READ_ONLY = "1"
+  $env:YIELD_SOURCE_DB_READ_ONLY = "1"
   & (Join-Path $rootDir "scripts/run.ps1") sandbox `
     -Dir (Join-Path $testRoot "reset") `
     -Fixture empty | Out-Null
@@ -50,7 +50,7 @@ try {
     throw "sandbox reset fixture dispatch failed with exit code $LASTEXITCODE"
   }
   $resetCalls = Get-Content -LiteralPath $calls
-  $expectedReset = "run --quiet --bin wavecrate-fixture -- provision --fixture empty --config-base $(Join-Path $testRoot 'reset') --profile sandbox"
+  $expectedReset = "run --quiet --bin yield-fixture -- provision --fixture empty --config-base $(Join-Path $testRoot 'reset') --profile sandbox"
   if ($resetCalls -notcontains $expectedReset) {
     throw "default fixture dispatch must request a clean reset"
   }
@@ -69,11 +69,11 @@ try {
 } finally {
   $env:PATH = $oldPath
   if ([string]::IsNullOrWhiteSpace($oldReadOnly)) {
-    Remove-Item Env:WAVECRATE_SOURCE_DB_READ_ONLY -ErrorAction SilentlyContinue
+    Remove-Item Env:YIELD_SOURCE_DB_READ_ONLY -ErrorAction SilentlyContinue
   } else {
-    $env:WAVECRATE_SOURCE_DB_READ_ONLY = $oldReadOnly
+    $env:YIELD_SOURCE_DB_READ_ONLY = $oldReadOnly
   }
-  Remove-Item Env:WAVECRATE_FIXTURE_TEST_CALLS -ErrorAction SilentlyContinue
+  Remove-Item Env:YIELD_FIXTURE_TEST_CALLS -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
