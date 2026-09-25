@@ -67,12 +67,12 @@ impl Browser {
             .active_source
             .and_then(|index| self.source_sessions.get(index))
         else {
-            self.playback_status = "Select a source before setting a compare anchor".into();
+            self.set_playback_status("Select a source before setting a compare anchor");
             cx.notify();
             return;
         };
         let Some(source_id) = session.source_id.clone() else {
-            self.playback_status = "Compare anchor source is not registered".into();
+            self.set_playback_status("Compare anchor source is not registered");
             cx.notify();
             return;
         };
@@ -81,18 +81,18 @@ impl Browser {
             .browser_focus_index()
             .and_then(|index| self.entries.get(index))
         else {
-            self.playback_status = "Focus a sample to set a compare anchor".into();
+            self.set_playback_status("Focus a sample to set a compare anchor");
             cx.notify();
             return;
         };
         let Ok(relative_path) = entry.path.strip_prefix(&root) else {
-            self.playback_status = "Focused sample is no longer available".into();
+            self.set_playback_status("Focused sample is no longer available");
             cx.notify();
             return;
         };
         let relative_path = relative_path.to_path_buf();
         if !self.compare_source_is_registered(&source_id, &root) {
-            self.playback_status = "Compare anchor source is not registered".into();
+            self.set_playback_status("Compare anchor source is not registered");
             cx.notify();
             return;
         }
@@ -101,7 +101,7 @@ impl Browser {
         self.compare_anchor_task.take();
         self.compare_anchor_play_pending = false;
         self.compare_anchor = None;
-        self.playback_status = "Checking compare anchor…".into();
+        self.set_playback_status("Checking compare anchor…");
         self.compare_anchor_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -122,7 +122,7 @@ impl Browser {
                         if browser.compare_source_is_registered(&source_id, &root) =>
                     {
                         let label = relative_path.display();
-                        browser.playback_status = format!("Compare anchor set: {label}");
+                        browser.set_playback_status(format!("Compare anchor set: {label}"));
                         browser.compare_anchor = Some(CompareAnchor {
                             source_id,
                             root,
@@ -131,10 +131,9 @@ impl Browser {
                         });
                     }
                     Ok(_) => {
-                        browser.playback_status =
-                            "Compare anchor source is no longer available".into();
+                        browser.set_playback_status("Compare anchor source is no longer available");
                     }
-                    Err(message) => browser.playback_status = message.into(),
+                    Err(message) => browser.set_playback_status(message),
                 }
                 cx.notify();
             });
@@ -144,13 +143,13 @@ impl Browser {
 
     pub(super) fn play_compare_anchor(&mut self, cx: &mut Context<Self>) {
         let Some(anchor) = self.compare_anchor.clone() else {
-            self.playback_status = "Set a compare anchor first".into();
+            self.set_playback_status("Set a compare anchor first");
             cx.notify();
             return;
         };
         if !self.compare_source_is_registered(&anchor.source_id, &anchor.root) {
             self.compare_anchor = None;
-            self.playback_status = "Compare anchor source is no longer available".into();
+            self.set_playback_status("Compare anchor source is no longer available");
             cx.notify();
             return;
         }
@@ -158,7 +157,7 @@ impl Browser {
         let generation = self.compare_anchor_generation;
         self.compare_anchor_task.take();
         self.compare_anchor_play_pending = true;
-        self.playback_status = "Checking compare anchor…".into();
+        self.set_playback_status("Checking compare anchor…");
         let root = anchor.root.clone();
         let relative_path = anchor.relative_path.clone();
         let expected_root = anchor.verified_root.clone();
@@ -184,10 +183,10 @@ impl Browser {
                 browser.compare_anchor_play_pending = false;
                 if !browser.compare_source_is_registered(&anchor.source_id, &anchor.root) {
                     browser.compare_anchor = None;
-                    browser.playback_status = "Compare anchor source is no longer available".into();
+                    browser.set_playback_status("Compare anchor source is no longer available");
                 } else if let Err(message) = result {
                     browser.compare_anchor = None;
-                    browser.playback_status = message.into();
+                    browser.set_playback_status(message);
                 } else {
                     let intent = PlaybackIntent {
                         start: 0.0,

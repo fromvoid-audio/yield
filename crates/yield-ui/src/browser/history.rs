@@ -59,11 +59,13 @@ impl Browser {
             PlaybackHistoryDirection::Forward => self.playback_history.forward(),
         };
         let Some(entry) = entry else {
-            self.playback_status = match direction {
-                PlaybackHistoryDirection::Back => "No earlier playback history",
-                PlaybackHistoryDirection::Forward => "No later playback history",
-            }
-            .to_string();
+            self.set_playback_status(
+                match direction {
+                    PlaybackHistoryDirection::Back => "No earlier playback history",
+                    PlaybackHistoryDirection::Forward => "No later playback history",
+                }
+                .to_string(),
+            );
             cx.notify();
             return;
         };
@@ -76,10 +78,10 @@ impl Browser {
             &self.source_registry_removed_roots,
             entry.path(),
         ) else {
-            self.playback_status = format!(
+            self.set_playback_status(format!(
                 "Playback history unavailable: {} is not in a registered source",
                 entry.path().display()
-            );
+            ));
             cx.notify();
             return;
         };
@@ -106,10 +108,10 @@ impl Browser {
         let Some(selected_index) =
             self.reveal_cached_history_entry(source_index, entry_index, entry.path(), cx)
         else {
-            self.playback_status = format!(
+            self.set_playback_status(format!(
                 "Playback history unavailable: {} is no longer visible",
                 entry.path().display()
-            );
+            ));
             cx.notify();
             return;
         };
@@ -129,18 +131,18 @@ impl Browser {
             .and_then(|index| self.entries.get(index))
             .map(|entry| entry.path.clone())
         else {
-            self.playback_status = format!(
+            self.set_playback_status(format!(
                 "Playback history unavailable: {} is not selected",
                 entry.path().display()
-            );
+            ));
             cx.notify();
             return;
         };
         if selected_path != entry.path() {
-            self.playback_status = format!(
+            self.set_playback_status(format!(
                 "Playback history unavailable: {} is not selected",
                 entry.path().display()
-            );
+            ));
             cx.notify();
             return;
         }
@@ -159,10 +161,10 @@ impl Browser {
             next_scan_generation_after_history_cancel(self.scan_generation, had_pending_scan);
         if had_pending_scan {
             let count = self.entries.len();
-            self.scan_status = format!(
+            self.set_scan_status(format!(
                 "{count} audio file{} · cached",
                 if count == 1 { "" } else { "s" }
-            );
+            ));
         }
         self.pending_source_label = None;
         self.pending_source_return_index = None;
@@ -236,12 +238,20 @@ impl Browser {
         self.waveform_error = None;
         self.invalidate_waveform_generation();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        if let Some(index) = self.active_source {
+            self.view_model.set_curation_queue(
+                &self.entries,
+                self.source_sessions[index].curation_queue_mode,
+            );
+        }
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        super::curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.search_input
@@ -259,10 +269,10 @@ impl Browser {
         }
         self.reconcile_selection();
         let count = self.entries.len();
-        self.scan_status = format!(
+        self.set_scan_status(format!(
             "{count} audio file{} · cached",
             if count == 1 { "" } else { "s" }
-        );
+        ));
         if let Some(session) = self.source_sessions.get_mut(source_index) {
             session.selected_folder = selected_folder;
             session.expanded_folders = expanded;

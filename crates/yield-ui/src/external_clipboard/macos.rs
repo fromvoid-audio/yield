@@ -14,6 +14,7 @@ const NS_UTF8_STRING_ENCODING: usize = 4;
 const NS_FILENAMES_PBOARD_TYPE: &str = "NSFilenamesPboardType";
 const NS_URL_PBOARD_TYPE: &str = "NSURLPboardType";
 const NSPASTEBOARD_TYPE_FILE_URL: &str = "public.file-url";
+const NSPASTEBOARD_TYPE_STRING: &str = "public.utf8-plain-text";
 
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
@@ -67,6 +68,19 @@ pub(super) fn copy_file_paths(paths: &[PathBuf]) -> Result<(), FileClipboardErro
             set_pasteboard_string(pasteboard, file_url_string, NS_URL_PBOARD_TYPE)
                 .map_err(platform_error)?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn copy_text(text: &str) -> Result<(), String> {
+    let _pool = AutoreleasePool::new()?;
+    // Prepare NSString before clearing the user's existing clipboard.
+    let ns_text = unsafe { ns_string(text)? };
+    let text_type = unsafe { ns_string(NSPASTEBOARD_TYPE_STRING)? };
+    let pasteboard = unsafe { general_pasteboard()? };
+    unsafe {
+        let _ = msg_isize(pasteboard, selector(c"clearContents"));
+        set_pasteboard_string_id(pasteboard, ns_text, text_type)?;
     }
     Ok(())
 }
