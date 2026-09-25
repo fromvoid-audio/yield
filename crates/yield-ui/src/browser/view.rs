@@ -752,6 +752,11 @@ impl Render for Browser {
         } else {
             theme.colors.text_muted
         });
+        let transient_markers_color = color(if self.transient_markers.enabled() {
+            theme.colors.accent
+        } else {
+            theme.colors.text_muted
+        });
         let random_color = color(if self.random_audition_sticky {
             theme.colors.accent
         } else {
@@ -1417,6 +1422,35 @@ impl Render for Browser {
                             })
                             .on_click(cx.listener(Self::toggle_beat_guides_from_toolbar))
                             .child(waveform::render_beat_guides_icon(beat_guides_color)),
+                    )
+                    .child(
+                        div()
+                            .id("transient-markers-toolbar")
+                            .relative()
+                            .when_some(
+                                self.ax_focus("transport-transient-markers"),
+                                |element, focus| element.track_focus(&focus),
+                            )
+                            .when_some(
+                                self.ax_marker("transport-transient-markers"),
+                                |element, marker| element.child(marker),
+                            )
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(theme.spacing.control_height))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border_emphasis))
+                            .hover(move |style| style.bg(color(toolbar_hover)))
+                            .active(move |style| style.bg(color(toolbar_pressed)))
+                            .on_click(cx.listener(Self::toggle_transient_markers_from_toolbar))
+                            .text_size(px(theme.typography.small_size))
+                            .text_color(transient_markers_color)
+                            .child("I"),
                     )
                     .child(
                         div()
