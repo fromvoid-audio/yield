@@ -352,6 +352,9 @@ pub(crate) struct Browser {
     playback_metronome_grid_path: Option<PathBuf>,
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
+    preferred_sidebar_width: Option<f32>,
+    preferred_waveform_height: Option<f32>,
+    pane_resize_drag: Option<view::PaneResizeDrag>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_edit_region: Option<WaveformEditRegion>,
@@ -660,6 +663,9 @@ impl Browser {
             playback_metronome_grid_path: None,
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
+            preferred_sidebar_width: None,
+            preferred_waveform_height: None,
+            pane_resize_drag: None,
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
             waveform_edit_region: None,
@@ -2555,6 +2561,11 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        if key == "escape" && self.pane_resize_drag.is_some() {
+            self.cancel_pane_resize(cx);
+            cx.stop_propagation();
+            return;
+        }
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
         let alt = event.keystroke.modifiers.alt;
         let function = event.keystroke.modifiers.function;
