@@ -25,7 +25,8 @@ use crate::durable_capacity::{
     PROTECTED_FREE_SPACE_FLOOR, VolumeFacts, VolumeIdentity, descriptor_capacity_facts,
 };
 use crate::file_operation_owner::{
-    EffectId, EffectRequest, FileOperationCommand, OutputIdentity, RootRegistrationRef, SourceFence,
+    EffectId, EffectRequest, FileOperationCommand, FileOperationResult, OutputIdentity,
+    RootRegistrationRef, SourceFence,
 };
 use crate::sample_sources::db::{
     SourceAuthorityDrainMarker, SourceAuthorityError, SourceAuthorityRegistrationReceipt,
@@ -59,6 +60,7 @@ use super::store::{
     JournalCancelRequestReceipt, JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt,
     JournalInsertWriteStage, JournalRetryReceipt, OperationJournalStore,
     OperationJournalStoreError, OrdinaryClaimReleaseReceipt, SourceReserveBindingFailure,
+    StagingCheckpointAck,
 };
 #[cfg(test)]
 use super::store::{ReleaseTestBoundary, ReleaseTestDirective};
@@ -384,6 +386,12 @@ pub enum OperationJournalOwnerError {
     #[error("operation journal chunk claim failed: {reason}")]
     ChunkClaim {
         /// Bounded chunk transition diagnostic.
+        reason: String,
+    },
+    /// Live source, checkpoint, or one-shot publication-grant validation failed closed.
+    #[error("operation journal staging grant failed: {reason}")]
+    StagingGrant {
+        /// Bounded staging diagnostic.
         reason: String,
     },
     /// An internally serialized control input could not be decoded on the owner thread.
@@ -873,6 +881,35 @@ pub(crate) struct LiveChunkEffectGrant {
     source_pin: SourceEffectPin,
     spec: LiveChunkEffectSpec,
     output_key: String,
+}
+
+/// A single publication attempt backed by an acknowledged CopyValidated checkpoint.
+/// The private live source pin and file-owner result are consumed together; retained journal
+/// bytes and a replayed checkpoint cannot construct this value.
+#[allow(dead_code)] // The publication effect itself belongs to the subsequent route.
+pub(crate) struct StagingPublicationGrant {
+    validation: FileOperationResult,
+    source_pin: SourceEffectPin,
+}
+
+impl std::fmt::Debug for StagingPublicationGrant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagingPublicationGrant")
+            .field("operation_id", &self.validation.operation_id())
+            .field("effect_id", &self.validation.effect_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)] // Consumed by the publication adapter when that route is installed.
+impl StagingPublicationGrant {
+    pub(crate) fn begin_publication(
+        self,
+    ) -> Result<(FileOperationResult, SourceEffectPermit), SourceAuthorityError> {
+        let permit = self.source_pin.begin_effect()?;
+        Ok((self.validation, permit))
+    }
 }
 
 impl std::fmt::Debug for LiveChunkEffectGrant {
@@ -1850,6 +1887,64 @@ impl OwnerRuntime {
             source_pin,
             spec,
             output_key,
+        })
+    }
+
+    fn checkpoint_and_grant_staging(
+        &mut self,
+        validation: FileOperationResult,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+    ) -> Result<StagingPublicationGrant, OperationJournalOwnerError> {
+        let source = self
+            .source_registrations
+            .get(&registration.registration_id)
+            .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
+                reason: String::from("source registration is not retained"),
+            })?;
+        if source.receipt != registration
+            || !matches!(source.readiness, SourceRegistrationReadiness::Registered)
+        {
+            return Err(OperationJournalOwnerError::StagingGrant {
+                reason: String::from("source registration is not current"),
+            });
+        }
+        let profile_guard = self.final_profile_guard.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: String::from("profile ownership is unavailable"),
+            }
+        })?;
+        source_pin.validate_for_issuance(&source.request, profile_guard)?;
+        let lease_epoch = u64::try_from(registration.lease_identity.epoch()).map_err(|_| {
+            OperationJournalOwnerError::StagingGrant {
+                reason: String::from("source lease epoch is invalid"),
+            }
+        })?;
+        let [fence] = validation.source_fences() else {
+            return Err(OperationJournalOwnerError::StagingGrant {
+                reason: String::from("staging validation must bind one live source fence"),
+            });
+        };
+        if fence.root_identity() != source.request.media_root().identity()
+            || fence.database_identity() != source.request.database_file_identity()
+            || fence.lease_epoch() != lease_epoch
+        {
+            return Err(OperationJournalOwnerError::StagingGrant {
+                reason: String::from("staging source fence differs from live registration"),
+            });
+        }
+        let checkpoint: StagingCheckpointAck = self
+            .store()
+            .checkpoint_staging_result(&validation)?
+            .ok_or_else(|| OperationJournalOwnerError::StagingGrant {
+                reason: String::from("replayed staging checkpoint cannot issue a grant"),
+            })?;
+        source_pin.validate_for_issuance(&source.request, profile_guard)?;
+        self.store()
+            .reserve_staging_grant(checkpoint, &validation)?;
+        Ok(StagingPublicationGrant {
+            validation,
+            source_pin,
         })
     }
 
@@ -3711,6 +3806,27 @@ impl OperationJournalClient {
         })
     }
 
+    /// Queue a file-owner staging result for durable CopyValidated acknowledgement and one
+    /// one-shot publication grant. The worker rechecks the registered source and its live pin.
+    #[allow(dead_code)] // First consumer is the publication route following this checkpoint.
+    pub(crate) fn checkpoint_and_grant_staging(
+        &self,
+        validation: FileOperationResult,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+    ) -> Result<OperationJournalRequest<StagingPublicationGrant>, OperationJournalOwnerQueueError>
+    {
+        self.submit(64 * 1024, move |input, result| {
+            JournalCommand::CheckpointStaging {
+                validation,
+                registration,
+                source_pin,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one bounded synthetic write entry. The ticket is checked against the live owner
     /// registry and fresh descriptor/provider facts on the worker; it never carries execution or
     /// filesystem authority across this queue boundary.
@@ -4336,6 +4452,13 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<LiveChunkEffectGrant, OperationJournalOwnerError>>,
     },
+    CheckpointStaging {
+        validation: FileOperationResult,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        input: InputPermit,
+        result: SyncSender<Result<StagingPublicationGrant, OperationJournalOwnerError>>,
+    },
     BeginChunkWrite {
         permit: ChunkWritePermit,
         identity: ChunkWriteIdentity,
@@ -4744,6 +4867,18 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 )
             })
         }
+        JournalCommand::CheckpointStaging {
+            validation,
+            registration,
+            source_pin,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.checkpoint_and_grant_staging(validation, registration, source_pin)
+            })
+        }
         JournalCommand::BeginChunkWrite {
             permit,
             identity,
@@ -4933,6 +5068,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::IssueLiveChunk { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::CheckpointStaging { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -8134,7 +8273,7 @@ mod tests {
             .issue_live_chunk_effect(
                 uncertain_claim.chunk_id(),
                 operation_id,
-                registration,
+                registration.clone(),
                 guard.pin_for_effect().expect("uncertain source pin"),
                 uncertain_spec,
             )
@@ -8177,7 +8316,96 @@ mod tests {
                 .expect("uncertain reissue result")
                 .is_err()
         );
+        let staged_file = source_root.path().join("staging-owner-check.bin");
+        fs::write(&staged_file, b"abc").expect("staged source content");
+        let staged_object = crate::file_operation_owner::OwnedObjectIdentity::new();
+        let staged_output = OutputIdentity::new();
+        let staging_participant_id = operation
+            .universal_intent
+            .as_ref()
+            .expect("staging operation intent")
+            .participants()
+            .descriptors()
+            .iter()
+            .find(|participant| participant.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let staged_command = || {
+            FileOperationCommand::for_staging_validation(
+                operation_id,
+                staging_participant_id,
+                EffectId::new(),
+                staged_output,
+                source_root_registration,
+                crate::file_operation_owner::AuthorityFence::Source(fence.clone()),
+                crate::file_operation_owner::BoundedRelativeLocator::new("staging-owner-check.bin")
+                    .expect("staging locator"),
+                staged_object,
+                crate::file_operation_owner::StagingValidation::new(
+                    3,
+                    *blake3::hash(b"abc").as_bytes(),
+                ),
+                vec![fence.clone()],
+                Some(source_root_registration),
+            )
+            .expect("source-bound staging command")
+        };
+        let mut staged = file_owner
+            .submit(staged_command())
+            .expect("source-bound validation queues");
+        let staged_result = staged
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source-bound validation result");
+        let EffectOutcome::Applied { evidence } = staged_result.outcome() else {
+            panic!("expected source-bound staging validation");
+        };
+        let proof = evidence.validated_staging().expect("staging proof");
+        assert_eq!(proof.output(), staged_output);
+        assert_eq!(proof.source_root(), Some(source_root_registration));
+        let mut checkpoint = client
+            .checkpoint_and_grant_staging(
+                staged_result.clone(),
+                registration.clone(),
+                guard.pin_for_effect().expect("checkpoint source pin"),
+            )
+            .expect("staging checkpoint queues");
+        let publication = checkpoint
+            .recv_timeout(Duration::from_secs(2))
+            .expect("staging checkpoint result")
+            .expect("acknowledged publication grant");
+        let (validated, permit) = publication
+            .begin_publication()
+            .expect("live publication entry");
+        assert_eq!(validated.operation_id(), operation_id);
+        drop(permit);
+        let mut replay_checkpoint = client
+            .checkpoint_and_grant_staging(
+                staged_result.clone(),
+                registration.clone(),
+                guard.pin_for_effect().expect("replay source pin"),
+            )
+            .expect("replay checkpoint queues");
+        assert!(
+            replay_checkpoint
+                .recv_timeout(Duration::from_secs(2))
+                .expect("replay checkpoint result")
+                .is_err()
+        );
+        staged.acknowledge().expect("staging result ack");
         drop(guard);
+        let mut stale_staged = file_owner
+            .submit(staged_command())
+            .expect("stale staging validation queues");
+        assert!(matches!(
+            stale_staged
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale staging validation result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale_staged
+            .acknowledge()
+            .expect("stale staging result ack");
         assert!(
             file_owner
                 .register_source_root(Arc::clone(&source_request), &fixture.owner, fence.clone())
@@ -8196,7 +8424,7 @@ mod tests {
                 .outcome(),
             EffectOutcome::SupersededBeforeEffect { .. }
         ));
-        assert_eq!(file_owner.execution_count_for_test(), 1);
+        assert_eq!(file_owner.execution_count_for_test(), 2);
         let unused_source = source_result
             .take_unused_live_chunk_grant()
             .expect("source grant recovery")

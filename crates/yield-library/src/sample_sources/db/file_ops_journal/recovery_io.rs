@@ -644,6 +644,24 @@ impl BoundDatabaseRoot {
             .map(|file| file.into_std())
     }
 
+    /// Open one direct child for read-only validation through the retained directory descriptor.
+    /// The final component is never followed when it is a symlink.
+    pub(crate) fn open_file_read_nofollow(&self, name: &Path) -> io::Result<fs::File> {
+        let components = relative_components(name).map_err(io::Error::other)?;
+        if components.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "staging file name must be one normal component",
+            ));
+        }
+        let directory = cap_std::fs::Dir::from_std_file(self._capability.try_clone()?);
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        directory
+            .open_with(name, &options)
+            .map(|file| file.into_std())
+    }
+
     /// Inspect one direct child without following a final symlink.
     pub(crate) fn symlink_metadata(&self, name: &Path) -> io::Result<cap_std::fs::Metadata> {
         let components = relative_components(name).map_err(io::Error::other)?;
