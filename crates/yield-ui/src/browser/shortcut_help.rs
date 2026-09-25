@@ -248,6 +248,14 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Play from the current waveform playhead",
     },
     ShortcutRow {
+        keys: "Shift-R",
+        description: "Play a random visible sample",
+    },
+    ShortcutRow {
+        keys: "Cmd-Shift-R",
+        description: "Play the previous random sample",
+    },
+    ShortcutRow {
         keys: "C",
         description: "Set the focused sample as compare anchor",
     },

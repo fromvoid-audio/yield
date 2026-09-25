@@ -73,6 +73,7 @@ mod catalog_metadata;
 mod compare_anchor;
 mod context_menu;
 mod curation;
+mod direct_random;
 mod directory_open;
 mod display_labels;
 mod file_drag;
@@ -331,6 +332,7 @@ pub(crate) struct Browser {
     random_audition_pending: Option<random_audition::PendingRandomAudition>,
     random_navigation: RandomNavigationState,
     random_navigation_scope: Option<(Option<SourceId>, PathBuf)>,
+    direct_random_history: direct_random::DirectRandomHistory,
     metronome_enabled: bool,
     playback_metronome_beat_count: Option<u16>,
     playback_metronome_confirmed: bool,
@@ -632,6 +634,7 @@ impl Browser {
             random_audition_pending: None,
             random_navigation: RandomNavigationState::default(),
             random_navigation_scope: None,
+            direct_random_history: direct_random::DirectRandomHistory::default(),
             metronome_enabled: false,
             playback_metronome_beat_count: None,
             playback_metronome_confirmed: false,
@@ -2360,6 +2363,59 @@ impl Browser {
         }
     }
 
+    fn play_direct_random_sample(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if previous {
+            let Some(visit) = self.direct_random_history.previous() else {
+                self.playback_status = "No earlier random sample".to_string();
+                cx.notify();
+                return;
+            };
+            self.replay_direct_random_visit(visit, cx);
+            return;
+        }
+        let visible_ids = self
+            .view_model
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                self.entries.get(row.entry_index).and_then(|entry| {
+                    yield_library::sample_sources::is_supported_audio(&entry.path)
+                        .then_some(row.id.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        let scope = self.current_random_navigation_scope();
+        let scope = scope.filter(|(_, root)| !self.source_registry_removed_roots.contains(root));
+        let focused = self.browser_focus_id();
+        let target = self.direct_random_history.next(
+            scope,
+            &visible_ids,
+            focused.as_ref(),
+            rand::random::<f32>(),
+        );
+        let Some(target) = target else {
+            self.playback_status = "No visible WAV sample for random playback".to_string();
+            cx.notify();
+            return;
+        };
+        let Some(index) = self
+            .view_model
+            .visible_position_for(&target)
+            .and_then(|position| self.view_model.rows().get(position))
+            .map(|row| row.entry_index)
+        else {
+            return;
+        };
+        self.selection.focus_pointer(&target);
+        self.select_entry(
+            index,
+            Some(motion::FocusTrigger::Keyboard),
+            SelectionOrigin::Passive,
+            cx,
+        );
+        self.start_playback_from_position(0.0, cx);
+    }
+
     fn current_random_navigation_scope(&self) -> Option<(Option<SourceId>, PathBuf)> {
         self.active_source
             .and_then(|index| self.source_sessions.get(index))
@@ -2660,6 +2716,18 @@ impl Browser {
         if event.is_held && key == "space" {
             return;
         }
+        if let Some(action) = direct_random_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.play_direct_random_sample(action == DirectRandomShortcut::Previous, cx);
+            return;
+        }
         if secondary && !shift && key.eq_ignore_ascii_case("a") {
             self.select_all_visible(cx);
             return;
@@ -2836,13 +2904,39 @@ fn current_playhead_shortcut(
     key == "space" && command && !control && !shift && !alt && !function && !held
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectRandomShortcut {
+    Next,
+    Previous,
+}
+
+fn direct_random_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> Option<DirectRandomShortcut> {
+    if !key.eq_ignore_ascii_case("r") || !shift || control || alt || function || held {
+        return None;
+    }
+    Some(if command {
+        DirectRandomShortcut::Previous
+    } else {
+        DirectRandomShortcut::Next
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
-        browser_focus_from_state, current_playhead_shortcut, resolve_scan_source_index,
-        reveal_should_clear_for_focus_change, sample_click_intent, scan_source_index_for_error,
-        selection_origin_for_click, selection_origin_for_navigation, should_autoplay_selection,
+        DirectRandomShortcut, SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
+        browser_focus_from_state, current_playhead_shortcut, direct_random_shortcut,
+        resolve_scan_source_index, reveal_should_clear_for_focus_change, sample_click_intent,
+        scan_source_index_for_error, selection_origin_for_click, selection_origin_for_navigation,
+        should_autoplay_selection,
     };
     use std::path::PathBuf;
     use yield_core::{AudioFile, AudioFileId};
@@ -2871,6 +2965,75 @@ mod tests {
         assert!(!current_playhead_shortcut(
             "space", true, false, false, false, false, true
         ));
+    }
+
+    #[test]
+    fn direct_random_shortcut_requires_shift_r_without_other_modifiers() {
+        assert_eq!(
+            direct_random_shortcut("r", false, false, true, false, false, false),
+            Some(DirectRandomShortcut::Next)
+        );
+        assert_eq!(
+            direct_random_shortcut("R", true, false, true, false, false, false),
+            Some(DirectRandomShortcut::Previous)
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, false, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, true, true, false, false, false),
+            None
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, false, true, true, false, false),
+            None
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, false, true, false, false, true),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn direct_random_action_selects_a_different_visible_wav_and_requests_its_playback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/direct-random-fixture");
+            let entries = ["a.wav", "b.wav"]
+                .into_iter()
+                .map(|name| AudioFile {
+                    path: root.join(name),
+                    relative_path: PathBuf::from(name),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                })
+                .collect::<Vec<_>>();
+            let mut source = SourceSession::new(root.clone());
+            source.entries = entries.clone();
+            view.source_sessions = vec![source];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.entries = entries;
+            view.view_model.set_entries(&view.entries);
+            view.selected = Some(0);
+            assert_eq!(view.view_model.rows().len(), 2);
+            view.play_direct_random_sample(false, cx);
+            assert_eq!(view.selected, Some(1));
+            assert_eq!(
+                view.playback_init_intent
+                    .as_ref()
+                    .map(|intent| intent.path.as_path()),
+                Some(view.entries[1].path.as_path())
+            );
+        });
     }
 
     #[gpui::test]
