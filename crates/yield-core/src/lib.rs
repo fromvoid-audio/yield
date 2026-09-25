@@ -982,6 +982,49 @@ mod tests {
     }
 
     #[test]
+    fn curation_queue_rehydrates_after_metadata_change_and_reveals_one_excluded_row() {
+        let mut entries = vec![
+            typed_entry(
+                "/source/first.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, None, None),
+            ),
+            typed_entry(
+                "/source/second.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, None, None),
+            ),
+        ];
+        let empty = CurationTagFacts::from_flags(false, false, false);
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.set_curation_queue(
+            &entries,
+            CurationQueueMode {
+                enabled: true,
+                ..Default::default()
+            }
+        ));
+        assert!(model.apply_curation_tag_facts(&entries, vec![empty; 2]));
+        assert_eq!(model.rows().len(), 2);
+
+        entries[0].curation =
+            AudioFileCuration::from_parts(1, false, 0, None, Some(current_unix_epoch_seconds()));
+        model.set_entries(&entries);
+        assert!(model.curation_queue_pending());
+        assert!(model.rows().is_empty());
+        assert!(model.apply_curation_tag_facts(&entries, vec![empty; 2]));
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
+
+        assert!(model.set_reveal(&entries, Some(entries[0].stable_id())));
+        assert_eq!(model.rows().len(), 2);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        model.set_query(&entries, "second");
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
+    }
+
+    #[test]
     fn browser_name_filter_matches_filename_or_stem_with_ascii_case_folding() {
         let entries = vec![
             model_entry("/tmp/Deep Kick.WAV", 10),
