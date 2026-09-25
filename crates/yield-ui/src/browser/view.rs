@@ -711,6 +711,7 @@ impl Render for Browser {
         } else {
             self.scan_status.clone()
         };
+        self.observe_statuses(Some(&list_status));
         let curation_status = self.active_curation_status();
         let selected_count = self.selected_count_label();
         let metadata_status = self.catalog_metadata.status_label();

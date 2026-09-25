@@ -96,6 +96,7 @@ mod sidebar;
 mod similar_sections;
 mod source_recovery;
 mod source_registry;
+mod status_log;
 mod tag_chips;
 mod tag_completion;
 mod tag_dictionary;
@@ -354,6 +355,7 @@ pub(crate) struct Browser {
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
+    status_log: status_log::StatusLog,
     playback_status: String,
     volume: f32,
     volume_drag: Option<volume::VolumeDrag>,
@@ -652,6 +654,7 @@ impl Browser {
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
+            status_log: status_log::StatusLog::default(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
             volume_drag: None,
@@ -906,7 +909,7 @@ impl Browser {
                 if let Some(editor) = self.playmark_timing_editor.as_mut() {
                     editor.error = Some(error.clone());
                 }
-                self.playback_status = format!("Playmark timing: {error}");
+                self.set_playback_status(format!("Playmark timing: {error}"));
                 let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
                 window.focus(&focus_handle);
                 cx.notify();
@@ -937,10 +940,10 @@ impl Browser {
         similar_sections::invalidate_if_stale(self);
         match self.submit_playmark_timing_span(&path, region, cx) {
             Some(Ok(())) => {
-                self.playback_status = "Playmark timing applying to playback".to_string();
+                self.set_playback_status("Playmark timing applying to playback".to_string());
             }
             Some(Err(error)) => {
-                self.playback_status = format!("Playmark timing update unavailable: {error}");
+                self.set_playback_status(format!("Playmark timing update unavailable: {error}"));
             }
             None => {}
         }
@@ -1260,7 +1263,7 @@ impl Browser {
         let generation = self.scan_generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.scan_cancel = Some(Arc::clone(&cancellation));
-        self.scan_status = format!("Scanning {}…", root.display());
+        self.set_scan_status(format!("Scanning {}…", root.display()));
         cx.notify();
 
         let scan_root = root.clone();
@@ -1353,11 +1356,11 @@ impl Browser {
         curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.scan_status = format!(
+        self.set_scan_status(format!(
             "{count} audio file{} · {} skipped",
             if count == 1 { "" } else { "s" },
             skipped_entries
-        );
+        ));
         if register_source {
             self.submit_source_add(root.clone(), cx);
         }
@@ -1416,7 +1419,7 @@ impl Browser {
             tag_filter::reinstall_after_projection(self, cx);
             curation_queue::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
-            self.scan_status = error;
+            self.set_scan_status(error);
             self.selected = None;
             self.playback_policy.clear_file();
             self.waveform_pending = false;
@@ -1461,14 +1464,14 @@ impl Browser {
         curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.scan_status = if is_refresh {
+        self.set_scan_status(if is_refresh {
             format!(
                 "Could not refresh {}: {error}",
                 self.source_sessions[index].label
             )
         } else {
             format!("Could not add source: {error}")
-        };
+        });
         let restore_id = self
             .restore_selection_id
             .take()
@@ -1712,7 +1715,7 @@ impl Browser {
 
     pub(super) fn refresh_active_source(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.active_source else {
-            self.scan_status = "Choose a source folder before refreshing".to_string();
+            self.set_scan_status("Choose a source folder before refreshing".to_string());
             cx.notify();
             return;
         };
@@ -1871,7 +1874,7 @@ impl Browser {
         let path = entry.path;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.waveform_cancel = Some(Arc::clone(&cancellation));
-        self.playback_status = "Ready".to_string();
+        self.set_playback_status("Ready".to_string());
         self.waveform_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -1930,7 +1933,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |view, cx| {
-                    view.scan_status = format!("Could not choose folder: {error}");
+                    view.set_scan_status(format!("Could not choose folder: {error}"));
                     cx.notify();
                 });
             }
@@ -1963,7 +1966,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |view, cx| {
-                    view.theme_status = format!("Theme picker error: {error}");
+                    view.set_theme_status(format!("Theme picker error: {error}"));
                     cx.notify();
                 });
             }
@@ -2075,11 +2078,11 @@ impl Browser {
         if !enabled {
             self.cancel_pending_selection_autoplay();
         }
-        self.playback_status = if self.autoplay_selection {
+        self.set_playback_status(if self.autoplay_selection {
             "Autoplay enabled".to_string()
         } else {
             "Autoplay disabled".to_string()
-        };
+        });
         cx.notify();
     }
 
@@ -2185,7 +2188,7 @@ impl Browser {
         if let Some(path) = self.theme_load.active_path.clone() {
             self.load_theme(path, cx);
         } else {
-            self.theme_status = "Choose a theme file before reloading".to_string();
+            self.set_theme_status("Choose a theme file before reloading".to_string());
             cx.notify();
         }
     }
@@ -2212,7 +2215,7 @@ impl Browser {
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.theme_status = "Yield Editorial Terminal".to_string();
+        self.set_theme_status("Yield Editorial Terminal".to_string());
         self.theme_changed_inputs(cx);
         cx.notify();
     }
@@ -2224,7 +2227,7 @@ impl Browser {
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme::default());
-        self.theme_status = "Yield Editorial Terminal".to_string();
+        self.set_theme_status("Yield Editorial Terminal".to_string());
         self.autoplay_selection = true;
         self.help_tooltips_enabled = true;
         self.general_settings.rating_decay_weeks = yield_session::DEFAULT_RATING_DECAY_WEEKS;
@@ -2248,7 +2251,7 @@ impl Browser {
         }
         let generation = self.theme_load.begin(path.clone());
         self.theme_task.take();
-        self.theme_status = format!("Loading {}…", path.display());
+        self.set_theme_status(format!("Loading {}…", path.display()));
         cx.notify();
         let read_path = path.clone();
         self.theme_task = Some(cx.spawn(async move |this, cx| {
@@ -2265,7 +2268,7 @@ impl Browser {
                     Ok(theme) => view.apply_theme(theme, path, generation, cx),
                     Err(error) => {
                         if view.theme_load.reject(generation) {
-                            view.theme_status = format!("Theme rejected: {error}");
+                            view.set_theme_status(format!("Theme rejected: {error}"));
                             cx.notify();
                         }
                     }
@@ -2302,7 +2305,7 @@ impl Browser {
         }
         let theme_name = theme.name.clone();
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.theme_status = theme_name;
+        self.set_theme_status(theme_name);
         self.theme_changed_inputs(cx);
         cx.notify();
     }
@@ -2490,6 +2493,18 @@ impl Browser {
                 return;
             }
             shortcut_help::KeyAction::Ignore => {}
+        }
+        if status_log::is_copy_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.copy_status_log(cx);
+            cx.stop_propagation();
+            return;
         }
         if self.theme_settings_open && key == "escape" {
             self.close_general_settings(window, cx);
