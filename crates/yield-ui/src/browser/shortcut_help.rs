@@ -373,6 +373,10 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
         keys: "Left / Right",
         description: "Slide the play selection",
     },
+    ShortcutRow {
+        keys: "Option or Shift + Left / Right",
+        description: "Nudge the play selection by one audio frame",
+    },
 ];
 
 const INPUT_ROWS: &[ShortcutRow] = &[

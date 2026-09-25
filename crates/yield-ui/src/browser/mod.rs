@@ -2785,30 +2785,28 @@ impl Browser {
         }
         if self.waveform_focus_handle.is_focused(window)
             && !secondary
-            && !shift
-            && !alt
             && !function
             && self.waveform.is_some()
         {
-            if key.eq_ignore_ascii_case("i") {
+            if !shift && !alt && key.eq_ignore_ascii_case("i") {
                 if !event.is_held {
                     transient_markers::toggle(self, cx);
                 }
                 return;
             }
-            if key.eq_ignore_ascii_case("b") {
+            if !shift && !alt && key.eq_ignore_ascii_case("b") {
                 if !event.is_held {
                     self.toggle_bpm_snap(cx);
                 }
                 return;
             }
-            if key.eq_ignore_ascii_case("z") {
+            if !shift && !alt && key.eq_ignore_ascii_case("z") {
                 if self.zoom_waveform_to_selection() {
                     cx.notify();
                 }
                 return;
             }
-            if key.eq_ignore_ascii_case("x") {
+            if !shift && !alt && key.eq_ignore_ascii_case("x") {
                 if self.reset_waveform_viewport() {
                     cx.notify();
                 }
@@ -2820,7 +2818,28 @@ impl Browser {
                 let canceled = self.cancel_waveform_gestures(window, cx);
                 let moved = self.slide_waveform_region(direction);
                 if moved {
-                    zero_crossing::schedule_for_committed_region(self, cx);
+                    if direction.is_fine() {
+                        if let (Some(path), Some(region)) = (
+                            self.selected
+                                .and_then(|index| self.entries.get(index))
+                                .map(|entry| entry.path.clone()),
+                            self.waveform_play_region,
+                        ) {
+                            match self.submit_playmark_timing_span(&path, region, cx) {
+                                Some(Ok(())) => {
+                                    self.playback_status =
+                                        "Fine selection nudge applying to playback".to_string();
+                                }
+                                Some(Err(error)) => {
+                                    self.playback_status =
+                                        format!("Fine selection nudge unavailable: {error}");
+                                }
+                                None => {}
+                            }
+                        }
+                    } else {
+                        zero_crossing::schedule_for_committed_region(self, cx);
+                    }
                 }
                 if moved || canceled {
                     cx.notify();
