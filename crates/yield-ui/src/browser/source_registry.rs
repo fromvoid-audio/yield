@@ -497,6 +497,17 @@ impl Browser {
     }
 
     fn remove_source_session(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if self
+            .compare_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.source_root() == root)
+        {
+            self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
+            self.compare_anchor_task.take();
+            self.compare_anchor_play_pending = false;
+            self.compare_anchor = None;
+            self.playback_status = "Compare anchor source is no longer available".into();
+        }
         let Some(index) = self
             .source_sessions
             .iter()
@@ -588,6 +599,15 @@ impl Browser {
             }
         }
         self.source_sessions = sessions;
+        if let Some(anchor) = self.compare_anchor.as_ref()
+            && !self.compare_anchor_path_is_current(&anchor.path())
+        {
+            self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
+            self.compare_anchor_task.take();
+            self.compare_anchor_play_pending = false;
+            self.compare_anchor = None;
+            self.playback_status = "Compare anchor source is no longer available".into();
+        }
         if let Some(root) = self.pending_source_return_root.as_ref() {
             self.pending_source_return_index = self
                 .source_sessions

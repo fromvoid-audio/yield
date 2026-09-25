@@ -1746,7 +1746,13 @@ pub(super) fn render_waveform(
                 - theme.waveform.metadata_height
                 - scrollbar_height)
                 .max(theme.spacing.waveform_min_bar_height);
-            let bar_color = if browser.playing_path.is_some() {
+            let selected_path = browser
+                .selected
+                .and_then(|index| browser.entries.get(index))
+                .map(|entry| entry.path.as_path());
+            let bar_color = if browser.playing_path.as_deref() == selected_path
+                && browser.playing_path.is_some()
+            {
                 theme.colors.waveform_played
             } else {
                 theme.colors.waveform_unplayed
