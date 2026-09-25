@@ -2783,6 +2783,26 @@ impl Browser {
         {
             return;
         }
+        if !secondary && !shift && !alt && !function && key.eq_ignore_ascii_case("x") {
+            if !event.is_held
+                && !self.theme_settings_open
+                && !self.audio_settings_open
+                && self.context_menu.is_none()
+            {
+                if self.waveform.is_some()
+                    && !self
+                        .waveform_viewport
+                        .is_effectively_equal(WaveformViewport::full())
+                {
+                    if self.reset_waveform_viewport() {
+                        cx.notify();
+                    }
+                } else {
+                    self.toggle_focused_selection(cx);
+                }
+            }
+            return;
+        }
         if self.waveform_focus_handle.is_focused(window)
             && !secondary
             && !function
@@ -2802,12 +2822,6 @@ impl Browser {
             }
             if !shift && !alt && key.eq_ignore_ascii_case("z") {
                 if self.zoom_waveform_to_selection() {
-                    cx.notify();
-                }
-                return;
-            }
-            if !shift && !alt && key.eq_ignore_ascii_case("x") {
-                if self.reset_waveform_viewport() {
                     cx.notify();
                 }
                 return;
@@ -2913,7 +2927,6 @@ impl Browser {
             "l" | "L" if !shift && !secondary && !alt && !function && !event.is_held => {
                 self.toggle_loop(cx)
             }
-            "x" if !shift && !secondary => self.toggle_focused_selection(cx),
             "up" | "arrowup" | "down" | "arrowdown" => {
                 let follow_row = self.browser_surface_focused(window)
                     && !self.theme_settings_open

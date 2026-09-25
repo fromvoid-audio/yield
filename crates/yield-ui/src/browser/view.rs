@@ -1957,7 +1957,9 @@ mod tests {
         EntityInputHandler, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, TestAppContext,
         VisualTestContext, point, px,
     };
-    use yield_core::{AudioFile, BrowserViewModel, WaveformEditFade, WaveformEditSettings};
+    use yield_core::{
+        AudioFile, BrowserViewModel, WaveformEditFade, WaveformEditSettings, WaveformViewport,
+    };
     use yield_media::WaveformPreview;
 
     use super::super::transport;
@@ -2167,6 +2169,71 @@ mod tests {
                 };
                 view.handle_key_down(&up, window, cx);
                 assert_eq!(view.browser_focus_id(), Some(first));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn x_uses_zoom_state_across_browser_and_waveform_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let path = PathBuf::from("/tmp/opt1910-x-fixture/sample.wav");
+                view.root = path.parent().map(Path::to_path_buf);
+                view.entries = vec![AudioFile {
+                    path,
+                    relative_path: PathBuf::from("sample.wav"),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                }];
+                view.view_model = BrowserViewModel::new(&view.entries);
+                view.selected = Some(0);
+                view.waveform = Some(inert_preview());
+                let focused_id = view.entries[0].stable_id();
+                let zoomed = WaveformViewport::full().zoom_to_region(48_000, 0.25, 0.75);
+                let press = |view: &mut Browser,
+                             key: &str,
+                             held: bool,
+                             window: &mut Window,
+                             cx: &mut Context<Browser>| {
+                    view.handle_key_down(
+                        &KeyDownEvent {
+                            keystroke: Keystroke::parse(key).expect("X keystroke"),
+                            is_held: held,
+                        },
+                        window,
+                        cx,
+                    );
+                };
+
+                window.focus(&view.focus_handle);
+                view.waveform_viewport = zoomed;
+                press(view, "x", false, window, cx);
+                assert_eq!(view.waveform_viewport, WaveformViewport::full());
+                assert!(!view.selection.contains(&focused_id));
+                press(view, "x", true, window, cx);
+                assert!(!view.selection.contains(&focused_id));
+
+                window.focus(&view.waveform_focus_handle);
+                view.waveform_viewport = zoomed;
+                press(view, "x", false, window, cx);
+                assert_eq!(view.waveform_viewport, WaveformViewport::full());
+                assert!(!view.selection.contains(&focused_id));
+                press(view, "x", false, window, cx);
+                assert!(view.selection.contains(&focused_id));
+                assert_eq!(view.browser_focus_id(), Some(focused_id.clone()));
+
+                view.waveform_viewport = zoomed;
+                press(view, "alt-x", false, window, cx);
+                assert_eq!(view.waveform_viewport, zoomed);
+                assert!(view.selection.contains(&focused_id));
+                view.waveform = None;
+                press(view, "x", false, window, cx);
+                assert!(!view.selection.contains(&focused_id));
             });
         });
     }
