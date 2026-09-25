@@ -2718,8 +2718,9 @@ fn patch_visible_entries(
         });
         rating_filter_membership_changed |= curation_matches_rating_filter(rating_filter, previous)
             != curation_matches_rating_filter(rating_filter, Some(*curation));
-        last_played_changed |=
-            previous.and_then(AudioFileCuration::last_played_at) != curation.last_played_at();
+        // An unhydrated row is not the same as a known Never played row.
+        last_played_changed |= previous.is_none()
+            || previous.and_then(AudioFileCuration::last_played_at) != curation.last_played_at();
         entry.curation = Some(*curation);
     }
     (
@@ -2870,6 +2871,24 @@ mod tests {
             playback_type: None,
             curation: Some(curation(value, locked, collections)),
         }
+    }
+
+    #[test]
+    fn first_curation_hydration_reveals_known_never_played_row() {
+        let mut entries = vec![entry("never.wav", 0, false, 0)];
+        entries[0].curation = None;
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.toggle_playback_age_filter(&entries, PlaybackAgeChip::NeverPlayed, false,));
+        assert!(model.rows().is_empty());
+        let patches = BTreeMap::from([(
+            PathBuf::from("never.wav"),
+            curation_with_last_played(0, false, 0, None),
+        )]);
+        let (_, _, _, last_played_changed) =
+            patch_visible_entries(&mut entries, &patches, None, RatingFilter::disabled(), None);
+        assert!(last_played_changed);
+        model.set_entries(&entries);
+        assert_eq!(model.rows().len(), 1);
     }
 
     fn install(entries: &[AudioFile]) -> CurationState {
