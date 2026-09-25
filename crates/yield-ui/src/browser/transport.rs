@@ -395,6 +395,26 @@ impl Browser {
         cx.notify();
     }
 
+    pub(super) fn toggle_loop_lock(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences_editable() {
+            self.mark_preferences_edit_blocked(cx);
+            return;
+        }
+        let locked_override = next_locked_override(self.playback_policy.locked_override());
+        if !self.persist_loop_lock_override(locked_override, cx) {
+            return;
+        }
+        self.playback_policy.apply_locked_override(locked_override);
+        let mut desired = self.current_playback_desired_state();
+        desired.looped = self.playback_policy.enabled();
+        self.apply_playback_state_change_with_status(
+            desired,
+            format!("Loop locked {}", loop_mode_status_word(desired.looped)),
+            cx,
+        );
+        cx.notify();
+    }
+
     /// Apply a changed loop choice to pending playback and, when possible, the accepted play.
     pub(super) fn apply_loop_mode_change(&mut self, enabled: bool, cx: &mut Context<Self>) {
         let mut desired = self.current_playback_desired_state();
@@ -808,6 +828,16 @@ impl Browser {
     }
 
     pub(super) fn loop_toolbar_label(&self) -> String {
+        if let Some(locked) = self.playback_policy.locked_override() {
+            if self.playing_path.is_some() && self.loop_toolbar_enabled() != locked {
+                return format!(
+                    "Loop locked {} → {}",
+                    loop_mode_toolbar_word(self.loop_toolbar_enabled()),
+                    loop_mode_toolbar_word(locked)
+                );
+            }
+            return format!("Loop locked {}", loop_mode_toolbar_word(locked));
+        }
         let next = self.playback_policy.enabled();
         if self.playing_path.is_none() {
             return format!("Loop {}", loop_mode_toolbar_word(next));
@@ -1522,6 +1552,10 @@ impl Browser {
     }
 }
 
+fn next_locked_override(current: Option<bool>) -> Option<bool> {
+    Some(current.map_or(true, |enabled| !enabled))
+}
+
 fn resolve_queued_playback_intent(
     policy: &mut PlaybackLoopPolicy,
     mut intent: PlaybackIntent,
@@ -2117,6 +2151,15 @@ mod tests {
 
     use super::super::waveform::WaveformPlayRegion;
     use yield_core::{AudioFile, PlaybackLoopPolicy, PlaybackType};
+
+    #[test]
+    fn locked_loop_cycle_enters_on_then_alternates_without_unlocking() {
+        let on = super::next_locked_override(None);
+        let off = super::next_locked_override(on);
+        assert_eq!(on, Some(true));
+        assert_eq!(off, Some(false));
+        assert_eq!(super::next_locked_override(off), Some(true));
+    }
 
     #[test]
     fn current_playhead_prefers_visible_playback_then_cursor_then_last_start() {

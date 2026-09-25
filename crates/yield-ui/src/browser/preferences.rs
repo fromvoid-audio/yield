@@ -235,10 +235,14 @@ impl PreferenceState {
         request: PreferenceRequestId,
         error: String,
     ) -> Option<PreferencePatch> {
+        self.fail_request_number(request.get(), error)
+    }
+
+    fn fail_request_number(&mut self, request: u64, error: String) -> Option<PreferencePatch> {
         let index = self
             .pending
             .iter()
-            .position(|pending| pending.request == request.get())?;
+            .position(|pending| pending.request == request)?;
         let failed = self.pending.remove(index).patch;
         self.status = format!("Settings error: {error}");
         Some(failed)
@@ -338,7 +342,13 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetHelpTooltipsEnabled(enabled) => {
             preferences.help_tooltips_enabled = *enabled
         }
-        PreferencePatch::SetLoopEnabled(enabled) => preferences.loop_enabled = *enabled,
+        PreferencePatch::SetLoopEnabled(enabled) => {
+            preferences.loop_enabled = *enabled;
+            preferences.loop_lock_override = None;
+        }
+        PreferencePatch::SetLoopLockOverride(locked_override) => {
+            preferences.loop_lock_override = *locked_override;
+        }
         PreferencePatch::SetNormalizedAuditionEnabled(enabled) => {
             preferences.normalized_audition_enabled = *enabled;
         }
@@ -497,8 +507,14 @@ impl Browser {
         self.general_settings.text_scale_percent = effective.text_scale_percent;
         self.general_settings.rating_decay_weeks = effective.rating_decay_weeks;
         self.general_settings.trash_folder = effective.trash_folder.clone();
+        let previous_loop_mode = self.playback_policy.enabled();
         self.playback_policy
             .apply_preference(effective.loop_enabled);
+        self.playback_policy
+            .apply_locked_override(effective.loop_lock_override);
+        if previous_loop_mode != self.playback_policy.enabled() {
+            self.apply_loop_mode_change(self.playback_policy.enabled(), cx);
+        }
         self.apply_preference_volume(effective.output_volume);
         self.apply_preference_audio_output(
             &effective.audio_output,
@@ -598,6 +614,14 @@ impl Browser {
         self.submit_preference_patch(PreferencePatch::SetLoopEnabled(enabled), cx)
     }
 
+    pub(super) fn persist_loop_lock_override(
+        &mut self,
+        locked_override: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.submit_preference_patch(PreferencePatch::SetLoopLockOverride(locked_override), cx)
+    }
+
     pub(super) fn persist_normalized_audition_preference(
         &mut self,
         enabled: bool,
@@ -675,6 +699,22 @@ mod tests {
         assert!(state.has_pending());
         state.mark_persisted_for_test(2);
         assert!(!state.has_pending());
+    }
+
+    #[test]
+    fn rejected_loop_lock_patch_restores_saved_choice_without_changing_normal_loop() {
+        let mut state = PreferenceState::new();
+        let mut saved = UiPreferences::default();
+        saved.loop_enabled = true;
+        saved.loop_lock_override = Some(false);
+        assert!(state.accept_snapshot(PreferenceRevision::default(), saved.clone()));
+        state.queue_for_test(1, PreferencePatch::SetLoopLockOverride(Some(true)));
+        assert_eq!(state.effective().loop_lock_override, Some(true));
+        assert!(matches!(
+            state.fail_request_number(1, "rejected".into()),
+            Some(PreferencePatch::SetLoopLockOverride(Some(true)))
+        ));
+        assert_eq!(state.effective(), saved);
     }
 
     #[test]

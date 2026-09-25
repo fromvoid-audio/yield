@@ -13,6 +13,7 @@ pub struct PlaybackLoopPolicy {
     enabled: bool,
     fallback: bool,
     manual_override: bool,
+    locked_override: Option<bool>,
 }
 
 impl Default for PlaybackLoopPolicy {
@@ -30,12 +31,26 @@ impl PlaybackLoopPolicy {
             enabled: fallback,
             fallback,
             manual_override: false,
+            locked_override: None,
         }
     }
 
     /// Return the effective loop mode for the next newly queued play.
     pub const fn enabled(&self) -> bool {
-        self.enabled
+        match self.locked_override {
+            Some(enabled) => enabled,
+            None => self.enabled,
+        }
+    }
+
+    /// Return the independent locked loop choice, when active.
+    pub const fn locked_override(&self) -> Option<bool> {
+        self.locked_override
+    }
+
+    /// Project the saved lock without changing the file's classification or manual choice.
+    pub fn apply_locked_override(&mut self, locked_override: Option<bool>) {
+        self.locked_override = locked_override;
     }
 
     /// Return the saved fallback used when an explicit preference projection changes an unknown
@@ -84,6 +99,7 @@ impl PlaybackLoopPolicy {
     /// choice made before any file is loaded still changes the effective session mode, but does
     /// not create an override that can block a later recognized classification.
     pub fn set_manual(&mut self, enabled: bool) {
+        self.locked_override = None;
         self.enabled = enabled;
         self.manual_override = self.current_file.is_some();
     }
@@ -103,6 +119,7 @@ impl PlaybackLoopPolicy {
     /// Reset the file override and explicitly reapply the saved fallback or recognized tag.
     pub fn reset(&mut self, fallback: bool) {
         self.manual_override = false;
+        self.locked_override = None;
         self.fallback = fallback;
         self.enabled = self.playback_type.map_or(fallback, |playback_type| {
             matches!(playback_type, PlaybackType::Loop)
@@ -219,5 +236,29 @@ mod tests {
         assert!(!policy.has_manual_override());
         policy.prepare(file("one-shot.wav"), Some(PlaybackType::OneShot));
         assert!(!policy.enabled());
+    }
+
+    #[test]
+    fn locked_choice_survives_file_changes_and_manual_choice_exits_it() {
+        let mut policy = PlaybackLoopPolicy::new(false);
+        policy.prepare(file("one-shot.wav"), Some(PlaybackType::OneShot));
+        policy.apply_locked_override(Some(true));
+        assert!(policy.enabled());
+        policy.prepare(file("loop.wav"), Some(PlaybackType::Loop));
+        policy.apply_locked_override(Some(false));
+        assert!(!policy.enabled());
+        policy.apply_locked_override(None);
+        assert!(
+            policy.enabled(),
+            "the file's classified choice remains intact"
+        );
+        policy.apply_locked_override(Some(false));
+        policy.set_manual(true);
+        assert_eq!(policy.locked_override(), None);
+        assert!(policy.enabled());
+        assert!(policy.has_manual_override());
+        policy.apply_locked_override(Some(false));
+        policy.reset(false);
+        assert_eq!(policy.locked_override(), None);
     }
 }

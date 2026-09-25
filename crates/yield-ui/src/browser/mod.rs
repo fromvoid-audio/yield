@@ -2829,7 +2829,12 @@ impl Browser {
         match key {
             "space" if self.random_audition_sticky => self.request_random_audition(false, cx),
             "space" => self.toggle_playback(cx),
-            "l" | "L" => self.toggle_loop(cx),
+            "l" | "L" if shift && !secondary && !alt && !function && !event.is_held => {
+                self.toggle_loop_lock(cx)
+            }
+            "l" | "L" if !shift && !secondary && !alt && !function && !event.is_held => {
+                self.toggle_loop(cx)
+            }
             "x" if !shift && !secondary => self.toggle_focused_selection(cx),
             "up" | "arrowup" => self.move_selection(
                 -1,

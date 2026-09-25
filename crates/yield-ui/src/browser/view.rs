@@ -2138,6 +2138,40 @@ mod tests {
     }
 
     #[gpui::test]
+    fn locked_loop_shortcut_respects_text_focus_repeat_and_rejected_submission(
+        cx: &mut TestAppContext,
+    ) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let press =
+                    |view: &mut Browser, held, window: &mut Window, cx: &mut Context<Browser>| {
+                        view.handle_key_down(
+                            &KeyDownEvent {
+                                keystroke: Keystroke::parse("shift-l").expect("Shift-L"),
+                                is_held: held,
+                            },
+                            window,
+                            cx,
+                        );
+                    };
+                let initial_status = view.preference_status().to_string();
+                window.focus(&view.search_input.read(cx).focus_handle());
+                press(view, false, window, cx);
+                assert_eq!(view.preference_status(), initial_status);
+
+                window.focus(&view.waveform_focus_handle);
+                press(view, true, window, cx);
+                assert_eq!(view.preference_status(), initial_status);
+                press(view, false, window, cx);
+                assert!(view.preference_status().contains("Settings not saved"));
+                assert_eq!(view.playback_policy.locked_override(), None);
+            });
+        });
+    }
+
+    #[gpui::test]
     fn bpm_snap_shortcut_requires_waveform_focus_and_ignores_repeats(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));

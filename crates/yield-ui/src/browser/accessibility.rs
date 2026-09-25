@@ -93,7 +93,7 @@ fn button(
     }
 }
 
-fn toggle(id: &'static str, label: &'static str, on: bool, enabled: bool) -> AxChild {
+fn toggle(id: &'static str, label: impl Into<String>, on: bool, enabled: bool) -> AxChild {
     AxChild {
         id: id.into(),
         role: AxRole::CheckBox,
@@ -962,7 +962,7 @@ impl Browser {
                 ),
                 toggle(
                     LOOP,
-                    "Loop selection",
+                    self.loop_toolbar_label(),
                     self.loop_toolbar_enabled(),
                     self.preferences_editable(),
                 ),
