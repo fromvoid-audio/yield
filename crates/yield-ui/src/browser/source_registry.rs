@@ -278,8 +278,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips,
-    tag_completion, tag_filter, tag_library, tags,
+    Browser, PendingRegistryMutation, SourceSession, catalog, curation_queue, source_label,
+    tag_chips, tag_completion, tag_filter, tag_library, tags,
 };
 use gpui::Context;
 
@@ -333,6 +333,7 @@ impl Browser {
         changed |= super::source_recovery::poll(self, cx);
         changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
+        changed |= curation_queue::poll(self, cx);
         changed |= tag_library::poll(self, cx);
         changed |= self.poll_display_labels(cx);
         changed |= self.poll_file_drag();
@@ -347,6 +348,7 @@ impl Browser {
             || tag_chips::has_pending(self)
             || tag_completion::has_pending(self)
             || tag_filter::has_pending(self)
+            || curation_queue::has_pending(self)
             || tag_library::has_pending(self)
             || self.has_pending_display_labels()
             || self.file_drag_poll_needed()
@@ -655,6 +657,7 @@ impl Browser {
         tag_chips::cancel_for_source_change(self);
         tag_completion::cancel_for_source_change(self, cx);
         tag_filter::cancel_for_source_change(self);
+        curation_queue::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         super::source_recovery::cancel_for_source_change(self);
         self.reset_browser_focus_state();
@@ -669,7 +672,10 @@ impl Browser {
         self.root = None;
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.view_model
+            .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.reset_collection_filter();
         self.selected = None;
         self.folder_tree = None;

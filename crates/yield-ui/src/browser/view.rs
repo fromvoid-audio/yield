@@ -699,6 +699,9 @@ impl Render for Browser {
             format!("Source error: {error}")
         } else if tag_filter::scope_pending(self) {
             tag_filter::status_label(self).unwrap_or_else(|| "Filtering tags…".to_string())
+        } else if self.view_model.curation_queue_pending() {
+            super::curation_queue::status_label(self)
+                .unwrap_or_else(|| "Loading Curation queue…".to_string())
         } else if !self.entries.is_empty() && self.view_model.rows().len() != self.entries.len() {
             format!(
                 "{} of {} audio files visible",
