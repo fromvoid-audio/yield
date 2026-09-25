@@ -434,4 +434,18 @@ mod tests {
             });
         });
     }
+
+    #[gpui::test]
+    fn waveform_focus_receives_global_chord_prefix(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, _| window.focus(&view.waveform_focus_handle));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("g");
+        cx.update(|_, app| {
+            assert!(browser.read(app).focus_chord_started.is_some());
+        });
+    }
 }
