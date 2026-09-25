@@ -2690,7 +2690,12 @@ impl WorkerState {
                         Ok(())
                     }
                 };
-                let _ = result.send(response);
+                let accepted = response.is_ok();
+                if result.send(response).is_err() && accepted {
+                    // The caller lost the registration reference before it could observe
+                    // success. No effect can name this fresh UUID, so release its custody.
+                    self.registrations.remove(&registration);
+                }
                 drop(input);
             }
             OwnerCommand::RetireRoot {
@@ -4242,6 +4247,43 @@ mod tests {
         let mut stale = owner
             .submit(unsupported_effect(&owner, retired, EffectId::new()))
             .expect("stale reference queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
+    }
+
+    #[test]
+    fn dropped_registration_reply_does_not_leave_addressable_root() {
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = RootRegistrationRef {
+            owner: owner.owner_identity(),
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let (reply, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        owner
+            .shared
+            .try_control(OwnerCommand::RegisterRoot {
+                registration,
+                authority: profile_fence(owner.owner_identity()),
+                label: String::from("lost reply"),
+                capability: None,
+                input: None,
+                result: reply,
+            })
+            .expect("registration queues");
+        owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "barrier")
+            .expect("prior registration processed");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("stale command queues");
         assert!(matches!(
             stale
                 .recv_timeout(Duration::from_secs(1))
