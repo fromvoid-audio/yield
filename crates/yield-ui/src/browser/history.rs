@@ -57,6 +57,11 @@ impl Browser {
             cx.notify();
             return;
         };
+        if !path.is_file() {
+            self.set_playback_status(format!("Random history unavailable: {}", path.display()));
+            cx.notify();
+            return;
+        }
         self.stop_playback();
         self.cancel_pending_scan_for_history();
         let index = if self.active_source == Some(source_index)
@@ -567,20 +572,29 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         use gpui::AppContext;
+        let first_root = tempfile::tempdir().expect("first source");
+        let second_root = tempfile::tempdir().expect("second source");
+        let first_path = first_root.path().join("a.wav");
+        std::fs::write(&first_path, b"fixture").expect("first sample");
         cx.set_global(crate::theme::ActiveTheme::default());
         let browser = cx.new(crate::browser::Browser::new);
         browser.update(cx, |view, cx| {
-            let mut first = SourceSession::new(PathBuf::from("/first"));
-            first.entries.push(audio("/first/a.wav", "a.wav"));
+            let mut first = SourceSession::new(first_root.path().to_path_buf());
+            first
+                .entries
+                .push(audio(first_path.to_str().unwrap(), "a.wav"));
             let visit = DirectRandomVisit {
                 source: (None, first.root.clone()),
                 id: first.entries[0].stable_id(),
             };
-            let mut second = SourceSession::new(PathBuf::from("/second"));
-            second.entries.push(audio("/second/b.wav", "b.wav"));
+            let mut second = SourceSession::new(second_root.path().to_path_buf());
+            second.entries.push(audio(
+                second_root.path().join("b.wav").to_str().unwrap(),
+                "b.wav",
+            ));
             view.source_sessions = vec![first, second];
             view.active_source = Some(1);
-            view.root = Some(PathBuf::from("/second"));
+            view.root = Some(second_root.path().to_path_buf());
             view.entries = view.source_sessions[1].entries.clone();
             view.view_model.set_entries(&view.entries);
             view.selected = Some(0);
@@ -590,14 +604,52 @@ mod tests {
                 view.selected
                     .and_then(|index| view.entries.get(index))
                     .map(|entry| entry.path.as_path()),
-                Some(PathBuf::from("/first/a.wav").as_path())
+                Some(first_path.as_path())
             );
             assert_eq!(
                 view.playback_init_intent
                     .as_ref()
                     .map(|intent| intent.path.as_path()),
-                Some(PathBuf::from("/first/a.wav").as_path())
+                Some(first_path.as_path())
             );
+        });
+    }
+
+    #[gpui::test]
+    fn direct_random_previous_rejects_a_deleted_cached_file_without_changing_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        let first_root = tempfile::tempdir().expect("first source");
+        let second_root = tempfile::tempdir().expect("second source");
+        let missing = first_root.path().join("missing.wav");
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(crate::browser::Browser::new);
+        browser.update(cx, |view, cx| {
+            let mut first = SourceSession::new(first_root.path().to_path_buf());
+            first
+                .entries
+                .push(audio(missing.to_str().unwrap(), "missing.wav"));
+            let visit = DirectRandomVisit {
+                source: (None, first.root.clone()),
+                id: first.entries[0].stable_id(),
+            };
+            let mut second = SourceSession::new(second_root.path().to_path_buf());
+            second.entries.push(audio(
+                second_root.path().join("current.wav").to_str().unwrap(),
+                "current.wav",
+            ));
+            view.source_sessions = vec![first, second];
+            view.active_source = Some(1);
+            view.root = Some(second_root.path().to_path_buf());
+            view.entries = view.source_sessions[1].entries.clone();
+            view.view_model.set_entries(&view.entries);
+            view.selected = Some(0);
+            view.replay_direct_random_visit(visit, cx);
+            assert_eq!(view.active_source, Some(1));
+            assert_eq!(view.selected, Some(0));
+            assert!(view.playback_init_intent.is_none());
+            assert!(view.playback_status.contains("Random history unavailable"));
         });
     }
 
