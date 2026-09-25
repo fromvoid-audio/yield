@@ -73,6 +73,7 @@ mod accessibility {
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod compare_anchor;
 mod context_menu;
 mod curation;
 mod curation_queue;
@@ -368,6 +369,10 @@ pub(crate) struct Browser {
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
+    compare_anchor: Option<compare_anchor::CompareAnchor>,
+    compare_anchor_task: Option<Task<()>>,
+    compare_anchor_generation: u64,
+    compare_anchor_play_pending: bool,
     playback_policy: PlaybackLoopPolicy,
     accepted_playback_intent: Option<transport::PlaybackIntent>,
     autoplay_selection: bool,
@@ -667,6 +672,10 @@ impl Browser {
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
+            compare_anchor: None,
+            compare_anchor_task: None,
+            compare_anchor_generation: 0,
+            compare_anchor_play_pending: false,
             playback_policy: PlaybackLoopPolicy::default(),
             accepted_playback_intent: None,
             autoplay_selection: true,
@@ -2714,6 +2723,14 @@ impl Browser {
             self.select_all_visible(cx);
             return;
         }
+        if !secondary && !alt && !function && shift && key == "space" {
+            self.play_compare_anchor(cx);
+            return;
+        }
+        if !secondary && !alt && !function && !shift && key.eq_ignore_ascii_case("c") {
+            self.set_compare_anchor_from_focus(cx);
+            return;
+        }
         match key {
             "space" if self.random_audition_sticky => self.request_random_audition(false, cx),
             "space" => self.toggle_playback(cx),
@@ -2769,6 +2786,7 @@ impl Drop for Browser {
         self.shutdown_directory_open();
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
+        self.compare_anchor_task.take();
         if let Some(runtime) = self.playback.as_ref() {
             let _ = runtime.handle.try_shutdown();
         }

@@ -118,6 +118,7 @@ pub(super) enum PlaybackIntentOrigin {
     Explicit,
     SelectionAutoplay,
     HistoryReplay,
+    CompareAnchor,
     AudioOutputResume,
 }
 
@@ -959,6 +960,14 @@ impl Browser {
             .selected
             .and_then(|index| self.entries.get(index))
             .cloned();
+        if intent.origin == PlaybackIntentOrigin::CompareAnchor
+            && !self.compare_anchor_path_is_current(&intent.path)
+        {
+            self.clear_playback_cursor();
+            self.set_playback_status("Compare anchor is no longer available");
+            cx.notify();
+            return;
+        }
         let Some(intent) = resolve_queued_playback_intent(
             &mut self.playback_policy,
             intent,
@@ -980,7 +989,8 @@ impl Browser {
             cx.notify();
             return;
         }
-        if precomputed_gain.is_none()
+        if intent.origin != PlaybackIntentOrigin::CompareAnchor
+            && precomputed_gain.is_none()
             && self.normalized_audition.enabled()
             && self.schedule_normalized_playback(intent.clone(), cx)
         {
@@ -1069,6 +1079,11 @@ impl Browser {
     }
 
     pub(super) fn stop_playback(&mut self) {
+        if self.compare_anchor_play_pending {
+            self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
+            self.compare_anchor_task.take();
+            self.compare_anchor_play_pending = false;
+        }
         self.random_audition_pending = None;
         super::zero_crossing::cancel_for_interruption(self);
         self.zero_crossing_queued = None;
@@ -1443,7 +1458,14 @@ impl Browser {
             self.set_playback_status("Ready".to_string());
             return;
         };
-        let should_queue = if resume.is_some() {
+        let should_queue = if intent.origin == PlaybackIntentOrigin::CompareAnchor {
+            (if resume.is_some() {
+                self.audio_output_resume_epoch
+            } else {
+                self.playback_init_epoch
+            }) == self.playback_epoch
+                && self.compare_anchor_path_is_current(&intent.path)
+        } else if resume.is_some() {
             let selected_path = self
                 .selected
                 .and_then(|index| self.entries.get(index))
@@ -1484,6 +1506,9 @@ fn resolve_queued_playback_intent(
     mut intent: PlaybackIntent,
     selected_entry: Option<&AudioFile>,
 ) -> Option<PlaybackIntent> {
+    if intent.origin == PlaybackIntentOrigin::CompareAnchor {
+        return Some(intent);
+    }
     let entry = selected_entry?;
     (entry.path == intent.path).then(|| {
         if intent.origin != PlaybackIntentOrigin::AudioOutputResume {
@@ -1961,6 +1986,21 @@ fn current_unix_epoch_seconds() -> i64 {
 
 fn preview_cursor_ratio_for_browser(browser: &Browser, ratio: f32) -> Option<f32> {
     browser.waveform.as_ref()?;
+    let selected_path = browser
+        .selected
+        .and_then(|index| browser.entries.get(index))
+        .map(|entry| entry.path.as_path());
+    if browser.playback_init_intent.as_ref().is_some_and(|intent| {
+        intent.origin == PlaybackIntentOrigin::CompareAnchor
+            && selected_path != Some(intent.path.as_path())
+    }) {
+        return None;
+    }
+    if let Some(playing_path) = browser.playing_path.as_deref()
+        && selected_path != Some(playing_path)
+    {
+        return None;
+    }
     preview_cursor_ratio(ratio)
 }
 
@@ -2494,6 +2534,17 @@ mod tests {
             ..resolved
         };
         assert!(resolve_queued_playback_intent(&mut policy, stale, Some(&entry)).is_none());
+
+        let compare = PlaybackIntent {
+            origin: PlaybackIntentOrigin::CompareAnchor,
+            path: PathBuf::from("other.wav"),
+            looped: true,
+            ..resolved_manual.clone()
+        };
+        let captured = resolve_queued_playback_intent(&mut policy, compare.clone(), Some(&entry))
+            .expect("compare playback can target a different source");
+        assert_eq!(captured, compare);
+        assert_eq!(policy.current_file(), Some(&entry.stable_id()));
 
         let resume = PlaybackIntent {
             origin: PlaybackIntentOrigin::AudioOutputResume,

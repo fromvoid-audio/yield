@@ -1847,6 +1847,14 @@ impl Render for Browser {
                     .text_size(px(theme.typography.small_size))
                     .text_color(color(theme.colors.text_muted))
                     .child(self.playback_status.clone())
+                    .when_some(self.compare_anchor.as_ref(), |element, anchor| {
+                        let path = anchor.path();
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        element.child(format!("Compare: {name}"))
+                    })
                     .when(self.volume_status.is_some(), |element| {
                         element.child(self.volume_status.clone().unwrap_or_default())
                     })
