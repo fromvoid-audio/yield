@@ -295,10 +295,14 @@ impl Browser {
         self.mark_folder_keyboard_focus(path.clone());
         let root = self.root.clone();
         let scan_generation = self.scan_generation;
-        let origin_focus = window.focused(cx);
         self.folder_scroll_handle
             .scroll_to_item(position, ScrollStrategy::Center);
         cx.notify();
+        let ax_id = self.ax_folder_ids(&path).0;
+        if ax_id.as_deref().and_then(|id| self.ax_focus(id)).is_some() {
+            self.focus_ax_row(ax_id, window, cx);
+        }
+        let origin_focus = window.focused(cx);
         cx.on_next_frame(window, move |view, window, cx| {
             if window.focused(cx) != origin_focus
                 || view.root != root
