@@ -570,8 +570,9 @@ impl Browser {
                 && let Some(playback_id) = self.latest_playback_request_id
             {
                 if let Err(error) = self.apply_normalized_gain(playback_id, 1.0, cx) {
-                    self.playback_status =
-                        format!("Could not disable normalized audition: {error}");
+                    self.set_playback_status(format!(
+                        "Could not disable normalized audition: {error}"
+                    ));
                 }
             }
             if let Some(request) = pending_playback_retarget {
@@ -581,7 +582,7 @@ impl Browser {
                 if let Some(Err(error)) =
                     self.submit_live_playback_retarget_request_with_gain(request, 1.0, cx)
                 {
-                    self.playback_status = format!("Could not apply playback change: {error}");
+                    self.set_playback_status(format!("Could not apply playback change: {error}"));
                 }
             }
             self.resume_deferred_play_after_preparation(cx);
@@ -771,7 +772,7 @@ impl Browser {
         if matches!(&request.action, NormalizedAuditionAction::Play(_)) {
             self.normalized_audition_deferred_play = Some(request.clone());
         }
-        self.playback_status = "Preparing normalized audition".to_string();
+        self.set_playback_status("Preparing normalized audition".to_string());
         self.normalized_audition_task = Some(cx.spawn(async move |this, cx| {
             let (job, result) = cx
                 .background_executor()
@@ -823,8 +824,9 @@ impl Browser {
                         if let Err(error) =
                             self.apply_normalized_gain(playback_id, preparation.gain, cx)
                         {
-                            self.playback_status =
-                                format!("Could not apply normalized audition gain: {error}");
+                            self.set_playback_status(format!(
+                                "Could not apply normalized audition gain: {error}"
+                            ));
                         }
                     }
                 }
@@ -835,8 +837,9 @@ impl Browser {
                         cx,
                     ) {
                         Some(Err(error)) => {
-                            self.playback_status =
-                                format!("Playback live update unavailable: {error}");
+                            self.set_playback_status(format!(
+                                "Playback live update unavailable: {error}"
+                            ));
                         }
                         Some(Ok(())) | None => {}
                     }
@@ -846,12 +849,12 @@ impl Browser {
                 if matches!(request.action, NormalizedAuditionAction::Play(_)) {
                     self.normalized_audition_deferred_play = None;
                 }
-                self.playback_status = match request.action {
+                self.set_playback_status(match request.action {
                     NormalizedAuditionAction::RetargetPlayback { .. } => {
                         format!("Playback live update normalization failed: {error}")
                     }
                     _ => format!("Normalized audition unavailable: {error}"),
-                };
+                });
             }
             _ => {}
         }
@@ -1018,7 +1021,7 @@ impl Browser {
                 Ok(())
             }
             Err(PlaybackRuntimeSubmitError::QueueFull) => {
-                self.playback_status = "Applying normalized audition…".to_string();
+                self.set_playback_status("Applying normalized audition…".to_string());
                 self.normalized_gain_runtime_pending = Some(pending);
                 self.ensure_playback_monitor(cx);
                 Ok(())
@@ -1042,25 +1045,25 @@ impl Browser {
             return;
         };
         if normalized_gain_retry_is_exhausted(pending.attempts) {
-            self.playback_status = normalized_gain_retry_failure_status(pending.gain);
+            self.set_playback_status(normalized_gain_retry_failure_status(pending.gain));
             return;
         }
         match handle.try_set_playback_gain_for(pending.playback_id, pending.gain) {
             Ok(()) => {
                 if self.playback_status == "Applying normalized audition…" {
-                    self.playback_status = "Playing".to_string();
+                    self.set_playback_status("Playing".to_string());
                 }
             }
             Err(PlaybackRuntimeSubmitError::QueueFull) => {
                 pending.attempts = pending.attempts.saturating_add(1);
                 if normalized_gain_retry_is_exhausted(pending.attempts) {
-                    self.playback_status = normalized_gain_retry_failure_status(pending.gain);
+                    self.set_playback_status(normalized_gain_retry_failure_status(pending.gain));
                 } else {
                     self.normalized_gain_runtime_pending = Some(pending);
                 }
             }
             Err(PlaybackRuntimeSubmitError::Closed) => {
-                self.playback_status = String::from("Audio runtime closed before gain update");
+                self.set_playback_status(String::from("Audio runtime closed before gain update"));
             }
         }
     }
