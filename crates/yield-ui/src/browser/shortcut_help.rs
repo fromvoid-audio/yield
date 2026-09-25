@@ -244,6 +244,26 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Play/stop; random section in sticky mode",
     },
     ShortcutRow {
+        keys: "Cmd-Space",
+        description: "Play from the current waveform playhead",
+    },
+    ShortcutRow {
+        keys: "Shift-R",
+        description: "Play a random visible sample",
+    },
+    ShortcutRow {
+        keys: "Cmd-Shift-R",
+        description: "Play the previous random sample",
+    },
+    ShortcutRow {
+        keys: "C",
+        description: "Set the focused sample as compare anchor",
+    },
+    ShortcutRow {
+        keys: "Shift-Space",
+        description: "Replay the compare anchor without changing focus",
+    },
+    ShortcutRow {
         keys: "Esc",
         description: "Stop playback",
     },
@@ -262,6 +282,10 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
     ShortcutRow {
         keys: "Cmd/Ctrl-C",
         description: "Copy selected files",
+    },
+    ShortcutRow {
+        keys: "Cmd-Shift-L",
+        description: "Copy status log",
     },
     ShortcutRow {
         keys: "Cmd/Ctrl-F",

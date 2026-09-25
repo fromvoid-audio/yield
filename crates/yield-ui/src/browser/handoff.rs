@@ -58,8 +58,9 @@ impl Browser {
 
     fn start_file_handoff(&mut self, command: HandoffCommand, cx: &mut Context<Self>) {
         if tag_filter::scope_pending(self) {
-            self.playback_status =
-                String::from("File handoff is waiting for the visible tag-filter scope");
+            self.set_playback_status(String::from(
+                "File handoff is waiting for the visible tag-filter scope",
+            ));
             cx.notify();
             return;
         }
@@ -84,8 +85,9 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         if tag_filter::scope_pending(self) {
-            self.playback_status =
-                String::from("File handoff is waiting for the visible tag-filter scope");
+            self.set_playback_status(String::from(
+                "File handoff is waiting for the visible tag-filter scope",
+            ));
             cx.notify();
             return;
         }
@@ -94,18 +96,18 @@ impl Browser {
         self.handoff_task.take();
         let context = self.handoff_context();
         if paths.is_empty() {
-            self.playback_status = match command {
+            self.set_playback_status(match command {
                 HandoffCommand::Copy => "No selected files to copy".to_string(),
                 HandoffCommand::Reveal => "Select a sample to reveal".to_string(),
-            };
+            });
             cx.notify();
             return;
         }
 
-        self.playback_status = match command {
+        self.set_playback_status(match command {
             HandoffCommand::Copy => "Preparing clipboard…".to_string(),
             HandoffCommand::Reveal => "Preparing reveal…".to_string(),
-        };
+        });
         self.handoff_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -140,8 +142,10 @@ impl Browser {
             HandoffCommand::Copy => match copy_file_paths(&prepared) {
                 Ok(()) => {
                     let count = prepared.as_slice().len();
-                    self.playback_status =
-                        format!("Copied {count} file{}", if count == 1 { "" } else { "s" });
+                    self.set_playback_status(format!(
+                        "Copied {count} file{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
                 }
                 Err(error) => self.handoff_failed(command, error),
             },
@@ -151,16 +155,16 @@ impl Browser {
                     return;
                 };
                 cx.reveal_path(path);
-                self.playback_status = format!("Revealed {}", path.display());
+                self.set_playback_status(format!("Revealed {}", path.display()));
             }
         }
     }
 
     fn handoff_failed(&mut self, command: HandoffCommand, error: FileClipboardError) {
-        self.playback_status = match command {
+        self.set_playback_status(match command {
             HandoffCommand::Copy => format!("Copy failed: {error}"),
             HandoffCommand::Reveal => format!("Reveal failed: {error}"),
-        };
+        });
     }
 
     fn handoff_context(&self) -> HandoffContext {

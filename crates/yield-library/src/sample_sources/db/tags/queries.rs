@@ -16,21 +16,166 @@ use super::super::util::{map_sql_error, normalize_relative_path};
 use super::super::{
     SOURCE_CURATION_MAX_TAG_LABEL_BYTES, SOURCE_TAG_PAGE_MAX_PAGE_SIZE,
     SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES,
-    SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceDatabase, SourceDbError, SourceTag, SourceTagFilterResult,
-    SourceTagPage, SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
+    SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationTagFacts, SourceCurationTagFactsPage,
+    SourceDatabase, SourceDbError, SourceTag, SourceTagFilterResult, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage,
 };
 use super::identity::normalize_tag_identity;
 use super::{
-    SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
-    SOURCE_TAG_FILTER_MAX_TOKEN_BYTES,
+    SOURCE_CURATION_TAG_FACTS_MAX_PATHS, SOURCE_TAG_FILTER_MAX_INPUT_BYTES,
+    SOURCE_TAG_FILTER_MAX_TAGS, SOURCE_TAG_FILTER_MAX_TOKEN_BYTES,
 };
 
 const DEFAULT_TAG_LIMIT: usize = 32;
 const TAG_PAGE_PREVIEW_CHAR_LIMIT: usize = 256;
 const TAG_PAGE_STAGING_CHUNK_SIZE: usize = 128;
+const SOURCE_CURATION_TAG_FACTS_MAX_ASSIGNMENTS: usize = 4096;
 pub(super) const TAG_FILTER_PROGRESS_OPS: i32 = 256;
 
 impl SourceDatabase {
+    /// Read exact per-file Curation tag facts for a bounded set of live paths at one revision.
+    ///
+    /// Unlike the selected-tag page, this retains the path-to-tag relationship. A missing path,
+    /// malformed legacy tag, or oversized assignment set fails the entire batch instead of
+    /// appearing as an empty-tag row. The caller must additionally fence source/root identity
+    /// and lifecycle generation before publishing the result.
+    pub fn curation_tag_facts_for_paths_at_revision(
+        &self,
+        expected_revision: u64,
+        paths: &[PathBuf],
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<SourceCurationTagFactsPage, SourceDbError> {
+        self.curation_tag_facts_for_paths_at_revision_with_progress_callback(
+            expected_revision,
+            paths,
+            cancellation,
+            None,
+        )
+    }
+
+    fn curation_tag_facts_for_paths_at_revision_with_progress_callback(
+        &self,
+        expected_revision: u64,
+        paths: &[PathBuf],
+        cancellation: &Arc<AtomicBool>,
+        progress_callback: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<SourceCurationTagFactsPage, SourceDbError> {
+        if paths.len() > SOURCE_CURATION_TAG_FACTS_MAX_PATHS {
+            return Err(SourceDbError::TagPageTooManyPaths {
+                max: SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
+                actual: paths.len(),
+            });
+        }
+        let paths = normalize_tag_page_paths(paths)?;
+        let mut is_canceled = || cancellation.load(Ordering::Acquire);
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(map_sql_error)?;
+        let revision = source_revision(&transaction)?;
+        if revision != expected_revision {
+            return Err(SourceDbError::CurationTagFactsStaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            });
+        }
+        if paths.is_empty() {
+            transaction.rollback().map_err(map_sql_error)?;
+            return Ok(SourceCurationTagFactsPage {
+                revision,
+                entries: Vec::new(),
+            });
+        }
+        stage_selected_paths(&transaction, &paths, &mut is_canceled)?;
+        if is_canceled() {
+            return Err(SourceDbError::Canceled);
+        }
+        let query = format!(
+            "SELECT selected.path,
+                    wf.path IS NOT NULL,
+                    wft.tag_id IS NOT NULL,
+                    st.id IS NOT NULL,
+                    CASE WHEN st.id IS NULL THEN 0 ELSE {preview} END,
+                    CASE WHEN st.id IS NULL OR {preview} THEN 0
+                         ELSE ({playback}) IS NOT NULL END,
+                    CASE WHEN st.id IS NULL OR {preview} THEN 0
+                         ELSE trim(st.display_label) != '' AND ({playback}) IS NULL END
+             FROM temp.selected_paths AS selected
+             LEFT JOIN wav_files AS wf ON wf.path = selected.path AND wf.missing = 0
+             LEFT JOIN wav_file_tags AS wft ON wft.path = wf.path
+             LEFT JOIN source_tags AS st ON st.id = wft.tag_id
+             ORDER BY selected.path, wft.tag_id
+             LIMIT ?1",
+            preview = tag_preview_sql(),
+            playback = super::PLAYBACK_TYPE_CLASSIFICATION,
+        );
+        let _progress_guard = TagFilterProgressHandlerGuard::install_with_callback(
+            &self.connection,
+            cancellation,
+            progress_callback,
+        );
+        let mut entries = Vec::<SourceCurationTagFacts>::with_capacity(paths.len());
+        {
+            let mut statement = transaction
+                .prepare(&query)
+                .map_err(map_tag_filter_sql_error)?;
+            let mut rows = statement
+                .query(
+                    [i64::try_from(SOURCE_CURATION_TAG_FACTS_MAX_ASSIGNMENTS + 1)
+                        .unwrap_or(i64::MAX)],
+                )
+                .map_err(map_tag_filter_sql_error)?;
+            let mut seen = 0usize;
+            while let Some(row) = rows.next().map_err(map_tag_filter_sql_error)? {
+                seen += 1;
+                if seen > SOURCE_CURATION_TAG_FACTS_MAX_ASSIGNMENTS {
+                    return Err(SourceDbError::CurationTagFactsTooManyAssignments {
+                        max: SOURCE_CURATION_TAG_FACTS_MAX_ASSIGNMENTS,
+                    });
+                }
+                if is_canceled() {
+                    return Err(SourceDbError::Canceled);
+                }
+                let path: String = row.get(0).map_err(map_sql_error)?;
+                let path_buf = PathBuf::from(&path);
+                let live: bool = row.get(1).map_err(map_sql_error)?;
+                let assigned: bool = row.get(2).map_err(map_sql_error)?;
+                let tag_exists: bool = row.get(3).map_err(map_sql_error)?;
+                let preview: bool = row.get(4).map_err(map_sql_error)?;
+                if !live || (assigned && !tag_exists) || preview {
+                    return Err(SourceDbError::CurationTagFactsUnavailable { path: path_buf });
+                }
+                if entries
+                    .last()
+                    .is_none_or(|entry| entry.relative_path != path_buf)
+                {
+                    entries.push(SourceCurationTagFacts {
+                        relative_path: path_buf,
+                        has_any_tag: false,
+                        has_descriptive_tag: false,
+                        has_playback_type_tag: false,
+                    });
+                }
+                let facts = entries.last_mut().expect("requested path has an entry");
+                facts.has_any_tag |= assigned;
+                facts.has_playback_type_tag |= row.get::<_, bool>(5).map_err(map_sql_error)?;
+                facts.has_descriptive_tag |= row.get::<_, bool>(6).map_err(map_sql_error)?;
+            }
+        }
+        if entries.len() != paths.len() || is_canceled() {
+            return if is_canceled() {
+                Err(SourceDbError::Canceled)
+            } else {
+                Err(SourceDbError::Unexpected)
+            };
+        }
+        drop(_progress_guard);
+        transaction.rollback().map_err(map_sql_error)?;
+        Ok(SourceCurationTagFactsPage { revision, entries })
+    }
     /// Return the most-used persisted normal tags, ordered by usage then label.
     pub fn most_used_tags(&self, limit: usize) -> Result<Vec<SourceTagUsage>, SourceDbError> {
         let limit = query_limit(limit);
@@ -1355,6 +1500,150 @@ mod plan_tests {
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].id, tag.id);
         assert_eq!(page.entries[0].assignment_count, Some(1));
+    }
+
+    #[test]
+    fn curation_facts_keep_each_live_path_and_empty_tag_set_distinct() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        for name in ["empty.wav", "complete.wav", "playback.wav"] {
+            database.upsert_file(Path::new(name), 10, 5).unwrap();
+        }
+        for label in ["kick", "one-shot"] {
+            database
+                .assign_tag_to_path(Path::new("complete.wav"), label)
+                .unwrap();
+        }
+        database
+            .assign_tag_to_path(Path::new("playback.wav"), "loop")
+            .unwrap();
+        let revision = database.get_revision().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let page = database
+            .curation_tag_facts_for_paths_at_revision(
+                revision,
+                &[
+                    PathBuf::from("playback.wav"),
+                    PathBuf::from("empty.wav"),
+                    PathBuf::from("complete.wav"),
+                    PathBuf::from("empty.wav"),
+                ],
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(page.revision, revision);
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.entries[0].relative_path, Path::new("complete.wav"));
+        assert!(page.entries[0].has_any_tag);
+        assert!(page.entries[0].has_descriptive_tag);
+        assert!(page.entries[0].has_playback_type_tag);
+        assert_eq!(page.entries[1].relative_path, Path::new("empty.wav"));
+        assert!(!page.entries[1].has_any_tag);
+        assert!(!page.entries[1].has_descriptive_tag);
+        assert!(!page.entries[1].has_playback_type_tag);
+        assert_eq!(page.entries[2].relative_path, Path::new("playback.wav"));
+        assert!(page.entries[2].has_any_tag);
+        assert!(!page.entries[2].has_descriptive_tag);
+        assert!(page.entries[2].has_playback_type_tag);
+    }
+
+    #[test]
+    fn curation_facts_reject_missing_stale_canceled_and_legacy_rows() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        database.upsert_file(Path::new("one.wav"), 10, 5).unwrap();
+        let tag = database
+            .assign_tag_to_path(Path::new("one.wav"), "kick")
+            .unwrap();
+        let revision = database.get_revision().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        assert!(matches!(
+            database.curation_tag_facts_for_paths_at_revision(
+                revision,
+                &[PathBuf::from("missing.wav")],
+                &cancellation,
+            ),
+            Err(SourceDbError::CurationTagFactsUnavailable { .. })
+        ));
+        assert!(matches!(
+            database.curation_tag_facts_for_paths_at_revision(
+                revision.saturating_sub(1),
+                &[PathBuf::from("one.wav")],
+                &cancellation,
+            ),
+            Err(SourceDbError::CurationTagFactsStaleRevision {
+                expected,
+                actual,
+            }) if expected == revision.saturating_sub(1) && actual == revision
+        ));
+        cancellation.store(true, Ordering::Release);
+        assert!(matches!(
+            database.curation_tag_facts_for_paths_at_revision(
+                revision,
+                &[PathBuf::from("one.wav")],
+                &cancellation,
+            ),
+            Err(SourceDbError::Canceled)
+        ));
+        cancellation.store(false, Ordering::Release);
+        database
+            .connection
+            .execute(
+                "UPDATE source_tags SET display_label = ?1 WHERE id = ?2",
+                rusqlite::params!["x".repeat(2048), tag.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.curation_tag_facts_for_paths_at_revision(
+                revision,
+                &[PathBuf::from("one.wav")],
+                &cancellation,
+            ),
+            Err(SourceDbError::CurationTagFactsUnavailable { .. })
+        ));
+        let too_many = (0..65)
+            .map(|index| PathBuf::from(format!("{index}.wav")))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            database.curation_tag_facts_for_paths_at_revision(revision, &too_many, &cancellation),
+            Err(SourceDbError::TagPageTooManyPaths { max: 64, .. })
+        ));
+    }
+
+    #[test]
+    fn curation_facts_cancel_during_sql_and_recover_connection() {
+        let directory = tempdir().unwrap();
+        let database = SourceDatabase::open_for_user_metadata_write(directory.path()).unwrap();
+        let paths = (0..64)
+            .map(|index| PathBuf::from(format!("sample-{index:02}.wav")))
+            .collect::<Vec<_>>();
+        for path in &paths {
+            database.upsert_file(path, 10, 5).unwrap();
+            database.assign_tag_to_path(path, "loop").unwrap();
+        }
+        let revision = database.get_revision().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let callback_cancellation = Arc::clone(&cancellation);
+        let callback_fired = Arc::clone(&fired);
+        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            callback_fired.store(true, Ordering::Release);
+            callback_cancellation.store(true, Ordering::Release);
+        });
+        let result = database.curation_tag_facts_for_paths_at_revision_with_progress_callback(
+            revision,
+            &paths,
+            &cancellation,
+            Some(callback),
+        );
+        assert!(fired.load(Ordering::Acquire));
+        assert!(matches!(result, Err(SourceDbError::Canceled)));
+        cancellation.store(false, Ordering::Release);
+        let page = database
+            .curation_tag_facts_for_paths_at_revision(revision, &paths[..1], &cancellation)
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.entries[0].has_playback_type_tag);
     }
 
     fn explain_opcodes<P: rusqlite::Params>(
