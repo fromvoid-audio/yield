@@ -17,7 +17,13 @@ been validated on a Windows host.
 
 The full and storage lanes run the `yield-session` library suite. Use
 `bash scripts/gpui-local-ci.sh session` to run that suite by itself. OPT-1861
-records the test fixture repair that restored this coverage on macOS.
+records the test fixture repair that restored this coverage on macOS. All three
+lanes limit that suite to four test threads: each session test starts several
+SQLite-backed owners, and the host's default test parallelism can exhaust its
+existing five-second event deadlines before the owners finish initializing. This limit
+does not change those deadlines or the tests' assertions. Run the lane on a
+macOS host with enough free space for Cargo's shared target and temporary test
+profiles; inspect the exact run log and free space if startup times out.
 
 Install the macOS automatic trigger once with
 `bash scripts/install-gpui-local-ci.sh`.
