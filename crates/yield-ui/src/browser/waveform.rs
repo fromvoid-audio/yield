@@ -23,6 +23,7 @@ use super::Browser;
 use super::played_ranges;
 use super::playmark_timing;
 use super::similar_sections;
+use super::transient_markers;
 use super::waveform_fades;
 use super::waveform_scrollbar;
 use super::zero_crossing;
@@ -1746,7 +1747,13 @@ pub(super) fn render_waveform(
                 - theme.waveform.metadata_height
                 - scrollbar_height)
                 .max(theme.spacing.waveform_min_bar_height);
-            let bar_color = if browser.playing_path.is_some() {
+            let selected_path = browser
+                .selected
+                .and_then(|index| browser.entries.get(index))
+                .map(|entry| entry.path.as_path());
+            let bar_color = if browser.playing_path.as_deref() == selected_path
+                && browser.playing_path.is_some()
+            {
                 theme.colors.waveform_played
             } else {
                 theme.colors.waveform_unplayed
@@ -1804,6 +1811,7 @@ pub(super) fn render_waveform(
         .right_0(),
     );
     bars = bars.child(similar_sections::overlay(browser, theme.clone()));
+    bars = bars.child(transient_markers::render_overlay(browser, &theme));
     let beat_guides = browser.beat_guides_enabled.then_some((
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
@@ -1936,6 +1944,11 @@ pub(super) fn render_waveform(
                 .filter(|bounds| bounds.contains(&event.position))
                 .and_then(|bounds| waveform_click_ratio(event.position, bounds))
                 .map(|ratio| view.waveform_viewport.absolute_ratio_from_visible(ratio));
+            if let Some(ratio) =
+                ratio.filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio))
+            {
+                view.waveform_hover_cursor = Some(ratio as f32);
+            }
             let similar_changed = similar_sections::hover(view, ratio);
             if view.update_waveform_fade_hover(event.position, bounds) || similar_changed {
                 cx.notify();
@@ -2248,7 +2261,10 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         played_ranges::clear_history(self);
+        self.transient_markers.invalidate();
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.waveform_hover_cursor = None;
+        self.waveform_last_play_start = None;
         self.waveform_detail.reset();
         self.waveform_viewport = WaveformViewport::full();
         self.waveform_zoom_anchor_ratio = 0.5;
