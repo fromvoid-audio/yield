@@ -12524,6 +12524,74 @@ mod tests {
             journal_sequence(&store, operation_id),
             operation_receipt.sequence()
         );
+        // A separate unused chunk can be released, but a failed release must leave its exact
+        // claim charged and retryable while the staged chunk remains protected.
+        let unused_chunk = ChunkId::new();
+        let unused_request = ChunkClaimRequest::new(
+            unused_chunk,
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                row.identity.clone(),
+                row.allocation_class.into(),
+                row.allocated_bytes,
+            )
+            .expect("unused chunk claim"),
+            filesystem,
+            String::from("unused-partial.wav"),
+            1,
+            row.logical_bytes,
+            row.allocation_unit,
+            row.protected_free_bytes,
+        )
+        .expect("unused chunk request");
+        let unused_lease = provider
+            .admit(
+                &unused_request.plan().expect("unused plan"),
+                &unused_request.inventory().expect("unused inventory"),
+            )
+            .expect("admit unused chunk");
+        store
+            .persist_chunk_claim_with_lease(&unused_request, &provider, unused_lease)
+            .expect("persist unused chunk claim");
+        let unused_issue_id = Uuid::new_v4();
+        store
+            .issue_chunk_claim(unused_chunk, operation_id, unused_issue_id)
+            .expect("issue unused chunk");
+        let unused_release_id = Uuid::new_v4();
+        store.set_release_test_hook(|boundary| {
+            if boundary == ReleaseTestBoundary::BeforePrecommitValidation {
+                ReleaseTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("injected unused chunk release failure"),
+                })
+            } else {
+                ReleaseTestDirective::Continue
+            }
+        });
+        assert!(
+            store
+                .release_chunk_claim(
+                    unused_chunk,
+                    operation_id,
+                    Some(ChunkUnusedReleaseAuthorization::for_test(
+                        unused_chunk,
+                        operation_id,
+                        unused_issue_id,
+                        unused_release_id,
+                    )),
+                    unused_release_id,
+                )
+                .is_err()
+        );
+        assert_eq!(provider.claim_count(), 2);
+        assert_eq!(
+            store
+                .read_chunk_claim(unused_chunk)
+                .expect("unused chunk after failed release")
+                .expect("unused chunk retained")
+                .state(),
+            ChunkClaimState::Issued
+        );
         drop(store);
 
         let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
@@ -12532,6 +12600,53 @@ mod tests {
                 .read_chunk_staging_row(chunk_id)
                 .expect("read restarted row"),
             Some((sequence, checkpoint.clone()))
+        );
+        let restart_snapshot = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild exact retained claims");
+        assert_eq!(restart_snapshot.claims().len(), 2);
+        assert_eq!(
+            restart_snapshot.readiness(),
+            &CapacityRebuildReadiness::Ready
+        );
+        let rebuilt = CapacityProvider::unavailable();
+        rebuilt
+            .install_rebuilt_claims(&restart_snapshot)
+            .expect("install exact restart claims");
+        assert_eq!(
+            rebuilt.outstanding(&row.identity, row.allocation_class.into()),
+            2
+        );
+        let unused_release = reopened
+            .release_chunk_claim(
+                unused_chunk,
+                operation_id,
+                Some(ChunkUnusedReleaseAuthorization::for_test(
+                    unused_chunk,
+                    operation_id,
+                    unused_issue_id,
+                    unused_release_id,
+                )),
+                unused_release_id,
+            )
+            .expect("retry failed unused release");
+        assert_eq!(unused_release.release_id(), unused_release_id);
+        assert_eq!(
+            reopened
+                .release_chunk_claim(unused_chunk, operation_id, None, unused_release_id)
+                .expect("exact duplicate release"),
+            unused_release
+        );
+        let after_release = reopened
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild after one release");
+        let rebuilt_after_release = CapacityProvider::unavailable();
+        rebuilt_after_release
+            .install_rebuilt_claims(&after_release)
+            .expect("install one-charge restart state");
+        assert_eq!(
+            rebuilt_after_release.outstanding(&row.identity, row.allocation_class.into()),
+            1
         );
         assert!(matches!(
             reopened
@@ -12564,7 +12679,9 @@ mod tests {
             ),
             Err(CapacityProviderError::DiskPressureRecoveryOnly { .. })
         ));
-        assert_eq!(provider.claim_count(), 1);
+        // This direct store test does not perform the owner-side provider reconciliation.
+        // The fresh rebuilt provider above is the restart accounting assertion.
+        assert_eq!(provider.claim_count(), 2);
         let retry = RetryObservation::new(
             1,
             51,
@@ -12623,7 +12740,7 @@ mod tests {
                 .checkpoint_chunk_staging_record(&checkpoint)
                 .is_err()
         );
-        assert_eq!(provider.claim_count(), 1);
+        assert_eq!(provider.claim_count(), 2);
     }
 
     #[test]
