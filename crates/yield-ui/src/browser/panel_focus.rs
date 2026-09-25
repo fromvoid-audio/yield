@@ -97,7 +97,7 @@ impl Browser {
         false
     }
 
-    fn browser_surface_focused(&self, window: &Window) -> bool {
+    pub(super) fn browser_surface_focused(&self, window: &Window) -> bool {
         if self.focus_handle.is_focused(window) {
             return true;
         }
@@ -229,6 +229,58 @@ impl Browser {
                 cx.notify();
             }
         });
+    }
+
+    /// Follow browser arrow-key navigation with native focus once the target row exists.
+    pub(super) fn focus_keyboard_navigation_row(
+        &mut self,
+        id: AudioFileId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(position) = self.view_model.visible_position_for(&id) else {
+            return;
+        };
+        let path = self
+            .entries
+            .iter()
+            .find(|entry| entry.stable_id() == id)
+            .map(|entry| entry.path.clone());
+        if let Some(path) = path.as_ref()
+            && let Some(focus) = self
+                .ax_sample_id(path)
+                .as_deref()
+                .and_then(|id| self.ax_focus(id))
+        {
+            window.focus(&focus);
+            self.sync_panel_focus_ax(window, cx);
+            cx.notify();
+            return;
+        }
+        let root = self.root.clone();
+        let scan_generation = self.scan_generation;
+        let origin_focus = window.focused(cx);
+        self.list_scroll_handle
+            .scroll_to_item(position, ScrollStrategy::Center);
+        cx.on_next_frame(window, move |view, window, cx| {
+            if window.focused(cx) != origin_focus
+                || view.root != root
+                || view.scan_generation != scan_generation
+                || view.browser_focus_id().as_ref() != Some(&id)
+                || view.view_model.visible_position_for(&id).is_none()
+            {
+                return;
+            }
+            let path = view
+                .entries
+                .iter()
+                .find(|entry| entry.stable_id() == id)
+                .map(|entry| entry.path.clone());
+            if let Some(path) = path {
+                view.focus_ax_row(view.ax_sample_id(&path), window, cx);
+            }
+        });
+        cx.notify();
     }
 
     fn focus_folder_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {

@@ -2895,20 +2895,28 @@ impl Browser {
                 self.toggle_loop(cx)
             }
             "x" if !shift && !secondary => self.toggle_focused_selection(cx),
-            "up" | "arrowup" => self.move_selection(
-                -1,
-                shift,
-                secondary && shift,
-                navigation_suppresses_autoplay,
-                cx,
-            ),
-            "down" | "arrowdown" => self.move_selection(
-                1,
-                shift,
-                secondary && shift,
-                navigation_suppresses_autoplay,
-                cx,
-            ),
+            "up" | "arrowup" | "down" | "arrowdown" => {
+                let follow_row = self.browser_surface_focused(window)
+                    && !self.theme_settings_open
+                    && !self.audio_settings_open
+                    && !self.shortcut_help.is_open()
+                    && self.context_menu.is_none();
+                let direction = if matches!(key, "up" | "arrowup") {
+                    -1
+                } else {
+                    1
+                };
+                self.move_selection(
+                    direction,
+                    shift,
+                    secondary && shift,
+                    navigation_suppresses_autoplay,
+                    cx,
+                );
+                if follow_row && let Some(id) = self.browser_focus_id() {
+                    self.focus_keyboard_navigation_row(id, window, cx);
+                }
+            }
             "escape" => {
                 self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);
