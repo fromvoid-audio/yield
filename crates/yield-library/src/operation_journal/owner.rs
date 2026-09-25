@@ -9487,7 +9487,7 @@ mod tests {
                 CancellationRequestObservation::new(3).expect("issued cancel observation"),
             )
             .expect("issued cancel request");
-        cancel_issued
+        let issued_cancel_receipt = cancel_issued
             .recv_timeout(Duration::from_secs(2))
             .expect("issued cancel result")
             .expect("issued cancel worker");
@@ -9507,6 +9507,53 @@ mod tests {
         assert_eq!(owner.synthetic_chunk_write_invocations(), 0);
 
         assert!(owner.shutdown());
+        let restarted = OperationJournalStore::open(&fixture.owner).expect("restart journal");
+        let cancelled = restarted
+            .get(issued_operation_id)
+            .expect("read cancelled operation")
+            .expect("retained cancelled operation");
+        assert_eq!(
+            cancelled.disposition,
+            OperationDisposition::CancelRequestedBeforePublish
+        );
+        assert_eq!(
+            cancelled.cancellation_request(),
+            Some(&CancellationRequestObservation::new(3).expect("cancel observation"))
+        );
+        assert_eq!(
+            restarted
+                .request_cancel_before_publish(
+                    issued_operation_id,
+                    issued_receipt.sequence(),
+                    CancellationRequestObservation::new(3).expect("replay observation"),
+                )
+                .expect("same request is read-only after restart"),
+            issued_cancel_receipt
+        );
+        assert_eq!(
+            restarted
+                .read_chunk_claim(issued_request.chunk_id())
+                .expect("read issued claim after restart")
+                .expect("issued claim retained")
+                .state(),
+            ChunkClaimState::Issued
+        );
+        let rebuild = restarted
+            .rebuild_ordinary_claim_snapshot()
+            .expect("rebuild cancellation charges");
+        assert_eq!(rebuild.readiness(), &CapacityRebuildReadiness::Ready);
+        let rebuilt_provider = CapacityProvider::unavailable();
+        rebuilt_provider
+            .install_rebuilt_claims(&rebuild)
+            .expect("install retained cancellation charge");
+        assert_eq!(
+            rebuilt_provider.outstanding(
+                &volume,
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+            ),
+            allocation_unit
+        );
+        assert!(restarted.prove_clean_handoff_durable().is_err());
         drop(fixture);
     }
 
