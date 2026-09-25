@@ -518,6 +518,11 @@ impl BrowserAccessibility {
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
+                        if event.action == AxAction::Focus
+                            && let Some((path, false)) = folder_action.as_ref()
+                        {
+                            view.mark_folder_keyboard_focus(path.clone());
+                        }
                         if settings_action {
                             match event.action {
                                 AxAction::Focus => {}
@@ -1266,7 +1271,7 @@ impl Browser {
                         label: label.clone(),
                         value: Some(format!(
                             "{}, {} audio {}",
-                            if self.selected_folder == row.path {
+                            if self.folder_is_selected(&row.path) {
                                 "Selected"
                             } else {
                                 "Not selected"

@@ -283,10 +283,16 @@ impl Browser {
         cx.notify();
     }
 
-    fn focus_folder_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_folder_path(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(position) = self.folder_rows().iter().position(|row| row.path == path) else {
             return;
         };
+        self.mark_folder_keyboard_focus(path.clone());
         let root = self.root.clone();
         let scan_generation = self.scan_generation;
         let origin_focus = window.focused(cx);
@@ -297,6 +303,10 @@ impl Browser {
             if window.focused(cx) != origin_focus
                 || view.root != root
                 || view.scan_generation != scan_generation
+                || view
+                    .folder_keyboard
+                    .as_ref()
+                    .is_none_or(|state| state.focused() != path)
                 || !view.folder_rows().iter().any(|row| row.path == path)
             {
                 return;
