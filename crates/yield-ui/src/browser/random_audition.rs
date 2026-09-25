@@ -470,7 +470,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use gpui::TestAppContext;
+    use gpui::{KeyDownEvent, Keystroke, TestAppContext};
     use yield_core::{
         AudioFile, FolderScope, RandomAuditionUnits, WaveformViewport,
         random_audition_span_for_units,
@@ -642,6 +642,69 @@ mod tests {
             view.waveform = Some(preview_for(path));
         });
         (browser, cx)
+    }
+
+    #[gpui::test]
+    fn control_and_option_space_request_selected_sample_sections(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/random-section-shortcut.wav");
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, _| {
+            view.entries = vec![file(path.to_string_lossy().as_ref(), "sample.wav")];
+            view.selected = Some(0);
+            view.waveform_generation = 7;
+            view.waveform = Some(preview_for(&path));
+        });
+        for chord in ["ctrl-space", "alt-space"] {
+            cx.update(|window, app| {
+                browser.update(app, |view, cx| {
+                    window.focus(&view.focus_handle);
+                    view.playback_init_intent = None;
+                    view.handle_key_down(
+                        &KeyDownEvent {
+                            keystroke: Keystroke::parse(chord).expect("random-section chord"),
+                            is_held: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    let intent = view
+                        .playback_init_intent
+                        .as_ref()
+                        .expect("random section schedules playback");
+                    assert_eq!(intent.path, path);
+                    assert!(intent.region.is_some(), "{chord} must audition a section");
+                    assert!(!view.random_audition_sticky);
+                });
+            });
+        }
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.playback_init_intent = None;
+                window.focus(&view.search_input.read(cx).focus_handle());
+                view.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: Keystroke::parse("ctrl-space").expect("Control-Space"),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(view.playback_init_intent.is_none());
+
+                window.focus(&view.focus_handle);
+                view.toggle_shortcut_help(window, cx);
+                view.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: Keystroke::parse("alt-space").expect("Option-Space"),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(view.playback_init_intent.is_none());
+            });
+        });
     }
 
     #[gpui::test]
