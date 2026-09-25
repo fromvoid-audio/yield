@@ -244,6 +244,26 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Play/stop; random section in sticky mode",
     },
     ShortcutRow {
+        keys: "Cmd-Space",
+        description: "Play from the current waveform playhead",
+    },
+    ShortcutRow {
+        keys: "Shift-R",
+        description: "Play a random visible sample",
+    },
+    ShortcutRow {
+        keys: "Cmd-Shift-R",
+        description: "Play the previous random sample",
+    },
+    ShortcutRow {
+        keys: "C",
+        description: "Set the focused sample as compare anchor",
+    },
+    ShortcutRow {
+        keys: "Shift-Space",
+        description: "Replay the compare anchor without changing focus",
+    },
+    ShortcutRow {
         keys: "Esc",
         description: "Stop playback",
     },
@@ -264,8 +284,24 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Copy selected files",
     },
     ShortcutRow {
+        keys: "Cmd-Shift-L",
+        description: "Copy status log",
+    },
+    ShortcutRow {
         keys: "Cmd/Ctrl-F",
         description: "Focus sample search",
+    },
+    ShortcutRow {
+        keys: "G W / G B",
+        description: "Focus waveform or sample browser",
+    },
+    ShortcutRow {
+        keys: "G T / G S",
+        description: "Focus folder tree or sources list",
+    },
+    ShortcutRow {
+        keys: "F (browser)",
+        description: "Focus the loaded sample when visible",
     },
     ShortcutRow {
         keys: "Up / Down",
@@ -336,6 +372,10 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
     ShortcutRow {
         keys: "Left / Right",
         description: "Slide the play selection",
+    },
+    ShortcutRow {
+        keys: "Option or Shift + Left / Right",
+        description: "Nudge the play selection by one audio frame",
     },
 ];
 
