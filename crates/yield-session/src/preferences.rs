@@ -133,6 +133,9 @@ pub struct UiPreferences {
     /// Whether audition playback loops its active region.
     #[serde(default)]
     pub loop_enabled: bool,
+    /// Independent locked loop choice: absent means ordinary per-file loop policy applies.
+    #[serde(default)]
+    pub loop_lock_override: Option<bool>,
     /// Whether audition playback uses the raw peak of its active span to normalize gain.
     #[serde(default)]
     pub normalized_audition_enabled: bool,
@@ -156,6 +159,7 @@ impl Default for UiPreferences {
             rating_decay_weeks: DEFAULT_RATING_DECAY_WEEKS,
             trash_folder: None,
             loop_enabled: false,
+            loop_lock_override: None,
             normalized_audition_enabled: false,
             output_volume: 1.0,
             audio_output: AudioOutputPreferences::default(),
@@ -377,6 +381,8 @@ pub enum PreferencePatch {
     SetHelpTooltipsEnabled(bool),
     /// Change the audition loop preference.
     SetLoopEnabled(bool),
+    /// Enter, cycle, or leave the locked loop override without writing sample metadata.
+    SetLoopLockOverride(Option<bool>),
     /// Change the peak-normalized audition preference.
     SetNormalizedAuditionEnabled(bool),
     /// Change the linear audition output volume.
@@ -414,7 +420,13 @@ impl PreferencePatch {
                 preferences.trash_folder = path;
             }
             Self::SetHelpTooltipsEnabled(enabled) => preferences.help_tooltips_enabled = enabled,
-            Self::SetLoopEnabled(enabled) => preferences.loop_enabled = enabled,
+            Self::SetLoopEnabled(enabled) => {
+                preferences.loop_enabled = enabled;
+                preferences.loop_lock_override = None;
+            }
+            Self::SetLoopLockOverride(locked_override) => {
+                preferences.loop_lock_override = locked_override;
+            }
             Self::SetNormalizedAuditionEnabled(enabled) => {
                 preferences.normalized_audition_enabled = enabled;
             }
@@ -699,6 +711,7 @@ mod tests {
         preferences.theme_source_path = Some(std::env::temp_dir().join("custom theme.json"));
         preferences.autoplay_selection = false;
         preferences.loop_enabled = true;
+        preferences.loop_lock_override = Some(false);
         preferences.normalized_audition_enabled = true;
         preferences.output_volume = 0.37;
 
@@ -732,6 +745,43 @@ mod tests {
         );
         PreferencePatch::Reset.apply(&mut preferences).unwrap();
         assert!(!preferences.normalized_audition_enabled);
+    }
+
+    #[test]
+    fn locked_loop_choice_is_separate_and_normal_toggle_exits_it_atomically() {
+        let mut preferences = UiPreferences::default();
+        PreferencePatch::SetLoopLockOverride(Some(true))
+            .apply(&mut preferences)
+            .expect("set lock");
+        assert_eq!(preferences.loop_lock_override, Some(true));
+        assert!(!preferences.loop_enabled);
+        PreferencePatch::SetLoopLockOverride(Some(false))
+            .apply(&mut preferences)
+            .expect("cycle lock");
+        assert_eq!(preferences.loop_lock_override, Some(false));
+        assert!(!preferences.loop_enabled);
+        PreferencePatch::SetLoopEnabled(true)
+            .apply(&mut preferences)
+            .expect("ordinary toggle");
+        assert_eq!(preferences.loop_lock_override, None);
+        assert!(preferences.loop_enabled);
+        let payload = preferences.to_payload().expect("encode");
+        assert_eq!(
+            UiPreferences::from_payload(&payload).expect("decode"),
+            preferences
+        );
+        let mut legacy = serde_json::to_value(&preferences).expect("encode legacy fixture");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("loop_lock_override");
+        let legacy = serde_json::to_string(&legacy).expect("legacy payload");
+        assert_eq!(
+            UiPreferences::from_payload(&legacy)
+                .expect("decode without lock")
+                .loop_lock_override,
+            None
+        );
     }
 
     #[test]

@@ -803,7 +803,7 @@ impl Browser {
                 }
                 if let Some(error) = result.error {
                     view.audio_output_error = Some(error.clone());
-                    view.audio_output_status = "Audio options unavailable".to_string();
+                    view.set_audio_output_status("Audio options unavailable".to_string());
                 }
                 cx.notify();
             });
@@ -856,7 +856,7 @@ impl Browser {
         self.audio_output_config = config;
         self.audio_output_dirty = true;
         self.audio_output_error = None;
-        self.audio_output_status = "Audio output change pending".to_string();
+        self.set_audio_output_status("Audio output change pending".to_string());
         self.audio_output_dropdown = None;
         self.start_audio_output_options_refresh(cx);
         self.reconfigure_audio_output(cx);
@@ -883,7 +883,7 @@ impl Browser {
         ) {
             self.audio_output_dirty = false;
             self.audio_output_error = None;
-            self.audio_output_status = "Audio output ready · saving settings…".to_string();
+            self.set_audio_output_status("Audio output ready · saving settings…".to_string());
             cx.notify();
         }
     }
@@ -902,7 +902,7 @@ impl Browser {
             if reset_pending {
                 self.audio_output_dirty = false;
                 self.audio_output_error = None;
-                self.audio_output_status = "Audio output reset".to_string();
+                self.set_audio_output_status("Audio output reset".to_string());
             }
             return;
         }
@@ -911,15 +911,17 @@ impl Browser {
             self.audio_output_dirty = false;
             self.audio_output_error = None;
         }
-        self.audio_output_status = if self
-            .audio_output_applied_config
-            .as_ref()
-            .is_some_and(|applied| applied != &self.audio_output_config)
-        {
-            "Audio output preference loaded · applies on next audition".to_string()
-        } else {
-            "Audio output preference loaded".to_string()
-        };
+        self.set_audio_output_status(
+            if self
+                .audio_output_applied_config
+                .as_ref()
+                .is_some_and(|applied| applied != &self.audio_output_config)
+            {
+                "Audio output preference loaded · applies on next audition".to_string()
+            } else {
+                "Audio output preference loaded".to_string()
+            },
+        );
         if self.audio_settings_open {
             self.start_audio_output_options_refresh(cx);
         }
@@ -928,7 +930,7 @@ impl Browser {
     pub(super) fn audio_output_persistence_failed(&mut self, error: String) {
         self.audio_output_dirty = true;
         self.audio_output_error = Some(error);
-        self.audio_output_status = "Audio output ready · settings not saved".to_string();
+        self.set_audio_output_status("Audio output ready · settings not saved".to_string());
     }
 
     pub(super) fn cancel_audio_output_options(&mut self) {
@@ -973,12 +975,12 @@ impl Browser {
             if retirement_failed {
                 let error = "Timed out waiting for the previous audio output to shut down";
                 self.audio_output_error = Some(error.to_string());
-                self.audio_output_status = "Audio output unavailable".to_string();
+                self.set_audio_output_status("Audio output unavailable".to_string());
                 self.playback_init_intent = None;
                 self.playback_waiting_for_preferences = false;
                 self.audio_output_resume = None;
                 self.clear_playback_cursor();
-                self.playback_status = format!("Audio output unavailable: {error}");
+                self.set_playback_status(format!("Audio output unavailable: {error}"));
             } else {
                 self.begin_audio_output_open(cx);
             }
@@ -991,11 +993,11 @@ impl Browser {
                 self.audio_output_resolved = Some(opened.resolved.clone());
                 self.audio_output_applied_config = Some(config.clone());
                 self.audio_output_error = None;
-                self.audio_output_status = if opened.resolved.used_fallback {
+                self.set_audio_output_status(if opened.resolved.used_fallback {
                     "Audio output ready with fallback".to_string()
                 } else {
                     "Audio output ready".to_string()
-                };
+                });
                 self.playback = Some(opened.runtime);
                 self.retry_runtime_volume();
                 if self.audio_output_dirty {
@@ -1005,8 +1007,9 @@ impl Browser {
                     {
                         self.audio_output_dirty = false;
                     } else {
-                        self.audio_output_status =
-                            "Audio output ready · settings not saved".to_string();
+                        self.set_audio_output_status(
+                            "Audio output ready · settings not saved".to_string(),
+                        );
                     }
                 }
                 self.resume_audio_output_playback_if_current(cx);
@@ -1023,16 +1026,16 @@ impl Browser {
                 self.audio_output_resolved = None;
                 self.audio_output_applied_config = None;
                 self.audio_output_error = Some(message.clone());
-                self.audio_output_status = if self.audio_output_dirty {
+                self.set_audio_output_status(if self.audio_output_dirty {
                     "Audio output unavailable · settings not saved".to_string()
                 } else {
                     "Audio output unavailable".to_string()
-                };
+                });
                 self.audio_output_resume = None;
                 self.playback_init_intent = None;
                 self.playback_waiting_for_preferences = false;
                 self.clear_playback_cursor();
-                self.playback_status = format!("Audio output unavailable: {message}");
+                self.set_playback_status(format!("Audio output unavailable: {message}"));
             }
         }
         cx.notify();

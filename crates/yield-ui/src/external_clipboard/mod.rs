@@ -105,6 +105,24 @@ pub(crate) fn copy_file_paths(paths: &PreparedFilePaths) -> Result<(), FileClipb
     platform::copy_file_paths(paths.as_slice())
 }
 
+/// Copy plain text through the native pasteboard and report publication failures.
+///
+/// The status-log shortcut uses this instead of GPUI's infallible clipboard
+/// convenience API so it never claims a failed write succeeded.
+pub(crate) fn copy_text(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::copy_text(text)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = text;
+        Err(String::from(
+            "Text clipboard handoff is unavailable on this platform",
+        ))
+    }
+}
+
 #[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
