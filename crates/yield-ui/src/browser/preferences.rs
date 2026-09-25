@@ -552,7 +552,7 @@ impl Browser {
         }
         if self.theme_load.pending_path.is_none() {
             self.theme_load.active_path = effective.theme_source_path.clone();
-            self.theme_status = effective.theme.name.clone();
+            self.set_theme_status(effective.theme.name.clone());
         }
     }
 

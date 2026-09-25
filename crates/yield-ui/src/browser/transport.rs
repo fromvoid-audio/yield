@@ -118,6 +118,7 @@ pub(super) enum PlaybackIntentOrigin {
     Explicit,
     SelectionAutoplay,
     HistoryReplay,
+    CompareAnchor,
     AudioOutputResume,
 }
 
@@ -327,6 +328,18 @@ impl Browser {
         self.request_playback_intent(intent, cx);
     }
 
+    pub(super) fn play_from_current_playhead(&mut self, cx: &mut Context<Self>) {
+        if self.waveform.is_none() {
+            return;
+        }
+        let start = current_playhead_start(
+            self.playback_cursor_ratio(true),
+            self.waveform_hover_cursor,
+            self.waveform_last_play_start,
+        );
+        self.start_playback_from_position(f64::from(start), cx);
+    }
+
     pub(super) fn start_playback_from_position(&mut self, start: f64, cx: &mut Context<Self>) {
         let Some(intent) = self.selected_playback_intent(start, PlaybackIntentOrigin::Explicit)
         else {
@@ -449,17 +462,19 @@ impl Browser {
 
         match self.submit_live_playback_retarget(desired, cx) {
             Some(Ok(())) => {
-                self.playback_status = format!("{status_label} · applying to playback");
+                self.set_playback_status(format!("{status_label} · applying to playback"));
             }
             Some(Err(error)) => {
-                self.playback_status = format!("{status_label} · live update unavailable: {error}");
+                self.set_playback_status(format!(
+                    "{status_label} · live update unavailable: {error}"
+                ));
             }
             None => {
-                self.playback_status = if self.playing_path.is_some() {
+                self.set_playback_status(if self.playing_path.is_some() {
                     format!("{status_label} — applies on next play")
                 } else {
                     status_label
-                };
+                });
             }
         }
     }
@@ -852,7 +867,7 @@ impl Browser {
         origin: PlaybackIntentOrigin,
     ) -> Option<PlaybackIntent> {
         let Some(index) = self.selected else {
-            self.playback_status = "Select a sample first".to_string();
+            self.set_playback_status("Select a sample first".to_string());
             return None;
         };
         let Some(entry) = self.entries.get(index).cloned() else {
@@ -862,11 +877,11 @@ impl Browser {
         self.playback_policy
             .prepare(entry.stable_id(), entry.playback_type);
         if !yield_library::sample_sources::is_supported_audio(&path) {
-            self.playback_status = "Audition currently supports WAV files".to_string();
+            self.set_playback_status("Audition currently supports WAV files".to_string());
             return None;
         }
         let Some(start) = normalized_playback_start(start) else {
-            self.playback_status = "Invalid playback position".to_string();
+            self.set_playback_status("Invalid playback position".to_string());
             return None;
         };
         let region = self.waveform_play_region.filter(|region| region.is_valid());
@@ -892,17 +907,26 @@ impl Browser {
         self.zero_crossing_queued = None;
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
-            self.playback_status = "Invalid playback position".to_string();
+            self.set_playback_status("Invalid playback position".to_string());
             cx.notify();
             return;
         };
         if intent.region.is_some_and(|region| !region.is_valid()) {
             self.clear_playback_cursor();
-            self.playback_status = "Invalid playback region".to_string();
+            self.set_playback_status("Invalid playback region".to_string());
             cx.notify();
             return;
         }
         let intent = PlaybackIntent { start, ..intent };
+        if intent.origin != PlaybackIntentOrigin::CompareAnchor
+            && self.waveform.is_some()
+            && self
+                .selected
+                .and_then(|index| self.entries.get(index))
+                .is_some_and(|entry| entry.path == intent.path)
+        {
+            self.waveform_last_play_start = Some(start as f32);
+        }
         self.clear_playback_cursor();
         self.audio_output_resume = None;
         self.playback_cursor_pending = Some(start as f32);
@@ -911,7 +935,7 @@ impl Browser {
             self.playback_init_epoch = self.playback_epoch;
             self.playback_init_generation = self.waveform_generation;
             self.playback_waiting_for_preferences = true;
-            self.playback_status = "Loading settings…".to_string();
+            self.set_playback_status("Loading settings…".to_string());
             self.start_preferences_poll(cx);
             cx.notify();
             return;
@@ -921,7 +945,7 @@ impl Browser {
             self.playback_init_intent = Some(intent);
             self.playback_init_epoch = self.playback_epoch;
             self.playback_init_generation = self.waveform_generation;
-            self.playback_status = "Starting audio…".to_string();
+            self.set_playback_status("Starting audio…".to_string());
             cx.notify();
             return;
         }
@@ -949,7 +973,7 @@ impl Browser {
         self.playback_init_intent = Some(intent);
         self.playback_init_epoch = self.playback_epoch;
         self.playback_init_generation = self.waveform_generation;
-        self.playback_status = "Starting audio…".to_string();
+        self.set_playback_status("Starting audio…".to_string());
         self.begin_audio_output_open(cx);
     }
 
@@ -979,7 +1003,7 @@ impl Browser {
         };
         if should_cancel_pending_autoplay(self.autoplay_selection, Some(intent.origin)) {
             self.clear_playback_cursor();
-            self.playback_status = "Selection autoplay disabled".to_string();
+            self.set_playback_status("Selection autoplay disabled".to_string());
             cx.notify();
             return;
         }
@@ -987,13 +1011,21 @@ impl Browser {
             .selected
             .and_then(|index| self.entries.get(index))
             .cloned();
+        if intent.origin == PlaybackIntentOrigin::CompareAnchor
+            && !self.compare_anchor_path_is_current(&intent.path)
+        {
+            self.clear_playback_cursor();
+            self.set_playback_status("Compare anchor is no longer available");
+            cx.notify();
+            return;
+        }
         let Some(intent) = resolve_queued_playback_intent(
             &mut self.playback_policy,
             intent,
             selected_entry.as_ref(),
         ) else {
             self.clear_playback_cursor();
-            self.playback_status = "Playback request is no longer current".to_string();
+            self.set_playback_status("Playback request is no longer current".to_string());
             cx.notify();
             return;
         };
@@ -1004,11 +1036,12 @@ impl Browser {
                 return;
             }
             self.clear_playback_cursor();
-            self.playback_status = "Playback normalization is no longer current".to_string();
+            self.set_playback_status("Playback normalization is no longer current".to_string());
             cx.notify();
             return;
         }
-        if precomputed_gain.is_none()
+        if intent.origin != PlaybackIntentOrigin::CompareAnchor
+            && precomputed_gain.is_none()
             && self.normalized_audition.enabled()
             && self.schedule_normalized_playback(intent.clone(), cx)
         {
@@ -1016,7 +1049,7 @@ impl Browser {
         }
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
-            self.playback_status = "Invalid playback position".to_string();
+            self.set_playback_status("Invalid playback position".to_string());
             return;
         };
         let mode = playback_mode_for_intent(&intent);
@@ -1076,7 +1109,7 @@ impl Browser {
                 self.playback_metronome_beat_count = None;
                 self.playback_metronome_confirmed = false;
                 self.playback_cursor_pending = Some(start as f32);
-                self.playback_status = "Starting…".to_string();
+                self.set_playback_status("Starting…".to_string());
                 if record_last_played {
                     self.record_playback_for_intent(accepted_path.as_path(), accepted_at, cx);
                 }
@@ -1090,13 +1123,18 @@ impl Browser {
                 self.playback_metronome_beat_count = None;
                 self.playback_metronome_confirmed = false;
                 self.clear_playback_cursor();
-                self.playback_status = format!("Could not queue playback: {error:?}");
+                self.set_playback_status(format!("Could not queue playback: {error:?}"));
             }
         }
         cx.notify();
     }
 
     pub(super) fn stop_playback(&mut self) {
+        if self.compare_anchor_play_pending {
+            self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
+            self.compare_anchor_task.take();
+            self.compare_anchor_play_pending = false;
+        }
         self.random_audition_pending = None;
         super::zero_crossing::cancel_for_interruption(self);
         self.zero_crossing_queued = None;
@@ -1123,7 +1161,7 @@ impl Browser {
             self.latest_playback_request_id = None;
         }
         self.playing_path = None;
-        self.playback_status = "Stopped".to_string();
+        self.set_playback_status("Stopped".to_string());
     }
 
     fn poll_playback_events(&mut self) {
@@ -1148,7 +1186,7 @@ impl Browser {
                     if let Some(pending) = self.pending_loop_retarget.as_ref() {
                         self.set_pending_playback_status(pending.request.target.desired);
                     } else {
-                        self.playback_status = "Playing".to_string();
+                        self.set_playback_status("Playing".to_string());
                     }
                 }
                 PlaybackRuntimeEvent::Progress { id, progress } => {
@@ -1158,7 +1196,7 @@ impl Browser {
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
                     self.pending_loop_retarget = None;
-                    self.playback_status = format!("Playback live update failed: {error}");
+                    self.set_playback_status(format!("Playback live update failed: {error}"));
                 }
                 PlaybackRuntimeEvent::Stopped { id }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
@@ -1171,7 +1209,7 @@ impl Browser {
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.accepted_playback_intent = None;
-                    self.playback_status = "Stopped".to_string();
+                    self.set_playback_status("Stopped".to_string());
                 }
                 PlaybackRuntimeEvent::Failed { id, error }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
@@ -1184,13 +1222,13 @@ impl Browser {
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.accepted_playback_intent = None;
-                    self.playback_status = format!("Playback failed: {error}");
+                    self.set_playback_status(format!("Playback failed: {error}"));
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
                     self.pending_loop_retarget = None;
-                    self.playback_status = "Playback live update cancelled".to_string();
+                    self.set_playback_status("Playback live update cancelled".to_string());
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
@@ -1203,7 +1241,7 @@ impl Browser {
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.accepted_playback_intent = None;
-                    self.playback_status = "Playback cancelled".to_string();
+                    self.set_playback_status("Playback cancelled".to_string());
                 }
                 _ => {}
             }
@@ -1311,9 +1349,9 @@ impl Browser {
             LoopRetargetProgressOutcome::Ignored => {}
             LoopRetargetProgressOutcome::Failed => {
                 if let Some(error) = progress.error.as_deref() {
-                    self.playback_status = format!("Playback live update failed: {error}");
+                    self.set_playback_status(format!("Playback live update failed: {error}"));
                 } else {
-                    self.playback_status = "Playback live update failed".to_string();
+                    self.set_playback_status("Playback live update failed".to_string());
                 }
             }
             LoopRetargetProgressOutcome::Inactive => self.clear_current_playback("Stopped"),
@@ -1324,8 +1362,9 @@ impl Browser {
                 if desired_matches {
                     self.set_playback_status_from_progress(&progress);
                 } else {
-                    self.playback_status =
-                        "Playback live update failed: playback mode did not change".to_string();
+                    self.set_playback_status(
+                        "Playback live update failed: playback mode did not change".to_string(),
+                    );
                 }
             }
         }
@@ -1367,17 +1406,17 @@ impl Browser {
     fn set_playback_status_from_progress(&mut self, progress: &PlaybackRuntimeProgress) {
         if let Some(progress) = progress.progress {
             let percent = progress * 100.0;
-            self.playback_status = format!("Playing {percent:.0}%");
+            self.set_playback_status(format!("Playing {percent:.0}%"));
         } else {
-            self.playback_status = "Playing".to_string();
+            self.set_playback_status("Playing".to_string());
         }
     }
 
     fn set_pending_playback_status(&mut self, desired: PlaybackDesiredState) {
-        self.playback_status = format!(
+        self.set_playback_status(format!(
             "{} · applying to playback",
             playback_state_status_word(desired)
-        );
+        ));
     }
 
     fn clear_current_playback(&mut self, status: &str) {
@@ -1390,7 +1429,7 @@ impl Browser {
         self.accepted_playback_intent = None;
         self.playback_metronome_beat_count = None;
         self.playback_metronome_confirmed = false;
-        self.playback_status = status.to_string();
+        self.set_playback_status(status.to_string());
     }
 
     fn pending_loop_retarget_is_current(&self, pending: &PendingLoopRetarget) -> bool {
@@ -1459,7 +1498,7 @@ impl Browser {
         self.audio_output_resume_generation = self.waveform_generation;
         self.audio_output_resolved = None;
         self.audio_output_applied_config = None;
-        self.audio_output_status = "Audio output change pending".to_string();
+        self.set_audio_output_status("Audio output change pending".to_string());
         self.begin_audio_output_open(cx);
     }
 
@@ -1467,10 +1506,17 @@ impl Browser {
         let resume = self.audio_output_resume.take();
         let pending = resume.clone().or_else(|| self.playback_init_intent.take());
         let Some(intent) = pending else {
-            self.playback_status = "Ready".to_string();
+            self.set_playback_status("Ready".to_string());
             return;
         };
-        let should_queue = if resume.is_some() {
+        let should_queue = if intent.origin == PlaybackIntentOrigin::CompareAnchor {
+            (if resume.is_some() {
+                self.audio_output_resume_epoch
+            } else {
+                self.playback_init_epoch
+            }) == self.playback_epoch
+                && self.compare_anchor_path_is_current(&intent.path)
+        } else if resume.is_some() {
             let selected_path = self
                 .selected
                 .and_then(|index| self.entries.get(index))
@@ -1501,7 +1547,7 @@ impl Browser {
             self.queue_playback_intent(intent, cx);
         } else {
             self.clear_playback_cursor();
-            self.playback_status = "Ready".to_string();
+            self.set_playback_status("Ready".to_string());
         }
     }
 }
@@ -1515,6 +1561,9 @@ fn resolve_queued_playback_intent(
     mut intent: PlaybackIntent,
     selected_entry: Option<&AudioFile>,
 ) -> Option<PlaybackIntent> {
+    if intent.origin == PlaybackIntentOrigin::CompareAnchor {
+        return Some(intent);
+    }
     let entry = selected_entry?;
     (entry.path == intent.path).then(|| {
         if intent.origin != PlaybackIntentOrigin::AudioOutputResume {
@@ -1992,6 +2041,21 @@ fn current_unix_epoch_seconds() -> i64 {
 
 fn preview_cursor_ratio_for_browser(browser: &Browser, ratio: f32) -> Option<f32> {
     browser.waveform.as_ref()?;
+    let selected_path = browser
+        .selected
+        .and_then(|index| browser.entries.get(index))
+        .map(|entry| entry.path.as_path());
+    if browser.playback_init_intent.as_ref().is_some_and(|intent| {
+        intent.origin == PlaybackIntentOrigin::CompareAnchor
+            && selected_path != Some(intent.path.as_path())
+    }) {
+        return None;
+    }
+    if let Some(playing_path) = browser.playing_path.as_deref()
+        && selected_path != Some(playing_path)
+    {
+        return None;
+    }
     preview_cursor_ratio(ratio)
 }
 
@@ -2001,6 +2065,18 @@ fn preview_cursor_ratio(ratio: f32) -> Option<f32> {
         return None;
     }
     Some(ratio.clamp(0.0, 1.0))
+}
+
+fn current_playhead_start(
+    playhead: Option<f32>,
+    cursor: Option<f32>,
+    last_start: Option<f32>,
+) -> f32 {
+    playhead
+        .and_then(preview_cursor_ratio)
+        .or_else(|| cursor.and_then(preview_cursor_ratio))
+        .or_else(|| last_start.and_then(preview_cursor_ratio))
+        .unwrap_or(0.0)
 }
 
 fn authoritative_cursor_progress(progress: &PlaybackRuntimeProgress) -> Option<f32> {
@@ -2057,17 +2133,17 @@ mod tests {
         PlaybackProgressDisposition, PlaybackRetargetAcknowledgement, PlaybackRetargetAnchor,
         PlaybackRetargetRequest, accepted_resume_intent, admit_loop_retarget,
         apply_pending_loop_retarget_to_resume, audio_output_resume_is_current,
-        authoritative_cursor_progress, captured_metronome_grid_or_source, cursor_interpolation,
-        fallback_metronome_target, metronome_target_is_pending, normalized_playback_start,
-        pending_resume_intent, playback_mode_for_intent, playback_progress_disposition,
-        playback_request_number_is_current, playback_retarget_anchor_matches,
-        playback_span_for_intent, playback_span_matches_preparation, preferred_metronome_grid,
-        preview_cursor_ratio, progress_poll_has_expired, progress_poll_is_current,
-        reconcile_playback_intent_mode, reduce_loop_retarget_progress,
-        reduce_playback_retarget_progress, resolve_queued_playback_intent,
-        retain_pending_loop_retarget_after_failed_admission, should_cancel_pending_autoplay,
-        should_queue_initialized_playback, should_record_last_played,
-        should_record_playback_history,
+        authoritative_cursor_progress, captured_metronome_grid_or_source, current_playhead_start,
+        cursor_interpolation, fallback_metronome_target, metronome_target_is_pending,
+        normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
+        playback_progress_disposition, playback_request_number_is_current,
+        playback_retarget_anchor_matches, playback_span_for_intent,
+        playback_span_matches_preparation, preferred_metronome_grid, preview_cursor_ratio,
+        progress_poll_has_expired, progress_poll_is_current, reconcile_playback_intent_mode,
+        reduce_loop_retarget_progress, reduce_playback_retarget_progress,
+        resolve_queued_playback_intent, retain_pending_loop_retarget_after_failed_admission,
+        should_cancel_pending_autoplay, should_queue_initialized_playback,
+        should_record_last_played, should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -2083,6 +2159,46 @@ mod tests {
         assert_eq!(on, Some(true));
         assert_eq!(off, Some(false));
         assert_eq!(super::next_locked_override(off), Some(true));
+    }
+
+    #[test]
+    fn current_playhead_prefers_visible_playback_then_cursor_then_last_start() {
+        assert_eq!(current_playhead_start(Some(0.6), Some(0.4), Some(0.2)), 0.6);
+        assert_eq!(current_playhead_start(None, Some(0.4), Some(0.2)), 0.4);
+        assert_eq!(current_playhead_start(None, None, Some(0.2)), 0.2);
+        assert_eq!(current_playhead_start(None, None, None), 0.0);
+        assert_eq!(current_playhead_start(Some(f32::NAN), Some(0.4), None), 0.4);
+    }
+
+    #[gpui::test]
+    fn current_playhead_state_is_scoped_to_waveform_and_selection_policy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        browser.update(cx, |view, _| {
+            view.entries = vec![AudioFile {
+                path: PathBuf::from("/tmp/current-playhead.wav"),
+                relative_path: PathBuf::from("current-playhead.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            view.waveform_play_region = WaveformPlayRegion::new(0.2, 0.8);
+            let intent = view
+                .selected_playback_intent(0.6, PlaybackIntentOrigin::Explicit)
+                .expect("selected WAV playback intent");
+            assert_eq!(intent.start, 0.2);
+            view.waveform_hover_cursor = Some(0.4);
+            view.waveform_last_play_start = Some(0.3);
+            view.invalidate_waveform_generation();
+            assert_eq!(view.waveform_hover_cursor, None);
+            assert_eq!(view.waveform_last_play_start, None);
+        });
     }
 
     fn sample_intent(path: &Path, looped: bool) -> PlaybackIntent {
@@ -2534,6 +2650,17 @@ mod tests {
             ..resolved
         };
         assert!(resolve_queued_playback_intent(&mut policy, stale, Some(&entry)).is_none());
+
+        let compare = PlaybackIntent {
+            origin: PlaybackIntentOrigin::CompareAnchor,
+            path: PathBuf::from("other.wav"),
+            looped: true,
+            ..resolved_manual.clone()
+        };
+        let captured = resolve_queued_playback_intent(&mut policy, compare.clone(), Some(&entry))
+            .expect("compare playback can target a different source");
+        assert_eq!(captured, compare);
+        assert_eq!(policy.current_file(), Some(&entry.stable_id()));
 
         let resume = PlaybackIntent {
             origin: PlaybackIntentOrigin::AudioOutputResume,
