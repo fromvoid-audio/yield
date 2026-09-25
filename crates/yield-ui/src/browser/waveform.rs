@@ -7,9 +7,9 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::beat_count_input::MAX_BEAT_COUNT;
 use gpui::{
-    AnyView, App, Bounds, ContentMask, Context, DragMoveEvent, Hsla, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px,
+    AnyView, App, Bounds, ContentMask, Context, DragMoveEvent, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px,
 };
 use yield_core::{
     WaveformEditFade, WaveformEditFadeDrag, WaveformEditFadeHandle, WaveformEditRegion,
@@ -1923,6 +1923,13 @@ pub(super) fn render_waveform(
     let click_bounds_for_hover = Rc::clone(&click_bounds);
     let bars = bars
         .track_focus(&browser.waveform_focus_handle)
+        .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+            if view.waveform_focus_handle.is_focused(window)
+                && view.handle_panel_focus_key(event, window, cx)
+            {
+                cx.stop_propagation();
+            }
+        }))
         .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
             if !*hovered {
                 let changed = view.waveform_fade_hover.take().is_some();

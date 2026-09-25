@@ -87,6 +87,7 @@ mod history;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod panel_focus;
 mod playback_age;
 mod played_ranges;
 mod playmark_timing;
@@ -326,6 +327,7 @@ pub(crate) struct Browser {
     selection: BrowserSelection,
     browser_focus_override: Option<AudioFileId>,
     browser_focus_detached: bool,
+    focus_chord_started: Option<(Instant, u64, Option<PathBuf>)>,
     context_menu: Option<context_menu::ContextMenuState>,
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
@@ -633,6 +635,7 @@ impl Browser {
             selection: BrowserSelection::new(),
             browser_focus_override: None,
             browser_focus_detached: false,
+            focus_chord_started: None,
             context_menu: None,
             waveform: None,
             waveform_error: None,
@@ -2557,6 +2560,17 @@ impl Browser {
         let function = event.keystroke.modifiers.function;
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
+        if self.shortcut_help.is_open()
+            || self.theme_settings_open
+            || self.audio_settings_open
+            || self.context_menu.is_some()
+            || secondary
+            || shift
+            || alt
+            || function
+        {
+            self.focus_chord_started = None;
+        }
         match shortcut_help::key_action(
             self.shortcut_help.is_open(),
             key,
@@ -2622,6 +2636,26 @@ impl Browser {
         ) {
             cx.stop_propagation();
             return;
+        }
+        if self.tag_input.read(cx).focus_handle().is_focused(window)
+            || self
+                .tag_filter_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            || self
+                .playmark_timing_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            || self.search_input.read(cx).focus_handle().is_focused(window)
+            || self
+                .beat_count_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+        {
+            self.focus_chord_started = None;
         }
         if self.tag_input.read(cx).focus_handle().is_focused(window) {
             if !event.is_held
@@ -2733,6 +2767,10 @@ impl Browser {
             } else if !event.is_held || volume::is_keyboard_key(key) {
                 self.change_volume_from_key(key, shift, cx);
             }
+            return;
+        }
+        if self.handle_panel_focus_key(event, window, cx) {
+            cx.stop_propagation();
             return;
         }
         if !event.is_held

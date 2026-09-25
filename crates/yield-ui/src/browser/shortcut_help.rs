@@ -292,6 +292,18 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Focus sample search",
     },
     ShortcutRow {
+        keys: "G W / G B",
+        description: "Focus waveform or sample browser",
+    },
+    ShortcutRow {
+        keys: "G T / G S",
+        description: "Focus folder tree or sources list",
+    },
+    ShortcutRow {
+        keys: "F (browser)",
+        description: "Focus the loaded sample when visible",
+    },
+    ShortcutRow {
         keys: "Up / Down",
         description: "Move sample focus",
     },
