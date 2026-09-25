@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Component, Path};
 #[cfg(test)]
@@ -24,6 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::app_dirs::WritableProfileGuard;
+use crate::filesystem_identity::stable_filesystem_identity_from_open_file;
 use crate::operation_journal::owner::LiveChunkEffectGrant;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
@@ -585,6 +587,17 @@ pub struct RestoreProof {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct StagingValidation {
     expected_bytes: u64,
+    expected_content_hash: [u8; 32],
+}
+
+impl StagingValidation {
+    /// Require exact content, including for an empty staged file.
+    pub const fn new(expected_bytes: u64, expected_content_hash: [u8; 32]) -> Self {
+        Self {
+            expected_bytes,
+            expected_content_hash,
+        }
+    }
 }
 
 /// All effect payloads understood by the owner boundary.
@@ -638,8 +651,12 @@ pub enum EffectRequest {
     ValidateStaging {
         /// Retained staging root.
         staging: StagingRoot,
+        /// Live source root required when the validated output carries a source fence.
+        source_root: Option<RootRegistrationRef>,
         /// Exact staged object identity.
         object: OwnedObjectIdentity,
+        /// Output bound to the validated staged object.
+        output: OutputIdentity,
         /// Bounded validation requirement.
         expected: StagingValidation,
     },
@@ -798,6 +815,54 @@ struct AuthorityFreeCommandView<'a> {
 }
 
 impl FileOperationCommand {
+    /// Build one read-only staged-file validation against a live owner registration.
+    /// The caller's root reference and fence are observations checked on the worker.
+    #[allow(dead_code)] // The journal checkpoint producer is added in OPT-1884.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_staging_validation(
+        operation_id: OperationId,
+        participant_id: ParticipantId,
+        effect_id: EffectId,
+        output: OutputIdentity,
+        registration: RootRegistrationRef,
+        authority: AuthorityFence,
+        locator: BoundedRelativeLocator,
+        object: OwnedObjectIdentity,
+        expected: StagingValidation,
+        source_fences: Vec<SourceFence>,
+        source_root: Option<RootRegistrationRef>,
+    ) -> Result<Self, FileOperationValidationError> {
+        let staging = StagingRoot {
+            binding: RootRoleBinding {
+                registration,
+                authority,
+                locator,
+                expected: ExpectedObject::Exact(object),
+            },
+        };
+        let command = Self {
+            operation_id,
+            participant_id,
+            effect_id,
+            target_registration: registration,
+            expected: ExpectedObject::Exact(object),
+            effect: EffectRequest::ValidateStaging {
+                staging,
+                source_root,
+                object,
+                output,
+                expected,
+            },
+            authorization: EffectAuthorization::ObservationOnly {
+                live_root_registration: registration,
+                source_fences: source_fences.clone(),
+            },
+            source_fences,
+        };
+        command.validate_shape()?;
+        Ok(command)
+    }
+
     #[allow(dead_code)] // Private OPT-1857 producer adapter has no ordinary-family caller yet.
     pub(crate) fn for_live_chunk(
         grant: &LiveChunkEffectGrant,
@@ -984,9 +1049,13 @@ impl FileOperationCommand {
                 live_root_registration,
                 source_fences,
             } => {
-                if !matches!(self.effect, EffectRequest::InspectOwnedObject { .. }) {
+                if !matches!(
+                    self.effect,
+                    EffectRequest::InspectOwnedObject { .. }
+                        | EffectRequest::ValidateStaging { .. }
+                ) {
                     return Err(FileOperationValidationError::new(
-                        "observation-only authorization is valid only for inspection",
+                        "observation-only authorization is valid only for inspection or staging validation",
                     ));
                 }
                 if source_fences.len() > FILE_OPERATION_OWNER_MAX_SOURCE_FENCES {
@@ -1011,12 +1080,13 @@ impl FileOperationCommand {
                 }
             }
         }
-        if !matches!(self.effect, EffectRequest::InspectOwnedObject { .. })
-            && matches!(
-                self.authorization,
-                EffectAuthorization::ObservationOnly { .. }
-            )
-        {
+        if !matches!(
+            self.effect,
+            EffectRequest::InspectOwnedObject { .. } | EffectRequest::ValidateStaging { .. }
+        ) && matches!(
+            self.authorization,
+            EffectAuthorization::ObservationOnly { .. }
+        ) {
             return Err(FileOperationValidationError::new(
                 "mutating effect requires live intent and capacity authorization",
             ));
@@ -1244,10 +1314,24 @@ impl EffectRequest {
                 require_present(&staging.binding)?;
                 let object = match self {
                     Self::FlushStaging { object, .. } => *object,
-                    Self::ValidateStaging { object, .. } => *object,
+                    Self::ValidateStaging { object, output, .. } => {
+                        if output.as_uuid().is_nil() {
+                            return Err(FileOperationValidationError::new(
+                                "staging validation output identity is nil",
+                            ));
+                        }
+                        *object
+                    }
                     _ => unreachable!("matched staging validation effect"),
                 };
                 require_binding_object(&staging.binding, object, "staging")?;
+                if let Self::ValidateStaging { source_root, .. } = self {
+                    if source_root.is_some() != (command_fences.len() == 1) {
+                        return Err(FileOperationValidationError::new(
+                            "staging source registration must match its one source fence",
+                        ));
+                    }
+                }
             }
             Self::PublishNoReplace {
                 staging,
@@ -1328,8 +1412,8 @@ impl EffectRequest {
 /// Typed outcome of an accepted effect request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EffectOutcome {
-    /// The owner applied an effect and returned observations.  Current production has no
-    /// backend, so this variant is reserved for a future qualified adapter and test fixtures.
+    /// The owner completed a qualified effect or read-only staging validation and returned
+    /// observations. A validation result alone does not authorize publication.
     Applied {
         /// Effect observations.
         evidence: EffectEvidence,
@@ -1376,6 +1460,45 @@ pub enum EffectOutcome {
 pub struct EffectEvidence {
     observed_identity: Option<OwnedObjectIdentity>,
     bytes: Option<u64>,
+    validated_staging: Option<ValidatedStagingEvidence>,
+}
+
+/// Physical staged-file proof produced by the file owner from a no-follow descriptor.
+/// This remains an observation; a journal checkpoint must be committed before publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedStagingEvidence {
+    output: OutputIdentity,
+    source_root: Option<RootRegistrationRef>,
+    stable_identity: String,
+    bytes: u64,
+    content_hash: [u8; 32],
+}
+
+impl ValidatedStagingEvidence {
+    /// Return the exact output bound to this validation.
+    pub const fn output(&self) -> OutputIdentity {
+        self.output
+    }
+
+    /// Return the source root checked for liveness, when the output has a source fence.
+    pub const fn source_root(&self) -> Option<RootRegistrationRef> {
+        self.source_root
+    }
+
+    /// Return the stable identity observed from the opened staged-file descriptor.
+    pub fn stable_identity(&self) -> &str {
+        &self.stable_identity
+    }
+
+    /// Return the exact byte length observed during validation.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Return the BLAKE3 hash of the complete staged content.
+    pub const fn content_hash(&self) -> [u8; 32] {
+        self.content_hash
+    }
 }
 
 impl EffectEvidence {
@@ -1387,6 +1510,11 @@ impl EffectEvidence {
     /// Return the observed byte count, if any.
     pub const fn bytes(&self) -> Option<u64> {
         self.bytes
+    }
+
+    /// Return descriptor-derived staging proof, if this was a validation result.
+    pub fn validated_staging(&self) -> Option<&ValidatedStagingEvidence> {
+        self.validated_staging.as_ref()
     }
 }
 
@@ -2812,10 +2940,15 @@ impl WorkerState {
                                 Ok(_source_permit) => {
                                     #[cfg(test)]
                                     shared.execution_count.fetch_add(1, Ordering::AcqRel);
-                                    EffectOutcome::Unsupported {
-                                        reason: String::from(
-                                            "no production file-effect producer or qualified backend is available",
-                                        ),
+                                    match &command.effect {
+                                        EffectRequest::ValidateStaging { .. } => {
+                                            validate_staging_effect(&command, &self.registrations)
+                                        }
+                                        _ => EffectOutcome::Unsupported {
+                                            reason: String::from(
+                                                "no production file-effect producer or qualified backend is available",
+                                            ),
+                                        },
                                     }
                                 }
                             },
@@ -3758,6 +3891,159 @@ fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
     }
 }
 
+/// Validate staged bytes through the registered directory descriptor. This is a read-only
+/// observation; the journal must bind and commit it before any final namespace claim.
+fn validate_staging_effect(
+    command: &FileOperationCommand,
+    registrations: &BTreeMap<RootRegistrationRef, RootRegistrationState>,
+) -> EffectOutcome {
+    let EffectRequest::ValidateStaging {
+        staging,
+        source_root,
+        object,
+        output,
+        expected,
+    } = &command.effect
+    else {
+        unreachable!("staging validation dispatch requires its exact effect")
+    };
+    let Some(capability) = registrations
+        .get(&staging.binding.registration)
+        .and_then(|registration| registration.capability.as_ref())
+    else {
+        return EffectOutcome::Unsupported {
+            reason: String::from("staging validation requires a production root capability"),
+        };
+    };
+    if let Err(reason) = capability.validate() {
+        return EffectOutcome::SupersededBeforeEffect {
+            reason: bounded_diagnostic(reason),
+        };
+    }
+    let mut file = match capability
+        .root
+        .open_file_read_nofollow(Path::new(staging.binding.locator.as_str()))
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return EffectOutcome::Collision {
+                reason: bounded_diagnostic(format!(
+                    "staging entry cannot be opened without following links: {error}"
+                )),
+            };
+        }
+    };
+    let (before, stable_identity) = match (
+        file.metadata(),
+        stable_filesystem_identity_from_open_file(&file),
+    ) {
+        (Ok(metadata), Some(identity)) => (metadata, identity),
+        _ => {
+            return EffectOutcome::RetainedUncertain {
+                reason: String::from("staging descriptor identity is unavailable"),
+            };
+        }
+    };
+    if !before.is_file() || before.len() != expected.expected_bytes {
+        return EffectOutcome::Collision {
+            reason: String::from("staging kind or length differs from the required content"),
+        };
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::MetadataExt::nlink(&before) != 1 {
+        return EffectOutcome::Collision {
+            reason: String::from("staging file has another hard link"),
+        };
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        let count = match file.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                return EffectOutcome::RetainedUncertain {
+                    reason: bounded_diagnostic(format!("staging content read failed: {error}")),
+                };
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        bytes = match bytes.checked_add(count as u64) {
+            Some(bytes) if bytes <= expected.expected_bytes => bytes,
+            _ => {
+                return EffectOutcome::Collision {
+                    reason: String::from("staging content exceeds its required length"),
+                };
+            }
+        };
+        hasher.update(&buffer[..count]);
+    }
+    let content_hash = *hasher.finalize().as_bytes();
+    let after_identity = stable_filesystem_identity_from_open_file(&file);
+    let after = file.metadata();
+    if bytes != expected.expected_bytes
+        || content_hash != expected.expected_content_hash
+        || after_identity.as_deref() != Some(stable_identity.as_str())
+        || !after
+            .as_ref()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes)
+    {
+        return EffectOutcome::Collision {
+            reason: String::from("staging identity, length, or content changed during validation"),
+        };
+    }
+    #[cfg(unix)]
+    if after
+        .as_ref()
+        .is_ok_and(|metadata| std::os::unix::fs::MetadataExt::nlink(metadata) != 1)
+    {
+        return EffectOutcome::Collision {
+            reason: String::from("staging file gained another hard link"),
+        };
+    }
+    if let Err(reason) = capability.validate() {
+        return EffectOutcome::SupersededBeforeEffect {
+            reason: bounded_diagnostic(reason),
+        };
+    }
+    if let EffectRequest::ValidateStaging {
+        source_root: Some(source_root),
+        ..
+    } = &command.effect
+    {
+        let Some(source) = registrations
+            .get(source_root)
+            .and_then(|registration| registration.capability.as_ref())
+        else {
+            return EffectOutcome::SupersededBeforeEffect {
+                reason: String::from("staging source was retired during validation"),
+            };
+        };
+        if let Err(reason) = source.validate() {
+            return EffectOutcome::SupersededBeforeEffect {
+                reason: bounded_diagnostic(format!(
+                    "staging source closed during validation: {reason}"
+                )),
+            };
+        }
+    }
+    EffectOutcome::Applied {
+        evidence: EffectEvidence {
+            observed_identity: Some(*object),
+            bytes: Some(bytes),
+            validated_staging: Some(ValidatedStagingEvidence {
+                output: *output,
+                source_root: *source_root,
+                stable_identity,
+                bytes,
+                content_hash,
+            }),
+        },
+    }
+}
+
 fn validate_for_owner(
     command: &FileOperationCommand,
     grant: Option<&LiveChunkEffectGrant>,
@@ -3789,6 +4075,35 @@ fn validate_for_owner(
                     )),
                 })?;
         }
+    }
+    if let EffectRequest::ValidateStaging {
+        source_root: Some(source_root),
+        ..
+    } = &command.effect
+    {
+        let fence = &command.source_fences[0];
+        let Some(source) = registrations.get(source_root) else {
+            return Err(EffectOutcome::SupersededBeforeEffect {
+                reason: String::from("staging source registration is not retained"),
+            });
+        };
+        if source_root.owner != shared.owner
+            || source.authority != AuthorityFence::Source(fence.clone())
+        {
+            return Err(EffectOutcome::SupersededBeforeEffect {
+                reason: String::from("staging source authority fence is stale or mismatched"),
+            });
+        }
+        let Some(capability) = source.capability.as_ref() else {
+            return Err(EffectOutcome::Unsupported {
+                reason: String::from("staging source requires a production root capability"),
+            });
+        };
+        capability
+            .validate()
+            .map_err(|reason| EffectOutcome::SupersededBeforeEffect {
+                reason: bounded_diagnostic(format!("staging source is no longer live: {reason}")),
+            })?;
     }
     match &command.authorization {
         EffectAuthorization::Mutating {
@@ -4203,6 +4518,181 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn staged_validation_uses_no_follow_file_identity_and_exact_content() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-staging-validation");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+        let staged = guard.profile_root().join("staging.bin");
+        std::fs::write(&staged, b"abc").expect("staged content");
+        let object = OwnedObjectIdentity::new();
+        let output = OutputIdentity::new();
+        let expected = StagingValidation::new(3, *blake3::hash(b"abc").as_bytes());
+        let make_command = || {
+            FileOperationCommand::for_staging_validation(
+                OperationId::new(),
+                ParticipantId::new(),
+                EffectId::new(),
+                output,
+                registration,
+                profile_fence(owner.owner_identity()),
+                BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+                object,
+                expected,
+                vec![],
+                None,
+            )
+            .expect("bounded validation command")
+        };
+        let mut valid = owner.submit(make_command()).expect("validation queues");
+        let result = valid
+            .recv_timeout(Duration::from_secs(1))
+            .expect("validation result");
+        let EffectOutcome::Applied { evidence } = result.outcome() else {
+            panic!("expected validated staging, got {:?}", result.outcome());
+        };
+        let proof = evidence
+            .validated_staging()
+            .expect("physical staging proof");
+        assert_eq!(proof.output(), output);
+        assert_eq!(proof.source_root(), None);
+        assert_eq!(proof.bytes(), 3);
+        assert_eq!(proof.content_hash(), *blake3::hash(b"abc").as_bytes());
+        assert_eq!(
+            proof.stable_identity(),
+            stable_filesystem_identity_from_open_file(
+                &std::fs::File::open(&staged).expect("reopen staged file")
+            )
+            .expect("stable staged identity")
+        );
+        valid.acknowledge().expect("acknowledge valid result");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&staged)
+            .expect("staged metadata")
+            .permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&staged, permissions).expect("make staging read only");
+        let mut read_only = owner
+            .submit(make_command())
+            .expect("read-only validation queues");
+        assert!(matches!(
+            read_only
+                .recv_timeout(Duration::from_secs(1))
+                .expect("read-only validation result")
+                .outcome(),
+            EffectOutcome::Applied { .. }
+        ));
+        read_only
+            .acknowledge()
+            .expect("acknowledge read-only result");
+        let mut permissions = std::fs::metadata(&staged)
+            .expect("staged metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&staged, permissions).expect("restore staging permissions");
+
+        assert!(
+            FileOperationCommand::for_staging_validation(
+                OperationId::new(),
+                ParticipantId::new(),
+                EffectId::new(),
+                output,
+                registration,
+                profile_fence(owner.owner_identity()),
+                BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+                object,
+                expected,
+                vec![source_fence()],
+                None,
+            )
+            .is_err()
+        );
+        let wrong_source = FileOperationCommand::for_staging_validation(
+            OperationId::new(),
+            ParticipantId::new(),
+            EffectId::new(),
+            output,
+            registration,
+            profile_fence(owner.owner_identity()),
+            BoundedRelativeLocator::new("staging.bin").expect("staging locator"),
+            object,
+            expected,
+            vec![source_fence()],
+            Some(registration),
+        )
+        .expect("bounded wrong-source command");
+        let mut denied = owner.submit(wrong_source).expect("wrong source queues");
+        assert!(matches!(
+            denied
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wrong source result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        denied
+            .acknowledge()
+            .expect("acknowledge wrong source result");
+
+        std::fs::write(&staged, b"abd").expect("change staged content");
+        let mut changed = owner
+            .submit(make_command())
+            .expect("changed validation queues");
+        assert!(matches!(
+            changed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("changed validation result")
+                .outcome(),
+            EffectOutcome::Collision { .. }
+        ));
+        changed.acknowledge().expect("acknowledge changed result");
+        std::fs::write(&staged, b"abc").expect("restore staged content");
+
+        let hardlink = guard.profile_root().join("staging-hardlink.bin");
+        std::fs::hard_link(&staged, &hardlink).expect("substitute hard-linked staging");
+        let mut linked = owner
+            .submit(make_command())
+            .expect("hard-link validation queues");
+        assert!(matches!(
+            linked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("hard-link validation result")
+                .outcome(),
+            EffectOutcome::Collision { .. }
+        ));
+        linked.acknowledge().expect("acknowledge hard-link result");
+        std::fs::remove_file(&hardlink).expect("remove hard link");
+
+        let target = guard.profile_root().join("staging-target.bin");
+        std::fs::rename(&staged, &target).expect("move original staging");
+        std::os::unix::fs::symlink(&target, &staged).expect("substitute staging symlink");
+        let mut symlinked = owner
+            .submit(make_command())
+            .expect("symlink validation queues");
+        assert!(matches!(
+            symlinked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("symlink validation result")
+                .outcome(),
+            EffectOutcome::Collision { .. }
+        ));
+        symlinked.acknowledge().expect("acknowledge symlink result");
+        std::fs::remove_file(&staged).expect("remove symlink");
+        std::fs::rename(&target, &staged).expect("restore staged file");
+        owner.retire_root(registration).expect("retire root");
+        owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn old_owner_root_reference_cannot_resurrect_after_restart() {
         let _runtime = TestRuntimeGuard::acquire();
         let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
@@ -4414,8 +4904,10 @@ mod tests {
             },
             EffectRequest::ValidateStaging {
                 staging: stage_present.clone(),
+                source_root: None,
                 object: test_object(),
-                expected: StagingValidation { expected_bytes: 1 },
+                output: OutputIdentity::new(),
+                expected: StagingValidation::new(1, [0; 32]),
             },
             EffectRequest::PublishNoReplace {
                 staging: stage_present.clone(),

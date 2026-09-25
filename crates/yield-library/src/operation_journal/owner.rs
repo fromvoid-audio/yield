@@ -8177,7 +8177,57 @@ mod tests {
                 .expect("uncertain reissue result")
                 .is_err()
         );
+        let staged_file = source_root.path().join("staging-owner-check.bin");
+        fs::write(&staged_file, b"abc").expect("staged source content");
+        let staged_object = crate::file_operation_owner::OwnedObjectIdentity::new();
+        let staged_output = OutputIdentity::new();
+        let staged_command = || {
+            FileOperationCommand::for_staging_validation(
+                operation_id,
+                participant_id,
+                EffectId::new(),
+                staged_output,
+                source_root_registration,
+                crate::file_operation_owner::AuthorityFence::Source(fence.clone()),
+                crate::file_operation_owner::BoundedRelativeLocator::new("staging-owner-check.bin")
+                    .expect("staging locator"),
+                staged_object,
+                crate::file_operation_owner::StagingValidation::new(
+                    3,
+                    *blake3::hash(b"abc").as_bytes(),
+                ),
+                vec![fence.clone()],
+                Some(source_root_registration),
+            )
+            .expect("source-bound staging command")
+        };
+        let mut staged = file_owner
+            .submit(staged_command())
+            .expect("source-bound validation queues");
+        let staged_result = staged
+            .recv_timeout(Duration::from_secs(2))
+            .expect("source-bound validation result");
+        let EffectOutcome::Applied { evidence } = staged_result.outcome() else {
+            panic!("expected source-bound staging validation");
+        };
+        let proof = evidence.validated_staging().expect("staging proof");
+        assert_eq!(proof.output(), staged_output);
+        assert_eq!(proof.source_root(), Some(source_root_registration));
+        staged.acknowledge().expect("staging result ack");
         drop(guard);
+        let mut stale_staged = file_owner
+            .submit(staged_command())
+            .expect("stale staging validation queues");
+        assert!(matches!(
+            stale_staged
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale staging validation result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale_staged
+            .acknowledge()
+            .expect("stale staging result ack");
         assert!(
             file_owner
                 .register_source_root(Arc::clone(&source_request), &fixture.owner, fence.clone())
@@ -8196,7 +8246,7 @@ mod tests {
                 .outcome(),
             EffectOutcome::SupersededBeforeEffect { .. }
         ));
-        assert_eq!(file_owner.execution_count_for_test(), 1);
+        assert_eq!(file_owner.execution_count_for_test(), 2);
         let unused_source = source_result
             .take_unused_live_chunk_grant()
             .expect("source grant recovery")
