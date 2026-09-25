@@ -148,10 +148,15 @@ impl Browser {
         let message = if let Some(error) = self.waveform_error.as_ref() {
             (error.clone(), theme.colors.danger)
         } else if let Some(preview) = self.waveform.as_ref() {
+            let space_action = if self.random_audition_sticky {
+                "Space auditions a random section"
+            } else {
+                "Space replays"
+            };
             (
                 format!(
-                    "Preview loaded: {}  ·  Space plays or stops  ·  Esc stops",
-                    format_duration(Some(preview.duration_seconds))
+                    "Preview loaded: {}  ·  {space_action}  ·  Esc stops",
+                    format_duration(Some(preview.duration_seconds)),
                 ),
                 theme.colors.text_muted,
             )
@@ -1971,6 +1976,81 @@ mod tests {
             total_frames: 48_000,
             detail_context: None,
         }
+    }
+
+    #[gpui::test]
+    fn space_replays_selected_span_and_shift_space_plays_from_mark_to_end(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let path = PathBuf::from("/tmp/space-shortcut.wav");
+        let region = waveform::WaveformPlayRegion::new(0.2, 0.8).expect("play region");
+        install_playmark_state(&browser, cx, &path, region);
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                window.focus(&view.focus_handle);
+                view.playing_path = Some(path.clone());
+                let press = |view: &mut Browser,
+                             key: &str,
+                             window: &mut Window,
+                             cx: &mut Context<Browser>| {
+                    view.handle_key_down(
+                        &KeyDownEvent {
+                            keystroke: Keystroke::parse(key).expect("shortcut"),
+                            is_held: false,
+                        },
+                        window,
+                        cx,
+                    );
+                };
+                press(view, "space", window, cx);
+                let intent = view.playback_init_intent.as_ref().expect("replay queued");
+                assert_eq!(intent.path, path);
+                assert_eq!(intent.region, Some(region));
+                assert_eq!(intent.start, region.start);
+
+                press(view, "shift-space", window, cx);
+                let intent = view
+                    .playback_init_intent
+                    .as_ref()
+                    .expect("mark play queued");
+                assert_eq!(intent.start, region.start);
+                assert_eq!(intent.region, None);
+
+                press(view, "shift-c", window, cx);
+                assert_eq!(view.playback_status, "Set a compare anchor first");
+                assert_eq!(
+                    view.playback_init_intent
+                        .as_ref()
+                        .map(|intent| intent.region),
+                    Some(None)
+                );
+
+                view.playing_path = None;
+                view.waveform = None;
+                view.waveform_play_region = None;
+                view.playback_init_intent = None;
+                press(view, "shift-space", window, cx);
+                let intent = view
+                    .playback_init_intent
+                    .as_ref()
+                    .expect("fallback play queued");
+                assert_eq!(intent.start, 0.0);
+                assert_eq!(intent.region, None);
+
+                view.playback_init_intent = None;
+                view.selected = None;
+                press(view, "space", window, cx);
+                assert_eq!(view.playback_status, "Select a sample first");
+                assert!(view.playback_init_intent.is_none());
+
+                view.selected = Some(0);
+                view.waveform = Some(inert_preview());
+                view.random_audition_sticky = true;
+                press(view, "space", window, cx);
+                assert_eq!(view.playback_status, "Random audition preview unavailable");
+                assert!(view.playback_init_intent.is_none());
+            });
+        });
     }
 
     fn install_playmark_state(
