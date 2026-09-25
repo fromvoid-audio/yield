@@ -3665,6 +3665,9 @@ fn worker_main(
             let _ = ready.send(Err(String::from(
                 "owner panicked during startup or execution",
             )));
+            // No effect can continue after the worker exits. Keep receipt evidence without
+            // retaining profile locks or source-root descriptors across uncertain shutdown.
+            state.registrations.clear();
             shared.retain_worker_state(state);
             shared.mark_unavailable("owner worker panicked");
             let outcome = FileOperationOwnerShutdown::RetirementUncertain {
@@ -3680,6 +3683,9 @@ fn worker_main(
 }
 
 fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
+    // Root capabilities are execution custody, while receipts are recovery evidence. The
+    // worker has stopped accepting effects, so release descriptors on every shutdown path.
+    state.registrations.clear();
     let unavailable = OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
         == OwnerLifecycle::Unavailable;
     if shared.implicit_drop.load(Ordering::Acquire) || unavailable {
@@ -4169,6 +4175,37 @@ mod tests {
             matches!(shutdown, FileOperationOwnerShutdown::DrainedAck),
             "unexpected shutdown: {shutdown:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deferred_shutdown_retains_receipt_without_profile_root_capability() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-deferred");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+        let mut request = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("effect queues");
+        request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retained result");
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::RetirementDeferred { .. }
+        ));
+        let retained = owner
+            .shared
+            .retained_state
+            .lock()
+            .expect("retained state lock");
+        let retained = retained.as_ref().expect("retained evidence");
+        assert!(retained.registrations.is_empty());
+        assert_eq!(retained.receipts.len(), 1);
     }
 
     #[test]
