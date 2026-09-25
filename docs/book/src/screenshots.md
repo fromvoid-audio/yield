@@ -1,10 +1,10 @@
 # Screenshots and Feature Tour
 
-This page is the starter visual tour for new users. The focused screenshots below show the current Wavecrate app shell with a small sample source loaded.
+This page is the starter visual tour for new users. The focused screenshots below show the current Yield app shell with a small sample source loaded.
 
 ## Main Window
 
-![Wavecrate main window](assets/wavecrate-main-window.png)
+![Yield main window](assets/yield-main-window.png)
 
 The main window shows the core working loop:
 

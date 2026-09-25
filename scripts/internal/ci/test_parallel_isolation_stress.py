@@ -33,7 +33,7 @@ class ParallelIsolationStressTests(unittest.TestCase):
 
             ---- test_isolation_sentinels::sentinel stdout ----
             thread 'test_isolation_sentinels::sentinel' panicked at src/lib.rs:1:1:
-            WAVECRATE_ISOLATION:process_state_contamination env,cwd
+            YIELD_ISOLATION:process_state_contamination env,cwd
 
             failures:
                 test_isolation_sentinels::sentinel
@@ -49,7 +49,7 @@ class ParallelIsolationStressTests(unittest.TestCase):
         self.assertEqual(
             failures[0].failure_class, "process_state_contamination"
         )
-        self.assertIn("WAVECRATE_ISOLATION:", failures[0].evidence)
+        self.assertIn("YIELD_ISOLATION:", failures[0].evidence)
 
     def test_failure_parser_associates_each_test_with_its_own_evidence(self) -> None:
         output = textwrap.dedent(
@@ -129,20 +129,20 @@ class ParallelIsolationStressTests(unittest.TestCase):
                 root,
                 """
                 import os, sys
-                process_env = "WAVECRATE_ISOLATION_INJECT_PROCESS_LEAK"
-                global_env = "WAVECRATE_ISOLATION_INJECT_GLOBAL_HOOK_LEAK"
+                process_env = "YIELD_ISOLATION_INJECT_PROCESS_LEAK"
+                global_env = "YIELD_ISOLATION_INJECT_GLOBAL_HOOK_LEAK"
                 if process_env in os.environ:
                     name = (
                         "test_isolation_sentinels::"
                         "parallel_isolation_sentinel_process_state_guard_under_contention"
                     )
-                    marker = "WAVECRATE_ISOLATION:process_state_contamination"
+                    marker = "YIELD_ISOLATION:process_state_contamination"
                 elif global_env in os.environ:
                     name = (
                         "app::controller::library::source_write_priority::tests::"
                         "parallel_isolation_sentinel_scoped_global_control_lifecycle_under_contention"
                     )
-                    marker = "WAVECRATE_ISOLATION:mutable_global_control_leak"
+                    marker = "YIELD_ISOLATION:mutable_global_control_leak"
                 else:
                     raise SystemExit(2)
                 print(f"test {name} ... FAILED")

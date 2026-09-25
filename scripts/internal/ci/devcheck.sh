@@ -13,7 +13,7 @@ cd "$ROOT_DIR"
 RADIANT_DIR="$(./scripts/radiant.sh locate | sed -n 's/^RADIANT_DIR=//p')"
 # shellcheck source=scripts/internal/use_cargo_cache.sh
 source "$ROOT_DIR/scripts/internal/use_cargo_cache.sh"
-wavecrate_enable_cargo_cache
+yield_enable_cargo_cache
 
 usage() {
   cat <<'EOF'
@@ -67,14 +67,14 @@ echo "[devcheck] cargo check --manifest-path $RADIANT_DIR/Cargo.toml --example g
 cargo check --manifest-path "$RADIANT_DIR/Cargo.toml" --example generic_native --no-default-features
 
 if (( APP_ONLY == 1 )); then
-  echo "[devcheck] cargo check -p wavecrate --lib --bin wavecrate"
-  cargo check -p wavecrate --lib --bin wavecrate
+  echo "[devcheck] cargo check -p yield --lib --bin yield"
+  cargo check -p yield --lib --bin yield
 elif (( WORKSPACE == 1 )); then
   echo "[devcheck] cargo check --workspace --tests --bins"
   cargo check --workspace --tests --bins
 else
-  echo "[devcheck] cargo check -p wavecrate --tests --bins"
-  cargo check -p wavecrate --tests --bins
+  echo "[devcheck] cargo check -p yield --tests --bins"
+  cargo check -p yield --tests --bins
 fi
 
 echo "[devcheck] OK"

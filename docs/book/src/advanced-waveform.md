@@ -47,7 +47,7 @@ Beat guides draw divisions over the waveform.
 - Toggle BPM Snap to make playmark and editmark resizing land on whole BPM values derived from the beat guide count.
 - Toggle the metronome when you want click feedback during playback.
 
-Beat guides are visual timing aids. They do not turn Wavecrate into an arrangement editor.
+Beat guides are visual timing aids. They do not turn Yield into an arrangement editor.
 
 ## Random Playback Controls
 

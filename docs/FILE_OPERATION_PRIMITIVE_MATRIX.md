@@ -19,9 +19,9 @@ The columns intentionally describe different facts:
 
 | Axis | Meaning |
 | --- | --- |
-| Primitive available | The platform exposes an API that can perform a low-level operation. This is an API fact, not a Wavecrate guarantee. |
+| Primitive available | The platform exposes an API that can perform a low-level operation. This is an API fact, not a Yield guarantee. |
 | Source-local implementation | The current source database recovery path has code that uses the primitive for its own journal rows. This is not a general file owner. |
-| Workflow/volume qualified | Wavecrate has evidence for the exact roots, object identities, volume relationship, ownership, ordering, collision behavior, synchronization, and uncertainty retention required by the effect. |
+| Workflow/volume qualified | Yield has evidence for the exact roots, object identities, volume relationship, ownership, ordering, collision behavior, synchronization, and uncertainty retention required by the effect. |
 | FileOperationOwner-ready | The owner queue, live effect grant, producer adapter, and coordinator barriers exist and have been qualified. OPT-1630, OPT-1857, OPT-1632, and OPT-1633 remain required for the corresponding effects. |
 
 `Candidate` means that a primitive may be useful after the required evidence is
@@ -80,7 +80,7 @@ impossible.
 
 Apple's [clonefile(2) documentation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/clonefile.2)
 documents clone operations including the `fclonefileat` form. The accepted
-Wavecrate decision records that the call does not return an opened destination
+Yield decision records that the call does not return an opened destination
 handle or transaction provenance. Reopening by pathname therefore cannot prove
 that the inspected object is the object created by this transaction. Cloning
 may be a staging primitive candidate, but it is not publication or cleanup
@@ -108,13 +108,13 @@ The Microsoft [`FILE_RENAME_INFO` documentation](https://learn.microsoft.com/en-
 states that `RootDirectory` is normally null, but can be a directory handle
 when `FileName` is relative. The current source's target-parent handle plus a
 relative leaf therefore matches this narrow documented API shape. That
-documentation does not prove Wavecrate's staged-identity, volume, collision,
+documentation does not prove Yield's staged-identity, volume, collision,
 or owner-fence contract; Windows remains a primitive candidate pending
 targeted workflow and filesystem qualification.
 
 [`FlushFileBuffers`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
 flushes buffered information for the supplied file or device handle. It does
-not, by itself, qualify Wavecrate's whole publication, namespace visibility,
+not, by itself, qualify Yield's whole publication, namespace visibility,
 volume, or power-loss contract. The current Windows code and policy therefore
 remain **pending workflow qualification**. Windows-specific CI runs #19–#21
 did not start because of the account billing gate; there is no Windows

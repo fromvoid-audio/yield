@@ -2,10 +2,10 @@
 layout: default
 title: Usage
 permalink: /usage
-description: How to set up Wavecrate, triage samples, edit waveforms, and manage sources.
+description: How to set up Yield, triage samples, edit waveforms, and manage sources.
 ---
 
-# Wavecrate Usage Guide
+# Yield Usage Guide
 
 * TOC
 {:toc}
@@ -13,7 +13,7 @@ description: How to set up Wavecrate, triage samples, edit waveforms, and manage
 ## Documentation status
 
 This is the current lightweight GitHub Pages usage guide. The expanded public
-docs live at <https://portalsurfer.org/wavecrate/docs/>; both surfaces document
+docs live at <https://portalsurfer.org/yield/docs/>; both surfaces document
 the same shipped app platforms: macOS and Windows.
 
 ## Quick start
@@ -30,20 +30,20 @@ the same shipped app platforms: macOS and Windows.
 - **Resizable sidebar:** Drag the divider to resize Sources and the main view.
 
 ## Configuration and storage
-- Wavecrate app builds currently support macOS and Windows. Linux is not currently supported for app installs.
-- App files live in a single `.wavecrate` folder inside your supported OS config directory. You can override the base dir with `WAVECRATE_CONFIG_HOME`.
-  - Windows: `%APPDATA%\\.wavecrate\\`
-  - macOS: `~/Library/Application Support/.wavecrate/`
+- Yield app builds currently support macOS and Windows. Linux is not currently supported for app installs.
+- App files live in a single `.yield` folder inside your supported OS config directory. You can override the base dir with `YIELD_CONFIG_HOME`.
+  - Windows: `%APPDATA%\\.yield\\`
+  - macOS: `~/Library/Application Support/.yield/`
 - App settings live in `config.toml`; sources are stored in `library.db` in the same folder. Legacy `config.json` files migrate automatically.
-- You can override the app data root by setting `app_data_dir` in `config.toml` (absolute path to the `.wavecrate` folder). This controls where models, logs, and the library DB live.
-- Each source keeps `.wavecrate_samples.db` beside the audio. Logs live under `.wavecrate/logs`.
+- You can override the app data root by setting `app_data_dir` in `config.toml` (absolute path to the `.yield` folder). This controls where models, logs, and the library DB live.
+- Each source keeps `.yield_samples.db` beside the audio. Logs live under `.yield/logs`.
 - Downloaded bundles may include ML assets under `models/`; keep those assets with the extracted app bundle unless a release note says they should be moved into app data.
-- Model assets (when present) live in `.wavecrate/models` (Windows: `%APPDATA%\\.wavecrate\\models\\`, macOS: `~/Library/Application Support/.wavecrate/models/`).
+- Model assets (when present) live in `.yield/models` (Windows: `%APPDATA%\\.yield\\models\\`, macOS: `~/Library/Application Support/.yield/models/`).
 - Tip: Use **Options → Open config folder** to jump to the right place on disk.
 
 ## Manage sources
-- Click **+** or drop a folder to add. Wavecrate creates/uses `.wavecrate_samples.db` and loads `.wav` entries.
-- Right-click a source row to sync, prioritize **Process Source**, open it in the file explorer, remap it, or remove it. Add new files outside Wavecrate? Run a sync.
+- Click **+** or drop a folder to add. Yield creates/uses `.yield_samples.db` and loads `.wav` entries.
+- Right-click a source row to sync, prioritize **Process Source**, open it in the file explorer, remap it, or remove it. Add new files outside Yield? Run a sync.
 - Selecting any row loads the waveform and (by default) starts playback. Missing sources are prefixed with `!`. Similarity artifacts reconcile automatically after adding or changing a source.
 - Use the **Folders** tree to filter which subfolders appear in the Samples list. Drag samples onto folders to move files on disk.
 
@@ -69,7 +69,7 @@ the same shipped app platforms: macOS and Windows.
 - Waveform controls: **Mono envelope** (downmixed average) / **Split L/R**, **Loop: On/Off**, **BPM snap** with a BPM input.
 - Drag with the primary mouse button to create a play mark selection for auditioning, looping, extraction, and DAW handoff. Drag with the secondary mouse button to create an edit mark selection for destructive in-place edits. Drag edge brackets to resize. When **BPM snap** is enabled, playback-selection drags snap to beats by default; hold **Alt** while dragging to move freely, and hold **Shift** on a playback edge drag to smart-scale BPM from the resized span. Mouse wheel zooms; **Shift + wheel** pans when zoomed. The bottom handle supports drag-and-drop.
 - Click **Silence Split** to detect slices and enter review immediately. Use **Left/Right** to move between slices, **Space** to audition the focused slice, **A** to mark or unmark it for export, **E** to export the marked slices, and **Esc** to leave review mode without clearing the slice batch.
-- Right-click a selection for destructive in-place edits that overwrite the source: **Crop to selection**, **Trim selection out**, **Reverse selection**, **Fade to null** (L→R or R→L), **Mute selection**, **Remove clicks** (best for short selections with audio on both sides), **Normalize selection** (adds 5 ms edge fades). Wavecrate uses confirmations and undo-oriented recovery where it owns the operation, but keep backups and choose deliberately.
+- Right-click a selection for destructive in-place edits that overwrite the source: **Crop to selection**, **Trim selection out**, **Reverse selection**, **Fade to null** (L→R or R→L), **Mute selection**, **Remove clicks** (best for short selections with audio on both sides), **Normalize selection** (adds 5 ms edge fades). Yield uses confirmations and undo-oriented recovery where it owns the operation, but keep backups and choose deliberately.
 - Destructive edits prompt for confirmation; enable **Yolo mode** in **Options** to apply without prompting.
 - Drag the selection handle:
   - Onto the Samples list to save a trimmed clip tagged by the current filter (saved into the selected folder when applicable).

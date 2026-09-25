@@ -27,7 +27,7 @@ try {
     "docs/TROUBLESHOOTING.md"
   )
   $requiredPhrases = @(
-    'Linear project `Wavecrate` under team `PORTALSURFER`'
+    'Linear project `Yield` under team `PORTALSURFER`'
   )
 
   $text = Get-Content -LiteralPath $docsReadme -Raw

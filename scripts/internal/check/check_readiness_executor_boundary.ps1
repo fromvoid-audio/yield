@@ -37,13 +37,13 @@ try {
   }
 
   Require-Literal "Cargo.toml" 'default = []' `
-    "The default Wavecrate feature set must remain free of legacy-controller."
+    "The default Yield feature set must remain free of legacy-controller."
   Require-Literal "src/lib.rs" 'pub mod readiness_execution;' `
     "The readiness executor must remain an explicit library API."
   Require-Literal "tools/gui-test-cli/Cargo.toml" 'features = ["legacy-controller"]' `
     "gui-test-cli must opt into legacy-controller explicitly."
   Require-Literal "tools/bench-cli/Cargo.toml" 'features = ["legacy-controller"]' `
-    "wavecrate-bench-cli must opt into legacy-controller explicitly."
+    "yield-bench-cli must opt into legacy-controller explicitly."
 
   $libSource = Get-Content -LiteralPath "src/lib.rs" -Raw
   foreach ($declaration in @("mod app;", "pub mod app_core;", "pub mod gui_test;")) {

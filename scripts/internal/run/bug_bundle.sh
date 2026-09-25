@@ -19,7 +19,7 @@ OUT_DIR="dist/bug_bundles"
 USE_SANDBOX=0
 
 usage() {
-  local entrypoint="${WAVECRATE_RUN_ENTRYPOINT:-scripts/run.sh}"
+  local entrypoint="${YIELD_RUN_ENTRYPOINT:-scripts/run.sh}"
   cat <<EOF
 Usage: ${entrypoint} bug-bundle [--out-dir <dir>] [--logs <n>] [--sandbox]
 
@@ -29,9 +29,9 @@ Creates an archive under <out-dir> containing:
 - version/system info
 
 Sandbox behavior:
-- If WAVECRATE_CONFIG_HOME is set, it is always used.
-- Otherwise, if <repo>/.sandbox/wavecrate exists, this script prefers it.
-- Pass --sandbox to force using <repo>/.sandbox/wavecrate.
+- If YIELD_CONFIG_HOME is set, it is always used.
+- Otherwise, if <repo>/.sandbox/yield exists, this script prefers it.
+- Pass --sandbox to force using <repo>/.sandbox/yield.
 EOF
 }
 
@@ -53,11 +53,11 @@ while (( $# > 0 )); do
 done
 
 os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
-sandbox_config_home="${ROOT_DIR}/.sandbox/wavecrate"
+sandbox_config_home="${ROOT_DIR}/.sandbox/yield"
 
 default_config_base_dir() {
-  if [[ -n "${WAVECRATE_CONFIG_HOME:-}" ]]; then
-    printf "%s" "$WAVECRATE_CONFIG_HOME"
+  if [[ -n "${YIELD_CONFIG_HOME:-}" ]]; then
+    printf "%s" "$YIELD_CONFIG_HOME"
     return 0
   fi
   if (( USE_SANDBOX == 1 )) || [[ -d "$sandbox_config_home" ]]; then
@@ -79,8 +79,8 @@ default_config_base_dir() {
 }
 
 current_persistence_profile() {
-  if [[ -n "${WAVECRATE_CONFIG_PROFILE:-}" ]]; then
-    printf "%s" "${WAVECRATE_CONFIG_PROFILE}"
+  if [[ -n "${YIELD_CONFIG_PROFILE:-}" ]]; then
+    printf "%s" "${YIELD_CONFIG_PROFILE}"
     return 0
   fi
   if (( USE_SANDBOX == 1 )); then
@@ -92,7 +92,7 @@ current_persistence_profile() {
 
 config_base_dir="$(default_config_base_dir)"
 used_sandbox_config_home="false"
-if [[ -z "${WAVECRATE_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
+if [[ -z "${YIELD_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
   used_sandbox_config_home="true"
 fi
 
@@ -113,7 +113,7 @@ extract_app_data_dir_from_config() {
 resolve_app_root_dir() {
   local profile
   profile="$(current_persistence_profile)"
-  local default_root="${config_base_dir}/.wavecrate"
+  local default_root="${config_base_dir}/.yield"
   if [[ "$profile" != "live" ]]; then
     default_root="${default_root}/profiles/${profile}"
   fi
@@ -137,7 +137,7 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 bundle_root="$(mktemp -d)"
 trap 'rm -rf "$bundle_root"' EXIT
 
-bundle_dir="${bundle_root}/wavecrate-bug-bundle-${timestamp}"
+bundle_dir="${bundle_root}/yield-bug-bundle-${timestamp}"
 mkdir -p "$bundle_dir"
 
 mkdir -p "${bundle_dir}/meta"
@@ -176,7 +176,7 @@ if [[ -d "$logs_dir" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
-archive_base="${OUT_DIR}/wavecrate-bug-bundle-${timestamp}"
+archive_base="${OUT_DIR}/yield-bug-bundle-${timestamp}"
 
 if command -v zip >/dev/null 2>&1; then
   (cd "$bundle_root" && zip -r "${archive_base}.zip" "$(basename "$bundle_dir")" >/dev/null)

@@ -15,7 +15,7 @@ usage() {
 Usage: publish_portalsurfer_release.sh --channel <nightly|rc|stable> --build-id <id> --build-number <n> --release-version <version> --released-at <iso-time> [--artifact-dir <path>] [--release-log <path>] [--full-changelog-out <path>]
 
 Requires PORTALSURFER_RELEASE_UPLOAD_TOKEN. Uses PORTALSURFER_RELEASE_UPLOAD_URL
-when set, otherwise https://portalsurfer.org/wavecrate/api/v1/release-uploads.
+when set, otherwise https://portalsurfer.org/yield/api/v1/release-uploads.
 USAGE
 }
 
@@ -105,7 +105,7 @@ curl_args=(
   --max-time "$PORTALSURFER_RELEASE_MAX_TIME_SECONDS"
 )
 
-upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/wavecrate/api/v1/release-uploads}"
+upload_base="${PORTALSURFER_RELEASE_UPLOAD_URL:-https://portalsurfer.org/yield/api/v1/release-uploads}"
 upload_base="${upload_base%/}"
 if [[ "$upload_base" != */release-uploads ]]; then
   echo "PORTALSURFER_RELEASE_UPLOAD_URL must end with /release-uploads." >&2
@@ -189,11 +189,11 @@ for file in "${files[@]}"; do
     --request PUT \
     --header "Authorization: Bearer $PORTALSURFER_RELEASE_UPLOAD_TOKEN" \
     --header "Content-Type: $content_type" \
-    --header "X-Wavecrate-Build-Number: ${BUILD_NUMBER}" \
-    --header "X-Wavecrate-Release-Channel: $CHANNEL" \
-    --header "X-Wavecrate-Release-Version: $RELEASE_VERSION" \
-    --header "X-Wavecrate-Released-At: $RELEASED_AT" \
-    --header "X-Wavecrate-Sha256: $sha256" \
+    --header "X-Yield-Build-Number: ${BUILD_NUMBER}" \
+    --header "X-Yield-Release-Channel: $CHANNEL" \
+    --header "X-Yield-Release-Version: $RELEASE_VERSION" \
+    --header "X-Yield-Released-At: $RELEASED_AT" \
+    --header "X-Yield-Sha256: $sha256" \
     --data-binary "@$file" \
     "$upload_base/$BUILD_ID/staging/files/$encoded_name" > "$response_file"
   python3 - "$response_file" "$BUILD_ID" "$file_name" "$sha256" "$size_bytes" <<'PY'
@@ -252,7 +252,7 @@ body = {
         "generated_at": released_at,
     },
     "full_changelog": {
-        "title": "Wavecrate changelog",
+        "title": "Yield changelog",
         "body": full_changelog,
         "generated_at": released_at,
     },
@@ -268,10 +268,10 @@ curl "${curl_args[@]}" \
   --request PUT \
   --header "Authorization: Bearer $PORTALSURFER_RELEASE_UPLOAD_TOKEN" \
   --header "Content-Type: application/json" \
-  --header "X-Wavecrate-Build-Number: ${BUILD_NUMBER}" \
-  --header "X-Wavecrate-Release-Channel: $CHANNEL" \
-  --header "X-Wavecrate-Release-Version: $RELEASE_VERSION" \
-  --header "X-Wavecrate-Released-At: $RELEASED_AT" \
+  --header "X-Yield-Build-Number: ${BUILD_NUMBER}" \
+  --header "X-Yield-Release-Channel: $CHANNEL" \
+  --header "X-Yield-Release-Version: $RELEASE_VERSION" \
+  --header "X-Yield-Released-At: $RELEASED_AT" \
   --data-binary "@$commit_request_file" \
   "$upload_base/$BUILD_ID/commit" > "$commit_response_file"
 python3 - "$commit_response_file" "$BUILD_ID" "$BUILD_NUMBER" <<'PY'
@@ -326,7 +326,7 @@ body = (response.get("changelog") or {}).get("body", "").strip()
 expected_body = open(changelog_path, encoding="utf-8").read().strip()
 if body != expected_body:
     raise SystemExit("Fetched changelog body does not match generated release log")
-print(f"Uploaded Wavecrate release log to {expected_build}")
+print(f"Uploaded Yield release log to {expected_build}")
 PY
 
 full_changelog_catalog_file="$response_dir/full-changelog-catalog.json"
@@ -343,6 +343,6 @@ body = (response.get("changelog") or {}).get("body", "").strip()
 expected_body = open(changelog_path, encoding="utf-8").read().strip()
 if body != expected_body:
     raise SystemExit("Fetched full changelog body does not match generated changelog")
-print("Uploaded Wavecrate full changelog")
+print("Uploaded Yield full changelog")
 PY
 summary_phase="complete"

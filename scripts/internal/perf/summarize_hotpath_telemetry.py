@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize Wavecrate hot-path telemetry logs for interactive playback smoke runs."""
+"""Summarize Yield hot-path telemetry logs for interactive playback smoke runs."""
 
 from __future__ import annotations
 
@@ -150,7 +150,7 @@ class EventGroup:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Summarize WAVECRATE_HOTPATH_TELEMETRY logs so dense starmap "
+            "Summarize YIELD_HOTPATH_TELEMETRY logs so dense starmap "
             "drag/list/keyboard playback smoke runs show where latency or "
             "misses accumulate."
         )
@@ -158,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "logs",
         nargs="+",
-        help="One or more Wavecrate log files to parse, or '-' for stdin.",
+        help="One or more Yield log files to parse, or '-' for stdin.",
     )
     parser.add_argument(
         "--json",
@@ -339,7 +339,7 @@ def diagnostics(groups: dict[str, EventGroup]) -> list[str]:
     if "starmap_audition.event" not in groups and "starmap_audition.snapshot" not in groups:
         warnings.append(
             "no starmap audition events found; normal logs only include slow starmap "
-            "hotpath warnings, so run a dense drag repro with WAVECRATE_HOTPATH_TELEMETRY=1 "
+            "hotpath warnings, so run a dense drag repro with YIELD_HOTPATH_TELEMETRY=1 "
             "and RUST_LOG including perf::starmap_drag for full queue/hit/playback coverage"
         )
     if "fast_audition.decision" not in groups:
@@ -449,7 +449,7 @@ def latest_snapshot(group: EventGroup | None) -> ParsedEvent | None:
 
 
 def emit_text(summary: dict[str, Any], log_paths: list[str], top: int) -> None:
-    print("Wavecrate hot-path telemetry summary")
+    print("Yield hot-path telemetry summary")
     print("Logs:")
     for path in log_paths:
         print(f"  {path}")

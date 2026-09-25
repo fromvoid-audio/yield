@@ -70,7 +70,7 @@ def main() -> int:
     changelog = release.get("changelog") or {}
     if changelog.get("format") != "markdown" or not changelog.get("url"):
         raise SystemExit("Release catalog is missing the markdown changelog link")
-    print(f"Uploaded {len(expected_files)} Wavecrate release file(s) to {args.build_id}")
+    print(f"Uploaded {len(expected_files)} Yield release file(s) to {args.build_id}")
     return 0
 
 

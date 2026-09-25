@@ -80,7 +80,7 @@ try {
   Invoke-Check -Label "readiness executor boundary guardrail" -ScriptPath (Join-Path $checkDir "check_readiness_executor_boundary.ps1")
   Invoke-Check -Label "source database open-role guardrail" -ScriptPath (Join-Path $checkDir "check_source_db_open_roles.ps1")
   Invoke-Check -Label "non-blocking architecture guardrails" -ScriptPath (Join-Path $checkDir "check_non_blocking_architecture.ps1")
-  Invoke-Check -Label "Wavecrate facade guardrail" -ScriptPath (Join-Path $checkDir "check_wavecrate_facades.ps1")
+  Invoke-Check -Label "Yield facade guardrail" -ScriptPath (Join-Path $checkDir "check_yield_facades.ps1")
   Invoke-Check -Label "rust todo/todo guardrail (non-test only)" -ScriptPath (Join-Path $checkDir "check_rust_no_todos.ps1")
 
   # Dead dependency sweep is advisory and has no first-class PowerShell parity yet.

@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-wavecrate_process_identity() {
+yield_process_identity() {
   local pid="$1"
   local process_line state identity
   process_line="$(ps -p "$pid" -o state= -o lstart= 2>/dev/null || true)"
@@ -19,7 +19,7 @@ wavecrate_process_identity() {
   printf '%s\n' "$identity"
 }
 
-wavecrate_directory_metadata() {
+yield_directory_metadata() {
   python3 - "$1" <<'PY'
 import os
 import sys
@@ -29,13 +29,13 @@ print(metadata.st_size, metadata.st_nlink)
 PY
 }
 
-wavecrate_has_enclosing_validation_watchdog() {
-  [[ "${WAVECRATE_VALIDATION_WATCHDOG_ACTIVE:-0}" == "1" ]] || return 1
-  [[ "${WAVECRATE_VALIDATION_TARGET_SELECTED:-0}" == "1" ]] || return 1
+yield_has_enclosing_validation_watchdog() {
+  [[ "${YIELD_VALIDATION_WATCHDOG_ACTIVE:-0}" == "1" ]] || return 1
+  [[ "${YIELD_VALIDATION_TARGET_SELECTED:-0}" == "1" ]] || return 1
 
-  local lease_dir="${WAVECRATE_VALIDATION_TARGET_LEASE_DIR:-}"
-  local owner_pid="${WAVECRATE_VALIDATION_TARGET_LEASE_OWNER:-}"
-  local owner_identity="${WAVECRATE_VALIDATION_TARGET_LEASE_IDENTITY:-}"
+  local lease_dir="${YIELD_VALIDATION_TARGET_LEASE_DIR:-}"
+  local owner_pid="${YIELD_VALIDATION_TARGET_LEASE_OWNER:-}"
+  local owner_identity="${YIELD_VALIDATION_TARGET_LEASE_IDENTITY:-}"
   local current_pid="${BASHPID:-$$}"
   [[ -n "$lease_dir" && "$owner_pid" =~ ^[0-9]+$ && -n "$owner_identity" ]] || return 1
   [[ "$owner_pid" != "$current_pid" ]] || return 1
@@ -44,7 +44,7 @@ wavecrate_has_enclosing_validation_watchdog() {
   IFS=$'\t' read -r recorded_owner recorded_identity 2>/dev/null < "$lease_dir/pid" || return 1
   [[ "$recorded_owner" == "$owner_pid" && "$recorded_identity" == "$owner_identity" ]] \
     || return 1
-  current_identity="$(wavecrate_process_identity "$owner_pid")" || return 1
+  current_identity="$(yield_process_identity "$owner_pid")" || return 1
   [[ "$current_identity" == "$owner_identity" ]] || return 1
   owner_command="$(ps -p "$owner_pid" -o command= 2>/dev/null || true)"
   [[ "$owner_command" == *run_with_progress_watchdog.py* ]] || return 1
@@ -59,9 +59,9 @@ wavecrate_has_enclosing_validation_watchdog() {
   return 1
 }
 
-wavecrate_use_validation_target() {
+yield_use_validation_target() {
   local root_dir="$1"
-  local platform="${WAVECRATE_VALIDATION_TEST_PLATFORM:-$(uname -s)}"
+  local platform="${YIELD_VALIDATION_TEST_PLATFORM:-$(uname -s)}"
   if [[ "$platform" != "Darwin" ]]; then
     return 0
   fi
@@ -69,11 +69,11 @@ wavecrate_use_validation_target() {
   local rustc_identity lock_identity target_root target_dir deps_dir lease_dir owner_pid owner_identity
   rustc_identity="$(rustc -vV | awk '/^(release|host):/{print $2}' | tr '\n' '-' | sed 's/-$//')"
   lock_identity="$(shasum -a 256 "$root_dir/Cargo.lock" | awk '{print substr($1, 1, 12)}')"
-  target_root="${WAVECRATE_VALIDATION_TARGET_ROOT:-$root_dir/target/agent-validation}"
+  target_root="${YIELD_VALIDATION_TARGET_ROOT:-$root_dir/target/agent-validation}"
   target_dir="$target_root/$rustc_identity-$lock_identity"
   deps_dir="$target_dir/debug/deps"
   lease_dir="$target_root/.lock-$rustc_identity-$lock_identity"
-  if wavecrate_has_enclosing_validation_watchdog; then
+  if yield_has_enclosing_validation_watchdog; then
     if [[ "${CARGO_TARGET_DIR:-}" == "$target_dir" ]]; then
       echo "[validation_target] reusing owned CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
       return 0
@@ -85,16 +85,16 @@ wavecrate_use_validation_target() {
     echo "[validation_target] overriding ambient CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
   fi
   owner_pid="${BASHPID:-$$}"
-  owner_identity="$(wavecrate_process_identity "$owner_pid")" || {
+  owner_identity="$(yield_process_identity "$owner_pid")" || {
     echo "[validation_target] unable to identify lease owner process $owner_pid" >&2
     return 1
   }
   mkdir -p "$target_root"
 
   local missing_owner_attempts=0
-  local lease_wait_seconds="${WAVECRATE_VALIDATION_LEASE_WAIT_SECONDS:-480}"
+  local lease_wait_seconds="${YIELD_VALIDATION_LEASE_WAIT_SECONDS:-480}"
   [[ "$lease_wait_seconds" =~ ^[1-9][0-9]*$ ]] || {
-    echo "[validation_target] WAVECRATE_VALIDATION_LEASE_WAIT_SECONDS must be a positive integer" >&2
+    echo "[validation_target] YIELD_VALIDATION_LEASE_WAIT_SECONDS must be a positive integer" >&2
     return 2
   }
   local lease_deadline=$(( $(date +%s) + lease_wait_seconds ))
@@ -103,7 +103,7 @@ wavecrate_use_validation_target() {
     IFS=$'\t' read -r current_owner recorded_identity 2>/dev/null < "$lease_dir/pid" || current_owner=""
     if [[ "$current_owner" =~ ^[0-9]+$ ]] \
       && [[ -n "$recorded_identity" ]] \
-      && current_identity="$(wavecrate_process_identity "$current_owner")" \
+      && current_identity="$(yield_process_identity "$current_owner")" \
       && [[ "$current_identity" == "$recorded_identity" ]]; then
       missing_owner_attempts=0
       if (( $(date +%s) >= lease_deadline )); then
@@ -123,14 +123,14 @@ wavecrate_use_validation_target() {
     missing_owner_attempts=0
   done
   printf '%s\t%s\n' "$owner_pid" "$owner_identity" > "$lease_dir/pid"
-  export WAVECRATE_VALIDATION_TARGET_LEASE_DIR="$lease_dir"
-  export WAVECRATE_VALIDATION_TARGET_LEASE_OWNER="$owner_pid"
-  export WAVECRATE_VALIDATION_TARGET_LEASE_IDENTITY="$owner_identity"
+  export YIELD_VALIDATION_TARGET_LEASE_DIR="$lease_dir"
+  export YIELD_VALIDATION_TARGET_LEASE_OWNER="$owner_pid"
+  export YIELD_VALIDATION_TARGET_LEASE_IDENTITY="$owner_identity"
 
-  local max_metadata_bytes="${WAVECRATE_VALIDATION_MAX_DEPS_METADATA_BYTES:-8388608}"
+  local max_metadata_bytes="${YIELD_VALIDATION_MAX_DEPS_METADATA_BYTES:-8388608}"
   if [[ -d "$deps_dir" ]]; then
     local metadata metadata_bytes link_count
-    metadata="$(wavecrate_directory_metadata "$deps_dir")"
+    metadata="$(yield_directory_metadata "$deps_dir")"
     read -r metadata_bytes link_count <<< "$metadata"
     if (( metadata_bytes > max_metadata_bytes || link_count >= 60000 )); then
       local quarantine="$target_root/stale-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -142,14 +142,14 @@ wavecrate_use_validation_target() {
 
   mkdir -p "$target_dir"
   export CARGO_TARGET_DIR="$target_dir"
-  export WAVECRATE_VALIDATION_TARGET_SELECTED=1
+  export YIELD_VALIDATION_TARGET_SELECTED=1
   echo "[validation_target] CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 }
 
-wavecrate_release_validation_target() {
-  local lease_dir="${WAVECRATE_VALIDATION_TARGET_LEASE_DIR:-}"
-  local expected_owner="${WAVECRATE_VALIDATION_TARGET_LEASE_OWNER:-}"
-  local expected_identity="${WAVECRATE_VALIDATION_TARGET_LEASE_IDENTITY:-}"
+yield_release_validation_target() {
+  local lease_dir="${YIELD_VALIDATION_TARGET_LEASE_DIR:-}"
+  local expected_owner="${YIELD_VALIDATION_TARGET_LEASE_OWNER:-}"
+  local expected_identity="${YIELD_VALIDATION_TARGET_LEASE_IDENTITY:-}"
   local owner_pid="${BASHPID:-$$}"
   if [[ -z "$lease_dir" || "$expected_owner" != "$owner_pid" || -z "$expected_identity" ]]; then
     return 0
@@ -162,8 +162,8 @@ wavecrate_release_validation_target() {
     rm -f "$lease_dir/pid"
     rmdir "$lease_dir" 2>/dev/null || true
   fi
-  unset WAVECRATE_VALIDATION_TARGET_LEASE_DIR
-  unset WAVECRATE_VALIDATION_TARGET_LEASE_OWNER
-  unset WAVECRATE_VALIDATION_TARGET_LEASE_IDENTITY
-  unset WAVECRATE_VALIDATION_TARGET_SELECTED
+  unset YIELD_VALIDATION_TARGET_LEASE_DIR
+  unset YIELD_VALIDATION_TARGET_LEASE_OWNER
+  unset YIELD_VALIDATION_TARGET_LEASE_IDENTITY
+  unset YIELD_VALIDATION_TARGET_SELECTED
 }

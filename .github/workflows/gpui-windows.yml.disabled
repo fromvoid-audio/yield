@@ -1,0 +1,102 @@
+name: GPUI Windows checks
+run-name: GPUI Windows (${{ inputs.scope || 'full' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        default: full
+        options:
+          - full
+          - storage
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'assets/**'
+      - 'scripts/internal/release/setup_windows_asio_sdk.ps1'
+      - '.github/workflows/gpui-windows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpui-windows-${{ github.ref }}-${{ inputs.scope || 'full' }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup show active-toolchain
+      - name: Provision ASIO SDK
+        if: inputs.scope != 'storage'
+        shell: pwsh
+        run: ./scripts/internal/release/setup_windows_asio_sdk.ps1
+      - name: Check production GPUI application
+        if: inputs.scope != 'storage'
+        run: cargo check --locked -p yield
+      - name: Check production storage library
+        if: inputs.scope == 'storage'
+        run: cargo check --locked -p yield-library --no-default-features
+      - name: Check production profile admission
+        shell: pwsh
+        run: |
+          cargo test --locked -p yield-library --test profile_admission --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-library --lib app_dirs::profile_ownership --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-library --test readiness_lease_process --features test-support
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test operation journal
+        run: cargo test --locked -p yield-library --lib operation_journal --no-default-features
+      - name: Test bounded legacy journal reader
+        run: cargo test --locked -p yield-library --lib file_ops_journal::reader --no-default-features
+      - name: Test source mutation ownership
+        shell: pwsh
+        run: |
+          cargo test --locked -p yield-library --lib profile_mutation_guard --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-library --lib readiness --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-library --lib source_database_identity --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-library --lib sqlite_wal --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test profile-owned settings maintenance
+        shell: pwsh
+        run: |
+          cargo test --locked -p yield-library --lib app_dirs::storage_usage --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-session -p yield-catalog --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test durable waveform edit adapters
+        if: inputs.scope == 'storage'
+        shell: pwsh
+        run: |
+          cargo test --locked -p yield-core --lib waveform_edit_effects
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p yield-media --lib edit_intent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test audio, core, media and native platform
+        if: inputs.scope != 'storage'
+        run: cargo test --locked -p reson -p yield-core -p yield-media -p yield-platform --lib
+      - name: Compile GPUI application and browser tests
+        if: inputs.scope != 'storage'
+        run: cargo test --locked -p yield -p yield-ui --no-run
+      - name: Test browser state and interactions
+        if: inputs.scope != 'storage'
+        run: cargo test --locked -p yield-ui --lib

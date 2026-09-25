@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/build.sh",
-      "role": "Build Wavecrate and create a uniquely targetable macOS development app bundle.",
+      "role": "Build Yield and create a uniquely targetable macOS development app bundle.",
       "windows_supported": false
     },
     {
@@ -294,8 +294,8 @@
           "target": "check_workflow_toolchain_pinning.ps1"
         },
         {
-          "name": "wavecrate-facades",
-          "target": "check_wavecrate_facades.ps1"
+          "name": "yield-facades",
+          "target": "check_yield_facades.ps1"
         }
       ]
     },

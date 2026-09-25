@@ -3,7 +3,7 @@
 Runs the opt-in parallel test-isolation stress lane.
 
 .DESCRIPTION
-Builds the Wavecrate library test harness once, verifies injected process-state
+Builds the Yield library test harness once, verifies injected process-state
 and mutable-global-control leak sentinels, then runs bounded repetitions in
 fresh explicitly parallel test processes. Results are emitted as JSONL.
 #>
@@ -27,7 +27,7 @@ $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
 if ($Help) {
   Write-Host "Usage: scripts/ci.ps1 isolation-stress [-Iterations N] [-TestThreads N] [-TimeoutSeconds N] [-Output PATH]"
   Write-Host ""
-  Write-Host "Runs bounded fresh-process repetitions of the Wavecrate library suite."
+  Write-Host "Runs bounded fresh-process repetitions of the Yield library suite."
   Write-Host "The lane verifies injected leak sentinels and emits one JSONL record per process."
   exit 0
 }

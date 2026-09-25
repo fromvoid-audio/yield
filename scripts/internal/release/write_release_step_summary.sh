@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TITLE="Wavecrate release summary"
+TITLE="Yield release summary"
 STATUS="unknown"
 CHANNEL=""
 VERSION=""

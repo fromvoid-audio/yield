@@ -1,7 +1,7 @@
-# Wavecrate GPUI
+# Yield
 
-A private GPUI reimplementation of [Wavecrate](https://github.com/PORTALSURFER/wavecrate).
-Full current feature parity is the target; the migration is in progress.
+A private sample manager built with GPUI. Full feature parity with the archived
+frontend is the target; the reimplementation is in progress.
 
 ## Workspace
 
@@ -10,28 +10,32 @@ separate crates with defined ownership:
 
 | Crate | Responsibility |
 | --- | --- |
-| `wavecrate-gpui` | Thin executable and launch arguments |
-| `wavecrate-core` | Pure sample types, filtering, sorting, selection projection |
-| `wavecrate-media` | Background file discovery and waveform preparation |
-| `wavecrate-design` | Validated semantic theme schema and canonical design tokens |
-| `wavecrate-ui` | GPUI views, input components, UI and transport coordination |
+| `yield` | Thin executable and launch arguments |
+| `yield-core` | Pure sample types, filtering, sorting, selection projection |
+| `yield-media` | Background file discovery and waveform preparation |
+| `yield-design` | Validated semantic theme schema and canonical design tokens |
+| `yield-ui` | GPUI views, input components, UI and transport coordination |
 | `reson` | Existing audio engine |
-| `wavecrate-library` | Persistence and source-ownership primitives |
-| `wavecrate-catalog` | Audited source projections and bounded metadata operations |
-| `wavecrate-source-watcher` | Native watch handles and bounded lifecycle-fenced change hints |
-| `wavecrate-platform` | Native file-drag foundation with explicit platform-session ownership |
-| `wavecrate-session` | Profile, source registry, preferences, and catalog lifecycle |
-| `wavecrate-scan` | Existing persistent scanner |
-| `wavecrate-analysis` | Existing decoding and analysis |
+| `yield-library` | Persistence and source-ownership primitives |
+| `yield-catalog` | Audited source projections and bounded metadata operations |
+| `yield-source-watcher` | Native watch handles and bounded lifecycle-fenced change hints |
+| `yield-platform` | Native file-drag foundation with explicit platform-session ownership |
+| `yield-session` | Profile, source registry, preferences, and catalog lifecycle |
+| `yield-scan` | Existing persistent scanner |
+| `yield-analysis` | Existing decoding and analysis |
 
 See [crate boundaries and dependency direction](docs/GPUI_ARCHITECTURE.md).
 The original frontend is preserved in [reference/radiant](reference/radiant/README.md)
 and excluded from the active build.
 
-The current GPUI frontend uses the original Wavecrate editorial-terminal
+Development profiles live under `.yield`, and source-local metadata uses Yield
+filenames and identifiers. This development rename starts with fresh storage;
+older data is not imported automatically.
+
+The current GPUI frontend uses an editorial-terminal
 palette and compact layout. Theme tokens are defined independently in
-`wavecrate-design`; the complete schema and a copyable default document are in
-[themes/wavecrate.json](themes/wavecrate.json). Open the gear settings control
+`yield-design`; the complete schema and a copyable default document are in
+[themes/yield.json](themes/yield.json). Open the gear settings control
 to import, reload, or reset a theme while the app is running. Theme choice and
 animation, audition, volume, and audio-output preferences persist across launches. Row hover rails remain immediate; loading
 indicators animate only during pending work and remain static when disabled.
@@ -140,8 +144,8 @@ and outstanding work. Inherited release workflows are disabled.
 ## Validate
 
 ```sh
-cargo check --locked -p wavecrate-gpui
-cargo test --locked -p wavecrate-core -p wavecrate-design -p wavecrate-media -p wavecrate-ui -p wavecrate-gpui
+cargo check --locked -p yield
+cargo test --locked -p yield-core -p yield-design -p yield-media -p yield-ui -p yield
 ```
 
 Third-party component attribution is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

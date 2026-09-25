@@ -1,4 +1,4 @@
-name: Wavecrate Radiant sibling smoke
+name: Yield Radiant sibling smoke
 
 on:
   workflow_dispatch:
@@ -23,12 +23,12 @@ jobs:
       - name: Validate Cargo resolves the sibling
         shell: bash
         run: |
-          cargo metadata --locked --format-version 1 >/tmp/wavecrate-metadata.json
+          cargo metadata --locked --format-version 1 >/tmp/yield-metadata.json
           python3 - <<'PY'
           import json
           from pathlib import Path
 
-          metadata = json.loads(Path('/tmp/wavecrate-metadata.json').read_text())
+          metadata = json.loads(Path('/tmp/yield-metadata.json').read_text())
           radiant = next(package for package in metadata['packages'] if package['name'] == 'radiant')
           assert radiant['manifest_path'].endswith('/radiant/Cargo.toml')
           assert not any(member.endswith('/radiant#0.1.0') for member in metadata['workspace_members'])

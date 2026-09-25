@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds the Wavecrate mdBook documentation.
+Builds the Yield mdBook documentation.
 #>
 
 Set-StrictMode -Version Latest

@@ -4,19 +4,19 @@ Configures optional local Cargo compile caching for repository scripts.
 
 .DESCRIPTION
 Cargo runs default to direct `rustc`. Scripts can opt in to `sccache` with
-`WAVECRATE_ENABLE_SCCACHE=1`, and can force the direct compiler path with
-`WAVECRATE_DISABLE_SCCACHE=1`. When `sccache` is enabled or already inherited
+`YIELD_ENABLE_SCCACHE=1`, and can force the direct compiler path with
+`YIELD_DISABLE_SCCACHE=1`. When `sccache` is enabled or already inherited
 through `RUSTC_WRAPPER`, this helper probes it in wrapper mode and falls back
 to direct `rustc` if the probe fails or times out.
 #>
 
-$script:WavecrateCargoConfigOverrideArgs = @()
+$script:YieldCargoConfigOverrideArgs = @()
 
-function Get-WavecrateRustcPassthroughWrapperPath {
+function Get-YieldRustcPassthroughWrapperPath {
   return (Join-Path $PSScriptRoot "rustc_passthrough.cmd")
 }
 
-function Test-WavecrateWritableDirectory {
+function Test-YieldWritableDirectory {
   param(
     [AllowEmptyString()]
     [string]$Path
@@ -26,7 +26,7 @@ function Test-WavecrateWritableDirectory {
     return $false
   }
 
-  $probeFile = Join-Path $Path "wavecrate-write-probe-$([guid]::NewGuid().ToString('N')).tmp"
+  $probeFile = Join-Path $Path "yield-write-probe-$([guid]::NewGuid().ToString('N')).tmp"
   try {
     Set-Content -Path $probeFile -Value "probe" -NoNewline
     return $true
@@ -37,9 +37,9 @@ function Test-WavecrateWritableDirectory {
   }
 }
 
-function Ensure-WavecrateWritableTempDir {
-  $tempWritable = Test-WavecrateWritableDirectory $env:TEMP
-  $tmpWritable = Test-WavecrateWritableDirectory $env:TMP
+function Ensure-YieldWritableTempDir {
+  $tempWritable = Test-YieldWritableDirectory $env:TEMP
+  $tmpWritable = Test-YieldWritableDirectory $env:TMP
   if ($tempWritable -and $tmpWritable) {
     return
   }
@@ -51,7 +51,7 @@ function Ensure-WavecrateWritableTempDir {
   Write-Host "[cargo-cache] using repo temp dir $fallback"
 }
 
-function Test-WavecrateSccacheWrapperValue {
+function Test-YieldSccacheWrapperValue {
   param(
     [AllowEmptyString()]
     [string]$Wrapper
@@ -65,20 +65,20 @@ function Test-WavecrateSccacheWrapperValue {
   return $fileName -eq "sccache" -or $fileName -eq "sccache.exe"
 }
 
-function Get-WavecrateCargoConfigOverrideArgs {
-  return $script:WavecrateCargoConfigOverrideArgs
+function Get-YieldCargoConfigOverrideArgs {
+  return $script:YieldCargoConfigOverrideArgs
 }
 
-function Invoke-WavecrateCargo {
+function Invoke-YieldCargo {
   param(
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Arguments
   )
 
-  & cargo @(Get-WavecrateCargoConfigOverrideArgs) @Arguments
+  & cargo @(Get-YieldCargoConfigOverrideArgs) @Arguments
 }
 
-function Set-WavecrateCargoWrapperOverride {
+function Set-YieldCargoWrapperOverride {
   param(
     [AllowEmptyString()]
     [string]$Wrapper
@@ -87,24 +87,24 @@ function Set-WavecrateCargoWrapperOverride {
   if ([string]::IsNullOrWhiteSpace($Wrapper)) {
     Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
     Remove-Item Env:CARGO_BUILD_RUSTC_WRAPPER -ErrorAction SilentlyContinue
-    $script:WavecrateCargoConfigOverrideArgs = @()
+    $script:YieldCargoConfigOverrideArgs = @()
     return
   }
 
   $env:RUSTC_WRAPPER = $Wrapper
   $env:CARGO_BUILD_RUSTC_WRAPPER = $Wrapper
-  $script:WavecrateCargoConfigOverrideArgs = @()
+  $script:YieldCargoConfigOverrideArgs = @()
 }
 
-function Clear-WavecrateSccacheWrapper {
+function Clear-YieldSccacheWrapper {
   param(
     [Parameter(Mandatory = $true)]
     [string]$Reason
   )
 
-  if ((Test-WavecrateSccacheWrapperValue $env:RUSTC_WRAPPER) -or
-      (Test-WavecrateSccacheWrapperValue $env:CARGO_BUILD_RUSTC_WRAPPER)) {
-    Set-WavecrateCargoWrapperOverride ""
+  if ((Test-YieldSccacheWrapperValue $env:RUSTC_WRAPPER) -or
+      (Test-YieldSccacheWrapperValue $env:CARGO_BUILD_RUSTC_WRAPPER)) {
+    Set-YieldCargoWrapperOverride ""
     Write-Host "[cargo-cache] $Reason; falling back to direct rustc"
     return
   }
@@ -112,7 +112,7 @@ function Clear-WavecrateSccacheWrapper {
   Write-Host "[cargo-cache] $Reason"
 }
 
-function Test-WavecrateSccacheHealth {
+function Test-YieldSccacheHealth {
   param(
     [Parameter(Mandatory = $true)]
     [string]$SccachePath
@@ -170,32 +170,32 @@ function Test-WavecrateSccacheHealth {
   }
 }
 
-function Enable-WavecrateCargoCache {
-  Ensure-WavecrateWritableTempDir
+function Enable-YieldCargoCache {
+  Ensure-YieldWritableTempDir
 
-  if ($env:WAVECRATE_DISABLE_SCCACHE -eq "1") {
-    Clear-WavecrateSccacheWrapper "sccache disabled by WAVECRATE_DISABLE_SCCACHE=1"
+  if ($env:YIELD_DISABLE_SCCACHE -eq "1") {
+    Clear-YieldSccacheWrapper "sccache disabled by YIELD_DISABLE_SCCACHE=1"
     return
   }
 
-  if ($env:WAVECRATE_ENABLE_SCCACHE -ne "1") {
-    Clear-WavecrateSccacheWrapper "sccache disabled by default"
+  if ($env:YIELD_ENABLE_SCCACHE -ne "1") {
+    Clear-YieldSccacheWrapper "sccache disabled by default"
     return
   }
 
   if (-not [string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)) {
-    if (Test-WavecrateSccacheWrapperValue $env:RUSTC_WRAPPER) {
-      if (Test-WavecrateSccacheHealth $env:RUSTC_WRAPPER) {
-        Set-WavecrateCargoWrapperOverride $env:RUSTC_WRAPPER
+    if (Test-YieldSccacheWrapperValue $env:RUSTC_WRAPPER) {
+      if (Test-YieldSccacheHealth $env:RUSTC_WRAPPER) {
+        Set-YieldCargoWrapperOverride $env:RUSTC_WRAPPER
         Write-Host "[cargo-cache] keeping healthy existing RUSTC_WRAPPER=$($env:RUSTC_WRAPPER)"
         return
       }
 
-      Clear-WavecrateSccacheWrapper "existing sccache wrapper failed health probe"
+      Clear-YieldSccacheWrapper "existing sccache wrapper failed health probe"
       return
     }
 
-    Set-WavecrateCargoWrapperOverride $env:RUSTC_WRAPPER
+    Set-YieldCargoWrapperOverride $env:RUSTC_WRAPPER
     Write-Host "[cargo-cache] keeping existing RUSTC_WRAPPER=$($env:RUSTC_WRAPPER)"
     return
   }
@@ -205,12 +205,12 @@ function Enable-WavecrateCargoCache {
     return
   }
 
-  if (-not (Test-WavecrateSccacheHealth $sccache.Source)) {
-    Set-WavecrateCargoWrapperOverride ""
+  if (-not (Test-YieldSccacheHealth $sccache.Source)) {
+    Set-YieldCargoWrapperOverride ""
     Write-Host "[cargo-cache] skipping sccache because the wrapper probe failed"
     return
   }
 
-  Set-WavecrateCargoWrapperOverride $sccache.Source
+  Set-YieldCargoWrapperOverride $sccache.Source
   Write-Host "[cargo-cache] using sccache via RUSTC_WRAPPER=$($env:RUSTC_WRAPPER)"
 }

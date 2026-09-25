@@ -1,0 +1,22 @@
+[package]
+name = "yield-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+yield-catalog = { path = "../yield-catalog" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+yield-design.workspace = true
+yield-library.workspace = true
+
+[dev-dependencies]
+rusqlite = { version = "0.37.0" }
+tempfile.workspace = true
+yield-library = { workspace = true, features = ["test-support"] }

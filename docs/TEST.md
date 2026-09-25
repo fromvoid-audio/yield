@@ -43,7 +43,7 @@ worker cleanup, or when investigating a failure that disappears on retry:
   `bash scripts/ci.sh isolation-stress --iterations 5 --test-threads 8`
 
 This lane is deliberately not part of `scripts/ci.* agent`. It compiles the
-Wavecrate library harness once, proves that deliberately injected
+Yield library harness once, proves that deliberately injected
 process-state and mutable-global-control leaks are detected, and then starts a
 fresh test-binary process for every bounded iteration. Each process uses the
 requested explicit libtest parallelism and a 15-minute default timeout. The
@@ -75,7 +75,7 @@ On macOS, the supported Bash `scripts/agent.sh` and `scripts/ci.sh` entrypoints
 use a Cargo target keyed by the Rust host/release and `Cargo.lock`. This keeps
 validation independent from the unbounded general-purpose `target/debug/deps`
 directory while preserving warm reuse across repeated runs. These entrypoints
-override an inherited `CARGO_TARGET_DIR`; use `WAVECRATE_VALIDATION_TARGET_ROOT`
+override an inherited `CARGO_TARGET_DIR`; use `YIELD_VALIDATION_TARGET_ROOT`
 to customize validation cache placement. A target whose
 `debug/deps` directory itself becomes pathological is atomically quarantined
 before Cargo starts; the emitted path can be removed after any needed
@@ -121,7 +121,7 @@ development and release-risk checks:
 
 ### Release lifecycle and promotion policy
 
-Wavecrate develops continuously on `main` through the normal PR pipeline. The
+Yield develops continuously on `main` through the normal PR pipeline. The
 first RC for a version is a project decision to enter stabilization, not a
 branch freeze or an automatic precursor to an immediate stable release.
 
@@ -170,9 +170,9 @@ the eventual explicit stable promotion.
 | Dead dependency sweep and env-var nudge | none | `scripts/check.* dead-deps --advisory` and `scripts/check.* report-env-vars` | Advisory Linux-only hygiene |
 | GUI semantic contracts | none | `scripts/gui.ps1 contract` or `scripts/gui.ps1 suite` | Local/manual or issue-specific |
 | Perf guard | none | `scripts/perf.* guard` | Local/manual or release-risk validation |
-| Nightly release build/sync | `Wavecrate nightly release` on the evening schedule or manual dispatch | release workflow dispatch | Resolves the exact `main` SHA, runs `scripts/internal/release/run_release_validation.sh` on Ubuntu before package builds or publication, builds Windows/macOS nightly assets from that SHA, embeds `X.Y.Z-nightly.DATE+SHA` metadata, verifies the checksum signing key against the pinned public key before public publication, uploads and verifies the immutable PortalSurfer release plus full changelog first, then refreshes the rolling GitHub `nightly` release assets and promotes the immutable and rolling GitHub tags as the final public identity step |
-| RC release | `Wavecrate RC release` manual dispatch | release workflow dispatch | Builds Windows/macOS RC assets from `release/X.Y`, validates the requested package version and branch, runs `scripts/internal/release/run_release_validation.sh`, verifies the checksum signing key against the pinned public key before public publication, and publishes `vX.Y.Z-rc.N` as a GitHub pre-release |
-| Stable release | Disabled | `scripts/release.sh stable` fails closed | The implementation is preserved in `.github/workflows/release-stable.yml.disabled`; restore it through a dedicated reviewed change only when Wavecrate is ready for stable publication |
+| Nightly release build/sync | `Yield nightly release` on the evening schedule or manual dispatch | release workflow dispatch | Resolves the exact `main` SHA, runs `scripts/internal/release/run_release_validation.sh` on Ubuntu before package builds or publication, builds Windows/macOS nightly assets from that SHA, embeds `X.Y.Z-nightly.DATE+SHA` metadata, verifies the checksum signing key against the pinned public key before public publication, uploads and verifies the immutable PortalSurfer release plus full changelog first, then refreshes the rolling GitHub `nightly` release assets and promotes the immutable and rolling GitHub tags as the final public identity step |
+| RC release | `Yield RC release` manual dispatch | release workflow dispatch | Builds Windows/macOS RC assets from `release/X.Y`, validates the requested package version and branch, runs `scripts/internal/release/run_release_validation.sh`, verifies the checksum signing key against the pinned public key before public publication, and publishes `vX.Y.Z-rc.N` as a GitHub pre-release |
+| Stable release | Disabled | `scripts/release.sh stable` fails closed | The implementation is preserved in `.github/workflows/release-stable.yml.disabled`; restore it through a dedicated reviewed change only when Yield is ready for stable publication |
 
 Use `scripts/release.sh` from a clean repo root for macOS/Linux release
 orchestration. It derives major, minor, and patch target versions from the
@@ -182,7 +182,7 @@ GitHub workflow only when `--dispatch` is passed. Prepare dispatch uses
 `--workflow-ref` (default `main`) for the workflow file ref and sends the
 resolved source commit SHA through the `source_ref` workflow input. The script
 requires `gh` only for explicit workflow dispatch. When `origin` is a GitHub
-remote, it must match `WAVECRATE_GITHUB_REPO` before release refs are fetched or
+remote, it must match `YIELD_GITHUB_REPO` before release refs are fetched or
 resolved. Dry RC runs print the exact workflow command and follow-up run-list
 command without publishing. Stable commands fail before resolving release refs
 or invoking GitHub.
@@ -201,7 +201,7 @@ The nextest policy is:
   artifacts.
 - Nightly, RC, and stable use `scripts/internal/release/run_release_validation.sh`
   on `ubuntu-latest` before any package build or public publication. The helper
-  compiles Wavecrate-owned workspace test targets with `cargo test --workspace
+  compiles Yield-owned workspace test targets with `cargo test --workspace
   --locked --no-run`, then runs standalone Radiant validation plus release contract/helper tests
   and scanner tests. It intentionally avoids running the full native/UI default
   Cargo test lane in scheduled release workflows; local `ci-required` nextest,
@@ -209,14 +209,14 @@ The nextest policy is:
   issue-specific release-risk evidence.
 - The nightly, RC, and stable Ubuntu release-validation jobs install
   `pkg-config` and `libasound2-dev` before Cargo builds the workspace.
-  Wavecrate still publishes only the Windows/macOS release targets declared in
+  Yield still publishes only the Windows/macOS release targets declared in
   `release_contract.toml`, but the Linux-hosted validation lane keeps
   ALSA-backed compilation explicit ahead of planned Linux release support.
 
 The non-blocking app architecture is enforced by
 `scripts/check.* non-blocking-architecture`, and that check is required by
 `scripts/ci.* agent` plus the agent preflight inside `scripts/ci.* local`. It
-runs Radiant's reusable non-blocking guardrails, Wavecrate's app-facing blocking
+runs Radiant's reusable non-blocking guardrails, Yield's app-facing blocking
 scan, and the deterministic strict slow-handler diagnostics harness.
 The agent lane intentionally runs the focused Radiant non-blocking guardrail
 module instead of the full `generic_surface_guardrails` suite, because that
@@ -229,7 +229,7 @@ Windows note:
 - use the PowerShell wrappers in this repository
 - the wrappers use direct `rustc` by default and still fall back to repo-local
   temp space when the default temp directory is unusable
-- set `WAVECRATE_ENABLE_SCCACHE=1` only when you explicitly want wrapper caching
+- set `YIELD_ENABLE_SCCACHE=1` only when you explicitly want wrapper caching
 - do not run multiple cargo test commands concurrently
 
 Headless Linux audio note:
@@ -273,7 +273,7 @@ Use for most app/domain behavior under `src/`.
     and target set, so stale inventory-dependent filter predicates fail before
     the test run starts
 - agent-safe library suite:
-  - `cargo test -p wavecrate --lib`
+  - `cargo test -p yield --lib`
   - `scripts/ci.* agent` runs the library suite with two known legacy
     controller failures skipped so the required agent lane can stay focused on
     deterministic architecture, compile, and broad non-ignored library coverage:
@@ -282,17 +282,17 @@ Use for most app/domain behavior under `src/`.
 
 ### Committed file-mutation and watcher reconciliation
 
-Use these focused lanes when changing Wavecrate-owned create, copy/extract,
+Use these focused lanes when changing Yield-owned create, copy/extract,
 import/drop, edit, normalize, undo/redo, rename, move, trash/delete, source
 manifest reconciliation, or watcher echo handling:
 
 - mutation contract, source revision, identity, invalidation, partial failure,
   stale completion, and large-file background behavior:
-  `cargo test -p wavecrate --bin wavecrate committed_file_mutations`
+  `cargo test -p yield --bin yield committed_file_mutations`
 - watcher acknowledgement, deduplication, and external-change fallback:
-  `cargo test -p wavecrate --bin wavecrate source_watcher`
+  `cargo test -p yield --bin yield source_watcher`
 - strict compile coverage for message routing and every native call site:
-  `cargo check -p wavecrate --all-targets`
+  `cargo check -p yield --all-targets`
 
 The mutation tests should prove that path-only moves retain content identity,
 content changes invalidate file-derived readiness, deletes invalidate source
@@ -310,36 +310,36 @@ The end-to-end tests are ignored by the default suite so normal CI does not
 inherit a real-time soak:
 
 - deterministic liveness oracle:
-  `cargo test -p wavecrate --lib liveness_oracle_rejects_actionable_deficits_without_observable_runtime_work`
+  `cargo test -p yield --lib liveness_oracle_rejects_actionable_deficits_without_observable_runtime_work`
 - real temporary source through add, targeted and overflow reconciliation,
   same-size content change, rename, delete, playback pause, committed internal
   mutation, closed-app restart audit, root disappearance/reappearance, and
   source remove/re-add:
-  `cargo test -p wavecrate --lib source_processing_liveness_harness_converges_restart_churn_and_root_recovery -- --ignored --nocapture`
+  `cargo test -p yield --lib source_processing_liveness_harness_converges_restart_churn_and_root_recovery -- --ignored --nocapture`
 - 10,000-file / 30,001-target calibrated source-processing profile:
-  `cargo test -p wavecrate --lib profile_source_processing_churn_under_playback_and_browser_priority -- --ignored --nocapture`
+  `cargo test -p yield --lib profile_source_processing_churn_under_playback_and_browser_priority -- --ignored --nocapture`
 - fully analyzed 10,000-file periodic-sweep and one-file readiness-delta profile:
-  `cargo test -p wavecrate --lib profile_revision_gated_readiness_sweeps_10k -- --ignored --nocapture`
+  `cargo test -p yield --lib profile_revision_gated_readiness_sweeps_10k -- --ignored --nocapture`
 - full mutation and watcher family coverage:
-  `cargo test -p wavecrate --lib committed_file_mutations`
+  `cargo test -p yield --lib committed_file_mutations`
   and
-  `cargo test -p wavecrate --lib source_watcher`
+  `cargo test -p yield --lib source_watcher`
 - supervisor and durable-readiness failure injection (busy/resource contention,
   retry deadlines, expired leases, cancellation, worker failures, unsupported
   inputs, and stale completions):
-  `cargo test -p wavecrate --lib native_app::source_processing::supervisor::tests`
+  `cargo test -p yield --lib native_app::source_processing::supervisor::tests`
   and
-  `cargo test -p wavecrate-library sample_sources::readiness::tests`
+  `cargo test -p yield-library sample_sources::readiness::tests`
 - seeded, replayable source lifecycle and scan-order state machine (six retained
   regression seeds in the bounded normal-CI scanner lane):
-  `cargo test -p wavecrate --lib source_processing_seeded_state_machine_normal_ci`
+  `cargo test -p yield --lib source_processing_seeded_state_machine_normal_ci`
 - integrated real-supervisor replay for the calibrated lifecycle seed:
-  `cargo test -p wavecrate --lib source_processing_seeded_state_machine_integrated_supervisor -- --ignored --nocapture`
+  `cargo test -p yield --lib source_processing_seeded_state_machine_integrated_supervisor -- --ignored --nocapture`
 - extended 1,000-sequence state-machine stress lane:
-  `cargo test -p wavecrate --lib source_processing_seeded_state_machine_stress_1000 -- --ignored --nocapture`
+  `cargo test -p yield --lib source_processing_seeded_state_machine_stress_1000 -- --ignored --nocapture`
 - replay a decimal seed or the minimized JSON artifact path printed by a
   failure:
-  `WAVECRATE_SOURCE_STATE_MACHINE_REPLAY=<seed-or-artifact> cargo test -p wavecrate --lib source_processing_seeded_state_machine_replay -- --ignored --nocapture`
+  `YIELD_SOURCE_STATE_MACHINE_REPLAY=<seed-or-artifact> cargo test -p yield --lib source_processing_seeded_state_machine_replay -- --ignored --nocapture`
 - UI frame and input budgets while exercising browser interactions:
   `bash scripts/perf.sh guard` on macOS/Linux/WSL or
   `powershell -ExecutionPolicy Bypass -File scripts/perf.ps1 guard` on Windows
@@ -411,13 +411,13 @@ Use this lane when changing `book.toml` or files under `docs/book/src/`.
 - preview:
   - `mdbook serve --hostname 127.0.0.1 --port 3011`
 - generated local output:
-  - `target/mdbook/wavecrate-docs/`
+  - `target/mdbook/yield-docs/`
 - public publishing target:
-  - `https://portalsurfer.org/wavecrate/docs/`
+  - `https://portalsurfer.org/yield/docs/`
 
-### Wavecrate UI projection compatibility tests
+### Yield UI projection compatibility tests
 
-Use for Wavecrate-owned projection snapshot and behavior changes. Default GUI
+Use for Yield-owned projection snapshot and behavior changes. Default GUI
 work should prefer focused tests around `src/native_app.rs` and the relevant
 Radiant public API surface.
 
@@ -426,7 +426,7 @@ Radiant public API surface.
   - `browser_dense_shot_matches_fixture`
   - `waveform_selection_shot_matches_fixture`
   - update fixtures with
-    `cargo test -p wavecrate --lib update_shot_fixtures -- --ignored`
+    `cargo test -p yield --lib update_shot_fixtures -- --ignored`
 
 ### Sample navigation responsiveness
 
@@ -434,7 +434,7 @@ Use this focused harness when changing sample selection, deferred loading,
 waveform cache promotion, decode scheduling, or stale sample-load completion
 handling:
 
-- `cargo test -p wavecrate rapid_navigation_harness --no-default-features`
+- `cargo test -p yield rapid_navigation_harness --no-default-features`
 
 The harness exercises rapid keyboard navigation while sample-load business work
 is queued, verifies visible selection updates before completions, checks stale
@@ -443,7 +443,7 @@ asserts Radiant runtime diagnostics report no slow UI update handlers.
 
 Manual cold-cache smoke for large folders:
 
-1. Run Wavecrate against a source folder with many uncached audio files.
+1. Run Yield against a source folder with many uncached audio files.
 2. Navigate quickly through the sample browser with keyboard arrows and mouse
    selection while cache/decode work is still cold.
 3. Confirm row selection and status feedback move immediately.
@@ -475,8 +475,8 @@ Use for semantic GUI contracts and CLI scenarios.
   or `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 sandbox -Name source-qa -Fixture small-multi-source`.
   Provisioning resets by default; pass `--fixture-preserve` or
   `-FixturePreserve` only when intentionally continuing the same mutation run.
-- The shared `wavecrate-fixture` tool emits
-  `.wavecrate/fixtures/<name>/fixture-manifest.json` with stable source ids,
+- The shared `yield-fixture` tool emits
+  `.yield/fixtures/<name>/fixture-manifest.json` with stable source ids,
   relative paths, hashes, file counts, and expected readiness-target counts.
   Its deterministic `create`, `same-size-change`, `move`, `delete`,
   `root-offline`, `root-online`, and `reset` scenarios replace ambient-folder
@@ -514,9 +514,9 @@ Use these checks when the change could affect startup config loading/saving,
 sample-source persistence, or GUI fixture profile selection.
 
 - profile model:
-  - live runs use `<config-base>/.wavecrate/`
-  - sandbox/manual QA runs use `<config-base>/.wavecrate/profiles/sandbox/`
-  - automated validation runs use `<config-base>/.wavecrate/profiles/automated-tests/`
+  - live runs use `<config-base>/.yield/`
+  - sandbox/manual QA runs use `<config-base>/.yield/profiles/sandbox/`
+  - automated validation runs use `<config-base>/.yield/profiles/automated-tests/`
 - regression anchors:
   - `cargo test app_core::controller::tests::persistence_boundary::`
   - `cargo test gui_test::`
@@ -527,7 +527,7 @@ sample-source persistence, or GUI fixture profile selection.
     bytes before and after an isolated native-runtime run, plus the retained
     controller `library.db` boundary checks
   - `powershell -ExecutionPolicy Bypass -File scripts/ci.ps1 agent`
-    still covers the same regression through `cargo test -p wavecrate --lib`
+    still covers the same regression through `cargo test -p yield --lib`
 
 ### Windows manual confirmation
 
@@ -536,8 +536,8 @@ that validation did not leak fixture sources into the real startup profile.
 
 1. Run `powershell -ExecutionPolicy Bypass -File scripts/ci.ps1 agent`.
 2. Run `powershell -ExecutionPolicy Bypass -File scripts/gui.ps1 contract`.
-3. Start one normal live runtime without `WAVECRATE_CONFIG_HOME` or
-   `WAVECRATE_CONFIG_PROFILE` overrides:
+3. Start one normal live runtime without `YIELD_CONFIG_HOME` or
+   `YIELD_CONFIG_PROFILE` overrides:
    `cargo run --release`
 4. Confirm the app opens with the intended real source list instead of temp or
    fixture paths.
@@ -549,18 +549,18 @@ that validation did not leak fixture sources into the real startup profile.
 ### Windows ZIP Distribution Lifecycle
 
 Windows releases are distributed as downloadable ZIP artifacts. A supported
-Windows release package contains the `wavecrate/` archive root, the
-`wavecrate/wavecrate.exe` runtime binary, and `wavecrate/update-manifest.json`.
-Wavecrate does not currently provide OS-managed app registration or automatic
+Windows release package contains the `yield/` archive root, the
+`yield/yield.exe` runtime binary, and `yield/update-manifest.json`.
+Yield does not currently provide OS-managed app registration or automatic
 system cleanup for the supported release path.
 
-Windows users install Wavecrate by extracting the ZIP to a folder they manage.
-To update a manual install, close Wavecrate, download a newer ZIP, and replace
-the extracted `wavecrate/` folder or its files with the newer release contents.
-To remove Wavecrate, delete the extracted folder. App settings, source metadata,
-logs, and rebuildable caches live under the user's `.wavecrate` app data paths
+Windows users install Yield by extracting the ZIP to a folder they manage.
+To update a manual install, close Yield, download a newer ZIP, and replace
+the extracted `yield/` folder or its files with the newer release contents.
+To remove Yield, delete the extracted folder. App settings, source metadata,
+logs, and rebuildable caches live under the user's `.yield` app data paths
 and can be removed separately when the user deliberately wants to clear local
-Wavecrate state.
+Yield state.
 
 Focused validation for Windows release distribution changes:
 
@@ -572,17 +572,17 @@ Focused validation for Windows release distribution changes:
 
 ### Database migration and compatibility
 
-Use this lane when changing `.wavecrate.db`, `library.db`, source metadata
+Use this lane when changing `.yield.db`, `library.db`, source metadata
 queries, schema DDL, schema version stamps, or migration code.
 
 - source DB contract and migration fixtures:
-  - `cargo test -p wavecrate-library source_db_migration_tests`
+  - `cargo test -p yield-library source_db_migration_tests`
 - read-only source query compatibility:
-  - `cargo test -p wavecrate-library sample_sources::db::read`
+  - `cargo test -p yield-library sample_sources::db::read`
 - global library DB contract and migrations:
-  - `cargo test -p wavecrate-library sample_sources::library`
+  - `cargo test -p yield-library sample_sources::library`
 - compile check for the storage crate:
-  - `cargo check -p wavecrate-library`
+  - `cargo check -p yield-library`
 
 See `docs/DATABASE_MIGRATIONS.md` for the schema-change contract. Source DB
 additive repairs must run even when `PRAGMA user_version` already matches the
@@ -594,14 +594,14 @@ shapes by projecting safe defaults or avoiding missing optional tables.
 On macOS, build manual-test binaries with `bash scripts/build.sh --release`.
 The helper emits a branch-specific, ad-hoc-signed app under
 `target/app-bundles/` and prints both its Launch Services identity and launch
-command. Use that app name for UI automation; launching `target/release/wavecrate`
+command. Use that app name for UI automation; launching `target/release/yield`
 directly does not register a distinct macOS application and can cause automation
-to fall back to an installed Wavecrate bundle.
+to fall back to an installed Yield bundle.
 
 Use this when reproducing a release/manual bug that needs the richer
 per-launch diagnostics trail.
 
-1. Start a repro run with the Wavecrate-owned debug flag:
+1. Start a repro run with the Yield-owned debug flag:
    `cargo run --release -- --log`
    For a live run that also shows debug layout overlays, use either spelling:
    `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 logs debug-overlays`
@@ -619,7 +619,7 @@ per-launch diagnostics trail.
 6. Extra-verbose hot-path traces are separate:
    default `--log` keeps routine loop-cycle and similar hot-path chatter out of
    the file, but it still records warning-level slow starmap audition hot phases.
-   Only enable `WAVECRATE_HOTPATH_TELEMETRY=1` when you deliberately need
+   Only enable `YIELD_HOTPATH_TELEMETRY=1` when you deliberately need
    developer-level loop/hot-path tracing during a focused repro.
 
 ### Benchmarks and perf checks
@@ -635,7 +635,7 @@ Startup threshold calibration is not a release lane by itself. The Bash
 `scripts/perf.sh calibrate-startup` command is optional Linux developer tooling
 for refreshing startup threshold lock files on compositor-backed hosts. Current
 release-risk startup perf evidence should be collected with `scripts/perf.* guard`
-on supported app platforms, using `WAVECRATE_PERF_GUARD_STARTUP_PROFILE=1` when
+on supported app platforms, using `YIELD_PERF_GUARD_STARTUP_PROFILE=1` when
 first-paint startup timing evidence is required.
 
 ## CI reference

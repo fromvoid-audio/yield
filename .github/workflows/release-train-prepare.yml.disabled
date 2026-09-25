@@ -1,4 +1,4 @@
-name: Wavecrate release train prep
+name: Yield release train prep
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: wavecrate-release-train-${{ inputs.version }}
+  group: yield-release-train-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:

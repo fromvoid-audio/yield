@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-# Developer-validation helper only. Wavecrate does not ship Linux app builds.
+# Developer-validation helper only. Yield does not ship Linux app builds.
 # This configures a dummy ALSA backend for headless Linux CI/agent/perf runs so
 # logs are not flooded with "cannot find card" / "Unknown PCM default" noise.
-wavecrate_setup_headless_audio() {
+yield_setup_headless_audio() {
   local log_prefix="${1:-headless_audio}"
 
   if [[ "$(uname -s)" != "Linux" ]]; then

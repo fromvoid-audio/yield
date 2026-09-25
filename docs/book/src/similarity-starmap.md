@@ -6,7 +6,7 @@ Similarity tools help you move by sound instead of only by folder name, filename
 
 Similarity search and Starmap depend on source processing, which reconciles automatically after source changes. Use **Process Source** only to prioritize that source.
 
-Large sources can take time to process. Wavecrate keeps browsing responsive while processing work runs in the background.
+Large sources can take time to process. Yield keeps browsing responsive while processing work runs in the background.
 
 ## Similarity Search
 

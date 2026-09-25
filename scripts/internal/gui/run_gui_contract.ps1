@@ -39,16 +39,16 @@ function Invoke-GuiStep {
 
 Push-Location $rootDir
 try {
-  Enable-WavecrateCargoCache
+  Enable-YieldCargoCache
 
   Write-Host "[gui-contract] cargo test app_core::actions::tests"
   Invoke-GuiStep -Label "cargo test app_core::actions::tests" -Command {
-    Invoke-WavecrateCargo test app_core::actions::tests
+    Invoke-YieldCargo test app_core::actions::tests
   }
 
   Write-Host "[gui-contract] cargo test gui_test::"
   Invoke-GuiStep -Label "cargo test gui_test::" -Command {
-    Invoke-WavecrateCargo test gui_test::
+    Invoke-YieldCargo test gui_test::
   }
 
   Write-Host "[gui-contract] cargo test gui_test::fixtures::tests -- --ignored"
@@ -56,13 +56,13 @@ try {
     $guiFixtureArgs = @(
       "test",
       "-p",
-      "wavecrate",
+      "yield",
       "--lib",
       "gui_test::fixtures::tests",
       "--",
       "--ignored"
     )
-    & cargo @(Get-WavecrateCargoConfigOverrideArgs) @guiFixtureArgs
+    & cargo @(Get-YieldCargoConfigOverrideArgs) @guiFixtureArgs
   }
 
   Write-Host "[gui-contract] cargo test gui_test::runner::tests -- --ignored"
@@ -70,13 +70,13 @@ try {
     $guiRunnerArgs = @(
       "test",
       "-p",
-      "wavecrate",
+      "yield",
       "--lib",
       "gui_test::runner::tests",
       "--",
       "--ignored"
     )
-    & cargo @(Get-WavecrateCargoConfigOverrideArgs) @guiRunnerArgs
+    & cargo @(Get-YieldCargoConfigOverrideArgs) @guiRunnerArgs
   }
 
   Write-Host "[gui-contract] cargo test bridge_runtime fixture checks -- --ignored"
@@ -84,13 +84,13 @@ try {
     $bridgeRuntimeArgs = @(
       "test",
       "-p",
-      "wavecrate",
+      "yield",
       "--lib",
       "app_core::ui_bridge::tests::bridge_runtime",
       "--",
       "--ignored"
     )
-    & cargo @(Get-WavecrateCargoConfigOverrideArgs) @bridgeRuntimeArgs
+    & cargo @(Get-YieldCargoConfigOverrideArgs) @bridgeRuntimeArgs
   }
 
   Write-Host "[gui-contract] cargo test contract_smoke_pack_runs_cleanly -- --ignored --exact"
@@ -98,24 +98,24 @@ try {
     $contractSmokeArgs = @(
       "test",
       "-p",
-      "wavecrate",
+      "yield",
       "--lib",
       "gui_test::packs::tests::contract_smoke_pack_runs_cleanly",
       "--",
       "--ignored",
       "--exact"
     )
-    & cargo @(Get-WavecrateCargoConfigOverrideArgs) @contractSmokeArgs
+    & cargo @(Get-YieldCargoConfigOverrideArgs) @contractSmokeArgs
   }
 
   Write-Host "[gui-contract] cargo test app_core::controller::tests::persistence_boundary::"
   Invoke-GuiStep -Label "cargo test app_core::controller::tests::persistence_boundary::" -Command {
-    Invoke-WavecrateCargo test app_core::controller::tests::persistence_boundary::
+    Invoke-YieldCargo test app_core::controller::tests::persistence_boundary::
   }
 
   Write-Host "[gui-contract] cargo test --manifest-path $radiantDir/Cargo.toml toolbar_hit_test_focuses_browser_search"
   Invoke-GuiStep -Label "cargo test --manifest-path $radiantDir/Cargo.toml toolbar_hit_test_focuses_browser_search" -Command {
-    Invoke-WavecrateCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') toolbar_hit_test_focuses_browser_search
+    Invoke-YieldCargo test --manifest-path (Join-Path $radiantDir 'Cargo.toml') toolbar_hit_test_focuses_browser_search
   }
 } finally {
   Pop-Location

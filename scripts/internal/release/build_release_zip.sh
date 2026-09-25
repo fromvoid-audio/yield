@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="wavecrate"
-APP_DISPLAY_NAME="Wavecrate"
-APP_BUNDLE_ID="org.portalsurfer.wavecrate"
+APP_NAME="yield"
+APP_DISPLAY_NAME="Yield"
+APP_BUNDLE_ID="org.portalsurfer.yield"
 APP_ICON_SOURCE="assets/logo3.icns"
 REPO_ROOT="$(pwd)"
-BUILD_CARGO_BIN="${WAVECRATE_CARGO_BIN:-cargo}"
-SKIP_BUILD="${WAVECRATE_SKIP_BUILD:-0}"
-MACOS_SIGNING="${WAVECRATE_MACOS_SIGNING:-0}"
+BUILD_CARGO_BIN="${YIELD_CARGO_BIN:-cargo}"
+SKIP_BUILD="${YIELD_SKIP_BUILD:-0}"
+MACOS_SIGNING="${YIELD_MACOS_SIGNING:-0}"
 OUT_DIR="dist/release"
 TARGET=""
 PLATFORM=""
@@ -155,15 +155,15 @@ esac
 if ! is_truthy "$SKIP_BUILD"; then
   env_args=()
   if [[ -n "$BUILD_NUMBER" ]]; then
-    env_args+=("WAVECRATE_BUILD_NUMBER=$BUILD_NUMBER")
+    env_args+=("YIELD_BUILD_NUMBER=$BUILD_NUMBER")
   fi
   if [[ -n "$GIT_SHA" ]]; then
-    env_args+=("WAVECRATE_GIT_SHA=$GIT_SHA")
+    env_args+=("YIELD_GIT_SHA=$GIT_SHA")
   fi
-  env_args+=("WAVECRATE_RELEASE_VERSION=$VERSION")
-  env_args+=("WAVECRATE_RELEASE_CHANNEL=$CHANNEL")
-  env_args+=("WAVECRATE_RELEASE_TARGET_VERSION=$TARGET_VERSION")
-  env_args+=("WAVECRATE_RELEASE_BUILD_DATE=$BUILD_DATE")
+  env_args+=("YIELD_RELEASE_VERSION=$VERSION")
+  env_args+=("YIELD_RELEASE_CHANNEL=$CHANNEL")
+  env_args+=("YIELD_RELEASE_TARGET_VERSION=$TARGET_VERSION")
+  env_args+=("YIELD_RELEASE_BUILD_DATE=$BUILD_DATE")
   env "${env_args[@]}" "$BUILD_CARGO_BIN" build --release -p "$APP_NAME" --bin "$APP_NAME" --target "$TARGET"
 fi
 

@@ -9,14 +9,14 @@
 
 set -euo pipefail
 
-wavecrate_git_uses_windows_worktree() {
+yield_git_uses_windows_worktree() {
   local current_dir
   current_dir="$(pwd -P 2>/dev/null || pwd)"
   [[ "$current_dir" =~ ^/mnt/[A-Za-z]/ ]]
 }
 
-wavecrate_git() {
-  if wavecrate_git_uses_windows_worktree; then
+yield_git() {
+  if yield_git_uses_windows_worktree; then
     git -c core.autocrlf=true "$@"
   else
     git "$@"

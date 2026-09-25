@@ -51,7 +51,7 @@ run_check "native app boundary guardrail" ./scripts/internal/check/check_native_
 run_check "readiness executor boundary guardrail" ./scripts/internal/check/check_readiness_executor_boundary.sh
 run_check "source database open-role guardrail" ./scripts/internal/check/check_source_db_open_roles.sh
 run_check "non-blocking architecture guardrails" ./scripts/internal/check/check_non_blocking_architecture.sh
-run_check "Wavecrate facade guardrail" ./scripts/internal/check/check_wavecrate_facades.sh
+run_check "Yield facade guardrail" ./scripts/internal/check/check_yield_facades.sh
 run_check "rust todo/todo guardrail (non-test only)" ./scripts/internal/check/check_rust_no_todos.sh
 run_check "rust dead dependency/unused code sweep (advisory)" \
   ./scripts/internal/check/check_rust_dead_deps_advisory.sh --advisory

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Locate and provision the standalone Radiant checkout used by Wavecrate.
+# Locate and provision the standalone Radiant checkout used by Yield.
 #
 # `locate` is deliberately non-mutating and permits a dirty/feature-branch
 # sibling for live development. `provision --clean` is for CI/release and only
@@ -18,7 +18,7 @@ usage() {
 Usage: scripts/radiant.sh [locate|provision] [options]
 
 Options:
-  --root <dir>       Wavecrate checkout (defaults to this repository)
+  --root <dir>       Yield checkout (defaults to this repository)
   --path <dir>       paired sibling path (must match Cargo's ../radiant path)
   --clean            provision an exact, clean detached checkout (CI/release)
   --help             show this help
@@ -46,7 +46,7 @@ done
 if [[ -z "$ROOT_DIR" ]]; then
   ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 fi
-[[ -n "$ROOT_DIR" && -f "$ROOT_DIR/Cargo.toml" ]] || die "could not identify a Wavecrate checkout; pass --root"
+[[ -n "$ROOT_DIR" && -f "$ROOT_DIR/Cargo.toml" ]] || die "could not identify a Yield checkout; pass --root"
 ROOT_DIR="$(cd "$ROOT_DIR" && pwd -P)"
 
 metadata_value() {
@@ -65,7 +65,7 @@ METADATA_PATH="$(metadata_value path)"
 [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || die "metadata revision is not a full SHA"
 [[ -n "$REPOSITORY" && -n "$METADATA_PATH" ]] || die "metadata repository/path is incomplete"
 
-[[ -z "${WAVECRATE_RADIANT_DIR:-}" ]] || die "WAVECRATE_RADIANT_DIR is unsupported because Cargo is pinned to the paired ../radiant sibling; unset it and use the paired path"
+[[ -z "${YIELD_RADIANT_DIR:-}" ]] || die "YIELD_RADIANT_DIR is unsupported because Cargo is pinned to the paired ../radiant sibling; unset it and use the paired path"
 
 canonical_path() {
   local path="$1" parent name

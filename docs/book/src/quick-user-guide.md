@@ -1,6 +1,6 @@
 # Quick User Guide
 
-This is the shortest path through Wavecrate: add a source, audition sounds, mark the useful part, extract or edit it, then keep enough metadata that you can find it again.
+This is the shortest path through Yield: add a source, audition sounds, mark the useful part, extract or edit it, then keep enough metadata that you can find it again.
 
 ## 1. Add A Source
 
@@ -8,7 +8,7 @@ Start with a folder that contains WAV files. Click the plus button in Sources or
 
 ![Sources and folders](assets/feature-sources-folders.png)
 
-Wavecrate indexes the folder and keeps the visible browser scoped to the source and folder selections on the left.
+Yield indexes the folder and keeps the visible browser scoped to the source and folder selections on the left.
 
 ## 2. Audition The List
 
@@ -49,11 +49,11 @@ Use waveform edit commands when the selected audio should change:
 - `M` mutes the selection
 - `N` normalizes the selection or sample, depending on focus
 
-Destructive edits can rewrite files. Wavecrate prompts before destructive edits unless Yolo mode is enabled.
+Destructive edits can rewrite files. Yield prompts before destructive edits unless Yolo mode is enabled.
 
 ## 6. Keep The Result Findable
 
-Rate, tag, rename, or place extracted clips into useful folders or collections. Wavecrate is strongest when quick auditioning and small metadata decisions happen in the same pass.
+Rate, tag, rename, or place extracted clips into useful folders or collections. Yield is strongest when quick auditioning and small metadata decisions happen in the same pass.
 
 ![Metadata and collections](assets/feature-metadata-collections.png)
 

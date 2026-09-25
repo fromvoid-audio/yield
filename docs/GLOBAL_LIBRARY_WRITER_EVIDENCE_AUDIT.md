@@ -42,12 +42,12 @@ metadata/index, link, cache/artifact route, or durable shutdown custody.
 ## Audit basis
 
 The implementation boundary is `GlobalLibraryWriter::start` and `run_owner` in
-`crates/wavecrate-library/src/sample_sources/library/owner.rs`. The owner clones
+`crates/yield-library/src/sample_sources/library/owner.rs`. The owner clones
 the already acquired `WritableProfileGuard`, opens one profile-bound
-`LibraryDatabase` connection on the `wavecrate-global-library-writer` thread,
+`LibraryDatabase` connection on the `yield-global-library-writer` thread,
 and exposes typed queue methods rather than the SQLite connection. The queue is
 a nonblocking `sync_channel` with capacity 32. The session startup path is
-`Persistence::start` in `crates/wavecrate-session/src/lib.rs`: profile ownership,
+`Persistence::start` in `crates/yield-session/src/lib.rs`: profile ownership,
 journal, global-library writer, and then catalog. Shutdown closes catalog before
 the global writer, journal, and profile guard.
 
@@ -142,13 +142,13 @@ from a direct-library fixture.
 
 | Requirement | Exact tests | Evidence limit |
 | --- | --- | --- |
-| Queue admission and full behavior | `queue_admission_distinguishes_initializing_and_full`; `queue_admission_is_nonblocking_and_reports_full` (`crates/wavecrate-library/src/sample_sources/library/owner.rs`) | Covers lifecycle/full signaling, not aggregate registry payload bounds. |
+| Queue admission and full behavior | `queue_admission_distinguishes_initializing_and_full`; `queue_admission_is_nonblocking_and_reports_full` (`crates/yield-library/src/sample_sources/library/owner.rs`) | Covers lifecycle/full signaling, not aggregate registry payload bounds. |
 | Owner startup, one connection, and drain | `one_owner_connection_serves_repeated_commands_and_shutdown_drains`; `writer_keeps_shared_profile_ownership_after_original_guard_is_dropped`; `source_registry_and_known_sources_survive_writer_reopen` (owner.rs) | Covers the current owner route and reopen; no durable participant receipt. |
 | Profile initialization/failure boundaries | `corrupt_database_is_unavailable_without_repeated_open_attempts`; `profile_owned_open_rejects_nonregular_sidecar_before_sqlite`; `profile_owned_open_rejects_database_symlink_without_following_it`; `profile_root_replacement_during_initialization_does_not_redirect_database`; `profile_replacement_closes_owner_and_rejects_later_commands` (owner.rs) | Fail-closed profile/database checks; no dedicated read-only snapshot test. |
 | Existing payload validation | `ui_preferences_payload_is_bounded_and_reopens_through_same_owner`; `profile_vocabulary_owner_validates_before_admission_and_drains_on_shutdown`; `profile_vocabulary_delete_drains_after_result_receiver_is_dropped` (owner.rs) | Covers 128 KiB preferences and vocabulary limits, not registry/path payload limits. |
-| Registry session route | `service_uses_isolated_profile_and_reopens_registry` (`crates/wavecrate-session/src/lib.rs`); `source_registry_and_known_sources_survive_writer_reopen` (owner.rs) | Covers load/save/reopen; no OperationId participant or aggregate byte-budget test. |
-| Harvest semantics | `harvest_state_auto_transitions_only_move_forward`; `current_harvest_touch_fence_rechecks_before_state_write`; `harvest_file_batch_upsert_persists_every_identity`; `manual_harvest_reset_returns_file_to_new_queue`; `manual_harvest_state_update_preserves_known_identity_metadata`; `harvest_derivation_graph_survives_reopen_and_marks_parent_touched`; `remaps_harvest_graph_keys_after_file_moves`; `remaps_harvest_graph_prefix_after_folder_moves` (`crates/wavecrate-library/src/sample_sources/library/tests.rs`) | Direct-library semantics/reopen/remap only; no global-writer Harvest route test exists. |
-| Shutdown ordering | `session_journal_reopens_after_orderly_shutdown`; `persistence_drop_stops_external_catalog_before_releasing_journal`; `catalog_shares_session_profile_owner_and_releases_after_shutdown` (`crates/wavecrate-session/src/lib.rs`) | Covers ordering and lifecycle release; durable shutdown diagnostics remain OPT-1838. |
+| Registry session route | `service_uses_isolated_profile_and_reopens_registry` (`crates/yield-session/src/lib.rs`); `source_registry_and_known_sources_survive_writer_reopen` (owner.rs) | Covers load/save/reopen; no OperationId participant or aggregate byte-budget test. |
+| Harvest semantics | `harvest_state_auto_transitions_only_move_forward`; `current_harvest_touch_fence_rechecks_before_state_write`; `harvest_file_batch_upsert_persists_every_identity`; `manual_harvest_reset_returns_file_to_new_queue`; `manual_harvest_state_update_preserves_known_identity_metadata`; `harvest_derivation_graph_survives_reopen_and_marks_parent_touched`; `remaps_harvest_graph_keys_after_file_moves`; `remaps_harvest_graph_prefix_after_folder_moves` (`crates/yield-library/src/sample_sources/library/tests.rs`) | Direct-library semantics/reopen/remap only; no global-writer Harvest route test exists. |
+| Shutdown ordering | `session_journal_reopens_after_orderly_shutdown`; `persistence_drop_stops_external_catalog_before_releasing_journal`; `catalog_shares_session_profile_owner_and_releases_after_shutdown` (`crates/yield-session/src/lib.rs`) | Covers ordering and lifecycle release; durable shutdown diagnostics remain OPT-1838. |
 | Unimplemented participant routes | No current exact test exists for global-writer metadata/index, operation links, cache/artifact references, profile epoch/OperationId idempotency, or durable global-writer shutdown evidence. | These remain assigned to OPT-1830, OPT-1833, OPT-1834, OPT-1836, and OPT-1838. |
 
 ## Follow-up boundaries

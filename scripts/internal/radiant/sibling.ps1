@@ -18,7 +18,7 @@ function MetadataValue([string] $Key, [string] $File) {
 if (-not $Root) {
   $Root = (git rev-parse --show-toplevel 2>$null)
 }
-if (-not $Root -or -not (Test-Path (Join-Path $Root 'Cargo.toml'))) { Fail 'could not identify a Wavecrate checkout; pass -Root' }
+if (-not $Root -or -not (Test-Path (Join-Path $Root 'Cargo.toml'))) { Fail 'could not identify a Yield checkout; pass -Root' }
 $Root = [IO.Path]::GetFullPath($Root)
 $Metadata = Join-Path $Root 'radiant-dependency.toml'
 if (-not (Test-Path $Metadata)) { Fail "missing $Metadata" }
@@ -27,8 +27,8 @@ $Revision = MetadataValue 'revision' $Metadata
 $MetadataPath = MetadataValue 'path' $Metadata
 if ($Revision -notmatch '^[0-9a-f]{40}$') { Fail 'metadata revision is not a full SHA' }
 if (-not $Repository -or -not $MetadataPath) { Fail 'metadata repository/path is incomplete' }
-if ($env:WAVECRATE_RADIANT_DIR) {
-  Fail 'WAVECRATE_RADIANT_DIR is unsupported because Cargo is pinned to the paired ../radiant sibling; unset it and use the paired path'
+if ($env:YIELD_RADIANT_DIR) {
+  Fail 'YIELD_RADIANT_DIR is unsupported because Cargo is pinned to the paired ../radiant sibling; unset it and use the paired path'
 }
 function Resolve-SiblingPath([string] $Value) {
   if (-not [IO.Path]::IsPathRooted($Value)) { $Value = Join-Path $Root $Value }
