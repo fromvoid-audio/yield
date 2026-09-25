@@ -35,6 +35,7 @@ const SIMILAR: &str = "transport-similar-sections";
 const BPM_SNAP: &str = "transport-bpm-snap";
 const ZERO_CROSSING: &str = "transport-zero-crossing";
 const BEAT_GUIDES: &str = "transport-beat-guides";
+const TRANSIENT_MARKERS: &str = "transport-transient-markers";
 const BEAT_COUNT: &str = "transport-beat-count";
 const METRONOME: &str = "transport-metronome";
 const RANDOM_AUDITION: &str = "transport-random-audition";
@@ -241,6 +242,7 @@ impl BrowserAccessibility {
             BPM_SNAP,
             ZERO_CROSSING,
             BEAT_GUIDES,
+            TRANSIENT_MARKERS,
             METRONOME,
             RANDOM_AUDITION,
             NORMALIZED_AUDITION,
@@ -428,6 +430,7 @@ impl BrowserAccessibility {
                                 | BPM_SNAP
                                 | ZERO_CROSSING
                                 | BEAT_GUIDES
+                                | TRANSIENT_MARKERS
                                 | BEAT_COUNT
                                 | METRONOME
                                 | RANDOM_AUDITION
@@ -483,8 +486,10 @@ impl BrowserAccessibility {
                         if event.id == WAVEFORM && view.waveform.is_none() {
                             return;
                         }
-                        if matches!(event.id.as_str(), BPM_SNAP | BEAT_GUIDES | BEAT_COUNT)
-                            && view.waveform.is_none()
+                        if matches!(
+                            event.id.as_str(),
+                            BPM_SNAP | BEAT_GUIDES | BEAT_COUNT | TRANSIENT_MARKERS
+                        ) && view.waveform.is_none()
                         {
                             return;
                         }
@@ -591,6 +596,7 @@ impl BrowserAccessibility {
                                     view.beat_guides_enabled = !view.beat_guides_enabled;
                                     cx.notify();
                                 }
+                                TRANSIENT_MARKERS => super::transient_markers::toggle(view, cx),
                                 METRONOME => view.toggle_metronome(cx),
                                 RANDOM_AUDITION => view.request_random_audition(false, cx),
                                 NORMALIZED_AUDITION => view.toggle_normalized_audition(cx),
@@ -988,6 +994,12 @@ impl Browser {
                     BEAT_GUIDES,
                     "Beat guides",
                     self.beat_guides_enabled,
+                    has_waveform,
+                ),
+                toggle(
+                    TRANSIENT_MARKERS,
+                    "Transient markers",
+                    self.transient_markers.enabled(),
                     has_waveform,
                 ),
                 toggle(

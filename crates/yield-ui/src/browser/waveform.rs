@@ -23,6 +23,7 @@ use super::Browser;
 use super::played_ranges;
 use super::playmark_timing;
 use super::similar_sections;
+use super::transient_markers;
 use super::waveform_fades;
 use super::waveform_scrollbar;
 use super::zero_crossing;
@@ -1810,6 +1811,7 @@ pub(super) fn render_waveform(
         .right_0(),
     );
     bars = bars.child(similar_sections::overlay(browser, theme.clone()));
+    bars = bars.child(transient_markers::render_overlay(browser, &theme));
     let beat_guides = browser.beat_guides_enabled.then_some((
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
@@ -2252,6 +2254,7 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         played_ranges::clear_history(self);
+        self.transient_markers.invalidate();
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
         self.waveform_hover_cursor = None;
         self.waveform_last_play_start = None;

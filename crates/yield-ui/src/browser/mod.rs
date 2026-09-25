@@ -106,6 +106,7 @@ mod tag_filter;
 mod tag_library;
 mod tag_pager;
 mod tags;
+mod transient_markers;
 mod transport;
 mod view;
 mod volume;
@@ -333,6 +334,7 @@ pub(crate) struct Browser {
     waveform_detail: waveform_detail::WaveformDetailState,
     zero_crossing: zero_crossing::ZeroCrossingState,
     similar_sections: similar_sections::SimilarSectionsState,
+    transient_markers: transient_markers::TransientMarkersState,
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
@@ -639,6 +641,7 @@ impl Browser {
             waveform_detail: waveform_detail::WaveformDetailState::default(),
             zero_crossing: zero_crossing::ZeroCrossingState::default(),
             similar_sections: similar_sections::SimilarSectionsState::default(),
+            transient_markers: transient_markers::TransientMarkersState::default(),
             bpm_snap_enabled: false,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
@@ -1905,7 +1908,10 @@ impl Browser {
                 view.waveform_task = None;
                 view.waveform_pending = false;
                 match result {
-                    Ok(preview) => view.waveform = Some(preview),
+                    Ok(preview) => {
+                        view.waveform = Some(preview);
+                        transient_markers::schedule(view, cx);
+                    }
                     Err(error) => {
                         view.clear_waveform_region();
                         view.waveform_error = Some(error);
@@ -2162,6 +2168,15 @@ impl Browser {
     ) {
         self.beat_guides_enabled = !self.beat_guides_enabled;
         cx.notify();
+    }
+
+    fn toggle_transient_markers_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        transient_markers::toggle(self, cx);
     }
 
     fn random_audition_available(&self) -> bool {
@@ -2737,6 +2752,12 @@ impl Browser {
             && !function
             && self.waveform.is_some()
         {
+            if key.eq_ignore_ascii_case("i") {
+                if !event.is_held {
+                    transient_markers::toggle(self, cx);
+                }
+                return;
+            }
             if key.eq_ignore_ascii_case("b") {
                 if !event.is_held {
                     self.toggle_bpm_snap(cx);
