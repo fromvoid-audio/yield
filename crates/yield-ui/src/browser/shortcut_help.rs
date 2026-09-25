@@ -244,6 +244,10 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Play/stop; random section in sticky mode",
     },
     ShortcutRow {
+        keys: "Cmd-Space",
+        description: "Play from the current waveform playhead",
+    },
+    ShortcutRow {
         keys: "C",
         description: "Set the focused sample as compare anchor",
     },

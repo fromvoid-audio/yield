@@ -328,6 +328,18 @@ impl Browser {
         self.request_playback_intent(intent, cx);
     }
 
+    pub(super) fn play_from_current_playhead(&mut self, cx: &mut Context<Self>) {
+        if self.waveform.is_none() {
+            return;
+        }
+        let start = current_playhead_start(
+            self.playback_cursor_ratio(true),
+            self.waveform_hover_cursor,
+            self.waveform_last_play_start,
+        );
+        self.start_playback_from_position(f64::from(start), cx);
+    }
+
     pub(super) fn start_playback_from_position(&mut self, start: f64, cx: &mut Context<Self>) {
         let Some(intent) = self.selected_playback_intent(start, PlaybackIntentOrigin::Explicit)
         else {
@@ -874,6 +886,15 @@ impl Browser {
             return;
         }
         let intent = PlaybackIntent { start, ..intent };
+        if intent.origin != PlaybackIntentOrigin::CompareAnchor
+            && self.waveform.is_some()
+            && self
+                .selected
+                .and_then(|index| self.entries.get(index))
+                .is_some_and(|entry| entry.path == intent.path)
+        {
+            self.waveform_last_play_start = Some(start as f32);
+        }
         self.clear_playback_cursor();
         self.audio_output_resume = None;
         self.playback_cursor_pending = Some(start as f32);
@@ -2009,6 +2030,18 @@ fn preview_cursor_ratio(ratio: f32) -> Option<f32> {
     Some(ratio.clamp(0.0, 1.0))
 }
 
+fn current_playhead_start(
+    playhead: Option<f32>,
+    cursor: Option<f32>,
+    last_start: Option<f32>,
+) -> f32 {
+    playhead
+        .and_then(preview_cursor_ratio)
+        .or_else(|| cursor.and_then(preview_cursor_ratio))
+        .or_else(|| last_start.and_then(preview_cursor_ratio))
+        .unwrap_or(0.0)
+}
+
 fn authoritative_cursor_progress(progress: &PlaybackRuntimeProgress) -> Option<f32> {
     if !progress.active || progress.error.is_some() {
         return None;
@@ -2063,17 +2096,17 @@ mod tests {
         PlaybackProgressDisposition, PlaybackRetargetAcknowledgement, PlaybackRetargetAnchor,
         PlaybackRetargetRequest, accepted_resume_intent, admit_loop_retarget,
         apply_pending_loop_retarget_to_resume, audio_output_resume_is_current,
-        authoritative_cursor_progress, captured_metronome_grid_or_source, cursor_interpolation,
-        fallback_metronome_target, metronome_target_is_pending, normalized_playback_start,
-        pending_resume_intent, playback_mode_for_intent, playback_progress_disposition,
-        playback_request_number_is_current, playback_retarget_anchor_matches,
-        playback_span_for_intent, playback_span_matches_preparation, preferred_metronome_grid,
-        preview_cursor_ratio, progress_poll_has_expired, progress_poll_is_current,
-        reconcile_playback_intent_mode, reduce_loop_retarget_progress,
-        reduce_playback_retarget_progress, resolve_queued_playback_intent,
-        retain_pending_loop_retarget_after_failed_admission, should_cancel_pending_autoplay,
-        should_queue_initialized_playback, should_record_last_played,
-        should_record_playback_history,
+        authoritative_cursor_progress, captured_metronome_grid_or_source, current_playhead_start,
+        cursor_interpolation, fallback_metronome_target, metronome_target_is_pending,
+        normalized_playback_start, pending_resume_intent, playback_mode_for_intent,
+        playback_progress_disposition, playback_request_number_is_current,
+        playback_retarget_anchor_matches, playback_span_for_intent,
+        playback_span_matches_preparation, preferred_metronome_grid, preview_cursor_ratio,
+        progress_poll_has_expired, progress_poll_is_current, reconcile_playback_intent_mode,
+        reduce_loop_retarget_progress, reduce_playback_retarget_progress,
+        resolve_queued_playback_intent, retain_pending_loop_retarget_after_failed_admission,
+        should_cancel_pending_autoplay, should_queue_initialized_playback,
+        should_record_last_played, should_record_playback_history,
     };
     use reson::{PlaybackRuntimeMode, PlaybackRuntimeProgress};
     use std::path::{Path, PathBuf};
@@ -2081,6 +2114,46 @@ mod tests {
 
     use super::super::waveform::WaveformPlayRegion;
     use yield_core::{AudioFile, PlaybackLoopPolicy, PlaybackType};
+
+    #[test]
+    fn current_playhead_prefers_visible_playback_then_cursor_then_last_start() {
+        assert_eq!(current_playhead_start(Some(0.6), Some(0.4), Some(0.2)), 0.6);
+        assert_eq!(current_playhead_start(None, Some(0.4), Some(0.2)), 0.4);
+        assert_eq!(current_playhead_start(None, None, Some(0.2)), 0.2);
+        assert_eq!(current_playhead_start(None, None, None), 0.0);
+        assert_eq!(current_playhead_start(Some(f32::NAN), Some(0.4), None), 0.4);
+    }
+
+    #[gpui::test]
+    fn current_playhead_state_is_scoped_to_waveform_and_selection_policy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        browser.update(cx, |view, _| {
+            view.entries = vec![AudioFile {
+                path: PathBuf::from("/tmp/current-playhead.wav"),
+                relative_path: PathBuf::from("current-playhead.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            view.waveform_play_region = WaveformPlayRegion::new(0.2, 0.8);
+            let intent = view
+                .selected_playback_intent(0.6, PlaybackIntentOrigin::Explicit)
+                .expect("selected WAV playback intent");
+            assert_eq!(intent.start, 0.2);
+            view.waveform_hover_cursor = Some(0.4);
+            view.waveform_last_play_start = Some(0.3);
+            view.invalidate_waveform_generation();
+            assert_eq!(view.waveform_hover_cursor, None);
+            assert_eq!(view.waveform_last_play_start, None);
+        });
+    }
 
     fn sample_intent(path: &Path, looped: bool) -> PlaybackIntent {
         PlaybackIntent {
