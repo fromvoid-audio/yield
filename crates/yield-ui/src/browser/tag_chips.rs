@@ -226,6 +226,7 @@ pub(super) fn poll(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
             | CatalogSubmitError::InvalidCurationRequest(_)
             | CatalogSubmitError::InvalidTagFilterRequest(_)
             | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+            | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
             | CatalogSubmitError::InvalidRatingDecayRequest(_),
         ) => {
             browser.tag_chips.dirty = false;

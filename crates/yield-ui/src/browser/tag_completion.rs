@@ -429,6 +429,7 @@ fn submit_source_page(
             CatalogSubmitError::InvalidWavMetadataRequest(_)
             | CatalogSubmitError::InvalidCurationRequest(_)
             | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+            | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
             | CatalogSubmitError::InvalidTagFilterRequest(_)
             | CatalogSubmitError::InvalidRatingDecayRequest(_),
         ) => {
