@@ -227,6 +227,7 @@ pub struct RecoveryEntry {
     key: RecoveryKey,
     sequence: i64,
     outcome: RecoveryRowOutcome,
+    capacity_partial: bool,
 }
 
 impl RecoveryEntry {
@@ -243,6 +244,12 @@ impl RecoveryEntry {
     /// Return the decoded record or retained audit reason.
     pub fn outcome(&self) -> &RecoveryRowOutcome {
         &self.outcome
+    }
+
+    /// Whether a durable positive incomplete chunk checkpoint qualifies a capacity retry as
+    /// PartialNeedsRetry. This observation grants no execution or release authority.
+    pub(crate) const fn capacity_partial(&self) -> bool {
+        self.capacity_partial
     }
 
     /// Return a compact status projection of this scanner-produced row.
@@ -884,6 +891,7 @@ fn scan_page_inner(
                 key: candidate.key.clone(),
                 sequence: candidate.sequence,
                 outcome: RecoveryRowOutcome::Retained(reason.clone()),
+                capacity_partial: false,
             });
             last_sequence = Some(candidate.sequence);
             continue;
@@ -898,6 +906,7 @@ fn scan_page_inner(
                     sql_type: candidate.record_type.clone(),
                     reason: String::from("record column must contain a SQLite BLOB"),
                 }),
+                capacity_partial: false,
             });
             last_sequence = Some(candidate.sequence);
             continue;
@@ -941,10 +950,27 @@ fn scan_page_inner(
         }
         encoded_bytes = encoded_bytes.saturating_add(encoded.len());
         let outcome = decode_outcome(candidate, &encoded);
+        let capacity_partial = match &outcome {
+            RecoveryRowOutcome::Consistent(record)
+                if record.disposition == crate::operation_journal::OperationDisposition::RetryPending
+                    && record.retry_observation().is_some_and(|retry| {
+                        retry.error_class()
+                            == crate::operation_journal::coordinator::RetryErrorClass::CapacityUnavailable
+                    }) =>
+            {
+                store.has_valid_chunk_staging(record.operation_id).map_err(|_| {
+                    RecoveryScanError::RequiresAudit {
+                        reason: String::from("chunk staging evidence requires audit"),
+                    }
+                })?
+            }
+            _ => false,
+        };
         entries.push(RecoveryEntry {
             key: candidate.key.clone(),
             sequence: candidate.sequence,
             outcome,
+            capacity_partial,
         });
         last_sequence = Some(candidate.sequence);
     }
@@ -1237,6 +1263,7 @@ fn size_invalid_entry(
             declared,
             reason: bounded_reason(reason),
         }),
+        capacity_partial: false,
     }
 }
 
