@@ -641,6 +641,28 @@ pub struct SourceTagPage {
     pub next_cursor: Option<SourceTagPageCursor>,
 }
 
+/// Exact, revision-fenced tag completeness facts for one live source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCurationTagFacts {
+    /// Canonical path relative to the source root.
+    pub relative_path: PathBuf,
+    /// Whether at least one source tag is assigned.
+    pub has_any_tag: bool,
+    /// Whether a non-playback descriptive tag is assigned.
+    pub has_descriptive_tag: bool,
+    /// Whether a canonical Loop or One Shot tag is assigned.
+    pub has_playback_type_tag: bool,
+}
+
+/// Bounded per-file Curation tag facts read from one committed source revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCurationTagFactsPage {
+    /// Exact source revision observed by the read transaction.
+    pub revision: u64,
+    /// One entry for each distinct requested live path, in path order.
+    pub entries: Vec<SourceCurationTagFacts>,
+}
+
 /// One bounded metadata display-label projection for a live supported source path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDisplayLabelEntry {

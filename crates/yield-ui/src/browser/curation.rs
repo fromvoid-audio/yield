@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use gpui::{ClickEvent, Context, ScrollStrategy, div, prelude::*, px};
 use yield_core::{
     AudioFile, AudioFileCuration, AudioFileId, BrowserViewModel, COLLECTION_COUNT, CurationAction,
-    CurationTransition, MAX_TAGS_PER_COMMIT, PLAYBACK_TYPE_FILTERS, PlaybackType,
-    PlaybackTypeFilter, RATING_FILTER_LEVELS, RatingFilter, TagFilterMask, plan_curation_action,
+    CurationTransition, MAX_TAGS_PER_COMMIT, PLAYBACK_AGE_CHIPS, PLAYBACK_TYPE_FILTERS,
+    PlaybackAgeChip, PlaybackType, PlaybackTypeFilter, RATING_FILTER_LEVELS, RatingFilter,
+    TagFilterMask, plan_curation_action,
 };
 use yield_design::Theme;
 use yield_library::sample_sources::{
@@ -1423,6 +1424,96 @@ fn playback_type_filter_label(playback_type: PlaybackType) -> &'static str {
     }
 }
 
+/// Render the three playback-age filters for the active source.
+pub(super) fn render_playback_age_filters(
+    browser: &Browser,
+    theme: Theme,
+    cx: &mut Context<Browser>,
+) -> impl gpui::IntoElement {
+    let active_source = browser.active_source.is_some();
+    let selected = browser.view_model.playback_age_filter();
+    let hover_fill = color(theme.colors.selection_hover_fill);
+    let pressed_fill = color(theme.interaction.pressed_fill);
+    let chip_width = (theme.spacing.sidebar_width
+        - theme.spacing.panel_padding * 2.0
+        - theme.spacing.control_gap * 2.0)
+        / PLAYBACK_AGE_CHIPS.len() as f32;
+    let chips = PLAYBACK_AGE_CHIPS
+        .into_iter()
+        .enumerate()
+        .map(|(index, chip)| {
+            let label = match chip {
+                PlaybackAgeChip::NeverPlayed => "Never",
+                PlaybackAgeChip::OlderThanMonth => "30d+",
+                PlaybackAgeChip::OlderThanWeek => "7d+",
+            };
+            div()
+                .id(("playback-age-filter", index))
+                .debug_selector(move || format!("playback-age-chip-{index}"))
+                .when_some(
+                    browser.ax_focus(&super::accessibility::playback_age_filter_id(index)),
+                    |element, focus| element.track_focus(&focus),
+                )
+                .flex()
+                .flex_none()
+                .w(px(chip_width))
+                .h(px(theme.spacing.row_height))
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .rounded(px(3.0))
+                .bg(if selected.contains(chip) {
+                    color(theme.colors.selection_fill)
+                } else {
+                    transparent()
+                })
+                .hover(move |style| style.bg(hover_fill))
+                .active(move |style| style.bg(pressed_fill))
+                .when(!active_source, |element| element.opacity(0.45))
+                .when_some(
+                    browser.ax_marker(super::accessibility::playback_age_filter_id(index)),
+                    |element, marker| element.child(marker),
+                )
+                .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
+                    if active_source {
+                        view.toggle_playback_age_filter(chip, event.modifiers().alt, cx);
+                    }
+                }))
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.text_primary))
+                .child(label)
+        })
+        .collect::<Vec<_>>();
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .w_full()
+        .debug_selector(|| String::from("playback-age-filter-row"))
+        .pb(px(theme.spacing.control_gap))
+        .border_t(px(theme.spacing.border_width))
+        .border_color(color(theme.colors.border))
+        .child(
+            div()
+                .flex()
+                .w_full()
+                .h(px(theme.spacing.row_height))
+                .items_center()
+                .px(px(theme.spacing.panel_padding))
+                .text_size(px(theme.typography.small_size))
+                .text_color(color(theme.colors.accent))
+                .child("PLAY AGE"),
+        )
+        .child(
+            div()
+                .flex()
+                .w_full()
+                .px(px(theme.spacing.panel_padding))
+                .gap(px(theme.spacing.control_gap))
+                .children(chips),
+        )
+}
+
 /// Render the eight fixed rating filters for the active source.
 pub(super) fn render_rating_filters(
     browser: &Browser,
@@ -1621,6 +1712,33 @@ impl Browser {
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.restore_explicit_projection_focus(previous_id, previous_position, cx);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_playback_age_filter(
+        &mut self,
+        chip: PlaybackAgeChip,
+        invert: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_source.is_none() {
+            return;
+        }
+        self.invalidate_file_handoff();
+        let previous_id = self.browser_focus_id();
+        let previous_position = self.selected_visible_position();
+        self.reset_browser_focus_state();
+        self.context_menu = None;
+        if !self
+            .view_model
+            .toggle_playback_age_filter(&self.entries, chip, invert)
+        {
+            return;
+        }
+        self.refresh_collection_filter_counts();
+        self.reconcile_selection();
+        self.restore_explicit_projection_focus(previous_id, previous_position, cx);
+        self.reschedule_playback_age_refresh(cx);
         cx.notify();
     }
 
@@ -2168,6 +2286,7 @@ impl Browser {
         let (previous_id, previous_position) = tag_filter::projection_focus(self);
         let collection_filter = self.view_model.collection_filter();
         let rating_filter = self.view_model.rating_filter();
+        let playback_age_filter = self.view_model.playback_age_filter();
         let playback_type_filter = self.view_model.playback_type_filter();
         let sort_column = self.view_model.sort().column;
         let entry_indices = self
@@ -2214,6 +2333,7 @@ impl Browser {
         self.reconcile_prepared_playback_type(playback_types);
         if collection_changed
             || rating_filter_membership_changed
+            || (playback_age_filter.is_enabled() && last_played_changed)
             || playback_type_changed
             || playback_type_filter_membership_changed
         {
@@ -2225,9 +2345,13 @@ impl Browser {
             || (sort_column == yield_core::SortColumn::PlaybackType && playback_type_changed)
             || filter_membership_changed
             || rating_filter_membership_changed
+            || (playback_age_filter.is_enabled() && last_played_changed)
             || playback_type_filter_membership_changed
         {
             self.view_model.set_entries(&self.entries);
+            if playback_age_filter.is_enabled() && last_played_changed {
+                self.reschedule_playback_age_refresh(cx);
+            }
             if let Some(mask) = reusable_tag_mask {
                 if !tag_filter::apply_reusable_mask(self, mask) {
                     tag_filter::invalidate_after_curation(
@@ -2400,6 +2524,7 @@ impl Browser {
             return true;
         }
         if active {
+            super::curation_queue::invalidate_after_curation(self, cx);
             let tag_filter_revision_changed = !application.failed
                 && self.catalog_metadata.context().is_some_and(|context| {
                     context.source_id == key.source_id
@@ -2597,8 +2722,9 @@ fn patch_visible_entries(
         });
         rating_filter_membership_changed |= curation_matches_rating_filter(rating_filter, previous)
             != curation_matches_rating_filter(rating_filter, Some(*curation));
-        last_played_changed |=
-            previous.and_then(AudioFileCuration::last_played_at) != curation.last_played_at();
+        // An unhydrated row is not the same as a known Never played row.
+        last_played_changed |= previous.is_none()
+            || previous.and_then(AudioFileCuration::last_played_at) != curation.last_played_at();
         entry.curation = Some(*curation);
     }
     (
@@ -2749,6 +2875,24 @@ mod tests {
             playback_type: None,
             curation: Some(curation(value, locked, collections)),
         }
+    }
+
+    #[test]
+    fn first_curation_hydration_reveals_known_never_played_row() {
+        let mut entries = vec![entry("never.wav", 0, false, 0)];
+        entries[0].curation = None;
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.toggle_playback_age_filter(&entries, PlaybackAgeChip::NeverPlayed, false,));
+        assert!(model.rows().is_empty());
+        let patches = BTreeMap::from([(
+            PathBuf::from("never.wav"),
+            curation_with_last_played(0, false, 0, None),
+        )]);
+        let (_, _, _, last_played_changed) =
+            patch_visible_entries(&mut entries, &patches, None, RatingFilter::disabled(), None);
+        assert!(last_played_changed);
+        model.set_entries(&entries);
+        assert_eq!(model.rows().len(), 1);
     }
 
     fn install(entries: &[AudioFile]) -> CurationState {

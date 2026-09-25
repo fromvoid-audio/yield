@@ -63,6 +63,9 @@ mod accessibility {
     pub(super) fn playback_type_filter_id(index: usize) -> String {
         format!("browser-type-filter-{index}")
     }
+    pub(super) fn playback_age_filter_id(index: usize) -> String {
+        format!("browser-age-filter-{index}")
+    }
     pub(super) fn rating_filter_id(index: usize) -> String {
         format!("browser-rating-filter-{index}")
     }
@@ -72,6 +75,7 @@ mod catalog;
 mod catalog_metadata;
 mod context_menu;
 mod curation;
+mod curation_queue;
 mod directory_open;
 mod display_labels;
 mod file_drag;
@@ -81,6 +85,7 @@ mod history;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod playback_age;
 mod played_ranges;
 mod playmark_timing;
 mod preferences;
@@ -132,6 +137,7 @@ struct SourceSession {
     selected_folder: PathBuf,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
+    curation_queue_mode: yield_core::CurationQueueMode,
     selected_audio_id: Option<AudioFileId>,
     catalog_facts: HashMap<PathBuf, catalog::CatalogFileFacts>,
     catalog_lifecycle_generation: Option<u64>,
@@ -160,6 +166,7 @@ impl SourceSession {
             selected_folder: PathBuf::from("."),
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
+            curation_queue_mode: yield_core::CurationQueueMode::default(),
             selected_audio_id: None,
             catalog_facts: HashMap::new(),
             catalog_lifecycle_generation: None,
@@ -356,6 +363,8 @@ pub(crate) struct Browser {
     volume_runtime_retry_count: u8,
     volume_status: Option<String>,
     scan_generation: u64,
+    playback_age_refresh_generation: u64,
+    playback_age_refresh_task: Option<Task<()>>,
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
@@ -394,6 +403,7 @@ pub(crate) struct Browser {
     display_labels: display_labels::DisplayLabelsState,
     source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
+    curation_queue: curation_queue::CurationQueueState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
     tag_dictionary: tag_dictionary::TagDictionaryState,
@@ -652,6 +662,8 @@ impl Browser {
             volume_runtime_retry_count: 0,
             volume_status: None,
             scan_generation: 0,
+            playback_age_refresh_generation: 0,
+            playback_age_refresh_task: None,
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
@@ -690,6 +702,7 @@ impl Browser {
             display_labels: display_labels::DisplayLabelsState::default(),
             source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
+            curation_queue: curation_queue::CurationQueueState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
             tag_dictionary: tag_dictionary::TagDictionaryState::default(),
@@ -1217,6 +1230,15 @@ impl Browser {
         self.root = Some(root.clone());
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            source_index
+                .and_then(|index| self.source_sessions.get(index))
+                .map_or(yield_core::CurationQueueMode::default(), |session| {
+                    session.curation_queue_mode
+                }),
+        );
         self.refresh_collection_filter_counts();
         self.selected = None;
         self.cancel_waveform_load();
@@ -1320,12 +1342,18 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[source_index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.set_scan_status(format!(
@@ -1385,7 +1413,11 @@ impl Browser {
             self.folder_tree = None;
             self.folder_rows_cache.clear();
             self.view_model.set_entries(&self.entries);
+            self.reschedule_playback_age_refresh(cx);
+            self.view_model
+                .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
             tag_filter::reinstall_after_projection(self, cx);
+            curation_queue::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
             self.set_scan_status(error);
             self.selected = None;
@@ -1418,12 +1450,18 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.set_scan_status(if is_refresh {
@@ -2483,6 +2521,17 @@ impl Browser {
             return;
         }
         if self.handle_context_menu_key_down(event, window, cx) {
+            return;
+        }
+        if curation_queue::handle_key_down(
+            self,
+            key,
+            event.is_held,
+            secondary || alt || shift || function,
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
             return;
         }
         if self.tag_input.read(cx).focus_handle().is_focused(window) {

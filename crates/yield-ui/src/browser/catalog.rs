@@ -173,6 +173,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.reset_browser_focus_state();
         self.context_menu = None;
@@ -264,12 +265,18 @@ impl Browser {
             super::tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         super::tag_filter::reinstall_after_projection(self, cx);
+        super::curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
 
@@ -332,6 +339,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
@@ -442,6 +450,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => {
                     return false;
@@ -490,6 +499,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => return false,
             }
@@ -589,6 +599,13 @@ impl Browser {
             CatalogEvent::TagFilterReady { .. } | CatalogEvent::TagFilterFailed { .. }
         ) {
             return super::tag_filter::apply_catalog_event(self, event, cx);
+        }
+        if matches!(
+            &event,
+            CatalogEvent::CurationTagFactsReady { .. }
+                | CatalogEvent::CurationTagFactsFailed { .. }
+        ) {
+            return super::curation_queue::apply_catalog_event(self, &event);
         }
         if matches!(event, CatalogEvent::CurationOperationCompleted { .. }) {
             // Compound outcomes belong to their source lifecycle even after the browser has
@@ -704,6 +721,8 @@ impl Browser {
             | CatalogEvent::TagFilterFailed { .. }
             | CatalogEvent::DisplayLabelsReady { .. }
             | CatalogEvent::DisplayLabelsFailed { .. }
+            | CatalogEvent::CurationTagFactsReady { .. }
+            | CatalogEvent::CurationTagFactsFailed { .. }
             | CatalogEvent::RatingDecayProgress { .. }
             | CatalogEvent::RatingDecayFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
@@ -750,6 +769,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -874,6 +894,7 @@ impl Browser {
             restore_position,
             super::tag_filter::FilterOrigin::PassiveMetadata,
         );
+        super::curation_queue::preserve_focus_for_projection(self);
         let focused_changed = restore_id.as_ref().is_some_and(|id| {
             focused_manifest_changed(id, &projection, &self.source_sessions[index])
         });
@@ -928,12 +949,18 @@ impl Browser {
         self.folder_scope = previous_scope;
         self.rebuild_folder_rows_cache();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         super::tag_filter::reinstall_after_projection(self, cx);
+        super::curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         super::tag_chips::invalidate(self);
@@ -982,6 +1009,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.catalog_pending_command = None;
         self.cancel_catalog_projection();
@@ -1060,6 +1088,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::DisplayLabelsFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationTagFactsReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationTagFactsFailed {
             source_id,
             lifecycle_generation,
             ..
