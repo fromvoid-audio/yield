@@ -7712,6 +7712,9 @@ mod tests {
             ChunkClaimState::Claimed
         );
         let file_owner = FileOperationOwner::start().expect("file owner");
+        let source_root_registration = file_owner
+            .register_source_root(Arc::clone(&source_request), &fixture.owner, fence.clone())
+            .expect("journal-registered source root transfers to file owner");
         let target = file_owner
             .register_live_chunk_root_for_test()
             .expect("registered staging root");
@@ -7726,6 +7729,15 @@ mod tests {
             lease_epoch,
         )
         .expect("wrong source fence observation");
+        assert!(
+            file_owner
+                .register_source_root(
+                    Arc::clone(&source_request),
+                    &fixture.owner,
+                    wrong_fence.clone(),
+                )
+                .is_err()
+        );
         let wrong_spec =
             LiveChunkEffectSpec::new(effect_id, output, target, vec![wrong_fence], 0, 3, b"abc")
                 .expect("bounded wrong observation");
@@ -8078,7 +8090,7 @@ mod tests {
             EffectId::new(),
             OutputIdentity::new(),
             live_target,
-            vec![fence],
+            vec![fence.clone()],
             facts.allocation_unit * 3,
             3,
             b"odd",
@@ -8132,6 +8144,14 @@ mod tests {
                 .is_err()
         );
         drop(guard);
+        assert!(
+            file_owner
+                .register_source_root(Arc::clone(&source_request), &fixture.owner, fence.clone())
+                .is_err()
+        );
+        file_owner
+            .retire_root(source_root_registration)
+            .expect("retire stale source root");
         let mut source_result = file_owner
             .submit_live_chunk(source_command, source_grant)
             .expect("source retirement file request queues");
