@@ -63,6 +63,9 @@ mod accessibility {
     pub(super) fn playback_type_filter_id(index: usize) -> String {
         format!("browser-type-filter-{index}")
     }
+    pub(super) fn playback_age_filter_id(index: usize) -> String {
+        format!("browser-age-filter-{index}")
+    }
     pub(super) fn rating_filter_id(index: usize) -> String {
         format!("browser-rating-filter-{index}")
     }
@@ -73,6 +76,7 @@ mod catalog_metadata;
 mod compare_anchor;
 mod context_menu;
 mod curation;
+mod curation_queue;
 mod direct_random;
 mod directory_open;
 mod display_labels;
@@ -83,6 +87,7 @@ mod history;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod playback_age;
 mod played_ranges;
 mod playmark_timing;
 mod preferences;
@@ -93,6 +98,7 @@ mod sidebar;
 mod similar_sections;
 mod source_recovery;
 mod source_registry;
+mod status_log;
 mod tag_chips;
 mod tag_completion;
 mod tag_dictionary;
@@ -133,6 +139,7 @@ struct SourceSession {
     selected_folder: PathBuf,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
+    curation_queue_mode: yield_core::CurationQueueMode,
     selected_audio_id: Option<AudioFileId>,
     catalog_facts: HashMap<PathBuf, catalog::CatalogFileFacts>,
     catalog_lifecycle_generation: Option<u64>,
@@ -161,6 +168,7 @@ impl SourceSession {
             selected_folder: PathBuf::from("."),
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
+            curation_queue_mode: yield_core::CurationQueueMode::default(),
             selected_audio_id: None,
             catalog_facts: HashMap::new(),
             catalog_lifecycle_generation: None,
@@ -350,6 +358,7 @@ pub(crate) struct Browser {
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
+    status_log: status_log::StatusLog,
     playback_status: String,
     volume: f32,
     volume_drag: Option<volume::VolumeDrag>,
@@ -357,6 +366,8 @@ pub(crate) struct Browser {
     volume_runtime_retry_count: u8,
     volume_status: Option<String>,
     scan_generation: u64,
+    playback_age_refresh_generation: u64,
+    playback_age_refresh_task: Option<Task<()>>,
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
@@ -401,6 +412,7 @@ pub(crate) struct Browser {
     display_labels: display_labels::DisplayLabelsState,
     source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
+    curation_queue: curation_queue::CurationQueueState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
     tag_dictionary: tag_dictionary::TagDictionaryState,
@@ -652,6 +664,7 @@ impl Browser {
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
+            status_log: status_log::StatusLog::default(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
             volume_drag: None,
@@ -659,6 +672,8 @@ impl Browser {
             volume_runtime_retry_count: 0,
             volume_status: None,
             scan_generation: 0,
+            playback_age_refresh_generation: 0,
+            playback_age_refresh_task: None,
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
@@ -703,6 +718,7 @@ impl Browser {
             display_labels: display_labels::DisplayLabelsState::default(),
             source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
+            curation_queue: curation_queue::CurationQueueState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
             tag_dictionary: tag_dictionary::TagDictionaryState::default(),
@@ -909,7 +925,7 @@ impl Browser {
                 if let Some(editor) = self.playmark_timing_editor.as_mut() {
                     editor.error = Some(error.clone());
                 }
-                self.playback_status = format!("Playmark timing: {error}");
+                self.set_playback_status(format!("Playmark timing: {error}"));
                 let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
                 window.focus(&focus_handle);
                 cx.notify();
@@ -940,10 +956,10 @@ impl Browser {
         similar_sections::invalidate_if_stale(self);
         match self.submit_playmark_timing_span(&path, region, cx) {
             Some(Ok(())) => {
-                self.playback_status = "Playmark timing applying to playback".to_string();
+                self.set_playback_status("Playmark timing applying to playback".to_string());
             }
             Some(Err(error)) => {
-                self.playback_status = format!("Playmark timing update unavailable: {error}");
+                self.set_playback_status(format!("Playmark timing update unavailable: {error}"));
             }
             None => {}
         }
@@ -1230,6 +1246,15 @@ impl Browser {
         self.root = Some(root.clone());
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            source_index
+                .and_then(|index| self.source_sessions.get(index))
+                .map_or(yield_core::CurationQueueMode::default(), |session| {
+                    session.curation_queue_mode
+                }),
+        );
         self.refresh_collection_filter_counts();
         self.selected = None;
         self.cancel_waveform_load();
@@ -1254,7 +1279,7 @@ impl Browser {
         let generation = self.scan_generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.scan_cancel = Some(Arc::clone(&cancellation));
-        self.scan_status = format!("Scanning {}…", root.display());
+        self.set_scan_status(format!("Scanning {}…", root.display()));
         cx.notify();
 
         let scan_root = root.clone();
@@ -1333,19 +1358,25 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[source_index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.scan_status = format!(
+        self.set_scan_status(format!(
             "{count} audio file{} · {} skipped",
             if count == 1 { "" } else { "s" },
             skipped_entries
-        );
+        ));
         if register_source {
             self.submit_source_add(root.clone(), cx);
         }
@@ -1398,9 +1429,13 @@ impl Browser {
             self.folder_tree = None;
             self.folder_rows_cache.clear();
             self.view_model.set_entries(&self.entries);
+            self.reschedule_playback_age_refresh(cx);
+            self.view_model
+                .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
             tag_filter::reinstall_after_projection(self, cx);
+            curation_queue::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
-            self.scan_status = error;
+            self.set_scan_status(error);
             self.selected = None;
             self.playback_policy.clear_file();
             self.waveform_pending = false;
@@ -1432,22 +1467,28 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.scan_status = if is_refresh {
+        self.set_scan_status(if is_refresh {
             format!(
                 "Could not refresh {}: {error}",
                 self.source_sessions[index].label
             )
         } else {
             format!("Could not add source: {error}")
-        };
+        });
         let restore_id = self
             .restore_selection_id
             .take()
@@ -1691,7 +1732,7 @@ impl Browser {
 
     pub(super) fn refresh_active_source(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.active_source else {
-            self.scan_status = "Choose a source folder before refreshing".to_string();
+            self.set_scan_status("Choose a source folder before refreshing".to_string());
             cx.notify();
             return;
         };
@@ -1850,7 +1891,7 @@ impl Browser {
         let path = entry.path;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.waveform_cancel = Some(Arc::clone(&cancellation));
-        self.playback_status = "Ready".to_string();
+        self.set_playback_status("Ready".to_string());
         self.waveform_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -1909,7 +1950,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |view, cx| {
-                    view.scan_status = format!("Could not choose folder: {error}");
+                    view.set_scan_status(format!("Could not choose folder: {error}"));
                     cx.notify();
                 });
             }
@@ -1942,7 +1983,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |view, cx| {
-                    view.theme_status = format!("Theme picker error: {error}");
+                    view.set_theme_status(format!("Theme picker error: {error}"));
                     cx.notify();
                 });
             }
@@ -2054,11 +2095,11 @@ impl Browser {
         if !enabled {
             self.cancel_pending_selection_autoplay();
         }
-        self.playback_status = if self.autoplay_selection {
+        self.set_playback_status(if self.autoplay_selection {
             "Autoplay enabled".to_string()
         } else {
             "Autoplay disabled".to_string()
-        };
+        });
         cx.notify();
     }
 
@@ -2164,7 +2205,7 @@ impl Browser {
         if let Some(path) = self.theme_load.active_path.clone() {
             self.load_theme(path, cx);
         } else {
-            self.theme_status = "Choose a theme file before reloading".to_string();
+            self.set_theme_status("Choose a theme file before reloading".to_string());
             cx.notify();
         }
     }
@@ -2191,7 +2232,7 @@ impl Browser {
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.theme_status = "Yield Editorial Terminal".to_string();
+        self.set_theme_status("Yield Editorial Terminal".to_string());
         self.theme_changed_inputs(cx);
         cx.notify();
     }
@@ -2203,7 +2244,7 @@ impl Browser {
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme::default());
-        self.theme_status = "Yield Editorial Terminal".to_string();
+        self.set_theme_status("Yield Editorial Terminal".to_string());
         self.autoplay_selection = true;
         self.help_tooltips_enabled = true;
         self.general_settings.rating_decay_weeks = yield_session::DEFAULT_RATING_DECAY_WEEKS;
@@ -2227,7 +2268,7 @@ impl Browser {
         }
         let generation = self.theme_load.begin(path.clone());
         self.theme_task.take();
-        self.theme_status = format!("Loading {}…", path.display());
+        self.set_theme_status(format!("Loading {}…", path.display()));
         cx.notify();
         let read_path = path.clone();
         self.theme_task = Some(cx.spawn(async move |this, cx| {
@@ -2244,7 +2285,7 @@ impl Browser {
                     Ok(theme) => view.apply_theme(theme, path, generation, cx),
                     Err(error) => {
                         if view.theme_load.reject(generation) {
-                            view.theme_status = format!("Theme rejected: {error}");
+                            view.set_theme_status(format!("Theme rejected: {error}"));
                             cx.notify();
                         }
                     }
@@ -2281,7 +2322,7 @@ impl Browser {
         }
         let theme_name = theme.name.clone();
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.theme_status = theme_name;
+        self.set_theme_status(theme_name);
         self.theme_changed_inputs(cx);
         cx.notify();
     }
@@ -2366,7 +2407,7 @@ impl Browser {
     fn play_direct_random_sample(&mut self, previous: bool, cx: &mut Context<Self>) {
         if previous {
             let Some(visit) = self.direct_random_history.previous() else {
-                self.playback_status = "No earlier random sample".to_string();
+                self.set_playback_status("No earlier random sample");
                 cx.notify();
                 return;
             };
@@ -2394,7 +2435,7 @@ impl Browser {
             rand::random::<f32>(),
         );
         let Some(target) = target else {
-            self.playback_status = "No visible WAV sample for random playback".to_string();
+            self.set_playback_status("No visible WAV sample for random playback");
             cx.notify();
             return;
         };
@@ -2523,6 +2564,18 @@ impl Browser {
             }
             shortcut_help::KeyAction::Ignore => {}
         }
+        if status_log::is_copy_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.copy_status_log(cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.theme_settings_open && key == "escape" {
             self.close_general_settings(window, cx);
             cx.stop_propagation();
@@ -2538,6 +2591,17 @@ impl Browser {
             return;
         }
         if self.handle_context_menu_key_down(event, window, cx) {
+            return;
+        }
+        if curation_queue::handle_key_down(
+            self,
+            key,
+            event.is_held,
+            secondary || alt || shift || function,
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
             return;
         }
         if self.tag_input.read(cx).focus_handle().is_focused(window) {

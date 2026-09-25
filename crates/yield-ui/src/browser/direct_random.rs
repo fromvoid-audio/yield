@@ -47,17 +47,16 @@ impl DirectRandomHistory {
         if !self.reconcile(scope.clone(), visible_ids) || visible_ids.is_empty() {
             return None;
         }
-        let candidates = |visited: &HashSet<AudioFileId>| {
-            visible_ids
-                .iter()
-                .filter(|id| !visited.contains(*id))
-                .filter(|id| visible_ids.len() == 1 || current != Some(*id))
-                .collect::<Vec<_>>()
-        };
-        let mut available = candidates(&self.visited);
+        let mut available = visible_ids
+            .iter()
+            .filter(|id| !self.visited.contains(*id))
+            .collect::<Vec<_>>();
         if available.is_empty() {
             self.visited.clear();
-            available = candidates(&self.visited);
+            available = visible_ids.iter().collect();
+        }
+        if available.len() > 1 {
+            available.retain(|id| current != Some(*id));
         }
         let unit = if random_unit.is_finite() {
             random_unit.clamp(0.0, 1.0)
@@ -152,5 +151,23 @@ mod tests {
         assert_eq!(prior.id, ids[0]);
         history.next(scope("two"), &ids[..2], Some(&ids[0]), 0.0);
         assert_eq!(history.next(None, &ids, Some(&ids[0]), 0.0), None);
+    }
+
+    #[test]
+    fn current_sample_completes_no_repeat_cycle_when_it_is_only_unvisited_choice() {
+        let ids = [id("a.wav"), id("b.wav"), id("c.wav")];
+        let mut history = DirectRandomHistory::default();
+        assert_eq!(
+            history.next(scope("one"), &ids, Some(&ids[0]), 0.0),
+            Some(ids[1].clone())
+        );
+        assert_eq!(
+            history.next(scope("one"), &ids, Some(&ids[0]), 0.0),
+            Some(ids[2].clone())
+        );
+        assert_eq!(
+            history.next(scope("one"), &ids, Some(&ids[0]), 0.0),
+            Some(ids[0].clone())
+        );
     }
 }
