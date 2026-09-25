@@ -50,6 +50,18 @@ pub struct CurationTagFacts {
 }
 
 impl CurationTagFacts {
+    /// Build facts supplied by a revision-fenced per-file source read.
+    pub fn from_flags(
+        has_any_tag: bool,
+        has_descriptive_tag: bool,
+        has_playback_type_tag: bool,
+    ) -> Self {
+        Self {
+            has_any_tag,
+            has_descriptive_tag,
+            has_playback_type_tag,
+        }
+    }
     /// Classify complete, exact source-tag labels for one file.
     ///
     /// A caller must reject truncated preview labels and fence this set to the active source
