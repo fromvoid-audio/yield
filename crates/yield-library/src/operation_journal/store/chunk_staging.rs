@@ -159,6 +159,74 @@ fn checkpoint_error(reason: impl Into<String>) -> OperationJournalStoreError {
 }
 
 impl OperationJournalStore {
+    /// Inspect bounded durable checkpoint rows as observations only. An Issued claim by itself
+    /// never proves partial work, and a malformed retained row cannot silently become absence.
+    pub(super) fn has_valid_chunk_staging(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<bool, OperationJournalStoreError> {
+        self.validate_namespace()?;
+        let mut statement = self.connection.prepare(
+            "SELECT chunk_id FROM operation_journal_chunk_staging ORDER BY sequence ASC LIMIT ?1",
+        )?;
+        let ids = statement
+            .query_map(params![MAX_ROWS + 1], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if ids.len() as i64 > MAX_ROWS {
+            return Err(checkpoint_error("chunk checkpoint row bound is exceeded"));
+        }
+        let mut present = false;
+        for key in ids {
+            let parsed = Uuid::parse_str(&key)
+                .map_err(|_| checkpoint_error("chunk checkpoint key is not a UUID"))?;
+            let chunk_id =
+                ChunkId::from_uuid(parsed).map_err(|error| checkpoint_error(error.to_string()))?;
+            if chunk_id.to_string() != key {
+                return Err(checkpoint_error("chunk checkpoint key is not canonical"));
+            }
+            let (_, record) = self.read_chunk_staging_row(chunk_id)?.ok_or_else(|| {
+                checkpoint_error("chunk checkpoint disappeared during bounded scan")
+            })?;
+            let claim = super::chunk_claims::read(&self.connection, chunk_id)
+                .map_err(|error| checkpoint_error(error.to_string()))?
+                .ok_or_else(|| checkpoint_error("chunk checkpoint has no retained claim"))?;
+            if !record.matches_claim(&claim) {
+                return Err(checkpoint_error(
+                    "chunk checkpoint differs from retained claim",
+                ));
+            }
+            if record.operation_id == operation_id {
+                let operation = self
+                    .read_row(operation_id)?
+                    .ok_or_else(|| checkpoint_error("checkpoint operation is absent"))?
+                    .record;
+                let participants = operation
+                    .universal_intent
+                    .as_ref()
+                    .ok_or_else(|| checkpoint_error("checkpoint participant set is absent"))?
+                    .participants()
+                    .descriptors();
+                let participant_ok = participants
+                    .iter()
+                    .any(|participant| participant.id() == record.participant_id);
+                let source_ok = record.staging().source_fence().is_some_and(|source| {
+                    participants
+                        .iter()
+                        .filter_map(|participant| participant.source_fence())
+                        .any(|retained| source.matches_participant(retained))
+                });
+                if operation.schema_version != SCHEMA_V16 || !participant_ok || !source_ok {
+                    return Err(checkpoint_error(
+                        "chunk checkpoint differs from durable operation participants",
+                    ));
+                }
+                present = true;
+            }
+        }
+        Ok(present)
+    }
+
     pub(crate) fn checkpoint_chunk_staging(
         &self,
         chunk_id: ChunkId,

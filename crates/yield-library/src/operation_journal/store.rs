@@ -5477,6 +5477,44 @@ impl OperationJournalStore {
         }
     }
 
+    /// Persist a post-intent capacity retry and classify the resulting status from positive,
+    /// durable incomplete staging evidence. The V1-V16 operation codec keeps its RetryPending
+    /// retry lease; a validated chunk checkpoint projects PartialNeedsRetry on recovery.
+    pub(crate) fn record_post_intent_chunk_exhaustion(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: RetryObservation,
+    ) -> Result<(JournalRetryReceipt, OperationDisposition), OperationJournalStoreError> {
+        if observation.error_class() != super::coordinator::RetryErrorClass::CapacityUnavailable {
+            return Err(OperationJournalStoreError::InvalidRetryObservation {
+                reason: String::from("chunk exhaustion requires CapacityUnavailable"),
+            });
+        }
+        // Validate every bounded checkpoint before changing the operation. A malformed row is
+        // retained for audit; it must not be interpreted as a clean RetryPending operation.
+        let partial = self.has_valid_chunk_staging(operation_id)?;
+        let receipt = self.record_retry_pending(operation_id, expected_sequence, observation)?;
+        let persisted = self
+            .get(operation_id)?
+            .ok_or_else(|| OperationJournalStoreError::OperationNotFound { operation_id })?;
+        if persisted.disposition != OperationDisposition::RetryPending
+            || self.has_valid_chunk_staging(operation_id)? != partial
+        {
+            return Err(OperationJournalStoreError::ChunkStaging {
+                reason: String::from("chunk exhaustion status changed during readback"),
+            });
+        }
+        Ok((
+            receipt,
+            if partial {
+                OperationDisposition::PartialNeedsRetry
+            } else {
+                OperationDisposition::RetryPending
+            },
+        ))
+    }
+
     fn record_retry_inside_transaction(
         &self,
         operation_id: OperationId,
@@ -12501,9 +12539,84 @@ mod tests {
                 .expect("restart replay"),
             chunk_staging::ChunkStagingReceipt::Replay { .. }
         ));
-        let cancel = CancellationRequestObservation::new(51).expect("cancel observation");
+        let exhausted_request = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                row.identity.clone(),
+                row.allocation_class.into(),
+                2048,
+            )
+            .expect("next chunk claim"),
+            filesystem,
+            String::from("next-partial.wav"),
+            1,
+            2048,
+            row.allocation_unit,
+            row.protected_free_bytes,
+        )
+        .expect("next chunk request");
+        assert!(matches!(
+            provider.admit(
+                &exhausted_request.plan().expect("next plan"),
+                &exhausted_request.inventory().expect("next inventory"),
+            ),
+            Err(CapacityProviderError::DiskPressureRecoveryOnly { .. })
+        ));
+        assert_eq!(provider.claim_count(), 1);
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("chunk-capacity-retry").expect("retry lease"),
+            53,
+            RetryErrorClass::CapacityUnavailable,
+            "disk_pressure_recovery_only",
+            None,
+        )
+        .expect("capacity retry");
+        let (retry_receipt, status) = reopened
+            .record_post_intent_chunk_exhaustion(
+                operation_id,
+                operation_receipt.sequence(),
+                retry.clone(),
+            )
+            .expect("classify positive incomplete chunk");
+        assert_eq!(status, OperationDisposition::PartialNeedsRetry);
+        assert_eq!(
+            reopened
+                .record_post_intent_chunk_exhaustion(
+                    operation_id,
+                    operation_receipt.sequence(),
+                    retry,
+                )
+                .expect("duplicate exhaustion completion"),
+            (retry_receipt, OperationDisposition::PartialNeedsRetry)
+        );
+        let recovered = reopened
+            .scan_recovery_page(None)
+            .expect("recover retry row");
+        assert_eq!(recovered.entries().len(), 1);
+        assert_eq!(
+            recovered.entries()[0]
+                .status_snapshot()
+                .observed()
+                .expect("observed capacity status")
+                .disposition(),
+            OperationDisposition::PartialNeedsRetry
+        );
+        assert_eq!(
+            reopened
+                .get(operation_id)
+                .expect("read persisted V16 operation")
+                .expect("operation retained")
+                .disposition,
+            OperationDisposition::RetryPending
+        );
+        let cancel = CancellationRequestObservation::new(54).expect("cancel observation");
         reopened
-            .request_cancel_before_publish(operation_id, operation_receipt.sequence(), cancel)
+            .request_cancel_before_publish(operation_id, retry_receipt.sequence(), cancel)
             .expect("cancel operation");
         assert!(
             reopened
@@ -12511,6 +12624,50 @@ mod tests {
                 .is_err()
         );
         assert_eq!(provider.claim_count(), 1);
+    }
+
+    #[test]
+    fn post_intent_capacity_exhaustion_without_positive_checkpoint_stays_retry_pending() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal, args, legacy_plan) = v5_copy_inputs();
+        let operation = StoredOperationRecord::new_v16_command(
+            operation_id,
+            intent,
+            universal,
+            UniversalCommandArgs::Copy(args),
+            FullCapacityPlan::from_legacy(&legacy_plan).expect("full plan"),
+            50,
+        );
+        let inserted = store.insert_intent(&operation).expect("persist intent");
+        let retry = RetryObservation::new(
+            1,
+            51,
+            52,
+            RetryLeaseId::new("no-staging-capacity-retry").expect("retry lease"),
+            53,
+            RetryErrorClass::CapacityUnavailable,
+            "recovery_reserve_low",
+            None,
+        )
+        .expect("capacity observation");
+        let (_, disposition) = store
+            .record_post_intent_chunk_exhaustion(operation_id, inserted.sequence(), retry)
+            .expect("classify exhausted chunk without staging");
+        assert_eq!(disposition, OperationDisposition::RetryPending);
+        drop(store);
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen store");
+        assert_eq!(
+            reopened
+                .scan_recovery_page(None)
+                .expect("recover capacity retry")
+                .entries()[0]
+                .status_snapshot()
+                .observed()
+                .expect("observed status")
+                .disposition(),
+            OperationDisposition::RetryPending
+        );
     }
 
     #[test]

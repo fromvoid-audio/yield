@@ -48,7 +48,8 @@ use super::full_progress_codec::{
     encode as encode_full_progress,
 };
 use super::model::{
-    CancellationRequestObservation, MAX_RECORD_BYTES, OperationId, OperationIntent, UniversalIntent,
+    CancellationRequestObservation, MAX_RECORD_BYTES, OperationDisposition, OperationId,
+    OperationIntent, UniversalIntent,
 };
 use super::participants::ParticipantSet;
 use super::store::recovery::{
@@ -3767,6 +3768,30 @@ impl OperationJournalClient {
         })
     }
 
+    /// Persist a capacity-exhaustion retry. The status is projected from durable positive chunk
+    /// staging evidence; an Issued claim alone cannot turn RetryPending into PartialNeedsRetry.
+    #[allow(dead_code)] // Operation-family producer is deferred by OPT-1565's scope.
+    pub(crate) fn record_post_intent_chunk_exhaustion(
+        &self,
+        operation_id: OperationId,
+        expected_sequence: i64,
+        observation: RetryObservation,
+    ) -> Result<
+        OperationJournalRequest<(JournalRetryReceipt, OperationDisposition)>,
+        OperationJournalOwnerQueueError,
+    > {
+        let encoded = bounded_retry_input(&observation)?;
+        self.submit(encoded.len(), move |input, result| {
+            JournalCommand::ChunkExhaustion {
+                operation_id,
+                expected_sequence,
+                encoded,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one bounded full-operation admission request.
     ///
     /// The request deliberately remains fail-closed until the descriptor-bound physical
@@ -4540,6 +4565,15 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<JournalRetryReceipt, OperationJournalOwnerError>>,
     },
+    ChunkExhaustion {
+        operation_id: OperationId,
+        expected_sequence: i64,
+        encoded: Vec<u8>,
+        input: InputPermit,
+        result: SyncSender<
+            Result<(JournalRetryReceipt, OperationDisposition), OperationJournalOwnerError>,
+        >,
+    },
     AdmitFull {
         args: UniversalCommandArgs,
         participants: ParticipantSet,
@@ -4931,6 +4965,26 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                     .map_err(OperationJournalOwnerError::from)
             })
         }
+        JournalCommand::ChunkExhaustion {
+            operation_id,
+            expected_sequence,
+            encoded,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                let observation = decode_control_input(&encoded)?;
+                runtime
+                    .store()
+                    .record_post_intent_chunk_exhaustion(
+                        operation_id,
+                        expected_sequence,
+                        observation,
+                    )
+                    .map_err(OperationJournalOwnerError::from)
+            })
+        }
         JournalCommand::AdmitFull {
             args,
             participants,
@@ -5196,6 +5250,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::Retry { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::ChunkExhaustion { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
