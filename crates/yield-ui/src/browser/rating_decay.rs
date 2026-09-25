@@ -226,7 +226,7 @@ impl Browser {
         ) {
             return false;
         }
-        self.scan_status = "Applying rating decay maintenance…".to_string();
+        self.set_scan_status("Applying rating decay maintenance…".to_string());
         let _ = retry(self, cx);
         self.start_source_registry_poll(cx);
         true
@@ -531,10 +531,10 @@ fn apply_progress(
             after_cursor: Some(cursor.clone()),
             admitted: false,
         });
-        browser.scan_status = format!(
+        browser.set_scan_status(format!(
             "Rating decay maintenance: {} updated across {} files…",
             browser.rating_decay.updated_count, browser.rating_decay.processed_count
-        );
+        ));
         let _ = retry(browser, cx);
         return true;
     }
@@ -556,7 +556,7 @@ fn apply_progress(
         "Rating decay complete: {} updated across {} files",
         updated_total, browser.rating_decay.processed_count
     ));
-    browser.scan_status = browser.rating_decay.status.clone().unwrap_or_default();
+    browser.set_scan_status(browser.rating_decay.status.clone().unwrap_or_default());
     if updated_total > 0 {
         browser.rating_decay.queue_refresh(
             request.source_id,

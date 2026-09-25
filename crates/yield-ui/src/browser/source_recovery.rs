@@ -732,7 +732,7 @@ fn set_scan_status(browser: &mut Browser, message: String) -> bool {
     if !status_changed(&browser.scan_status, &message) {
         return false;
     }
-    browser.scan_status = message;
+    browser.set_scan_status(message);
     true
 }
 

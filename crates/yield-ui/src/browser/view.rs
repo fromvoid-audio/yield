@@ -699,6 +699,9 @@ impl Render for Browser {
             format!("Source error: {error}")
         } else if tag_filter::scope_pending(self) {
             tag_filter::status_label(self).unwrap_or_else(|| "Filtering tags…".to_string())
+        } else if self.view_model.curation_queue_pending() {
+            super::curation_queue::status_label(self)
+                .unwrap_or_else(|| "Loading Curation queue…".to_string())
         } else if !self.entries.is_empty() && self.view_model.rows().len() != self.entries.len() {
             format!(
                 "{} of {} audio files visible",
@@ -708,6 +711,7 @@ impl Render for Browser {
         } else {
             self.scan_status.clone()
         };
+        self.observe_statuses(Some(&list_status));
         let curation_status = self.active_curation_status();
         let selected_count = self.selected_count_label();
         let metadata_status = self.catalog_metadata.status_label();
@@ -1843,6 +1847,14 @@ impl Render for Browser {
                     .text_size(px(theme.typography.small_size))
                     .text_color(color(theme.colors.text_muted))
                     .child(self.playback_status.clone())
+                    .when_some(self.compare_anchor.as_ref(), |element, anchor| {
+                        let path = anchor.path();
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        element.child(format!("Compare: {name}"))
+                    })
                     .when(self.volume_status.is_some(), |element| {
                         element.child(self.volume_status.clone().unwrap_or_default())
                     })
@@ -2531,6 +2543,48 @@ mod tests {
                 "{selector} is below strip: {bounds:?}, strip {strip:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn enlarged_playback_age_chips_fit_constrained_sidebar(cx: &mut TestAppContext) {
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(480.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .expect("open narrow test window")
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.refresh().expect("enlarged age filter layout");
+        let row = cx
+            .debug_bounds("playback-age-filter-row")
+            .expect("age filter row");
+        let chips = [
+            "playback-age-chip-0",
+            "playback-age-chip-1",
+            "playback-age-chip-2",
+        ]
+        .into_iter()
+        .map(|selector| cx.debug_bounds(selector).expect("age chip"))
+        .collect::<Vec<_>>();
+        for chip in &chips {
+            assert!(chip.origin.x >= row.origin.x);
+            assert!(chip.origin.x + chip.size.width <= row.origin.x + row.size.width);
+            assert!(chip.origin.y + chip.size.height <= row.origin.y + row.size.height);
+        }
+        assert!(
+            chips
+                .windows(2)
+                .all(|pair| { pair[0].origin.x + pair[0].size.width <= pair[1].origin.x })
+        );
     }
 
     #[gpui::test]
