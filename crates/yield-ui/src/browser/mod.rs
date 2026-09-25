@@ -91,6 +91,7 @@ mod sidebar;
 mod similar_sections;
 mod source_recovery;
 mod source_registry;
+mod status_log;
 mod tag_chips;
 mod tag_completion;
 mod tag_dictionary;
@@ -347,6 +348,7 @@ pub(crate) struct Browser {
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
+    status_log: status_log::StatusLog,
     playback_status: String,
     volume: f32,
     volume_drag: Option<volume::VolumeDrag>,
@@ -642,6 +644,7 @@ impl Browser {
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
+            status_log: status_log::StatusLog::default(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
             volume_drag: None,
@@ -2452,6 +2455,18 @@ impl Browser {
                 return;
             }
             shortcut_help::KeyAction::Ignore => {}
+        }
+        if status_log::is_copy_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.copy_status_log(cx);
+            cx.stop_propagation();
+            return;
         }
         if self.theme_settings_open && key == "escape" {
             self.close_general_settings(window, cx);
