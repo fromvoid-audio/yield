@@ -1,7 +1,7 @@
 //! Native accessibility controls owned by the browser window.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -187,6 +187,8 @@ pub(super) struct BrowserAccessibility {
     visible_sources: Vec<PathBuf>,
     visible_folders: Vec<PathBuf>,
     visible_samples: Vec<PathBuf>,
+    recent_sample_focus_ids: VecDeque<String>,
+    recent_sample_focus_set: HashSet<String>,
     control_focus: HashMap<String, FocusHandle>,
     add_focus: FocusHandle,
     scope_focus: FocusHandle,
@@ -264,6 +266,8 @@ impl BrowserAccessibility {
             visible_sources: Vec::new(),
             visible_folders: Vec::new(),
             visible_samples: Vec::new(),
+            recent_sample_focus_ids: VecDeque::new(),
+            recent_sample_focus_set: HashSet::new(),
             control_focus,
             add_focus: cx.focus_handle(),
             scope_focus: cx.focus_handle(),
@@ -831,6 +835,13 @@ impl Browser {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let focused_sample_id = self
+            .browser_focus_id()
+            .as_ref()
+            .and_then(|id| self.view_model.visible_position_for(id))
+            .and_then(|position| self.view_model.rows().get(position))
+            .and_then(|row| self.entries.get(row.entry_index))
+            .map(|entry| sample_id(&entry.path));
         let visible_samples = range
             .filter_map(|position| {
                 let row = self.view_model.rows().get(position)?;
@@ -846,12 +857,32 @@ impl Browser {
         for path in &visible_samples {
             let id = sample_id(path);
             visible_ids.insert(id.clone());
-            ax.control_focus
-                .entry(id)
-                .or_insert_with(|| cx.focus_handle());
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                ax.control_focus.entry(id.clone())
+            {
+                entry.insert(cx.focus_handle());
+                if ax.recent_sample_focus_set.insert(id.clone()) {
+                    ax.recent_sample_focus_ids.push_back(id);
+                }
+            }
         }
-        ax.control_focus
-            .retain(|id, _| !id.starts_with("browser-sample:") || visible_ids.contains(id));
+        // The virtual list reports overlapping ranges during one paint. Keep a
+        // bounded recent set so a row's focus handle survives those range changes.
+        while ax.recent_sample_focus_ids.len() > 128 {
+            let Some(id) = ax.recent_sample_focus_ids.pop_front() else {
+                break;
+            };
+            ax.recent_sample_focus_set.remove(&id);
+            if !visible_ids.contains(&id) && focused_sample_id.as_ref() != Some(&id) {
+                ax.control_focus.remove(&id);
+            }
+        }
+        ax.control_focus.retain(|id, _| {
+            !id.starts_with("browser-sample:")
+                || visible_ids.contains(id)
+                || focused_sample_id.as_ref() == Some(id)
+                || ax.recent_sample_focus_set.contains(id)
+        });
         ax.visible_samples = visible_samples;
         self.sync_browser_accessibility(window, cx);
     }
