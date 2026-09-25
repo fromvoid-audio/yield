@@ -672,6 +672,7 @@ impl Browser {
         self.root = None;
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.view_model
             .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
         tag_filter::reinstall_after_projection(self, cx);

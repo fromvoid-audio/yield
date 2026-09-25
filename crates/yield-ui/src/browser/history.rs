@@ -236,6 +236,7 @@ impl Browser {
         self.waveform_error = None;
         self.invalidate_waveform_generation();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         if let Some(index) = self.active_source {
             self.view_model.set_curation_queue(
                 &self.entries,

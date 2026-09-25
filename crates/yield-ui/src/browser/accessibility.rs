@@ -9,8 +9,8 @@ use async_channel::Receiver;
 use gpui::{Context, FocusHandle, Task, Window, canvas, prelude::*};
 use raw_window_handle::HasWindowHandle;
 use yield_core::{
-    COLLECTION_COUNT, CurationQueueScope, PLAYBACK_TYPE_FILTERS, RATING_FILTER_LEVELS, SortColumn,
-    SortDirection,
+    COLLECTION_COUNT, CurationQueueScope, PLAYBACK_AGE_CHIPS, PLAYBACK_TYPE_FILTERS,
+    PlaybackAgeChip, RATING_FILTER_LEVELS, SortColumn, SortDirection,
 };
 use yield_platform::accessibility::{
     AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole, AxSlider,
@@ -130,6 +130,10 @@ pub(super) fn collection_filter_id(slot: usize) -> String {
 
 pub(super) fn playback_type_filter_id(index: usize) -> String {
     format!("browser-type-filter-{index}")
+}
+
+pub(super) fn playback_age_filter_id(index: usize) -> String {
+    format!("browser-age-filter-{index}")
 }
 
 pub(super) fn rating_filter_id(index: usize) -> String {
@@ -263,6 +267,9 @@ impl BrowserAccessibility {
         for index in 0..PLAYBACK_TYPE_FILTERS.len() {
             control_focus.insert(playback_type_filter_id(index), cx.focus_handle());
         }
+        for index in 0..PLAYBACK_AGE_CHIPS.len() {
+            control_focus.insert(playback_age_filter_id(index), cx.focus_handle());
+        }
         for index in 0..RATING_FILTER_LEVELS.len() {
             control_focus.insert(rating_filter_id(index), cx.focus_handle());
         }
@@ -371,6 +378,13 @@ impl BrowserAccessibility {
                             .find_map(|(index, &kind)| {
                                 (event.id == playback_type_filter_id(index)).then_some(kind)
                             });
+                        let playback_age_action =
+                            PLAYBACK_AGE_CHIPS
+                                .iter()
+                                .enumerate()
+                                .find_map(|(index, &chip)| {
+                                    (event.id == playback_age_filter_id(index)).then_some(chip)
+                                });
                         let rating_action =
                             RATING_FILTER_LEVELS
                                 .iter()
@@ -403,6 +417,7 @@ impl BrowserAccessibility {
                         ) || sort_action.is_some()
                             || collection_action.is_some()
                             || playback_type_action.is_some()
+                            || playback_age_action.is_some()
                             || rating_action.is_some();
                         let extra_action = extra_action || curation_scope_action.is_some();
                         let transport_action = matches!(
@@ -620,6 +635,10 @@ impl BrowserAccessibility {
                                                     view.toggle_collection_filter(slot, cx);
                                                 } else if let Some(kind) = playback_type_action {
                                                     view.toggle_playback_type_filter(kind, cx);
+                                                } else if let Some(chip) = playback_age_action {
+                                                    view.toggle_playback_age_filter(
+                                                        chip, false, cx,
+                                                    );
                                                 } else if let Some(level) = rating_action {
                                                     view.toggle_rating_filter(level, cx);
                                                 } else if let Some(scope) = curation_scope_action {
@@ -1280,6 +1299,27 @@ impl Browser {
                     label: format!("{} filter", if index == 0 { "1-Shot" } else { "Loop" }),
                     value: Some(
                         if self.view_model.playback_type_filter().contains_type(*kind) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    enabled: active_source,
+                });
+            }
+            for (index, chip) in PLAYBACK_AGE_CHIPS.iter().enumerate() {
+                let label = match chip {
+                    PlaybackAgeChip::NeverPlayed => "Never played",
+                    PlaybackAgeChip::OlderThanMonth => "Older than 30 days",
+                    PlaybackAgeChip::OlderThanWeek => "Older than 7 days",
+                };
+                controls.push(AxChild {
+                    id: playback_age_filter_id(index),
+                    role: AxRole::CheckBox,
+                    label: format!("{label} filter"),
+                    value: Some(
+                        if self.view_model.playback_age_filter().contains(*chip) {
                             "On"
                         } else {
                             "Off"

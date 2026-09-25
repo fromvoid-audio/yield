@@ -11,6 +11,7 @@ mod curation;
 mod curation_queue;
 mod folder_tree;
 mod last_played;
+mod playback_age_filter;
 mod playback_history;
 mod playback_loop_policy;
 mod playback_type_filter;
@@ -43,6 +44,7 @@ pub use folder_tree::{
 pub use last_played::{
     SECONDS_PER_DAY, format_last_played, last_played_age_seconds, last_played_sort_key,
 };
+pub use playback_age_filter::{PLAYBACK_AGE_CHIPS, PlaybackAgeChip, PlaybackAgeFilter};
 pub use playback_history::{
     PLAYBACK_NAVIGATION_HISTORY_LIMIT, PlaybackHistoryEntry, PlaybackNavigationHistory,
     PlaybackSpan,
@@ -268,6 +270,7 @@ pub struct BrowserViewModel {
     folder_scope: FolderScope,
     collection_filter: Option<usize>,
     rating_filter: RatingFilter,
+    playback_age_filter: PlaybackAgeFilter,
     playback_type_filter: PlaybackTypeFilter,
     tag_filter: TagFilterState,
     curation_queue: CurationQueueMode,
@@ -286,6 +289,7 @@ impl BrowserViewModel {
             folder_scope: FolderScope::DirectOnly,
             collection_filter: None,
             rating_filter: RatingFilter::disabled(),
+            playback_age_filter: PlaybackAgeFilter::disabled(),
             playback_type_filter: PlaybackTypeFilter::disabled(),
             tag_filter: TagFilterState::disabled(),
             curation_queue: CurationQueueMode::default(),
@@ -325,6 +329,11 @@ impl BrowserViewModel {
     /// Return the active source rating filter, or a disabled filter when no level is selected.
     pub fn rating_filter(&self) -> RatingFilter {
         self.rating_filter
+    }
+
+    /// Return the active playback-age selection.
+    pub fn playback_age_filter(&self) -> PlaybackAgeFilter {
+        self.playback_age_filter
     }
 
     /// Return the active source playback-type filter, or a disabled filter when no type is
@@ -577,6 +586,54 @@ impl BrowserViewModel {
         self.set_rating_filter(entries, next)
     }
 
+    /// Toggle or invert one playback-age chip and rebuild the projection.
+    pub fn toggle_playback_age_filter(
+        &mut self,
+        entries: &[AudioFile],
+        chip: PlaybackAgeChip,
+        invert: bool,
+    ) -> bool {
+        let next = if invert {
+            self.playback_age_filter.inverted(chip)
+        } else {
+            self.playback_age_filter.toggled(chip)
+        };
+        if next == self.playback_age_filter {
+            return false;
+        }
+        self.reveal_id = None;
+        self.playback_age_filter = next;
+        self.rebuild(entries);
+        true
+    }
+
+    /// Recompute time-sensitive membership and report the next age boundary.
+    pub fn refresh_playback_age(
+        &mut self,
+        entries: &[AudioFile],
+        now_unix_secs: i64,
+    ) -> Option<i64> {
+        self.rebuild_with_now(entries, now_unix_secs);
+        self.next_playback_age_change(entries, now_unix_secs)
+    }
+
+    /// Return the next age-filter membership boundary in the current entries.
+    pub fn next_playback_age_change(
+        &self,
+        entries: &[AudioFile],
+        now_unix_secs: i64,
+    ) -> Option<i64> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                self.playback_age_filter.next_membership_change(
+                    entry.curation.and_then(AudioFileCuration::last_played_at),
+                    now_unix_secs,
+                )
+            })
+            .min()
+    }
+
     /// Replace the playback-type filter while preserving query, folder, collection, rating, and
     /// sort state.
     pub fn set_playback_type_filter(
@@ -603,20 +660,22 @@ impl BrowserViewModel {
         self.set_playback_type_filter(entries, next)
     }
 
-    /// Count each collection across the current name, folder, rating, playback-type, and tag
+    /// Count each collection across the current name, folder, rating, playback-age, playback-type, and tag
     /// scope.
     ///
     /// The active collection filter is intentionally ignored so sidebar counts remain useful
     /// while a different collection is selected. Callers should cache this result and refresh it
-    /// when entries, query, folder, rating, or playback-type scope changes rather than during row
+    /// when entries, query, folder, rating, playback-age, or playback-type scope changes rather than during row
     /// rendering.
     pub fn collection_counts(&self, entries: &[AudioFile]) -> [usize; COLLECTION_COUNT] {
         let query = self.query.trim().to_ascii_lowercase();
+        let now_unix_secs = current_unix_epoch_seconds();
         let mut counts = [0; COLLECTION_COUNT];
         for (entry_index, entry) in entries.iter().enumerate() {
             if !self.entry_matches_tag_filter(entry_index)
                 || !self.entry_matches_scope(entry, &query)
                 || !self.entry_matches_rating(entry)
+                || !self.entry_matches_playback_age(entry, now_unix_secs)
                 || !self.entry_matches_playback_type(entry)
                 || !self.entry_matches_curation_queue(
                     entry_index,
@@ -715,6 +774,7 @@ impl BrowserViewModel {
                             })
                             && self.entry_matches_rating(entry)
                             && self.entry_matches_playback_type(entry)
+                            && self.entry_matches_playback_age(entry, now_epoch_seconds)
                             && self.entry_matches_curation_queue(
                                 *entry_index,
                                 entry,
@@ -810,6 +870,14 @@ impl BrowserViewModel {
 
     fn entry_matches_playback_type(&self, entry: &AudioFile) -> bool {
         self.playback_type_filter.matches(entry.playback_type)
+    }
+
+    fn entry_matches_playback_age(&self, entry: &AudioFile, now_unix_secs: i64) -> bool {
+        !self.playback_age_filter.is_enabled()
+            || entry.curation.is_some_and(|curation| {
+                self.playback_age_filter
+                    .matches(curation.last_played_at(), now_unix_secs)
+            })
     }
 
     fn entry_matches_tag_filter(&self, entry_index: usize) -> bool {
@@ -1372,6 +1440,160 @@ mod tests {
             vec![1]
         );
         assert_eq!(model.collection_counts(&entries), [0, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn playback_age_filter_composes_with_scope_and_refreshes_at_boundary() {
+        const DAY: i64 = 24 * 60 * 60;
+        let now = 90 * DAY;
+        let curation =
+            |rating, played_at| AudioFileCuration::from_parts(rating, false, 1, played_at, None);
+        let entries = vec![
+            typed_entry(
+                "kit/never.wav",
+                Some(PlaybackType::OneShot),
+                curation(1, None),
+            ),
+            typed_entry(
+                "kit/month.wav",
+                Some(PlaybackType::OneShot),
+                curation(1, Some(0)),
+            ),
+            typed_entry(
+                "kit/week.wav",
+                Some(PlaybackType::OneShot),
+                curation(1, Some(now - 8 * DAY)),
+            ),
+            typed_entry(
+                "other/never.wav",
+                Some(PlaybackType::OneShot),
+                curation(1, None),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        model.set_folder_scope(
+            &entries,
+            Some(PathBuf::from("kit")),
+            FolderScope::DirectOnly,
+        );
+        model.set_query(&entries, ".wav");
+        assert!(model.toggle_rating_filter(&entries, 1));
+        assert!(model.toggle_playback_type_filter(&entries, PlaybackType::OneShot));
+        assert!(model.set_collection_filter(&entries, Some(0)));
+        assert!(model.toggle_playback_age_filter(&entries, PlaybackAgeChip::NeverPlayed, false));
+        assert!(model.toggle_playback_age_filter(&entries, PlaybackAgeChip::OlderThanMonth, false));
+        model.refresh_playback_age(&entries, now);
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        let week_id = entries[2].stable_id();
+        assert!(model.set_reveal(&entries, Some(week_id)));
+        assert_eq!(model.rows().len(), 3);
+        assert!(model.toggle_playback_age_filter(&entries, PlaybackAgeChip::OlderThanMonth, true));
+        model.refresh_playback_age(&entries, now);
+        assert!(
+            model
+                .playback_age_filter()
+                .contains(PlaybackAgeChip::OlderThanWeek)
+        );
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+
+        let future = typed_entry(
+            "kit/future.wav",
+            Some(PlaybackType::OneShot),
+            curation(1, Some(now)),
+        );
+        let mut updated = entries.clone();
+        updated.push(future);
+        updated.push(typed_entry(
+            "kit/unknown.wav",
+            Some(PlaybackType::OneShot),
+            None,
+        ));
+        model.set_entries(&updated);
+        assert_eq!(
+            model.refresh_playback_age(&updated, now),
+            Some(now + 7 * DAY)
+        );
+        assert!(
+            model
+                .refresh_playback_age(&updated, now + 7 * DAY)
+                .is_some()
+        );
+        assert!(model.rows().iter().any(|row| row.entry_index == 4));
+        assert!(!model.rows().iter().any(|row| row.entry_index == 5));
+
+        updated[0].curation = curation(1, Some(now + 7 * DAY));
+        model.set_entries(&updated);
+        model.refresh_playback_age(&updated, now + 7 * DAY);
+        assert!(!model.rows().iter().any(|row| row.entry_index == 0));
+    }
+
+    #[test]
+    fn playback_age_and_curation_queue_intersect_and_preserve_explicit_reveal() {
+        const DAY: i64 = 24 * 60 * 60;
+        let now = current_unix_epoch_seconds();
+        let entries = vec![
+            typed_entry(
+                "never-complete.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, None, None),
+            ),
+            typed_entry(
+                "month-incomplete.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, Some(now - 40 * DAY), None),
+            ),
+            typed_entry(
+                "week-incomplete.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, Some(now - 10 * DAY), None),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.toggle_playback_age_filter(&entries, PlaybackAgeChip::OlderThanMonth, false));
+        model.refresh_playback_age(&entries, now);
+        assert!(model.set_curation_queue(
+            &entries,
+            CurationQueueMode {
+                enabled: true,
+                scope: CurationQueueScope::Tags,
+                ..Default::default()
+            }
+        ));
+        assert!(model.rows().is_empty());
+        let complete = CurationTagFacts::from_flags(true, true, true);
+        let incomplete = CurationTagFacts::from_flags(true, true, false);
+        assert!(model.apply_curation_tag_facts(&entries, vec![complete, incomplete, incomplete]));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(model.set_reveal(&entries, Some(entries[2].stable_id())));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[test]
