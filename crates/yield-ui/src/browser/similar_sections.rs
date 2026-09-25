@@ -97,18 +97,18 @@ pub(super) fn toggle(browser: &mut Browser, cx: &mut Context<Browser>) {
     invalidate_if_stale(browser);
     if browser.similar_sections.enabled() {
         browser.similar_sections.cancel();
-        browser.playback_status = String::from("Similar sections disabled");
+        browser.set_playback_status(String::from("Similar sections disabled"));
     } else if let Some(intent) = current_intent(browser) {
         browser.similar_sections.wanted = Some(intent.clone());
         browser.similar_sections.ranges.clear();
-        browser.playback_status = String::from("Finding similar sections…");
+        browser.set_playback_status(String::from("Finding similar sections…"));
         if browser.similar_sections.task.is_some() {
             browser.similar_sections.queued = Some(intent);
         } else {
             launch(browser, intent, cx);
         }
     } else {
-        browser.playback_status = String::from("Set a playmark selection first");
+        browser.set_playback_status(String::from("Set a playmark selection first"));
     }
     cx.notify();
 }
@@ -134,12 +134,12 @@ fn launch(browser: &mut Browser, intent: Intent, cx: &mut Context<Browser>) {
             {
                 match result {
                     Ok(ranges) => {
-                        browser.playback_status = format!("{} similar sections", ranges.len());
+                        browser.set_playback_status(format!("{} similar sections", ranges.len()));
                         browser.similar_sections.ranges = ranges;
                     }
                     Err(error) => {
                         browser.similar_sections.cancel();
-                        browser.playback_status = error;
+                        browser.set_playback_status(error);
                     }
                 }
             }

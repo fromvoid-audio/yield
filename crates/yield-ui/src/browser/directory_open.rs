@@ -125,7 +125,7 @@ impl Browser {
             return;
         }
         let Some(target) = capture_source_target(self, index, event.position) else {
-            self.playback_status = String::from("Source is not ready to open");
+            self.set_playback_status(String::from("Source is not ready to open"));
             cx.notify();
             return;
         };
@@ -144,7 +144,7 @@ impl Browser {
             return;
         }
         let Some(target) = capture_folder_target(self, folder, event.position) else {
-            self.playback_status = String::from("Folder is not ready to open");
+            self.set_playback_status(String::from("Folder is not ready to open"));
             cx.notify();
             return;
         };
@@ -158,13 +158,13 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         if !directory_target_is_current(self, &target) {
-            self.playback_status = String::from("Open canceled: the directory changed");
+            self.set_playback_status(String::from("Open canceled: the directory changed"));
             cx.notify();
             return;
         }
         if self.directory_open.running.is_some() {
             self.directory_open.queue_latest(target);
-            self.playback_status = String::from("Preparing the latest directory open…");
+            self.set_playback_status(String::from("Preparing the latest directory open…"));
             cx.notify();
             return;
         }
@@ -187,13 +187,13 @@ impl Browser {
             cancellation: std::sync::Arc::clone(&cancellation),
         });
         let preparation_target = target.clone();
-        self.playback_status = format!(
+        self.set_playback_status(format!(
             "Preparing {} open…",
             match target.kind {
                 DirectoryOpenKind::Source => "source",
                 DirectoryOpenKind::Folder => "folder",
             }
-        );
+        ));
         self.directory_open.task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -231,7 +231,7 @@ impl Browser {
             if directory_target_is_current(self, &queued) {
                 self.start_directory_open_preparation(queued, cx);
             } else {
-                self.playback_status = String::from("Open canceled: the directory changed");
+                self.set_playback_status(String::from("Open canceled: the directory changed"));
                 cx.notify();
             }
             return;
@@ -241,17 +241,17 @@ impl Browser {
         }
         let target = running.target;
         if !directory_target_is_current(self, &target) {
-            self.playback_status = String::from("Open canceled: the directory changed");
+            self.set_playback_status(String::from("Open canceled: the directory changed"));
             cx.notify();
             return;
         }
         match result {
             Ok(path) => {
                 cx.open_with_system(&path);
-                self.playback_status = format!("Open requested: {}", path.display());
+                self.set_playback_status(format!("Open requested: {}", path.display()));
             }
             Err(error) => {
-                self.playback_status = format!("Open unavailable: {error}");
+                self.set_playback_status(format!("Open unavailable: {error}"));
             }
         }
         cx.notify();
