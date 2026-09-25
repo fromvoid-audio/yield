@@ -204,6 +204,10 @@ impl StagingCheckpointRecord {
         self.output_id
     }
 
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub(super) fn source_fence(&self) -> Option<&StoredStagingSourceFence> {
         self.source_fence.as_ref()
     }

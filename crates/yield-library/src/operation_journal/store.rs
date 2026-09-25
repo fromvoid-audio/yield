@@ -67,6 +67,7 @@ use super::selection_output_commands::{
 use super::validation::{RecordConsistency, classify_record};
 
 mod chunk_claims;
+mod chunk_staging;
 #[allow(dead_code)]
 mod full_progress;
 #[allow(dead_code)]
@@ -78,6 +79,7 @@ pub(crate) use chunk_claims::{
     ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
     ChunkWriteIdentity,
 };
+pub(crate) use chunk_staging::ChunkStagingReceipt;
 pub(crate) use full_progress::FullProgressWriteOutcome;
 #[cfg(test)]
 pub(crate) use ordinary_claims::MAX_PAGE_ROWS;
@@ -96,7 +98,7 @@ pub const JOURNAL_DATABASE_ROOT_NAME: &str = "operation_journal";
 /// The SQLite application id reserved for the operation journal.
 pub const JOURNAL_APPLICATION_ID: u32 = u32::from_be_bytes(*b"WCJ1");
 /// The SQLite user-version written by this journal schema.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 8;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 9;
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -115,7 +117,8 @@ const RECOVERY_RESERVE_BINDING_SCHEMA_VERSION: u32 = 4;
 const ORDINARY_CLAIM_SCHEMA_VERSION: u32 = 5;
 const ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION: u32 = 6;
 const CHUNK_CLAIM_SCHEMA_VERSION: u32 = 7;
-const MAX_SCHEMA_OBJECTS: i64 = 9;
+const STAGING_CHECKPOINT_SCHEMA_VERSION: u32 = 8;
+const MAX_SCHEMA_OBJECTS: i64 = 10;
 const MAX_SCHEMA_COLUMNS: usize = 16;
 const MAX_SCHEMA_INDEXES: usize = 8;
 const MAX_REBUILD_DIAGNOSTICS: usize = 32;
@@ -237,6 +240,12 @@ pub enum OperationJournalStoreError {
     /// A staging checkpoint could not be acknowledged or conflicts with retained evidence.
     #[error("operation journal staging checkpoint error: {reason}")]
     StagingCheckpoint {
+        /// Bounded checkpoint diagnostic.
+        reason: String,
+    },
+    /// A capability-bound incomplete chunk checkpoint failed closed.
+    #[error("operation journal chunk staging error: {reason}")]
+    ChunkStaging {
         /// Bounded checkpoint diagnostic.
         reason: String,
     },
@@ -2004,6 +2013,16 @@ impl OperationJournalStore {
                     reason: String::from("chunk claim belongs to a different operation"),
                 });
             }
+            let has_checkpoint: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_journal_chunk_staging WHERE chunk_id = ?1)",
+                params![chunk_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if has_checkpoint {
+                return Err(OperationJournalStoreError::ChunkClaim {
+                    reason: String::from("incomplete chunk staging checkpoint retains its charge"),
+                });
+            }
             let claim = ordinary_claims::read_claim(&self.connection, current.claim_id())
                 .map_err(|error| OperationJournalStoreError::ChunkClaim {
                     reason: error.to_string(),
@@ -2178,7 +2197,8 @@ impl OperationJournalStore {
                 )
             })?;
             let staging_rows: i64 = self.connection.query_row(
-                "SELECT COUNT(*) FROM operation_journal_staging_checkpoints",
+                "SELECT (SELECT COUNT(*) FROM operation_journal_staging_checkpoints)
+                      + (SELECT COUNT(*) FROM operation_journal_chunk_staging)",
                 [],
                 |row| row.get(0),
             )?;
@@ -3171,6 +3191,28 @@ impl OperationJournalStore {
                     CHUNK_CLAIM_SCHEMA_VERSION,
                 )?;
                 migrate_staging_checkpoint_schema(
+                    &connection,
+                    &database_root,
+                    &database_path,
+                    &database_identity,
+                    profile_guard,
+                    rollback_journal.as_ref(),
+                )?;
+            } else if header_version == STAGING_CHECKPOINT_SCHEMA_VERSION {
+                if let Some(rollback_journal) = rollback_journal.as_ref() {
+                    validate_rollback_journal_identity(
+                        &database_root,
+                        &database_path,
+                        &rollback_journal.identity,
+                    )?;
+                }
+                configure_connection(&connection)?;
+                verify_connection_configuration(
+                    &connection,
+                    &database_path,
+                    STAGING_CHECKPOINT_SCHEMA_VERSION,
+                )?;
+                migrate_chunk_staging_schema(
                     &connection,
                     &database_root,
                     &database_path,
@@ -6243,6 +6285,8 @@ impl OperationJournalStore {
                  SELECT sequence FROM operation_journal_full_progress
                  UNION ALL
                  SELECT sequence FROM operation_journal_staging_checkpoints
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_chunk_staging
              )",
             [],
             |row| row.get::<_, Option<i64>>(0),
@@ -6759,6 +6803,9 @@ impl OperationJournalStore {
                  UNION ALL
                  SELECT sequence FROM operation_journal_staging_checkpoints
                  WHERE typeof(sequence) = 'integer' AND sequence = ?1
+                 UNION ALL
+                 SELECT sequence FROM operation_journal_chunk_staging
+                 WHERE typeof(sequence) = 'integer' AND sequence = ?1
              )",
             params![sequence],
             |row| row.get(0),
@@ -7236,6 +7283,7 @@ fn validate_sqlite_header(file: &mut File, path: &Path) -> Result<u32, Operation
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -7269,6 +7317,7 @@ fn read_sqlite_user_version(
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(audit_error(
@@ -7399,7 +7448,7 @@ fn validate_existing_schema(
                 String::from("table"),
             ),
         ],
-        CHUNK_CLAIM_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION => {
+        CHUNK_CLAIM_SCHEMA_VERSION | STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION => {
             let mut expected = vec![
                 (String::from(JOURNAL_TABLE_NAME), String::from("table")),
                 (
@@ -7431,11 +7480,20 @@ fn validate_existing_schema(
                     String::from("table"),
                 ),
             ];
-            if schema_version == JOURNAL_SCHEMA_VERSION {
+            if schema_version >= STAGING_CHECKPOINT_SCHEMA_VERSION {
                 expected.insert(
                     8,
                     (
                         String::from(staging_checkpoints::TABLE_NAME),
+                        String::from("table"),
+                    ),
+                );
+            }
+            if schema_version == JOURNAL_SCHEMA_VERSION {
+                expected.insert(
+                    2,
+                    (
+                        String::from(chunk_staging::TABLE_NAME),
                         String::from("table"),
                     ),
                 );
@@ -7465,6 +7523,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7481,6 +7540,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7502,6 +7562,7 @@ fn validate_existing_schema(
             | ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7516,6 +7577,7 @@ fn validate_existing_schema(
         ORDINARY_CLAIM_SCHEMA_VERSION
             | ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
             | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
             | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
@@ -7527,7 +7589,10 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION | CHUNK_CLAIM_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        ORDINARY_CLAIM_RELEASE_SCHEMA_VERSION
+            | CHUNK_CLAIM_SCHEMA_VERSION
+            | STAGING_CHECKPOINT_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -7538,7 +7603,7 @@ fn validate_existing_schema(
     }
     if matches!(
         schema_version,
-        CHUNK_CLAIM_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        CHUNK_CLAIM_SCHEMA_VERSION | STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
     ) {
         validate_table_schema(
             connection,
@@ -7547,12 +7612,23 @@ fn validate_existing_schema(
             chunk_claims::CREATE_TABLE,
         )?;
     }
-    if schema_version == JOURNAL_SCHEMA_VERSION {
+    if matches!(
+        schema_version,
+        STAGING_CHECKPOINT_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+    ) {
         validate_table_schema(
             connection,
             path,
             staging_checkpoints::TABLE_NAME,
             staging_checkpoints::CREATE_TABLE,
+        )?;
+    }
+    if schema_version == JOURNAL_SCHEMA_VERSION {
+        validate_table_schema(
+            connection,
+            path,
+            chunk_staging::TABLE_NAME,
+            chunk_staging::CREATE_TABLE,
         )?;
     }
     Ok(())
@@ -7742,6 +7818,11 @@ fn validate_table_schema(
                 0,
             ),
         ],
+        chunk_staging::TABLE_NAME => vec![
+            (String::from("chunk_id"), String::from("TEXT"), 1, 1),
+            (String::from("sequence"), String::from("INTEGER"), 1, 0),
+            (String::from("record"), String::from("BLOB"), 1, 0),
+        ],
         _ => {
             return Err(audit_error(path, format!("unsupported table {table_name}")));
         }
@@ -7851,6 +7932,7 @@ fn migrate_legacy_schema(
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         if let Some(error) =
             migration_failure.and_then(|hook| hook(MigrationTestBoundary::BeforeCommit, connection))
@@ -7921,6 +8003,7 @@ fn migrate_previous_schema(
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -7984,6 +8067,7 @@ fn migrate_recovery_reserve_schema(
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8050,6 +8134,7 @@ fn migrate_ordinary_claim_schema(
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8111,6 +8196,7 @@ fn migrate_ordinary_claim_release_schema(
         connection.execute_batch(ordinary_claims::CREATE_RELEASE_TABLE)?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8175,6 +8261,7 @@ fn migrate_chunk_claim_schema(
         )?;
         connection.execute_batch(chunk_claims::CREATE_TABLE)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8234,6 +8321,66 @@ fn migrate_staging_checkpoint_schema(
         )?;
         validate_existing_schema(connection, database_path, CHUNK_CLAIM_SCHEMA_VERSION)?;
         connection.execute_batch(staging_checkpoints::CREATE_TABLE)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
+        validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_chunk_staging_schema(
+    connection: &Connection,
+    database_root: &BoundDatabaseRoot,
+    database_path: &Path,
+    database_identity: &str,
+    profile_guard: &WritableProfileGuard,
+    rollback_journal: Option<&PreexistingRollbackJournal>,
+) -> Result<(), OperationJournalStoreError> {
+    validate_migration_guards(
+        connection,
+        database_root,
+        database_path,
+        database_identity,
+        profile_guard,
+        rollback_journal,
+        STAGING_CHECKPOINT_SCHEMA_VERSION,
+    )?;
+    connection.execute_batch("BEGIN EXCLUSIVE")?;
+    let result = (|| {
+        validate_migration_guards(
+            connection,
+            database_root,
+            database_path,
+            database_identity,
+            profile_guard,
+            rollback_journal,
+            STAGING_CHECKPOINT_SCHEMA_VERSION,
+        )?;
+        validate_existing_schema(connection, database_path, STAGING_CHECKPOINT_SCHEMA_VERSION)?;
+        connection.execute_batch(chunk_staging::CREATE_TABLE)?;
         connection.execute_batch(&format!("PRAGMA user_version = {JOURNAL_SCHEMA_VERSION};"))?;
         validate_existing_schema(connection, database_path, JOURNAL_SCHEMA_VERSION)?;
         validate_migration_guards(
@@ -8317,7 +8464,8 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
              {ordinary_claim_table};
              {ordinary_claim_release_table};
              {chunk_claim_table};
-             {staging_checkpoint_table};",
+             {staging_checkpoint_table};
+             {chunk_staging_table};",
             charge_table = recovery_reserve::CREATE_CHARGE_TABLE,
             transition_table = recovery_reserve::CREATE_TRANSITION_TABLE,
             binding_table = recovery_reserve_binding::CREATE_TABLE,
@@ -8325,6 +8473,7 @@ fn bootstrap_schema(connection: &Connection) -> Result<(), OperationJournalStore
             ordinary_claim_release_table = ordinary_claims::CREATE_RELEASE_TABLE,
             chunk_claim_table = chunk_claims::CREATE_TABLE,
             staging_checkpoint_table = staging_checkpoints::CREATE_TABLE,
+            chunk_staging_table = chunk_staging::CREATE_TABLE,
         ))
         .map(|_| ());
     match result {
@@ -12154,6 +12303,217 @@ mod tests {
     }
 
     #[test]
+    fn chunk_staging_checkpoint_retains_charge_across_faults_replay_and_restart() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open store");
+        let (operation_id, intent, universal, args, legacy_plan) = v5_copy_inputs();
+        let filesystem = universal
+            .participants()
+            .descriptors()
+            .iter()
+            .find(|participant| participant.kind() == ParticipantKind::Filesystem)
+            .expect("filesystem participant")
+            .id();
+        let source_fence = universal
+            .participants()
+            .descriptors()
+            .iter()
+            .find_map(|participant| participant.source_fence())
+            .expect("source participant fence")
+            .clone();
+        let operation = StoredOperationRecord::new_v16_command(
+            operation_id,
+            intent,
+            universal,
+            UniversalCommandArgs::Copy(args),
+            FullCapacityPlan::from_legacy(&legacy_plan).expect("full plan"),
+            50,
+        );
+        let operation_receipt = store.insert_intent(&operation).expect("persist operation");
+        let row = &legacy_plan.volumes[0];
+        let chunk_id = ChunkId::new();
+        let request = ChunkClaimRequest::new(
+            chunk_id,
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                row.identity.clone(),
+                row.allocation_class.into(),
+                row.allocated_bytes,
+            )
+            .expect("admission claim"),
+            filesystem,
+            String::from("partial.wav"),
+            0,
+            row.logical_bytes,
+            row.allocation_unit,
+            row.protected_free_bytes,
+        )
+        .expect("chunk request");
+        let mut facts = BTreeMap::new();
+        facts.insert(
+            row.identity.clone(),
+            VolumeFacts {
+                identity: row.identity.clone(),
+                free_bytes: PROTECTED_FREE_SPACE_FLOOR + 1024,
+                allocation_unit: row.allocation_unit,
+            },
+        );
+        let provider = CapacityProvider::qualified_fixture(facts);
+        let lease = provider
+            .admit(
+                &request.plan().expect("plan"),
+                &request.inventory().expect("inventory"),
+            )
+            .expect("admit chunk");
+        store
+            .persist_chunk_claim_with_lease(&request, &provider, lease)
+            .expect("persist chunk claim");
+        let issue_id = Uuid::new_v4();
+        store
+            .issue_chunk_claim(chunk_id, operation_id, issue_id)
+            .expect("issue chunk");
+        let checkpoint = chunk_staging::ChunkStagingRecord::decode(
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "chunk_id": chunk_id.as_uuid(),
+                "operation_id": operation_id,
+                "issue_id": issue_id,
+                "participant_id": filesystem,
+                "output_key": "partial.wav",
+                "logical_offset": 0,
+                "logical_length": row.logical_bytes,
+                "status": "PartialNeedsRetry",
+                "staging": {
+                    "schema_version": 1,
+                    "operation_id": operation_id,
+                    "participant_id": filesystem,
+                    "effect_id": Uuid::new_v4(),
+                    "output_id": Uuid::new_v4(),
+                    "staging_root": {
+                        "owner": Uuid::new_v4(),
+                        "registration_id": Uuid::new_v4(),
+                        "generation": 1
+                    },
+                    "source_root": {
+                        "owner": Uuid::new_v4(),
+                        "registration_id": Uuid::new_v4(),
+                        "generation": 1
+                    },
+                    "source_fence": {
+                        "source_id": source_fence.source_id(),
+                        "root_identity": source_fence.root_identity(),
+                        "database_identity": source_fence.database_identity(),
+                        "lifecycle_generation": source_fence.lifecycle_generation(),
+                        "source_revision": source_fence.source_revision(),
+                        "lease_epoch": source_fence.lease_epoch()
+                    },
+                    "locator": "partial.wav",
+                    "logical_object_id": Uuid::new_v4(),
+                    "physical_object_id": "physical-partial-file",
+                    "bytes": 1,
+                    "content_hash": vec![7; 32],
+                    "request_fingerprint": vec![8; 32]
+                }
+            }))
+            .expect("encode checkpoint fixture"),
+        )
+        .expect("decode checkpoint fixture");
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::BeforePrecommitValidation {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced checkpoint precommit failure"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(store.checkpoint_chunk_staging_record(&checkpoint).is_err());
+        assert!(
+            store
+                .read_chunk_staging_row(chunk_id)
+                .expect("read rollback")
+                .is_none()
+        );
+        assert_eq!(provider.claim_count(), 1);
+
+        store.set_insert_test_hook(|boundary| {
+            if boundary == InsertTestBoundary::AfterCommit {
+                InsertTestDirective::Fail(OperationJournalStoreError::IdentityCheckUnavailable {
+                    reason: String::from("forced checkpoint postcommit uncertainty"),
+                })
+            } else {
+                InsertTestDirective::Continue
+            }
+        });
+        assert!(store.checkpoint_chunk_staging_record(&checkpoint).is_err());
+        let (sequence, retained) = store
+            .read_chunk_staging_row(chunk_id)
+            .expect("read uncertain checkpoint")
+            .expect("retained checkpoint");
+        assert_eq!(retained, checkpoint);
+        assert!(matches!(
+            store.checkpoint_chunk_staging_record(&checkpoint).expect("exact replay"),
+            chunk_staging::ChunkStagingReceipt::Replay { sequence: replayed }
+                if replayed == sequence
+        ));
+        let mut conflicting = serde_json::to_value(&checkpoint).expect("checkpoint JSON");
+        conflicting["staging"]["physical_object_id"] = serde_json::json!("other-file");
+        let conflicting = chunk_staging::ChunkStagingRecord::decode(
+            &serde_json::to_vec(&conflicting).expect("encode conflicting checkpoint"),
+        )
+        .expect("decode conflicting checkpoint");
+        assert!(store.checkpoint_chunk_staging_record(&conflicting).is_err());
+        let release_id = Uuid::new_v4();
+        assert!(
+            store
+                .release_chunk_claim(
+                    chunk_id,
+                    operation_id,
+                    Some(ChunkUnusedReleaseAuthorization::for_test(
+                        chunk_id,
+                        operation_id,
+                        issue_id,
+                        release_id,
+                    )),
+                    release_id,
+                )
+                .is_err()
+        );
+        assert_eq!(provider.claim_count(), 1);
+        assert!(store.prove_clean_handoff_durable().is_err());
+        assert_eq!(
+            journal_sequence(&store, operation_id),
+            operation_receipt.sequence()
+        );
+        drop(store);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("reopen journal");
+        assert_eq!(
+            reopened
+                .read_chunk_staging_row(chunk_id)
+                .expect("read restarted row"),
+            Some((sequence, checkpoint.clone()))
+        );
+        assert!(matches!(
+            reopened
+                .checkpoint_chunk_staging_record(&checkpoint)
+                .expect("restart replay"),
+            chunk_staging::ChunkStagingReceipt::Replay { .. }
+        ));
+        let cancel = CancellationRequestObservation::new(51).expect("cancel observation");
+        reopened
+            .request_cancel_before_publish(operation_id, operation_receipt.sequence(), cancel)
+            .expect("cancel operation");
+        assert!(
+            reopened
+                .checkpoint_chunk_staging_record(&checkpoint)
+                .is_err()
+        );
+        assert_eq!(provider.claim_count(), 1);
+    }
+
+    #[test]
     fn v16_copy_retry_and_cancel_preserve_full_plan_through_store_cas_and_restart() {
         let fixture = fixture();
         let store = OperationJournalStore::open(&fixture.owner).expect("open store");
@@ -13340,6 +13700,10 @@ mod tests {
                     String::from("table")
                 ),
                 (
+                    String::from(chunk_staging::TABLE_NAME),
+                    String::from("table")
+                ),
+                (
                     String::from(FULL_PROGRESS_TABLE_NAME),
                     String::from("table")
                 ),
@@ -13396,8 +13760,9 @@ mod tests {
         let connection = Connection::open(&path).expect("open old schema fixture");
         connection
             .execute_batch(&format!(
-                "DROP TABLE {}; PRAGMA user_version = {};",
+                "DROP TABLE {}; DROP TABLE {}; PRAGMA user_version = {};",
                 staging_checkpoints::TABLE_NAME,
+                chunk_staging::TABLE_NAME,
                 CHUNK_CLAIM_SCHEMA_VERSION
             ))
             .expect("make exact v7 schema");
@@ -13418,6 +13783,46 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read empty staging checkpoint table");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn existing_v8_journal_adds_chunk_staging_without_rewriting_progress() {
+        let fixture = fixture();
+        let store = OperationJournalStore::open(&fixture.owner).expect("open journal");
+        let (initial, _) = full_progress_store_records();
+        let operation_id = initial.snapshot().intent().operation_id();
+        store
+            .persist_full(&initial, None)
+            .expect("persist progress");
+        let previous = full_progress_raw_row(&store, operation_id);
+        drop(store);
+
+        let connection = Connection::open(database_path(&fixture.owner)).expect("open v8 fixture");
+        connection
+            .execute_batch(&format!(
+                "DROP TABLE {}; PRAGMA user_version = {};",
+                chunk_staging::TABLE_NAME,
+                STAGING_CHECKPOINT_SCHEMA_VERSION
+            ))
+            .expect("make exact v8 schema");
+        drop(connection);
+
+        let reopened = OperationJournalStore::open(&fixture.owner).expect("migrate v8 journal");
+        assert_eq!(full_progress_raw_row(&reopened, operation_id), previous);
+        let version: i64 = reopened
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, i64::from(JOURNAL_SCHEMA_VERSION));
+        let rows: i64 = reopened
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", chunk_staging::TABLE_NAME),
+                [],
+                |row| row.get(0),
+            )
+            .expect("read empty chunk staging table");
         assert_eq!(rows, 0);
     }
 

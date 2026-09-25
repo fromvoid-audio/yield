@@ -56,7 +56,7 @@ use super::store::recovery::{
 };
 use super::store::{
     ChunkClaimRecord, ChunkClaimRequest, ChunkClaimState, ChunkId, ChunkIssueReceipt,
-    ChunkWriteIdentity, FullProgressWriteOutcome, InitialClaimSettlementError,
+    ChunkStagingReceipt, ChunkWriteIdentity, FullProgressWriteOutcome, InitialClaimSettlementError,
     JournalCancelRequestReceipt, JournalInsertFailure, JournalInsertOutcome, JournalInsertReceipt,
     JournalInsertWriteStage, JournalRetryReceipt, OperationJournalStore,
     OperationJournalStoreError, OrdinaryClaimReleaseReceipt, SourceReserveBindingFailure,
@@ -778,6 +778,9 @@ struct IssuedChunkTicket {
     chunk_id: ChunkId,
     operation_id: OperationId,
     identity: ChunkWriteIdentity,
+    live_output: Option<OutputIdentity>,
+    live_target: Option<RootRegistrationRef>,
+    live_source_fences: Vec<SourceFence>,
 }
 
 /// Proof retained after an unused issuance has been consumed by a release attempt. It forbids
@@ -1783,6 +1786,9 @@ impl OwnerRuntime {
                 chunk_id: permit.chunk_id(),
                 operation_id: permit.operation_id(),
                 identity: permit.identity().clone(),
+                live_output: None,
+                live_target: None,
+                live_source_fences: Vec::new(),
             },
         );
         Ok(permit)
@@ -1882,6 +1888,15 @@ impl OwnerRuntime {
         }
         let output_key = record.output_key().to_owned();
         let permit = self.issue_chunk(chunk_id, operation_id)?;
+        let ticket = self
+            .issued_chunk_tickets
+            .get_mut(&permit.issue_id())
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("issued chunk ticket disappeared before live binding"),
+            })?;
+        ticket.live_output = Some(spec.output);
+        ticket.live_target = Some(spec.target);
+        ticket.live_source_fences = spec.source_fences.clone();
         Ok(LiveChunkEffectGrant {
             permit,
             source_pin,
@@ -1946,6 +1961,86 @@ impl OwnerRuntime {
             validation,
             source_pin,
         })
+    }
+
+    fn checkpoint_live_chunk_staging(
+        &mut self,
+        chunk_id: ChunkId,
+        issue_id: Uuid,
+        validation: FileOperationResult,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+    ) -> Result<ChunkStagingReceipt, OperationJournalOwnerError> {
+        let ticket = self.issued_chunk_tickets.get(&issue_id).ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk checkpoint has no live issued ticket"),
+            }
+        })?;
+        let crate::file_operation_owner::EffectOutcome::Applied { evidence } = validation.outcome()
+        else {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk staging validation did not succeed"),
+            });
+        };
+        let proof =
+            evidence
+                .validated_staging()
+                .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                    reason: String::from("chunk validation has no physical staging proof"),
+                })?;
+        if ticket.chunk_id != chunk_id
+            || ticket.operation_id != validation.operation_id()
+            || ticket.identity.participant_id() != validation.participant_id()
+            || ticket.live_output != Some(proof.output())
+            || ticket.live_target != Some(validation.target_registration())
+            || ticket.live_source_fences != validation.source_fences()
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk staging proof differs from its live issued ticket"),
+            });
+        }
+        let source = self
+            .source_registrations
+            .get(&registration.registration_id)
+            .ok_or_else(|| OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk source registration is not retained"),
+            })?;
+        if source.receipt != registration
+            || !matches!(source.readiness, SourceRegistrationReadiness::Registered)
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk source registration is not current"),
+            });
+        }
+        let profile_guard = self.final_profile_guard.as_ref().ok_or_else(|| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk profile ownership is unavailable"),
+            }
+        })?;
+        source_pin.validate_for_issuance(&source.request, profile_guard)?;
+        let lease_epoch = u64::try_from(registration.lease_identity.epoch()).map_err(|_| {
+            OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk source lease epoch is invalid"),
+            }
+        })?;
+        let [fence] = validation.source_fences() else {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk validation requires one source fence"),
+            });
+        };
+        if fence.root_identity() != source.request.media_root().identity()
+            || fence.database_identity() != source.request.database_file_identity()
+            || fence.lease_epoch() != lease_epoch
+        {
+            return Err(OperationJournalOwnerError::ChunkClaim {
+                reason: String::from("chunk source fence differs from live registration"),
+            });
+        }
+        let receipt = self
+            .store()
+            .checkpoint_chunk_staging(chunk_id, issue_id, &validation)?;
+        self.issued_chunk_tickets.remove(&issue_id);
+        Ok(receipt)
     }
 
     fn begin_chunk_write(
@@ -3827,6 +3922,30 @@ impl OperationJournalClient {
         })
     }
 
+    /// Persist a positive incomplete chunk checkpoint from the exact issued ticket, live source
+    /// pin, and a file-owner validation result. The returned receipt carries no effect authority.
+    #[allow(dead_code)] // Ordinary-family producer is deferred by OPT-1856's scope.
+    pub(crate) fn checkpoint_live_chunk_staging(
+        &self,
+        chunk_id: ChunkId,
+        issue_id: Uuid,
+        validation: FileOperationResult,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+    ) -> Result<OperationJournalRequest<ChunkStagingReceipt>, OperationJournalOwnerQueueError> {
+        self.submit(64 * 1024, move |input, result| {
+            JournalCommand::CheckpointLiveChunkStaging {
+                chunk_id,
+                issue_id,
+                validation,
+                registration,
+                source_pin,
+                input,
+                result,
+            }
+        })
+    }
+
     /// Queue one bounded synthetic write entry. The ticket is checked against the live owner
     /// registry and fresh descriptor/provider facts on the worker; it never carries execution or
     /// filesystem authority across this queue boundary.
@@ -4459,6 +4578,15 @@ enum JournalCommand {
         input: InputPermit,
         result: SyncSender<Result<StagingPublicationGrant, OperationJournalOwnerError>>,
     },
+    CheckpointLiveChunkStaging {
+        chunk_id: ChunkId,
+        issue_id: Uuid,
+        validation: FileOperationResult,
+        registration: SourceAuthorityRegistrationReceipt,
+        source_pin: SourceEffectPin,
+        input: InputPermit,
+        result: SyncSender<Result<ChunkStagingReceipt, OperationJournalOwnerError>>,
+    },
     BeginChunkWrite {
         permit: ChunkWritePermit,
         identity: ChunkWriteIdentity,
@@ -4879,6 +5007,26 @@ fn execute_command(command: JournalCommand, runtime: &mut OwnerRuntime) -> bool 
                 runtime.checkpoint_and_grant_staging(validation, registration, source_pin)
             })
         }
+        JournalCommand::CheckpointLiveChunkStaging {
+            chunk_id,
+            issue_id,
+            validation,
+            registration,
+            source_pin,
+            input,
+            result,
+        } => {
+            drop(input);
+            execute_store_result(result, || {
+                runtime.checkpoint_live_chunk_staging(
+                    chunk_id,
+                    issue_id,
+                    validation,
+                    registration,
+                    source_pin,
+                )
+            })
+        }
         JournalCommand::BeginChunkWrite {
             permit,
             identity,
@@ -5072,6 +5220,10 @@ fn reject_command(command: JournalCommand, error: OperationJournalOwnerError) {
             let _ = result.send(Err(error));
         }
         JournalCommand::CheckpointStaging { input, result, .. } => {
+            drop(input);
+            let _ = result.send(Err(error));
+        }
+        JournalCommand::CheckpointLiveChunkStaging { input, result, .. } => {
             drop(input);
             let _ = result.send(Err(error));
         }
@@ -8362,6 +8514,94 @@ mod tests {
         let proof = evidence.validated_staging().expect("staging proof");
         assert_eq!(proof.output(), staged_output);
         assert_eq!(proof.source_root(), Some(source_root_registration));
+        let checkpoint_claim = ChunkClaimRequest::new(
+            ChunkId::new(),
+            operation_id,
+            AdmissionClaim::new(
+                AdmissionClaimId::new(),
+                claim.claim().volume().clone(),
+                crate::operation_journal::full_capacity::FullCapacityAllocationClass::DestinationStaging,
+                facts.allocation_unit,
+            )
+            .expect("checkpoint claim"),
+            staging_participant_id,
+            String::from("staging-owner-check.bin"),
+            facts.allocation_unit * 4,
+            facts.allocation_unit,
+            facts.allocation_unit,
+            PROTECTED_FREE_SPACE_FLOOR,
+        )
+        .expect("checkpoint chunk request");
+        let mut checkpoint_claim_result = client
+            .claim_chunk(checkpoint_claim.clone())
+            .expect("checkpoint claim queues");
+        checkpoint_claim_result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("checkpoint claim result")
+            .expect("checkpoint claim worker");
+        let checkpoint_spec = LiveChunkEffectSpec::new(
+            EffectId::new(),
+            staged_output,
+            source_root_registration,
+            vec![fence.clone()],
+            facts.allocation_unit * 4,
+            3,
+            b"abc",
+        )
+        .expect("checkpoint live effect spec");
+        let mut checkpoint_issue = client
+            .issue_live_chunk_effect(
+                checkpoint_claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("checkpoint issue pin"),
+                checkpoint_spec,
+            )
+            .expect("checkpoint issue queues");
+        let checkpoint_grant = checkpoint_issue
+            .recv_timeout(Duration::from_secs(2))
+            .expect("checkpoint issue result")
+            .expect("checkpoint issue worker");
+        let mut wrong_chunk_checkpoint = client
+            .checkpoint_live_chunk_staging(
+                checkpoint_claim.chunk_id(),
+                Uuid::new_v4(),
+                staged_result.clone(),
+                registration.clone(),
+                guard.pin_for_effect().expect("wrong checkpoint pin"),
+            )
+            .expect("wrong checkpoint queues");
+        assert!(
+            wrong_chunk_checkpoint
+                .recv_timeout(Duration::from_secs(2))
+                .expect("wrong checkpoint result")
+                .is_err()
+        );
+        let mut chunk_checkpoint = client
+            .checkpoint_live_chunk_staging(
+                checkpoint_claim.chunk_id(),
+                checkpoint_grant.issue_id(),
+                staged_result.clone(),
+                registration.clone(),
+                guard.pin_for_effect().expect("chunk checkpoint pin"),
+            )
+            .expect("chunk checkpoint queues");
+        assert!(matches!(
+            chunk_checkpoint
+                .recv_timeout(Duration::from_secs(2))
+                .expect("chunk checkpoint result")
+                .expect("chunk checkpoint worker"),
+            ChunkStagingReceipt::Committed { .. }
+        ));
+        let mut denied_checkpoint_release = client
+            .release_chunk(checkpoint_grant.into_unused_permit(), Uuid::new_v4())
+            .expect("checkpoint release queues");
+        assert!(
+            denied_checkpoint_release
+                .recv_timeout(Duration::from_secs(2))
+                .expect("checkpoint release result")
+                .is_err()
+        );
         let mut checkpoint = client
             .checkpoint_and_grant_staging(
                 staged_result.clone(),
