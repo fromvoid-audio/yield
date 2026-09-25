@@ -1,9 +1,9 @@
 //! Bounded ownership for future file-operation effects.
 //!
-//! This module owns only an isolated command queue, root-registration observations, and
-//! bounded effect receipts.  It deliberately does not open files, hold SQLite connections,
-//! retain source leases, or manufacture live authority.  Until the producer and backend
-//! adapters land, accepted commands finish as typed [`EffectOutcome::Unsupported`] results.
+//! This module owns an isolated command queue, registered descriptor-bound roots, and bounded
+//! effect receipts. It does not hold SQLite connections, retain source leases, or manufacture
+//! live write authority. Until the producer and backend adapters land, accepted commands finish
+//! as typed [`EffectOutcome::Unsupported`] results.
 //! The test-only fixtures exercise the owner boundary without pretending to qualify a
 //! filesystem effect.
 
@@ -23,9 +23,11 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::app_dirs::WritableProfileGuard;
 use crate::operation_journal::owner::LiveChunkEffectGrant;
 use crate::operation_journal::{MAX_RECORD_BYTES, OperationId, ParticipantId};
 use crate::sample_sources::SourceId;
+use crate::sample_sources::db::{BoundDatabaseRoot, SourceAuthorityRequest};
 
 /// Maximum number of effect commands waiting for the file owner.
 pub const FILE_OPERATION_OWNER_COMMAND_CAPACITY: usize = 32;
@@ -37,6 +39,8 @@ pub const FILE_OPERATION_OWNER_MAX_INPUT_BYTES: usize = MAX_RECORD_BYTES * 4;
 pub const FILE_OPERATION_OWNER_MAX_RECEIPTS: usize = 64;
 /// Maximum number of roots used by one primitive.
 pub const FILE_OPERATION_OWNER_MAX_ROOTS: usize = 2;
+/// Maximum retained live root capabilities in one owner.
+pub const FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS: usize = 128;
 /// Maximum number of source fences used by one primitive.
 pub const FILE_OPERATION_OWNER_MAX_SOURCE_FENCES: usize = 2;
 /// Maximum byte length of one relative locator.
@@ -2044,6 +2048,112 @@ impl FileOperationOwner {
         })
     }
 
+    /// Register the currently owned profile root for a future profile-scoped effect.
+    ///
+    /// The returned reference is only an observation. The worker retains a cloned profile
+    /// lock and a descriptor-bound root; it revalidates both before accepting an effect.
+    #[allow(dead_code)] // Production effect producers are added in later owner slices.
+    pub(crate) fn register_profile_root(
+        &self,
+        profile_guard: &WritableProfileGuard,
+    ) -> Result<RootRegistrationRef, String> {
+        let retained_guard = profile_guard
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        let root = BoundDatabaseRoot::for_profile_guard(&retained_guard)
+            .map_err(|error| error.to_string())?;
+        let capability = ProductionRootCapability {
+            root,
+            profile_guard: retained_guard,
+            source: None,
+        };
+        let registration = RootRegistrationRef {
+            owner: self.shared.owner,
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let authority = AuthorityFence::Profile(ProfileAuthorityFence {
+            owner: self.shared.owner,
+            generation: registration.generation,
+            lease_epoch: 1,
+        });
+        self.register_root(registration, authority, "profile root", Some(capability))?;
+        Ok(registration)
+    }
+
+    /// Register the live media root from a source authority already accepted by the journal.
+    ///
+    /// The source request is sealed by the source owner and its registered lifecycle is checked
+    /// here and again before every effect. A caller-provided fence remains an observation; it
+    /// must match the retained root and lease epoch and will still need an exact journal grant.
+    #[allow(dead_code)] // Production publication handoff is added after this root slice.
+    pub(crate) fn register_source_root(
+        &self,
+        request: Arc<SourceAuthorityRequest>,
+        profile_guard: &WritableProfileGuard,
+        fence: SourceFence,
+    ) -> Result<RootRegistrationRef, String> {
+        fence.validate().map_err(|error| error.to_string())?;
+        if fence.root_identity != request.media_root().identity()
+            || fence.database_identity != request.database_file_identity()
+            || i64::try_from(fence.lease_epoch).ok() != Some(request.lease_identity().epoch())
+        {
+            return Err(String::from(
+                "source fence does not match retained source authority",
+            ));
+        }
+        let retained_guard = profile_guard
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        request
+            .validate_registered_boundary(&retained_guard)
+            .map_err(|error| error.to_string())?;
+        let root = request
+            .media_root()
+            .try_clone_for_owned_capability()
+            .map_err(|error| error.to_string())?;
+        let capability = ProductionRootCapability {
+            root,
+            profile_guard: retained_guard,
+            source: Some(request),
+        };
+        let registration = RootRegistrationRef {
+            owner: self.shared.owner,
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        self.register_root(
+            registration,
+            AuthorityFence::Source(fence),
+            "source media root",
+            Some(capability),
+        )?;
+        Ok(registration)
+    }
+
+    fn register_root(
+        &self,
+        registration: RootRegistrationRef,
+        authority: AuthorityFence,
+        label: &str,
+        capability: Option<ProductionRootCapability>,
+    ) -> Result<(), String> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.shared
+            .try_control(OwnerCommand::RegisterRoot {
+                registration,
+                authority,
+                label: bounded_diagnostic(label.to_owned()),
+                capability,
+                input: None,
+                result: result_tx,
+            })
+            .map_err(|error| error.to_string())?;
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| String::from("root registration timed out"))?
+    }
+
     #[cfg(test)]
     fn register_root_for_test(
         &self,
@@ -2065,20 +2175,7 @@ impl FileOperationOwner {
             registration_id: Uuid::new_v4(),
             generation,
         };
-        let label = bounded_diagnostic(label.to_owned());
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        self.shared
-            .try_control(OwnerCommand::RegisterRoot {
-                registration,
-                authority,
-                label,
-                input: None,
-                result: result_tx,
-            })
-            .map_err(|error| error.to_string())?;
-        result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|_| String::from("root registration timed out"))??;
+        self.register_root(registration, authority, label, None)?;
         Ok(registration)
     }
 
@@ -2123,11 +2220,9 @@ impl FileOperationOwner {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn retire_root_for_test(
-        &self,
-        registration: RootRegistrationRef,
-    ) -> Result<(), String> {
+    /// Retire a registered root and release its worker-owned descriptor custody.
+    #[allow(dead_code)] // Production effect producers are added in later owner slices.
+    pub(crate) fn retire_root(&self, registration: RootRegistrationRef) -> Result<(), String> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.shared
             .try_control(OwnerCommand::RetireRoot {
@@ -2140,6 +2235,14 @@ impl FileOperationOwner {
             .recv_timeout(Duration::from_secs(1))
             .map_err(|_| String::from("root retirement timed out"))??;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_root_for_test(
+        &self,
+        registration: RootRegistrationRef,
+    ) -> Result<(), String> {
+        self.retire_root(registration)
     }
 
     #[cfg(test)]
@@ -2458,7 +2561,27 @@ struct AdmissionRecord {
 struct RootRegistrationState {
     authority: AuthorityFence,
     _label: String,
-    active: bool,
+    capability: Option<ProductionRootCapability>,
+}
+
+/// Descriptor-bound custody retained by the worker, never reconstructed from a root reference.
+struct ProductionRootCapability {
+    root: BoundDatabaseRoot,
+    profile_guard: WritableProfileGuard,
+    source: Option<Arc<SourceAuthorityRequest>>,
+}
+
+impl ProductionRootCapability {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(source) = self.source.as_ref() {
+            source
+                .validate_registered_boundary(&self.profile_guard)
+                .map_err(|error| error.to_string())?;
+        }
+        self.root
+            .validate_profile_guard(&self.profile_guard)
+            .map_err(|error| error.to_string())
+    }
 }
 
 struct WorkerState {
@@ -2525,11 +2648,11 @@ impl WorkerState {
             } => {
                 self.take_unused_live_chunk_grant(key, fingerprint, result);
             }
-            #[cfg(test)]
             OwnerCommand::RegisterRoot {
                 registration,
                 authority,
                 label,
+                capability,
                 input,
                 result,
             } => {
@@ -2539,40 +2662,52 @@ impl WorkerState {
                     return;
                 }
                 let response = match self.registrations.get(&registration) {
-                    Some(existing)
-                        if existing.authority == authority && existing._label == label =>
-                    {
-                        Ok(())
-                    }
-                    Some(_) => Err(String::from("conflicting root registration")),
+                    Some(_) => Err(String::from(
+                        "root registration identity is already retained",
+                    )),
                     None => {
+                        if self.registrations.len() >= FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS {
+                            let _ =
+                                result.send(Err(String::from("registered root capacity is full")));
+                            drop(input);
+                            return;
+                        }
+                        if let Some(capability) = capability.as_ref() {
+                            if let Err(error) = capability.validate() {
+                                let _ = result.send(Err(error));
+                                drop(input);
+                                return;
+                            }
+                        }
                         self.registrations.insert(
                             registration,
                             RootRegistrationState {
                                 authority,
                                 _label: label,
-                                active: true,
+                                capability,
                             },
                         );
                         Ok(())
                     }
                 };
-                let _ = result.send(response);
+                let accepted = response.is_ok();
+                if result.send(response).is_err() && accepted {
+                    // The caller lost the registration reference before it could observe
+                    // success. No effect can name this fresh UUID, so release its custody.
+                    self.registrations.remove(&registration);
+                }
                 drop(input);
             }
-            #[cfg(test)]
             OwnerCommand::RetireRoot {
                 registration,
                 input,
                 result,
             } => {
-                let response = match self.registrations.get_mut(&registration) {
-                    Some(existing) => {
-                        existing.active = false;
-                        Ok(())
-                    }
-                    None => Err(String::from("root registration is not retained")),
-                };
+                let response = self
+                    .registrations
+                    .remove(&registration)
+                    .map(|_| ())
+                    .ok_or_else(|| String::from("root registration is not retained"));
                 let _ = result.send(response);
                 drop(input);
             }
@@ -2844,15 +2979,14 @@ enum OwnerCommand {
         fingerprint: RequestFingerprint,
         result: SyncSender<Option<LiveChunkEffectGrant>>,
     },
-    #[cfg(test)]
     RegisterRoot {
         registration: RootRegistrationRef,
         authority: AuthorityFence,
         label: String,
+        capability: Option<ProductionRootCapability>,
         input: Option<InputPermit>,
         result: SyncSender<Result<(), String>>,
     },
-    #[cfg(test)]
     RetireRoot {
         registration: RootRegistrationRef,
         input: Option<InputPermit>,
@@ -3361,7 +3495,6 @@ impl OwnerShared {
         }
     }
 
-    #[cfg(test)]
     fn try_control(&self, command: OwnerCommand) -> Result<(), FileOperationOwnerQueueError> {
         let _gate = self
             .admission_gate
@@ -3537,6 +3670,9 @@ fn worker_main(
             let _ = ready.send(Err(String::from(
                 "owner panicked during startup or execution",
             )));
+            // No effect can continue after the worker exits. Keep receipt evidence without
+            // retaining profile locks or source-root descriptors across uncertain shutdown.
+            state.registrations.clear();
             shared.retain_worker_state(state);
             shared.mark_unavailable("owner worker panicked");
             let outcome = FileOperationOwnerShutdown::RetirementUncertain {
@@ -3552,6 +3688,9 @@ fn worker_main(
 }
 
 fn finish_worker(shared: Arc<OwnerShared>, mut state: WorkerState) {
+    // Root capabilities are execution custody, while receipts are recovery evidence. The
+    // worker has stopped accepting effects, so release descriptors on every shutdown path.
+    state.registrations.clear();
     let unavailable = OwnerLifecycle::from_u8(shared.lifecycle.load(Ordering::Acquire))
         == OwnerLifecycle::Unavailable;
     if shared.implicit_drop.load(Ordering::Acquire) || unavailable {
@@ -3636,10 +3775,19 @@ fn validate_for_owner(
                 reason: String::from("root registration is not retained by this owner"),
             });
         };
-        if !registration.active || registration.authority != binding.authority {
+        if registration.authority != binding.authority {
             return Err(EffectOutcome::SupersededBeforeEffect {
                 reason: String::from("root authority fence is stale or mismatched"),
             });
+        }
+        if let Some(capability) = registration.capability.as_ref() {
+            capability
+                .validate()
+                .map_err(|reason| EffectOutcome::SupersededBeforeEffect {
+                    reason: bounded_diagnostic(format!(
+                        "registered root is no longer live: {reason}"
+                    )),
+                })?;
         }
     }
     match &command.authorization {
@@ -3834,7 +3982,11 @@ impl fmt::Display for OwnerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard};
     use crate::operation_journal::ParticipantId;
+    #[cfg(target_os = "macos")]
+    use crate::test_runtime::TestRuntimeGuard;
 
     fn test_object() -> OwnedObjectIdentity {
         OwnedObjectIdentity(Uuid::from_u128(1))
@@ -3978,6 +4130,227 @@ mod tests {
             },
             owner.test_mutating_authorization(vec![], 100, 0),
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_profile_registration_rejects_replaced_root_before_effect() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-root");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+
+        let mut valid = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("valid command queues");
+        assert!(matches!(
+            valid
+                .recv_timeout(Duration::from_secs(1))
+                .expect("valid result")
+                .outcome(),
+            EffectOutcome::Unsupported { .. }
+        ));
+        valid.acknowledge().expect("acknowledge valid result");
+
+        let root = guard.profile_root().to_path_buf();
+        let displaced = root.with_extension("displaced");
+        std::fs::rename(&root, &displaced).expect("displace profile root");
+        std::fs::create_dir(&root).expect("replace profile root");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("stale command queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
+        let replacement = root.with_extension("replacement");
+        std::fs::rename(&root, &replacement).expect("move replacement aside");
+        std::os::unix::fs::symlink(&displaced, &root).expect("substitute root symlink");
+        let mut linked = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("symlink-substituted command queues");
+        assert!(matches!(
+            linked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("symlink-substituted result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        linked
+            .acknowledge()
+            .expect("acknowledge symlink-substituted result");
+        std::fs::remove_file(&root).expect("remove substituted symlink");
+        std::fs::rename(&displaced, &root).expect("restore original profile root");
+        drop(valid);
+        drop(stale);
+        drop(linked);
+        owner.retire_root(registration).expect("retire root");
+        owner.acknowledge_custody_for_test();
+        let shutdown = owner.shutdown();
+        assert!(
+            matches!(shutdown, FileOperationOwnerShutdown::DrainedAck),
+            "unexpected shutdown: {shutdown:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn old_owner_root_reference_cannot_resurrect_after_restart() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-restart");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let old_owner = FileOperationOwner::start().expect("first file owner");
+        let registration = old_owner.register_profile_root(&guard).expect("live root");
+        old_owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            old_owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+
+        let new_owner = FileOperationOwner::start().expect("replacement file owner");
+        let mut stale = new_owner
+            .submit(unsupported_effect(
+                &new_owner,
+                registration,
+                EffectId::new(),
+            ))
+            .expect("old registration queues for rejection");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old registration result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge rejected result");
+        new_owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            new_owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deferred_shutdown_retains_receipt_without_profile_root_capability() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-deferred");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = owner.register_profile_root(&guard).expect("live root");
+        let mut request = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("effect queues");
+        request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retained result");
+        assert!(matches!(
+            owner.shutdown(),
+            FileOperationOwnerShutdown::RetirementDeferred { .. }
+        ));
+        let retained = owner
+            .shared
+            .retained_state
+            .lock()
+            .expect("retained state lock");
+        let retained = retained.as_ref().expect("retained evidence");
+        assert!(retained.registrations.is_empty());
+        assert_eq!(retained.receipts.len(), 1);
+    }
+
+    #[test]
+    fn retired_roots_release_registration_capacity_and_cannot_be_reused() {
+        let owner = FileOperationOwner::start().expect("file owner");
+        let mut registrations = Vec::new();
+        for _ in 0..FILE_OPERATION_OWNER_MAX_REGISTERED_ROOTS {
+            registrations.push(
+                owner
+                    .register_root_for_test(profile_fence(owner.owner_identity()), "bounded root")
+                    .expect("registration within bound"),
+            );
+        }
+        assert!(
+            owner
+                .register_root(
+                    registrations[0],
+                    profile_fence(owner.owner_identity()),
+                    "bounded root",
+                    None,
+                )
+                .is_err()
+        );
+        assert!(
+            owner
+                .register_root_for_test(profile_fence(owner.owner_identity()), "overflow")
+                .is_err()
+        );
+        let retired = registrations.pop().expect("registered root");
+        owner.retire_root(retired).expect("retire one root");
+        owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "replacement")
+            .expect("freed capacity");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, retired, EffectId::new()))
+            .expect("stale reference queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
+    }
+
+    #[test]
+    fn dropped_registration_reply_does_not_leave_addressable_root() {
+        let owner = FileOperationOwner::start().expect("file owner");
+        let registration = RootRegistrationRef {
+            owner: owner.owner_identity(),
+            registration_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let (reply, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        owner
+            .shared
+            .try_control(OwnerCommand::RegisterRoot {
+                registration,
+                authority: profile_fence(owner.owner_identity()),
+                label: String::from("lost reply"),
+                capability: None,
+                input: None,
+                result: reply,
+            })
+            .expect("registration queues");
+        owner
+            .register_root_for_test(profile_fence(owner.owner_identity()), "barrier")
+            .expect("prior registration processed");
+        let mut stale = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("stale command queues");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stale result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge stale result");
     }
 
     #[test]
