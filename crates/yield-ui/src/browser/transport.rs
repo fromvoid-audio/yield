@@ -964,7 +964,7 @@ impl Browser {
             && !self.compare_anchor_path_is_current(&intent.path)
         {
             self.clear_playback_cursor();
-            self.playback_status = "Compare anchor is no longer available".to_string();
+            self.set_playback_status("Compare anchor is no longer available");
             cx.notify();
             return;
         }

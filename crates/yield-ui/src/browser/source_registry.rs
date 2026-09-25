@@ -512,7 +512,7 @@ impl Browser {
             self.compare_anchor_task.take();
             self.compare_anchor_play_pending = false;
             self.compare_anchor = None;
-            self.playback_status = "Compare anchor source is no longer available".into();
+            self.set_playback_status("Compare anchor source is no longer available");
         }
         let Some(index) = self
             .source_sessions
@@ -612,7 +612,7 @@ impl Browser {
             self.compare_anchor_task.take();
             self.compare_anchor_play_pending = false;
             self.compare_anchor = None;
-            self.playback_status = "Compare anchor source is no longer available".into();
+            self.set_playback_status("Compare anchor source is no longer available");
         }
         if let Some(root) = self.pending_source_return_root.as_ref() {
             self.pending_source_return_index = self
