@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod bpm_snap;
 mod curation;
+mod curation_queue;
 mod folder_tree;
 mod last_played;
 mod playback_history;
@@ -32,6 +33,10 @@ mod waveform_viewport;
 
 pub use bpm_snap::snap_resize_ratio_to_whole_bpm;
 pub use curation::{CurationAction, CurationTransition, plan_curation_action};
+pub use curation_queue::{
+    CurationQueueDecision, CurationQueueKey, CurationQueueMode, CurationQueuePriority,
+    CurationQueueScope, CurationTagFacts, curation_queue_decision,
+};
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
 };
