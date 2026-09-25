@@ -77,7 +77,10 @@ impl SourceDatabase {
             .map_err(map_sql_error)?;
         let revision = source_revision(&transaction)?;
         if revision != expected_revision {
-            return Err(SourceDbError::Unexpected);
+            return Err(SourceDbError::CurationTagFactsStaleRevision {
+                expected: expected_revision,
+                actual: revision,
+            });
         }
         if paths.is_empty() {
             transaction.rollback().map_err(map_sql_error)?;
@@ -1568,7 +1571,10 @@ mod plan_tests {
                 &[PathBuf::from("one.wav")],
                 &cancellation,
             ),
-            Err(SourceDbError::Unexpected)
+            Err(SourceDbError::CurationTagFactsStaleRevision {
+                expected,
+                actual,
+            }) if expected == revision.saturating_sub(1) && actual == revision
         ));
         cancellation.store(true, Ordering::Release);
         assert!(matches!(

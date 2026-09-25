@@ -193,6 +193,14 @@ pub enum SourceDbError {
     /// SQLite returned an unexpected result.
     #[error("SQLite returned an unexpected result")]
     Unexpected,
+    /// A per-file Curation tag-facts read observed a different source revision.
+    #[error("Curation tag facts source revision mismatch: expected {expected}, actual {actual}")]
+    CurationTagFactsStaleRevision {
+        /// Revision required by the caller.
+        expected: u64,
+        /// Revision observed by the read transaction.
+        actual: u64,
+    },
     /// Curation tag facts could not be proven for one requested live path.
     #[error("Curation tag facts unavailable for {path}")]
     CurationTagFactsUnavailable {

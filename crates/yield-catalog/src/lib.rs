@@ -31,12 +31,12 @@ use yield_library::sample_sources::db::{
 };
 use yield_library::sample_sources::reconciliation::{RootIdentity, RootRelativePath};
 pub use yield_library::sample_sources::{
-    BrowserFileMetadata, BrowserMetadataCursor, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
-    SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,
-    SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES, SOURCE_TAG_PAGE_MAX_PATHS,
-    SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS, SourceCurationCommitReceipt,
-    SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry,
+    BrowserFileMetadata, BrowserMetadataCursor, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
+    SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
+    SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
+    SourceCurationCommitReceipt, SourceCurationTagFacts, SourceCurationUpdate,
+    SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
 };
 use yield_library::sample_sources::{
     SourceDatabase, SourceDbError, SourceId, SourcePublicationFence,
@@ -51,6 +51,7 @@ use yield_source_watcher::WatchHintEvidence;
 use yield_source_watcher::{SourceWatchSpec, SourceWatcher, WatcherSignal};
 
 mod curation;
+mod curation_tag_facts;
 mod display_labels;
 mod rating_decay;
 mod root;
@@ -378,6 +379,13 @@ const MAX_DISPLAY_LABEL_PAYLOAD_BYTES: usize = SOURCE_DISPLAY_LABEL_MAX_PATH_BYT
     + std::mem::size_of::<Vec<PathBuf>>()
     + std::mem::size_of::<Vec<SourceDisplayLabelEntry>>()
     + DISPLAY_LABEL_PAYLOAD_METADATA_BYTES;
+/// Maximum aggregate raw plus normalized path bytes in a Curation tag-facts request.
+pub const MAX_CURATION_TAG_FACTS_PATH_BYTES: usize = 256 * 1024;
+const MAX_CURATION_TAG_FACTS_PAYLOAD_BYTES: usize = MAX_CURATION_TAG_FACTS_PATH_BYTES * 2
+    + SOURCE_CURATION_TAG_FACTS_MAX_PATHS * std::mem::size_of::<SourceCurationTagFacts>()
+    + std::mem::size_of::<Vec<PathBuf>>()
+    + std::mem::size_of::<Vec<SourceCurationTagFacts>>()
+    + DISPLAY_LABEL_PAYLOAD_METADATA_BYTES;
 
 pub use curation::{
     CatalogCurationRequestError, SourceCurationOperationFailure, SourceCurationOperationFence,
@@ -478,6 +486,21 @@ pub enum CatalogCommand {
     /// Display-label reads are ephemeral. A superseded, removed, or canceled lifecycle may
     /// discard the request without publishing a completion event.
     RequestDisplayLabels {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Generation that must still own the source when the request publishes.
+        lifecycle_generation: u64,
+        /// Retained catalog revision required by the request.
+        expected_revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Exact source-relative paths to project.
+        relative_paths: Vec<PathBuf>,
+    },
+    /// Read exact per-file Curation tag facts for bounded live source paths.
+    ///
+    /// This ephemeral read may be discarded after cancellation or source replacement.
+    RequestCurationTagFacts {
         /// Stable source identifier.
         source_id: SourceId,
         /// Generation that must still own the source when the request publishes.
@@ -741,6 +764,38 @@ pub enum CatalogDisplayLabelsRequestError {
     },
 }
 
+/// Why a bounded per-file Curation tag-facts request could not be admitted.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CatalogCurationTagFactsRequestError {
+    /// No source-relative paths were supplied.
+    #[error("Curation tag-facts request is empty")]
+    Empty,
+    /// The request exceeded the bounded exact-path admission limit.
+    #[error("Curation tag-facts request contains {actual} paths; maximum is {max}")]
+    TooManyPaths {
+        /// Maximum admitted path count.
+        max: usize,
+        /// Supplied path count.
+        actual: usize,
+    },
+    /// The request exceeded its aggregate raw plus normalized path-byte limit.
+    #[error("Curation tag-facts paths contain {actual} bytes; maximum is {max}")]
+    PathBytesTooLarge {
+        /// Maximum aggregate path bytes.
+        max: usize,
+        /// Supplied aggregate path bytes.
+        actual: usize,
+    },
+    /// One path could not be represented as a safe source-relative path.
+    #[error("invalid Curation tag-facts path {path}: {reason}")]
+    InvalidPath {
+        /// Rejected path spelling.
+        path: PathBuf,
+        /// Validation failure reported by the shared root-relative path type.
+        reason: yield_library::sample_sources::reconciliation::RootRelativePathError,
+    },
+}
+
 /// Why a lazy WAV metadata request could not be admitted.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogWavMetadataRequestError {
@@ -801,6 +856,9 @@ pub enum CatalogSubmitError {
     /// A source display-label request failed bounded input admission.
     #[error("invalid display-label request: {0}")]
     InvalidDisplayLabelsRequest(#[from] CatalogDisplayLabelsRequestError),
+    /// A per-file Curation tag-facts request failed bounded input admission.
+    #[error("invalid Curation tag-facts request: {0}")]
+    InvalidCurationTagFactsRequest(#[from] CatalogCurationTagFactsRequestError),
     /// A durable curation request failed bounded or lifecycle admission.
     #[error("invalid source curation request: {0}")]
     InvalidCurationRequest(#[from] CatalogCurationRequestError),
@@ -887,6 +945,14 @@ pub enum CatalogError {
     /// A display-label request named a path outside the retained live manifest.
     #[error("display-label path is not a live source member for {source_id}: {path}")]
     DisplayLabelPathMissing {
+        /// Source whose retained manifest was queried.
+        source_id: SourceId,
+        /// Missing source-relative path.
+        path: PathBuf,
+    },
+    /// A Curation tag-facts request named a path outside the retained live manifest.
+    #[error("Curation tag-facts path is not a live source member for {source_id}: {path}")]
+    CurationTagFactsPathMissing {
         /// Source whose retained manifest was queried.
         source_id: SourceId,
         /// Missing source-relative path.
@@ -1144,6 +1210,40 @@ pub enum CatalogEvent {
     },
     /// A bounded source display-label read failed after admission.
     DisplayLabelsFailed {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation associated with the request.
+        lifecycle_generation: u64,
+        /// Revision required by the request.
+        expected_revision: u64,
+        /// Revision observed before a typed failure, when available.
+        observed_revision: Option<u64>,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Typed failure.
+        error: CatalogError,
+    },
+    /// A bounded per-file Curation tag-facts read completed.
+    CurationTagFactsReady {
+        /// Stable source identifier.
+        source_id: SourceId,
+        /// Source lifecycle generation that produced the facts.
+        lifecycle_generation: u64,
+        /// Physical source-root identity checked by the read.
+        root_identity: RootIdentity,
+        /// Active directory generation represented by the retained snapshot.
+        directory_generation: u64,
+        /// Catalog revision represented by the facts.
+        revision: u64,
+        /// Caller-assigned query identifier.
+        request_id: u64,
+        /// Original exact paths requested by the caller.
+        requested_paths: Vec<PathBuf>,
+        /// Bounded ordered facts for each distinct requested path.
+        entries: Vec<SourceCurationTagFacts>,
+    },
+    /// A bounded per-file Curation tag-facts read failed after admission.
+    CurationTagFactsFailed {
         /// Stable source identifier.
         source_id: SourceId,
         /// Source lifecycle generation associated with the request.
@@ -1700,6 +1800,9 @@ fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> 
         CatalogCommand::RequestDisplayLabels { relative_paths, .. } => {
             validate_display_labels_request(relative_paths)?
         }
+        CatalogCommand::RequestCurationTagFacts { relative_paths, .. } => {
+            validate_curation_tag_facts_request(relative_paths)?
+        }
         CatalogCommand::ApplyRatingDecay {
             rating_decay_weeks, ..
         } => rating_decay::validate_request(*rating_decay_weeks)
@@ -1790,6 +1893,58 @@ fn validate_display_labels_request(relative_paths: &[PathBuf]) -> Result<(), Cat
         return Err(CatalogSubmitError::InvalidDisplayLabelsRequest(
             CatalogDisplayLabelsRequestError::PathBytesTooLarge {
                 max: yield_library::sample_sources::SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
+                actual: path_bytes,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn validate_curation_tag_facts_request(
+    relative_paths: &[PathBuf],
+) -> Result<(), CatalogSubmitError> {
+    if relative_paths.is_empty() {
+        return Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+            CatalogCurationTagFactsRequestError::Empty,
+        ));
+    }
+    if relative_paths.len() > yield_library::sample_sources::SOURCE_CURATION_TAG_FACTS_MAX_PATHS {
+        return Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+            CatalogCurationTagFactsRequestError::TooManyPaths {
+                max: yield_library::sample_sources::SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
+                actual: relative_paths.len(),
+            },
+        ));
+    }
+    let raw_path_bytes = relative_paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(encoded_path_len(path))
+    });
+    if raw_path_bytes > MAX_CURATION_TAG_FACTS_PATH_BYTES {
+        return Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+            CatalogCurationTagFactsRequestError::PathBytesTooLarge {
+                max: MAX_CURATION_TAG_FACTS_PATH_BYTES,
+                actual: raw_path_bytes,
+            },
+        ));
+    }
+    for path in relative_paths {
+        if let Err(reason) = RootRelativePath::try_from_path(path.clone()) {
+            return Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+                CatalogCurationTagFactsRequestError::InvalidPath {
+                    path: path.clone(),
+                    reason,
+                },
+            ));
+        }
+    }
+    let normalized_path_bytes = relative_paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(normalized_relative_path_len(path))
+    });
+    let path_bytes = raw_path_bytes.saturating_add(normalized_path_bytes);
+    if path_bytes > MAX_CURATION_TAG_FACTS_PATH_BYTES {
+        return Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+            CatalogCurationTagFactsRequestError::PathBytesTooLarge {
+                max: MAX_CURATION_TAG_FACTS_PATH_BYTES,
                 actual: path_bytes,
             },
         ));
@@ -1944,6 +2099,7 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestTagPage { .. }
         | CatalogCommand::RequestTagFilter { .. }
         | CatalogCommand::RequestDisplayLabels { .. }
+        | CatalogCommand::RequestCurationTagFacts { .. }
         | CatalogCommand::ApplyCuration { .. }
         | CatalogCommand::ApplyCurationOperation { .. }
         | CatalogCommand::ApplyRatingDecay { .. }
@@ -2008,6 +2164,9 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestDisplayLabels { relative_paths, .. } => {
             selected_paths_input_bytes(relative_paths)
         }
+        CatalogCommand::RequestCurationTagFacts { relative_paths, .. } => {
+            selected_paths_input_bytes(relative_paths)
+        }
         _ => 0,
     }
 }
@@ -2036,6 +2195,7 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
                 .saturating_add(TAG_FILTER_PAYLOAD_METADATA_BYTES))
         }
         CatalogCommand::RequestDisplayLabels { .. } => Ok(MAX_DISPLAY_LABEL_PAYLOAD_BYTES),
+        CatalogCommand::RequestCurationTagFacts { .. } => Ok(MAX_CURATION_TAG_FACTS_PAYLOAD_BYTES),
         _ => Ok(0),
     }
 }
@@ -2051,6 +2211,7 @@ enum AdmissionAction {
     RequestTagPage,
     RequestTagFilter,
     RequestDisplayLabels,
+    RequestCurationTagFacts,
     ApplyCuration,
     ApplyCurationOperation {
         source_id: SourceId,
@@ -2085,6 +2246,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         CatalogCommand::RequestTagPage { .. } => AdmissionAction::RequestTagPage,
         CatalogCommand::RequestTagFilter { .. } => AdmissionAction::RequestTagFilter,
         CatalogCommand::RequestDisplayLabels { .. } => AdmissionAction::RequestDisplayLabels,
+        CatalogCommand::RequestCurationTagFacts { .. } => AdmissionAction::RequestCurationTagFacts,
         CatalogCommand::ApplyCuration { .. } => AdmissionAction::ApplyCuration,
         CatalogCommand::ApplyCurationOperation {
             source_id,
@@ -2168,6 +2330,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         | AdmissionAction::RequestTagPage
         | AdmissionAction::RequestTagFilter
         | AdmissionAction::RequestDisplayLabels
+        | AdmissionAction::RequestCurationTagFacts
         | AdmissionAction::ApplyCuration
         | AdmissionAction::ApplyRatingDecay
         | AdmissionAction::ReadSnapshot => {}
@@ -2919,6 +3082,26 @@ fn handle_command(
             );
             false
         }
+        CatalogCommand::RequestCurationTagFacts {
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            relative_paths,
+        } => {
+            request_curation_tag_facts(
+                source_id,
+                lifecycle_generation,
+                expected_revision,
+                request_id,
+                relative_paths,
+                profile_guard,
+                reservation,
+                admission,
+                sources,
+            );
+            false
+        }
         CatalogCommand::ApplyCuration {
             source_id,
             lifecycle_generation,
@@ -3293,6 +3476,97 @@ fn request_display_labels(
             );
         }
         Err(error) => emit_display_labels_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            Some(&token),
+            error,
+        ),
+    }
+}
+
+fn request_curation_tag_facts(
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    relative_paths: Vec<PathBuf>,
+    profile_guard: &WritableProfileGuard,
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    sources: &mut HashMap<SourceId, RegisteredSource>,
+) {
+    let Some(current_generation) = sources
+        .get(&source_id)
+        .map(|source| source.lifecycle_generation)
+    else {
+        emit_curation_tag_facts_failure(
+            reservation,
+            admission,
+            source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            CatalogError::NotRegistered(source_id),
+        );
+        return;
+    };
+    if let Err(error) = ensure_generation(&source_id, current_generation, lifecycle_generation) {
+        emit_curation_tag_facts_failure(
+            reservation,
+            admission,
+            source_id,
+            lifecycle_generation,
+            expected_revision,
+            request_id,
+            None,
+            error,
+        );
+        return;
+    }
+    let Some(token) = begin_source_attempt(admission, &source_id, lifecycle_generation) else {
+        return;
+    };
+    let Some(source) = sources.get_mut(&source_id) else {
+        return;
+    };
+    source.attempt_token = Some(Arc::clone(&token));
+    let result = curation_tag_facts::read(
+        source,
+        &source_id,
+        lifecycle_generation,
+        expected_revision,
+        relative_paths,
+        &token,
+        admission,
+        profile_guard,
+    );
+    match result {
+        Ok(patch) => {
+            let _ = publish_source_if_current(
+                admission,
+                reservation,
+                &source_id,
+                lifecycle_generation,
+                Some(&token),
+                source,
+                CatalogEvent::CurationTagFactsReady {
+                    source_id: source_id.clone(),
+                    lifecycle_generation,
+                    root_identity: patch.root_identity,
+                    directory_generation: patch.directory_generation,
+                    revision: patch.revision,
+                    request_id,
+                    requested_paths: patch.requested_paths,
+                    entries: patch.entries,
+                },
+            );
+        }
+        Err(error) => emit_curation_tag_facts_failure(
             reservation,
             admission,
             source_id,
@@ -5255,6 +5529,37 @@ fn emit_display_labels_failure(
     );
 }
 
+fn emit_curation_tag_facts_failure(
+    reservation: &mut EventReservation<'_>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    source_id: SourceId,
+    lifecycle_generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    token: Option<&Arc<AtomicBool>>,
+    error: CatalogError,
+) {
+    let observed_revision = match &error {
+        CatalogError::StaleRevision { actual, .. } => Some(*actual),
+        _ => None,
+    };
+    let _ = publish_if_current(
+        admission,
+        reservation,
+        &source_id,
+        lifecycle_generation,
+        token,
+        CatalogEvent::CurationTagFactsFailed {
+            source_id: source_id.clone(),
+            lifecycle_generation,
+            expected_revision,
+            observed_revision,
+            request_id,
+            error,
+        },
+    );
+}
+
 fn catalog_error_from_db(error: SourceDbError) -> CatalogError {
     catalog_error_from_db_with_source(None, error)
 }
@@ -5322,6 +5627,9 @@ fn catalog_error_from_db_with_source(
             },
         ) => CatalogError::StaleRevision { expected, actual },
         SourceDbError::DisplayLabelStaleRevision { expected, actual } => {
+            CatalogError::StaleRevision { expected, actual }
+        }
+        SourceDbError::CurationTagFactsStaleRevision { expected, actual } => {
             CatalogError::StaleRevision { expected, actual }
         }
         SourceDbError::InvalidTagId { tag_id } => CatalogError::InvalidTagId { tag_id },
@@ -11358,6 +11666,418 @@ mod tests {
             1,
             WatchHintEvidence::DESCENDANT_CHANGED,
         ));
+    }
+
+    #[test]
+    fn curation_tag_facts_publish_exact_per_file_flags_and_empty_rows() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-ready");
+        for name in ["complete.wav", "playback.wav", "empty.wav"] {
+            write_test_wav(&fixture.root.path().join(name), 16_000, 4);
+        }
+        let source_id = SourceId::from_string("source-curation-tag-facts-ready");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let complete =
+            RootRelativePath::try_from_path(PathBuf::from("complete.wav")).expect("complete path");
+        let playback =
+            RootRelativePath::try_from_path(PathBuf::from("playback.wav")).expect("playback path");
+        let receipt = apply_curation_updates(
+            &service,
+            &source_id,
+            &snapshot,
+            9_300,
+            vec![
+                SourceCurationUpdate::AddTag {
+                    path: complete.clone(),
+                    label: String::from("loop"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: complete,
+                    label: String::from("warm"),
+                },
+                SourceCurationUpdate::AddTag {
+                    path: playback,
+                    label: String::from("one-shot"),
+                },
+            ],
+        );
+        let revision = receipt.source_revision();
+        let requested_paths = vec![
+            PathBuf::from("playback.wav"),
+            PathBuf::from("empty.wav"),
+            PathBuf::from("complete.wav"),
+            PathBuf::from("playback.wav"),
+        ];
+        service
+            .submit(CatalogCommand::RequestCurationTagFacts {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: revision,
+                request_id: 9_301,
+                relative_paths: requested_paths.clone(),
+            })
+            .expect("Curation tag-facts request");
+        wait_for_tag_read_payload(&service, MAX_CURATION_TAG_FACTS_PAYLOAD_BYTES);
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationTagFactsReady {
+                    request_id: 9_301,
+                    ..
+                }
+            )
+        });
+        match event {
+            CatalogEvent::CurationTagFactsReady {
+                source_id: event_source,
+                lifecycle_generation,
+                root_identity,
+                directory_generation,
+                revision: event_revision,
+                request_id: 9_301,
+                requested_paths: received_paths,
+                entries,
+            } => {
+                assert_eq!(event_source, source_id);
+                assert_eq!(lifecycle_generation, 1);
+                assert_eq!(root_identity, snapshot.root_identity);
+                assert_eq!(directory_generation, snapshot.directory_generation);
+                assert_eq!(event_revision, revision);
+                assert_eq!(received_paths, requested_paths);
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].relative_path, Path::new("complete.wav"));
+                assert!(entries[0].has_any_tag);
+                assert!(entries[0].has_descriptive_tag);
+                assert!(entries[0].has_playback_type_tag);
+                assert_eq!(entries[1].relative_path, Path::new("empty.wav"));
+                assert!(!entries[1].has_any_tag);
+                assert!(!entries[1].has_descriptive_tag);
+                assert!(!entries[1].has_playback_type_tag);
+                assert_eq!(entries[2].relative_path, Path::new("playback.wav"));
+                assert!(entries[2].has_any_tag);
+                assert!(!entries[2].has_descriptive_tag);
+                assert!(entries[2].has_playback_type_tag);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_tag_facts_admission_rejects_empty_invalid_and_overlarge_paths() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-admission");
+        let source_id = SourceId::from_string("source-curation-tag-facts-admission");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let request = |relative_paths| CatalogCommand::RequestCurationTagFacts {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: 0,
+            request_id: 9_110,
+            relative_paths,
+        };
+
+        assert_eq!(
+            service.submit(request(Vec::new())),
+            Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+                CatalogCurationTagFactsRequestError::Empty
+            ))
+        );
+        let too_many = (0..=SOURCE_CURATION_TAG_FACTS_MAX_PATHS)
+            .map(|index| PathBuf::from(format!("{index}.wav")))
+            .collect();
+        assert!(matches!(
+            service.submit(request(too_many)),
+            Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+                CatalogCurationTagFactsRequestError::TooManyPaths { .. }
+            ))
+        ));
+        let too_many_bytes = vec![PathBuf::from(
+            "x".repeat(MAX_CURATION_TAG_FACTS_PATH_BYTES + 1),
+        )];
+        assert!(matches!(
+            service.submit(request(too_many_bytes)),
+            Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+                CatalogCurationTagFactsRequestError::PathBytesTooLarge { .. }
+            ))
+        ));
+        let combined_bytes = vec![PathBuf::from(format!(
+            "{}/./y",
+            "x".repeat(MAX_CURATION_TAG_FACTS_PATH_BYTES / 2)
+        ))];
+        assert!(matches!(
+            service.submit(request(combined_bytes)),
+            Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+                CatalogCurationTagFactsRequestError::PathBytesTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            service.submit(request(vec![PathBuf::from("../escape.wav")])),
+            Err(CatalogSubmitError::InvalidCurationTagFactsRequest(
+                CatalogCurationTagFactsRequestError::InvalidPath {
+                    reason: yield_library::sample_sources::reconciliation::RootRelativePathError::ParentTraversal,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            admission_state(&service.admission, |state| {
+                (state.tag_page_input_bytes, state.tag_read_payload_bytes)
+            }),
+            (0, 0)
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_tag_facts_stale_revision_reports_observed_revision() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-stale");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-tag-facts-stale");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let expected_revision = snapshot.committed_revision + 1;
+        service
+            .submit(CatalogCommand::RequestCurationTagFacts {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision,
+                request_id: 9_120,
+                relative_paths: vec![PathBuf::from("one.wav")],
+            })
+            .expect("stale curation-tag-facts request");
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationTagFactsFailed {
+                    request_id: 9_120,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::CurationTagFactsFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                expected_revision: received_expected,
+                observed_revision: Some(observed),
+                request_id: 9_120,
+                error: CatalogError::StaleRevision { expected, actual },
+            } if event_source == source_id
+                && received_expected == expected_revision
+                && expected == expected_revision
+                && observed == snapshot.committed_revision
+                && actual == snapshot.committed_revision
+        ));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_tag_facts_reject_absent_and_unsupported_snapshot_paths() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-path-fence");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        fs::write(fixture.root.path().join("notes.txt"), b"not audio").expect("notes file");
+        let source_id = SourceId::from_string("source-curation-tag-facts-path-fence");
+        let service = CatalogService::start(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        for (request_id, path) in [(9_130, "missing.wav"), (9_131, "notes.txt")] {
+            service
+                .submit(CatalogCommand::RequestCurationTagFacts {
+                    source_id: source_id.clone(),
+                    lifecycle_generation: 1,
+                    expected_revision: snapshot.committed_revision,
+                    request_id,
+                    relative_paths: vec![PathBuf::from(path)],
+                })
+                .expect("path-fenced curation-tag-facts request");
+            let event = receive_until(&service, |event| {
+                matches!(
+                    event,
+                    CatalogEvent::CurationTagFactsFailed {
+                        request_id: received,
+                        ..
+                    } if *received == request_id
+                )
+            });
+            assert!(matches!(
+                event,
+                CatalogEvent::CurationTagFactsFailed {
+                    source_id: event_source,
+                    error: CatalogError::CurationTagFactsPathMissing {
+                        source_id: error_source,
+                        path: error_path,
+                    },
+                    ..
+                } if event_source == source_id
+                    && error_source == source_id
+                    && error_path == Path::new(path)
+            ));
+        }
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_tag_facts_root_replacement_fails_closed_before_publication() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-root-replacement");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-tag-facts-root-replacement");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestCurationTagFacts {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 9_140,
+                relative_paths: vec![PathBuf::from("one.wav")],
+            })
+            .expect("curation-tag-facts request");
+
+        let root = fixture.root.path().to_path_buf();
+        let displaced_root = root.with_extension("old");
+        assert!(!displaced_root.exists());
+        fs::rename(&root, &displaced_root).expect("displace source root");
+        fs::create_dir(&root).expect("replace source root");
+        pause.release();
+
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::CurationTagFactsFailed {
+                    request_id: 9_140,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            event,
+            CatalogEvent::CurationTagFactsFailed {
+                source_id: event_source,
+                lifecycle_generation: 1,
+                error: CatalogError::StaleRootGeneration { .. },
+                ..
+            } if event_source == source_id
+        ));
+        wait_for_tag_page_input_release(&service);
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+        fs::remove_dir_all(displaced_root).expect("remove displaced source root");
+    }
+
+    #[test]
+    fn superseded_curation_tag_facts_are_discarded_and_release_credits() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-superseded");
+        write_test_wav(&fixture.root.path().join("one.wav"), 16_000, 4);
+        let source_id = SourceId::from_string("source-curation-tag-facts-superseded");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let snapshot = register_and_audit(&service, fixture.root.path(), &source_id);
+        let pause = test_gate.pause_next();
+        service
+            .submit(CatalogCommand::RequestCurationTagFacts {
+                source_id: source_id.clone(),
+                lifecycle_generation: 1,
+                expected_revision: snapshot.committed_revision,
+                request_id: 9_150,
+                relative_paths: vec![PathBuf::from("one.wav")],
+            })
+            .expect("curation-tag-facts request");
+        service
+            .submit(CatalogCommand::Register {
+                source_id: source_id.clone(),
+                canonical_root: fixture.root.path().to_path_buf(),
+                lifecycle_generation: 2,
+            })
+            .expect("replacement admission");
+        pause.release();
+
+        let _ = receive_until(&service, |event| {
+            assert!(
+                !matches!(
+                    event,
+                    CatalogEvent::CurationTagFactsReady { .. }
+                        | CatalogEvent::CurationTagFactsFailed { .. }
+                ),
+                "superseded curation-tag-facts request published an event: {event:?}"
+            );
+            matches!(
+                event,
+                CatalogEvent::Registered {
+                    source_id: event_source,
+                    lifecycle_generation: 2,
+                } if event_source == &source_id
+            )
+        });
+        let _ = receive_until(&service, |event| {
+            assert!(
+                !matches!(
+                    event,
+                    CatalogEvent::CurationTagFactsReady { .. }
+                        | CatalogEvent::CurationTagFactsFailed { .. }
+                ),
+                "superseded curation-tag-facts request published an event: {event:?}"
+            );
+            matches!(
+                event,
+                CatalogEvent::SnapshotReady { snapshot: received }
+                    if received.source_id == source_id && received.lifecycle_generation == 2
+            )
+        });
+        wait_for_tag_page_input_release(&service);
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            0
+        );
+        service.shutdown();
+    }
+
+    #[test]
+    fn curation_tag_facts_submit_rejection_releases_shared_payload_credit() {
+        let fixture = Fixture::new("catalog-curation-tag-facts-submit-rejection");
+        let source_id = SourceId::from_string("source-curation-tag-facts-submit-rejection");
+        let (service, test_gate) =
+            CatalogService::start_with_test_gate(&fixture.guard).expect("catalog service");
+        let pause = test_gate.pause_next();
+        let request = |request_id| CatalogCommand::RequestCurationTagFacts {
+            source_id: source_id.clone(),
+            lifecycle_generation: 1,
+            expected_revision: 0,
+            request_id,
+            relative_paths: vec![PathBuf::from("one.wav")],
+        };
+        for request_id in 0..COMMAND_CAPACITY {
+            service
+                .submit(request(9_160 + request_id as u64))
+                .expect("bounded curation-tag-facts admission");
+        }
+        assert_eq!(
+            service.submit(request(9_200)),
+            Err(CatalogSubmitError::Full)
+        );
+        assert_eq!(
+            admission_state(&service.admission, |state| state.tag_read_payload_bytes),
+            MAX_CURATION_TAG_FACTS_PAYLOAD_BYTES * COMMAND_CAPACITY
+        );
+        pause.release();
+        wait_for_tag_page_input_release(&service);
+        wait_for_tag_read_payload(&service, 0);
+        assert!(matches!(service.try_recv_event(), Err(TryRecvError::Empty)));
+        service.shutdown();
     }
 
     #[test]
