@@ -669,6 +669,7 @@ impl Browser {
         self.root = None;
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         tag_filter::reinstall_after_projection(self, cx);
         self.reset_collection_filter();
         self.selected = None;

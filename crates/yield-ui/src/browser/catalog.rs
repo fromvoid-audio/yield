@@ -264,6 +264,7 @@ impl Browser {
             super::tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
@@ -928,6 +929,7 @@ impl Browser {
         self.folder_scope = previous_scope;
         self.rebuild_folder_rows_cache();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),

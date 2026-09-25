@@ -236,6 +236,7 @@ impl Browser {
         self.waveform_error = None;
         self.invalidate_waveform_generation();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),

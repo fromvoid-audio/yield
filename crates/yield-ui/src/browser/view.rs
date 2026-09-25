@@ -2480,6 +2480,48 @@ mod tests {
     }
 
     #[gpui::test]
+    fn enlarged_playback_age_chips_fit_constrained_sidebar(cx: &mut TestAppContext) {
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(480.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .expect("open narrow test window")
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.refresh().expect("enlarged age filter layout");
+        let row = cx
+            .debug_bounds("playback-age-filter-row")
+            .expect("age filter row");
+        let chips = [
+            "playback-age-chip-0",
+            "playback-age-chip-1",
+            "playback-age-chip-2",
+        ]
+        .into_iter()
+        .map(|selector| cx.debug_bounds(selector).expect("age chip"))
+        .collect::<Vec<_>>();
+        for chip in &chips {
+            assert!(chip.origin.x >= row.origin.x);
+            assert!(chip.origin.x + chip.size.width <= row.origin.x + row.size.width);
+            assert!(chip.origin.y + chip.size.height <= row.origin.y + row.size.height);
+        }
+        assert!(
+            chips
+                .windows(2)
+                .all(|pair| { pair[0].origin.x + pair[0].size.width <= pair[1].origin.x })
+        );
+    }
+
+    #[gpui::test]
     fn random_toolbar_command_precedes_shift_without_starting_playback(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));

@@ -635,6 +635,11 @@ pub(super) fn render(
             theme.clone(),
             cx,
         ))
+        .child(curation::render_playback_age_filters(
+            browser,
+            theme.clone(),
+            cx,
+        ))
         .child(curation::render_rating_filters(browser, theme.clone(), cx))
         .child(tag_filter::render(browser, theme.clone(), cx))
         .child(tags::render(browser, theme.clone(), cx))

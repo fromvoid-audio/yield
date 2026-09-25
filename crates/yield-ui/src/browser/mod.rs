@@ -63,6 +63,9 @@ mod accessibility {
     pub(super) fn playback_type_filter_id(index: usize) -> String {
         format!("browser-type-filter-{index}")
     }
+    pub(super) fn playback_age_filter_id(index: usize) -> String {
+        format!("browser-age-filter-{index}")
+    }
     pub(super) fn rating_filter_id(index: usize) -> String {
         format!("browser-rating-filter-{index}")
     }
@@ -81,6 +84,7 @@ mod history;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod playback_age;
 mod played_ranges;
 mod playmark_timing;
 mod preferences;
@@ -354,6 +358,8 @@ pub(crate) struct Browser {
     volume_runtime_retry_count: u8,
     volume_status: Option<String>,
     scan_generation: u64,
+    playback_age_refresh_generation: u64,
+    playback_age_refresh_task: Option<Task<()>>,
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
@@ -649,6 +655,8 @@ impl Browser {
             volume_runtime_retry_count: 0,
             volume_status: None,
             scan_generation: 0,
+            playback_age_refresh_generation: 0,
+            playback_age_refresh_task: None,
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
@@ -1214,6 +1222,7 @@ impl Browser {
         self.root = Some(root.clone());
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.refresh_collection_filter_counts();
         self.selected = None;
         self.cancel_waveform_load();
@@ -1317,6 +1326,7 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
@@ -1382,6 +1392,7 @@ impl Browser {
             self.folder_tree = None;
             self.folder_rows_cache.clear();
             self.view_model.set_entries(&self.entries);
+            self.reschedule_playback_age_refresh(cx);
             tag_filter::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
             self.scan_status = error;
@@ -1415,6 +1426,7 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
