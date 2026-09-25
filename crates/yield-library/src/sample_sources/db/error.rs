@@ -193,6 +193,26 @@ pub enum SourceDbError {
     /// SQLite returned an unexpected result.
     #[error("SQLite returned an unexpected result")]
     Unexpected,
+    /// A per-file Curation tag-facts read observed a different source revision.
+    #[error("Curation tag facts source revision mismatch: expected {expected}, actual {actual}")]
+    CurationTagFactsStaleRevision {
+        /// Revision required by the caller.
+        expected: u64,
+        /// Revision observed by the read transaction.
+        actual: u64,
+    },
+    /// Curation tag facts could not be proven for one requested live path.
+    #[error("Curation tag facts unavailable for {path}")]
+    CurationTagFactsUnavailable {
+        /// Path relative to the source root.
+        path: PathBuf,
+    },
+    /// A bounded Curation facts batch exceeded its tag-assignment work limit.
+    #[error("Curation tag facts exceed {max} assignments in one batch")]
+    CurationTagFactsTooManyAssignments {
+        /// Maximum tag-assignment rows read per batch.
+        max: usize,
+    },
     /// Directory-truth storage rejected a stale, malformed, or conflicting operation.
     #[error(transparent)]
     DirectoryTruth(#[from] SourceDirectoryTruthError),

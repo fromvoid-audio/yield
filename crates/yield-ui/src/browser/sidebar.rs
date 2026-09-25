@@ -641,6 +641,7 @@ pub(super) fn render(
             cx,
         ))
         .child(curation::render_rating_filters(browser, theme.clone(), cx))
+        .child(super::curation_queue::render(browser, theme.clone(), cx))
         .child(tag_filter::render(browser, theme.clone(), cx))
         .child(tags::render(browser, theme.clone(), cx))
         .child(tag_completion::render(browser, theme.clone(), cx))

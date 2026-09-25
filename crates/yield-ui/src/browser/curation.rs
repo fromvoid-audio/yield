@@ -2521,6 +2521,7 @@ impl Browser {
             return true;
         }
         if active {
+            super::curation_queue::invalidate_after_curation(self, cx);
             let tag_filter_revision_changed = !application.failed
                 && self.catalog_metadata.context().is_some_and(|context| {
                     context.source_id == key.source_id

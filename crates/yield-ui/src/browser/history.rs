@@ -237,12 +237,19 @@ impl Browser {
         self.invalidate_waveform_generation();
         self.view_model.set_entries(&self.entries);
         self.reschedule_playback_age_refresh(cx);
+        if let Some(index) = self.active_source {
+            self.view_model.set_curation_queue(
+                &self.entries,
+                self.source_sessions[index].curation_queue_mode,
+            );
+        }
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        super::curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         self.search_input
