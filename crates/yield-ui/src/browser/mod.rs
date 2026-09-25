@@ -2079,6 +2079,10 @@ impl Browser {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_bpm_snap(cx);
+    }
+
+    fn toggle_bpm_snap(&mut self, cx: &mut Context<Self>) {
         self.bpm_snap_enabled = !self.bpm_snap_enabled;
         cx.notify();
     }
@@ -2599,6 +2603,12 @@ impl Browser {
             && !function
             && self.waveform.is_some()
         {
+            if key.eq_ignore_ascii_case("b") {
+                if !event.is_held {
+                    self.toggle_bpm_snap(cx);
+                }
+                return;
+            }
             if key.eq_ignore_ascii_case("z") {
                 if self.zoom_waveform_to_selection() {
                     cx.notify();

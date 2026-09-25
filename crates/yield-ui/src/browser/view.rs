@@ -2126,6 +2126,60 @@ mod tests {
     }
 
     #[gpui::test]
+    fn bpm_snap_shortcut_requires_waveform_focus_and_ignores_repeats(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let press =
+                    |view: &mut Browser, held, window: &mut Window, cx: &mut Context<Browser>| {
+                        view.handle_key_down(
+                            &KeyDownEvent {
+                                keystroke: Keystroke::parse("b").expect("B key"),
+                                is_held: held,
+                            },
+                            window,
+                            cx,
+                        );
+                    };
+
+                window.focus(&view.waveform_focus_handle);
+                press(view, false, window, cx);
+                assert!(
+                    !view.bpm_snap_enabled,
+                    "an unloaded waveform cannot toggle snap"
+                );
+
+                view.waveform = Some(inert_preview());
+                press(view, false, window, cx);
+                assert!(view.bpm_snap_enabled);
+                press(view, true, window, cx);
+                assert!(view.bpm_snap_enabled, "key repeat must not toggle snap");
+
+                window.focus(&view.focus_handle);
+                press(view, false, window, cx);
+                assert!(view.bpm_snap_enabled, "browser focus must not toggle snap");
+
+                window.focus(&view.search_input.read(cx).focus_handle());
+                press(view, false, window, cx);
+                assert!(
+                    view.bpm_snap_enabled,
+                    "typing in search must not toggle snap"
+                );
+
+                window.focus(&view.waveform_focus_handle);
+                press(view, false, window, cx);
+                assert!(!view.bpm_snap_enabled);
+                view.toggle_bpm_snap(cx);
+                assert!(
+                    view.bpm_snap_enabled,
+                    "toolbar and AX use this same transition"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
     fn playmark_timing_duration_and_bpm_commit_update_stopped_selection(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
