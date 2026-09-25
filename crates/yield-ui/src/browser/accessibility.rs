@@ -9,7 +9,8 @@ use async_channel::Receiver;
 use gpui::{Context, FocusHandle, Task, Window, canvas, prelude::*};
 use raw_window_handle::HasWindowHandle;
 use yield_core::{
-    COLLECTION_COUNT, PLAYBACK_TYPE_FILTERS, RATING_FILTER_LEVELS, SortColumn, SortDirection,
+    COLLECTION_COUNT, CurationQueueScope, PLAYBACK_TYPE_FILTERS, RATING_FILTER_LEVELS, SortColumn,
+    SortDirection,
 };
 use yield_platform::accessibility::{
     AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole, AxSlider,
@@ -23,6 +24,8 @@ pub(super) const REFRESH_SOURCE: &str = "browser-refresh-source";
 pub(super) const SEARCH: &str = "browser-search";
 pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
 pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
+pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
 pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
 pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
 const PLAY: &str = "transport-play";
@@ -133,6 +136,10 @@ pub(super) fn rating_filter_id(index: usize) -> String {
     format!("browser-rating-filter-{index}")
 }
 
+pub(super) fn curation_queue_choice_id(index: usize) -> String {
+    format!("browser-curation-queue-choice-{index}")
+}
+
 fn visible_sort_columns(window: &Window, cx: &Context<Browser>) -> Vec<(SortColumn, &'static str)> {
     let theme = crate::theme::active(cx);
     let visibility =
@@ -221,6 +228,8 @@ impl BrowserAccessibility {
             RANDOM_NAVIGATION,
             NAME_VIEW_MODE,
             TAG_FILTER_TOGGLE,
+            CURATION_QUEUE_TOGGLE,
+            CURATION_QUEUE_SCOPE,
             PLAY,
             STOP,
             LOOP,
@@ -256,6 +265,9 @@ impl BrowserAccessibility {
         }
         for index in 0..RATING_FILTER_LEVELS.len() {
             control_focus.insert(rating_filter_id(index), cx.focus_handle());
+        }
+        for index in 0..3 {
+            control_focus.insert(curation_queue_choice_id(index), cx.focus_handle());
         }
         Some(Self {
             registry: Rc::new(RefCell::new(registry)),
@@ -366,16 +378,33 @@ impl BrowserAccessibility {
                                 .find_map(|(index, &level)| {
                                     (event.id == rating_filter_id(index)).then_some(level)
                                 });
+                        let curation_scope_action = super::curation_queue::scope_menu_open(view)
+                            .then(|| {
+                                [
+                                    CurationQueueScope::All,
+                                    CurationQueueScope::Ratings,
+                                    CurationQueueScope::Tags,
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .find_map(|(index, scope)| {
+                                    (event.id == curation_queue_choice_id(index)).then_some(scope)
+                                })
+                            })
+                            .flatten();
                         let extra_action = matches!(
                             event.id.as_str(),
                             TAG_FILTER_INPUT
                                 | TAG_FILTER_TOGGLE
+                                | CURATION_QUEUE_TOGGLE
+                                | CURATION_QUEUE_SCOPE
                                 | RANDOM_NAVIGATION
                                 | NAME_VIEW_MODE
                         ) || sort_action.is_some()
                             || collection_action.is_some()
                             || playback_type_action.is_some()
                             || rating_action.is_some();
+                        let extra_action = extra_action || curation_scope_action.is_some();
                         let transport_action = matches!(
                             event.id.as_str(),
                             PLAY | STOP
@@ -409,7 +438,8 @@ impl BrowserAccessibility {
                         if view.active_source.is_none()
                             && (collection_action.is_some()
                                 || playback_type_action.is_some()
-                                || rating_action.is_some())
+                                || rating_action.is_some()
+                                || curation_scope_action.is_some())
                         {
                             return;
                         }
@@ -556,6 +586,10 @@ impl BrowserAccessibility {
                                 FOLDER_SCOPE => view.toggle_folder_scope(cx),
                                 REFRESH_SOURCE => view.refresh_active_source(cx),
                                 TAG_FILTER_TOGGLE => super::tag_filter::toggle(view, cx),
+                                CURATION_QUEUE_TOGGLE => super::curation_queue::toggle(view, cx),
+                                CURATION_QUEUE_SCOPE => {
+                                    super::curation_queue::toggle_scope_menu(view, cx)
+                                }
                                 RANDOM_NAVIGATION => view.toggle_random_navigation(cx),
                                 NAME_VIEW_MODE => view.toggle_sample_name_view_mode(cx),
                                 _ => match source_action {
@@ -588,6 +622,15 @@ impl BrowserAccessibility {
                                                     view.toggle_playback_type_filter(kind, cx);
                                                 } else if let Some(level) = rating_action {
                                                     view.toggle_rating_filter(level, cx);
+                                                } else if let Some(scope) = curation_scope_action {
+                                                    super::curation_queue::set_scope(
+                                                        view, scope, cx,
+                                                    );
+                                                    if let Some(scope_focus) =
+                                                        view.ax_focus(CURATION_QUEUE_SCOPE)
+                                                    {
+                                                        window.focus(&scope_focus);
+                                                    }
                                                 } else {
                                                     return;
                                                 }
@@ -1261,6 +1304,58 @@ impl Browser {
                     ),
                     enabled: active_source,
                 });
+            }
+            controls.push(AxChild {
+                id: CURATION_QUEUE_TOGGLE.into(),
+                role: AxRole::CheckBox,
+                label: "Curation queue".into(),
+                value: Some(
+                    if self.view_model.curation_queue().enabled {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                    .into(),
+                ),
+                enabled: active_source,
+            });
+            controls.push(AxChild {
+                id: CURATION_QUEUE_SCOPE.into(),
+                role: AxRole::Button,
+                label: "Curation queue scope".into(),
+                value: Some(
+                    super::curation_queue::scope_label(self.view_model.curation_queue().scope)
+                        .into(),
+                ),
+                enabled: active_source,
+            });
+            if super::curation_queue::scope_menu_open(self) {
+                for (index, scope) in [
+                    CurationQueueScope::All,
+                    CurationQueueScope::Ratings,
+                    CurationQueueScope::Tags,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    controls.push(AxChild {
+                        id: curation_queue_choice_id(index),
+                        role: AxRole::Button,
+                        label: format!(
+                            "Curation queue {} scope",
+                            super::curation_queue::scope_label(scope)
+                        ),
+                        value: Some(
+                            if self.view_model.curation_queue().scope == scope {
+                                "Selected"
+                            } else {
+                                "Not selected"
+                            }
+                            .into(),
+                        ),
+                        enabled: active_source,
+                    });
+                }
             }
             controls.push(AxChild {
                 id: TAG_FILTER_TOGGLE.into(),

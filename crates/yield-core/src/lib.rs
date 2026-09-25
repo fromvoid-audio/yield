@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod bpm_snap;
 mod curation;
+mod curation_queue;
 mod folder_tree;
 mod last_played;
 mod playback_history;
@@ -32,6 +33,10 @@ mod waveform_viewport;
 
 pub use bpm_snap::snap_resize_ratio_to_whole_bpm;
 pub use curation::{CurationAction, CurationTransition, plan_curation_action};
+pub use curation_queue::{
+    CurationQueueDecision, CurationQueueKey, CurationQueueMode, CurationQueuePriority,
+    CurationQueueScope, CurationTagFacts, curation_queue_decision,
+};
 pub use folder_tree::{
     FolderScope, FolderTree, FolderTreeRow, FolderTreeState, folder_contains_relative_path,
 };
@@ -265,6 +270,8 @@ pub struct BrowserViewModel {
     rating_filter: RatingFilter,
     playback_type_filter: PlaybackTypeFilter,
     tag_filter: TagFilterState,
+    curation_queue: CurationQueueMode,
+    curation_tag_facts: Option<Vec<CurationTagFacts>>,
     reveal_id: Option<AudioFileId>,
     rows: Vec<BrowserRow>,
 }
@@ -281,6 +288,8 @@ impl BrowserViewModel {
             rating_filter: RatingFilter::disabled(),
             playback_type_filter: PlaybackTypeFilter::disabled(),
             tag_filter: TagFilterState::disabled(),
+            curation_queue: CurationQueueMode::default(),
+            curation_tag_facts: None,
             reveal_id: None,
             rows: Vec::new(),
         };
@@ -329,6 +338,56 @@ impl BrowserViewModel {
         &self.tag_filter
     }
 
+    /// Return the source-scoped Curation queue mode.
+    pub fn curation_queue(&self) -> CurationQueueMode {
+        self.curation_queue
+    }
+
+    /// Return whether an enabled Curation queue is waiting for exact per-file tag facts.
+    pub fn curation_queue_pending(&self) -> bool {
+        self.curation_queue.enabled && self.curation_tag_facts.is_none()
+    }
+
+    /// Set the Curation queue mode without changing the ordinary sort choice.
+    pub fn set_curation_queue(&mut self, entries: &[AudioFile], mode: CurationQueueMode) -> bool {
+        if self.curation_queue == mode {
+            return false;
+        }
+        self.reveal_id = None;
+        self.curation_queue = mode;
+        self.rebuild(entries);
+        true
+    }
+
+    /// Apply exact facts for every current entry, in scan order.
+    ///
+    /// The caller must fence these facts to the current source, root, revision, and lifecycle.
+    pub fn apply_curation_tag_facts(
+        &mut self,
+        entries: &[AudioFile],
+        facts: Vec<CurationTagFacts>,
+    ) -> bool {
+        if facts.len() != entries.len() {
+            return false;
+        }
+        self.curation_tag_facts = Some(facts);
+        if self.curation_queue.enabled {
+            self.rebuild(entries);
+        }
+        true
+    }
+
+    /// Invalidate exact tag facts after source or tag mutation.
+    pub fn invalidate_curation_tag_facts(&mut self, entries: &[AudioFile]) -> bool {
+        if self.curation_tag_facts.take().is_none() {
+            return false;
+        }
+        if self.curation_queue.enabled {
+            self.rebuild(entries);
+        }
+        true
+    }
+
     /// Return the single file identity temporarily included in the projection despite another
     /// active filter.
     pub fn reveal_id(&self) -> Option<&AudioFileId> {
@@ -350,6 +409,7 @@ impl BrowserViewModel {
     /// Replace the scan while preserving the current query and sort choice.
     pub fn set_entries(&mut self, entries: &[AudioFile]) {
         self.invalidate_tag_filter_result();
+        self.curation_tag_facts = None;
         self.clear_reveal_if_missing(entries);
         self.rebuild(entries);
     }
@@ -558,6 +618,11 @@ impl BrowserViewModel {
                 || !self.entry_matches_scope(entry, &query)
                 || !self.entry_matches_rating(entry)
                 || !self.entry_matches_playback_type(entry)
+                || !self.entry_matches_curation_queue(
+                    entry_index,
+                    entry,
+                    current_unix_epoch_seconds(),
+                )
             {
                 continue;
             }
@@ -649,7 +714,12 @@ impl BrowserViewModel {
                                     .is_some_and(|curation| curation.has_collection(slot))
                             })
                             && self.entry_matches_rating(entry)
-                            && self.entry_matches_playback_type(entry)))
+                            && self.entry_matches_playback_type(entry)
+                            && self.entry_matches_curation_queue(
+                                *entry_index,
+                                entry,
+                                now_epoch_seconds,
+                            )))
             })
             .map(|(entry_index, entry)| {
                 (
@@ -665,30 +735,64 @@ impl BrowserViewModel {
                         now_epoch_seconds,
                     ),
                     playback_type_sort_key(entry.playback_type),
+                    self.curation_queue_key(entry_index, entry, now_epoch_seconds),
                 )
             })
             .collect::<Vec<_>>();
         projected.sort_by(|left, right| {
-            let ordering = match self.sort.column {
-                SortColumn::Name => left.2.cmp(&right.2),
-                SortColumn::Size => left.4.cmp(&right.4),
-                SortColumn::Extension => left.3.cmp(&right.3),
-                SortColumn::Rating => left.5.cmp(&right.5),
-                SortColumn::Collection => left.6.cmp(&right.6),
-                SortColumn::LastPlayed => left.7.cmp(&right.7),
-                SortColumn::PlaybackType => left.8.cmp(&right.8),
+            let ordering = if self.curation_queue.enabled {
+                left.9.cmp(&right.9)
+            } else {
+                match self.sort.column {
+                    SortColumn::Name => left.2.cmp(&right.2),
+                    SortColumn::Size => left.4.cmp(&right.4),
+                    SortColumn::Extension => left.3.cmp(&right.3),
+                    SortColumn::Rating => left.5.cmp(&right.5),
+                    SortColumn::Collection => left.6.cmp(&right.6),
+                    SortColumn::LastPlayed => left.7.cmp(&right.7),
+                    SortColumn::PlaybackType => left.8.cmp(&right.8),
+                }
             }
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.1.path().cmp(right.1.path()));
-            match self.sort.direction {
+            match if self.curation_queue.enabled {
+                SortDirection::Ascending
+            } else {
+                self.sort.direction
+            } {
                 SortDirection::Ascending => ordering,
                 SortDirection::Descending => ordering.reverse(),
             }
         });
         self.rows = projected
             .into_iter()
-            .map(|(entry_index, id, _, _, _, _, _, _, _)| BrowserRow { entry_index, id })
+            .map(|(entry_index, id, _, _, _, _, _, _, _, _)| BrowserRow { entry_index, id })
             .collect();
+    }
+
+    fn curation_queue_key(
+        &self,
+        entry_index: usize,
+        entry: &AudioFile,
+        now_epoch_seconds: i64,
+    ) -> Option<CurationQueueKey> {
+        let tags = self.curation_tag_facts.as_ref()?.get(entry_index).copied();
+        match curation_queue_decision(entry, tags, self.curation_queue, now_epoch_seconds) {
+            CurationQueueDecision::Included(key) => Some(key),
+            _ => None,
+        }
+    }
+
+    fn entry_matches_curation_queue(
+        &self,
+        entry_index: usize,
+        entry: &AudioFile,
+        now_epoch_seconds: i64,
+    ) -> bool {
+        !self.curation_queue.enabled
+            || self
+                .curation_queue_key(entry_index, entry, now_epoch_seconds)
+                .is_some()
     }
 
     fn entry_matches_scope(&self, entry: &AudioFile, query: &str) -> bool {
@@ -804,6 +908,120 @@ mod tests {
             playback_type,
             curation,
         }
+    }
+
+    #[test]
+    fn curation_queue_intersects_existing_filters_orders_rows_and_fails_closed() {
+        let entries = vec![
+            typed_entry(
+                "/source/kit/complete.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(2, false, 0b1, None, None),
+            ),
+            typed_entry(
+                "/source/kit/empty.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0b1, None, None),
+            ),
+            typed_entry(
+                "/source/kit/locked.wav",
+                Some(PlaybackType::Loop),
+                AudioFileCuration::from_parts(3, true, 0b1, None, None),
+            ),
+        ];
+        let mut model = BrowserViewModel::new(&entries);
+        let mode = CurationQueueMode {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(model.set_curation_queue(&entries, mode));
+        assert!(model.curation_queue_pending());
+        assert!(model.rows().is_empty());
+        assert!(!model.apply_curation_tag_facts(&entries, vec![]));
+        assert!(model.rows().is_empty());
+        assert!(model.apply_curation_tag_facts(
+            &entries,
+            vec![
+                CurationTagFacts::from_flags(true, true, true),
+                CurationTagFacts::from_flags(false, false, false),
+                CurationTagFacts::from_flags(true, true, true),
+            ]
+        ));
+        assert_eq!(
+            model
+                .rows()
+                .iter()
+                .map(|row| row.entry_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(model.collection_counts(&entries), [2, 0, 0, 0, 0, 0]);
+
+        model.set_query(&entries, "complete");
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        assert!(model.set_reveal(&entries, Some(entries[1].stable_id())));
+        assert_eq!(model.rows().len(), 2);
+        assert!(model.set_curation_queue(
+            &entries,
+            CurationQueueMode {
+                scope: CurationQueueScope::Tags,
+                ..mode
+            }
+        ));
+        assert!(model.rows().is_empty());
+        model.set_query(&entries, "");
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
+
+        assert!(model.invalidate_curation_tag_facts(&entries));
+        assert!(model.curation_queue_pending());
+        assert!(model.rows().is_empty());
+        assert!(model.set_curation_queue(&entries, CurationQueueMode::default()));
+        assert_eq!(model.rows().len(), 3);
+    }
+
+    #[test]
+    fn curation_queue_rehydrates_after_metadata_change_and_reveals_one_excluded_row() {
+        let mut entries = vec![
+            typed_entry(
+                "/source/first.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, None, None),
+            ),
+            typed_entry(
+                "/source/second.wav",
+                Some(PlaybackType::OneShot),
+                AudioFileCuration::from_parts(0, false, 0, None, None),
+            ),
+        ];
+        let empty = CurationTagFacts::from_flags(false, false, false);
+        let mut model = BrowserViewModel::new(&entries);
+        assert!(model.set_curation_queue(
+            &entries,
+            CurationQueueMode {
+                enabled: true,
+                ..Default::default()
+            }
+        ));
+        assert!(model.apply_curation_tag_facts(&entries, vec![empty; 2]));
+        assert_eq!(model.rows().len(), 2);
+
+        entries[0].curation =
+            AudioFileCuration::from_parts(1, false, 0, None, Some(current_unix_epoch_seconds()));
+        model.set_entries(&entries);
+        assert!(model.curation_queue_pending());
+        assert!(model.rows().is_empty());
+        assert!(model.apply_curation_tag_facts(&entries, vec![empty; 2]));
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
+
+        assert!(model.set_reveal(&entries, Some(entries[0].stable_id())));
+        assert_eq!(model.rows().len(), 2);
+        assert_eq!(model.rows()[0].entry_index, 0);
+        model.set_query(&entries, "second");
+        assert_eq!(model.rows().len(), 1);
+        assert_eq!(model.rows()[0].entry_index, 1);
     }
 
     #[test]
