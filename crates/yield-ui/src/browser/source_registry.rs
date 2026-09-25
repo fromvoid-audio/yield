@@ -290,7 +290,7 @@ impl Browser {
         }
         if let Some(error) = cx.global::<SourceRegistryGlobal>().start_error() {
             self.source_registry_loaded = true;
-            self.source_registry_status = format!("Source persistence unavailable: {error}");
+            self.set_source_registry_status(format!("Source persistence unavailable: {error}"));
         }
         self.source_registry_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -364,7 +364,7 @@ impl Browser {
                     return false;
                 }
                 self.source_registry_revision = revision;
-                self.source_registry_status = "Loading sources…".to_string();
+                self.set_source_registry_status("Loading sources…".to_string());
                 true
             }
             RegistryEvent::Snapshot { revision, snapshot } => {
@@ -374,7 +374,7 @@ impl Browser {
                 self.source_registry_revision = revision;
                 self.source_registry_loaded = true;
                 self.apply_source_registry_snapshot(snapshot, cx);
-                self.source_registry_status = "Sources loaded".to_string();
+                self.set_source_registry_status("Sources loaded".to_string());
                 true
             }
             RegistryEvent::Persisted { revision } => {
@@ -383,13 +383,15 @@ impl Browser {
                 }
                 self.source_registry_persisted_revision = revision;
                 self.clear_persisted_registry_mutations();
-                self.source_registry_status = if self.source_registry_pending_adds.is_empty()
-                    && self.source_registry_pending_removes.is_empty()
-                {
-                    "Sources saved".to_string()
-                } else {
-                    "Saving source…".to_string()
-                };
+                self.set_source_registry_status(
+                    if self.source_registry_pending_adds.is_empty()
+                        && self.source_registry_pending_removes.is_empty()
+                    {
+                        "Sources saved".to_string()
+                    } else {
+                        "Saving source…".to_string()
+                    },
+                );
                 true
             }
             RegistryEvent::RequestApplied { request, revision } => {
@@ -412,13 +414,15 @@ impl Browser {
                     self.source_registry_revision = revision;
                 }
                 self.clear_persisted_registry_mutations();
-                self.source_registry_status = if self.source_registry_pending_adds.is_empty()
-                    && self.source_registry_pending_removes.is_empty()
-                {
-                    "Sources saved".to_string()
-                } else {
-                    "Saving source…".to_string()
-                };
+                self.set_source_registry_status(
+                    if self.source_registry_pending_adds.is_empty()
+                        && self.source_registry_pending_removes.is_empty()
+                    {
+                        "Sources saved".to_string()
+                    } else {
+                        "Saving source…".to_string()
+                    },
+                );
                 true
             }
             RegistryEvent::RequestFailed { request, error } => {
@@ -430,20 +434,20 @@ impl Browser {
                     self.source_registry_removed_roots.remove(&mutation.root);
                     self.set_source_error(&mutation.root, message.clone());
                 }
-                self.source_registry_status = format!("Source registry error: {message}");
+                self.set_source_registry_status(format!("Source registry error: {message}"));
                 true
             }
             RegistryEvent::PersistenceUnavailable { revision, error } => {
                 self.source_registry_loaded = true;
                 self.source_registry_revision = revision;
                 self.fail_pending_registry_mutations(error.to_string());
-                self.source_registry_status = format!("Source persistence unavailable: {error}");
+                self.set_source_registry_status(format!("Source persistence unavailable: {error}"));
                 true
             }
             RegistryEvent::Closed => {
                 self.source_registry_loaded = true;
                 self.fail_pending_registry_mutations("Source registry closed".to_string());
-                self.source_registry_status = "Source registry closed".to_string();
+                self.set_source_registry_status("Source registry closed".to_string());
                 true
             }
         }
@@ -677,7 +681,7 @@ impl Browser {
         self.waveform_pending = false;
         self.waveform = None;
         self.waveform_error = None;
-        self.scan_status = "Choose a source folder to begin".to_string();
+        self.set_scan_status("Choose a source folder to begin".to_string());
         cx.notify();
     }
 
@@ -689,7 +693,7 @@ impl Browser {
         {
             session.last_error = Some(error);
         } else if self.root.as_deref() == Some(root) {
-            self.scan_status = error;
+            self.set_scan_status(error);
         }
     }
 
@@ -729,12 +733,12 @@ impl Browser {
                         revision: None,
                     },
                 );
-                self.source_registry_status = "Saving source…".to_string();
+                self.set_source_registry_status("Saving source…".to_string());
                 self.start_source_registry_poll(cx);
             }
             Err(error) => {
                 self.set_source_error(&root, format!("Could not save source: {error}"));
-                self.source_registry_status = format!("Source registry error: {error}");
+                self.set_source_registry_status(format!("Source registry error: {error}"));
             }
         }
     }
@@ -780,13 +784,13 @@ impl Browser {
                         revision: None,
                     },
                 );
-                self.source_registry_status = "Saving source removal…".to_string();
+                self.set_source_registry_status("Saving source removal…".to_string());
                 self.start_source_registry_poll(cx);
                 true
             }
             Err(error) => {
                 self.set_source_error(&root, format!("Could not remove source: {error}"));
-                self.source_registry_status = format!("Source registry error: {error}");
+                self.set_source_registry_status(format!("Source registry error: {error}"));
                 false
             }
         }

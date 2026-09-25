@@ -1687,8 +1687,9 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let Some(relative_path) = self.playback_target_relative_path(absolute_path) else {
-            self.scan_status =
-                String::from("Playback history not saved: sample metadata is unavailable");
+            self.set_scan_status(String::from(
+                "Playback history not saved: sample metadata is unavailable",
+            ));
             cx.notify();
             return;
         };
@@ -1706,31 +1707,31 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let Some(activation) = self.catalog_activation.as_ref() else {
-            self.scan_status = if is_playback_record_action(action) {
+            self.set_scan_status(if is_playback_record_action(action) {
                 String::from("Playback history unavailable: sample metadata is not ready")
             } else {
                 String::from("Curation requires a successful audited catalog projection")
-            };
+            });
             cx.notify();
             return;
         };
         if !activation.audit_finished || activation.audit_error.is_some() {
-            self.scan_status = if is_playback_record_action(action) {
+            self.set_scan_status(if is_playback_record_action(action) {
                 String::from("Playback history unavailable: sample metadata is not ready")
             } else {
                 String::from("Curation requires a successful audited catalog projection")
-            };
+            });
             cx.notify();
             return;
         }
         let Some(context) = self.catalog_metadata.context() else {
-            self.scan_status = if is_playback_record_action(action) {
+            self.set_scan_status(if is_playback_record_action(action) {
                 String::from("Playback history unavailable: sample metadata is not ready")
             } else {
                 String::from(
                     "Curation metadata is still loading; try again after the catalog is ready",
                 )
-            };
+            });
             cx.notify();
             return;
         };
@@ -1913,21 +1914,23 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> TagAdmissionResult {
         let Some(activation) = self.catalog_activation.as_ref() else {
-            self.scan_status =
-                String::from("Tag editing requires a successful audited catalog projection");
+            self.set_scan_status(String::from(
+                "Tag editing requires a successful audited catalog projection",
+            ));
             cx.notify();
             return TagAdmissionResult::Rejected(self.scan_status.clone());
         };
         if !activation.audit_finished || activation.audit_error.is_some() {
-            self.scan_status =
-                String::from("Tag editing requires a successful audited catalog projection");
+            self.set_scan_status(String::from(
+                "Tag editing requires a successful audited catalog projection",
+            ));
             cx.notify();
             return TagAdmissionResult::Rejected(self.scan_status.clone());
         }
         let Some(context) = self.catalog_metadata.context() else {
-            self.scan_status = String::from(
+            self.set_scan_status(String::from(
                 "Curation metadata is still loading; try again after the catalog is ready",
-            );
+            ));
             cx.notify();
             return TagAdmissionResult::Rejected(self.scan_status.clone());
         };
@@ -2509,7 +2512,7 @@ impl Browser {
             if let Some(message) = self.curation_state.status_for(&key)
                 && message.starts_with("Curation failed:")
             {
-                self.scan_status = message;
+                self.set_scan_status(message);
             }
         }
         true
