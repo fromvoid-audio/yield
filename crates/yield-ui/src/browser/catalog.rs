@@ -442,6 +442,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => {
                     return false;
@@ -490,6 +491,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => return false,
             }
@@ -704,6 +706,8 @@ impl Browser {
             | CatalogEvent::TagFilterFailed { .. }
             | CatalogEvent::DisplayLabelsReady { .. }
             | CatalogEvent::DisplayLabelsFailed { .. }
+            | CatalogEvent::CurationTagFactsReady { .. }
+            | CatalogEvent::CurationTagFactsFailed { .. }
             | CatalogEvent::RatingDecayProgress { .. }
             | CatalogEvent::RatingDecayFailed { .. } => false,
             CatalogEvent::Failed { error, .. } => {
@@ -1058,6 +1062,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::DisplayLabelsFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationTagFactsReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationTagFactsFailed {
             source_id,
             lifecycle_generation,
             ..
