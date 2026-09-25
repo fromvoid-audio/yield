@@ -385,6 +385,8 @@ pub(crate) struct Browser {
     playback_cursor_pending: Option<f32>,
     playback_cursor_sample: Option<transport::PlaybackCursorSample>,
     playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
+    waveform_hover_cursor: Option<f32>,
+    waveform_last_play_start: Option<f32>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     source_registry_task: Option<Task<()>>,
@@ -688,6 +690,8 @@ impl Browser {
             playback_cursor_pending: None,
             playback_cursor_sample: None,
             playback_cursor_interpolation: None,
+            waveform_hover_cursor: None,
+            waveform_last_play_start: None,
             scan_cancel: None,
             scan_task: None,
             source_registry_task: None,
@@ -1434,6 +1438,7 @@ impl Browser {
             self.waveform_pending = false;
             self.waveform = None;
             self.waveform_error = None;
+            self.invalidate_waveform_generation();
             cx.notify();
             return;
         };
@@ -2727,6 +2732,18 @@ impl Browser {
             self.play_compare_anchor(cx);
             return;
         }
+        if current_playhead_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.play_from_current_playhead(cx);
+            return;
+        }
         if !secondary && !alt && !function && !shift && key.eq_ignore_ascii_case("c") {
             self.set_compare_anchor_from_focus(cx);
             return;
@@ -2871,17 +2888,54 @@ fn browser_focus_from_state(
     (!browser_focus_detached).then_some(selected_id).flatten()
 }
 
+fn current_playhead_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> bool {
+    key == "space" && command && !control && !shift && !alt && !function && !held
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
-        browser_focus_from_state, resolve_scan_source_index, reveal_should_clear_for_focus_change,
-        sample_click_intent, scan_source_index_for_error, selection_origin_for_click,
-        selection_origin_for_navigation, should_autoplay_selection,
+        browser_focus_from_state, current_playhead_shortcut, resolve_scan_source_index,
+        reveal_should_clear_for_focus_change, sample_click_intent, scan_source_index_for_error,
+        selection_origin_for_click, selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
     use yield_core::{AudioFile, AudioFileId};
     use yield_library::sample_sources::{SampleSource, SourceId};
+
+    #[test]
+    fn current_playhead_shortcut_requires_unmodified_command_space() {
+        assert!(current_playhead_shortcut(
+            "space", true, false, false, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", false, false, false, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, true, false, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, true, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, false, true, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, false, false, true, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, false, false, false, true
+        ));
+    }
 
     #[gpui::test]
     fn explicit_actions_cancel_a_pending_random_load(cx: &mut gpui::TestAppContext) {
