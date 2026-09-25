@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{ClickEvent, Context, div, prelude::*, px};
+use gpui::{ClickEvent, Context, Window, div, prelude::*, px};
 use yield_core::{AudioFile, AudioFileId, CurationQueueMode, CurationQueueScope, CurationTagFacts};
 use yield_session::{
     CatalogCommand, CatalogEvent, CatalogStatus, CatalogSubmitError,
@@ -209,6 +209,98 @@ pub(super) fn set_scope(
     browser.curation_queue.scope_menu_open = false;
     cx.notify();
     set_mode(browser, index, mode, cx);
+}
+
+/// Keep the two controls operable when macOS keyboard focus is on their AX handles.
+pub(super) fn handle_key_down(
+    browser: &mut Browser,
+    key: &str,
+    is_held: bool,
+    has_modifiers: bool,
+    window: &mut Window,
+    cx: &mut Context<Browser>,
+) -> bool {
+    if has_modifiers || browser.active_source.is_none() {
+        return false;
+    }
+    let toggle_focused = browser
+        .ax_focus(super::accessibility::CURATION_QUEUE_TOGGLE)
+        .is_some_and(|focus| focus.is_focused(window));
+    let scope_focus = browser.ax_focus(super::accessibility::CURATION_QUEUE_SCOPE);
+    let scope_focused = scope_focus
+        .as_ref()
+        .is_some_and(|focus| focus.is_focused(window));
+    let choices = [
+        CurationQueueScope::All,
+        CurationQueueScope::Ratings,
+        CurationQueueScope::Tags,
+    ];
+    let choice_focused = browser
+        .curation_queue
+        .scope_menu_open
+        .then(|| {
+            choices.iter().enumerate().find_map(|(index, _)| {
+                browser
+                    .ax_focus(&super::accessibility::curation_queue_choice_id(index))
+                    .filter(|focus| focus.is_focused(window))
+                    .map(|_| index)
+            })
+        })
+        .flatten();
+    if key == "escape" && browser.curation_queue.scope_menu_open {
+        browser.curation_queue.scope_menu_open = false;
+        if let Some(focus) = scope_focus {
+            window.focus(&focus);
+        }
+        cx.notify();
+        return true;
+    }
+    if is_held {
+        return toggle_focused || scope_focused || choice_focused.is_some();
+    }
+    if matches!(key, "enter" | "space") {
+        if toggle_focused {
+            toggle(browser, cx);
+            return true;
+        }
+        if let Some(index) = choice_focused {
+            set_scope(browser, choices[index], cx);
+            if let Some(focus) = scope_focus {
+                window.focus(&focus);
+            }
+            return true;
+        }
+        if scope_focused {
+            toggle_scope_menu(browser, cx);
+            return true;
+        }
+    }
+    if matches!(key, "up" | "arrowup" | "down" | "arrowdown")
+        && (scope_focused || choice_focused.is_some())
+    {
+        if !browser.curation_queue.scope_menu_open {
+            browser.curation_queue.scope_menu_open = true;
+        }
+        let down = matches!(key, "down" | "arrowdown");
+        let index = choice_focused
+            .map(|index| {
+                if down {
+                    (index + 1) % choices.len()
+                } else {
+                    (index + choices.len() - 1) % choices.len()
+                }
+            })
+            .unwrap_or(if down { 0 } else { choices.len() - 1 });
+        if let Some(focus) =
+            browser.ax_focus(&super::accessibility::curation_queue_choice_id(index))
+        {
+            window.focus(&focus);
+        }
+        cx.notify();
+        return true;
+    }
+    // Focused queue controls must not fall through to sample audition or curation shortcuts.
+    (toggle_focused || scope_focused || choice_focused.is_some()) && key != "tab"
 }
 
 fn set_mode(
@@ -419,8 +511,13 @@ pub(super) fn render(
                                 }))
                                 .hover(move |style| style.bg(hover))
                                 .active(move |style| style.bg(pressed))
-                                .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
+                                .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
                                     set_scope(view, scope, cx);
+                                    if let Some(focus) =
+                                        view.ax_focus(super::accessibility::CURATION_QUEUE_SCOPE)
+                                    {
+                                        window.focus(&focus);
+                                    }
                                 }))
                                 .child(scope_label(scope))
                                 .when_some(

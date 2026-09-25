@@ -2496,6 +2496,17 @@ impl Browser {
         if self.handle_context_menu_key_down(event, window, cx) {
             return;
         }
+        if curation_queue::handle_key_down(
+            self,
+            key,
+            event.is_held,
+            secondary || alt || shift || function,
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
+            return;
+        }
         if self.tag_input.read(cx).focus_handle().is_focused(window) {
             if !event.is_held
                 && handoff::is_browser_copy_shortcut(key, secondary, shift, alt, function)

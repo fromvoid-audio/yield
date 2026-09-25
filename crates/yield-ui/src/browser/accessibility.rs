@@ -626,6 +626,11 @@ impl BrowserAccessibility {
                                                     super::curation_queue::set_scope(
                                                         view, scope, cx,
                                                     );
+                                                    if let Some(scope_focus) =
+                                                        view.ax_focus(CURATION_QUEUE_SCOPE)
+                                                    {
+                                                        window.focus(&scope_focus);
+                                                    }
                                                 } else {
                                                     return;
                                                 }
