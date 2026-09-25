@@ -583,10 +583,7 @@ impl BrowserAccessibility {
                                 }
                                 LOOP => view.toggle_loop(cx),
                                 SIMILAR => super::similar_sections::toggle(view, cx),
-                                BPM_SNAP => {
-                                    view.bpm_snap_enabled = !view.bpm_snap_enabled;
-                                    cx.notify();
-                                }
+                                BPM_SNAP => view.toggle_bpm_snap(cx),
                                 ZERO_CROSSING => super::zero_crossing::toggle_from_accessibility(
                                     view, window, cx,
                                 ),
