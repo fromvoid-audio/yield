@@ -4171,8 +4171,27 @@ mod tests {
             EffectOutcome::SupersededBeforeEffect { .. }
         ));
         stale.acknowledge().expect("acknowledge stale result");
+        let replacement = root.with_extension("replacement");
+        std::fs::rename(&root, &replacement).expect("move replacement aside");
+        std::os::unix::fs::symlink(&displaced, &root).expect("substitute root symlink");
+        let mut linked = owner
+            .submit(unsupported_effect(&owner, registration, EffectId::new()))
+            .expect("symlink-substituted command queues");
+        assert!(matches!(
+            linked
+                .recv_timeout(Duration::from_secs(1))
+                .expect("symlink-substituted result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        linked
+            .acknowledge()
+            .expect("acknowledge symlink-substituted result");
+        std::fs::remove_file(&root).expect("remove substituted symlink");
+        std::fs::rename(&displaced, &root).expect("restore original profile root");
         drop(valid);
         drop(stale);
+        drop(linked);
         owner.retire_root(registration).expect("retire root");
         owner.acknowledge_custody_for_test();
         let shutdown = owner.shutdown();
@@ -4180,6 +4199,46 @@ mod tests {
             matches!(shutdown, FileOperationOwnerShutdown::DrainedAck),
             "unexpected shutdown: {shutdown:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn old_owner_root_reference_cannot_resurrect_after_restart() {
+        let _runtime = TestRuntimeGuard::acquire();
+        let temp_root = std::fs::canonicalize(std::env::temp_dir()).expect("temporary root");
+        let base = tempfile::tempdir_in(temp_root).expect("isolated profile base");
+        let _base = ConfigBaseGuard::set(base.path().to_path_buf());
+        let _profile = PersistenceProfileGuard::named("file-owner-restart");
+        let guard = WritableProfileGuard::acquire_current().expect("profile ownership");
+        let old_owner = FileOperationOwner::start().expect("first file owner");
+        let registration = old_owner.register_profile_root(&guard).expect("live root");
+        old_owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            old_owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
+
+        let new_owner = FileOperationOwner::start().expect("replacement file owner");
+        let mut stale = new_owner
+            .submit(unsupported_effect(
+                &new_owner,
+                registration,
+                EffectId::new(),
+            ))
+            .expect("old registration queues for rejection");
+        assert!(matches!(
+            stale
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old registration result")
+                .outcome(),
+            EffectOutcome::SupersededBeforeEffect { .. }
+        ));
+        stale.acknowledge().expect("acknowledge rejected result");
+        new_owner.acknowledge_custody_for_test();
+        assert!(matches!(
+            new_owner.shutdown(),
+            FileOperationOwnerShutdown::DrainedAck
+        ));
     }
 
     #[cfg(target_os = "macos")]

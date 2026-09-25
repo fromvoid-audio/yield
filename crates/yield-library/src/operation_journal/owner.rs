@@ -7790,6 +7790,40 @@ mod tests {
                 .expect("stale generation issue result")
                 .is_err()
         );
+        let stale_lifecycle = SourceFence::new(
+            fence.source_id().clone(),
+            fence.root_identity(),
+            fence.database_identity(),
+            fence.lifecycle_generation() + 1,
+            fence.source_revision(),
+            lease_epoch,
+        )
+        .expect("stale lifecycle observation");
+        let stale_lifecycle_spec = LiveChunkEffectSpec::new(
+            effect_id,
+            output,
+            target,
+            vec![stale_lifecycle],
+            0,
+            3,
+            b"abc",
+        )
+        .expect("stale lifecycle effect");
+        let mut stale_lifecycle_issue = client
+            .issue_live_chunk_effect(
+                claim.chunk_id(),
+                operation_id,
+                registration.clone(),
+                guard.pin_for_effect().expect("stale lifecycle pin"),
+                stale_lifecycle_spec,
+            )
+            .expect("stale lifecycle issue queues");
+        assert!(
+            stale_lifecycle_issue
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stale lifecycle issue result")
+                .is_err()
+        );
         let foreign_participant_fence = SourceFence::new(
             SourceId::from_string(String::from("foreign-source")),
             fence.root_identity(),
