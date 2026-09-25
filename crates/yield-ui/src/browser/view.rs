@@ -273,6 +273,7 @@ impl Browser {
         let hover_color = color(theme.colors.border_emphasis);
         div()
             .id("workspace-sidebar-resize")
+            .debug_selector(|| String::from("workspace-sidebar-resize"))
             .flex_none()
             .w(px(PANE_RESIZE_RAIL))
             .h_full()
@@ -318,6 +319,7 @@ impl Browser {
         let hover_color = color(theme.colors.border_emphasis);
         div()
             .id("workspace-waveform-resize")
+            .debug_selector(|| String::from("workspace-waveform-resize"))
             .flex_none()
             .w_full()
             .h(px(PANE_RESIZE_RAIL))
@@ -3568,6 +3570,82 @@ mod tests {
                 assert_eq!(view.selected, selected);
                 assert_eq!(view.playback_epoch, playback_epoch);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn workspace_resize_rails_follow_pointer_drags(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("initial workspace layout");
+        cx.run_until_parked();
+        let sidebar = cx
+            .debug_bounds("workspace-sidebar-resize")
+            .expect("sidebar resize rail");
+        let start = point(
+            sidebar.origin.x + sidebar.size.width / 2.0,
+            sidebar.origin.y + sidebar.size.height / 2.0,
+        );
+        let end = point(start.x + px(80.0), start.y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.cx
+            .update(|app| assert!(browser.read(app).pane_resize_drag.is_some()));
+        cx.simulate_mouse_move(
+            point(start.x + px(4.0), start.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().expect("sidebar drag layout");
+        let moved_sidebar = cx
+            .debug_bounds("workspace-sidebar-resize")
+            .expect("moved sidebar rail");
+        let preferred = cx
+            .cx
+            .update(|app| browser.read(app).preferred_sidebar_width);
+        assert!(
+            moved_sidebar.origin.x > sidebar.origin.x + px(40.0),
+            "sidebar={sidebar:?} moved={moved_sidebar:?} preferred={:?}",
+            preferred
+        );
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert!(view.preferred_sidebar_width.is_some());
+        });
+
+        let waveform = cx
+            .debug_bounds("workspace-waveform-resize")
+            .expect("waveform resize rail");
+        let start = point(
+            waveform.origin.x + waveform.size.width / 2.0,
+            waveform.origin.y + waveform.size.height / 2.0,
+        );
+        let end = point(start.x, start.y + px(60.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.cx
+            .update(|app| assert!(browser.read(app).pane_resize_drag.is_some()));
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(4.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().expect("waveform drag layout");
+        let moved_waveform = cx
+            .debug_bounds("workspace-waveform-resize")
+            .expect("moved waveform rail");
+        assert!(moved_waveform.origin.y > waveform.origin.y + px(30.0));
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert!(view.preferred_waveform_height.is_some());
+            assert!(view.selected.is_none());
+            assert!(view.waveform_play_region.is_none());
         });
     }
 
