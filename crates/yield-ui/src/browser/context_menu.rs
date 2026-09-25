@@ -205,21 +205,23 @@ impl Browser {
             return;
         };
         let Some(activation) = self.catalog_activation.clone() else {
-            self.scan_status =
-                String::from("Context menu requires a successful audited catalog projection");
+            self.set_scan_status(String::from(
+                "Context menu requires a successful audited catalog projection",
+            ));
             cx.notify();
             return;
         };
         if !activation.audit_finished || activation.audit_error.is_some() {
-            self.scan_status =
-                String::from("Context menu requires a successful audited catalog projection");
+            self.set_scan_status(String::from(
+                "Context menu requires a successful audited catalog projection",
+            ));
             cx.notify();
             return;
         }
         let Some(context) = self.catalog_metadata.context() else {
-            self.scan_status = String::from(
+            self.set_scan_status(String::from(
                 "Catalog metadata is still loading; try again after the catalog is ready",
-            );
+            ));
             cx.notify();
             return;
         };
@@ -384,7 +386,7 @@ impl Browser {
                 cx.write_to_clipboard(ClipboardItem::new_string(format_copy_path(
                     &target.absolute_path,
                 )));
-                self.playback_status = String::from("Copied path");
+                self.set_playback_status(String::from("Copied path"));
                 cx.notify();
             }
             (ContextMenuAction::Unlock, ContextMenuTarget::Sample(target)) => {
@@ -405,7 +407,7 @@ impl Browser {
                 self.start_directory_open(target, cx)
             }
             _ => {
-                self.playback_status = String::from("Context menu action is unavailable");
+                self.set_playback_status(String::from("Context menu action is unavailable"));
                 cx.notify();
             }
         }
@@ -416,7 +418,7 @@ impl Browser {
             self.clear_browser_focus_override();
             super::tag_chips::invalidate(self);
             self.start_source_registry_poll(cx);
-            self.playback_status = String::from(STALE_CONTEXT_MESSAGE);
+            self.set_playback_status(String::from(STALE_CONTEXT_MESSAGE));
             cx.notify();
         }
     }
@@ -432,7 +434,7 @@ pub(super) fn invalidate_if_stale(browser: &mut Browser) {
         browser.context_menu = None;
         browser.clear_browser_focus_override();
         super::tag_chips::invalidate(browser);
-        browser.playback_status = String::from(STALE_CONTEXT_MESSAGE);
+        browser.set_playback_status(String::from(STALE_CONTEXT_MESSAGE));
     }
 }
 

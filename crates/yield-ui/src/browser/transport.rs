@@ -430,17 +430,19 @@ impl Browser {
 
         match self.submit_live_playback_retarget(desired, cx) {
             Some(Ok(())) => {
-                self.playback_status = format!("{status_label} · applying to playback");
+                self.set_playback_status(format!("{status_label} · applying to playback"));
             }
             Some(Err(error)) => {
-                self.playback_status = format!("{status_label} · live update unavailable: {error}");
+                self.set_playback_status(format!(
+                    "{status_label} · live update unavailable: {error}"
+                ));
             }
             None => {
-                self.playback_status = if self.playing_path.is_some() {
+                self.set_playback_status(if self.playing_path.is_some() {
                     format!("{status_label} — applies on next play")
                 } else {
                     status_label
-                };
+                });
             }
         }
     }
@@ -823,7 +825,7 @@ impl Browser {
         origin: PlaybackIntentOrigin,
     ) -> Option<PlaybackIntent> {
         let Some(index) = self.selected else {
-            self.playback_status = "Select a sample first".to_string();
+            self.set_playback_status("Select a sample first".to_string());
             return None;
         };
         let Some(entry) = self.entries.get(index).cloned() else {
@@ -833,11 +835,11 @@ impl Browser {
         self.playback_policy
             .prepare(entry.stable_id(), entry.playback_type);
         if !yield_library::sample_sources::is_supported_audio(&path) {
-            self.playback_status = "Audition currently supports WAV files".to_string();
+            self.set_playback_status("Audition currently supports WAV files".to_string());
             return None;
         }
         let Some(start) = normalized_playback_start(start) else {
-            self.playback_status = "Invalid playback position".to_string();
+            self.set_playback_status("Invalid playback position".to_string());
             return None;
         };
         let region = self.waveform_play_region.filter(|region| region.is_valid());
@@ -863,13 +865,13 @@ impl Browser {
         self.zero_crossing_queued = None;
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
-            self.playback_status = "Invalid playback position".to_string();
+            self.set_playback_status("Invalid playback position".to_string());
             cx.notify();
             return;
         };
         if intent.region.is_some_and(|region| !region.is_valid()) {
             self.clear_playback_cursor();
-            self.playback_status = "Invalid playback region".to_string();
+            self.set_playback_status("Invalid playback region".to_string());
             cx.notify();
             return;
         }
@@ -882,7 +884,7 @@ impl Browser {
             self.playback_init_epoch = self.playback_epoch;
             self.playback_init_generation = self.waveform_generation;
             self.playback_waiting_for_preferences = true;
-            self.playback_status = "Loading settings…".to_string();
+            self.set_playback_status("Loading settings…".to_string());
             self.start_preferences_poll(cx);
             cx.notify();
             return;
@@ -892,7 +894,7 @@ impl Browser {
             self.playback_init_intent = Some(intent);
             self.playback_init_epoch = self.playback_epoch;
             self.playback_init_generation = self.waveform_generation;
-            self.playback_status = "Starting audio…".to_string();
+            self.set_playback_status("Starting audio…".to_string());
             cx.notify();
             return;
         }
@@ -920,7 +922,7 @@ impl Browser {
         self.playback_init_intent = Some(intent);
         self.playback_init_epoch = self.playback_epoch;
         self.playback_init_generation = self.waveform_generation;
-        self.playback_status = "Starting audio…".to_string();
+        self.set_playback_status("Starting audio…".to_string());
         self.begin_audio_output_open(cx);
     }
 
@@ -950,7 +952,7 @@ impl Browser {
         };
         if should_cancel_pending_autoplay(self.autoplay_selection, Some(intent.origin)) {
             self.clear_playback_cursor();
-            self.playback_status = "Selection autoplay disabled".to_string();
+            self.set_playback_status("Selection autoplay disabled".to_string());
             cx.notify();
             return;
         }
@@ -972,7 +974,7 @@ impl Browser {
             selected_entry.as_ref(),
         ) else {
             self.clear_playback_cursor();
-            self.playback_status = "Playback request is no longer current".to_string();
+            self.set_playback_status("Playback request is no longer current".to_string());
             cx.notify();
             return;
         };
@@ -983,7 +985,7 @@ impl Browser {
                 return;
             }
             self.clear_playback_cursor();
-            self.playback_status = "Playback normalization is no longer current".to_string();
+            self.set_playback_status("Playback normalization is no longer current".to_string());
             cx.notify();
             return;
         }
@@ -996,7 +998,7 @@ impl Browser {
         }
         let Some(start) = normalized_playback_start(intent.start) else {
             self.clear_playback_cursor();
-            self.playback_status = "Invalid playback position".to_string();
+            self.set_playback_status("Invalid playback position".to_string());
             return;
         };
         let mode = playback_mode_for_intent(&intent);
@@ -1056,7 +1058,7 @@ impl Browser {
                 self.playback_metronome_beat_count = None;
                 self.playback_metronome_confirmed = false;
                 self.playback_cursor_pending = Some(start as f32);
-                self.playback_status = "Starting…".to_string();
+                self.set_playback_status("Starting…".to_string());
                 if record_last_played {
                     self.record_playback_for_intent(accepted_path.as_path(), accepted_at, cx);
                 }
@@ -1070,7 +1072,7 @@ impl Browser {
                 self.playback_metronome_beat_count = None;
                 self.playback_metronome_confirmed = false;
                 self.clear_playback_cursor();
-                self.playback_status = format!("Could not queue playback: {error:?}");
+                self.set_playback_status(format!("Could not queue playback: {error:?}"));
             }
         }
         cx.notify();
@@ -1108,7 +1110,7 @@ impl Browser {
             self.latest_playback_request_id = None;
         }
         self.playing_path = None;
-        self.playback_status = "Stopped".to_string();
+        self.set_playback_status("Stopped".to_string());
     }
 
     fn poll_playback_events(&mut self) {
@@ -1133,7 +1135,7 @@ impl Browser {
                     if let Some(pending) = self.pending_loop_retarget.as_ref() {
                         self.set_pending_playback_status(pending.request.target.desired);
                     } else {
-                        self.playback_status = "Playing".to_string();
+                        self.set_playback_status("Playing".to_string());
                     }
                 }
                 PlaybackRuntimeEvent::Progress { id, progress } => {
@@ -1143,7 +1145,7 @@ impl Browser {
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
                     self.pending_loop_retarget = None;
-                    self.playback_status = format!("Playback live update failed: {error}");
+                    self.set_playback_status(format!("Playback live update failed: {error}"));
                 }
                 PlaybackRuntimeEvent::Stopped { id }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
@@ -1156,7 +1158,7 @@ impl Browser {
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.accepted_playback_intent = None;
-                    self.playback_status = "Stopped".to_string();
+                    self.set_playback_status("Stopped".to_string());
                 }
                 PlaybackRuntimeEvent::Failed { id, error }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
@@ -1169,13 +1171,13 @@ impl Browser {
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.accepted_playback_intent = None;
-                    self.playback_status = format!("Playback failed: {error}");
+                    self.set_playback_status(format!("Playback failed: {error}"));
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
                     self.pending_loop_retarget = None;
-                    self.playback_status = "Playback live update cancelled".to_string();
+                    self.set_playback_status("Playback live update cancelled".to_string());
                 }
                 PlaybackRuntimeEvent::Cancelled { id, .. }
                     if playback_request_is_current(self.latest_playback_request_id, id) =>
@@ -1188,7 +1190,7 @@ impl Browser {
                     self.latest_playback_request_id = None;
                     self.playing_path = None;
                     self.accepted_playback_intent = None;
-                    self.playback_status = "Playback cancelled".to_string();
+                    self.set_playback_status("Playback cancelled".to_string());
                 }
                 _ => {}
             }
@@ -1296,9 +1298,9 @@ impl Browser {
             LoopRetargetProgressOutcome::Ignored => {}
             LoopRetargetProgressOutcome::Failed => {
                 if let Some(error) = progress.error.as_deref() {
-                    self.playback_status = format!("Playback live update failed: {error}");
+                    self.set_playback_status(format!("Playback live update failed: {error}"));
                 } else {
-                    self.playback_status = "Playback live update failed".to_string();
+                    self.set_playback_status("Playback live update failed".to_string());
                 }
             }
             LoopRetargetProgressOutcome::Inactive => self.clear_current_playback("Stopped"),
@@ -1309,8 +1311,9 @@ impl Browser {
                 if desired_matches {
                     self.set_playback_status_from_progress(&progress);
                 } else {
-                    self.playback_status =
-                        "Playback live update failed: playback mode did not change".to_string();
+                    self.set_playback_status(
+                        "Playback live update failed: playback mode did not change".to_string(),
+                    );
                 }
             }
         }
@@ -1352,17 +1355,17 @@ impl Browser {
     fn set_playback_status_from_progress(&mut self, progress: &PlaybackRuntimeProgress) {
         if let Some(progress) = progress.progress {
             let percent = progress * 100.0;
-            self.playback_status = format!("Playing {percent:.0}%");
+            self.set_playback_status(format!("Playing {percent:.0}%"));
         } else {
-            self.playback_status = "Playing".to_string();
+            self.set_playback_status("Playing".to_string());
         }
     }
 
     fn set_pending_playback_status(&mut self, desired: PlaybackDesiredState) {
-        self.playback_status = format!(
+        self.set_playback_status(format!(
             "{} · applying to playback",
             playback_state_status_word(desired)
-        );
+        ));
     }
 
     fn clear_current_playback(&mut self, status: &str) {
@@ -1375,7 +1378,7 @@ impl Browser {
         self.accepted_playback_intent = None;
         self.playback_metronome_beat_count = None;
         self.playback_metronome_confirmed = false;
-        self.playback_status = status.to_string();
+        self.set_playback_status(status.to_string());
     }
 
     fn pending_loop_retarget_is_current(&self, pending: &PendingLoopRetarget) -> bool {
@@ -1444,7 +1447,7 @@ impl Browser {
         self.audio_output_resume_generation = self.waveform_generation;
         self.audio_output_resolved = None;
         self.audio_output_applied_config = None;
-        self.audio_output_status = "Audio output change pending".to_string();
+        self.set_audio_output_status("Audio output change pending".to_string());
         self.begin_audio_output_open(cx);
     }
 
@@ -1452,7 +1455,7 @@ impl Browser {
         let resume = self.audio_output_resume.take();
         let pending = resume.clone().or_else(|| self.playback_init_intent.take());
         let Some(intent) = pending else {
-            self.playback_status = "Ready".to_string();
+            self.set_playback_status("Ready".to_string());
             return;
         };
         let should_queue = if intent.origin == PlaybackIntentOrigin::CompareAnchor {
@@ -1493,7 +1496,7 @@ impl Browser {
             self.queue_playback_intent(intent, cx);
         } else {
             self.clear_playback_cursor();
-            self.playback_status = "Ready".to_string();
+            self.set_playback_status("Ready".to_string());
         }
     }
 }

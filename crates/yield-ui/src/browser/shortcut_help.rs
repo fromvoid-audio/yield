@@ -272,6 +272,10 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Copy selected files",
     },
     ShortcutRow {
+        keys: "Cmd-Shift-L",
+        description: "Copy status log",
+    },
+    ShortcutRow {
         keys: "Cmd/Ctrl-F",
         description: "Focus sample search",
     },
