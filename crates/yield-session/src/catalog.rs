@@ -6,19 +6,22 @@ pub(crate) use yield_catalog::CatalogService;
 use yield_catalog::CatalogSubmitError as CatalogWorkerSubmitError;
 
 pub use yield_catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
-    CatalogError, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
-    CatalogRatingDecayRequestError, CatalogTagFilterRequestError, CatalogTagPageQuery,
-    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
+    CatalogDelivery, CatalogDisplayLabelsRequestError, CatalogError, CatalogEvent,
+    CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError,
+    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
+    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
-    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
-    MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
+    MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
+    MAX_WAV_METADATA_REQUEST_PATHS, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
     SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
     SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
     SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
     SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
-    SourceCurationOperationOutcome, SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SourceCurationOperationOutcome, SourceCurationTagFacts, SourceCurationUpdate,
+    SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    VerifiedSourceRoot, resolve_source_root,
 };
 
 /// Lifecycle state of the independently-owned source catalog worker.
@@ -64,6 +67,9 @@ pub enum CatalogSubmitError {
     /// A display-label request failed bounded input admission.
     #[error("invalid source catalog display-label request: {0}")]
     InvalidDisplayLabelsRequest(CatalogDisplayLabelsRequestError),
+    /// A per-file Curation tag-facts request failed bounded input admission.
+    #[error("invalid source catalog Curation tag-facts request: {0}")]
+    InvalidCurationTagFactsRequest(CatalogCurationTagFactsRequestError),
     /// A durable source curation request failed bounded or lifecycle admission.
     #[error("invalid source catalog curation request: {0}")]
     InvalidCurationRequest(CatalogCurationRequestError),
@@ -212,6 +218,9 @@ fn map_submit_error(error: CatalogWorkerSubmitError) -> CatalogSubmitError {
         }
         CatalogWorkerSubmitError::InvalidDisplayLabelsRequest(error) => {
             CatalogSubmitError::InvalidDisplayLabelsRequest(error)
+        }
+        CatalogWorkerSubmitError::InvalidCurationTagFactsRequest(error) => {
+            CatalogSubmitError::InvalidCurationTagFactsRequest(error)
         }
         CatalogWorkerSubmitError::InvalidTagFilterRequest(error) => {
             CatalogSubmitError::InvalidTagFilterRequest(error)

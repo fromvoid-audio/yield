@@ -232,12 +232,12 @@ impl Browser {
             })
         };
         let Some(index) = candidate else {
-            self.playback_status = "No WAV samples available for random audition".to_string();
+            self.set_playback_status("No WAV samples available for random audition".to_string());
             cx.notify();
             return;
         };
         let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
-            self.playback_status = "Random audition sample is unavailable".to_string();
+            self.set_playback_status("Random audition sample is unavailable".to_string());
             cx.notify();
             return;
         };
@@ -263,11 +263,11 @@ impl Browser {
         ) {
             self.finish_pending_random_audition(cx);
         } else if self.waveform_pending || self.waveform_task.is_some() {
-            self.playback_status = "Loading random audition preview…".to_string();
+            self.set_playback_status("Loading random audition preview…".to_string());
             cx.notify();
         } else if was_selected && !self.waveform_pending && self.waveform_task.is_none() {
             self.random_audition_pending = None;
-            self.playback_status = "Random audition preview unavailable".to_string();
+            self.set_playback_status("Random audition preview unavailable".to_string());
             cx.notify();
         }
     }
@@ -281,12 +281,12 @@ impl Browser {
             return;
         }
         if self.waveform.is_none() {
-            self.playback_status = "Random audition preview unavailable".to_string();
+            self.set_playback_status("Random audition preview unavailable".to_string());
             cx.notify();
             return;
         }
         if !pending_matches(self, &pending) {
-            self.playback_status = "Random audition preview unavailable".to_string();
+            self.set_playback_status("Random audition preview unavailable".to_string());
             cx.notify();
             return;
         }
@@ -295,13 +295,13 @@ impl Browser {
             .as_ref()
             .map(|preview| (preview.duration_seconds, preview.total_frames))
         else {
-            self.playback_status = "Random audition preview unavailable".to_string();
+            self.set_playback_status("Random audition preview unavailable".to_string());
             cx.notify();
             return;
         };
         let (start, end) = random_audition_span_for_units(duration_seconds, pending.units);
         let Some(region) = WaveformPlayRegion::new(f64::from(start), f64::from(end)) else {
-            self.playback_status = "Random audition span unavailable".to_string();
+            self.set_playback_status("Random audition span unavailable".to_string());
             cx.notify();
             return;
         };
@@ -314,7 +314,7 @@ impl Browser {
         super::similar_sections::invalidate_if_stale(self);
         self.waveform_viewport =
             viewport_containing_selection(self.waveform_viewport, total_frames, region);
-        self.playback_status = "Starting random audition…".to_string();
+        self.set_playback_status("Starting random audition…".to_string());
         let intent = super::transport::PlaybackIntent {
             start: region.start,
             region: Some(region),
@@ -330,11 +330,11 @@ impl Browser {
     /// Toggle whether the ordinary Space shortcut requests a random section.
     pub(super) fn toggle_sticky_random_audition(&mut self, cx: &mut Context<Self>) {
         self.random_audition_sticky = !self.random_audition_sticky;
-        self.playback_status = if self.random_audition_sticky {
+        self.set_playback_status(if self.random_audition_sticky {
             "Random audition enabled for Space".to_string()
         } else {
             "Random audition disabled for Space".to_string()
-        };
+        });
         cx.notify();
     }
 }
