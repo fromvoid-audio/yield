@@ -58,6 +58,13 @@ pub const FILE_OPERATION_OWNER_MAX_DIAGNOSTIC_BYTES: usize = 512;
 #[serde(transparent)]
 pub struct OwnerIdentity(Uuid);
 
+impl OwnerIdentity {
+    /// Return the opaque owner UUID as an observation only.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
 /// Stable identity for one file-owner effect.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -337,6 +344,11 @@ impl OwnedObjectIdentity {
     /// Generate an object identity for a test or future qualified backend.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Return the logical object UUID without granting access to a physical file.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
     }
 }
 
