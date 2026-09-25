@@ -29,6 +29,9 @@ pub const SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES: usize = 256 * 1024;
 /// Maximum UTF-8 byte length of one assembled display label.
 pub const SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES: usize = 4096;
 
+/// Maximum live paths accepted by one per-file Curation tag-facts read.
+pub const SOURCE_CURATION_TAG_FACTS_MAX_PATHS: usize = 64;
+
 /// Counts returned by one revision-fenced source tag filter read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceTagFilterResult {

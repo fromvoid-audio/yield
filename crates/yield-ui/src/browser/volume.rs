@@ -337,7 +337,7 @@ impl Browser {
     pub(super) fn mark_volume_applied_by_play(&mut self) {
         self.volume_runtime_pending = None;
         self.volume_runtime_retry_count = 0;
-        self.volume_status = None;
+        self.set_volume_status(None);
     }
 
     fn sync_runtime_volume(&mut self) {
@@ -354,16 +354,17 @@ impl Browser {
             Ok(()) => {
                 self.volume_runtime_pending = None;
                 self.volume_runtime_retry_count = 0;
-                self.volume_status = None;
+                self.set_volume_status(None);
             }
             Err(error) => {
                 self.volume_runtime_retry_count = self.volume_runtime_retry_count.saturating_add(1);
-                self.volume_status =
-                    Some(if self.volume_runtime_retry_count >= MAX_RUNTIME_RETRIES {
+                self.set_volume_status(Some(
+                    if self.volume_runtime_retry_count >= MAX_RUNTIME_RETRIES {
                         format!("Volume update failed; change volume to retry ({error:?})")
                     } else {
                         format!("Could not update audition volume: {error:?}")
-                    });
+                    },
+                ));
             }
         }
     }
