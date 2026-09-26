@@ -684,6 +684,8 @@ impl Render for Browser {
         context_menu::invalidate_if_stale(self);
         similar_sections::invalidate_if_stale(self);
         let theme = active(cx).clone();
+        let enlarged_text =
+            self.general_settings.text_scale_percent == yield_session::ENLARGED_TEXT_SCALE_PERCENT;
         let motion_frame = self.motion_frame(theme.motion, window);
         let playback_cursor_ratio = self.playback_cursor_ratio(theme.motion.enabled);
         let root_label = self
@@ -1195,10 +1197,16 @@ impl Render for Browser {
             )
             .child(
                 div()
+                    .debug_selector(|| "main-toolbar".into())
                     .flex()
                     .flex_none()
                     .items_center()
                     .h(px(theme.spacing.toolbar_height))
+                    .when(enlarged_text, |element| {
+                        element.flex_wrap().h(px(theme.spacing.control_height * 2.0
+                            + toolbar_gap
+                            + theme.spacing.panel_padding * 2.0))
+                    })
                     .gap(px(toolbar_gap))
                     .px(px(theme.spacing.panel_padding))
                     .bg(color(theme.colors.surface_raised))
@@ -1211,6 +1219,9 @@ impl Render for Browser {
                                 - theme.spacing.panel_padding)
                                 .max(0.0)))
                             .h_full()
+                            .when(enlarged_text, |element| {
+                                element.h(px(theme.spacing.control_height))
+                            })
                             .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
                                 window.start_window_move();
                             }),
@@ -1559,6 +1570,7 @@ impl Render for Browser {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .when(enlarged_text, |element| element.flex_none().w(px(160.0)))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
@@ -1872,7 +1884,14 @@ impl Render for Browser {
                     .w_full()
                     .min_w_0()
                     .overflow_hidden()
+                    .debug_selector(|| "main-status-bar".into())
                     .h(px(theme.spacing.status_height))
+                    .when(enlarged_text, |element| {
+                        element
+                            .flex_wrap()
+                            .items_start()
+                            .h(px(theme.spacing.status_height * 2.0))
+                    })
                     .gap(px(theme.spacing.control_gap))
                     .px(px(theme.spacing.panel_padding))
                     .bg(color(theme.colors.surface_raised))
@@ -2611,6 +2630,53 @@ mod tests {
                 "{selector} is below strip: {bounds:?}, strip {strip:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn enlarged_transport_controls_wrap_inside_minimum_window(cx: &mut TestAppContext) {
+        let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(960.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .expect("open compact test window")
+        });
+        let browser = window.root(cx).expect("browser root");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        browser.update(&mut cx, |view, cx| {
+            view.general_settings.text_scale_percent = 200;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.refresh().expect("enlarged transport layout");
+        let toolbar = cx.debug_bounds("main-toolbar").expect("toolbar bounds");
+        let random = cx
+            .debug_bounds("random-audition-toolbar")
+            .expect("random audition bounds");
+        let settings = cx.debug_bounds("theme-settings").expect("settings bounds");
+        let status = cx.debug_bounds("main-status-bar").expect("status bounds");
+        assert!(toolbar.size.height > px(70.0), "{toolbar:?}");
+        assert!(settings.top() > random.top(), "controls did not wrap");
+        for (name, control) in [("random", random), ("settings", settings)] {
+            assert!(control.left() >= toolbar.left());
+            assert!(control.right() <= toolbar.right());
+            assert!(control.top() >= toolbar.top());
+            assert!(
+                control.bottom() <= toolbar.bottom(),
+                "{name}: {control:?}, toolbar: {toolbar:?}"
+            );
+        }
+        assert!(status.top() >= toolbar.bottom());
+        assert!(status.bottom() <= px(560.0));
+        assert!(status.size.height > px(60.0));
     }
 
     #[gpui::test]
