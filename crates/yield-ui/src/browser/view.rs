@@ -5,7 +5,7 @@
 
 use gpui::{
     ClickEvent, Context, Div, DragMoveEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, Window, div, font, prelude::*, px, uniform_list,
+    MouseUpEvent, Pixels, Point, Render, Window, div, font, prelude::*, px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use yield_core::{PlaybackType, SortColumn, SortDirection, format_duration, format_last_played};
@@ -70,6 +70,69 @@ fn current_unix_epoch_seconds() -> i64 {
 }
 
 const MIN_SAMPLE_NAME_WIDTH: f32 = 192.0;
+const MIN_SIDEBAR_WIDTH: f32 = 180.0;
+const MAX_SIDEBAR_WIDTH: f32 = 420.0;
+const MIN_WAVEFORM_HEIGHT: f32 = 94.0;
+const MAX_WAVEFORM_HEIGHT: f32 = 512.0;
+const MIN_MAIN_PANE_WIDTH: f32 = 240.0;
+const MIN_LIST_ROWS: f32 = 4.0;
+const PANE_RESIZE_RAIL: f32 = 6.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneAxis {
+    Sidebar,
+    Waveform,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PaneResizeDrag {
+    axis: PaneAxis,
+    start_position: Point<Pixels>,
+    start_size: f32,
+    previous_preference: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidebarResizeToken;
+
+#[derive(Clone, Copy, Debug)]
+struct WaveformResizeToken;
+
+struct PaneResizeGhost;
+
+impl Render for PaneResizeGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+fn sidebar_width(preferred: Option<f32>, window_width: f32, theme: &Theme) -> f32 {
+    let maximum = (window_width - MIN_MAIN_PANE_WIDTH - PANE_RESIZE_RAIL)
+        .max(96.0)
+        .min(MAX_SIDEBAR_WIDTH);
+    preferred
+        .unwrap_or(theme.spacing.sidebar_width)
+        .clamp(MIN_SIDEBAR_WIDTH.min(maximum), maximum)
+}
+
+fn waveform_height(preferred: Option<f32>, window_height: f32, theme: &Theme) -> f32 {
+    let minimum = MIN_WAVEFORM_HEIGHT.max(
+        theme.waveform.title_height
+            + theme.waveform.metadata_height
+            + theme.waveform.scrollbar_height
+            + theme.spacing.waveform_min_bar_height,
+    );
+    let maximum = (window_height
+        - theme.spacing.toolbar_height
+        - theme.spacing.status_height
+        - theme.spacing.row_height * MIN_LIST_ROWS
+        - PANE_RESIZE_RAIL)
+        .max(minimum)
+        .min(MAX_WAVEFORM_HEIGHT.max(minimum));
+    preferred
+        .unwrap_or(theme.spacing.waveform_height)
+        .clamp(minimum, maximum)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct BrowserColumnVisibility {
@@ -119,6 +182,180 @@ fn playback_type_label(playback_type: Option<PlaybackType>) -> &'static str {
 }
 
 impl Browser {
+    fn begin_pane_resize(
+        &mut self,
+        axis: PaneAxis,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = active(cx);
+        let (start_size, previous_preference) = match axis {
+            PaneAxis::Sidebar => (
+                sidebar_width(
+                    self.preferred_sidebar_width,
+                    f32::from(window.bounds().size.width),
+                    theme,
+                ),
+                self.preferred_sidebar_width,
+            ),
+            PaneAxis::Waveform => (
+                waveform_height(
+                    self.preferred_waveform_height,
+                    f32::from(window.bounds().size.height),
+                    theme,
+                ),
+                self.preferred_waveform_height,
+            ),
+        };
+        self.pane_resize_drag = Some(PaneResizeDrag {
+            axis,
+            start_position: position,
+            start_size,
+            previous_preference,
+        });
+    }
+
+    fn update_pane_resize(
+        &mut self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.pane_resize_drag else {
+            return;
+        };
+        let theme = active(cx);
+        match drag.axis {
+            PaneAxis::Sidebar => {
+                let delta = f32::from(position.x - drag.start_position.x);
+                self.preferred_sidebar_width = Some(sidebar_width(
+                    Some(drag.start_size + delta),
+                    f32::from(window.bounds().size.width),
+                    theme,
+                ));
+            }
+            PaneAxis::Waveform => {
+                let delta = f32::from(position.y - drag.start_position.y);
+                self.preferred_waveform_height = Some(waveform_height(
+                    Some(drag.start_size + delta),
+                    f32::from(window.bounds().size.height),
+                    theme,
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_pane_resize(
+        &mut self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_pane_resize(position, window, cx);
+        self.pane_resize_drag = None;
+    }
+
+    pub(super) fn cancel_pane_resize(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.pane_resize_drag.take() else {
+            return;
+        };
+        match drag.axis {
+            PaneAxis::Sidebar => self.preferred_sidebar_width = drag.previous_preference,
+            PaneAxis::Waveform => self.preferred_waveform_height = drag.previous_preference,
+        }
+        cx.notify();
+    }
+
+    fn render_sidebar_resize_rail(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let rail_color = color(theme.colors.border);
+        let hover_color = color(theme.colors.border_emphasis);
+        div()
+            .id("workspace-sidebar-resize")
+            .debug_selector(|| String::from("workspace-sidebar-resize"))
+            .flex_none()
+            .w(px(PANE_RESIZE_RAIL))
+            .h_full()
+            .cursor_col_resize()
+            .bg(rail_color)
+            .hover(move |style| style.bg(hover_color))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    view.begin_pane_resize(PaneAxis::Sidebar, event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(SidebarResizeToken, |_, _, _, cx| {
+                cx.new(|_| PaneResizeGhost)
+            })
+            .on_drag_move::<SidebarResizeToken>(cx.listener(
+                |view, event: &DragMoveEvent<SidebarResizeToken>, window, cx| {
+                    view.update_pane_resize(event.event.position, window, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                    view.finish_pane_resize(event.position, window, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                    view.finish_pane_resize(event.position, window, cx);
+                }),
+            )
+    }
+
+    fn render_waveform_resize_rail(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rail_color = color(theme.colors.border);
+        let hover_color = color(theme.colors.border_emphasis);
+        div()
+            .id("workspace-waveform-resize")
+            .debug_selector(|| String::from("workspace-waveform-resize"))
+            .flex_none()
+            .w_full()
+            .h(px(PANE_RESIZE_RAIL))
+            .cursor_row_resize()
+            .bg(rail_color)
+            .hover(move |style| style.bg(hover_color))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    window.prevent_default();
+                    view.begin_pane_resize(PaneAxis::Waveform, event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag(WaveformResizeToken, |_, _, _, cx| {
+                cx.new(|_| PaneResizeGhost)
+            })
+            .on_drag_move::<WaveformResizeToken>(cx.listener(
+                |view, event: &DragMoveEvent<WaveformResizeToken>, window, cx| {
+                    view.update_pane_resize(event.event.position, window, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                    view.finish_pane_resize(event.position, window, cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseUpEvent, window, cx| {
+                    view.finish_pane_resize(event.position, window, cx);
+                }),
+            )
+    }
+
     fn render_waveform_panel(
         &self,
         theme: Theme,
@@ -683,7 +920,17 @@ impl Render for Browser {
         }
         context_menu::invalidate_if_stale(self);
         similar_sections::invalidate_if_stale(self);
-        let theme = active(cx).clone();
+        let mut theme = active(cx).clone();
+        theme.spacing.sidebar_width = sidebar_width(
+            self.preferred_sidebar_width,
+            f32::from(window.bounds().size.width),
+            &theme,
+        );
+        theme.spacing.waveform_height = waveform_height(
+            self.preferred_waveform_height,
+            f32::from(window.bounds().size.height),
+            &theme,
+        );
         let motion_frame = self.motion_frame(theme.motion, window);
         let jobs = super::job_details::snapshot(self);
         let jobs_status = jobs.status_label();
@@ -1740,6 +1987,7 @@ impl Render for Browser {
                         motion_frame,
                         cx,
                     ))
+                    .child(self.render_sidebar_resize_rail(theme.clone(), cx))
                     .child(
                         div()
                             .flex()
@@ -1752,6 +2000,7 @@ impl Render for Browser {
                                 playback_cursor_ratio,
                                 cx,
                             ))
+                            .child(self.render_waveform_resize_rail(theme.clone(), cx))
                             .child(
                                 div()
                                     .flex()
@@ -3409,6 +3658,129 @@ mod tests {
             browser_column_visibility(f32::NAN, &theme),
             BrowserColumnVisibility::default()
         );
+    }
+
+    #[test]
+    fn workspace_pane_sizes_clamp_to_window_and_restore_preferred_sizes() {
+        let theme = Theme::default();
+        assert_eq!(sidebar_width(Some(420.0), 1_280.0, &theme), 420.0);
+        assert!(sidebar_width(Some(420.0), 480.0, &theme) < 420.0);
+        assert_eq!(sidebar_width(Some(420.0), 1_280.0, &theme), 420.0);
+        assert_eq!(sidebar_width(Some(0.0), 1_280.0, &theme), 180.0);
+
+        assert_eq!(waveform_height(Some(512.0), 1_200.0, &theme), 512.0);
+        assert!(waveform_height(Some(512.0), 560.0, &theme) < 512.0);
+        assert_eq!(waveform_height(Some(512.0), 1_200.0, &theme), 512.0);
+        let enlarged = crate::theme::with_text_scale(&theme, 200);
+        let minimum = enlarged.waveform.title_height
+            + enlarged.waveform.metadata_height
+            + enlarged.waveform.scrollbar_height
+            + enlarged.spacing.waveform_min_bar_height;
+        assert!(waveform_height(Some(94.0), 560.0, &enlarged) >= minimum);
+    }
+
+    #[gpui::test]
+    fn workspace_pane_drag_and_cancel_preserve_browser_state(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let selected = view.selected;
+                let playback_epoch = view.playback_epoch;
+                let start = point(px(300.0), px(220.0));
+
+                view.begin_pane_resize(PaneAxis::Sidebar, start, window, cx);
+                view.update_pane_resize(point(px(380.0), px(220.0)), window, cx);
+                assert!(view.preferred_sidebar_width.is_some());
+                assert_eq!(view.selected, selected);
+                assert_eq!(view.playback_epoch, playback_epoch);
+                view.cancel_pane_resize(cx);
+                assert!(view.preferred_sidebar_width.is_none());
+
+                view.begin_pane_resize(PaneAxis::Waveform, start, window, cx);
+                view.finish_pane_resize(point(px(300.0), px(320.0)), window, cx);
+                assert!(view.preferred_waveform_height.is_some());
+                assert!(view.pane_resize_drag.is_none());
+                assert_eq!(view.selected, selected);
+                assert_eq!(view.playback_epoch, playback_epoch);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn workspace_resize_rails_follow_pointer_drags(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.refresh().expect("initial workspace layout");
+        cx.run_until_parked();
+        let sidebar = cx
+            .debug_bounds("workspace-sidebar-resize")
+            .expect("sidebar resize rail");
+        let start = point(
+            sidebar.origin.x + sidebar.size.width / 2.0,
+            sidebar.origin.y + sidebar.size.height / 2.0,
+        );
+        let end = point(start.x + px(80.0), start.y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.cx
+            .update(|app| assert!(browser.read(app).pane_resize_drag.is_some()));
+        cx.simulate_mouse_move(
+            point(start.x + px(4.0), start.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().expect("sidebar drag layout");
+        let moved_sidebar = cx
+            .debug_bounds("workspace-sidebar-resize")
+            .expect("moved sidebar rail");
+        let preferred = cx
+            .cx
+            .update(|app| browser.read(app).preferred_sidebar_width);
+        assert!(
+            moved_sidebar.origin.x > sidebar.origin.x + px(40.0),
+            "sidebar={sidebar:?} moved={moved_sidebar:?} preferred={:?}",
+            preferred
+        );
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert!(view.preferred_sidebar_width.is_some());
+        });
+
+        let waveform = cx
+            .debug_bounds("workspace-waveform-resize")
+            .expect("waveform resize rail");
+        let start = point(
+            waveform.origin.x + waveform.size.width / 2.0,
+            waveform.origin.y + waveform.size.height / 2.0,
+        );
+        let end = point(start.x, start.y + px(60.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.cx
+            .update(|app| assert!(browser.read(app).pane_resize_drag.is_some()));
+        cx.simulate_mouse_move(
+            point(start.x, start.y + px(4.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.refresh().expect("waveform drag layout");
+        let moved_waveform = cx
+            .debug_bounds("workspace-waveform-resize")
+            .expect("moved waveform rail");
+        assert!(moved_waveform.origin.y > waveform.origin.y + px(30.0));
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        cx.cx.update(|app| {
+            let view = browser.read(app);
+            assert!(view.pane_resize_drag.is_none());
+            assert!(view.preferred_waveform_height.is_some());
+            assert!(view.selected.is_none());
+            assert!(view.waveform_play_region.is_none());
+        });
     }
 
     #[test]
