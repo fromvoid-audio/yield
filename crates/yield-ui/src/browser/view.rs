@@ -148,16 +148,22 @@ impl Browser {
         source: BrowserColumn,
         x: f32,
         start_width: f32,
+        name_width: f32,
         window: &mut Window,
     ) {
         window.focus(&self.focus_handle);
         self.suppress_column_sort_click = true;
         let previous_override = self.column_layout.width_override(source);
+        let previous_name_override = self.column_layout.width_override(BrowserColumn::Name);
+        if source != BrowserColumn::Name {
+            self.column_layout.freeze_name_width(name_width);
+        }
         self.column_gesture = Some(ColumnGesture::Resize {
             source,
             start_x: x,
             start_width,
             previous_override,
+            previous_name_override,
         });
     }
 
@@ -252,12 +258,15 @@ impl Browser {
         } else if let ColumnGesture::Resize {
             source,
             previous_override,
+            previous_name_override,
             ..
         } = gesture
         {
             if !commit {
                 self.column_layout
                     .restore_width_override(source, previous_override);
+                self.column_layout
+                    .restore_width_override(BrowserColumn::Name, previous_name_override);
             }
         }
         cx.notify();
@@ -267,11 +276,14 @@ impl Browser {
         if let Some(ColumnGesture::Resize {
             source,
             previous_override,
+            previous_name_override,
             ..
         }) = self.column_gesture.take()
         {
             self.column_layout
                 .restore_width_override(source, previous_override);
+            self.column_layout
+                .restore_width_override(BrowserColumn::Name, previous_name_override);
         }
         cx.notify();
     }
@@ -279,11 +291,11 @@ impl Browser {
     fn render_browser_header_column(
         &self,
         column: ResolvedColumn,
+        name_width: f32,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let content: AnyElement = if column.id == BrowserColumn::Name {
-            let name_label_width = (column.width - 86.0).max(48.0);
             div()
                 .flex()
                 .flex_none()
@@ -294,7 +306,7 @@ impl Browser {
                     column.id,
                     theme.clone(),
                     cx,
-                    Some(name_label_width),
+                    None,
                     theme.spacing.row_padding_x,
                 ))
                 .child(self.render_random_navigation_button(theme.clone(), cx))
@@ -357,6 +369,7 @@ impl Browser {
                                 column.id,
                                 f32::from(event.position.x),
                                 column.width,
+                                name_width,
                                 window,
                             );
                             cx.stop_propagation();
@@ -986,6 +999,10 @@ impl Render for Browser {
         let resolved_columns =
             self.column_layout
                 .resolve(&theme, column_visibility, available_table_width);
+        let name_column_width = resolved_columns
+            .iter()
+            .find(|column| column.id == BrowserColumn::Name)
+            .map_or(MIN_SAMPLE_NAME_WIDTH, |column| column.width);
         let table_width = theme.spacing.selected_marker_width
             + resolved_columns
                 .iter()
@@ -1207,6 +1224,7 @@ impl Render for Browser {
                                         for column in &row_columns {
                                             let cell: AnyElement = match column.id {
                                                 BrowserColumn::Name => div()
+                                                    .debug_selector(move || format!("browser-row-name-{visible_index}"))
                                                     .flex_none()
                                                     .w(px(column.width))
                                                     .overflow_hidden()
@@ -1993,13 +2011,16 @@ impl Render for Browser {
                                     .child(
                                         div()
                                             .id("sample-table-scroll")
+                                            .debug_selector(|| "sample-table-viewport".into())
                                             .flex()
                                             .flex_col()
                                             .flex_1()
+                                            .w_full()
                                             .min_w_0()
                                             .overflow_x_scroll()
                                             .child(
                                                 div()
+                                                    .debug_selector(|| "sample-table-content".into())
                                                     .flex()
                                                     .flex_col()
                                                     .h_full()
@@ -2054,6 +2075,7 @@ impl Render for Browser {
                                                             column_header = column_header.child(
                                                                 self.render_browser_header_column(
                                                                     *column,
+                                                                    name_column_width,
                                                                     theme.clone(),
                                                                     cx,
                                                                 ),
@@ -2189,8 +2211,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use gpui::{
-        EntityInputHandler, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, TestAppContext,
-        VisualTestContext, point, px,
+        EntityInputHandler, KeyDownEvent, Keystroke, Modifiers, MouseDownEvent, ScrollDelta,
+        ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, point, px,
     };
     use yield_core::{AudioFile, BrowserViewModel, WaveformEditFade, WaveformEditSettings};
     use yield_media::WaveformPreview;
@@ -2289,6 +2311,57 @@ mod tests {
                 [other]
             );
         });
+    }
+
+    #[gpui::test]
+    fn horizontal_table_scroll_moves_header_and_rows_together(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        browser.update(cx, |view, _| {
+            for column in BrowserColumn::DEFAULT_ORDER {
+                view.column_layout.set_width(column, 420.0);
+            }
+            let root = PathBuf::from("/tmp/opt1908-scroll-fixture");
+            view.root = Some(root.clone());
+            view.entries = vec![AudioFile {
+                path: root.join("alpha.wav"),
+                relative_path: PathBuf::from("alpha.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.view_model = BrowserViewModel::new(&view.entries);
+        });
+        cx.refresh().expect("render overflowed table");
+        cx.run_until_parked();
+        let name_before = cx.debug_bounds("browser-column-Name").expect("name header");
+        let row_before = cx
+            .debug_bounds("browser-row-name-0")
+            .expect("first row name cell");
+        let scroll_position = point(
+            name_before.origin.x + px(50.0),
+            name_before.origin.y + name_before.size.height / 2.0,
+        );
+        cx.simulate_event(ScrollWheelEvent {
+            position: scroll_position,
+            delta: ScrollDelta::Pixels(point(px(-200.0), px(0.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh().expect("render horizontally scrolled table");
+        let name_after = cx
+            .debug_bounds("browser-column-Name")
+            .expect("scrolled name header");
+        let row_after = cx
+            .debug_bounds("browser-row-name-0")
+            .expect("scrolled row name cell");
+        assert!(name_after.origin.x < name_before.origin.x - px(50.0));
+        assert_eq!(
+            row_after.origin.x - row_before.origin.x,
+            name_after.origin.x - name_before.origin.x
+        );
     }
 
     #[gpui::test]
@@ -2392,6 +2465,9 @@ mod tests {
             .debug_bounds("browser-column-Rating")
             .expect("resized rating");
         assert!(resized.size.width > rating.size.width + px(25.0));
+        assert!(
+            resized.origin.x + resized.size.width > rating.origin.x + rating.size.width + px(25.0)
+        );
 
         let rating_start = point(
             resized.origin.x + px(20.0),

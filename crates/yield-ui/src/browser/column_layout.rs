@@ -22,6 +22,7 @@ pub(super) enum ColumnGesture {
         start_x: f32,
         start_width: f32,
         previous_override: Option<f32>,
+        previous_name_override: Option<f32>,
     },
 }
 
@@ -146,6 +147,12 @@ impl ColumnLayout {
 
     pub(super) fn restore_width_override(&mut self, column: BrowserColumn, value: Option<f32>) {
         self.widths[column.index()] = value;
+    }
+
+    pub(super) fn freeze_name_width(&mut self, rendered_width: f32) {
+        if self.widths[BrowserColumn::Name.index()].is_none() {
+            self.widths[BrowserColumn::Name.index()] = Some(rendered_width);
+        }
     }
 
     pub(super) fn resolve(
