@@ -84,6 +84,7 @@ mod file_drag;
 mod general_settings;
 mod handoff;
 mod history;
+mod job_details;
 mod metronome;
 mod motion;
 mod normalized_audition;
@@ -362,6 +363,8 @@ pub(crate) struct Browser {
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
+    job_details_open: bool,
+    job_details_focus_handle: FocusHandle,
     status_log: status_log::StatusLog,
     playback_status: String,
     volume: f32,
@@ -527,7 +530,11 @@ impl Browser {
         let mut browser = Self::new(cx);
         #[cfg(target_os = "macos")]
         {
-            browser.accessibility = accessibility::BrowserAccessibility::new(window, cx);
+            browser.accessibility = accessibility::BrowserAccessibility::new(
+                window,
+                cx,
+                browser.job_details_focus_handle.clone(),
+            );
         }
         #[cfg(not(target_os = "macos"))]
         let _ = window;
@@ -670,6 +677,8 @@ impl Browser {
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
+            job_details_open: false,
+            job_details_focus_handle: cx.focus_handle(),
             status_log: status_log::StatusLog::default(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
@@ -2560,6 +2569,16 @@ impl Browser {
         let function = event.keystroke.modifiers.function;
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
+        if self.job_details_open
+            && self.job_details_focus_handle.is_focused(window)
+            && key == "escape"
+            && !event.is_held
+        {
+            self.job_details_open = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if self.shortcut_help.is_open()
             || self.theme_settings_open
             || self.audio_settings_open
