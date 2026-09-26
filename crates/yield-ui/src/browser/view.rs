@@ -4,8 +4,8 @@
 //! Browser rendering and the compact Yield application shell.
 
 use gpui::{
-    ClickEvent, Context, Div, DragMoveEvent, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Render, Window, div, font, prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, DragMoveEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, Window, div, font, prelude::*, px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use yield_core::{PlaybackType, SortColumn, SortDirection, format_duration, format_last_played};
@@ -1883,37 +1883,46 @@ impl Render for Browser {
                     .border_color(color(theme.colors.border))
                     .text_size(px(theme.typography.small_size))
                     .text_color(color(theme.colors.text_muted))
-                    .child(self.playback_status.clone())
-                    .when_some(self.compare_anchor.as_ref(), |element, anchor| {
-                        let path = anchor.path();
-                        let name = path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.display().to_string());
-                        element.child(format!("Compare: {name}"))
-                    })
-                    .when(self.volume_status.is_some(), |element| {
-                        element.child(self.volume_status.clone().unwrap_or_default())
-                    })
-                    .child(list_status)
-                    .child(self.source_registry_status.clone())
-                    .when(curation_status.is_some(), move |element| {
-                        element.child(curation_status.clone().unwrap_or_default())
-                    })
-                    .when(metadata_status.is_some(), move |element| {
-                        element.child(metadata_status.clone().unwrap_or_default())
-                    })
-                    .when(display_labels_status.is_some(), move |element| {
-                        element.child(display_labels_status.clone().unwrap_or_default())
-                    })
-                    .when(zero_crossing_status.is_some(), move |element| {
-                        element.child(zero_crossing_status.unwrap_or_default())
-                    })
-                    .when(selected_count.is_some(), move |element| {
-                        element.child(selected_count.unwrap_or_default())
-                    })
-                    .child(div().flex_1())
-                    .child(self.theme_status.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(theme.spacing.control_gap))
+                            .overflow_hidden()
+                            .child(self.playback_status.clone())
+                            .when_some(self.compare_anchor.as_ref(), |element, anchor| {
+                                let path = anchor.path();
+                                let name = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                element.child(format!("Compare: {name}"))
+                            })
+                            .when(self.volume_status.is_some(), |element| {
+                                element.child(self.volume_status.clone().unwrap_or_default())
+                            })
+                            .child(list_status)
+                            .child(self.source_registry_status.clone())
+                            .when(curation_status.is_some(), move |element| {
+                                element.child(curation_status.clone().unwrap_or_default())
+                            })
+                            .when(metadata_status.is_some(), move |element| {
+                                element.child(metadata_status.clone().unwrap_or_default())
+                            })
+                            .when(display_labels_status.is_some(), move |element| {
+                                element.child(display_labels_status.clone().unwrap_or_default())
+                            })
+                            .when(zero_crossing_status.is_some(), move |element| {
+                                element.child(zero_crossing_status.unwrap_or_default())
+                            })
+                            .when(selected_count.is_some(), move |element| {
+                                element.child(selected_count.unwrap_or_default())
+                            })
+                            .child(div().flex_1())
+                            .child(self.theme_status.clone()),
+                    )
                     .child(
                         div()
                             .id("status-job-details")
@@ -1942,23 +1951,6 @@ impl Render for Browser {
                                 window.focus(&view.job_details_focus_handle);
                                 view.job_details_open = !view.job_details_open;
                                 cx.notify();
-                            }))
-                            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
-                                if !event.is_held
-                                    && !event.keystroke.modifiers.platform
-                                    && !event.keystroke.modifiers.control
-                                    && !event.keystroke.modifiers.alt
-                                    && !event.keystroke.modifiers.shift
-                                    && !event.keystroke.modifiers.function
-                                    && matches!(
-                                        event.keystroke.key.to_ascii_lowercase().as_str(),
-                                        "enter" | "return" | "space"
-                                    )
-                                {
-                                    view.job_details_open = !view.job_details_open;
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                }
                             })),
                     ),
             )
@@ -3366,7 +3358,10 @@ mod tests {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
         cx.simulate_resize(size(px(960.0), px(560.0)));
-        browser.update(cx, |view, _| view.job_details_open = true);
+        browser.update(cx, |view, _| {
+            view.job_details_open = true;
+            view.source_registry_status = "Source status ".repeat(100);
+        });
         cx.draw(
             point(px(0.0), px(0.0)),
             size(
@@ -3390,7 +3385,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn job_details_keyboard_route_requires_its_focus(cx: &mut TestAppContext) {
+    fn job_details_does_not_duplicate_focused_keyboard_click(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
         cx.update(|window, app| {
@@ -3399,16 +3394,9 @@ mod tests {
                     keystroke: Keystroke::parse("enter").expect("Enter"),
                     is_held: false,
                 };
-                window.focus(&view.search_input.read(cx).focus_handle());
-                view.handle_key_down(&enter, window, cx);
-                assert!(!view.job_details_open);
-
                 window.focus(&view.job_details_focus_handle);
                 view.handle_key_down(&enter, window, cx);
-                assert!(view.job_details_open);
-                view.handle_key_down(&enter, window, cx);
                 assert!(!view.job_details_open);
-
                 view.job_details_open = true;
                 let escape = KeyDownEvent {
                     keystroke: Keystroke::parse("escape").expect("Escape"),

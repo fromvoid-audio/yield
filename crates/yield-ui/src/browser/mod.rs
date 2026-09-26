@@ -2579,22 +2579,6 @@ impl Browser {
             cx.stop_propagation();
             return;
         }
-        if !event.is_held
-            && !secondary
-            && !alt
-            && !function
-            && !shift
-            && matches!(
-                key.to_ascii_lowercase().as_str(),
-                "enter" | "return" | "space"
-            )
-            && self.job_details_focus_handle.is_focused(window)
-        {
-            self.job_details_open = !self.job_details_open;
-            cx.notify();
-            cx.stop_propagation();
-            return;
-        }
         if self.shortcut_help.is_open()
             || self.theme_settings_open
             || self.audio_settings_open
