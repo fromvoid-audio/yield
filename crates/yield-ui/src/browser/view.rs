@@ -4,8 +4,8 @@
 //! Browser rendering and the compact Yield application shell.
 
 use gpui::{
-    ClickEvent, Context, Div, DragMoveEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, Window, div, font, prelude::*, px, uniform_list,
+    ClickEvent, Context, Div, DragMoveEvent, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, Window, div, font, prelude::*, px, uniform_list,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use yield_core::{PlaybackType, SortColumn, SortDirection, format_duration, format_last_played};
@@ -685,6 +685,9 @@ impl Render for Browser {
         similar_sections::invalidate_if_stale(self);
         let theme = active(cx).clone();
         let motion_frame = self.motion_frame(theme.motion, window);
+        let jobs = super::job_details::snapshot(self);
+        let jobs_status = jobs.status_label();
+        let jobs_running = jobs.active_count() > 0;
         let playback_cursor_ratio = self.playback_cursor_ratio(theme.motion.enabled);
         let root_label = self
             .root
@@ -1911,18 +1914,90 @@ impl Render for Browser {
                     })
                     .child(div().flex_1())
                     .child(self.theme_status.clone())
-                    .when(self.motion_pending().any(), |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .w(px(10.0))
-                                .h(px(10.0))
-                                .rounded_full()
-                                .bg(color(theme.colors.accent))
-                                .opacity(f32::from(motion_frame.worker_alpha) / 255.0),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .id("status-job-details")
+                            .track_focus(&self.job_details_focus_handle)
+                            .debug_selector(|| "status-job-details".into())
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(theme.spacing.control_gap))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(10.0))
+                                    .h(px(10.0))
+                                    .rounded_full()
+                                    .bg(color(theme.colors.accent))
+                                    .opacity(if jobs_running {
+                                        f32::from(motion_frame.worker_alpha) / 255.0
+                                    } else {
+                                        0.35
+                                    }),
+                            )
+                            .child(jobs_status)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                window.focus(&view.job_details_focus_handle);
+                                view.job_details_open = !view.job_details_open;
+                                cx.notify();
+                            }))
+                            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+                                if !event.is_held
+                                    && !event.keystroke.modifiers.platform
+                                    && !event.keystroke.modifiers.control
+                                    && !event.keystroke.modifiers.alt
+                                    && !event.keystroke.modifiers.shift
+                                    && !event.keystroke.modifiers.function
+                                    && matches!(
+                                        event.keystroke.key.to_ascii_lowercase().as_str(),
+                                        "enter" | "return" | "space"
+                                    )
+                                {
+                                    view.job_details_open = !view.job_details_open;
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }
+                            })),
+                    ),
             )
+            .when(self.job_details_open, |element| {
+                let mut panel = div()
+                    .id("status-job-details-panel")
+                    .debug_selector(|| "status-job-details-panel".into())
+                    .absolute()
+                    .bottom(px(theme.spacing.status_height))
+                    .right(px(theme.spacing.panel_padding))
+                    .w(px(360.0))
+                    .max_h(px(300.0))
+                    .overflow_y_scroll()
+                    .p(px(theme.spacing.panel_padding))
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.spacing.control_gap))
+                    .bg(color(theme.colors.surface_raised))
+                    .border(px(theme.spacing.border_width))
+                    .border_color(color(theme.colors.border))
+                    .occlude()
+                    .child("Job Details");
+                if jobs.rows.is_empty() {
+                    panel = panel.child("No active jobs");
+                }
+                for row in &jobs.rows {
+                    let source = row.source_label();
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(format!("{} · {source}", row.kind.label()))
+                            .child(row.state_label())
+                            .child(row.work)
+                            .when_some(row.blocked_label(), |element, error| element.child(error)),
+                    );
+                }
+                element.child(panel)
+            })
             .when(self.audio_settings_open, |element| {
                 element.child(
                     div()
@@ -3282,5 +3357,70 @@ mod tests {
         assert_eq!(playback_type_label(Some(PlaybackType::Loop)), "Loop");
         assert_eq!(playback_type_label(Some(PlaybackType::OneShot)), "1-Shot");
         assert_eq!(playback_type_label(None), "—");
+    }
+
+    #[gpui::test]
+    fn job_details_fit_compact_window(cx: &mut TestAppContext) {
+        use gpui::{AvailableSpace, size};
+
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.simulate_resize(size(px(960.0), px(560.0)));
+        browser.update(cx, |view, _| view.job_details_open = true);
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(
+                AvailableSpace::Definite(px(960.0)),
+                AvailableSpace::Definite(px(560.0)),
+            ),
+            |_, _| browser.clone(),
+        );
+        let control = cx
+            .debug_bounds("status-job-details")
+            .expect("job details status control");
+        let panel = cx
+            .debug_bounds("status-job-details-panel")
+            .expect("job details panel");
+        assert!(control.right() <= px(960.0));
+        assert!(control.bottom() <= px(560.0));
+        assert!(panel.left() >= px(0.0));
+        assert!(panel.right() <= px(960.0));
+        assert!(panel.top() >= px(0.0));
+        assert!(panel.bottom() <= control.top());
+    }
+
+    #[gpui::test]
+    fn job_details_keyboard_route_requires_its_focus(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let enter = KeyDownEvent {
+                    keystroke: Keystroke::parse("enter").expect("Enter"),
+                    is_held: false,
+                };
+                window.focus(&view.search_input.read(cx).focus_handle());
+                view.handle_key_down(&enter, window, cx);
+                assert!(!view.job_details_open);
+
+                window.focus(&view.job_details_focus_handle);
+                view.handle_key_down(&enter, window, cx);
+                assert!(view.job_details_open);
+                view.handle_key_down(&enter, window, cx);
+                assert!(!view.job_details_open);
+
+                view.job_details_open = true;
+                let escape = KeyDownEvent {
+                    keystroke: Keystroke::parse("escape").expect("Escape"),
+                    is_held: false,
+                };
+                window.focus(&view.search_input.read(cx).focus_handle());
+                view.handle_key_down(&escape, window, cx);
+                assert!(view.job_details_open);
+                window.focus(&view.job_details_focus_handle);
+                view.handle_key_down(&escape, window, cx);
+                assert!(!view.job_details_open);
+            });
+        });
     }
 }

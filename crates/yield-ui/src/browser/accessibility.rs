@@ -28,6 +28,8 @@ pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
 pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
 pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
 pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+pub(super) const JOB_DETAILS: &str = "status-job-details";
+const JOB_DETAILS_PANEL: &str = "status-job-details-panel";
 const PLAY: &str = "transport-play";
 const STOP: &str = "transport-stop";
 const LOOP: &str = "transport-loop";
@@ -210,7 +212,11 @@ pub(super) struct BrowserAccessibility {
 }
 
 impl BrowserAccessibility {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Browser>) -> Option<Self> {
+    pub(super) fn new(
+        window: &mut Window,
+        cx: &mut Context<Browser>,
+        job_details_focus: FocusHandle,
+    ) -> Option<Self> {
         let handle = match window.window_handle() {
             Ok(handle) => handle,
             Err(error) => {
@@ -251,6 +257,7 @@ impl BrowserAccessibility {
         ] {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
+        control_focus.insert(JOB_DETAILS.to_owned(), job_details_focus);
         for id in SETTINGS_ORDER.iter().copied().chain([SETTINGS_OPEN]) {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
@@ -420,6 +427,7 @@ impl BrowserAccessibility {
                                 | CURATION_QUEUE_SCOPE
                                 | RANDOM_NAVIGATION
                                 | NAME_VIEW_MODE
+                                | JOB_DETAILS
                         ) || sort_action.is_some()
                             || collection_action.is_some()
                             || playback_type_action.is_some()
@@ -614,6 +622,10 @@ impl BrowserAccessibility {
                                 }
                                 RANDOM_NAVIGATION => view.toggle_random_navigation(cx),
                                 NAME_VIEW_MODE => view.toggle_sample_name_view_mode(cx),
+                                JOB_DETAILS => {
+                                    view.job_details_open = !view.job_details_open;
+                                    cx.notify();
+                                }
                                 _ => match source_action {
                                     Some((index, true)) => {
                                         view.forget_source(index, window, cx);
@@ -1109,6 +1121,50 @@ impl Browser {
                 ),
                 true,
             ));
+            let jobs = super::job_details::snapshot(self);
+            controls.push(button(
+                JOB_DETAILS,
+                "Job Details",
+                Some(format!(
+                    "{}, {}",
+                    if self.job_details_open {
+                        "Open"
+                    } else {
+                        "Closed"
+                    },
+                    jobs.status_label()
+                )),
+                true,
+            ));
+            if self.job_details_open {
+                let details = if jobs.rows.is_empty() {
+                    "No active jobs".to_string()
+                } else {
+                    jobs.rows
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{} for {}: {}, {}{}",
+                                row.kind.label(),
+                                row.source_label(),
+                                row.state_label(),
+                                row.work,
+                                row.blocked_label()
+                                    .map(|error| format!(", {error}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                };
+                controls.push(AxChild {
+                    id: JOB_DETAILS_PANEL.into(),
+                    role: AxRole::Group,
+                    label: "Job Details panel".into(),
+                    value: Some(details),
+                    enabled: true,
+                });
+            }
             if self.theme_settings_open {
                 let editable = self.preferences_editable();
                 let busy = self.general_settings.maintenance_busy();
