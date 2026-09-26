@@ -515,6 +515,12 @@ impl BrowserAccessibility {
                         {
                             return;
                         }
+                        if event.id == SETTINGS_OPEN
+                            && event.action == AxAction::Press
+                            && !view.theme_settings_open
+                        {
+                            view.general_settings.previous_focus = window.focused(cx);
+                        }
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);

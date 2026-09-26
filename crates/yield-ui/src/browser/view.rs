@@ -2554,6 +2554,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn general_settings_ax_activation_keeps_previously_focused_input(cx: &mut TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                let search_focus = view.search_input.read(cx).focus_handle();
+                window.focus(&search_focus);
+                // AX dispatch captures focus before focusing the settings button.
+                view.general_settings.previous_focus = window.focused(cx);
+                window.focus(&view.focus_handle);
+                view.toggle_theme_settings_from_accessibility(window, cx);
+                assert!(view.theme_settings_open);
+                assert_eq!(
+                    view.general_settings.previous_focus,
+                    Some(search_focus.clone())
+                );
+                view.close_general_settings(window, cx);
+                assert!(search_focus.is_focused(window));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn enlarged_settings_controls_wrap_within_narrow_viewport(cx: &mut TestAppContext) {
         let enlarged = crate::theme::with_text_scale(&Theme::default(), 200);
         cx.set_global(crate::theme::ActiveTheme(std::sync::Arc::new(enlarged)));

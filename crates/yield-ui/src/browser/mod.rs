@@ -2018,7 +2018,9 @@ impl Browser {
         if self.theme_settings_open {
             self.close_general_settings(window, cx);
         } else {
-            self.general_settings.previous_focus = window.focused(cx);
+            if self.general_settings.previous_focus.is_none() {
+                self.general_settings.previous_focus = window.focused(cx);
+            }
             self.theme_settings_open = true;
             self.audio_settings_open = false;
             self.audio_output_dropdown = None;
