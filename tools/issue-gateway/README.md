@@ -15,9 +15,9 @@ The Worker emits generic errors without OAuth codes, GitHub tokens, gateway sess
 
 ## Deployment prerequisites
 
-- Choose the feedback repository and its visibility. A public target can request `public_repo`; the current private `PORTALSURFER/yield` target requires the broad `repo` OAuth scope. That choice is pending.
+- The approved feedback destination is the existing private `PORTALSURFER/yield` repository. GitHub's OAuth `repo` scope grants access to all private repositories the authorizing user can access, not just Yield. Review that broad grant in the GitHub consent screen before connecting; the Worker only creates issues in `PORTALSURFER/yield`.
 - Create a separate GitHub OAuth app with callback `https://<new-yield-worker-host>/auth/callback`. Store its client secret using Wrangler secrets, never in this repo.
-- Create a new Yield KV namespace for `SESSIONS`. Do not reuse the legacy namespace or its sessions. Copy `wrangler.example.jsonc` to `wrangler.jsonc` and fill only the approved repository, scope, and new namespace ID. The client ID is a deployment variable; the client secret is a secret.
+- Create a new Yield KV namespace for `SESSIONS`. Do not reuse the legacy namespace or its sessions. Copy `wrangler.example.jsonc` to `wrangler.jsonc` and fill the new namespace ID; keep the approved repository and scope. The client ID is a deployment variable; the client secret is a secret.
 - Review the Worker target and run its tests/typecheck. Run an OAuth connect, expiry, rejection, and confirmed issue-creation session against the approved target before pointing a release build at the Worker. Deployment and live issue creation require explicit approval.
 - Set the app's `YIELD_ISSUE_GATEWAY_URL` to the approved HTTPS Worker base URL. Without it, the Rust client reports that feedback is unconfigured. The GPUI prompt integration remains OPT-1896.
 
