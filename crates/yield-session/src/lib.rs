@@ -63,9 +63,9 @@ pub use maintenance::{
 
 pub use preferences::{
     AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT,
-    ENLARGED_TEXT_SCALE_PERCENT, MAX_RATING_DECAY_WEEKS, MIN_RATING_DECAY_WEEKS, PreferenceError,
-    PreferenceEvent, PreferencePatch, PreferenceRequestId, PreferenceRevision,
-    UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
+    ENLARGED_TEXT_SCALE_PERCENT, MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS,
+    MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
+    PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
 use preferences::{PreferenceCoordinator, PreferenceOutcome, PreferenceSaveDeadline};
 
@@ -984,6 +984,8 @@ fn sources_equal(left: &[SampleSource], right: &[SampleSource]) -> bool {
 
 struct Persistence {
     maintenance: MaintenanceService,
+    catalog_slot: Arc<Mutex<CatalogSlot>>,
+    vocabulary_slot: Arc<Mutex<VocabularySlot>>,
     catalog: Option<Arc<CatalogService>>,
     writer: Option<GlobalLibraryWriter>,
     journal: Option<OperationJournalOwner>,
@@ -1016,6 +1018,8 @@ impl Persistence {
         let mut persistence = Self {
             writable: None,
             maintenance: MaintenanceService::new(maintenance_admission),
+            catalog_slot: Arc::clone(&catalog_slot),
+            vocabulary_slot: Arc::clone(&vocabulary_slot),
             writer: None,
             catalog: None,
             journal: None,
@@ -1159,6 +1163,20 @@ impl Persistence {
                         _ => None,
                     })
             })
+    }
+
+    fn fence_dependents_after_journal_failure(&self, error: &SessionError) {
+        if !self.journal.as_ref().is_some_and(|journal| {
+            matches!(
+                journal.status(),
+                OperationJournalOwnerStatus::Unavailable { .. }
+            )
+        }) {
+            return;
+        }
+        let reason = error.to_string();
+        catalog::mark_unavailable(&self.catalog_slot, reason.clone());
+        vocabulary::mark_unavailable(&self.vocabulary_slot, reason);
     }
 
     fn available(&self) -> bool {
@@ -2427,6 +2445,7 @@ fn report_unavailable(
     reported: &mut bool,
     unfinalized_requests: &mut HashSet<RequestId>,
 ) {
+    persistence.fence_dependents_after_journal_failure(&error);
     persistence.unavailable = Some(error.clone());
     let mut failed_requests: Vec<_> = unfinalized_requests.drain().collect();
     failed_requests.sort_by_key(|request| request.get());
@@ -2639,6 +2658,7 @@ mod tests {
     use yield_library::sample_sources::{SourceId, SourceMetadataStorage};
 
     const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "YIELD_SESSION_OWNER_PROFILE_ROOT";
+    const SESSION_OWNER_READY_LINE: &str = "YIELD_SESSION_OWNER_READY";
     const FULL_PROGRESS_FIXTURE_OPERATION_ID: &str = "00000000-0000-0000-0000-0000000000cd";
     const FULL_PROGRESS_FIXTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2686,7 +2706,7 @@ mod tests {
                     Ok(0) => {
                         break Err(String::from("session owner helper exited before handshake"));
                     }
-                    Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                    Ok(_) if line.trim_end().ends_with(SESSION_OWNER_READY_LINE) => break Ok(()),
                     Ok(_) => continue,
                     Err(error) => {
                         break Err(format!("failed to read session owner handshake: {error}"));
@@ -2744,7 +2764,9 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for session owner slots"
+                "timed out waiting for session owner slots: catalog={:?}, vocabulary={:?}",
+                service.catalog_status(),
+                service.vocabulary_status()
             );
             thread::yield_now();
         }
@@ -4424,6 +4446,62 @@ mod tests {
     }
 
     #[test]
+    fn collection_slot_name_survives_profile_restart_without_leaking_to_another_profile() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let first_profile = profile_root(&temp);
+        let second_profile = temp
+            .path()
+            .join(".yield")
+            .join(PROFILE_DIR_NAME)
+            .join("other-profile");
+        fs::create_dir_all(&second_profile).expect("other profile root");
+        let second_profile = fs::canonicalize(second_profile).expect("canonical other profile");
+        let mut service =
+            SourceRegistryService::start_inner(Some(first_profile.clone())).expect("first start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        let request = service
+            .patch_preferences(PreferencePatch::SetCollectionName {
+                slot: 4,
+                name: String::from("Textures"),
+            })
+            .expect("rename request");
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::RequestApplied { request: applied, .. } if *applied == request),
+        );
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+        service.shutdown().expect("first shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(first_profile)).expect("reopen first");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences.collection_names[4].as_deref() == Some("Textures")
+        });
+        assert!(
+            restored
+                .collection_names
+                .iter()
+                .enumerate()
+                .all(|(slot, name)| slot == 4 || name.is_none())
+        );
+        reopened.shutdown().expect("reopen shutdown");
+
+        let mut other =
+            SourceRegistryService::start_inner(Some(second_profile)).expect("other profile start");
+        let isolated = wait_for_preference_snapshot(&other, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        assert!(isolated.collection_names.iter().all(Option::is_none));
+        other.shutdown().expect("other shutdown");
+    }
+
+    #[test]
     fn immediate_shutdown_persists_latest_output_volume() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -4779,6 +4857,88 @@ mod tests {
     }
 
     #[test]
+    fn competing_profile_restarts_only_after_orderly_volume_handoff() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let owner_root = profile_root(&temp);
+        let competing_root = temp
+            .path()
+            .join(".yield")
+            .join(PROFILE_DIR_NAME)
+            .join("competing-profile");
+        fs::create_dir_all(&competing_root).expect("competing profile root");
+        let competing_root = fs::canonicalize(competing_root).expect("canonical contender");
+
+        let mut owner =
+            SourceRegistryService::start_inner(Some(owner_root.clone())).expect("owner service");
+        wait_for_session_owner_slots(&owner);
+        let owner_journal = journal_database_path(&owner_root);
+        assert!(owner_journal.is_file());
+
+        let mut contender = SourceRegistryService::start_inner(Some(competing_root.clone()))
+            .expect("contender service");
+        wait_for_event(&contender, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::Persistence(reason),
+                    ..
+                } if reason.contains("volume ownership is held by another process")
+            )
+        });
+        let catalog_status = contender.catalog_status();
+        assert!(
+            matches!(
+                &catalog_status,
+                CatalogStatus::Unavailable { reason }
+                    if reason.contains("volume ownership is held by another process")
+            ),
+            "catalog status: {catalog_status:?}"
+        );
+        assert!(matches!(
+            contender.vocabulary_status(),
+            VocabularyStatus::Unavailable { reason }
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(matches!(
+            contender.submit_catalog(CatalogCommand::Register {
+                source_id: SourceId::from_string("competing-profile-source"),
+                canonical_root: competing_root.clone(),
+                lifecycle_generation: 1,
+            }),
+            Err(CatalogSubmitError::Unavailable(reason))
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(matches!(
+            contender.lookup_profile_tag_categories(vec![String::from("competing-profile-tag")]),
+            Err(VocabularySubmitError::Unavailable(reason))
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(matches!(
+            contender.shutdown(),
+            Err(ShutdownError::Session(SessionError::Persistence(reason)))
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(owner_journal.is_file());
+
+        owner.shutdown().expect("clean owner handoff");
+        let mut restarted = SourceRegistryService::start_inner(Some(competing_root))
+            .expect("competing profile restart");
+        wait_for_session_owner_slots(&restarted);
+        wait_for_catalog_ready(&restarted);
+        restarted.shutdown().expect("competing profile shutdown");
+        let _owner_scope = AppRootGuard::set(owner_root).expect("owner profile after handoff");
+        let guard = WritableProfileGuard::acquire_current().expect("owner profile remains usable");
+        let journal = OperationJournalStore::open(&guard).expect("owner journal remains readable");
+        assert!(matches!(
+            journal
+                .recovery_readiness()
+                .expect("owner recovery readiness"),
+            OperationJournalRecoveryReadiness::Clear
+        ));
+    }
+
+    #[test]
     fn cross_process_profile_owner_conflict_leaves_session_slots_uninstalled() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -4865,7 +5025,7 @@ mod tests {
         let mut service = SourceRegistryService::start_inner(Some(profile_root))
             .expect("session owner helper service");
         wait_for_session_owner_slots(&service);
-        println!("READY");
+        println!("{SESSION_OWNER_READY_LINE}");
         io::stdout()
             .flush()
             .expect("flush session owner helper handshake");
@@ -5007,6 +5167,8 @@ mod tests {
         let mut persistence = Persistence {
             writable: None,
             maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
+            catalog_slot: Arc::new(Mutex::new(CatalogSlot::loading())),
+            vocabulary_slot: Arc::new(Mutex::new(VocabularySlot::loading())),
             writer: None,
             catalog: None,
             journal: None,
@@ -5074,6 +5236,8 @@ mod tests {
         let mut persistence = Persistence {
             writable: None,
             maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
+            catalog_slot: Arc::new(Mutex::new(CatalogSlot::loading())),
+            vocabulary_slot: Arc::new(Mutex::new(VocabularySlot::loading())),
             writer: None,
             catalog: None,
             journal: None,

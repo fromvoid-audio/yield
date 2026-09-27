@@ -83,7 +83,7 @@ Yield is a focused sample-library workstation for browsing large folders, auditi
     <dl>
       <div class="hotkey-row"><dt><kbd>Space</kbd></dt><dd>Play the selected sample. When sticky random is on, play a random sample section.</dd></div>
       <div class="hotkey-row"><dt><kbd>Shift-Space</kbd></dt><dd>Play from the current play start.</dd></div>
-      <div class="hotkey-row"><dt><kbd>Option-Space</kbd></dt><dd>Play a random sample section.</dd></div>
+      <div class="hotkey-row"><dt><kbd>R</kbd></dt><dd>Play a random section of the selected sample.</dd></div>
       <div class="hotkey-row"><dt><kbd>X</kbd></dt><dd>Mark the sample and advance.</dd></div>
       <div class="hotkey-row"><dt><kbd>Command-A</kbd></dt><dd>Select all listed samples.</dd></div>
       <div class="hotkey-row"><dt><kbd>Command-C</kbd></dt><dd>Copy the play selection or selected file.</dd></div>

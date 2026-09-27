@@ -45,6 +45,7 @@ mod accessibility {
     pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
     pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
     pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+    pub(super) const COLLECTION_RENAME: &str = "browser-collection-rename-input";
 
     pub(super) fn sort_id(column: SortColumn) -> &'static str {
         match column {
@@ -73,6 +74,7 @@ mod accessibility {
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod collection_rename;
 mod column_layout;
 mod compare_anchor;
 mod context_menu;
@@ -82,6 +84,7 @@ mod direct_random;
 mod directory_open;
 mod display_labels;
 mod file_drag;
+mod folder_keyboard;
 mod general_settings;
 mod handoff;
 mod history;
@@ -308,6 +311,10 @@ pub(crate) struct Browser {
     _playmark_timing_subscription: gpui::Subscription,
     playmark_timing_editor: Option<PlaymarkTimingEditorState>,
     playmark_timing_blur_subscription: Option<gpui::Subscription>,
+    collection_rename_input: gpui::Entity<SearchInput>,
+    _collection_rename_subscription: gpui::Subscription,
+    collection_rename_editor: Option<collection_rename::CollectionRenameEditor>,
+    suppress_collection_keyboard_click: Option<usize>,
     beat_count_input: gpui::Entity<BeatCountInput>,
     _beat_count_subscription: gpui::Subscription,
     tag_input: gpui::Entity<SearchInput>,
@@ -326,6 +333,7 @@ pub(crate) struct Browser {
     folder_tree: Option<FolderTree>,
     folder_rows_cache: Vec<FolderTreeRow>,
     selected_folder: PathBuf,
+    folder_keyboard: Option<folder_keyboard::FolderKeyboardState>,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
     restore_selection_id: Option<AudioFileId>,
@@ -585,6 +593,16 @@ impl Browser {
                 }
             },
         );
+        let collection_rename_input =
+            cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::collection_name()));
+        let collection_rename_subscription = cx.subscribe(
+            &collection_rename_input,
+            |view, _input, _: &SearchChanged, cx| {
+                if view.collection_rename_editor.is_some() {
+                    cx.notify();
+                }
+            },
+        );
         let beat_count_input = cx.new(BeatCountInput::new);
         let beat_count_subscription = cx.subscribe(
             &beat_count_input,
@@ -631,6 +649,10 @@ impl Browser {
             _playmark_timing_subscription: playmark_timing_subscription,
             playmark_timing_editor: None,
             playmark_timing_blur_subscription: None,
+            collection_rename_input,
+            _collection_rename_subscription: collection_rename_subscription,
+            collection_rename_editor: None,
+            suppress_collection_keyboard_click: None,
             beat_count_input,
             _beat_count_subscription: beat_count_subscription,
             tag_input,
@@ -649,6 +671,7 @@ impl Browser {
             folder_tree: None,
             folder_rows_cache: Vec::new(),
             selected_folder: PathBuf::from("."),
+            folder_keyboard: None,
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
             restore_selection_id: None,
@@ -920,6 +943,8 @@ impl Browser {
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));
         self.playmark_timing_input
+            .update(cx, |input, cx| input.theme_changed(cx));
+        self.collection_rename_input
             .update(cx, |input, cx| input.theme_changed(cx));
     }
 
@@ -1244,6 +1269,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_file_handoff();
+        self.collection_rename_editor = None;
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.deactivate_catalog_source(cx);
@@ -1304,6 +1330,7 @@ impl Browser {
         self.waveform_error = None;
         self.folder_tree = None;
         self.folder_rows_cache.clear();
+        self.folder_keyboard = None;
         if let Some(index) = source_index
             && let Some(session) = self.source_sessions.get(index)
         {
@@ -1469,6 +1496,7 @@ impl Browser {
             self.entries.clear();
             self.folder_tree = None;
             self.folder_rows_cache.clear();
+            self.folder_keyboard = None;
             self.view_model.set_entries(&self.entries);
             self.reschedule_playback_age_refresh(cx);
             self.view_model
@@ -1814,11 +1842,26 @@ impl Browser {
         self.invalidate_file_handoff();
         self.selection.clear();
         self.selected_folder = path.clone();
+        if let Some(root) = self.root.as_ref() {
+            if self
+                .folder_keyboard
+                .as_ref()
+                .is_some_and(|state| state.root() != root)
+            {
+                self.folder_keyboard = None;
+            }
+            self.folder_keyboard
+                .get_or_insert_with(|| {
+                    folder_keyboard::FolderKeyboardState::new(root.clone(), path.clone())
+                })
+                .pointer_select(path.clone());
+        }
         self.update_active_folder_projection(cx);
         self.start_focus(
-            motion::FocusTarget::Folder(path),
+            motion::FocusTarget::Folder(path.clone()),
             motion::FocusTrigger::Pointer,
         );
+        self.focus_folder_path(path, window, cx);
     }
 
     pub(super) fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1867,6 +1910,7 @@ impl Browser {
             .as_ref()
             .map(|tree| tree.rows(&self.expanded_folders))
             .unwrap_or_default();
+        self.ensure_folder_keyboard();
     }
 
     fn select_entry(
@@ -2590,6 +2634,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        self.suppress_collection_keyboard_click = None;
         if key == "escape" && self.source_reorder_drag.take().is_some() {
             cx.notify();
             cx.stop_propagation();
@@ -2598,6 +2643,35 @@ impl Browser {
         if key == "escape" && self.pane_resize_drag.is_some() {
             self.cancel_pane_resize(cx);
             cx.stop_propagation();
+            return;
+        }
+        if self
+            .collection_rename_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            if !self
+                .collection_rename_editor
+                .as_ref()
+                .is_some_and(|editor| self.collection_rename_is_current(editor.slot))
+            {
+                self.collection_rename_editor = None;
+                window.focus(&self.focus_handle);
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            self.focus_chord_started = None;
+            if key == "escape" {
+                self.cancel_collection_rename(window, cx);
+                cx.stop_propagation();
+            } else if key == "enter" {
+                if !event.is_held && !self.collection_rename_input.read(cx).is_composing() {
+                    self.commit_collection_rename(window, cx);
+                }
+                cx.stop_propagation();
+            }
             return;
         }
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
@@ -2828,6 +2902,10 @@ impl Browser {
             cx.stop_propagation();
             return;
         }
+        if self.handle_folder_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !event.is_held
             && !secondary
             && !shift
@@ -2949,12 +3027,26 @@ impl Browser {
             self.play_direct_random_sample(action == DirectRandomShortcut::Previous, cx);
             return;
         }
+        if random_section_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            if self.random_audition_available() {
+                self.request_random_audition(false, cx);
+            }
+            return;
+        }
         if secondary && !shift && key.eq_ignore_ascii_case("a") {
             self.select_all_visible(cx);
             return;
         }
         if !secondary && !alt && !function && shift && key == "space" {
-            self.play_compare_anchor(cx);
+            self.play_from_current_play_start(cx);
             return;
         }
         if current_playhead_shortcut(
@@ -2973,9 +3065,16 @@ impl Browser {
             self.set_compare_anchor_from_focus(cx);
             return;
         }
+        if !secondary && !alt && !function && shift && key.eq_ignore_ascii_case("c") {
+            self.play_compare_anchor(cx);
+            return;
+        }
         match key {
-            "space" if self.random_audition_sticky => self.request_random_audition(false, cx),
-            "space" => self.toggle_playback(cx),
+            "space" if !secondary && !alt && !function && !shift && self.random_audition_sticky => {
+                self.request_random_audition(false, cx)
+            }
+            "space" if !secondary && !alt && !function && !shift => self.play_selected_sample(cx),
+            "space" => return,
             "l" | "L" if shift && !secondary && !alt && !function && !event.is_held => {
                 self.toggle_loop_lock(cx)
             }
@@ -3163,14 +3262,26 @@ fn direct_random_shortcut(
     })
 }
 
+fn random_section_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> bool {
+    key.eq_ignore_ascii_case("r") && !command && !control && !shift && !alt && !function && !held
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DirectRandomShortcut, SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
         browser_focus_from_state, current_playhead_shortcut, direct_random_shortcut,
-        resolve_scan_source_index, reveal_should_clear_for_focus_change, sample_click_intent,
-        scan_source_index_for_error, selection_origin_for_click, selection_origin_for_navigation,
-        should_autoplay_selection,
+        random_section_shortcut, resolve_scan_source_index, reveal_should_clear_for_focus_change,
+        sample_click_intent, scan_source_index_for_error, selection_origin_for_click,
+        selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
     use yield_core::{AudioFile, AudioFileId};
@@ -3227,6 +3338,33 @@ mod tests {
             direct_random_shortcut("r", false, false, true, false, false, true),
             None
         );
+    }
+
+    #[test]
+    fn random_section_shortcut_accepts_only_plain_r() {
+        assert!(random_section_shortcut(
+            "r", false, false, false, false, false, false
+        ));
+        for (key, command, control, shift, alt, function, held) in [
+            ("space", false, false, false, false, false, false),
+            ("space", false, true, false, false, false, false),
+            ("space", false, false, false, true, false, false),
+            ("space", false, true, false, true, false, false),
+            ("space", true, true, false, false, false, false),
+            ("space", false, true, true, false, false, false),
+            ("space", false, false, false, true, true, false),
+            ("space", false, false, false, true, false, true),
+            ("r", false, true, false, false, false, false),
+            ("r", true, false, false, false, false, false),
+            ("r", false, false, true, false, false, false),
+            ("r", false, false, false, true, false, false),
+            ("r", false, false, false, false, true, false),
+            ("r", false, false, false, false, false, true),
+        ] {
+            assert!(!random_section_shortcut(
+                key, command, control, shift, alt, function, held
+            ));
+        }
     }
 
     #[gpui::test]

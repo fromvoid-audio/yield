@@ -129,6 +129,23 @@ impl PreferenceState {
         self.effective().normalized_audition_enabled
     }
 
+    pub(super) fn collection_name(&self, slot: usize) -> Option<String> {
+        let mut name = self.baseline.collection_names.get(slot)?.clone();
+        for pending in &self.pending {
+            match &pending.patch {
+                PreferencePatch::SetCollectionName {
+                    slot: changed,
+                    name: draft,
+                } if *changed == slot => {
+                    name = Some(draft.clone());
+                }
+                PreferencePatch::Reset => name = None,
+                _ => {}
+            }
+        }
+        name
+    }
+
     pub(super) fn queue(&mut self, request: PreferenceRequestId, patch: PreferencePatch) {
         self.pending.push(PendingPreferencePatch {
             request: request.get(),
@@ -358,6 +375,11 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         PreferencePatch::SetAudioOutput(audio_output) => {
             preferences.audio_output = audio_output.clone();
         }
+        PreferencePatch::SetCollectionName { slot, name } => {
+            if let Some(current) = preferences.collection_names.get_mut(*slot) {
+                *current = Some(name.clone());
+            }
+        }
         PreferencePatch::Reset => *preferences = UiPreferences::default(),
     }
 }
@@ -549,6 +571,8 @@ impl Browser {
                 .update(cx, |input, cx| input.theme_changed(cx));
             self.playmark_timing_input
                 .update(cx, |input, cx| input.theme_changed(cx));
+            self.collection_rename_input
+                .update(cx, |input, cx| input.theme_changed(cx));
         }
         if self.theme_load.pending_path.is_none() {
             self.theme_load.active_path = effective.theme_source_path.clone();
@@ -649,6 +673,54 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use yield_design::{Color, Theme};
+
+    #[test]
+    fn collection_name_optimism_rolls_back_on_owner_rejection() {
+        let mut state = PreferenceState::new();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        state.queue_for_test(
+            7,
+            PreferencePatch::SetCollectionName {
+                slot: 1,
+                name: "Drums".to_string(),
+            },
+        );
+        assert_eq!(
+            state.effective().collection_names[1].as_deref(),
+            Some("Drums")
+        );
+        assert_eq!(state.collection_name(1).as_deref(), Some("Drums"));
+        assert!(state.effective().collection_names[0].is_none());
+        state.fail_request_number(7, "write rejected".to_string());
+        assert!(
+            state
+                .effective()
+                .collection_names
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(state.collection_name(1), None);
+        state.queue_for_test(
+            8,
+            PreferencePatch::SetCollectionName {
+                slot: 1,
+                name: "New".to_string(),
+            },
+        );
+        state.queue_for_test(9, PreferencePatch::Reset);
+        state.queue_for_test(
+            10,
+            PreferencePatch::SetCollectionName {
+                slot: 1,
+                name: "After reset".to_string(),
+            },
+        );
+        assert_eq!(state.collection_name(1).as_deref(), Some("After reset"));
+        assert_eq!(
+            state.collection_name(1),
+            state.effective().collection_names[1]
+        );
+    }
 
     #[test]
     fn optimistic_patches_survive_a_late_full_snapshot() {

@@ -250,6 +250,7 @@ impl Browser {
         let selected_folder = state.selected.clone();
         let target_index = entries.iter().position(|entry| entry.path == target_path)?;
 
+        self.collection_rename_editor = None;
         self.active_source = Some(source_index);
         self.pending_source_label = None;
         self.pending_source_return_index = None;

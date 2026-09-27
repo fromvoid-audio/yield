@@ -46,6 +46,7 @@ const NORMALIZED_AUDITION: &str = "transport-normalized-audition";
 const VOLUME: &str = "transport-volume";
 const WAVEFORM: &str = "transport-waveform";
 const PLAYMARK_TIMING: &str = "transport-playmark-timing";
+pub(super) const COLLECTION_RENAME: &str = "browser-collection-rename-input";
 const SETTINGS_OPEN: &str = "settings-open";
 const SETTINGS_CLOSE: &str = "settings-close";
 const THEME_CHOOSE: &str = "settings-theme-choose";
@@ -335,6 +336,8 @@ impl BrowserAccessibility {
                             view.beat_count_input.read(cx).focus_handle()
                         } else if event.id == PLAYMARK_TIMING {
                             view.playmark_timing_input.read(cx).focus_handle()
+                        } else if event.id == COLLECTION_RENAME {
+                            view.collection_rename_input.read(cx).focus_handle()
                         } else if event.id == VOLUME {
                             view.volume_focus_handle.clone()
                         } else if event.id == WAVEFORM {
@@ -427,6 +430,7 @@ impl BrowserAccessibility {
                         let extra_action = matches!(
                             event.id.as_str(),
                             TAG_FILTER_INPUT
+                                | COLLECTION_RENAME
                                 | TAG_FILTER_TOGGLE
                                 | CURATION_QUEUE_TOGGLE
                                 | CURATION_QUEUE_SCOPE
@@ -529,9 +533,24 @@ impl BrowserAccessibility {
                         {
                             return;
                         }
+                        if event.id == COLLECTION_RENAME
+                            && !view
+                                .collection_rename_editor
+                                .as_ref()
+                                .is_some_and(|editor| {
+                                    view.collection_rename_is_current(editor.slot)
+                                })
+                        {
+                            return;
+                        }
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
+                        if event.action == AxAction::Focus
+                            && let Some((path, false)) = folder_action.as_ref()
+                        {
+                            view.mark_folder_keyboard_focus(path.clone());
+                        }
                         if settings_action {
                             match event.action {
                                 AxAction::Focus => {}
@@ -543,6 +562,7 @@ impl BrowserAccessibility {
                         } else if event.id == SEARCH
                             || event.id == TAG_FILTER_INPUT
                             || event.id == PLAYMARK_TIMING
+                            || event.id == COLLECTION_RENAME
                         {
                             match event.action {
                                 AxAction::SetValue(value) => {
@@ -550,6 +570,8 @@ impl BrowserAccessibility {
                                         view.search_input.clone()
                                     } else if event.id == PLAYMARK_TIMING {
                                         view.playmark_timing_input.clone()
+                                    } else if event.id == COLLECTION_RENAME {
+                                        view.collection_rename_input.clone()
                                     } else {
                                         view.tag_filter_input.clone()
                                     };
@@ -887,6 +909,10 @@ impl Browser {
         let visible_folders = range
             .filter_map(|position| rows.get(position).map(|row| row.path.clone()))
             .collect::<Vec<_>>();
+        let focused_folder = self.folder_keyboard.as_ref().and_then(|state| {
+            (state.root() == root && rows.iter().any(|row| row.path == state.focused()))
+                .then(|| state.focused().to_path_buf())
+        });
         let mut visible_ids = HashSet::new();
         for folder in &visible_folders {
             let has_toggle = rows
@@ -904,6 +930,14 @@ impl Browser {
                     .entry(id)
                     .or_insert_with(|| cx.focus_handle());
             }
+        }
+        // A transient empty virtual-list range must not retire the keyboard target's handle.
+        if let Some(path) = focused_folder {
+            let id = folder_id(root, &path);
+            visible_ids.insert(id.clone());
+            ax.control_focus
+                .entry(id)
+                .or_insert_with(|| cx.focus_handle());
         }
         ax.control_focus.retain(|id, _| {
             (!id.starts_with("browser-folder:") && !id.starts_with("browser-folder-toggle:"))
@@ -1330,7 +1364,7 @@ impl Browser {
                         label: label.clone(),
                         value: Some(format!(
                             "{}, {} audio {}",
-                            if self.selected_folder == row.path {
+                            if self.folder_is_selected(&row.path) {
                                 "Selected"
                             } else {
                                 "Not selected"
@@ -1384,7 +1418,7 @@ impl Browser {
                 controls.push(AxChild {
                     id: collection_filter_id(slot),
                     role: AxRole::CheckBox,
-                    label: format!("Collection {} filter", slot + 1),
+                    label: format!("{} filter", self.collection_name(slot)),
                     value: Some(
                         if self.view_model.collection_filter() == Some(slot) {
                             "On"
@@ -1395,6 +1429,15 @@ impl Browser {
                     ),
                     enabled: active_source,
                 });
+                if self.collection_rename_is_current(slot) {
+                    controls.push(AxChild {
+                        id: COLLECTION_RENAME.into(),
+                        role: AxRole::TextField,
+                        label: format!("Rename {}", self.collection_name(slot)),
+                        value: Some(self.collection_rename_input.read(cx).content().to_owned()),
+                        enabled: true,
+                    });
+                }
             }
             for (index, kind) in PLAYBACK_TYPE_FILTERS.iter().enumerate() {
                 controls.push(AxChild {

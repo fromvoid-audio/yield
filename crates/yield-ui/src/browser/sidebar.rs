@@ -525,7 +525,7 @@ pub(super) fn render(
                                     let path_for_select = row.path.clone();
                                     let path_for_toggle = row.path.clone();
                                     let path_for_context = row.path.clone();
-                                    let selected = view.selected_folder == row.path;
+                                    let selected = view.folder_is_selected(&row.path);
                                     let focused = motion_frame.focus_alpha > 0
                                         && view.focus_matches_folder(&row.path);
                                     let hover_fill = color(list_theme.colors.selection_hover_fill);

@@ -7678,6 +7678,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "yield-catalog",
+ "yield-core",
  "yield-design",
  "yield-library",
 ]
