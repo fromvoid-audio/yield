@@ -10,7 +10,7 @@ Press `Command-/` in the app to open the current context-aware shortcut overlay.
 | --- | --- |
 | `Space` | Play the selected sample, or play a random section while sticky random playback is active |
 | `Shift-Space` / `Right` | Play from the current play start |
-| `Option-Space` / `Control-Space` | Play a random sample section |
+| `R` | Play a random section of the selected sample |
 | `Command-Left` / `Command-Right` | Step through playback history |
 | `Up` / `Down` | Move browser selection |
 | `Shift-Up` / `Shift-Down` | Extend sample selection |

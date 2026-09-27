@@ -2933,6 +2933,20 @@ impl Browser {
             self.play_direct_random_sample(action == DirectRandomShortcut::Previous, cx);
             return;
         }
+        if random_section_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            if self.random_audition_available() {
+                self.request_random_audition(false, cx);
+            }
+            return;
+        }
         if secondary && !shift && key.eq_ignore_ascii_case("a") {
             self.select_all_visible(cx);
             return;
@@ -3154,14 +3168,26 @@ fn direct_random_shortcut(
     })
 }
 
+fn random_section_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> bool {
+    key.eq_ignore_ascii_case("r") && !command && !control && !shift && !alt && !function && !held
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DirectRandomShortcut, SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
         browser_focus_from_state, current_playhead_shortcut, direct_random_shortcut,
-        resolve_scan_source_index, reveal_should_clear_for_focus_change, sample_click_intent,
-        scan_source_index_for_error, selection_origin_for_click, selection_origin_for_navigation,
-        should_autoplay_selection,
+        random_section_shortcut, resolve_scan_source_index, reveal_should_clear_for_focus_change,
+        sample_click_intent, scan_source_index_for_error, selection_origin_for_click,
+        selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
     use yield_core::{AudioFile, AudioFileId};
@@ -3218,6 +3244,33 @@ mod tests {
             direct_random_shortcut("r", false, false, true, false, false, true),
             None
         );
+    }
+
+    #[test]
+    fn random_section_shortcut_accepts_only_plain_r() {
+        assert!(random_section_shortcut(
+            "r", false, false, false, false, false, false
+        ));
+        for (key, command, control, shift, alt, function, held) in [
+            ("space", false, false, false, false, false, false),
+            ("space", false, true, false, false, false, false),
+            ("space", false, false, false, true, false, false),
+            ("space", false, true, false, true, false, false),
+            ("space", true, true, false, false, false, false),
+            ("space", false, true, true, false, false, false),
+            ("space", false, false, false, true, true, false),
+            ("space", false, false, false, true, false, true),
+            ("r", false, true, false, false, false, false),
+            ("r", true, false, false, false, false, false),
+            ("r", false, false, true, false, false, false),
+            ("r", false, false, false, true, false, false),
+            ("r", false, false, false, false, true, false),
+            ("r", false, false, false, false, false, true),
+        ] {
+            assert!(!random_section_shortcut(
+                key, command, control, shift, alt, function, held
+            ));
+        }
     }
 
     #[gpui::test]

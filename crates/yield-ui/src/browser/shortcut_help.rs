@@ -232,6 +232,10 @@ const GENERAL_ROWS: &[ShortcutRow] = &[
         description: "Play a random section of the selected sample",
     },
     ShortcutRow {
+        keys: "R",
+        description: "Play a random section of the selected sample",
+    },
+    ShortcutRow {
         keys: "Shift + Random",
         description: "Choose a listed sample, then a random section",
     },
