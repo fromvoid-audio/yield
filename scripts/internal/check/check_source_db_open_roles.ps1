@@ -39,6 +39,15 @@ try {
   }
 
   Write-Host "[source_db_roles] OK"
+  $python = Get-Command python3, python -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $python) {
+    throw "[source_db_roles] Python is required for the competing-writer guard."
+  }
+  $guard = Join-Path $PSScriptRoot "check_source_db_competing_writers.py"
+  & $python.Source $guard --self-test
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  & $python.Source $guard
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   exit 0
 } finally {
   Pop-Location

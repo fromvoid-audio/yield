@@ -48,6 +48,7 @@ pub(super) struct CatalogActivation {
     pub(super) root_identity: Option<RootIdentity>,
     pub(super) audit_finished: bool,
     pub(super) audit_error: Option<String>,
+    pub(super) audit_retryable: bool,
     pub(super) force_reload: bool,
     pub(super) fallback_to_scan: bool,
 }
@@ -173,6 +174,8 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
+        self.collection_rename_editor = None;
         self.display_labels.cancel_for_source_change();
         self.reset_browser_focus_state();
         self.context_menu = None;
@@ -264,12 +267,18 @@ impl Browser {
             super::tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         super::tag_filter::reinstall_after_projection(self, cx);
+        super::curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
 
@@ -288,6 +297,7 @@ impl Browser {
             root_identity: None,
             audit_finished: false,
             audit_error: None,
+            audit_retryable: false,
             force_reload,
             fallback_to_scan,
         });
@@ -296,7 +306,7 @@ impl Browser {
             root,
             lifecycle_generation,
         });
-        self.scan_status = format!("Loading catalog {label}…");
+        self.set_scan_status(format!("Loading catalog {label}…"));
         self.start_source_registry_poll(cx);
         cx.notify();
         true
@@ -327,11 +337,14 @@ impl Browser {
 
     /// Queue removal of the browser's current catalog projection.
     pub(super) fn deactivate_catalog_source(&mut self, cx: &mut Context<Self>) {
+        self.job_action = None;
+        self.job_action_error = None;
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::cancel_for_source_change(self);
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.reset_catalog_metadata();
         let activation = self.catalog_activation.take();
@@ -442,6 +455,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => {
                     return false;
@@ -490,6 +504,7 @@ impl Browser {
                     | CatalogSubmitError::InvalidTagPageRequest(_)
                     | CatalogSubmitError::InvalidTagFilterRequest(_)
                     | CatalogSubmitError::InvalidDisplayLabelsRequest(_)
+                    | CatalogSubmitError::InvalidCurationTagFactsRequest(_)
                     | CatalogSubmitError::InvalidRatingDecayRequest(_),
                 ) => return false,
             }
@@ -525,13 +540,13 @@ impl Browser {
         self.curation_state.prune_completed_except(None);
         self.catalog_activation = None;
         if activation.fallback_to_scan {
-            self.scan_status = format!(
+            self.set_scan_status(format!(
                 "Catalog unavailable for {}; scanning source…",
                 activation.root.display()
-            );
+            ));
             self.begin_source_scan(activation.root, self.active_source, cx);
         } else {
-            self.scan_status = format!("Catalog unavailable: {reason}");
+            self.set_scan_status(format!("Catalog unavailable: {reason}"));
         }
         true
     }
@@ -590,6 +605,13 @@ impl Browser {
         ) {
             return super::tag_filter::apply_catalog_event(self, event, cx);
         }
+        if matches!(
+            &event,
+            CatalogEvent::CurationTagFactsReady { .. }
+                | CatalogEvent::CurationTagFactsFailed { .. }
+        ) {
+            return super::curation_queue::apply_catalog_event(self, &event);
+        }
         if matches!(event, CatalogEvent::CurationOperationCompleted { .. }) {
             // Compound outcomes belong to their source lifecycle even after the browser has
             // switched to another source. Consume them before the active projection fence so a
@@ -625,6 +647,8 @@ impl Browser {
         }
         let Some((source_id, lifecycle_generation)) = catalog_event_identity(&event) else {
             if matches!(event, CatalogEvent::Closed) {
+                self.job_action = None;
+                self.job_action_error = None;
                 super::source_recovery::cancel_for_source_change(self);
                 super::rating_decay::cancel_for_source_change(self);
                 super::tag_chips::cancel_for_source_change(self);
@@ -636,7 +660,7 @@ impl Browser {
                 self.catalog_pending_removes.clear();
                 self.cancel_catalog_projection();
                 self.reset_catalog_metadata();
-                self.scan_status = "Source catalog closed".to_string();
+                self.set_scan_status("Source catalog closed".to_string());
                 return true;
             }
             return false;
@@ -656,7 +680,7 @@ impl Browser {
                     source_id,
                     lifecycle_generation,
                 });
-                self.scan_status = "Auditing source catalog…".to_string();
+                self.set_scan_status("Auditing source catalog…".to_string());
                 true
             }
             CatalogEvent::SnapshotReady { .. } => {
@@ -664,18 +688,32 @@ impl Browser {
                 true
             }
             CatalogEvent::AuditCommitted { .. } => {
+                self.job_action = None;
+                self.job_action_error = None;
                 super::rating_decay::note_audit_committed(self);
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = None;
+                    activation.audit_retryable = false;
                 }
                 if let CatalogEvent::AuditCommitted { snapshot } = &event
                     && let Some(activation) = self.catalog_activation.as_mut()
                 {
                     activation.root_identity = Some(snapshot.root_identity.clone());
                 }
-                self.scan_status = "Catalog audit committed…".to_string();
+                self.set_scan_status("Catalog audit committed…".to_string());
                 self.start_catalog_projection(event, publication_fence, cx);
+                true
+            }
+            CatalogEvent::AuditCanceled { .. } => {
+                self.job_action = None;
+                self.job_action_error = None;
+                if let Some(activation) = self.catalog_activation.as_mut() {
+                    activation.audit_finished = true;
+                    activation.audit_error = Some("Audit canceled; Retry when ready".into());
+                    activation.audit_retryable = true;
+                }
+                self.set_scan_status("Source audit canceled; Retry when ready");
                 true
             }
             CatalogEvent::WavMetadataReady { .. } | CatalogEvent::WavMetadataFailed { .. } => {
@@ -704,9 +742,16 @@ impl Browser {
             | CatalogEvent::TagFilterFailed { .. }
             | CatalogEvent::DisplayLabelsReady { .. }
             | CatalogEvent::DisplayLabelsFailed { .. }
+            | CatalogEvent::CurationTagFactsReady { .. }
+            | CatalogEvent::CurationTagFactsFailed { .. }
             | CatalogEvent::RatingDecayProgress { .. }
             | CatalogEvent::RatingDecayFailed { .. } => false,
-            CatalogEvent::Failed { error, .. } => {
+            CatalogEvent::Failed {
+                error, operation, ..
+            } => {
+                if *operation == CatalogOperation::Audit {
+                    self.job_action = None;
+                }
                 super::tag_chips::cancel_for_source_change(self);
                 super::tag_completion::cancel_for_source_change(self, cx);
                 super::tag_filter::cancel_for_source_change(self);
@@ -715,8 +760,10 @@ impl Browser {
                 if let Some(activation) = self.catalog_activation.as_mut() {
                     activation.audit_finished = true;
                     activation.audit_error = Some(error.to_string());
+                    activation.audit_retryable =
+                        *operation == CatalogOperation::Audit && error.audit_retryable();
                 }
-                self.scan_status = format!("Catalog update failed: {error}");
+                self.set_scan_status(format!("Catalog update failed: {error}"));
                 if let Some(index) = self.active_source
                     && let Some(session) = self.source_sessions.get_mut(index)
                 {
@@ -750,6 +797,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.reset_catalog_metadata();
         self.cancel_catalog_projection();
         let cancellation = Arc::new(AtomicBool::new(false));
@@ -794,7 +842,7 @@ impl Browser {
                 match result {
                     Ok(projection) => view.apply_catalog_projection(projection, force_reload, cx),
                     Err(error) => {
-                        view.scan_status = format!("Catalog projection failed: {error}");
+                        view.set_scan_status(format!("Catalog projection failed: {error}"));
                         if let Some(index) = view.active_source
                             && let Some(session) = view.source_sessions.get_mut(index)
                         {
@@ -874,6 +922,7 @@ impl Browser {
             restore_position,
             super::tag_filter::FilterOrigin::PassiveMetadata,
         );
+        super::curation_queue::preserve_focus_for_projection(self);
         let focused_changed = restore_id.as_ref().is_some_and(|id| {
             focused_manifest_changed(id, &projection, &self.source_sessions[index])
         });
@@ -928,12 +977,18 @@ impl Browser {
         self.folder_scope = previous_scope;
         self.rebuild_folder_rows_cache();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         super::tag_filter::reinstall_after_projection(self, cx);
+        super::curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
         super::tag_chips::invalidate(self);
@@ -943,18 +998,20 @@ impl Browser {
         {
             activation.force_reload = false;
         }
-        self.scan_status = if let Some(error) = self
-            .catalog_activation
-            .as_ref()
-            .and_then(|activation| activation.audit_error.as_ref())
-        {
-            format!("Catalog update failed: {error}")
-        } else {
-            format!(
-                "{count} audio file{} · catalog ready",
-                if count == 1 { "" } else { "s" }
-            )
-        };
+        self.set_scan_status(
+            if let Some(error) = self
+                .catalog_activation
+                .as_ref()
+                .and_then(|activation| activation.audit_error.as_ref())
+            {
+                format!("Catalog update failed: {error}")
+            } else {
+                format!(
+                    "{count} audio file{} · catalog ready",
+                    if count == 1 { "" } else { "s" }
+                )
+            },
+        );
         self.restore_projection_focus(restore_id, restore_position, cx);
         if audit_ready {
             let _ = self.maybe_start_rating_decay(cx);
@@ -980,6 +1037,7 @@ impl Browser {
         super::tag_chips::cancel_for_source_change(self);
         super::tag_completion::cancel_for_source_change(self, cx);
         super::tag_filter::cancel_for_source_change(self);
+        super::curation_queue::cancel_for_source_change(self);
         self.display_labels.cancel_for_source_change();
         self.catalog_pending_command = None;
         self.cancel_catalog_projection();
@@ -987,8 +1045,9 @@ impl Browser {
         if let Some(activation) = self.catalog_activation.as_mut() {
             activation.audit_finished = false;
             activation.audit_error = Some(status.to_string());
+            activation.audit_retryable = false;
         }
-        self.scan_status = status.to_string();
+        self.set_scan_status(status.to_string());
     }
 }
 
@@ -1021,6 +1080,10 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             lifecycle_generation,
         }
         | CatalogEvent::Removed {
+            source_id,
+            lifecycle_generation,
+        }
+        | CatalogEvent::AuditCanceled {
             source_id,
             lifecycle_generation,
         } => Some((source_id.clone(), *lifecycle_generation)),
@@ -1058,6 +1121,16 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             ..
         }
         | CatalogEvent::DisplayLabelsFailed {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationTagFactsReady {
+            source_id,
+            lifecycle_generation,
+            ..
+        }
+        | CatalogEvent::CurationTagFactsFailed {
             source_id,
             lifecycle_generation,
             ..
@@ -1614,6 +1687,7 @@ mod tests {
             root_identity: None,
             audit_finished: false,
             audit_error: None,
+            audit_retryable: false,
             force_reload: false,
             fallback_to_scan: false,
         };

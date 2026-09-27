@@ -3,13 +3,14 @@
 use std::sync::mpsc::TryRecvError;
 
 use gpui::{BorrowAppContext, Global, Subscription};
-use yield_library::sample_sources::SampleSource;
+use yield_library::sample_sources::{SampleSource, SourceId};
 use yield_session::{
-    CanonicalSourceRoot, CatalogCommand, CatalogDelivery, CatalogEvent, CatalogStatus,
-    CatalogSubmitError, PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
-    ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
-    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt, RegistryEvent, RequestId,
-    SourceRegistryService, SubmitError, VocabularyRequest, VocabularyStatus, VocabularySubmitError,
+    CanonicalSourceRoot, CatalogCancelError, CatalogCommand, CatalogDelivery, CatalogEvent,
+    CatalogStatus, CatalogSubmitError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
+    ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyLookup,
+    ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
+    RegistryEvent, RegistryRevision, RequestId, SourceRegistryService, SubmitError,
+    VocabularyRequest, VocabularyStatus, VocabularySubmitError,
 };
 
 /// The app-owned source registry service.
@@ -60,6 +61,19 @@ impl SourceRegistryGlobal {
             .as_ref()
             .ok_or(SubmitError::Closed)?
             .remove_root(root)
+    }
+
+    pub(crate) fn reorder_source(
+        &self,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+        revision: RegistryRevision,
+    ) -> Result<RequestId, SubmitError> {
+        self.service
+            .as_ref()
+            .ok_or(SubmitError::Closed)?
+            .reorder_source(source_id, target_id, after, revision)
     }
 
     /// Submit one typed preference patch to the profile-owned session service.
@@ -177,6 +191,27 @@ impl SourceRegistryGlobal {
             .submit_catalog(command)
     }
 
+    pub(crate) fn cancel_catalog_audit(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<(), CatalogCancelError> {
+        self.service
+            .as_ref()
+            .ok_or(CatalogCancelError::Closed)?
+            .cancel_catalog_audit(source_id, lifecycle_generation)
+    }
+
+    pub(crate) fn catalog_audit_is_running(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> bool {
+        self.service.as_ref().is_some_and(|service| {
+            service.catalog_audit_is_running(source_id, lifecycle_generation)
+        })
+    }
+
     /// Drain catalog events without waiting for the background worker.
     #[allow(dead_code)]
     pub(crate) fn drain_catalog_events(&self, events: &mut Vec<CatalogEvent>) -> bool {
@@ -278,8 +313,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Browser, PendingRegistryMutation, SourceSession, catalog, source_label, tag_chips,
-    tag_completion, tag_filter, tag_library, tags,
+    Browser, PendingRegistryMutation, SourceSession, catalog, curation_queue, source_label,
+    tag_chips, tag_completion, tag_filter, tag_library, tags,
 };
 use gpui::Context;
 
@@ -290,7 +325,7 @@ impl Browser {
         }
         if let Some(error) = cx.global::<SourceRegistryGlobal>().start_error() {
             self.source_registry_loaded = true;
-            self.source_registry_status = format!("Source persistence unavailable: {error}");
+            self.set_source_registry_status(format!("Source persistence unavailable: {error}"));
         }
         self.source_registry_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -333,6 +368,7 @@ impl Browser {
         changed |= super::source_recovery::poll(self, cx);
         changed |= tag_completion::poll(self, cx);
         changed |= tag_filter::poll(self, cx);
+        changed |= curation_queue::poll(self, cx);
         changed |= tag_library::poll(self, cx);
         changed |= self.poll_display_labels(cx);
         changed |= self.poll_file_drag();
@@ -342,11 +378,13 @@ impl Browser {
         !self.source_registry_loaded
             || !self.source_registry_pending_adds.is_empty()
             || !self.source_registry_pending_removes.is_empty()
+            || self.source_registry_pending_reorder.is_some()
             || catalog_events_capped
             || tags::has_pending(self)
             || tag_chips::has_pending(self)
             || tag_completion::has_pending(self)
             || tag_filter::has_pending(self)
+            || curation_queue::has_pending(self)
             || tag_library::has_pending(self)
             || self.has_pending_display_labels()
             || self.file_drag_poll_needed()
@@ -364,7 +402,7 @@ impl Browser {
                     return false;
                 }
                 self.source_registry_revision = revision;
-                self.source_registry_status = "Loading sources…".to_string();
+                self.set_source_registry_status("Loading sources…".to_string());
                 true
             }
             RegistryEvent::Snapshot { revision, snapshot } => {
@@ -372,9 +410,16 @@ impl Browser {
                     return false;
                 }
                 self.source_registry_revision = revision;
+                if self
+                    .source_reorder_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.revision != revision)
+                {
+                    self.source_reorder_drag = None;
+                }
                 self.source_registry_loaded = true;
                 self.apply_source_registry_snapshot(snapshot, cx);
-                self.source_registry_status = "Sources loaded".to_string();
+                self.set_source_registry_status("Sources loaded".to_string());
                 true
             }
             RegistryEvent::Persisted { revision } => {
@@ -383,16 +428,24 @@ impl Browser {
                 }
                 self.source_registry_persisted_revision = revision;
                 self.clear_persisted_registry_mutations();
-                self.source_registry_status = if self.source_registry_pending_adds.is_empty()
-                    && self.source_registry_pending_removes.is_empty()
-                {
-                    "Sources saved".to_string()
-                } else {
-                    "Saving source…".to_string()
-                };
+                self.set_source_registry_status(
+                    if self.source_registry_pending_adds.is_empty()
+                        && self.source_registry_pending_removes.is_empty()
+                        && self.source_registry_pending_reorder.is_none()
+                    {
+                        "Sources saved".to_string()
+                    } else {
+                        "Saving source…".to_string()
+                    },
+                );
                 true
             }
             RegistryEvent::RequestApplied { request, revision } => {
+                if let Some((pending, applied)) = self.source_registry_pending_reorder.as_mut()
+                    && *pending == request
+                {
+                    *applied = Some(revision);
+                }
                 if let Some(mutation) = self.source_registry_pending_adds.get_mut(&request) {
                     mutation.revision = Some(revision);
                 }
@@ -412,17 +465,27 @@ impl Browser {
                     self.source_registry_revision = revision;
                 }
                 self.clear_persisted_registry_mutations();
-                self.source_registry_status = if self.source_registry_pending_adds.is_empty()
-                    && self.source_registry_pending_removes.is_empty()
-                {
-                    "Sources saved".to_string()
-                } else {
-                    "Saving source…".to_string()
-                };
+                self.set_source_registry_status(
+                    if self.source_registry_pending_adds.is_empty()
+                        && self.source_registry_pending_removes.is_empty()
+                        && self.source_registry_pending_reorder.is_none()
+                    {
+                        "Sources saved".to_string()
+                    } else {
+                        "Saving source…".to_string()
+                    },
+                );
                 true
             }
             RegistryEvent::RequestFailed { request, error } => {
                 let message = error.to_string();
+                if self
+                    .source_registry_pending_reorder
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending == request)
+                {
+                    self.source_registry_pending_reorder = None;
+                }
                 if let Some(mutation) = self.source_registry_pending_adds.remove(&request) {
                     self.set_source_error(&mutation.root, message.clone());
                 }
@@ -430,20 +493,22 @@ impl Browser {
                     self.source_registry_removed_roots.remove(&mutation.root);
                     self.set_source_error(&mutation.root, message.clone());
                 }
-                self.source_registry_status = format!("Source registry error: {message}");
+                self.set_source_registry_status(format!("Source registry error: {message}"));
                 true
             }
             RegistryEvent::PersistenceUnavailable { revision, error } => {
                 self.source_registry_loaded = true;
                 self.source_registry_revision = revision;
+                self.source_reorder_drag = None;
                 self.fail_pending_registry_mutations(error.to_string());
-                self.source_registry_status = format!("Source persistence unavailable: {error}");
+                self.set_source_registry_status(format!("Source persistence unavailable: {error}"));
                 true
             }
             RegistryEvent::Closed => {
                 self.source_registry_loaded = true;
+                self.source_reorder_drag = None;
                 self.fail_pending_registry_mutations("Source registry closed".to_string());
-                self.source_registry_status = "Source registry closed".to_string();
+                self.set_source_registry_status("Source registry closed".to_string());
                 true
             }
         }
@@ -451,6 +516,13 @@ impl Browser {
 
     fn clear_persisted_registry_mutations(&mut self) {
         let persisted = self.source_registry_persisted_revision;
+        if self
+            .source_registry_pending_reorder
+            .as_ref()
+            .is_some_and(|(_, revision)| revision.is_some_and(|revision| revision <= persisted))
+        {
+            self.source_registry_pending_reorder = None;
+        }
         self.source_registry_pending_adds.retain(|_, mutation| {
             !mutation
                 .revision
@@ -477,6 +549,7 @@ impl Browser {
     }
 
     fn fail_pending_registry_mutations(&mut self, message: String) {
+        self.source_registry_pending_reorder = None;
         let add_roots: Vec<PathBuf> = self
             .source_registry_pending_adds
             .drain()
@@ -497,6 +570,17 @@ impl Browser {
     }
 
     fn remove_source_session(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if self
+            .compare_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.source_root() == root)
+        {
+            self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
+            self.compare_anchor_task.take();
+            self.compare_anchor_play_pending = false;
+            self.compare_anchor = None;
+            self.set_playback_status("Compare anchor source is no longer available");
+        }
         let Some(index) = self
             .source_sessions
             .iter()
@@ -588,6 +672,15 @@ impl Browser {
             }
         }
         self.source_sessions = sessions;
+        if let Some(anchor) = self.compare_anchor.as_ref()
+            && !self.compare_anchor_path_is_current(&anchor.path())
+        {
+            self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
+            self.compare_anchor_task.take();
+            self.compare_anchor_play_pending = false;
+            self.compare_anchor = None;
+            self.set_playback_status("Compare anchor source is no longer available");
+        }
         if let Some(root) = self.pending_source_return_root.as_ref() {
             self.pending_source_return_index = self
                 .source_sessions
@@ -655,6 +748,8 @@ impl Browser {
         tag_chips::cancel_for_source_change(self);
         tag_completion::cancel_for_source_change(self, cx);
         tag_filter::cancel_for_source_change(self);
+        curation_queue::cancel_for_source_change(self);
+        self.collection_rename_editor = None;
         self.display_labels.cancel_for_source_change();
         super::source_recovery::cancel_for_source_change(self);
         self.reset_browser_focus_state();
@@ -669,7 +764,11 @@ impl Browser {
         self.root = None;
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model
+            .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.reset_collection_filter();
         self.selected = None;
         self.folder_tree = None;
@@ -677,7 +776,7 @@ impl Browser {
         self.waveform_pending = false;
         self.waveform = None;
         self.waveform_error = None;
-        self.scan_status = "Choose a source folder to begin".to_string();
+        self.set_scan_status("Choose a source folder to begin".to_string());
         cx.notify();
     }
 
@@ -689,7 +788,7 @@ impl Browser {
         {
             session.last_error = Some(error);
         } else if self.root.as_deref() == Some(root) {
-            self.scan_status = error;
+            self.set_scan_status(error);
         }
     }
 
@@ -729,12 +828,12 @@ impl Browser {
                         revision: None,
                     },
                 );
-                self.source_registry_status = "Saving source…".to_string();
+                self.set_source_registry_status("Saving source…".to_string());
                 self.start_source_registry_poll(cx);
             }
             Err(error) => {
                 self.set_source_error(&root, format!("Could not save source: {error}"));
-                self.source_registry_status = format!("Source registry error: {error}");
+                self.set_source_registry_status(format!("Source registry error: {error}"));
             }
         }
     }
@@ -780,13 +879,13 @@ impl Browser {
                         revision: None,
                     },
                 );
-                self.source_registry_status = "Saving source removal…".to_string();
+                self.set_source_registry_status("Saving source removal…".to_string());
                 self.start_source_registry_poll(cx);
                 true
             }
             Err(error) => {
                 self.set_source_error(&root, format!("Could not remove source: {error}"));
-                self.source_registry_status = format!("Source registry error: {error}");
+                self.set_source_registry_status(format!("Source registry error: {error}"));
                 false
             }
         }

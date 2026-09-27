@@ -306,14 +306,14 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         if self.file_drag.has_native_drag() {
-            self.playback_status = "A native file drag is still active".to_string();
+            self.set_playback_status("A native file drag is still active".to_string());
             cx.notify();
             return;
         }
         let intent = match capture_intent(self, &payload) {
             Ok(intent) => intent,
             Err(error) => {
-                self.playback_status = format!("File drag unavailable: {error}");
+                self.set_playback_status(format!("File drag unavailable: {error}"));
                 cx.notify();
                 return;
             }
@@ -336,7 +336,7 @@ impl Browser {
         self.file_drag.mark_pending_ghost(gesture_id);
         if self.file_drag.running.is_some() {
             self.file_drag.queue_latest(intent);
-            self.playback_status = "Preparing the latest file selection…".to_string();
+            self.set_playback_status("Preparing the latest file selection…".to_string());
             cx.notify();
             return;
         }
@@ -361,11 +361,11 @@ impl Browser {
             cancellation: Arc::clone(&cancellation),
         });
         self.file_drag.ready = None;
-        self.playback_status = if intent.targets.len() == 1 {
+        self.set_playback_status(if intent.targets.len() == 1 {
             "Preparing file drag…".to_string()
         } else {
             format!("Preparing {} file drag items…", intent.targets.len())
-        };
+        });
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -423,7 +423,7 @@ impl Browser {
                     self.file_drag.ready = None;
                     self.file_drag.queued = None;
                     self.clear_file_drag_gesture();
-                    self.playback_status = format!("File drag unavailable: {error}");
+                    self.set_playback_status(format!("File drag unavailable: {error}"));
                     cx.notify();
                 }
                 if owns_ghost && !self.file_drag.has_native_drag() {
@@ -466,7 +466,7 @@ impl Browser {
         if !prepared_intent_is_current(self, &prepared.intent) {
             let gesture_id = self.file_drag.active_gesture_id;
             self.clear_file_drag_gesture();
-            self.playback_status = "File drag canceled: the file list changed".to_string();
+            self.set_playback_status("File drag canceled: the file list changed".to_string());
             if let Some(gesture_id) = gesture_id {
                 self.stop_owned_file_drag_ghost(gesture_id, window, cx);
             }
@@ -486,8 +486,9 @@ impl Browser {
                 Err(_) => {
                     let gesture_id = self.file_drag.active_gesture_id;
                     self.clear_file_drag_gesture();
-                    self.playback_status =
-                        "File drag unavailable: window handle is unavailable".to_string();
+                    self.set_playback_status(
+                        "File drag unavailable: window handle is unavailable".to_string(),
+                    );
                     if let Some(gesture_id) = gesture_id {
                         self.stop_owned_file_drag_ghost(gesture_id, window, cx);
                     }
@@ -505,8 +506,10 @@ impl Browser {
                         self.stop_owned_file_drag_ghost(gesture_id, window, cx);
                     }
                     self.start_source_registry_poll(cx);
-                    self.playback_status =
-                        format!("Dragging {count} file{}", if count == 1 { "" } else { "s" });
+                    self.set_playback_status(format!(
+                        "Dragging {count} file{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
                     cx.notify();
                 }
                 Err(error) if retryable_platform_error(&error) && cx.has_active_drag() => {
@@ -515,7 +518,7 @@ impl Browser {
                 Err(error) => {
                     let gesture_id = self.file_drag.active_gesture_id;
                     self.clear_file_drag_gesture();
-                    self.playback_status = format!("File drag unavailable: {error}");
+                    self.set_playback_status(format!("File drag unavailable: {error}"));
                     if let Some(gesture_id) = gesture_id {
                         self.stop_owned_file_drag_ghost(gesture_id, window, cx);
                     }
@@ -582,8 +585,10 @@ impl Browser {
                 }
                 view.clear_file_drag_gesture();
                 view.stop_owned_file_drag_ghost(gesture_id, window, cx);
-                view.playback_status =
-                    format!("Dragging {count} file{}", if count == 1 { "" } else { "s" });
+                view.set_playback_status(format!(
+                    "Dragging {count} file{}",
+                    if count == 1 { "" } else { "s" }
+                ));
                 cx.notify();
                 Some((paths, cancellation))
             }) {
@@ -650,7 +655,7 @@ impl Browser {
             self.clear_file_drag_gesture();
         }
         if owns_ghost || owns_active_drag {
-            self.playback_status = "File drag canceled".to_string();
+            self.set_playback_status("File drag canceled".to_string());
             cx.notify();
         }
     }
@@ -673,7 +678,7 @@ impl Browser {
         if self.file_drag.active_gesture_id == Some(gesture_id) {
             self.clear_file_drag_gesture();
         }
-        self.playback_status = match result {
+        self.set_playback_status(match result {
             Ok(FileDragCompletion::Copy) => format!(
                 "Copied {count} dragged file{}",
                 if count == 1 { "" } else { "s" }
@@ -681,7 +686,7 @@ impl Browser {
             Ok(FileDragCompletion::Cancelled) => "File drag canceled".to_string(),
             Ok(FileDragCompletion::Other) => "File drag finished".to_string(),
             Err(error) => format!("File drag unavailable: {error}"),
-        };
+        });
         cx.notify();
     }
 
@@ -789,14 +794,14 @@ impl Browser {
         };
         let count = native.count;
         self.file_drag.native = None;
-        self.playback_status = match completion {
+        self.set_playback_status(match completion {
             FileDragCompletion::Copy => format!(
                 "Copied {count} dragged file{}",
                 if count == 1 { "" } else { "s" }
             ),
             FileDragCompletion::Cancelled => "File drag canceled".to_string(),
             FileDragCompletion::Other => "File drag finished".to_string(),
-        };
+        });
         true
     }
 

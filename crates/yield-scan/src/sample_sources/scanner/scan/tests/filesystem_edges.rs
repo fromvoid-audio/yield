@@ -24,7 +24,7 @@ fn scan_tolerates_vanishing_nested_directories() {
         }
     });
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     assert!(stats.total_files >= 1);
 
@@ -49,7 +49,7 @@ fn full_scan_rejects_a_root_swap_before_the_first_checkpoint() {
         )
         .unwrap();
     }
-    let db = SourceDatabase::open_for_scan(&root).unwrap();
+    let db = open_maintained_scan_database(&root).unwrap();
     let mut swapped = false;
     let result = scan_with_progress(&db, ScanMode::Quick, None, &mut |count, _| {
         if count == 64 && !swapped {
@@ -84,7 +84,7 @@ fn scan_skips_symlink_directories() {
     let link = dir.path().join("nested_link");
     unix_fs::symlink(&nested, &link).unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     assert_eq!(stats.total_files, 2);
     assert_eq!(stats.added, 2);
@@ -100,7 +100,7 @@ fn full_scan_stops_an_injected_directory_identity_cycle() {
 
     let _root_identity = force_directory_identity(dir.path(), Some("root-identity"));
     let _cycle_identity = force_directory_identity(&cycle, Some("root-identity"));
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let ScanError::Incomplete { committed, .. } = scan_once(&db).unwrap_err() else {
         panic!("an injected repeated subtree must return the committed partial result");
     };
@@ -131,7 +131,7 @@ fn catalog_manifest_audit_does_not_complete_on_incomplete_directory_evidence() {
 
     let _root_identity = force_directory_identity(dir.path(), Some("root-identity"));
     let _cycle_identity = force_directory_identity(&cycle, Some("root-identity"));
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let result = audit_manifest_for_catalog_with_budget_and_progress_and_writer(
         &db,
         None,
@@ -160,7 +160,7 @@ fn catalog_manifest_audit_does_not_complete_on_incomplete_directory_evidence() {
 fn full_scan_preserves_manifest_when_root_identity_is_unavailable() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("keep.wav"), b"keep").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
 
     let _root_identity = force_directory_identity(dir.path(), None);
@@ -186,7 +186,7 @@ fn scan_skips_symlink_files() {
     let link = dir.path().join("one_link.wav");
     unix_fs::symlink(&target, &link).unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     assert_eq!(stats.total_files, 1);
     assert_eq!(stats.added, 1);
@@ -203,7 +203,7 @@ fn scan_skips_appledouble_sidecar_files() {
     std::fs::write(nested.join("snare.wav"), b"snare").unwrap();
     std::fs::write(nested.join("._snare.wav"), b"sidecar").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     let paths = db
         .list_files()
@@ -231,7 +231,7 @@ fn full_scan_captures_browser_layout_in_the_authoritative_traversal() {
     std::fs::write(nested.join("kick.wav"), b"kick").unwrap();
     std::fs::write(nested.join("notes.txt"), b"notes").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     let snapshot = stats.source_tree_snapshot.expect("source tree snapshot");
 
@@ -261,7 +261,7 @@ fn full_scan_transports_directory_identities_in_relative_path_order() {
     let _nested_identity = force_directory_identity(&nested, Some("identity-nested"));
     let _zeta_identity = force_directory_identity(&zeta, Some("identity-zeta"));
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let snapshot = scan_once(&db)
         .unwrap()
         .source_tree_snapshot
@@ -320,7 +320,7 @@ fn browser_layout_includes_hidden_entries_by_default() {
     std::fs::write(hidden.join("kick.wav"), b"kick").unwrap();
     std::fs::write(hidden.join("notes.txt"), b"notes").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let stats = scan_once(&db).unwrap();
     let snapshot = stats.source_tree_snapshot.expect("source tree snapshot");
 
@@ -343,7 +343,7 @@ fn configured_hidden_directory_exclusion_removes_hidden_browser_entries() {
     std::fs::write(hidden.join("kick.wav"), b"kick").unwrap();
     std::fs::write(hidden.join("notes.txt"), b"notes").unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     db.set_source_traversal_policy(
         yield_library::sample_sources::SourceTraversalPolicy::exclude_hidden_directories(),
     )
@@ -377,7 +377,7 @@ fn browser_layout_snapshot_does_not_include_symlink_entries() {
     )
     .unwrap();
 
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let snapshot = scan_once(&db)
         .unwrap()
         .source_tree_snapshot

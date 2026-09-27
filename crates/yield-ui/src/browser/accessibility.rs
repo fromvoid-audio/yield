@@ -1,7 +1,7 @@
 //! Native accessibility controls owned by the browser window.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -9,7 +9,8 @@ use async_channel::Receiver;
 use gpui::{Context, FocusHandle, Task, Window, canvas, prelude::*};
 use raw_window_handle::HasWindowHandle;
 use yield_core::{
-    COLLECTION_COUNT, PLAYBACK_TYPE_FILTERS, RATING_FILTER_LEVELS, SortColumn, SortDirection,
+    COLLECTION_COUNT, CurationQueueScope, PLAYBACK_AGE_CHIPS, PLAYBACK_TYPE_FILTERS,
+    PlaybackAgeChip, RATING_FILTER_LEVELS, SortColumn, SortDirection,
 };
 use yield_platform::accessibility::{
     AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole, AxSlider,
@@ -20,18 +21,27 @@ use super::{Browser, tag_library};
 pub(super) const ADD_SOURCE: &str = "browser-add-source";
 pub(super) const FOLDER_SCOPE: &str = "browser-folder-scope";
 pub(super) const REFRESH_SOURCE: &str = "browser-refresh-source";
+pub(super) const SHOW_EMPTY_FOLDERS: &str = "browser-show-empty-folders";
 pub(super) const SEARCH: &str = "browser-search";
 pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
 pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
+pub(super) const CURATION_QUEUE_TOGGLE: &str = "browser-curation-queue-toggle";
+pub(super) const CURATION_QUEUE_SCOPE: &str = "browser-curation-queue-scope";
 pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
 pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+pub(super) const JOB_DETAILS: &str = "status-job-details";
+const JOB_DETAILS_PANEL: &str = "status-job-details-panel";
+const JOB_RETRY: &str = "status-job-retry";
+const JOB_CANCEL: &str = "status-job-cancel";
 const PLAY: &str = "transport-play";
 const STOP: &str = "transport-stop";
 const LOOP: &str = "transport-loop";
+const FOCUS_LOADED: &str = "transport-focus-loaded";
 const SIMILAR: &str = "transport-similar-sections";
 const BPM_SNAP: &str = "transport-bpm-snap";
 const ZERO_CROSSING: &str = "transport-zero-crossing";
 const BEAT_GUIDES: &str = "transport-beat-guides";
+const TRANSIENT_MARKERS: &str = "transport-transient-markers";
 const BEAT_COUNT: &str = "transport-beat-count";
 const METRONOME: &str = "transport-metronome";
 const RANDOM_AUDITION: &str = "transport-random-audition";
@@ -39,12 +49,14 @@ const NORMALIZED_AUDITION: &str = "transport-normalized-audition";
 const VOLUME: &str = "transport-volume";
 const WAVEFORM: &str = "transport-waveform";
 const PLAYMARK_TIMING: &str = "transport-playmark-timing";
+pub(super) const COLLECTION_RENAME: &str = "browser-collection-rename-input";
 const SETTINGS_OPEN: &str = "settings-open";
 const SETTINGS_CLOSE: &str = "settings-close";
 const THEME_CHOOSE: &str = "settings-theme-choose";
 const THEME_RELOAD: &str = "settings-theme-reload";
 const THEME_RESET: &str = "settings-theme-reset";
 const MOTION: &str = "settings-motion";
+const TEXT_SCALE: &str = "settings-text-scale";
 const AUTOPLAY: &str = "settings-autoplay";
 const HELP_TIPS: &str = "settings-help-tips";
 const RATING_DECAY_DECREASE: &str = "settings-rating-decay-decrease";
@@ -62,6 +74,7 @@ const SETTINGS_ORDER: &[&str] = &[
     THEME_RELOAD,
     THEME_RESET,
     MOTION,
+    TEXT_SCALE,
     AUTOPLAY,
     HELP_TIPS,
     SETTINGS_CLOSE,
@@ -88,7 +101,7 @@ fn button(
     }
 }
 
-fn toggle(id: &'static str, label: &'static str, on: bool, enabled: bool) -> AxChild {
+fn toggle(id: &'static str, label: impl Into<String>, on: bool, enabled: bool) -> AxChild {
     AxChild {
         id: id.into(),
         role: AxRole::CheckBox,
@@ -96,6 +109,15 @@ fn toggle(id: &'static str, label: &'static str, on: bool, enabled: bool) -> AxC
         value: Some(if on { "On" } else { "Off" }.into()),
         enabled,
     }
+}
+
+fn text_scale_button(percent: u16, enabled: bool) -> AxChild {
+    button(
+        TEXT_SCALE,
+        "Text size",
+        Some(format!("{percent}%")),
+        enabled,
+    )
 }
 
 pub(super) fn sort_id(column: SortColumn) -> &'static str {
@@ -118,27 +140,40 @@ pub(super) fn playback_type_filter_id(index: usize) -> String {
     format!("browser-type-filter-{index}")
 }
 
+pub(super) fn playback_age_filter_id(index: usize) -> String {
+    format!("browser-age-filter-{index}")
+}
+
 pub(super) fn rating_filter_id(index: usize) -> String {
     format!("browser-rating-filter-{index}")
 }
 
-fn visible_sort_columns(window: &Window, cx: &Context<Browser>) -> Vec<(SortColumn, &'static str)> {
+pub(super) fn curation_queue_choice_id(index: usize) -> String {
+    format!("browser-curation-queue-choice-{index}")
+}
+
+fn visible_sort_columns(
+    view: &Browser,
+    window: &Window,
+    cx: &Context<Browser>,
+) -> Vec<(SortColumn, &'static str)> {
     let theme = crate::theme::active(cx);
     let visibility =
         super::view::browser_column_visibility(f32::from(window.bounds().size.width), &theme);
-    let mut columns = vec![(SortColumn::Name, "Name"), (SortColumn::Rating, "Rating")];
-    if visibility.playback_type {
-        columns.push((SortColumn::PlaybackType, "Type"));
-    }
-    columns.extend([
-        (SortColumn::Collection, "Collection"),
-        (SortColumn::Extension, "Extension"),
-        (SortColumn::Size, "Size"),
-    ]);
-    if visibility.last_played {
-        columns.push((SortColumn::LastPlayed, "Last Played"));
-    }
-    columns
+    view.column_layout
+        .visible_order(visibility)
+        .into_iter()
+        .filter_map(|column| {
+            column.sort_column().map(|sort| {
+                let label = match column {
+                    super::column_layout::BrowserColumn::Collection => "Collection",
+                    super::column_layout::BrowserColumn::Extension => "Extension",
+                    _ => column.label(),
+                };
+                (sort, label)
+            })
+        })
+        .collect()
 }
 
 pub(super) fn source_id(root: &Path) -> String {
@@ -176,6 +211,8 @@ pub(super) struct BrowserAccessibility {
     visible_sources: Vec<PathBuf>,
     visible_folders: Vec<PathBuf>,
     visible_samples: Vec<PathBuf>,
+    recent_sample_focus_ids: VecDeque<String>,
+    recent_sample_focus_set: HashSet<String>,
     control_focus: HashMap<String, FocusHandle>,
     add_focus: FocusHandle,
     scope_focus: FocusHandle,
@@ -185,7 +222,11 @@ pub(super) struct BrowserAccessibility {
 }
 
 impl BrowserAccessibility {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Browser>) -> Option<Self> {
+    pub(super) fn new(
+        window: &mut Window,
+        cx: &mut Context<Browser>,
+        job_details_focus: FocusHandle,
+    ) -> Option<Self> {
         let handle = match window.window_handle() {
             Ok(handle) => handle,
             Err(error) => {
@@ -208,21 +249,27 @@ impl BrowserAccessibility {
         let mut control_focus = HashMap::new();
         for id in [
             RANDOM_NAVIGATION,
+            SHOW_EMPTY_FOLDERS,
             NAME_VIEW_MODE,
             TAG_FILTER_TOGGLE,
+            CURATION_QUEUE_TOGGLE,
+            CURATION_QUEUE_SCOPE,
             PLAY,
             STOP,
             LOOP,
+            FOCUS_LOADED,
             SIMILAR,
             BPM_SNAP,
             ZERO_CROSSING,
             BEAT_GUIDES,
+            TRANSIENT_MARKERS,
             METRONOME,
             RANDOM_AUDITION,
             NORMALIZED_AUDITION,
         ] {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
+        control_focus.insert(JOB_DETAILS.to_owned(), job_details_focus);
         for id in SETTINGS_ORDER.iter().copied().chain([SETTINGS_OPEN]) {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
@@ -243,8 +290,14 @@ impl BrowserAccessibility {
         for index in 0..PLAYBACK_TYPE_FILTERS.len() {
             control_focus.insert(playback_type_filter_id(index), cx.focus_handle());
         }
+        for index in 0..PLAYBACK_AGE_CHIPS.len() {
+            control_focus.insert(playback_age_filter_id(index), cx.focus_handle());
+        }
         for index in 0..RATING_FILTER_LEVELS.len() {
             control_focus.insert(rating_filter_id(index), cx.focus_handle());
+        }
+        for index in 0..3 {
+            control_focus.insert(curation_queue_choice_id(index), cx.focus_handle());
         }
         Some(Self {
             registry: Rc::new(RefCell::new(registry)),
@@ -253,6 +306,8 @@ impl BrowserAccessibility {
             visible_sources: Vec::new(),
             visible_folders: Vec::new(),
             visible_samples: Vec::new(),
+            recent_sample_focus_ids: VecDeque::new(),
+            recent_sample_focus_set: HashSet::new(),
             control_focus,
             add_focus: cx.focus_handle(),
             scope_focus: cx.focus_handle(),
@@ -285,10 +340,14 @@ impl BrowserAccessibility {
                             view.beat_count_input.read(cx).focus_handle()
                         } else if event.id == PLAYMARK_TIMING {
                             view.playmark_timing_input.read(cx).focus_handle()
+                        } else if event.id == COLLECTION_RENAME {
+                            view.collection_rename_input.read(cx).focus_handle()
                         } else if event.id == VOLUME {
                             view.volume_focus_handle.clone()
                         } else if event.id == WAVEFORM {
                             view.waveform_focus_handle.clone()
+                        } else if matches!(event.id.as_str(), JOB_RETRY | JOB_CANCEL) {
+                            view.job_details_focus_handle.clone()
                         } else if let Some(focus) = ax.focus_handle(&event.id) {
                             focus
                         } else {
@@ -335,11 +394,9 @@ impl BrowserAccessibility {
                             .then_some(row.entry_index)
                         });
                         let sort_action =
-                            visible_sort_columns(window, cx)
-                                .into_iter()
-                                .find_map(|(column, _)| {
-                                    (event.id == sort_id(column)).then_some(column)
-                                });
+                            visible_sort_columns(view, window, cx).into_iter().find_map(
+                                |(column, _)| (event.id == sort_id(column)).then_some(column),
+                            );
                         let collection_action = (0..COLLECTION_COUNT)
                             .find(|&slot| event.id == collection_filter_id(slot));
                         let playback_type_action = PLAYBACK_TYPE_FILTERS
@@ -348,6 +405,13 @@ impl BrowserAccessibility {
                             .find_map(|(index, &kind)| {
                                 (event.id == playback_type_filter_id(index)).then_some(kind)
                             });
+                        let playback_age_action =
+                            PLAYBACK_AGE_CHIPS
+                                .iter()
+                                .enumerate()
+                                .find_map(|(index, &chip)| {
+                                    (event.id == playback_age_filter_id(index)).then_some(chip)
+                                });
                         let rating_action =
                             RATING_FILTER_LEVELS
                                 .iter()
@@ -355,24 +419,48 @@ impl BrowserAccessibility {
                                 .find_map(|(index, &level)| {
                                     (event.id == rating_filter_id(index)).then_some(level)
                                 });
+                        let curation_scope_action = super::curation_queue::scope_menu_open(view)
+                            .then(|| {
+                                [
+                                    CurationQueueScope::All,
+                                    CurationQueueScope::Ratings,
+                                    CurationQueueScope::Tags,
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .find_map(|(index, scope)| {
+                                    (event.id == curation_queue_choice_id(index)).then_some(scope)
+                                })
+                            })
+                            .flatten();
                         let extra_action = matches!(
                             event.id.as_str(),
                             TAG_FILTER_INPUT
+                                | COLLECTION_RENAME
                                 | TAG_FILTER_TOGGLE
+                                | CURATION_QUEUE_TOGGLE
+                                | CURATION_QUEUE_SCOPE
                                 | RANDOM_NAVIGATION
                                 | NAME_VIEW_MODE
+                                | JOB_DETAILS
+                                | JOB_RETRY
+                                | JOB_CANCEL
                         ) || sort_action.is_some()
                             || collection_action.is_some()
                             || playback_type_action.is_some()
+                            || playback_age_action.is_some()
                             || rating_action.is_some();
+                        let extra_action = extra_action || curation_scope_action.is_some();
                         let transport_action = matches!(
                             event.id.as_str(),
                             PLAY | STOP
                                 | LOOP
+                                | FOCUS_LOADED
                                 | SIMILAR
                                 | BPM_SNAP
                                 | ZERO_CROSSING
                                 | BEAT_GUIDES
+                                | TRANSIENT_MARKERS
                                 | BEAT_COUNT
                                 | METRONOME
                                 | RANDOM_AUDITION
@@ -385,7 +473,11 @@ impl BrowserAccessibility {
                             || SETTINGS_ORDER.contains(&event.id.as_str());
                         if !matches!(
                             event.id.as_str(),
-                            ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE | SEARCH
+                            ADD_SOURCE
+                                | FOLDER_SCOPE
+                                | REFRESH_SOURCE
+                                | SHOW_EMPTY_FOLDERS
+                                | SEARCH
                         ) && source_action.is_none()
                             && folder_action.is_none()
                             && sample_action.is_none()
@@ -398,7 +490,8 @@ impl BrowserAccessibility {
                         if view.active_source.is_none()
                             && (collection_action.is_some()
                                 || playback_type_action.is_some()
-                                || rating_action.is_some())
+                                || rating_action.is_some()
+                                || curation_scope_action.is_some())
                         {
                             return;
                         }
@@ -427,8 +520,10 @@ impl BrowserAccessibility {
                         if event.id == WAVEFORM && view.waveform.is_none() {
                             return;
                         }
-                        if matches!(event.id.as_str(), BPM_SNAP | BEAT_GUIDES | BEAT_COUNT)
-                            && view.waveform.is_none()
+                        if matches!(
+                            event.id.as_str(),
+                            BPM_SNAP | BEAT_GUIDES | BEAT_COUNT | TRANSIENT_MARKERS
+                        ) && view.waveform.is_none()
                         {
                             return;
                         }
@@ -450,9 +545,24 @@ impl BrowserAccessibility {
                         {
                             return;
                         }
+                        if event.id == COLLECTION_RENAME
+                            && !view
+                                .collection_rename_editor
+                                .as_ref()
+                                .is_some_and(|editor| {
+                                    view.collection_rename_is_current(editor.slot)
+                                })
+                        {
+                            return;
+                        }
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
+                        if event.action == AxAction::Focus
+                            && let Some((path, false)) = folder_action.as_ref()
+                        {
+                            view.mark_folder_keyboard_focus(path.clone());
+                        }
                         if settings_action {
                             match event.action {
                                 AxAction::Focus => {}
@@ -464,6 +574,7 @@ impl BrowserAccessibility {
                         } else if event.id == SEARCH
                             || event.id == TAG_FILTER_INPUT
                             || event.id == PLAYMARK_TIMING
+                            || event.id == COLLECTION_RENAME
                         {
                             match event.action {
                                 AxAction::SetValue(value) => {
@@ -471,6 +582,8 @@ impl BrowserAccessibility {
                                         view.search_input.clone()
                                     } else if event.id == PLAYMARK_TIMING {
                                         view.playmark_timing_input.clone()
+                                    } else if event.id == COLLECTION_RENAME {
+                                        view.collection_rename_input.clone()
                                     } else {
                                         view.tag_filter_input.clone()
                                     };
@@ -526,11 +639,9 @@ impl BrowserAccessibility {
                                     cx.notify();
                                 }
                                 LOOP => view.toggle_loop(cx),
+                                FOCUS_LOADED => view.focus_loaded_sample_in_browser(window, cx),
                                 SIMILAR => super::similar_sections::toggle(view, cx),
-                                BPM_SNAP => {
-                                    view.bpm_snap_enabled = !view.bpm_snap_enabled;
-                                    cx.notify();
-                                }
+                                BPM_SNAP => view.toggle_bpm_snap(cx),
                                 ZERO_CROSSING => super::zero_crossing::toggle_from_accessibility(
                                     view, window, cx,
                                 ),
@@ -538,15 +649,33 @@ impl BrowserAccessibility {
                                     view.beat_guides_enabled = !view.beat_guides_enabled;
                                     cx.notify();
                                 }
+                                TRANSIENT_MARKERS => super::transient_markers::toggle(view, cx),
                                 METRONOME => view.toggle_metronome(cx),
                                 RANDOM_AUDITION => view.request_random_audition(false, cx),
                                 NORMALIZED_AUDITION => view.toggle_normalized_audition(cx),
                                 ADD_SOURCE => view.prompt_for_source(cx),
                                 FOLDER_SCOPE => view.toggle_folder_scope(cx),
                                 REFRESH_SOURCE => view.refresh_active_source(cx),
+                                SHOW_EMPTY_FOLDERS => view.toggle_empty_folder_visibility(cx),
                                 TAG_FILTER_TOGGLE => super::tag_filter::toggle(view, cx),
+                                CURATION_QUEUE_TOGGLE => super::curation_queue::toggle(view, cx),
+                                CURATION_QUEUE_SCOPE => {
+                                    super::curation_queue::toggle_scope_menu(view, cx)
+                                }
                                 RANDOM_NAVIGATION => view.toggle_random_navigation(cx),
                                 NAME_VIEW_MODE => view.toggle_sample_name_view_mode(cx),
+                                JOB_DETAILS => {
+                                    view.job_details_open = !view.job_details_open;
+                                    cx.notify();
+                                }
+                                JOB_RETRY => {
+                                    view.retry_job_audit(cx);
+                                    window.focus(&view.job_details_focus_handle);
+                                }
+                                JOB_CANCEL => {
+                                    view.cancel_job_audit(cx);
+                                    window.focus(&view.job_details_focus_handle);
+                                }
                                 _ => match source_action {
                                     Some((index, true)) => {
                                         view.forget_source(index, window, cx);
@@ -575,8 +704,21 @@ impl BrowserAccessibility {
                                                     view.toggle_collection_filter(slot, cx);
                                                 } else if let Some(kind) = playback_type_action {
                                                     view.toggle_playback_type_filter(kind, cx);
+                                                } else if let Some(chip) = playback_age_action {
+                                                    view.toggle_playback_age_filter(
+                                                        chip, false, cx,
+                                                    );
                                                 } else if let Some(level) = rating_action {
                                                     view.toggle_rating_filter(level, cx);
+                                                } else if let Some(scope) = curation_scope_action {
+                                                    super::curation_queue::set_scope(
+                                                        view, scope, cx,
+                                                    );
+                                                    if let Some(scope_focus) =
+                                                        view.ax_focus(CURATION_QUEUE_SCOPE)
+                                                    {
+                                                        window.focus(&scope_focus);
+                                                    }
                                                 } else {
                                                     return;
                                                 }
@@ -674,7 +816,7 @@ impl Browser {
         let busy = self.general_settings.maintenance_busy();
         match id {
             SETTINGS_CLOSE | THEME_RESET => true,
-            THEME_CHOOSE | MOTION | AUTOPLAY | HELP_TIPS => editable,
+            THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | HELP_TIPS => editable,
             THEME_RELOAD => editable && self.theme_load.pending_path.is_none(),
             RATING_DECAY_DECREASE => {
                 editable
@@ -707,6 +849,7 @@ impl Browser {
             THEME_RELOAD => self.reload_theme_from_accessibility(cx),
             THEME_RESET => self.reset_theme_from_accessibility(cx),
             MOTION => self.toggle_motion_from_accessibility(cx),
+            TEXT_SCALE => self.toggle_text_scale_from_accessibility(cx),
             AUTOPLAY => self.toggle_autoplay_from_accessibility(cx),
             HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
             RATING_DECAY_DECREASE => self.change_rating_decay(-1, cx),
@@ -787,6 +930,10 @@ impl Browser {
         let visible_folders = range
             .filter_map(|position| rows.get(position).map(|row| row.path.clone()))
             .collect::<Vec<_>>();
+        let focused_folder = self.folder_keyboard.as_ref().and_then(|state| {
+            (state.root() == root && rows.iter().any(|row| row.path == state.focused()))
+                .then(|| state.focused().to_path_buf())
+        });
         let mut visible_ids = HashSet::new();
         for folder in &visible_folders {
             let has_toggle = rows
@@ -805,6 +952,14 @@ impl Browser {
                     .or_insert_with(|| cx.focus_handle());
             }
         }
+        // A transient empty virtual-list range must not retire the keyboard target's handle.
+        if let Some(path) = focused_folder {
+            let id = folder_id(root, &path);
+            visible_ids.insert(id.clone());
+            ax.control_focus
+                .entry(id)
+                .or_insert_with(|| cx.focus_handle());
+        }
         ax.control_focus.retain(|id, _| {
             (!id.starts_with("browser-folder:") && !id.starts_with("browser-folder-toggle:"))
                 || visible_ids.contains(id)
@@ -819,6 +974,13 @@ impl Browser {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let focused_sample_id = self
+            .browser_focus_id()
+            .as_ref()
+            .and_then(|id| self.view_model.visible_position_for(id))
+            .and_then(|position| self.view_model.rows().get(position))
+            .and_then(|row| self.entries.get(row.entry_index))
+            .map(|entry| sample_id(&entry.path));
         let visible_samples = range
             .filter_map(|position| {
                 let row = self.view_model.rows().get(position)?;
@@ -834,12 +996,32 @@ impl Browser {
         for path in &visible_samples {
             let id = sample_id(path);
             visible_ids.insert(id.clone());
-            ax.control_focus
-                .entry(id)
-                .or_insert_with(|| cx.focus_handle());
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                ax.control_focus.entry(id.clone())
+            {
+                entry.insert(cx.focus_handle());
+                if ax.recent_sample_focus_set.insert(id.clone()) {
+                    ax.recent_sample_focus_ids.push_back(id);
+                }
+            }
         }
-        ax.control_focus
-            .retain(|id, _| !id.starts_with("browser-sample:") || visible_ids.contains(id));
+        // The virtual list reports overlapping ranges during one paint. Keep a
+        // bounded recent set so a row's focus handle survives those range changes.
+        while ax.recent_sample_focus_ids.len() > 128 {
+            let Some(id) = ax.recent_sample_focus_ids.pop_front() else {
+                break;
+            };
+            ax.recent_sample_focus_set.remove(&id);
+            if !visible_ids.contains(&id) && focused_sample_id.as_ref() != Some(&id) {
+                ax.control_focus.remove(&id);
+            }
+        }
+        ax.control_focus.retain(|id, _| {
+            !id.starts_with("browser-sample:")
+                || visible_ids.contains(id)
+                || focused_sample_id.as_ref() == Some(id)
+                || ax.recent_sample_focus_set.contains(id)
+        });
         ax.visible_samples = visible_samples;
         self.sync_browser_accessibility(window, cx);
     }
@@ -891,10 +1073,11 @@ impl Browser {
                 ),
                 toggle(
                     LOOP,
-                    "Loop selection",
+                    self.loop_toolbar_label(),
                     self.loop_toolbar_enabled(),
                     self.preferences_editable(),
                 ),
+                button(FOCUS_LOADED, "Focus loaded sample in browser", None, true),
                 toggle(
                     SIMILAR,
                     "Find similar sections",
@@ -917,6 +1100,12 @@ impl Browser {
                     BEAT_GUIDES,
                     "Beat guides",
                     self.beat_guides_enabled,
+                    has_waveform,
+                ),
+                toggle(
+                    TRANSIENT_MARKERS,
+                    "Transient markers",
+                    self.transient_markers.enabled(),
                     has_waveform,
                 ),
                 toggle(
@@ -995,6 +1184,60 @@ impl Browser {
                 ),
                 true,
             ));
+            let jobs = super::job_details::snapshot(self, cx);
+            controls.push(button(
+                JOB_DETAILS,
+                "Job Details",
+                Some(format!(
+                    "{}, {}",
+                    if self.job_details_open {
+                        "Open"
+                    } else {
+                        "Closed"
+                    },
+                    jobs.status_label()
+                )),
+                true,
+            ));
+            if self.job_details_open {
+                let mut details = if jobs.rows.is_empty() {
+                    "No active jobs".to_string()
+                } else {
+                    jobs.rows
+                        .iter()
+                        .map(|row| {
+                            format!(
+                                "{} for {}: {}, {}{}",
+                                row.kind.label(),
+                                row.source_label(),
+                                row.state_label(),
+                                row.work,
+                                row.blocked_label()
+                                    .map(|error| format!(", {error}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                };
+                if let Some(error) = self.job_action_error.as_ref() {
+                    details.push_str("; ");
+                    details.push_str(error);
+                }
+                controls.push(AxChild {
+                    id: JOB_DETAILS_PANEL.into(),
+                    role: AxRole::Group,
+                    label: "Job Details panel".into(),
+                    value: Some(details),
+                    enabled: true,
+                });
+                if jobs.rows.iter().any(|row| row.can_retry) {
+                    controls.push(button(JOB_RETRY, "Retry source audit", None, true));
+                }
+                if jobs.rows.iter().any(|row| row.can_cancel) {
+                    controls.push(button(JOB_CANCEL, "Cancel source audit", None, true));
+                }
+            }
             if self.theme_settings_open {
                 let editable = self.preferences_editable();
                 let busy = self.general_settings.maintenance_busy();
@@ -1020,6 +1263,7 @@ impl Browser {
                         true,
                     ),
                     toggle(MOTION, "Animations", theme.motion.enabled, editable),
+                    text_scale_button(self.general_settings.text_scale_percent, editable),
                     toggle(
                         AUTOPLAY,
                         "Autoplay selection",
@@ -1151,7 +1395,7 @@ impl Browser {
                         label: label.clone(),
                         value: Some(format!(
                             "{}, {} audio {}",
-                            if self.selected_folder == row.path {
+                            if self.folder_is_selected(&row.path) {
                                 "Selected"
                             } else {
                                 "Not selected"
@@ -1200,12 +1444,19 @@ impl Browser {
                 value: None,
                 enabled: true,
             });
+            controls.push(AxChild {
+                id: SHOW_EMPTY_FOLDERS.into(),
+                role: AxRole::CheckBox,
+                label: "Show Empty Folders".into(),
+                value: Some(if self.show_empty_folders { "On" } else { "Off" }.into()),
+                enabled: true,
+            });
             let active_source = self.active_source.is_some();
             for slot in 0..COLLECTION_COUNT {
                 controls.push(AxChild {
                     id: collection_filter_id(slot),
                     role: AxRole::CheckBox,
-                    label: format!("Collection {} filter", slot + 1),
+                    label: format!("{} filter", self.collection_name(slot)),
                     value: Some(
                         if self.view_model.collection_filter() == Some(slot) {
                             "On"
@@ -1216,6 +1467,15 @@ impl Browser {
                     ),
                     enabled: active_source,
                 });
+                if self.collection_rename_is_current(slot) {
+                    controls.push(AxChild {
+                        id: COLLECTION_RENAME.into(),
+                        role: AxRole::TextField,
+                        label: format!("Rename {}", self.collection_name(slot)),
+                        value: Some(self.collection_rename_input.read(cx).content().to_owned()),
+                        enabled: true,
+                    });
+                }
             }
             for (index, kind) in PLAYBACK_TYPE_FILTERS.iter().enumerate() {
                 controls.push(AxChild {
@@ -1224,6 +1484,27 @@ impl Browser {
                     label: format!("{} filter", if index == 0 { "1-Shot" } else { "Loop" }),
                     value: Some(
                         if self.view_model.playback_type_filter().contains_type(*kind) {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                        .into(),
+                    ),
+                    enabled: active_source,
+                });
+            }
+            for (index, chip) in PLAYBACK_AGE_CHIPS.iter().enumerate() {
+                let label = match chip {
+                    PlaybackAgeChip::NeverPlayed => "Never played",
+                    PlaybackAgeChip::OlderThanMonth => "Older than 30 days",
+                    PlaybackAgeChip::OlderThanWeek => "Older than 7 days",
+                };
+                controls.push(AxChild {
+                    id: playback_age_filter_id(index),
+                    role: AxRole::CheckBox,
+                    label: format!("{label} filter"),
+                    value: Some(
+                        if self.view_model.playback_age_filter().contains(*chip) {
                             "On"
                         } else {
                             "Off"
@@ -1250,6 +1531,58 @@ impl Browser {
                 });
             }
             controls.push(AxChild {
+                id: CURATION_QUEUE_TOGGLE.into(),
+                role: AxRole::CheckBox,
+                label: "Curation queue".into(),
+                value: Some(
+                    if self.view_model.curation_queue().enabled {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                    .into(),
+                ),
+                enabled: active_source,
+            });
+            controls.push(AxChild {
+                id: CURATION_QUEUE_SCOPE.into(),
+                role: AxRole::Button,
+                label: "Curation queue scope".into(),
+                value: Some(
+                    super::curation_queue::scope_label(self.view_model.curation_queue().scope)
+                        .into(),
+                ),
+                enabled: active_source,
+            });
+            if super::curation_queue::scope_menu_open(self) {
+                for (index, scope) in [
+                    CurationQueueScope::All,
+                    CurationQueueScope::Ratings,
+                    CurationQueueScope::Tags,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    controls.push(AxChild {
+                        id: curation_queue_choice_id(index),
+                        role: AxRole::Button,
+                        label: format!(
+                            "Curation queue {} scope",
+                            super::curation_queue::scope_label(scope)
+                        ),
+                        value: Some(
+                            if self.view_model.curation_queue().scope == scope {
+                                "Selected"
+                            } else {
+                                "Not selected"
+                            }
+                            .into(),
+                        ),
+                        enabled: active_source,
+                    });
+                }
+            }
+            controls.push(AxChild {
                 id: TAG_FILTER_TOGGLE.into(),
                 role: AxRole::CheckBox,
                 label: "Tag filter".into(),
@@ -1270,7 +1603,7 @@ impl Browser {
                 value: Some(self.tag_filter_input.read(cx).content().to_owned()),
                 enabled: true,
             });
-            for (column, label) in visible_sort_columns(window, cx) {
+            for (column, label) in visible_sort_columns(self, window, cx) {
                 let sort = self.view_model.sort();
                 controls.push(AxChild {
                     id: sort_id(column).into(),
@@ -1465,5 +1798,32 @@ impl Browser {
 impl Drop for BrowserAccessibility {
     fn drop(&mut self) {
         let _ = self.registry.borrow_mut().reconcile(Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_text_scale_exposes_keyboard_order_and_readable_ax_values() {
+        let position = SETTINGS_ORDER
+            .iter()
+            .position(|id| *id == TEXT_SCALE)
+            .expect("text scale participates in settings keyboard navigation");
+        assert_eq!(SETTINGS_ORDER[position - 1], MOTION);
+        assert_eq!(SETTINGS_ORDER[position + 1], AUTOPLAY);
+
+        for (percent, enabled) in [(100, true), (200, false)] {
+            let control = text_scale_button(percent, enabled);
+            assert_eq!(control.id, TEXT_SCALE);
+            assert_eq!(control.role, AxRole::Button);
+            assert_eq!(control.label, "Text size");
+            assert_eq!(
+                control.value.as_deref(),
+                Some(format!("{percent}%").as_str())
+            );
+            assert_eq!(control.enabled, enabled);
+        }
     }
 }

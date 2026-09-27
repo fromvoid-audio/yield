@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use yield_core::COLLECTION_COUNT;
 use yield_design::{Theme, ThemeError, validate_theme};
 use yield_library::sample_sources::UI_PREFERENCES_MAX_BYTES;
 
@@ -14,10 +15,16 @@ use crate::SessionError;
 pub const UI_PREFERENCES_SCHEMA_VERSION: u32 = 1;
 const MAX_THEME_SOURCE_PATH_BYTES: usize = 16 * 1024;
 const MAX_AUDIO_OUTPUT_NAME_BYTES: usize = 1024;
+/// Longest persisted custom collection label, measured in UTF-8 bytes.
+pub const MAX_COLLECTION_NAME_BYTES: usize = 128;
 const OUTPUT_VOLUME_SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Default interval between positive-rating decay steps, in weeks.
 pub const DEFAULT_RATING_DECAY_WEEKS: u16 = 4;
+/// Default in-app text size as a percentage of the authored theme.
+pub const DEFAULT_TEXT_SCALE_PERCENT: u16 = 100;
+/// Enlarged in-app text size for accessibility verification.
+pub const ENLARGED_TEXT_SCALE_PERCENT: u16 = 200;
 /// Shortest supported rating-decay interval.
 pub const MIN_RATING_DECAY_WEEKS: u16 = 1;
 /// Longest supported rating-decay interval.
@@ -37,6 +44,14 @@ fn default_autoplay_selection() -> bool {
 
 fn default_output_volume() -> f32 {
     1.0
+}
+
+fn default_text_scale_percent() -> u16 {
+    DEFAULT_TEXT_SCALE_PERCENT
+}
+
+fn default_collection_names() -> [Option<String>; COLLECTION_COUNT] {
+    std::array::from_fn(|_| None)
 }
 
 /// The optional, renderer-neutral audio output routing persisted with the UI preferences.
@@ -107,6 +122,9 @@ pub struct UiPreferences {
     /// Optional absolute path used by an explicit theme reload action.
     #[serde(default)]
     pub theme_source_path: Option<PathBuf>,
+    /// In-app text scale; the authored theme remains unchanged.
+    #[serde(default = "default_text_scale_percent")]
+    pub text_scale_percent: u16,
     /// Whether a newly focused sample may start playback.
     #[serde(default = "default_autoplay_selection")]
     pub autoplay_selection: bool,
@@ -122,6 +140,9 @@ pub struct UiPreferences {
     /// Whether audition playback loops its active region.
     #[serde(default)]
     pub loop_enabled: bool,
+    /// Independent locked loop choice: absent means ordinary per-file loop policy applies.
+    #[serde(default)]
+    pub loop_lock_override: Option<bool>,
     /// Whether audition playback uses the raw peak of its active span to normalize gain.
     #[serde(default)]
     pub normalized_audition_enabled: bool,
@@ -131,6 +152,9 @@ pub struct UiPreferences {
     /// Optional output routing requested by the user.
     #[serde(default)]
     pub audio_output: AudioOutputPreferences,
+    /// Profile-owned custom labels for the six stable collection slots.
+    #[serde(default = "default_collection_names")]
+    pub collection_names: [Option<String>; COLLECTION_COUNT],
 }
 
 impl Default for UiPreferences {
@@ -139,14 +163,17 @@ impl Default for UiPreferences {
             schema_version: UI_PREFERENCES_SCHEMA_VERSION,
             theme: Theme::default(),
             theme_source_path: None,
+            text_scale_percent: default_text_scale_percent(),
             autoplay_selection: true,
             help_tooltips_enabled: true,
             rating_decay_weeks: DEFAULT_RATING_DECAY_WEEKS,
             trash_folder: None,
             loop_enabled: false,
+            loop_lock_override: None,
             normalized_audition_enabled: false,
             output_volume: 1.0,
             audio_output: AudioOutputPreferences::default(),
+            collection_names: default_collection_names(),
         }
     }
 }
@@ -161,6 +188,7 @@ impl UiPreferences {
         }
         let theme = validate_theme(self.theme)
             .map_err(|error| PreferenceError::InvalidTheme(error.to_string()))?;
+        validate_text_scale_percent(self.text_scale_percent)?;
         if let Some(path) = self.theme_source_path.as_deref() {
             validate_theme_source_path(path)?;
         }
@@ -168,6 +196,9 @@ impl UiPreferences {
         validate_trash_folder(self.trash_folder.as_deref())?;
         validate_output_volume(self.output_volume)?;
         self.audio_output.validate()?;
+        for name in self.collection_names.iter().flatten() {
+            validate_collection_name(name)?;
+        }
         Ok(Self { theme, ..self })
     }
 
@@ -229,6 +260,9 @@ pub enum PreferenceError {
     /// The output volume was not a finite value in the inclusive 0..=1 range.
     #[error("output volume must be finite and between 0 and 1")]
     InvalidOutputVolume,
+    /// The in-app text scale is not one of the supported sizes.
+    #[error("text scale must be 100% or 200%")]
+    InvalidTextScale,
     /// An audio output host or device name was empty, contained a NUL, or exceeded its bound.
     #[error(
         "audio output {field} must be non-empty, contain no NUL bytes, and be at most {MAX_AUDIO_OUTPUT_NAME_BYTES} bytes"
@@ -243,6 +277,14 @@ pub enum PreferenceError {
         /// The invalid audio output field name.
         field: &'static str,
     },
+    /// A collection label did not meet the bounded single-line name contract.
+    #[error(
+        "collection name must be trimmed, non-empty, single-line, NUL-free, and at most {MAX_COLLECTION_NAME_BYTES} UTF-8 bytes"
+    )]
+    InvalidCollectionName,
+    /// The requested stable collection slot does not exist.
+    #[error("collection slot must be less than {COLLECTION_COUNT}")]
+    InvalidCollectionSlot,
     /// The profile payload exceeded its bounded UTF-8 byte limit.
     #[error(
         "UI preferences payload exceeds the {UI_PREFERENCES_MAX_BYTES}-byte limit ({actual} bytes)"
@@ -287,6 +329,17 @@ fn validate_output_volume(volume: f32) -> Result<(), PreferenceError> {
     Ok(())
 }
 
+fn validate_text_scale_percent(percent: u16) -> Result<(), PreferenceError> {
+    if matches!(
+        percent,
+        DEFAULT_TEXT_SCALE_PERCENT | ENLARGED_TEXT_SCALE_PERCENT
+    ) {
+        Ok(())
+    } else {
+        Err(PreferenceError::InvalidTextScale)
+    }
+}
+
 fn validate_audio_output_name(
     value: Option<&str>,
     field: &'static str,
@@ -306,6 +359,17 @@ fn validate_audio_output_name(
 fn validate_rating_decay_weeks(weeks: u16) -> Result<(), PreferenceError> {
     if !(MIN_RATING_DECAY_WEEKS..=MAX_RATING_DECAY_WEEKS).contains(&weeks) {
         return Err(PreferenceError::InvalidRatingDecay);
+    }
+    Ok(())
+}
+
+fn validate_collection_name(name: &str) -> Result<(), PreferenceError> {
+    if name.is_empty()
+        || name.trim() != name
+        || name.len() > MAX_COLLECTION_NAME_BYTES
+        || name.chars().any(char::is_control)
+    {
+        return Err(PreferenceError::InvalidCollectionName);
     }
     Ok(())
 }
@@ -338,6 +402,8 @@ pub enum PreferencePatch {
     },
     /// Change only the motion-enabled flag inside the current theme.
     SetMotionEnabled(bool),
+    /// Change the in-app text scale without editing the authored theme.
+    SetTextScalePercent(u16),
     /// Change the selection autoplay preference.
     SetAutoplaySelection(bool),
     /// Change the reference rating-decay interval.
@@ -348,12 +414,21 @@ pub enum PreferencePatch {
     SetHelpTooltipsEnabled(bool),
     /// Change the audition loop preference.
     SetLoopEnabled(bool),
+    /// Enter, cycle, or leave the locked loop override without writing sample metadata.
+    SetLoopLockOverride(Option<bool>),
     /// Change the peak-normalized audition preference.
     SetNormalizedAuditionEnabled(bool),
     /// Change the linear audition output volume.
     SetOutputVolume(f32),
     /// Replace all optional audio output routing fields atomically.
     SetAudioOutput(AudioOutputPreferences),
+    /// Assign a custom display label to one stable collection slot.
+    SetCollectionName {
+        /// Zero-based slot identity, independent of active source.
+        slot: usize,
+        /// Trimmed, bounded user label.
+        name: String,
+    },
     /// Replace the invalid or current document with built-in defaults.
     Reset,
 }
@@ -371,6 +446,10 @@ impl PreferencePatch {
                 preferences.theme_source_path = source_path;
             }
             Self::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = enabled,
+            Self::SetTextScalePercent(percent) => {
+                validate_text_scale_percent(percent)?;
+                preferences.text_scale_percent = percent;
+            }
             Self::SetAutoplaySelection(enabled) => preferences.autoplay_selection = enabled,
             Self::SetRatingDecayWeeks(weeks) => {
                 validate_rating_decay_weeks(weeks)?;
@@ -381,7 +460,13 @@ impl PreferencePatch {
                 preferences.trash_folder = path;
             }
             Self::SetHelpTooltipsEnabled(enabled) => preferences.help_tooltips_enabled = enabled,
-            Self::SetLoopEnabled(enabled) => preferences.loop_enabled = enabled,
+            Self::SetLoopEnabled(enabled) => {
+                preferences.loop_enabled = enabled;
+                preferences.loop_lock_override = None;
+            }
+            Self::SetLoopLockOverride(locked_override) => {
+                preferences.loop_lock_override = locked_override;
+            }
             Self::SetNormalizedAuditionEnabled(enabled) => {
                 preferences.normalized_audition_enabled = enabled;
             }
@@ -392,6 +477,13 @@ impl PreferencePatch {
             Self::SetAudioOutput(audio_output) => {
                 audio_output.validate()?;
                 preferences.audio_output = audio_output;
+            }
+            Self::SetCollectionName { slot, name } => {
+                validate_collection_name(&name)?;
+                let Some(current) = preferences.collection_names.get_mut(slot) else {
+                    return Err(PreferenceError::InvalidCollectionSlot);
+                };
+                *current = Some(name);
             }
             Self::Reset => *preferences = Self::default_preferences(),
         }
@@ -666,6 +758,7 @@ mod tests {
         preferences.theme_source_path = Some(std::env::temp_dir().join("custom theme.json"));
         preferences.autoplay_selection = false;
         preferences.loop_enabled = true;
+        preferences.loop_lock_override = Some(false);
         preferences.normalized_audition_enabled = true;
         preferences.output_volume = 0.37;
 
@@ -674,6 +767,66 @@ mod tests {
             UiPreferences::from_payload(&payload).expect("decode"),
             preferences
         );
+    }
+
+    #[test]
+    fn collection_names_are_bounded_slot_stable_and_round_trip() {
+        let mut preferences = UiPreferences::default();
+        assert!(
+            PreferencePatch::SetCollectionName {
+                slot: 2,
+                name: "Percussion".to_string(),
+            }
+            .apply(&mut preferences)
+            .expect("rename slot")
+        );
+        assert_eq!(
+            preferences.collection_names[2].as_deref(),
+            Some("Percussion")
+        );
+        assert!(
+            preferences
+                .collection_names
+                .iter()
+                .enumerate()
+                .all(|(slot, name)| { slot == 2 || name.is_none() })
+        );
+        assert_eq!(
+            UiPreferences::from_payload(&preferences.to_payload().unwrap()).unwrap(),
+            preferences
+        );
+        assert_eq!(
+            PreferencePatch::SetCollectionName {
+                slot: COLLECTION_COUNT,
+                name: "Wrong".to_string(),
+            }
+            .apply(&mut preferences),
+            Err(PreferenceError::InvalidCollectionSlot)
+        );
+        for invalid in [
+            "",
+            " Name",
+            "Name ",
+            "two\nlines",
+            "two\twords",
+            "bad\0name",
+            &"x".repeat(129),
+        ] {
+            assert_eq!(
+                PreferencePatch::SetCollectionName {
+                    slot: 2,
+                    name: invalid.to_string(),
+                }
+                .apply(&mut preferences),
+                Err(PreferenceError::InvalidCollectionName)
+            );
+        }
+        assert_eq!(
+            preferences.collection_names[2].as_deref(),
+            Some("Percussion")
+        );
+        PreferencePatch::Reset.apply(&mut preferences).unwrap();
+        assert!(preferences.collection_names.iter().all(Option::is_none));
     }
 
     #[test]
@@ -699,6 +852,79 @@ mod tests {
         );
         PreferencePatch::Reset.apply(&mut preferences).unwrap();
         assert!(!preferences.normalized_audition_enabled);
+    }
+
+    #[test]
+    fn locked_loop_choice_is_separate_and_normal_toggle_exits_it_atomically() {
+        let mut preferences = UiPreferences::default();
+        PreferencePatch::SetLoopLockOverride(Some(true))
+            .apply(&mut preferences)
+            .expect("set lock");
+        assert_eq!(preferences.loop_lock_override, Some(true));
+        assert!(!preferences.loop_enabled);
+        PreferencePatch::SetLoopLockOverride(Some(false))
+            .apply(&mut preferences)
+            .expect("cycle lock");
+        assert_eq!(preferences.loop_lock_override, Some(false));
+        assert!(!preferences.loop_enabled);
+        PreferencePatch::SetLoopEnabled(true)
+            .apply(&mut preferences)
+            .expect("ordinary toggle");
+        assert_eq!(preferences.loop_lock_override, None);
+        assert!(preferences.loop_enabled);
+        let payload = preferences.to_payload().expect("encode");
+        assert_eq!(
+            UiPreferences::from_payload(&payload).expect("decode"),
+            preferences
+        );
+        let mut legacy = serde_json::to_value(&preferences).expect("encode legacy fixture");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("loop_lock_override");
+        let legacy = serde_json::to_string(&legacy).expect("legacy payload");
+        assert_eq!(
+            UiPreferences::from_payload(&legacy)
+                .expect("decode without lock")
+                .loop_lock_override,
+            None
+        );
+    }
+
+    #[test]
+    fn text_scale_defaults_for_old_payloads_and_persists_at_supported_sizes() {
+        let mut payload = serde_json::to_value(UiPreferences::default()).expect("encode");
+        payload
+            .as_object_mut()
+            .expect("object")
+            .remove("text_scale_percent");
+        let mut preferences = UiPreferences::from_payload(
+            &serde_json::to_string(&payload).expect("encode old payload"),
+        )
+        .expect("decode old payload");
+        assert_eq!(preferences.text_scale_percent, DEFAULT_TEXT_SCALE_PERCENT);
+
+        assert!(
+            PreferencePatch::SetTextScalePercent(ENLARGED_TEXT_SCALE_PERCENT)
+                .apply(&mut preferences)
+                .expect("set enlarged text")
+        );
+        assert_eq!(
+            UiPreferences::from_payload(&preferences.to_payload().expect("persist"))
+                .expect("restore")
+                .text_scale_percent,
+            ENLARGED_TEXT_SCALE_PERCENT
+        );
+        let before = preferences.clone();
+        assert_eq!(
+            PreferencePatch::SetTextScalePercent(150).apply(&mut preferences),
+            Err(PreferenceError::InvalidTextScale)
+        );
+        assert_eq!(preferences, before);
+        PreferencePatch::Reset
+            .apply(&mut preferences)
+            .expect("reset");
+        assert_eq!(preferences.text_scale_percent, DEFAULT_TEXT_SCALE_PERCENT);
     }
 
     #[test]

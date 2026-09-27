@@ -84,27 +84,28 @@ pub use open_profiles::SourceDatabaseConnectionRole;
 pub use pending_renames::{PendingRenameDiagnostics, PendingRenameEntry, PendingRenamePruneReport};
 pub use rename_metadata::RenameMetadataSnapshot;
 pub use tags::{
-    SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
-    SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
+    SOURCE_CURATION_TAG_FACTS_MAX_PATHS, SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES,
+    SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATHS,
+    SOURCE_TAG_FILTER_MAX_INPUT_BYTES, SOURCE_TAG_FILTER_MAX_TAGS,
     SOURCE_TAG_FILTER_MAX_TOKEN_BYTES, SourceTagFilterResult,
 };
 pub use types::{
     BrowserFileMetadata, BrowserMetadataCursor, BrowserMetadataPage, BrowserMetadataSnapshot,
-    ExistingFileMetadataUpdate, Rating, SampleCollection, SampleSoundType, SourceDirectoryEntry,
-    SourceDirectoryTruthCleanup, SourceDirectoryTruthCursor, SourceDirectoryTruthPage,
-    SourceDirectoryTruthPublication, SourceDirectoryTruthState,
-    SourceDirectoryTruthUnavailableReason, SourceDisplayLabelEntry, SourceDisplayLabelResult,
-    SourceIndexClassification, SourceIndexDiagnostic, SourceIndexEntry, SourceIndexSnapshot,
-    SourceManifestEntry, SourcePlaybackType, SourceTag, SourceTagPage, SourceTagPageCursor,
-    SourceTagPageEntry, SourceTagUsage, WavEntry,
+    ExistingFileMetadataUpdate, Rating, SampleCollection, SampleSoundType, SourceCurationTagFacts,
+    SourceCurationTagFactsPage, SourceDirectoryEntry, SourceDirectoryTruthCleanup,
+    SourceDirectoryTruthCursor, SourceDirectoryTruthPage, SourceDirectoryTruthPublication,
+    SourceDirectoryTruthState, SourceDirectoryTruthUnavailableReason, SourceDisplayLabelEntry,
+    SourceDisplayLabelResult, SourceIndexClassification, SourceIndexDiagnostic, SourceIndexEntry,
+    SourceIndexSnapshot, SourceManifestEntry, SourcePlaybackType, SourceTag, SourceTagPage,
+    SourceTagPageCursor, SourceTagPageEntry, SourceTagUsage, WavEntry,
 };
 pub use util::normalize_relative_path;
 pub use write::{
     ManifestCommitResult, SOURCE_CURATION_BATCH_LIMIT, SourceCollectionWrite, SourceCommandId,
     SourceContentHashWrite, SourceCurationCommitReceipt, SourceCurationUpdate,
     SourceDirectoryTruthCommitResult, SourceFileWrite, SourceIndexCommitResult, SourceRevision,
-    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
-    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    SourceSnapshotOwner, SourceSnapshotPage, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 
 /// Hidden filename used for per-source databases.

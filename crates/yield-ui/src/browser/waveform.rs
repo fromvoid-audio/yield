@@ -7,9 +7,9 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::beat_count_input::MAX_BEAT_COUNT;
 use gpui::{
-    AnyView, App, Bounds, ContentMask, Context, DragMoveEvent, Hsla, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px,
+    AnyView, App, Bounds, ContentMask, Context, DragMoveEvent, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px,
 };
 use yield_core::{
     WaveformEditFade, WaveformEditFadeDrag, WaveformEditFadeHandle, WaveformEditRegion,
@@ -23,6 +23,7 @@ use super::Browser;
 use super::played_ranges;
 use super::playmark_timing;
 use super::similar_sections;
+use super::transient_markers;
 use super::waveform_fades;
 use super::waveform_scrollbar;
 use super::zero_crossing;
@@ -276,6 +277,29 @@ impl WaveformPlayRegion {
     fn slide_right(self) -> Option<Self> {
         self.core()
             .map(|region| Self::from_core(region.slide_right()))
+    }
+
+    fn nudged_by_frame(self, direction: WaveformRegionSlide, total_frames: usize) -> Option<Self> {
+        if total_frames == 0 || !self.is_valid() {
+            return None;
+        }
+        // Playback rounds normalized span endpoints to frames. Nudge those same frames instead
+        // of using the outward-rounded range used for timing labels.
+        let total = total_frames as f64;
+        let start = (self.start * total)
+            .round()
+            .clamp(0.0, (total_frames - 1) as f64) as usize;
+        let end = (self.end * total).round().clamp((start + 1) as f64, total) as usize;
+        let width = end - start;
+        let next_start = match direction {
+            WaveformRegionSlide::FineLeft => start.saturating_sub(1),
+            WaveformRegionSlide::FineRight => start.saturating_add(1).min(total_frames - width),
+            _ => return None,
+        };
+        Self::new(
+            next_start as f64 / total,
+            (next_start + width) as f64 / total,
+        )
     }
 }
 
@@ -1746,7 +1770,13 @@ pub(super) fn render_waveform(
                 - theme.waveform.metadata_height
                 - scrollbar_height)
                 .max(theme.spacing.waveform_min_bar_height);
-            let bar_color = if browser.playing_path.is_some() {
+            let selected_path = browser
+                .selected
+                .and_then(|index| browser.entries.get(index))
+                .map(|entry| entry.path.as_path());
+            let bar_color = if browser.playing_path.as_deref() == selected_path
+                && browser.playing_path.is_some()
+            {
                 theme.colors.waveform_played
             } else {
                 theme.colors.waveform_unplayed
@@ -1804,6 +1834,7 @@ pub(super) fn render_waveform(
         .right_0(),
     );
     bars = bars.child(similar_sections::overlay(browser, theme.clone()));
+    bars = bars.child(transient_markers::render_overlay(browser, &theme));
     let beat_guides = browser.beat_guides_enabled.then_some((
         browser.beat_guide_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
@@ -1915,6 +1946,13 @@ pub(super) fn render_waveform(
     let click_bounds_for_hover = Rc::clone(&click_bounds);
     let bars = bars
         .track_focus(&browser.waveform_focus_handle)
+        .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+            if view.waveform_focus_handle.is_focused(window)
+                && view.handle_panel_focus_key(event, window, cx)
+            {
+                cx.stop_propagation();
+            }
+        }))
         .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
             if !*hovered {
                 let changed = view.waveform_fade_hover.take().is_some();
@@ -1929,6 +1967,11 @@ pub(super) fn render_waveform(
                 .filter(|bounds| bounds.contains(&event.position))
                 .and_then(|bounds| waveform_click_ratio(event.position, bounds))
                 .map(|ratio| view.waveform_viewport.absolute_ratio_from_visible(ratio));
+            if let Some(ratio) =
+                ratio.filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio))
+            {
+                view.waveform_hover_cursor = Some(ratio as f32);
+            }
             let similar_changed = similar_sections::hover(view, ratio);
             if view.update_waveform_fade_hover(event.position, bounds) || similar_changed {
                 cx.notify();
@@ -2241,7 +2284,10 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         played_ranges::clear_history(self);
+        self.transient_markers.invalidate();
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
+        self.waveform_hover_cursor = None;
+        self.waveform_last_play_start = None;
         self.waveform_detail.reset();
         self.waveform_viewport = WaveformViewport::full();
         self.waveform_zoom_anchor_ratio = 0.5;
@@ -2413,6 +2459,12 @@ impl Browser {
         let Some(next) = (match direction {
             WaveformRegionSlide::Left => region.slide_left(),
             WaveformRegionSlide::Right => region.slide_right(),
+            WaveformRegionSlide::FineLeft | WaveformRegionSlide::FineRight => {
+                let Some(preview) = self.waveform.as_ref() else {
+                    return false;
+                };
+                region.nudged_by_frame(direction, preview.total_frames)
+            }
         }) else {
             return false;
         };
@@ -3105,6 +3157,14 @@ fn fade_silence_clear_side(hit: waveform_fades::WaveformEditFadeHit) -> Option<b
 pub(super) enum WaveformRegionSlide {
     Left,
     Right,
+    FineLeft,
+    FineRight,
+}
+
+impl WaveformRegionSlide {
+    pub(super) fn is_fine(self) -> bool {
+        matches!(self, Self::FineLeft | Self::FineRight)
+    }
 }
 
 pub(super) fn waveform_region_navigation_key(
@@ -3114,12 +3174,14 @@ pub(super) fn waveform_region_navigation_key(
     alt: bool,
     function: bool,
 ) -> Option<WaveformRegionSlide> {
-    if secondary || shift || alt || function {
+    if secondary || function || (shift && alt) {
         return None;
     }
-    match key {
-        "left" | "arrowleft" => Some(WaveformRegionSlide::Left),
-        "right" | "arrowright" => Some(WaveformRegionSlide::Right),
+    match (key, shift || alt) {
+        ("left" | "arrowleft", false) => Some(WaveformRegionSlide::Left),
+        ("right" | "arrowright", false) => Some(WaveformRegionSlide::Right),
+        ("left" | "arrowleft", true) => Some(WaveformRegionSlide::FineLeft),
+        ("right" | "arrowright", true) => Some(WaveformRegionSlide::FineRight),
         _ => None,
     }
 }
@@ -3363,6 +3425,14 @@ mod tests {
 
     fn test_bounds(width: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(width), px(height)))
+    }
+
+    fn playback_frames(region: WaveformPlayRegion, total_frames: usize) -> (usize, usize) {
+        let total = total_frames as f64;
+        (
+            (region.start * total).round() as usize,
+            (region.end * total).round() as usize,
+        )
     }
 
     #[test]
@@ -4694,7 +4764,7 @@ mod tests {
     }
 
     #[test]
-    fn waveform_region_keyboard_routing_requires_an_unmodified_waveform_key() {
+    fn waveform_region_keyboard_routing_keeps_coarse_and_fine_modifiers_distinct() {
         assert_eq!(
             waveform_region_navigation_key("left", false, false, false, false),
             Some(WaveformRegionSlide::Left)
@@ -4709,10 +4779,22 @@ mod tests {
         );
         assert_eq!(
             waveform_region_navigation_key("right", false, true, false, false),
-            None
+            Some(WaveformRegionSlide::FineRight)
         );
         assert_eq!(
             waveform_region_navigation_key("right", false, false, true, false),
+            Some(WaveformRegionSlide::FineRight)
+        );
+        assert_eq!(
+            waveform_region_navigation_key("arrowleft", false, true, false, false),
+            Some(WaveformRegionSlide::FineLeft)
+        );
+        assert_eq!(
+            waveform_region_navigation_key("left", false, false, true, false),
+            Some(WaveformRegionSlide::FineLeft)
+        );
+        assert_eq!(
+            waveform_region_navigation_key("right", false, true, true, false),
             None
         );
         assert_eq!(
@@ -4723,6 +4805,52 @@ mod tests {
             waveform_region_navigation_key("up", false, false, false, false),
             None
         );
+    }
+
+    #[test]
+    fn fine_region_nudges_preserve_exact_frames_and_clamp_without_repeat_drift() {
+        let mut region = WaveformPlayRegion::new(0.2, 0.4).expect("play region");
+        for start in 201..=800 {
+            region = region
+                .nudged_by_frame(WaveformRegionSlide::FineRight, 1_000)
+                .expect("one-frame nudge");
+            assert_eq!(playback_frames(region, 1_000), (start, start + 200));
+        }
+        let right_edge = region
+            .nudged_by_frame(WaveformRegionSlide::FineRight, 1_000)
+            .expect("clamped nudge");
+        assert_eq!(right_edge, region);
+        for start in (0..800).rev() {
+            region = region
+                .nudged_by_frame(WaveformRegionSlide::FineLeft, 1_000)
+                .expect("one-frame nudge");
+            assert_eq!(playback_frames(region, 1_000), (start, start + 200));
+        }
+        assert_eq!(
+            region.nudged_by_frame(WaveformRegionSlide::FineLeft, 1_000),
+            Some(region)
+        );
+        assert_eq!(
+            region.nudged_by_frame(WaveformRegionSlide::FineRight, 0),
+            None
+        );
+
+        for total_frames in [44_100, 1_000_003, 50_000_000] {
+            let start = total_frames / 3;
+            let width = total_frames / 5;
+            let region = WaveformPlayRegion::new(
+                start as f64 / total_frames as f64,
+                (start + width) as f64 / total_frames as f64,
+            )
+            .expect("frame-aligned region");
+            let before = playback_frames(region, total_frames);
+            let nudged = region
+                .nudged_by_frame(WaveformRegionSlide::FineRight, total_frames)
+                .expect("one-frame nudge");
+            let after = playback_frames(nudged, total_frames);
+            assert_eq!(after.0, before.0 + 1);
+            assert_eq!(after.1 - after.0, before.1 - before.0);
+        }
     }
 
     #[test]

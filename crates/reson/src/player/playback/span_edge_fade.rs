@@ -3,11 +3,9 @@ use std::time::Duration;
 use crate::Source;
 
 use super::super::PlaybackSpanPlan;
-use super::span_samples::SpanSamplesMode;
 
 pub(super) struct StaticSpanEdgeFadeSource<S> {
     inner: S,
-    mode: SpanSamplesMode,
     channels: u16,
     sample_rate: u32,
     frame_count: u64,
@@ -21,11 +19,6 @@ where
     S: Source,
 {
     pub(super) fn new(inner: S, plan: &PlaybackSpanPlan, max_fade: Duration) -> Self {
-        let mode = if plan.looped() {
-            SpanSamplesMode::Looped
-        } else {
-            SpanSamplesMode::OneShot
-        };
         Self {
             channels: inner.channels().max(1),
             sample_rate: inner.sample_rate().max(1),
@@ -37,7 +30,6 @@ where
             ),
             frame_offset: plan.seek_offset_frames(),
             inner,
-            mode,
             samples_emitted: 0,
         }
     }
@@ -52,12 +44,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let sample = self.inner.next()?;
         let emitted_frame = self.samples_emitted / u64::from(self.channels);
-        let frame = match self.mode {
-            SpanSamplesMode::Looped => (self.frame_offset + emitted_frame) % self.frame_count,
-            SpanSamplesMode::OneShot => {
-                (self.frame_offset + emitted_frame).min(self.frame_count.saturating_sub(1))
-            }
-        };
+        let frame = self.frame_offset.saturating_add(emitted_frame) % self.frame_count;
         self.samples_emitted = self.samples_emitted.saturating_add(1);
         Some(sample * span_edge_fade_gain(frame, self.frame_count, self.fade_frames))
     }

@@ -32,6 +32,7 @@ enum ContextMenuAction {
     Unlock,
     RemoveFromCollection { slot: usize },
     OpenDirectory,
+    RenameCollection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +83,13 @@ struct SampleContextMenuTarget {
 enum ContextMenuTarget {
     Sample(SampleContextMenuTarget),
     Directory(super::directory_open::DirectoryOpenTarget),
+    Collection {
+        slot: usize,
+        name: String,
+        source_id: SourceId,
+        root: PathBuf,
+        anchor: Point<Pixels>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +166,16 @@ impl ContextMenuTarget {
             Self::Directory(target) => {
                 super::directory_open::directory_target_is_current(browser, target)
             }
+            Self::Collection {
+                slot,
+                source_id,
+                root,
+                ..
+            } => {
+                *slot < yield_core::COLLECTION_COUNT
+                    && browser.active_source_id().as_ref() == Some(source_id)
+                    && browser.root.as_ref() == Some(root)
+            }
         }
     }
 
@@ -165,6 +183,7 @@ impl ContextMenuTarget {
         match self {
             Self::Sample(target) => target.anchor,
             Self::Directory(target) => target.anchor,
+            Self::Collection { anchor, .. } => *anchor,
         }
     }
 
@@ -175,13 +194,18 @@ impl ContextMenuTarget {
                 super::directory_open::DirectoryOpenKind::Source => "SOURCE",
                 super::directory_open::DirectoryOpenKind::Folder => "FOLDER",
             },
+            Self::Collection { .. } => "COLLECTION",
         }
     }
 
     fn label(&self) -> String {
+        if let Self::Collection { name, .. } = self {
+            return name.clone();
+        }
         let path = match self {
             Self::Sample(target) => &target.relative_path,
             Self::Directory(target) => target.folder.as_ref().unwrap_or(&target.root),
+            Self::Collection { .. } => unreachable!(),
         };
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -190,6 +214,35 @@ impl ContextMenuTarget {
 }
 
 impl Browser {
+    pub(super) fn open_collection_context_menu(
+        &mut self,
+        slot: usize,
+        anchor: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(source_id), Some(root)) = (self.active_source_id(), self.root.clone()) else {
+            return;
+        };
+        if slot >= yield_core::COLLECTION_COUNT {
+            return;
+        }
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Collection {
+                slot,
+                name: self.collection_name(slot),
+                source_id,
+                root,
+                anchor,
+            },
+            actions: vec![ContextMenuAction::RenameCollection],
+            selected_action: 0,
+        });
+        window.focus(&self.focus_handle);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     /// Open a sample row menu without changing the loaded waveform or transport selection.
     pub(super) fn open_context_menu(
         &mut self,
@@ -205,21 +258,23 @@ impl Browser {
             return;
         };
         let Some(activation) = self.catalog_activation.clone() else {
-            self.scan_status =
-                String::from("Context menu requires a successful audited catalog projection");
+            self.set_scan_status(String::from(
+                "Context menu requires a successful audited catalog projection",
+            ));
             cx.notify();
             return;
         };
         if !activation.audit_finished || activation.audit_error.is_some() {
-            self.scan_status =
-                String::from("Context menu requires a successful audited catalog projection");
+            self.set_scan_status(String::from(
+                "Context menu requires a successful audited catalog projection",
+            ));
             cx.notify();
             return;
         }
         let Some(context) = self.catalog_metadata.context() else {
-            self.scan_status = String::from(
+            self.set_scan_status(String::from(
                 "Catalog metadata is still loading; try again after the catalog is ready",
-            );
+            ));
             cx.notify();
             return;
         };
@@ -362,7 +417,7 @@ impl Browser {
         true
     }
 
-    fn activate_context_menu_action(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn activate_context_menu_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.context_menu.as_ref() else {
             return;
         };
@@ -384,7 +439,7 @@ impl Browser {
                 cx.write_to_clipboard(ClipboardItem::new_string(format_copy_path(
                     &target.absolute_path,
                 )));
-                self.playback_status = String::from("Copied path");
+                self.set_playback_status(String::from("Copied path"));
                 cx.notify();
             }
             (ContextMenuAction::Unlock, ContextMenuTarget::Sample(target)) => {
@@ -404,8 +459,11 @@ impl Browser {
             (ContextMenuAction::OpenDirectory, ContextMenuTarget::Directory(target)) => {
                 self.start_directory_open(target, cx)
             }
+            (ContextMenuAction::RenameCollection, ContextMenuTarget::Collection { slot, .. }) => {
+                self.begin_collection_rename(slot, window, cx);
+            }
             _ => {
-                self.playback_status = String::from("Context menu action is unavailable");
+                self.set_playback_status(String::from("Context menu action is unavailable"));
                 cx.notify();
             }
         }
@@ -416,7 +474,7 @@ impl Browser {
             self.clear_browser_focus_override();
             super::tag_chips::invalidate(self);
             self.start_source_registry_poll(cx);
-            self.playback_status = String::from(STALE_CONTEXT_MESSAGE);
+            self.set_playback_status(String::from(STALE_CONTEXT_MESSAGE));
             cx.notify();
         }
     }
@@ -432,7 +490,7 @@ pub(super) fn invalidate_if_stale(browser: &mut Browser) {
         browser.context_menu = None;
         browser.clear_browser_focus_override();
         super::tag_chips::invalidate(browser);
-        browser.playback_status = String::from(STALE_CONTEXT_MESSAGE);
+        browser.set_playback_status(String::from(STALE_CONTEXT_MESSAGE));
     }
 }
 
@@ -655,6 +713,7 @@ fn context_menu_action_label(action: ContextMenuAction) -> &'static str {
         ContextMenuAction::Unlock => "Unlock",
         ContextMenuAction::RemoveFromCollection { .. } => "Remove from collection",
         ContextMenuAction::OpenDirectory => directory_open_label(),
+        ContextMenuAction::RenameCollection => "Rename collection",
     }
 }
 

@@ -1429,7 +1429,7 @@ mod tests {
         loop {
             line.clear();
             assert!(reader.read_line(&mut line).expect("read helper output") > 0);
-            if line.trim_end() == "READY" {
+            if line.trim_end().ends_with("YIELD_VOLUME_OWNER_READY") {
                 break;
             }
         }
@@ -1492,7 +1492,7 @@ mod tests {
         let _owner =
             acquire_fixture_for_test(&descriptor, &registry, volume(volume_device), &profile)
                 .expect("helper volume owner");
-        println!("READY");
+        println!("YIELD_VOLUME_OWNER_READY");
         io::stdout().flush().expect("flush helper handshake");
         let mut command = String::new();
         io::stdin()

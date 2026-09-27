@@ -25,7 +25,7 @@ use yield_library::operation_journal::{
 };
 use yield_library::sample_sources::{
     GlobalLibraryWriter, GlobalLibraryWriterQueueError, GlobalLibraryWriterStartError,
-    GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceRegistrySnapshot,
+    GlobalLibraryWriterStatus, LibraryError, SampleSource, SourceId, SourceRegistrySnapshot,
 };
 
 mod catalog;
@@ -34,20 +34,23 @@ mod preferences;
 mod vocabulary;
 
 pub use catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
+    CatalogCancelError, CatalogCommand, CatalogCurationRequestError,
+    CatalogCurationTagFactsRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
     CatalogError, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
     CatalogRatingDecayRequestError, CatalogStatus, CatalogSubmitError,
     CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
     CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
-    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_UPDATES, MAX_TAG_FILTER_MASK_BYTES,
-    MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES, MAX_WAV_METADATA_REQUEST_PATHS,
+    MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
+    MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
+    MAX_WAV_METADATA_REQUEST_PATHS, SOURCE_CURATION_TAG_FACTS_MAX_PATHS,
     SOURCE_DISPLAY_LABEL_MAX_OUTPUT_BYTES, SOURCE_DISPLAY_LABEL_MAX_PATH_BYTES,
     SOURCE_DISPLAY_LABEL_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PAGE_SIZE, SOURCE_TAG_PAGE_MAX_PATH_BYTES,
     SOURCE_TAG_PAGE_MAX_PATHS, SOURCE_TAG_PAGE_MAX_PREFIX_BYTES, SOURCE_TAG_PAGE_MAX_TAG_IDS,
     SourceCurationCommitReceipt, SourceCurationOperationFailure, SourceCurationOperationFence,
-    SourceCurationOperationOutcome, SourceCurationUpdate, SourceDisplayLabelEntry, SourceTagPage,
-    SourceTagPageCursor, SourceTagPageEntry, VerifiedSourceRoot, resolve_source_root,
+    SourceCurationOperationOutcome, SourceCurationTagFacts, SourceCurationUpdate,
+    SourceDisplayLabelEntry, SourceTagPage, SourceTagPageCursor, SourceTagPageEntry,
+    VerifiedSourceRoot, resolve_source_root,
 };
 use catalog::{CatalogService, CatalogSlot};
 use maintenance::{
@@ -60,7 +63,8 @@ pub use maintenance::{
 };
 
 pub use preferences::{
-    AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, MAX_RATING_DECAY_WEEKS,
+    AudioOutputPreferences, DEFAULT_RATING_DECAY_WEEKS, DEFAULT_TEXT_SCALE_PERCENT,
+    ENLARGED_TEXT_SCALE_PERCENT, MAX_COLLECTION_NAME_BYTES, MAX_RATING_DECAY_WEEKS,
     MIN_RATING_DECAY_WEEKS, PreferenceError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
     PreferenceRevision, UI_PREFERENCES_SCHEMA_VERSION, UiPreferences,
 };
@@ -301,6 +305,26 @@ impl SourceRegistryService {
         self.submit(|request| Command::RemoveRoot { request, root })
     }
 
+    /// Reorder one configured source relative to another at an exact registry revision.
+    ///
+    /// This changes only the persisted source-list order. The worker rejects stale revisions
+    /// and unknown IDs before producing a replacement snapshot.
+    pub fn reorder_source(
+        &self,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+        expected_revision: RegistryRevision,
+    ) -> Result<RequestId, SubmitError> {
+        self.submit(|request| Command::ReorderSource {
+            request,
+            source_id,
+            target_id,
+            after,
+            expected_revision,
+        })
+    }
+
     /// Submit a typed preference patch to the shared session owner.
     pub fn patch_preferences(
         &self,
@@ -466,6 +490,24 @@ impl SourceRegistryService {
         catalog::submit(&self.catalog, command)
     }
 
+    /// Request cancellation of the exact current source audit without blocking on the worker.
+    pub fn cancel_catalog_audit(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<(), CatalogCancelError> {
+        catalog::cancel_audit(&self.catalog, source_id, lifecycle_generation)
+    }
+
+    /// Check whether the exact source lifecycle currently has an active audit to cancel.
+    pub fn catalog_audit_is_running(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> bool {
+        catalog::audit_is_running(&self.catalog, source_id, lifecycle_generation)
+    }
+
     /// Poll one catalog event without waiting for startup or worker I/O.
     pub fn try_recv_catalog(&self) -> Result<CatalogEvent, TryRecvError> {
         catalog::try_recv_event(&self.catalog)
@@ -608,6 +650,13 @@ enum Command {
         request: RequestId,
         root: CanonicalSourceRoot,
     },
+    ReorderSource {
+        request: RequestId,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+        expected_revision: RegistryRevision,
+    },
     PatchPreferences {
         request: PreferenceRequestId,
         patch: PreferencePatch,
@@ -640,6 +689,12 @@ enum Edit {
     Remove {
         request: RequestId,
         root: CanonicalSourceRoot,
+    },
+    Reorder {
+        request: RequestId,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
     },
 }
 
@@ -709,6 +764,21 @@ impl Coordinator {
         self.edits.push(Edit::Remove { request, root });
     }
 
+    fn reorder_edit(
+        &mut self,
+        request: RequestId,
+        source_id: SourceId,
+        target_id: SourceId,
+        after: bool,
+    ) {
+        self.edits.push(Edit::Reorder {
+            request,
+            source_id,
+            target_id,
+            after,
+        });
+    }
+
     fn resolve_add(
         &mut self,
         request: RequestId,
@@ -769,6 +839,12 @@ impl Coordinator {
                 Edit::Remove { root, .. } => {
                     next.retain(|source| source.root != root.as_path());
                 }
+                Edit::Reorder {
+                    source_id,
+                    target_id,
+                    after,
+                    ..
+                } => reorder_sources(&mut next, source_id, target_id, *after)?,
             }
         }
         let changed = !sources_equal(&previous, &next);
@@ -800,7 +876,7 @@ impl Coordinator {
             Edit::Add {
                 root, source: None, ..
             } => Some(root.as_path().to_path_buf()),
-            Edit::Add { .. } | Edit::Remove { .. } => None,
+            Edit::Add { .. } | Edit::Remove { .. } | Edit::Reorder { .. } => None,
         }));
         roots.sort();
         roots.dedup();
@@ -830,14 +906,14 @@ impl Coordinator {
                 source: Some(_),
                 ..
             } => Some(*request),
-            Edit::Add { source: None, .. } | Edit::Remove { .. } => None,
+            Edit::Add { source: None, .. } | Edit::Remove { .. } | Edit::Reorder { .. } => None,
         })
     }
 
     fn remove_requests(&self) -> impl Iterator<Item = RequestId> + '_ {
         self.edits.iter().filter_map(|edit| match edit {
             Edit::Remove { request, .. } => Some(*request),
-            Edit::Add { .. } => None,
+            Edit::Add { .. } | Edit::Reorder { .. } => None,
         })
     }
 
@@ -847,7 +923,9 @@ impl Coordinator {
         }
         self.edits.retain(|edit| {
             let request = match edit {
-                Edit::Add { request, .. } | Edit::Remove { request, .. } => request,
+                Edit::Add { request, .. }
+                | Edit::Remove { request, .. }
+                | Edit::Reorder { request, .. } => request,
             };
             !requests.contains(request)
         });
@@ -879,6 +957,39 @@ fn add_source(
     Ok(())
 }
 
+fn reorder_sources(
+    sources: &mut Vec<SampleSource>,
+    source_id: &SourceId,
+    target_id: &SourceId,
+    after: bool,
+) -> Result<(), SessionError> {
+    let source_matches = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| (&source.id == source_id).then_some(index))
+        .collect::<Vec<_>>();
+    let target_matches = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| (&source.id == target_id).then_some(index))
+        .collect::<Vec<_>>();
+    if source_matches.len() != 1 || target_matches.len() != 1 {
+        return Err(SessionError::Library(String::from(
+            "source reorder requires two current unique source IDs",
+        )));
+    }
+    if source_id == target_id {
+        return Ok(());
+    }
+    let moved = sources.remove(source_matches[0]);
+    let target = sources
+        .iter()
+        .position(|source| &source.id == target_id)
+        .expect("validated target source remains after removing a different ID");
+    sources.insert(target + usize::from(after), moved);
+    Ok(())
+}
+
 fn sources_equal(left: &[SampleSource], right: &[SampleSource]) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
@@ -892,6 +1003,8 @@ fn sources_equal(left: &[SampleSource], right: &[SampleSource]) -> bool {
 
 struct Persistence {
     maintenance: MaintenanceService,
+    catalog_slot: Arc<Mutex<CatalogSlot>>,
+    vocabulary_slot: Arc<Mutex<VocabularySlot>>,
     catalog: Option<Arc<CatalogService>>,
     writer: Option<GlobalLibraryWriter>,
     journal: Option<OperationJournalOwner>,
@@ -924,6 +1037,8 @@ impl Persistence {
         let mut persistence = Self {
             writable: None,
             maintenance: MaintenanceService::new(maintenance_admission),
+            catalog_slot: Arc::clone(&catalog_slot),
+            vocabulary_slot: Arc::clone(&vocabulary_slot),
             writer: None,
             catalog: None,
             journal: None,
@@ -1067,6 +1182,20 @@ impl Persistence {
                         _ => None,
                     })
             })
+    }
+
+    fn fence_dependents_after_journal_failure(&self, error: &SessionError) {
+        if !self.journal.as_ref().is_some_and(|journal| {
+            matches!(
+                journal.status(),
+                OperationJournalOwnerStatus::Unavailable { .. }
+            )
+        }) {
+            return;
+        }
+        let reason = error.to_string();
+        catalog::mark_unavailable(&self.catalog_slot, reason.clone());
+        vocabulary::mark_unavailable(&self.vocabulary_slot, reason);
     }
 
     fn available(&self) -> bool {
@@ -1365,6 +1494,51 @@ fn run_worker(
                 }
                 coordinator.compact_if_resolved(!persistence.pending_adds.is_empty());
             }
+            Command::ReorderSource {
+                request,
+                source_id,
+                target_id,
+                after,
+                expected_revision,
+            } => {
+                if !coordinator.loaded
+                    || !persistence.pending_adds.is_empty()
+                    || coordinator.revision() != expected_revision
+                {
+                    fail_request(
+                        &event_tx,
+                        &mut unfinalized_requests,
+                        request,
+                        SessionError::Library(String::from(
+                            "source reorder rejected because the registry changed or is still loading",
+                        )),
+                    );
+                    continue;
+                }
+                coordinator.reorder_edit(request, source_id, target_id, after);
+                match coordinator.rebuild() {
+                    Ok(changed) => {
+                        if changed {
+                            let _ = event_tx.send(RegistryEvent::Snapshot {
+                                revision: coordinator.revision(),
+                                snapshot: coordinator.snapshot(),
+                            });
+                        }
+                        announce_request(
+                            &event_tx,
+                            &mut applied_requests,
+                            &mut unfinalized_requests,
+                            request,
+                            coordinator.revision(),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = coordinator.discard_requests(&HashSet::from([request]));
+                        fail_request(&event_tx, &mut unfinalized_requests, request, error);
+                    }
+                }
+                coordinator.compact_if_resolved(false);
+            }
             Command::PatchPreferences { request, patch } => {
                 if matches!(&patch, PreferencePatch::SetTrashFolder(_))
                     && persistence.maintenance.clear_reserved()
@@ -1489,7 +1663,9 @@ fn can_block_on_command(
 
 fn command_request(command: &Command) -> Option<RequestId> {
     match command {
-        Command::AddRoot { request, .. } | Command::RemoveRoot { request, .. } => Some(*request),
+        Command::AddRoot { request, .. }
+        | Command::RemoveRoot { request, .. }
+        | Command::ReorderSource { request, .. } => Some(*request),
         Command::PatchPreferences { .. }
         | Command::StorageUsage { .. }
         | Command::ClearRebuildableCache { .. }
@@ -1502,6 +1678,7 @@ fn preference_command_request(command: &Command) -> Option<PreferenceRequestId> 
         Command::PatchPreferences { request, .. } => Some(*request),
         Command::AddRoot { .. }
         | Command::RemoveRoot { .. }
+        | Command::ReorderSource { .. }
         | Command::StorageUsage { .. }
         | Command::ClearRebuildableCache { .. }
         | Command::Shutdown { .. } => None,
@@ -2287,6 +2464,7 @@ fn report_unavailable(
     reported: &mut bool,
     unfinalized_requests: &mut HashSet<RequestId>,
 ) {
+    persistence.fence_dependents_after_journal_failure(&error);
     persistence.unavailable = Some(error.clone());
     let mut failed_requests: Vec<_> = unfinalized_requests.drain().collect();
     failed_requests.sort_by_key(|request| request.get());
@@ -2499,6 +2677,7 @@ mod tests {
     use yield_library::sample_sources::{SourceId, SourceMetadataStorage};
 
     const SESSION_OWNER_PROFILE_ROOT_ENV: &str = "YIELD_SESSION_OWNER_PROFILE_ROOT";
+    const SESSION_OWNER_READY_LINE: &str = "YIELD_SESSION_OWNER_READY";
     const FULL_PROGRESS_FIXTURE_OPERATION_ID: &str = "00000000-0000-0000-0000-0000000000cd";
     const FULL_PROGRESS_FIXTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2546,7 +2725,7 @@ mod tests {
                     Ok(0) => {
                         break Err(String::from("session owner helper exited before handshake"));
                     }
-                    Ok(_) if line.trim_end() == "READY" => break Ok(()),
+                    Ok(_) if line.trim_end().ends_with(SESSION_OWNER_READY_LINE) => break Ok(()),
                     Ok(_) => continue,
                     Err(error) => {
                         break Err(format!("failed to read session owner handshake: {error}"));
@@ -2604,7 +2783,9 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for session owner slots"
+                "timed out waiting for session owner slots: catalog={:?}, vocabulary={:?}",
+                service.catalog_status(),
+                service.vocabulary_status()
             );
             thread::yield_now();
         }
@@ -2749,12 +2930,15 @@ mod tests {
         fs::write(path, bytes).expect("test WAV");
     }
 
-    fn wait_for_event(service: &SourceRegistryService, predicate: impl Fn(&RegistryEvent) -> bool) {
+    fn wait_for_event(
+        service: &SourceRegistryService,
+        predicate: impl Fn(&RegistryEvent) -> bool,
+    ) -> RegistryEvent {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut observed = Vec::new();
         loop {
             match service.try_recv() {
-                Ok(event) if predicate(&event) => return,
+                Ok(event) if predicate(&event) => return event,
                 Ok(event) => observed.push(format!("{event:?}")),
                 Err(TryRecvError::Empty) => {
                     assert!(
@@ -2986,6 +3170,124 @@ mod tests {
                 .any(|source| source.root == source_root.as_path())
         });
         assert_eq!(restored.len(), 1);
+        reopened.shutdown().expect("reopen shutdown");
+    }
+
+    #[test]
+    fn source_reorder_persists_identity_and_rejects_stale_revision() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let profile = profile_root(&temp);
+        let mut service = SourceRegistryService::start_inner(Some(profile.clone())).expect("start");
+        wait_for_event(&service, |event| {
+            matches!(event, RegistryEvent::Snapshot { .. })
+        });
+
+        let roots = [
+            root(&temp, "first"),
+            root(&temp, "second"),
+            root(&temp, "third"),
+        ];
+        let mut revision = RegistryRevision::default();
+        let mut before = None;
+        for (index, source_root) in roots.iter().enumerate() {
+            let request = service.add_root(source_root.clone()).expect("add source");
+            if index == roots.len() - 1 {
+                before = Some(wait_for_snapshot(&service, |snapshot| {
+                    snapshot.len() == roots.len()
+                }));
+            }
+            let event = wait_for_event(
+                &service,
+                |event| matches!(event, RegistryEvent::RequestApplied { request: applied, .. } if *applied == request),
+            );
+            let RegistryEvent::RequestApplied {
+                revision: applied, ..
+            } = event
+            else {
+                unreachable!()
+            };
+            revision = applied;
+        }
+        let before = before.expect("complete source snapshot");
+        let ids = before
+            .as_slice()
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let request = service
+            .reorder_source(ids[0].clone(), ids[2].clone(), true, revision)
+            .expect("reorder");
+        let reordered = wait_for_snapshot(&service, |snapshot| {
+            snapshot
+                .as_slice()
+                .iter()
+                .map(|source| &source.id)
+                .collect::<Vec<_>>()
+                == vec![&ids[1], &ids[2], &ids[0]]
+        });
+        assert_eq!(
+            reordered
+                .as_slice()
+                .iter()
+                .map(|source| source.root.as_path())
+                .collect::<Vec<_>>(),
+            vec![roots[1].as_path(), roots[2].as_path(), roots[0].as_path()]
+        );
+        assert!(sources_equal(
+            reordered.as_slice(),
+            &[
+                before.as_slice()[1].clone(),
+                before.as_slice()[2].clone(),
+                before.as_slice()[0].clone(),
+            ]
+        ));
+        let applied = wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestApplied { request: actual, .. } if *actual == request),
+        );
+        let RegistryEvent::RequestApplied {
+            revision: reordered_revision,
+            ..
+        } = applied
+        else {
+            unreachable!()
+        };
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::Persisted { revision } if *revision == reordered_revision),
+        );
+        let stale = service
+            .reorder_source(ids[0].clone(), ids[1].clone(), false, revision)
+            .expect("submit stale reorder");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestFailed { request, .. } if *request == stale),
+        );
+        let missing = service
+            .reorder_source(
+                SourceId::from_string("missing-source"),
+                ids[1].clone(),
+                false,
+                reordered_revision,
+            )
+            .expect("submit removed source reorder");
+        wait_for_event(
+            &service,
+            |event| matches!(event, RegistryEvent::RequestFailed { request, .. } if *request == missing),
+        );
+        service.shutdown().expect("shutdown");
+
+        let mut reopened = SourceRegistryService::start_inner(Some(profile)).expect("reopen");
+        let restored = wait_for_snapshot(&reopened, |snapshot| snapshot.len() == roots.len());
+        assert_eq!(
+            restored
+                .as_slice()
+                .iter()
+                .map(|source| &source.id)
+                .collect::<Vec<_>>(),
+            vec![&ids[1], &ids[2], &ids[0]]
+        );
         reopened.shutdown().expect("reopen shutdown");
     }
 
@@ -4163,6 +4465,62 @@ mod tests {
     }
 
     #[test]
+    fn collection_slot_name_survives_profile_restart_without_leaking_to_another_profile() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let first_profile = profile_root(&temp);
+        let second_profile = temp
+            .path()
+            .join(".yield")
+            .join(PROFILE_DIR_NAME)
+            .join("other-profile");
+        fs::create_dir_all(&second_profile).expect("other profile root");
+        let second_profile = fs::canonicalize(second_profile).expect("canonical other profile");
+        let mut service =
+            SourceRegistryService::start_inner(Some(first_profile.clone())).expect("first start");
+        wait_for_preference_snapshot(&service, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        let request = service
+            .patch_preferences(PreferencePatch::SetCollectionName {
+                slot: 4,
+                name: String::from("Textures"),
+            })
+            .expect("rename request");
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::RequestApplied { request: applied, .. } if *applied == request),
+        );
+        wait_for_preference_event(
+            &service,
+            |event| matches!(event, PreferenceEvent::Persisted { revision } if revision.get() > 0),
+        );
+        service.shutdown().expect("first shutdown");
+
+        let mut reopened =
+            SourceRegistryService::start_inner(Some(first_profile)).expect("reopen first");
+        let restored = wait_for_preference_snapshot(&reopened, |preferences| {
+            preferences.collection_names[4].as_deref() == Some("Textures")
+        });
+        assert!(
+            restored
+                .collection_names
+                .iter()
+                .enumerate()
+                .all(|(slot, name)| slot == 4 || name.is_none())
+        );
+        reopened.shutdown().expect("reopen shutdown");
+
+        let mut other =
+            SourceRegistryService::start_inner(Some(second_profile)).expect("other profile start");
+        let isolated = wait_for_preference_snapshot(&other, |preferences| {
+            preferences == &UiPreferences::default()
+        });
+        assert!(isolated.collection_names.iter().all(Option::is_none));
+        other.shutdown().expect("other shutdown");
+    }
+
+    #[test]
     fn immediate_shutdown_persists_latest_output_volume() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -4518,6 +4876,88 @@ mod tests {
     }
 
     #[test]
+    fn competing_profile_restarts_only_after_orderly_volume_handoff() {
+        let temp = TempDir::new().expect("config base");
+        let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
+        let owner_root = profile_root(&temp);
+        let competing_root = temp
+            .path()
+            .join(".yield")
+            .join(PROFILE_DIR_NAME)
+            .join("competing-profile");
+        fs::create_dir_all(&competing_root).expect("competing profile root");
+        let competing_root = fs::canonicalize(competing_root).expect("canonical contender");
+
+        let mut owner =
+            SourceRegistryService::start_inner(Some(owner_root.clone())).expect("owner service");
+        wait_for_session_owner_slots(&owner);
+        let owner_journal = journal_database_path(&owner_root);
+        assert!(owner_journal.is_file());
+
+        let mut contender = SourceRegistryService::start_inner(Some(competing_root.clone()))
+            .expect("contender service");
+        wait_for_event(&contender, |event| {
+            matches!(
+                event,
+                RegistryEvent::PersistenceUnavailable {
+                    error: SessionError::Persistence(reason),
+                    ..
+                } if reason.contains("volume ownership is held by another process")
+            )
+        });
+        let catalog_status = contender.catalog_status();
+        assert!(
+            matches!(
+                &catalog_status,
+                CatalogStatus::Unavailable { reason }
+                    if reason.contains("volume ownership is held by another process")
+            ),
+            "catalog status: {catalog_status:?}"
+        );
+        assert!(matches!(
+            contender.vocabulary_status(),
+            VocabularyStatus::Unavailable { reason }
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(matches!(
+            contender.submit_catalog(CatalogCommand::Register {
+                source_id: SourceId::from_string("competing-profile-source"),
+                canonical_root: competing_root.clone(),
+                lifecycle_generation: 1,
+            }),
+            Err(CatalogSubmitError::Unavailable(reason))
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(matches!(
+            contender.lookup_profile_tag_categories(vec![String::from("competing-profile-tag")]),
+            Err(VocabularySubmitError::Unavailable(reason))
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(matches!(
+            contender.shutdown(),
+            Err(ShutdownError::Session(SessionError::Persistence(reason)))
+                if reason.contains("volume ownership is held by another process")
+        ));
+        assert!(owner_journal.is_file());
+
+        owner.shutdown().expect("clean owner handoff");
+        let mut restarted = SourceRegistryService::start_inner(Some(competing_root))
+            .expect("competing profile restart");
+        wait_for_session_owner_slots(&restarted);
+        wait_for_catalog_ready(&restarted);
+        restarted.shutdown().expect("competing profile shutdown");
+        let _owner_scope = AppRootGuard::set(owner_root).expect("owner profile after handoff");
+        let guard = WritableProfileGuard::acquire_current().expect("owner profile remains usable");
+        let journal = OperationJournalStore::open(&guard).expect("owner journal remains readable");
+        assert!(matches!(
+            journal
+                .recovery_readiness()
+                .expect("owner recovery readiness"),
+            OperationJournalRecoveryReadiness::Clear
+        ));
+    }
+
+    #[test]
     fn cross_process_profile_owner_conflict_leaves_session_slots_uninstalled() {
         let temp = TempDir::new().expect("config base");
         let _base_guard = ConfigBaseGuard::set(fs::canonicalize(temp.path()).expect("base"));
@@ -4604,7 +5044,7 @@ mod tests {
         let mut service = SourceRegistryService::start_inner(Some(profile_root))
             .expect("session owner helper service");
         wait_for_session_owner_slots(&service);
-        println!("READY");
+        println!("{SESSION_OWNER_READY_LINE}");
         io::stdout()
             .flush()
             .expect("flush session owner helper handshake");
@@ -4746,6 +5186,8 @@ mod tests {
         let mut persistence = Persistence {
             writable: None,
             maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
+            catalog_slot: Arc::new(Mutex::new(CatalogSlot::loading())),
+            vocabulary_slot: Arc::new(Mutex::new(VocabularySlot::loading())),
             writer: None,
             catalog: None,
             journal: None,
@@ -4813,6 +5255,8 @@ mod tests {
         let mut persistence = Persistence {
             writable: None,
             maintenance: MaintenanceService::new(Arc::new(MaintenanceAdmission::new())),
+            catalog_slot: Arc::new(Mutex::new(CatalogSlot::loading())),
+            vocabulary_slot: Arc::new(Mutex::new(VocabularySlot::loading())),
             writer: None,
             catalog: None,
             journal: None,

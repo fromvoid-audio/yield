@@ -13,7 +13,7 @@ fn authoritative_scans_converge_large_deletion_churn_after_restart() {
         )
         .unwrap();
     }
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     let initial = scan_once(&db).unwrap();
     assert_eq!(
         initial
@@ -35,7 +35,7 @@ fn authoritative_scans_converge_large_deletion_churn_after_restart() {
     assert_eq!(deleted.pending_renames_pruned, 0);
 
     drop(db);
-    let reopened = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let reopened = open_maintained_scan_database(dir.path()).unwrap();
     let grace = scan_once(&reopened).unwrap();
     assert_eq!(
         grace
@@ -60,7 +60,7 @@ fn targeted_batches_do_not_age_pending_metadata() {
     let dir = tempdir().unwrap();
     let file = dir.path().join("deleted.wav");
     std::fs::write(&file, b"metadata").unwrap();
-    let db = SourceDatabase::open_for_scan(dir.path()).unwrap();
+    let db = open_maintained_scan_database(dir.path()).unwrap();
     scan_once(&db).unwrap();
     db.set_tag(Path::new("deleted.wav"), Rating::KEEP_1)
         .unwrap();
@@ -92,7 +92,7 @@ fn offline_source_does_not_age_and_recovers_rename_after_reconnect() {
     let offline = parent.path().join("offline");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("old.wav"), b"retained metadata").unwrap();
-    let db = SourceDatabase::open_for_scan(&source).unwrap();
+    let db = open_maintained_scan_database(&source).unwrap();
     scan_once(&db).unwrap();
     db.set_tag(Path::new("old.wav"), Rating::KEEP_1).unwrap();
 

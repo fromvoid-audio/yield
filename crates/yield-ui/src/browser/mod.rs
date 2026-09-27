@@ -45,6 +45,7 @@ mod accessibility {
     pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
     pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
     pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
+    pub(super) const COLLECTION_RENAME: &str = "browser-collection-rename-input";
 
     pub(super) fn sort_id(column: SortColumn) -> &'static str {
         match column {
@@ -63,6 +64,9 @@ mod accessibility {
     pub(super) fn playback_type_filter_id(index: usize) -> String {
         format!("browser-type-filter-{index}")
     }
+    pub(super) fn playback_age_filter_id(index: usize) -> String {
+        format!("browser-age-filter-{index}")
+    }
     pub(super) fn rating_filter_id(index: usize) -> String {
         format!("browser-rating-filter-{index}")
     }
@@ -70,17 +74,26 @@ mod accessibility {
 mod audio_output;
 mod catalog;
 mod catalog_metadata;
+mod collection_rename;
+mod column_layout;
+mod compare_anchor;
 mod context_menu;
 mod curation;
+mod curation_queue;
+mod direct_random;
 mod directory_open;
 mod display_labels;
 mod file_drag;
+mod folder_keyboard;
 mod general_settings;
 mod handoff;
 mod history;
+mod job_details;
 mod metronome;
 mod motion;
 mod normalized_audition;
+mod panel_focus;
+mod playback_age;
 mod played_ranges;
 mod playmark_timing;
 mod preferences;
@@ -91,6 +104,7 @@ mod sidebar;
 mod similar_sections;
 mod source_recovery;
 mod source_registry;
+mod status_log;
 mod tag_chips;
 mod tag_completion;
 mod tag_dictionary;
@@ -98,6 +112,7 @@ mod tag_filter;
 mod tag_library;
 mod tag_pager;
 mod tags;
+mod transient_markers;
 mod transport;
 mod view;
 mod volume;
@@ -131,6 +146,7 @@ struct SourceSession {
     selected_folder: PathBuf,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
+    curation_queue_mode: yield_core::CurationQueueMode,
     selected_audio_id: Option<AudioFileId>,
     catalog_facts: HashMap<PathBuf, catalog::CatalogFileFacts>,
     catalog_lifecycle_generation: Option<u64>,
@@ -159,6 +175,7 @@ impl SourceSession {
             selected_folder: PathBuf::from("."),
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
+            curation_queue_mode: yield_core::CurationQueueMode::default(),
             selected_audio_id: None,
             catalog_facts: HashMap::new(),
             catalog_lifecycle_generation: None,
@@ -275,6 +292,13 @@ struct PlaymarkTimingEditorState {
     error: Option<String>,
 }
 
+#[derive(Clone)]
+struct SourceReorderDrag {
+    source_id: SourceId,
+    revision: RegistryRevision,
+    target: Option<(SourceId, bool)>,
+}
+
 pub(crate) struct Browser {
     #[cfg(target_os = "macos")]
     accessibility: Option<accessibility::BrowserAccessibility>,
@@ -287,6 +311,10 @@ pub(crate) struct Browser {
     _playmark_timing_subscription: gpui::Subscription,
     playmark_timing_editor: Option<PlaymarkTimingEditorState>,
     playmark_timing_blur_subscription: Option<gpui::Subscription>,
+    collection_rename_input: gpui::Entity<SearchInput>,
+    _collection_rename_subscription: gpui::Subscription,
+    collection_rename_editor: Option<collection_rename::CollectionRenameEditor>,
+    suppress_collection_keyboard_click: Option<usize>,
     beat_count_input: gpui::Entity<BeatCountInput>,
     _beat_count_subscription: gpui::Subscription,
     tag_input: gpui::Entity<SearchInput>,
@@ -306,16 +334,22 @@ pub(crate) struct Browser {
     folder_rows_cache: Vec<FolderTreeRow>,
     show_empty_folders: bool,
     selected_folder: PathBuf,
+    folder_keyboard: Option<folder_keyboard::FolderKeyboardState>,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
     restore_selection_id: Option<AudioFileId>,
     restore_selection_position: Option<usize>,
     view_model: BrowserViewModel,
+    column_layout: column_layout::ColumnLayout,
+    column_gesture: Option<column_layout::ColumnGesture>,
+    column_header_bounds: Rc<RefCell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    suppress_column_sort_click: bool,
     sample_name_view_mode: yield_core::SampleNameViewMode,
     selected: Option<usize>,
     selection: BrowserSelection,
     browser_focus_override: Option<AudioFileId>,
     browser_focus_detached: bool,
+    focus_chord_started: Option<(Instant, u64, Option<PathBuf>)>,
     context_menu: Option<context_menu::ContextMenuState>,
     waveform: Option<WaveformPreview>,
     waveform_error: Option<String>,
@@ -324,6 +358,7 @@ pub(crate) struct Browser {
     waveform_detail: waveform_detail::WaveformDetailState,
     zero_crossing: zero_crossing::ZeroCrossingState,
     similar_sections: similar_sections::SimilarSectionsState,
+    transient_markers: transient_markers::TransientMarkersState,
     bpm_snap_enabled: bool,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
@@ -331,6 +366,7 @@ pub(crate) struct Browser {
     random_audition_pending: Option<random_audition::PendingRandomAudition>,
     random_navigation: RandomNavigationState,
     random_navigation_scope: Option<(Option<SourceId>, PathBuf)>,
+    direct_random_history: direct_random::DirectRandomHistory,
     metronome_enabled: bool,
     playback_metronome_beat_count: Option<u16>,
     playback_metronome_confirmed: bool,
@@ -338,6 +374,9 @@ pub(crate) struct Browser {
     playback_metronome_grid_path: Option<PathBuf>,
     normalized_audition: normalized_audition::NormalizedAuditionState,
     waveform_viewport: WaveformViewport,
+    preferred_sidebar_width: Option<f32>,
+    preferred_waveform_height: Option<f32>,
+    pane_resize_drag: Option<view::PaneResizeDrag>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_edit_region: Option<WaveformEditRegion>,
@@ -348,6 +387,11 @@ pub(crate) struct Browser {
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
     scan_status: String,
+    job_details_open: bool,
+    job_details_focus_handle: FocusHandle,
+    job_action: Option<job_details::JobActionState>,
+    job_action_error: Option<String>,
+    status_log: status_log::StatusLog,
     playback_status: String,
     volume: f32,
     volume_drag: Option<volume::VolumeDrag>,
@@ -355,9 +399,15 @@ pub(crate) struct Browser {
     volume_runtime_retry_count: u8,
     volume_status: Option<String>,
     scan_generation: u64,
+    playback_age_refresh_generation: u64,
+    playback_age_refresh_task: Option<Task<()>>,
     waveform_generation: u64,
     playback_epoch: u64,
     playing_path: Option<PathBuf>,
+    compare_anchor: Option<compare_anchor::CompareAnchor>,
+    compare_anchor_task: Option<Task<()>>,
+    compare_anchor_generation: u64,
+    compare_anchor_play_pending: bool,
     playback_policy: PlaybackLoopPolicy,
     accepted_playback_intent: Option<transport::PlaybackIntent>,
     autoplay_selection: bool,
@@ -370,6 +420,8 @@ pub(crate) struct Browser {
     playback_cursor_pending: Option<f32>,
     playback_cursor_sample: Option<transport::PlaybackCursorSample>,
     playback_cursor_interpolation: Option<transport::PlaybackCursorInterpolation>,
+    waveform_hover_cursor: Option<f32>,
+    waveform_last_play_start: Option<f32>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     source_registry_task: Option<Task<()>>,
@@ -380,6 +432,8 @@ pub(crate) struct Browser {
     source_registry_known_roots: BTreeSet<PathBuf>,
     source_registry_pending_adds: HashMap<RequestId, PendingRegistryMutation>,
     source_registry_pending_removes: HashMap<RequestId, PendingRegistryMutation>,
+    source_registry_pending_reorder: Option<(RequestId, Option<RegistryRevision>)>,
+    source_reorder_drag: Option<SourceReorderDrag>,
     source_registry_removed_roots: BTreeSet<PathBuf>,
     source_registry_status: String,
     catalog_next_generation: u64,
@@ -393,6 +447,7 @@ pub(crate) struct Browser {
     display_labels: display_labels::DisplayLabelsState,
     source_recovery: source_recovery::SourceRecoveryState,
     curation_state: curation::CurationState,
+    curation_queue: curation_queue::CurationQueueState,
     tag_editor: tags::TagEditorState,
     tag_completion: tag_completion::TagCompletionState,
     tag_dictionary: tag_dictionary::TagDictionaryState,
@@ -503,7 +558,11 @@ impl Browser {
         let mut browser = Self::new(cx);
         #[cfg(target_os = "macos")]
         {
-            browser.accessibility = accessibility::BrowserAccessibility::new(window, cx);
+            browser.accessibility = accessibility::BrowserAccessibility::new(
+                window,
+                cx,
+                browser.job_details_focus_handle.clone(),
+            );
         }
         #[cfg(not(target_os = "macos"))]
         let _ = window;
@@ -533,6 +592,16 @@ impl Browser {
             |view, _input, _: &SearchChanged, cx| {
                 if let Some(editor) = view.playmark_timing_editor.as_mut() {
                     editor.error = None;
+                    cx.notify();
+                }
+            },
+        );
+        let collection_rename_input =
+            cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::collection_name()));
+        let collection_rename_subscription = cx.subscribe(
+            &collection_rename_input,
+            |view, _input, _: &SearchChanged, cx| {
+                if view.collection_rename_editor.is_some() {
                     cx.notify();
                 }
             },
@@ -583,6 +652,10 @@ impl Browser {
             _playmark_timing_subscription: playmark_timing_subscription,
             playmark_timing_editor: None,
             playmark_timing_blur_subscription: None,
+            collection_rename_input,
+            _collection_rename_subscription: collection_rename_subscription,
+            collection_rename_editor: None,
+            suppress_collection_keyboard_click: None,
             beat_count_input,
             _beat_count_subscription: beat_count_subscription,
             tag_input,
@@ -602,16 +675,22 @@ impl Browser {
             folder_rows_cache: Vec::new(),
             show_empty_folders: false,
             selected_folder: PathBuf::from("."),
+            folder_keyboard: None,
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
             restore_selection_id: None,
             restore_selection_position: None,
             view_model: BrowserViewModel::new(&[]),
+            column_layout: column_layout::ColumnLayout::default(),
+            column_gesture: None,
+            column_header_bounds: Rc::new(RefCell::new(None)),
+            suppress_column_sort_click: false,
             sample_name_view_mode: yield_core::SampleNameViewMode::default(),
             selected: None,
             selection: BrowserSelection::new(),
             browser_focus_override: None,
             browser_focus_detached: false,
+            focus_chord_started: None,
             context_menu: None,
             waveform: None,
             waveform_error: None,
@@ -620,6 +699,7 @@ impl Browser {
             waveform_detail: waveform_detail::WaveformDetailState::default(),
             zero_crossing: zero_crossing::ZeroCrossingState::default(),
             similar_sections: similar_sections::SimilarSectionsState::default(),
+            transient_markers: transient_markers::TransientMarkersState::default(),
             bpm_snap_enabled: false,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
@@ -627,6 +707,7 @@ impl Browser {
             random_audition_pending: None,
             random_navigation: RandomNavigationState::default(),
             random_navigation_scope: None,
+            direct_random_history: direct_random::DirectRandomHistory::default(),
             metronome_enabled: false,
             playback_metronome_beat_count: None,
             playback_metronome_confirmed: false,
@@ -634,6 +715,9 @@ impl Browser {
             playback_metronome_grid_path: None,
             normalized_audition: normalized_audition::NormalizedAuditionState::default(),
             waveform_viewport: WaveformViewport::full(),
+            preferred_sidebar_width: None,
+            preferred_waveform_height: None,
+            pane_resize_drag: None,
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
             waveform_edit_region: None,
@@ -644,6 +728,11 @@ impl Browser {
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
             scan_status: "Choose a folder or pass one on the command line".to_string(),
+            job_details_open: false,
+            job_details_focus_handle: cx.focus_handle(),
+            job_action: None,
+            job_action_error: None,
+            status_log: status_log::StatusLog::default(),
             playback_status: "Ready".to_string(),
             volume: volume::DEFAULT_VOLUME,
             volume_drag: None,
@@ -651,9 +740,15 @@ impl Browser {
             volume_runtime_retry_count: 0,
             volume_status: None,
             scan_generation: 0,
+            playback_age_refresh_generation: 0,
+            playback_age_refresh_task: None,
             waveform_generation: 0,
             playback_epoch: 0,
             playing_path: None,
+            compare_anchor: None,
+            compare_anchor_task: None,
+            compare_anchor_generation: 0,
+            compare_anchor_play_pending: false,
             playback_policy: PlaybackLoopPolicy::default(),
             accepted_playback_intent: None,
             autoplay_selection: true,
@@ -666,6 +761,8 @@ impl Browser {
             playback_cursor_pending: None,
             playback_cursor_sample: None,
             playback_cursor_interpolation: None,
+            waveform_hover_cursor: None,
+            waveform_last_play_start: None,
             scan_cancel: None,
             scan_task: None,
             source_registry_task: None,
@@ -676,6 +773,8 @@ impl Browser {
             source_registry_known_roots: BTreeSet::new(),
             source_registry_pending_adds: HashMap::new(),
             source_registry_pending_removes: HashMap::new(),
+            source_registry_pending_reorder: None,
+            source_reorder_drag: None,
             source_registry_removed_roots: BTreeSet::new(),
             source_registry_status: "Loading sources…".to_string(),
             catalog_next_generation: 0,
@@ -689,6 +788,7 @@ impl Browser {
             display_labels: display_labels::DisplayLabelsState::default(),
             source_recovery: source_recovery::SourceRecoveryState::default(),
             curation_state: curation::CurationState::default(),
+            curation_queue: curation_queue::CurationQueueState::default(),
             tag_editor: tags::TagEditorState::default(),
             tag_completion: tag_completion::TagCompletionState::default(),
             tag_dictionary: tag_dictionary::TagDictionaryState::default(),
@@ -850,6 +950,8 @@ impl Browser {
             .update(cx, |input, cx| input.theme_changed(cx));
         self.playmark_timing_input
             .update(cx, |input, cx| input.theme_changed(cx));
+        self.collection_rename_input
+            .update(cx, |input, cx| input.theme_changed(cx));
     }
 
     fn commit_playmark_timing_edit(
@@ -895,7 +997,7 @@ impl Browser {
                 if let Some(editor) = self.playmark_timing_editor.as_mut() {
                     editor.error = Some(error.clone());
                 }
-                self.playback_status = format!("Playmark timing: {error}");
+                self.set_playback_status(format!("Playmark timing: {error}"));
                 let focus_handle = self.playmark_timing_input.read(cx).focus_handle();
                 window.focus(&focus_handle);
                 cx.notify();
@@ -926,10 +1028,10 @@ impl Browser {
         similar_sections::invalidate_if_stale(self);
         match self.submit_playmark_timing_span(&path, region, cx) {
             Some(Ok(())) => {
-                self.playback_status = "Playmark timing applying to playback".to_string();
+                self.set_playback_status("Playmark timing applying to playback".to_string());
             }
             Some(Err(error)) => {
-                self.playback_status = format!("Playmark timing update unavailable: {error}");
+                self.set_playback_status(format!("Playmark timing update unavailable: {error}"));
             }
             None => {}
         }
@@ -1173,6 +1275,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_file_handoff();
+        self.collection_rename_editor = None;
         self.reset_browser_focus_state();
         self.context_menu = None;
         self.deactivate_catalog_source(cx);
@@ -1216,6 +1319,15 @@ impl Browser {
         self.root = Some(root.clone());
         self.entries.clear();
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            source_index
+                .and_then(|index| self.source_sessions.get(index))
+                .map_or(yield_core::CurationQueueMode::default(), |session| {
+                    session.curation_queue_mode
+                }),
+        );
         self.refresh_collection_filter_counts();
         self.selected = None;
         self.cancel_waveform_load();
@@ -1224,6 +1336,7 @@ impl Browser {
         self.waveform_error = None;
         self.folder_tree = None;
         self.folder_rows_cache.clear();
+        self.folder_keyboard = None;
         if let Some(index) = source_index
             && let Some(session) = self.source_sessions.get(index)
         {
@@ -1240,7 +1353,7 @@ impl Browser {
         let generation = self.scan_generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.scan_cancel = Some(Arc::clone(&cancellation));
-        self.scan_status = format!("Scanning {}…", root.display());
+        self.set_scan_status(format!("Scanning {}…", root.display()));
         cx.notify();
 
         let scan_root = root.clone();
@@ -1319,19 +1432,25 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[source_index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.scan_status = format!(
+        self.set_scan_status(format!(
             "{count} audio file{} · {} skipped",
             if count == 1 { "" } else { "s" },
             skipped_entries
-        );
+        ));
         if register_source {
             self.submit_source_add(root.clone(), cx);
         }
@@ -1383,15 +1502,21 @@ impl Browser {
             self.entries.clear();
             self.folder_tree = None;
             self.folder_rows_cache.clear();
+            self.folder_keyboard = None;
             self.view_model.set_entries(&self.entries);
+            self.reschedule_playback_age_refresh(cx);
+            self.view_model
+                .set_curation_queue(&self.entries, yield_core::CurationQueueMode::default());
             tag_filter::reinstall_after_projection(self, cx);
+            curation_queue::reinstall_after_projection(self, cx);
             self.reset_collection_filter();
-            self.scan_status = error;
+            self.set_scan_status(error);
             self.selected = None;
             self.playback_policy.clear_file();
             self.waveform_pending = false;
             self.waveform = None;
             self.waveform_error = None;
+            self.invalidate_waveform_generation();
             cx.notify();
             return;
         };
@@ -1417,22 +1542,28 @@ impl Browser {
             tag_filter::FilterOrigin::PassiveMetadata,
         );
         self.view_model.set_entries(&self.entries);
+        self.reschedule_playback_age_refresh(cx);
+        self.view_model.set_curation_queue(
+            &self.entries,
+            self.source_sessions[index].curation_queue_mode,
+        );
         self.view_model.set_folder_scope(
             &self.entries,
             Some(self.selected_folder.clone()),
             self.folder_scope,
         );
         tag_filter::reinstall_after_projection(self, cx);
+        curation_queue::reinstall_after_projection(self, cx);
         self.refresh_collection_filter_counts();
         self.reconcile_selection();
-        self.scan_status = if is_refresh {
+        self.set_scan_status(if is_refresh {
             format!(
                 "Could not refresh {}: {error}",
                 self.source_sessions[index].label
             )
         } else {
             format!("Could not add source: {error}")
-        };
+        });
         let restore_id = self
             .restore_selection_id
             .take()
@@ -1676,7 +1807,7 @@ impl Browser {
 
     pub(super) fn refresh_active_source(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.active_source else {
-            self.scan_status = "Choose a source folder before refreshing".to_string();
+            self.set_scan_status("Choose a source folder before refreshing".to_string());
             cx.notify();
             return;
         };
@@ -1800,11 +1931,26 @@ impl Browser {
         self.invalidate_file_handoff();
         self.selection.clear();
         self.selected_folder = path.clone();
+        if let Some(root) = self.root.as_ref() {
+            if self
+                .folder_keyboard
+                .as_ref()
+                .is_some_and(|state| state.root() != root)
+            {
+                self.folder_keyboard = None;
+            }
+            self.folder_keyboard
+                .get_or_insert_with(|| {
+                    folder_keyboard::FolderKeyboardState::new(root.clone(), path.clone())
+                })
+                .pointer_select(path.clone());
+        }
         self.update_active_folder_projection(cx);
         self.start_focus(
-            motion::FocusTarget::Folder(path),
+            motion::FocusTarget::Folder(path.clone()),
             motion::FocusTrigger::Pointer,
         );
+        self.focus_folder_path(path, window, cx);
     }
 
     pub(super) fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1866,6 +2012,7 @@ impl Browser {
             .as_ref()
             .map(|tree| tree.visible_rows(&self.expanded_folders, self.show_empty_folders))
             .unwrap_or_default();
+        self.ensure_folder_keyboard();
     }
 
     fn select_entry(
@@ -1931,7 +2078,7 @@ impl Browser {
         let path = entry.path;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.waveform_cancel = Some(Arc::clone(&cancellation));
-        self.playback_status = "Ready".to_string();
+        self.set_playback_status("Ready".to_string());
         self.waveform_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -1945,7 +2092,10 @@ impl Browser {
                 view.waveform_task = None;
                 view.waveform_pending = false;
                 match result {
-                    Ok(preview) => view.waveform = Some(preview),
+                    Ok(preview) => {
+                        view.waveform = Some(preview);
+                        transient_markers::schedule(view, cx);
+                    }
                     Err(error) => {
                         view.clear_waveform_region();
                         view.waveform_error = Some(error);
@@ -1990,7 +2140,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |view, cx| {
-                    view.scan_status = format!("Could not choose folder: {error}");
+                    view.set_scan_status(format!("Could not choose folder: {error}"));
                     cx.notify();
                 });
             }
@@ -2023,7 +2173,7 @@ impl Browser {
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
                 let _ = this.update(cx, |view, cx| {
-                    view.theme_status = format!("Theme picker error: {error}");
+                    view.set_theme_status(format!("Theme picker error: {error}"));
                     cx.notify();
                 });
             }
@@ -2135,11 +2285,11 @@ impl Browser {
         if !enabled {
             self.cancel_pending_selection_autoplay();
         }
-        self.playback_status = if self.autoplay_selection {
+        self.set_playback_status(if self.autoplay_selection {
             "Autoplay enabled".to_string()
         } else {
             "Autoplay disabled".to_string()
-        };
+        });
         cx.notify();
     }
 
@@ -2177,6 +2327,10 @@ impl Browser {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_bpm_snap(cx);
+    }
+
+    fn toggle_bpm_snap(&mut self, cx: &mut Context<Self>) {
         self.bpm_snap_enabled = !self.bpm_snap_enabled;
         cx.notify();
     }
@@ -2198,6 +2352,15 @@ impl Browser {
     ) {
         self.beat_guides_enabled = !self.beat_guides_enabled;
         cx.notify();
+    }
+
+    fn toggle_transient_markers_from_toolbar(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        transient_markers::toggle(self, cx);
     }
 
     fn random_audition_available(&self) -> bool {
@@ -2245,7 +2408,7 @@ impl Browser {
         if let Some(path) = self.theme_load.active_path.clone() {
             self.load_theme(path, cx);
         } else {
-            self.theme_status = "Choose a theme file before reloading".to_string();
+            self.set_theme_status("Choose a theme file before reloading".to_string());
             cx.notify();
         }
     }
@@ -2272,7 +2435,7 @@ impl Browser {
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.theme_status = "Yield Editorial Terminal".to_string();
+        self.set_theme_status("Yield Editorial Terminal".to_string());
         self.theme_changed_inputs(cx);
         cx.notify();
     }
@@ -2284,7 +2447,7 @@ impl Browser {
         self.theme_load.invalidate();
         self.theme_task.take();
         cx.set_global(ActiveTheme::default());
-        self.theme_status = "Yield Editorial Terminal".to_string();
+        self.set_theme_status("Yield Editorial Terminal".to_string());
         self.autoplay_selection = true;
         self.help_tooltips_enabled = true;
         self.general_settings.rating_decay_weeks = yield_session::DEFAULT_RATING_DECAY_WEEKS;
@@ -2308,7 +2471,7 @@ impl Browser {
         }
         let generation = self.theme_load.begin(path.clone());
         self.theme_task.take();
-        self.theme_status = format!("Loading {}…", path.display());
+        self.set_theme_status(format!("Loading {}…", path.display()));
         cx.notify();
         let read_path = path.clone();
         self.theme_task = Some(cx.spawn(async move |this, cx| {
@@ -2325,7 +2488,7 @@ impl Browser {
                     Ok(theme) => view.apply_theme(theme, path, generation, cx),
                     Err(error) => {
                         if view.theme_load.reject(generation) {
-                            view.theme_status = format!("Theme rejected: {error}");
+                            view.set_theme_status(format!("Theme rejected: {error}"));
                             cx.notify();
                         }
                     }
@@ -2362,7 +2525,7 @@ impl Browser {
         }
         let theme_name = theme.name.clone();
         cx.set_global(ActiveTheme(Arc::new(theme)));
-        self.theme_status = theme_name;
+        self.set_theme_status(theme_name);
         self.theme_changed_inputs(cx);
         cx.notify();
     }
@@ -2444,6 +2607,59 @@ impl Browser {
         }
     }
 
+    fn play_direct_random_sample(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if previous {
+            let Some(visit) = self.direct_random_history.previous() else {
+                self.set_playback_status("No earlier random sample");
+                cx.notify();
+                return;
+            };
+            self.replay_direct_random_visit(visit, cx);
+            return;
+        }
+        let visible_ids = self
+            .view_model
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                self.entries.get(row.entry_index).and_then(|entry| {
+                    yield_library::sample_sources::is_supported_audio(&entry.path)
+                        .then_some(row.id.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        let scope = self.current_random_navigation_scope();
+        let scope = scope.filter(|(_, root)| !self.source_registry_removed_roots.contains(root));
+        let focused = self.browser_focus_id();
+        let target = self.direct_random_history.next(
+            scope,
+            &visible_ids,
+            focused.as_ref(),
+            rand::random::<f32>(),
+        );
+        let Some(target) = target else {
+            self.set_playback_status("No visible WAV sample for random playback");
+            cx.notify();
+            return;
+        };
+        let Some(index) = self
+            .view_model
+            .visible_position_for(&target)
+            .and_then(|position| self.view_model.rows().get(position))
+            .map(|row| row.entry_index)
+        else {
+            return;
+        };
+        self.selection.focus_pointer(&target);
+        self.select_entry(
+            index,
+            Some(motion::FocusTrigger::Keyboard),
+            SelectionOrigin::Passive,
+            cx,
+        );
+        self.start_playback_from_position(0.0, cx);
+    }
+
     fn current_random_navigation_scope(&self) -> Option<(Option<SourceId>, PathBuf)> {
         self.active_source
             .and_then(|index| self.source_sessions.get(index))
@@ -2520,11 +2736,72 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        self.suppress_collection_keyboard_click = None;
+        if key == "escape" && self.source_reorder_drag.take().is_some() {
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if key == "escape" && self.pane_resize_drag.is_some() {
+            self.cancel_pane_resize(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self
+            .collection_rename_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            if !self
+                .collection_rename_editor
+                .as_ref()
+                .is_some_and(|editor| self.collection_rename_is_current(editor.slot))
+            {
+                self.collection_rename_editor = None;
+                window.focus(&self.focus_handle);
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            self.focus_chord_started = None;
+            if key == "escape" {
+                self.cancel_collection_rename(window, cx);
+                cx.stop_propagation();
+            } else if key == "enter" {
+                if !event.is_held && !self.collection_rename_input.read(cx).is_composing() {
+                    self.commit_collection_rename(window, cx);
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
         let secondary = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
         let alt = event.keystroke.modifiers.alt;
         let function = event.keystroke.modifiers.function;
         let navigation_suppresses_autoplay = secondary || alt || function;
         let shift = event.keystroke.modifiers.shift;
+        if self.job_details_open
+            && self.job_details_focus_handle.is_focused(window)
+            && key == "escape"
+            && !event.is_held
+        {
+            self.job_details_open = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if self.shortcut_help.is_open()
+            || self.theme_settings_open
+            || self.audio_settings_open
+            || self.context_menu.is_some()
+            || secondary
+            || shift
+            || alt
+            || function
+        {
+            self.focus_chord_started = None;
+        }
         match shortcut_help::key_action(
             self.shortcut_help.is_open(),
             key,
@@ -2551,6 +2828,18 @@ impl Browser {
             }
             shortcut_help::KeyAction::Ignore => {}
         }
+        if status_log::is_copy_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.copy_status_log(cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.theme_settings_open && key == "escape" {
             self.close_general_settings(window, cx);
             cx.stop_propagation();
@@ -2567,6 +2856,37 @@ impl Browser {
         }
         if self.handle_context_menu_key_down(event, window, cx) {
             return;
+        }
+        if curation_queue::handle_key_down(
+            self,
+            key,
+            event.is_held,
+            secondary || alt || shift || function,
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.tag_input.read(cx).focus_handle().is_focused(window)
+            || self
+                .tag_filter_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            || self
+                .playmark_timing_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            || self.search_input.read(cx).focus_handle().is_focused(window)
+            || self
+                .beat_count_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+        {
+            self.focus_chord_started = None;
         }
         if self.tag_input.read(cx).focus_handle().is_focused(window) {
             if !event.is_held
@@ -2680,6 +3000,14 @@ impl Browser {
             }
             return;
         }
+        if self.handle_panel_focus_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_folder_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !event.is_held
             && !secondary
             && !shift
@@ -2690,21 +3018,45 @@ impl Browser {
         {
             return;
         }
+        if !secondary && !shift && !alt && !function && key.eq_ignore_ascii_case("x") {
+            if !event.is_held
+                && !self.theme_settings_open
+                && !self.audio_settings_open
+                && self.context_menu.is_none()
+            {
+                if self.waveform.is_some()
+                    && !self
+                        .waveform_viewport
+                        .is_effectively_equal(WaveformViewport::full())
+                {
+                    if self.reset_waveform_viewport() {
+                        cx.notify();
+                    }
+                } else {
+                    self.toggle_focused_selection(cx);
+                }
+            }
+            return;
+        }
         if self.waveform_focus_handle.is_focused(window)
             && !secondary
-            && !shift
-            && !alt
             && !function
             && self.waveform.is_some()
         {
-            if key.eq_ignore_ascii_case("z") {
-                if self.zoom_waveform_to_selection() {
-                    cx.notify();
+            if !shift && !alt && key.eq_ignore_ascii_case("i") {
+                if !event.is_held {
+                    transient_markers::toggle(self, cx);
                 }
                 return;
             }
-            if key.eq_ignore_ascii_case("x") {
-                if self.reset_waveform_viewport() {
+            if !shift && !alt && key.eq_ignore_ascii_case("b") {
+                if !event.is_held {
+                    self.toggle_bpm_snap(cx);
+                }
+                return;
+            }
+            if !shift && !alt && key.eq_ignore_ascii_case("z") {
+                if self.zoom_waveform_to_selection() {
                     cx.notify();
                 }
                 return;
@@ -2715,7 +3067,28 @@ impl Browser {
                 let canceled = self.cancel_waveform_gestures(window, cx);
                 let moved = self.slide_waveform_region(direction);
                 if moved {
-                    zero_crossing::schedule_for_committed_region(self, cx);
+                    if direction.is_fine() {
+                        if let (Some(path), Some(region)) = (
+                            self.selected
+                                .and_then(|index| self.entries.get(index))
+                                .map(|entry| entry.path.clone()),
+                            self.waveform_play_region,
+                        ) {
+                            match self.submit_playmark_timing_span(&path, region, cx) {
+                                Some(Ok(())) => {
+                                    self.playback_status =
+                                        "Fine selection nudge applying to playback".to_string();
+                                }
+                                Some(Err(error)) => {
+                                    self.playback_status =
+                                        format!("Fine selection nudge unavailable: {error}");
+                                }
+                                None => {}
+                            }
+                        }
+                    } else {
+                        zero_crossing::schedule_for_committed_region(self, cx);
+                    }
                 }
                 if moved || canceled {
                     cx.notify();
@@ -2744,30 +3117,96 @@ impl Browser {
         if event.is_held && key == "space" {
             return;
         }
+        if let Some(action) = direct_random_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.play_direct_random_sample(action == DirectRandomShortcut::Previous, cx);
+            return;
+        }
+        if random_section_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            if self.random_audition_available() {
+                self.request_random_audition(false, cx);
+            }
+            return;
+        }
         if secondary && !shift && key.eq_ignore_ascii_case("a") {
             self.select_all_visible(cx);
             return;
         }
+        if !secondary && !alt && !function && shift && key == "space" {
+            self.play_from_current_play_start(cx);
+            return;
+        }
+        if current_playhead_shortcut(
+            key,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+            shift,
+            alt,
+            function,
+            event.is_held,
+        ) {
+            self.play_from_current_playhead(cx);
+            return;
+        }
+        if !secondary && !alt && !function && !shift && key.eq_ignore_ascii_case("c") {
+            self.set_compare_anchor_from_focus(cx);
+            return;
+        }
+        if !secondary && !alt && !function && shift && key.eq_ignore_ascii_case("c") {
+            self.play_compare_anchor(cx);
+            return;
+        }
         match key {
-            "space" if self.random_audition_sticky => self.request_random_audition(false, cx),
-            "space" => self.toggle_playback(cx),
-            "l" | "L" => self.toggle_loop(cx),
-            "x" if !shift && !secondary => self.toggle_focused_selection(cx),
-            "up" | "arrowup" => self.move_selection(
-                -1,
-                shift,
-                secondary && shift,
-                navigation_suppresses_autoplay,
-                cx,
-            ),
-            "down" | "arrowdown" => self.move_selection(
-                1,
-                shift,
-                secondary && shift,
-                navigation_suppresses_autoplay,
-                cx,
-            ),
+            "space" if !secondary && !alt && !function && !shift && self.random_audition_sticky => {
+                self.request_random_audition(false, cx)
+            }
+            "space" if !secondary && !alt && !function && !shift => self.play_selected_sample(cx),
+            "space" => return,
+            "l" | "L" if shift && !secondary && !alt && !function && !event.is_held => {
+                self.toggle_loop_lock(cx)
+            }
+            "l" | "L" if !shift && !secondary && !alt && !function && !event.is_held => {
+                self.toggle_loop(cx)
+            }
+            "up" | "arrowup" | "down" | "arrowdown" => {
+                let follow_row = self.browser_surface_focused(window)
+                    && !self.theme_settings_open
+                    && !self.audio_settings_open
+                    && !self.shortcut_help.is_open()
+                    && self.context_menu.is_none();
+                let direction = if matches!(key, "up" | "arrowup") {
+                    -1
+                } else {
+                    1
+                };
+                self.move_selection(
+                    direction,
+                    shift,
+                    secondary && shift,
+                    navigation_suppresses_autoplay,
+                    cx,
+                );
+                if follow_row && let Some(id) = self.browser_focus_id() {
+                    self.focus_keyboard_navigation_row(id, window, cx);
+                }
+            }
             "escape" => {
+                self.cancel_column_gesture(cx);
                 self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);
                 self.cancel_waveform_scrollbar_drag(window, cx);
@@ -2803,6 +3242,7 @@ impl Drop for Browser {
         self.shutdown_directory_open();
         self.handoff_generation = self.handoff_generation.wrapping_add(1);
         self.handoff_task.take();
+        self.compare_anchor_task.take();
         if let Some(runtime) = self.playback.as_ref() {
             let _ = runtime.handle.try_shutdown();
         }
@@ -2887,17 +3327,188 @@ fn browser_focus_from_state(
     (!browser_focus_detached).then_some(selected_id).flatten()
 }
 
+fn current_playhead_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> bool {
+    key == "space" && command && !control && !shift && !alt && !function && !held
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectRandomShortcut {
+    Next,
+    Previous,
+}
+
+fn direct_random_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> Option<DirectRandomShortcut> {
+    if !key.eq_ignore_ascii_case("r") || !shift || control || alt || function || held {
+        return None;
+    }
+    Some(if command {
+        DirectRandomShortcut::Previous
+    } else {
+        DirectRandomShortcut::Next
+    })
+}
+
+fn random_section_shortcut(
+    key: &str,
+    command: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    function: bool,
+    held: bool,
+) -> bool {
+    key.eq_ignore_ascii_case("r") && !command && !control && !shift && !alt && !function && !held
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
-        browser_focus_from_state, resolve_scan_source_index, reveal_should_clear_for_focus_change,
+        DirectRandomShortcut, SampleClickIntent, SelectionOrigin, SourceSession, ThemeLoadState,
+        browser_focus_from_state, current_playhead_shortcut, direct_random_shortcut,
+        random_section_shortcut, resolve_scan_source_index, reveal_should_clear_for_focus_change,
         sample_click_intent, scan_source_index_for_error, selection_origin_for_click,
         selection_origin_for_navigation, should_autoplay_selection,
     };
     use std::path::PathBuf;
     use yield_core::{AudioFile, AudioFileId};
     use yield_library::sample_sources::{SampleSource, SourceId};
+
+    #[test]
+    fn current_playhead_shortcut_requires_unmodified_command_space() {
+        assert!(current_playhead_shortcut(
+            "space", true, false, false, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", false, false, false, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, true, false, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, true, false, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, false, true, false, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, false, false, true, false
+        ));
+        assert!(!current_playhead_shortcut(
+            "space", true, false, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn direct_random_shortcut_requires_shift_r_without_other_modifiers() {
+        assert_eq!(
+            direct_random_shortcut("r", false, false, true, false, false, false),
+            Some(DirectRandomShortcut::Next)
+        );
+        assert_eq!(
+            direct_random_shortcut("R", true, false, true, false, false, false),
+            Some(DirectRandomShortcut::Previous)
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, false, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, true, true, false, false, false),
+            None
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, false, true, true, false, false),
+            None
+        );
+        assert_eq!(
+            direct_random_shortcut("r", false, false, true, false, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn random_section_shortcut_accepts_only_plain_r() {
+        assert!(random_section_shortcut(
+            "r", false, false, false, false, false, false
+        ));
+        for (key, command, control, shift, alt, function, held) in [
+            ("space", false, false, false, false, false, false),
+            ("space", false, true, false, false, false, false),
+            ("space", false, false, false, true, false, false),
+            ("space", false, true, false, true, false, false),
+            ("space", true, true, false, false, false, false),
+            ("space", false, true, true, false, false, false),
+            ("space", false, false, false, true, true, false),
+            ("space", false, false, false, true, false, true),
+            ("r", false, true, false, false, false, false),
+            ("r", true, false, false, false, false, false),
+            ("r", false, false, true, false, false, false),
+            ("r", false, false, false, true, false, false),
+            ("r", false, false, false, false, true, false),
+            ("r", false, false, false, false, false, true),
+        ] {
+            assert!(!random_section_shortcut(
+                key, command, control, shift, alt, function, held
+            ));
+        }
+    }
+
+    #[gpui::test]
+    fn direct_random_action_selects_a_different_visible_wav_and_requests_its_playback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        browser.update(cx, |view, cx| {
+            let root = PathBuf::from("/tmp/direct-random-fixture");
+            let entries = ["a.wav", "b.wav"]
+                .into_iter()
+                .map(|name| AudioFile {
+                    path: root.join(name),
+                    relative_path: PathBuf::from(name),
+                    byte_len: 0,
+                    duration_seconds: None,
+                    sample_rate: None,
+                    playback_type: None,
+                    curation: None,
+                })
+                .collect::<Vec<_>>();
+            let mut source = SourceSession::new(root.clone());
+            source.entries = entries.clone();
+            view.source_sessions = vec![source];
+            view.active_source = Some(0);
+            view.root = Some(root);
+            view.entries = entries;
+            view.view_model.set_entries(&view.entries);
+            view.selected = Some(0);
+            assert_eq!(view.view_model.rows().len(), 2);
+            view.play_direct_random_sample(false, cx);
+            assert_eq!(view.selected, Some(1));
+            assert_eq!(
+                view.playback_init_intent
+                    .as_ref()
+                    .map(|intent| intent.path.as_path()),
+                Some(view.entries[1].path.as_path())
+            );
+        });
+    }
 
     #[gpui::test]
     fn explicit_actions_cancel_a_pending_random_load(cx: &mut gpui::TestAppContext) {

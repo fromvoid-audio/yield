@@ -129,6 +129,23 @@ impl PreferenceState {
         self.effective().normalized_audition_enabled
     }
 
+    pub(super) fn collection_name(&self, slot: usize) -> Option<String> {
+        let mut name = self.baseline.collection_names.get(slot)?.clone();
+        for pending in &self.pending {
+            match &pending.patch {
+                PreferencePatch::SetCollectionName {
+                    slot: changed,
+                    name: draft,
+                } if *changed == slot => {
+                    name = Some(draft.clone());
+                }
+                PreferencePatch::Reset => name = None,
+                _ => {}
+            }
+        }
+        name
+    }
+
     pub(super) fn queue(&mut self, request: PreferenceRequestId, patch: PreferencePatch) {
         self.pending.push(PendingPreferencePatch {
             request: request.get(),
@@ -235,10 +252,14 @@ impl PreferenceState {
         request: PreferenceRequestId,
         error: String,
     ) -> Option<PreferencePatch> {
+        self.fail_request_number(request.get(), error)
+    }
+
+    fn fail_request_number(&mut self, request: u64, error: String) -> Option<PreferencePatch> {
         let index = self
             .pending
             .iter()
-            .position(|pending| pending.request == request.get())?;
+            .position(|pending| pending.request == request)?;
         let failed = self.pending.remove(index).patch;
         self.status = format!("Settings error: {error}");
         Some(failed)
@@ -331,13 +352,20 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
             preferences.theme_source_path = source_path.clone();
         }
         PreferencePatch::SetMotionEnabled(enabled) => preferences.theme.motion.enabled = *enabled,
+        PreferencePatch::SetTextScalePercent(percent) => preferences.text_scale_percent = *percent,
         PreferencePatch::SetAutoplaySelection(enabled) => preferences.autoplay_selection = *enabled,
         PreferencePatch::SetRatingDecayWeeks(weeks) => preferences.rating_decay_weeks = *weeks,
         PreferencePatch::SetTrashFolder(path) => preferences.trash_folder = path.clone(),
         PreferencePatch::SetHelpTooltipsEnabled(enabled) => {
             preferences.help_tooltips_enabled = *enabled
         }
-        PreferencePatch::SetLoopEnabled(enabled) => preferences.loop_enabled = *enabled,
+        PreferencePatch::SetLoopEnabled(enabled) => {
+            preferences.loop_enabled = *enabled;
+            preferences.loop_lock_override = None;
+        }
+        PreferencePatch::SetLoopLockOverride(locked_override) => {
+            preferences.loop_lock_override = *locked_override;
+        }
         PreferencePatch::SetNormalizedAuditionEnabled(enabled) => {
             preferences.normalized_audition_enabled = *enabled;
         }
@@ -346,6 +374,11 @@ fn apply_patch(preferences: &mut UiPreferences, patch: &PreferencePatch) {
         }
         PreferencePatch::SetAudioOutput(audio_output) => {
             preferences.audio_output = audio_output.clone();
+        }
+        PreferencePatch::SetCollectionName { slot, name } => {
+            if let Some(current) = preferences.collection_names.get_mut(*slot) {
+                *current = Some(name.clone());
+            }
         }
         PreferencePatch::Reset => *preferences = UiPreferences::default(),
     }
@@ -488,15 +521,22 @@ impl Browser {
         }
     }
 
-    fn apply_preference_projection(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn apply_preference_projection(&mut self, cx: &mut Context<Self>) {
         let effective = self.preferences.effective();
         let autoplay_was_enabled = self.autoplay_selection;
         self.autoplay_selection = effective.autoplay_selection;
         self.help_tooltips_enabled = effective.help_tooltips_enabled;
+        self.general_settings.text_scale_percent = effective.text_scale_percent;
         self.general_settings.rating_decay_weeks = effective.rating_decay_weeks;
         self.general_settings.trash_folder = effective.trash_folder.clone();
+        let previous_loop_mode = self.playback_policy.enabled();
         self.playback_policy
             .apply_preference(effective.loop_enabled);
+        self.playback_policy
+            .apply_locked_override(effective.loop_lock_override);
+        if previous_loop_mode != self.playback_policy.enabled() {
+            self.apply_loop_mode_change(self.playback_policy.enabled(), cx);
+        }
         self.apply_preference_volume(effective.output_volume);
         self.apply_preference_audio_output(
             &effective.audio_output,
@@ -522,17 +562,21 @@ impl Browser {
         if preserve_inflight_theme {
             return;
         }
+        let displayed_theme =
+            crate::theme::with_text_scale(&effective.theme, effective.text_scale_percent);
         let active_theme = crate::theme::active(cx).clone();
-        if active_theme != effective.theme {
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(effective.theme.clone())));
+        if active_theme != displayed_theme {
+            cx.set_global(crate::theme::ActiveTheme(Arc::new(displayed_theme)));
             self.search_input
                 .update(cx, |input, cx| input.theme_changed(cx));
             self.playmark_timing_input
                 .update(cx, |input, cx| input.theme_changed(cx));
+            self.collection_rename_input
+                .update(cx, |input, cx| input.theme_changed(cx));
         }
         if self.theme_load.pending_path.is_none() {
             self.theme_load.active_path = effective.theme_source_path.clone();
-            self.theme_status = effective.theme.name.clone();
+            self.set_theme_status(effective.theme.name.clone());
         }
     }
 
@@ -594,6 +638,14 @@ impl Browser {
         self.submit_preference_patch(PreferencePatch::SetLoopEnabled(enabled), cx)
     }
 
+    pub(super) fn persist_loop_lock_override(
+        &mut self,
+        locked_override: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.submit_preference_patch(PreferencePatch::SetLoopLockOverride(locked_override), cx)
+    }
+
     pub(super) fn persist_normalized_audition_preference(
         &mut self,
         enabled: bool,
@@ -623,6 +675,54 @@ mod tests {
     use yield_design::{Color, Theme};
 
     #[test]
+    fn collection_name_optimism_rolls_back_on_owner_rejection() {
+        let mut state = PreferenceState::new();
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        state.queue_for_test(
+            7,
+            PreferencePatch::SetCollectionName {
+                slot: 1,
+                name: "Drums".to_string(),
+            },
+        );
+        assert_eq!(
+            state.effective().collection_names[1].as_deref(),
+            Some("Drums")
+        );
+        assert_eq!(state.collection_name(1).as_deref(), Some("Drums"));
+        assert!(state.effective().collection_names[0].is_none());
+        state.fail_request_number(7, "write rejected".to_string());
+        assert!(
+            state
+                .effective()
+                .collection_names
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(state.collection_name(1), None);
+        state.queue_for_test(
+            8,
+            PreferencePatch::SetCollectionName {
+                slot: 1,
+                name: "New".to_string(),
+            },
+        );
+        state.queue_for_test(9, PreferencePatch::Reset);
+        state.queue_for_test(
+            10,
+            PreferencePatch::SetCollectionName {
+                slot: 1,
+                name: "After reset".to_string(),
+            },
+        );
+        assert_eq!(state.collection_name(1).as_deref(), Some("After reset"));
+        assert_eq!(
+            state.collection_name(1),
+            state.effective().collection_names[1]
+        );
+    }
+
+    #[test]
     fn optimistic_patches_survive_a_late_full_snapshot() {
         let mut state = PreferenceState::new();
         let mut imported = Theme::default();
@@ -649,6 +749,18 @@ mod tests {
     }
 
     #[test]
+    fn text_scale_stays_visible_while_persistence_is_pending() {
+        let mut state = PreferenceState::new();
+        state.queue_for_test(1, PreferencePatch::SetTextScalePercent(200));
+        assert_eq!(state.effective().text_scale_percent, 200);
+        assert!(state.accept_snapshot(PreferenceRevision::default(), UiPreferences::default()));
+        assert_eq!(state.effective().text_scale_percent, 200);
+        state.mark_applied_for_test(1, 1);
+        state.mark_persisted_for_test(1);
+        assert!(!state.has_pending());
+    }
+
+    #[test]
     fn persistence_only_retires_applied_requests_at_or_before_ack() {
         let mut state = PreferenceState::new();
         state.queue_for_test(1, PreferencePatch::SetLoopEnabled(true));
@@ -659,6 +771,22 @@ mod tests {
         assert!(state.has_pending());
         state.mark_persisted_for_test(2);
         assert!(!state.has_pending());
+    }
+
+    #[test]
+    fn rejected_loop_lock_patch_restores_saved_choice_without_changing_normal_loop() {
+        let mut state = PreferenceState::new();
+        let mut saved = UiPreferences::default();
+        saved.loop_enabled = true;
+        saved.loop_lock_override = Some(false);
+        assert!(state.accept_snapshot(PreferenceRevision::default(), saved.clone()));
+        state.queue_for_test(1, PreferencePatch::SetLoopLockOverride(Some(true)));
+        assert_eq!(state.effective().loop_lock_override, Some(true));
+        assert!(matches!(
+            state.fail_request_number(1, "rejected".into()),
+            Some(PreferencePatch::SetLoopLockOverride(Some(true)))
+        ));
+        assert_eq!(state.effective(), saved);
     }
 
     #[test]
