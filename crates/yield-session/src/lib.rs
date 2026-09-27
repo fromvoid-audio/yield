@@ -34,11 +34,12 @@ mod preferences;
 mod vocabulary;
 
 pub use catalog::{
-    CatalogCommand, CatalogCurationRequestError, CatalogCurationTagFactsRequestError,
-    CatalogDelivery, CatalogDisplayLabelsRequestError, CatalogError, CatalogEvent,
-    CatalogOperation, CatalogPublicationStatus, CatalogRatingDecayRequestError, CatalogStatus,
-    CatalogSubmitError, CatalogTagFilterRequestError, CatalogTagPageQuery,
-    CatalogTagPageRequestError, CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
+    CatalogCancelError, CatalogCommand, CatalogCurationRequestError,
+    CatalogCurationTagFactsRequestError, CatalogDelivery, CatalogDisplayLabelsRequestError,
+    CatalogError, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
+    CatalogRatingDecayRequestError, CatalogStatus, CatalogSubmitError,
+    CatalogTagFilterRequestError, CatalogTagPageQuery, CatalogTagPageRequestError,
+    CatalogWavMetadataRequestError, MAX_CURATION_OPERATION_BATCHES,
     MAX_CURATION_OPERATION_PATH_BYTES, MAX_CURATION_OPERATION_RECEIPT_BYTES,
     MAX_CURATION_OPERATION_UPDATES, MAX_CURATION_TAG_FACTS_PATH_BYTES, MAX_CURATION_UPDATES,
     MAX_TAG_FILTER_MASK_BYTES, MAX_TAG_FILTER_PAYLOAD_BYTES, MAX_TAG_PAGE_INPUT_BYTES,
@@ -487,6 +488,24 @@ impl SourceRegistryService {
     /// Submit one typed catalog command without waiting for catalog startup or worker I/O.
     pub fn submit_catalog(&self, command: CatalogCommand) -> Result<(), CatalogSubmitError> {
         catalog::submit(&self.catalog, command)
+    }
+
+    /// Request cancellation of the exact current source audit without blocking on the worker.
+    pub fn cancel_catalog_audit(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<(), CatalogCancelError> {
+        catalog::cancel_audit(&self.catalog, source_id, lifecycle_generation)
+    }
+
+    /// Check whether the exact source lifecycle currently has an active audit to cancel.
+    pub fn catalog_audit_is_running(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> bool {
+        catalog::audit_is_running(&self.catalog, source_id, lifecycle_generation)
     }
 
     /// Poll one catalog event without waiting for startup or worker I/O.

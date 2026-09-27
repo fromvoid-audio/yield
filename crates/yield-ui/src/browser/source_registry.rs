@@ -5,12 +5,12 @@ use std::sync::mpsc::TryRecvError;
 use gpui::{BorrowAppContext, Global, Subscription};
 use yield_library::sample_sources::{SampleSource, SourceId};
 use yield_session::{
-    CanonicalSourceRoot, CatalogCommand, CatalogDelivery, CatalogEvent, CatalogStatus,
-    CatalogSubmitError, PreferenceEvent, PreferencePatch, PreferenceRequestId, ProfileTagCategory,
-    ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyLookup, ProfileTagVocabularyPage,
-    ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt, RegistryEvent,
-    RegistryRevision, RequestId, SourceRegistryService, SubmitError, VocabularyRequest,
-    VocabularyStatus, VocabularySubmitError,
+    CanonicalSourceRoot, CatalogCancelError, CatalogCommand, CatalogDelivery, CatalogEvent,
+    CatalogStatus, CatalogSubmitError, PreferenceEvent, PreferencePatch, PreferenceRequestId,
+    ProfileTagCategory, ProfileTagVocabularyDeleteReceipt, ProfileTagVocabularyLookup,
+    ProfileTagVocabularyPage, ProfileTagVocabularyPageCursor, ProfileTagVocabularySetReceipt,
+    RegistryEvent, RegistryRevision, RequestId, SourceRegistryService, SubmitError,
+    VocabularyRequest, VocabularyStatus, VocabularySubmitError,
 };
 
 /// The app-owned source registry service.
@@ -189,6 +189,27 @@ impl SourceRegistryGlobal {
             .as_ref()
             .ok_or(CatalogSubmitError::Closed)?
             .submit_catalog(command)
+    }
+
+    pub(crate) fn cancel_catalog_audit(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> Result<(), CatalogCancelError> {
+        self.service
+            .as_ref()
+            .ok_or(CatalogCancelError::Closed)?
+            .cancel_catalog_audit(source_id, lifecycle_generation)
+    }
+
+    pub(crate) fn catalog_audit_is_running(
+        &self,
+        source_id: &SourceId,
+        lifecycle_generation: u64,
+    ) -> bool {
+        self.service.as_ref().is_some_and(|service| {
+            service.catalog_audit_is_running(source_id, lifecycle_generation)
+        })
     }
 
     /// Drain catalog events without waiting for the background worker.

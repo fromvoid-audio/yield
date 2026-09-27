@@ -30,6 +30,8 @@ pub(super) const RANDOM_NAVIGATION: &str = "browser-random-navigation";
 pub(super) const NAME_VIEW_MODE: &str = "browser-name-view-mode";
 pub(super) const JOB_DETAILS: &str = "status-job-details";
 const JOB_DETAILS_PANEL: &str = "status-job-details-panel";
+const JOB_RETRY: &str = "status-job-retry";
+const JOB_CANCEL: &str = "status-job-cancel";
 const PLAY: &str = "transport-play";
 const STOP: &str = "transport-stop";
 const LOOP: &str = "transport-loop";
@@ -342,6 +344,8 @@ impl BrowserAccessibility {
                             view.volume_focus_handle.clone()
                         } else if event.id == WAVEFORM {
                             view.waveform_focus_handle.clone()
+                        } else if matches!(event.id.as_str(), JOB_RETRY | JOB_CANCEL) {
+                            view.job_details_focus_handle.clone()
                         } else if let Some(focus) = ax.focus_handle(&event.id) {
                             focus
                         } else {
@@ -437,6 +441,8 @@ impl BrowserAccessibility {
                                 | RANDOM_NAVIGATION
                                 | NAME_VIEW_MODE
                                 | JOB_DETAILS
+                                | JOB_RETRY
+                                | JOB_CANCEL
                         ) || sort_action.is_some()
                             || collection_action.is_some()
                             || playback_type_action.is_some()
@@ -654,6 +660,14 @@ impl BrowserAccessibility {
                                 JOB_DETAILS => {
                                     view.job_details_open = !view.job_details_open;
                                     cx.notify();
+                                }
+                                JOB_RETRY => {
+                                    view.retry_job_audit(cx);
+                                    window.focus(&view.job_details_focus_handle);
+                                }
+                                JOB_CANCEL => {
+                                    view.cancel_job_audit(cx);
+                                    window.focus(&view.job_details_focus_handle);
                                 }
                                 _ => match source_action {
                                     Some((index, true)) => {
@@ -1163,7 +1177,7 @@ impl Browser {
                 ),
                 true,
             ));
-            let jobs = super::job_details::snapshot(self);
+            let jobs = super::job_details::snapshot(self, cx);
             controls.push(button(
                 JOB_DETAILS,
                 "Job Details",
@@ -1179,7 +1193,7 @@ impl Browser {
                 true,
             ));
             if self.job_details_open {
-                let details = if jobs.rows.is_empty() {
+                let mut details = if jobs.rows.is_empty() {
                     "No active jobs".to_string()
                 } else {
                     jobs.rows
@@ -1199,6 +1213,10 @@ impl Browser {
                         .collect::<Vec<_>>()
                         .join("; ")
                 };
+                if let Some(error) = self.job_action_error.as_ref() {
+                    details.push_str("; ");
+                    details.push_str(error);
+                }
                 controls.push(AxChild {
                     id: JOB_DETAILS_PANEL.into(),
                     role: AxRole::Group,
@@ -1206,6 +1224,12 @@ impl Browser {
                     value: Some(details),
                     enabled: true,
                 });
+                if jobs.rows.iter().any(|row| row.can_retry) {
+                    controls.push(button(JOB_RETRY, "Retry source audit", None, true));
+                }
+                if jobs.rows.iter().any(|row| row.can_cancel) {
+                    controls.push(button(JOB_CANCEL, "Cancel source audit", None, true));
+                }
             }
             if self.theme_settings_open {
                 let editable = self.preferences_editable();
