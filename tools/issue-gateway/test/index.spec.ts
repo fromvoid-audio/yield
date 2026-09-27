@@ -3,9 +3,24 @@ import { createWorker, type GatewayEnv, type SessionStore } from '../src/index';
 
 class MemoryStore implements SessionStore {
   values = new Map<string, string>();
-  async get(key: string) { return this.values.get(key) ?? null; }
-  async put(key: string, value: string) { this.values.set(key, value); }
-  async delete(key: string) { this.values.delete(key); }
+  expirations = new Map<string, number>();
+  now = 0;
+  advance(seconds: number) { this.now += seconds; }
+  async get(key: string) {
+    if ((this.expirations.get(key) ?? Infinity) <= this.now) {
+      await this.delete(key);
+      return null;
+    }
+    return this.values.get(key) ?? null;
+  }
+  async put(key: string, value: string, options: { expirationTtl: number }) {
+    this.values.set(key, value);
+    this.expirations.set(key, this.now + options.expirationTtl);
+  }
+  async delete(key: string) {
+    this.values.delete(key);
+    this.expirations.delete(key);
+  }
 }
 
 function fixture(fetcher: typeof fetch = async () => { throw new Error('unexpected network'); }) {
@@ -76,6 +91,51 @@ describe('Yield issue gateway', () => {
     expect(response.status).toBe(502);
     expect(await response.text()).not.toContain('private-secret-never-show');
     expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+  });
+
+  it('reports OAuth denial to the poller and consumes the state once', async () => {
+    let exchanges = 0;
+    const { call, sessions } = fixture(async () => {
+      exchanges += 1;
+      throw new Error('no exchange on denial');
+    });
+    const state = await connect(call, sessions);
+    const callback = await call(`/auth/callback?error=access_denied&state=${state}`);
+    expect(callback.status).toBe(200);
+    expect(await callback.text()).toContain('canceled');
+    const poll = await call(`/auth/poll?requestId=${requestId}`);
+    expect(poll.status).toBe(403);
+    expect(await poll.json()).toEqual({ error: 'GitHub connection canceled' });
+    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+    expect((await call(`/auth/callback?error=access_denied&state=${state}`)).status).toBe(400);
+    expect(exchanges).toBe(0);
+  });
+
+  it('expires OAuth state, the poll handoff, and gateway sessions', async () => {
+    const { call, sessions } = fixture(async (input) =>
+      String(input).endsWith('/login/oauth/access_token')
+        ? Response.json({ access_token: 'github-private-token' })
+        : Response.json({ number: 7, html_url: 'https://github.com/PORTALSURFER/yield-feedback/issues/7' }));
+    const expiredState = await connect(call, sessions);
+    sessions.advance(601);
+    expect((await call(`/auth/callback?code=late&state=${expiredState}`)).status).toBe(400);
+
+    const state = await connect(call, sessions);
+    expect((await call(`/auth/callback?code=valid&state=${state}`)).status).toBe(200);
+    const sessionId = sessions.values.get(`poll:${requestId}`)!;
+    sessions.advance(301);
+    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+    expect((await call('/issue', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${sessionId}` },
+      body: JSON.stringify({ title: 'Valid report' }),
+    })).status).toBe(200);
+    sessions.advance(7 * 24 * 60 * 60);
+    expect((await call('/issue', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${sessionId}` },
+      body: JSON.stringify({ title: 'Valid report' }),
+    })).status).toBe(401);
   });
 
   it('rejects missing, expired, malformed, or oversized issue requests before GitHub', async () => {

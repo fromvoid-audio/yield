@@ -103,10 +103,18 @@ export function createWorker(fetcher: Fetcher) {
       if (request.method === 'GET' && url.pathname === '/auth/callback') {
         const code = url.searchParams.get('code') ?? '';
         const state = url.searchParams.get('state') ?? '';
-        if (!code || !SESSION_ID.test(state)) return json({ error: 'Invalid authorization callback' }, 400);
+        const denied = url.searchParams.has('error');
+        if ((!code && !denied) || !SESSION_ID.test(state))
+          return json({ error: 'Invalid authorization callback' }, 400);
         const requestId = await env.SESSIONS.get(`state:${state}`);
         if (!requestId || !REQUEST_ID.test(requestId)) return json({ error: 'Authorization expired' }, 400);
         await env.SESSIONS.delete(`state:${state}`);
+        if (denied) {
+          await env.SESSIONS.put(`poll:${requestId}`, 'denied', { expirationTtl: POLL_SECONDS });
+          return new Response('GitHub connection canceled. Return to Yield; you can close this tab.', {
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' },
+          });
+        }
         let githubToken: string;
         try {
           const response = await fetcher('https://github.com/login/oauth/access_token', {
@@ -139,6 +147,8 @@ export function createWorker(fetcher: Fetcher) {
         const sessionId = await env.SESSIONS.get(`poll:${requestId}`);
         if (!sessionId) return json({ ok: false }, 202);
         await env.SESSIONS.delete(`poll:${requestId}`);
+        if (sessionId === 'denied') return json({ error: 'GitHub connection canceled' }, 403);
+        if (!SESSION_ID.test(sessionId)) return json({ error: 'Gateway unavailable' }, 503);
         return json({ ok: true, sessionId });
       }
 
