@@ -10,7 +10,8 @@ use yield_library::sample_sources::db::file_ops_journal;
 use yield_library::{
     app_dirs::{AppRootGuard, ProfileOwnershipError, WritableProfileGuard},
     sample_sources::{
-        DB_FILE_NAME, LibraryError, SourceDatabase, SourceDatabaseConnectionRole, SourceDbError,
+        DB_FILE_NAME, LibraryError, SampleSource, SourceDatabase, SourceDatabaseConnectionRole,
+        SourceDbError,
         library::{self, LibraryState},
         readiness::{
             ReadinessClassification, ReadinessDeficit, ReadinessError, ReadinessStage,
@@ -81,6 +82,7 @@ fn path_only_writable_source_entrypoints_fail_before_filesystem_side_effects() {
     expect_source_profile_required(SourceDatabase::open_for_source_write(source_root.path()));
     expect_source_profile_required(SourceDatabase::open_for_background_job(source_root.path()));
     expect_source_profile_required(SourceDatabase::open_for_scan(source_root.path()));
+    expect_source_profile_required(SampleSource::new(source_root.path().to_path_buf()).open_db());
     expect_source_profile_required(SourceDatabase::open_for_maintenance(source_root.path()));
     expect_source_profile_required(SourceDatabase::open_for_user_metadata_write(
         source_root.path(),
