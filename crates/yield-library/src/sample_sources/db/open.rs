@@ -9,7 +9,7 @@ mod read_only;
 
 use super::{
     BoundDatabaseRoot, SOURCE_DB_READ_ONLY_ENV, SourceDatabase, SourceDatabaseConnectionRole,
-    SourceDbError, source_lease, sqlite_identity, telemetry, util,
+    SourceDbError, schema, source_lease, sqlite_identity, telemetry, util,
 };
 use read_only::open_read_only_source_database;
 
@@ -19,6 +19,7 @@ const DEFAULT_WRITABLE_BUSY_TIMEOUT_MS: u64 = 5_000;
 pub(crate) enum SourceDatabaseOpenMode {
     Fast,
     Full,
+    Operational,
 }
 
 pub(super) fn open_source_database_for_role(
@@ -429,12 +430,19 @@ fn open_source_database_with_flags(
     }
 
     let database_is_embedded = database_root == root;
-    let db_path = if database_is_embedded {
+    let db_path = if mode == SourceDatabaseOpenMode::Operational {
+        let path =
+            paths::read_only_db_path(database_root)?.ok_or(SourceDbError::MaintenanceRequired)?;
+        if path.file_name() != Some(std::ffi::OsStr::new(super::DB_FILE_NAME)) {
+            return Err(SourceDbError::MaintenanceRequired);
+        }
+        path
+    } else if database_is_embedded {
         paths::prepare_writable_db_path_in_existing_root(database_root)?
     } else {
         paths::prepare_writable_db_path(database_root)?
     };
-    if !database_is_embedded {
+    if !database_is_embedded && mode != SourceDatabaseOpenMode::Operational {
         util::create_parent_if_needed(&db_path)?;
     }
     let connect_started = std::time::Instant::now();
@@ -493,6 +501,9 @@ fn initialize_source_database(
     telemetry_label: &'static str,
     busy_timeout_ms: u64,
 ) -> Result<SourceDatabase, SourceDbError> {
+    if mode == SourceDatabaseOpenMode::Operational {
+        schema::require_current_schema(&db.connection)?;
+    }
     let db_path = db.db_path.clone();
     let open_started = std::time::Instant::now();
     let pragmas_started = std::time::Instant::now();
@@ -561,6 +572,7 @@ fn initialize_source_database(
     let schema_result = match mode {
         SourceDatabaseOpenMode::Fast => db.apply_schema_fast(),
         SourceDatabaseOpenMode::Full => db.apply_schema(),
+        SourceDatabaseOpenMode::Operational => Ok(()),
     };
     match schema_result {
         Ok(()) => {
@@ -665,6 +677,7 @@ impl SourceDatabaseOpenMode {
         match self {
             Self::Fast => "fast",
             Self::Full => "full",
+            Self::Operational => "operational",
         }
     }
 }

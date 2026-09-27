@@ -328,6 +328,35 @@ impl Browser {
         self.request_playback_intent(intent, cx);
     }
 
+    /// Replay the selected sample or play selection, including during active playback.
+    pub(super) fn play_selected_sample(&mut self, cx: &mut Context<Self>) {
+        let Some(intent) = self.selected_playback_intent(0.0, PlaybackIntentOrigin::Explicit)
+        else {
+            cx.notify();
+            return;
+        };
+        self.request_playback_intent(intent, cx);
+    }
+
+    /// Start at the play selection's start mark and continue through the sample end.
+    pub(super) fn play_from_current_play_start(&mut self, cx: &mut Context<Self>) {
+        if self.waveform.is_none() {
+            self.play_selected_sample(cx);
+            return;
+        }
+        let start = self
+            .waveform_play_region
+            .filter(|region| region.is_valid())
+            .map_or(0.0, |region| region.start);
+        let Some(mut intent) = self.selected_playback_intent(start, PlaybackIntentOrigin::Explicit)
+        else {
+            cx.notify();
+            return;
+        };
+        intent.region = None;
+        self.request_playback_intent(intent, cx);
+    }
+
     pub(super) fn play_from_current_playhead(&mut self, cx: &mut Context<Self>) {
         if self.waveform.is_none() {
             return;
