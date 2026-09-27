@@ -143,11 +143,39 @@ def self_test() -> None:
     assert validate(fixture)
 
 
-def main() -> int:
-    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
-        self_test()
-        print("[source_db_competing_writers] self-test OK")
-        return 0
+def inventory_label(call: Call) -> str:
+    if call.kind == "source":
+        if call.opener in READ_ONLY_SOURCE_OPENS:
+            return "legacy-read-only"
+        if call.path.endswith("/sample_sources/mod.rs") or call.path.endswith(
+            "/file_ops_journal/recovery_io.rs"
+        ) or call.path.endswith("/scanner/scan/runner.rs"):
+            return "path-only-compatibility"
+        if call.path.endswith("/yield-catalog/src/lib.rs") and call.function == "register_source":
+            return "source-owner"
+        return "unclassified"
+    if call.path.endswith("/operation_journal/store.rs"):
+        return "operation-journal"
+    if call.path.endswith("/library/connection.rs"):
+        return "global-library"
+    if call.path.endswith("/open/read_only.rs") or call.path.endswith(
+        "/library/read_only.rs"
+    ):
+        return "legacy-read-only"
+    if call.path.endswith("/open.rs"):
+        if call.function == "open_source_database_with_flags":
+            return "path-only-compatibility"
+        return "source-owner"
+    if call.path.endswith("/source_lease.rs"):
+        return "source-lease-control"
+    if call.path.endswith("/schema/mod.rs"):
+        return "in-memory-schema-probe"
+    if call.path.endswith("/mod.rs") and call.function == "snapshot_to_path_with_held_write_fence":
+        return "snapshot-destination"
+    return "unclassified"
+
+
+def collect_calls() -> tuple[list[Call], list[str]]:
     calls = []
     errors = []
     for directory in ("crates", "src", "tools", "benches", "tests"):
@@ -159,11 +187,31 @@ def main() -> int:
             found, diagnostics = calls_in(relative, path.read_text(encoding="utf-8"))
             calls.extend(found)
             errors.extend(diagnostics)
+    return calls, errors
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        self_test()
+        print("[source_db_competing_writers] self-test OK")
+        return 0
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] != "--inventory"):
+        print("usage: check_source_db_competing_writers.py [--self-test|--inventory]", file=sys.stderr)
+        return 2
+    calls, errors = collect_calls()
     errors.extend(validate(calls))
+    errors.extend(
+        f"{call.path}:{call.line}: direct open has no inventory boundary"
+        for call in calls
+        if inventory_label(call) == "unclassified"
+    )
     if errors:
         for error in errors:
             print(f"[source_db_competing_writers] {error}", file=sys.stderr)
         return 1
+    if len(sys.argv) == 2:
+        for call in calls:
+            print(f"{inventory_label(call)}\t{call.path}:{call.line}\t{call.function}\t{call.opener}")
     print(f"[source_db_competing_writers] OK ({len(calls)} reviewed production opens)")
     return 0
 
