@@ -82,6 +82,7 @@ mod direct_random;
 mod directory_open;
 mod display_labels;
 mod file_drag;
+mod folder_keyboard;
 mod general_settings;
 mod handoff;
 mod history;
@@ -319,6 +320,7 @@ pub(crate) struct Browser {
     folder_tree: Option<FolderTree>,
     folder_rows_cache: Vec<FolderTreeRow>,
     selected_folder: PathBuf,
+    folder_keyboard: Option<folder_keyboard::FolderKeyboardState>,
     expanded_folders: BTreeSet<PathBuf>,
     folder_scope: FolderScope,
     restore_selection_id: Option<AudioFileId>,
@@ -640,6 +642,7 @@ impl Browser {
             folder_tree: None,
             folder_rows_cache: Vec::new(),
             selected_folder: PathBuf::from("."),
+            folder_keyboard: None,
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
             folder_scope: FolderScope::DirectOnly,
             restore_selection_id: None,
@@ -1293,6 +1296,7 @@ impl Browser {
         self.waveform_error = None;
         self.folder_tree = None;
         self.folder_rows_cache.clear();
+        self.folder_keyboard = None;
         if let Some(index) = source_index
             && let Some(session) = self.source_sessions.get(index)
         {
@@ -1458,6 +1462,7 @@ impl Browser {
             self.entries.clear();
             self.folder_tree = None;
             self.folder_rows_cache.clear();
+            self.folder_keyboard = None;
             self.view_model.set_entries(&self.entries);
             self.reschedule_playback_age_refresh(cx);
             self.view_model
@@ -1803,11 +1808,26 @@ impl Browser {
         self.invalidate_file_handoff();
         self.selection.clear();
         self.selected_folder = path.clone();
+        if let Some(root) = self.root.as_ref() {
+            if self
+                .folder_keyboard
+                .as_ref()
+                .is_some_and(|state| state.root() != root)
+            {
+                self.folder_keyboard = None;
+            }
+            self.folder_keyboard
+                .get_or_insert_with(|| {
+                    folder_keyboard::FolderKeyboardState::new(root.clone(), path.clone())
+                })
+                .pointer_select(path.clone());
+        }
         self.update_active_folder_projection(cx);
         self.start_focus(
-            motion::FocusTarget::Folder(path),
+            motion::FocusTarget::Folder(path.clone()),
             motion::FocusTrigger::Pointer,
         );
+        self.focus_folder_path(path, window, cx);
     }
 
     pub(super) fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1856,6 +1876,7 @@ impl Browser {
             .as_ref()
             .map(|tree| tree.rows(&self.expanded_folders))
             .unwrap_or_default();
+        self.ensure_folder_keyboard();
     }
 
     fn select_entry(
@@ -2809,6 +2830,10 @@ impl Browser {
             return;
         }
         if self.handle_panel_focus_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_folder_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }

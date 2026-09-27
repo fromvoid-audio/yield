@@ -532,6 +532,11 @@ impl BrowserAccessibility {
                         cx.activate(true);
                         window.activate_window();
                         window.focus(&focus);
+                        if event.action == AxAction::Focus
+                            && let Some((path, false)) = folder_action.as_ref()
+                        {
+                            view.mark_folder_keyboard_focus(path.clone());
+                        }
                         if settings_action {
                             match event.action {
                                 AxAction::Focus => {}
@@ -887,6 +892,10 @@ impl Browser {
         let visible_folders = range
             .filter_map(|position| rows.get(position).map(|row| row.path.clone()))
             .collect::<Vec<_>>();
+        let focused_folder = self.folder_keyboard.as_ref().and_then(|state| {
+            (state.root() == root && rows.iter().any(|row| row.path == state.focused()))
+                .then(|| state.focused().to_path_buf())
+        });
         let mut visible_ids = HashSet::new();
         for folder in &visible_folders {
             let has_toggle = rows
@@ -904,6 +913,14 @@ impl Browser {
                     .entry(id)
                     .or_insert_with(|| cx.focus_handle());
             }
+        }
+        // A transient empty virtual-list range must not retire the keyboard target's handle.
+        if let Some(path) = focused_folder {
+            let id = folder_id(root, &path);
+            visible_ids.insert(id.clone());
+            ax.control_focus
+                .entry(id)
+                .or_insert_with(|| cx.focus_handle());
         }
         ax.control_focus.retain(|id, _| {
             (!id.starts_with("browser-folder:") && !id.starts_with("browser-folder-toggle:"))
@@ -1330,7 +1347,7 @@ impl Browser {
                         label: label.clone(),
                         value: Some(format!(
                             "{}, {} audio {}",
-                            if self.selected_folder == row.path {
+                            if self.folder_is_selected(&row.path) {
                                 "Selected"
                             } else {
                                 "Not selected"
