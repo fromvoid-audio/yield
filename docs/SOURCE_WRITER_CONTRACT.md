@@ -255,7 +255,9 @@ Operational writable roles require a currently compatible schema and return a ty
 `MaintenanceRequired` result instead of opportunistically repairing it. The same owned
 connection may perform that maintenance before entering the operational queue; no
 competing writer is introduced. Operational writer roles now reject a missing or stale schema
-without creating the database or running additive repairs. The owner-held browser page reads
+without creating the database or running additive repairs. They compare table and column
+shape against a cached, in-memory current-schema reference so a current version stamp cannot
+hide a repairable omission. The owner-held browser page reads
 through its retained connection with revision fencing, a 64-row keyset limit, a 16 MiB
 materialized path/membership budget, and a two-second SQLite progress cutoff. Path-only
 read roles remain explicit legacy exceptions pending the WAL/SHM no-hidden-write proof.

@@ -1,5 +1,8 @@
 //! SQLite schema creation and migration helpers for source databases.
 
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
 use rusqlite::Connection;
 
 use super::SourceDbError;
@@ -35,16 +38,41 @@ pub(super) fn require_current_schema(connection: &Connection) -> Result<(), Sour
     if !schema_is_current(connection)? {
         return Err(SourceDbError::MaintenanceRequired);
     }
-    for table in [
-        "metadata",
-        "wav_files",
-        "source_participant_curation_receipts",
-    ] {
-        if table_columns(connection, table)?.is_empty() {
+    // The version stamp can be current even when a prior open would have repaired
+    // an omitted table or optional column. Build the required shape in memory once,
+    // then inspect the source without running any DDL against it.
+    static EXPECTED_TABLES: OnceLock<Option<Vec<(String, HashSet<String>)>>> = OnceLock::new();
+    let expected = EXPECTED_TABLES
+        .get_or_init(|| current_table_shape().ok())
+        .as_ref()
+        .ok_or(SourceDbError::Unexpected)?;
+    for (table, required_columns) in expected {
+        if !required_columns.is_subset(&table_columns(connection, table)?) {
             return Err(SourceDbError::MaintenanceRequired);
         }
     }
     Ok(())
+}
+
+fn current_table_shape() -> Result<Vec<(String, HashSet<String>)>, SourceDbError> {
+    let reference = Connection::open_in_memory().map_err(map_sql_error)?;
+    assure_schema(&reference)?;
+    let mut statement = reference
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .map_err(map_sql_error)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sql_error)?;
+    names
+        .into_iter()
+        .map(|name| Ok((name.clone(), table_columns(&reference, &name)?)))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

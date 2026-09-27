@@ -52,6 +52,16 @@ fn operational_roles_require_owned_maintenance_without_creating_or_migrating() {
         Err(SourceDbError::MaintenanceRequired)
     ));
     drop(SourceDatabase::open_for_maintenance(dir.path()).expect("repair relation"));
+    let connection = rusqlite::Connection::open(&db_path).expect("current-stamped database");
+    connection
+        .execute("ALTER TABLE wav_files DROP COLUMN last_curated_at", [])
+        .expect("remove repairable column");
+    drop(connection);
+    assert!(matches!(
+        SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker),
+        Err(SourceDbError::MaintenanceRequired)
+    ));
+    drop(SourceDatabase::open_for_maintenance(dir.path()).expect("repair column"));
     SourceDatabase::open_with_role(dir.path(), SourceDatabaseConnectionRole::JobWorker)
         .expect("compatible operational open");
 }
