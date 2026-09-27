@@ -1393,7 +1393,13 @@ impl Browser {
             LoopRetargetProgressOutcome::Confirmed { desired_matches } => {
                 self.record_confirmed_metronome(&progress);
                 self.playback_metronome_confirmed = true;
-                self.record_playback_progress(&progress);
+                // The acknowledgement can arrive in the same monitor tick as an
+                // ordinary progress sample. It confirms the mode, but does not
+                // represent a seek: restarting the cursor interpolation here
+                // briefly stalls the playhead while audio keeps advancing.
+                if self.playback_cursor_sample.is_none() {
+                    self.record_playback_progress(&progress);
+                }
                 if desired_matches {
                     self.set_playback_status_from_progress(&progress);
                 } else {
