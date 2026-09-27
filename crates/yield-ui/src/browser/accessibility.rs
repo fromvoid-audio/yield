@@ -21,6 +21,7 @@ use super::{Browser, tag_library};
 pub(super) const ADD_SOURCE: &str = "browser-add-source";
 pub(super) const FOLDER_SCOPE: &str = "browser-folder-scope";
 pub(super) const REFRESH_SOURCE: &str = "browser-refresh-source";
+pub(super) const SHOW_EMPTY_FOLDERS: &str = "browser-show-empty-folders";
 pub(super) const SEARCH: &str = "browser-search";
 pub(super) const TAG_FILTER_INPUT: &str = "browser-tag-filter-input";
 pub(super) const TAG_FILTER_TOGGLE: &str = "browser-tag-filter-toggle";
@@ -248,6 +249,7 @@ impl BrowserAccessibility {
         let mut control_focus = HashMap::new();
         for id in [
             RANDOM_NAVIGATION,
+            SHOW_EMPTY_FOLDERS,
             NAME_VIEW_MODE,
             TAG_FILTER_TOGGLE,
             CURATION_QUEUE_TOGGLE,
@@ -471,7 +473,11 @@ impl BrowserAccessibility {
                             || SETTINGS_ORDER.contains(&event.id.as_str());
                         if !matches!(
                             event.id.as_str(),
-                            ADD_SOURCE | FOLDER_SCOPE | REFRESH_SOURCE | SEARCH
+                            ADD_SOURCE
+                                | FOLDER_SCOPE
+                                | REFRESH_SOURCE
+                                | SHOW_EMPTY_FOLDERS
+                                | SEARCH
                         ) && source_action.is_none()
                             && folder_action.is_none()
                             && sample_action.is_none()
@@ -650,6 +656,7 @@ impl BrowserAccessibility {
                                 ADD_SOURCE => view.prompt_for_source(cx),
                                 FOLDER_SCOPE => view.toggle_folder_scope(cx),
                                 REFRESH_SOURCE => view.refresh_active_source(cx),
+                                SHOW_EMPTY_FOLDERS => view.toggle_empty_folder_visibility(cx),
                                 TAG_FILTER_TOGGLE => super::tag_filter::toggle(view, cx),
                                 CURATION_QUEUE_TOGGLE => super::curation_queue::toggle(view, cx),
                                 CURATION_QUEUE_SCOPE => {
@@ -1435,6 +1442,13 @@ impl Browser {
                 role: AxRole::Button,
                 label: "Refresh source".into(),
                 value: None,
+                enabled: true,
+            });
+            controls.push(AxChild {
+                id: SHOW_EMPTY_FOLDERS.into(),
+                role: AxRole::CheckBox,
+                label: "Show Empty Folders".into(),
+                value: Some(if self.show_empty_folders { "On" } else { "Off" }.into()),
                 enabled: true,
             });
             let active_source = self.active_source.is_some();

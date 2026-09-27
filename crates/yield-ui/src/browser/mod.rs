@@ -29,7 +29,7 @@ use yield_library::sample_sources::{SampleSource, SourceId};
 use yield_media::{
     WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
 };
-use yield_session::{PreferencePatch, RegistryRevision, RequestId};
+use yield_session::{CatalogStatus, PreferencePatch, RegistryRevision, RequestId};
 
 use crate::beat_count_input::{BeatCountChanged, BeatCountInput, DEFAULT_BEAT_COUNT};
 use crate::search_input::{SearchChanged, SearchInput, SearchInputOptions, SearchInputRejected};
@@ -332,6 +332,7 @@ pub(crate) struct Browser {
     pending_source_return_root: Option<PathBuf>,
     folder_tree: Option<FolderTree>,
     folder_rows_cache: Vec<FolderTreeRow>,
+    show_empty_folders: bool,
     selected_folder: PathBuf,
     folder_keyboard: Option<folder_keyboard::FolderKeyboardState>,
     expanded_folders: BTreeSet<PathBuf>,
@@ -672,6 +673,7 @@ impl Browser {
             pending_source_return_root: None,
             folder_tree: None,
             folder_rows_cache: Vec::new(),
+            show_empty_folders: false,
             selected_folder: PathBuf::from("."),
             folder_keyboard: None,
             expanded_folders: BTreeSet::from([PathBuf::from(".")]),
@@ -1824,10 +1826,90 @@ impl Browser {
         }
     }
 
+    fn refresh_folder_tree_preserving_projection(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.catalog_activation.is_some() && source_recovery::manual_refresh(self, cx) {
+            return;
+        }
+        if self
+            .source_sessions
+            .get(index)
+            .is_some_and(|session| session.source_id.is_some())
+            && matches!(
+                catalog::catalog_status(cx),
+                Some(CatalogStatus::Loading | CatalogStatus::Ready)
+            )
+            && self.begin_catalog_activation(index, true, true, false, cx)
+        {
+            return;
+        }
+        if self.catalog_activation.is_some() {
+            self.deactivate_catalog_source(cx);
+        }
+        let Some(root) = self
+            .source_sessions
+            .get(index)
+            .map(|session| session.root.clone())
+        else {
+            return;
+        };
+        if let Some(cancellation) = self.scan_cancel.take() {
+            cancellation.store(true, Ordering::Release);
+        }
+        self.scan_task.take();
+        self.restore_selection_id = self.selected_id();
+        self.restore_selection_position = self.selected_visible_position();
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        let generation = self.scan_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.scan_cancel = Some(Arc::clone(&cancellation));
+        self.scan_status = format!("Scanning {}…", root.display());
+        cx.notify();
+        self.scan_task = Some(cx.spawn(async move |this, cx| {
+            let scan_root = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { enumerate_audio_files_with_cancel(&root, Some(&cancellation)) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if !scan_completion_is_current(generation, view.scan_generation) {
+                    return;
+                }
+                view.scan_cancel = None;
+                match result {
+                    Ok(scan) => view.apply_scan_result(scan, Some(index), cx),
+                    Err(error) => view.apply_scan_error(Some(index), scan_root, error, cx),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     pub(super) fn toggle_folder_scope(&mut self, cx: &mut Context<Self>) {
         self.invalidate_file_handoff();
         self.folder_scope = self.folder_scope.toggled();
         self.update_active_folder_projection(cx);
+    }
+
+    pub(super) fn toggle_empty_folder_visibility(&mut self, cx: &mut Context<Self>) {
+        self.show_empty_folders = !self.show_empty_folders;
+        self.context_menu = None;
+        self.invalidate_file_handoff();
+        if !self.show_empty_folders {
+            self.reset_focus();
+        }
+        let previous_folder = self.selected_folder.clone();
+        self.rebuild_folder_rows_cache();
+        if self.selected_folder != previous_folder {
+            self.selection.clear();
+            self.update_active_folder_projection(cx);
+        } else {
+            cx.notify();
+        }
+        if self.show_empty_folders
+            && let Some(index) = self.active_source
+        {
+            self.refresh_folder_tree_preserving_projection(index, cx);
+        }
     }
 
     pub(super) fn select_folder(
@@ -1840,6 +1922,9 @@ impl Browser {
             return;
         };
         if !tree.contains(&path) {
+            return;
+        }
+        if !self.folder_rows_cache.iter().any(|row| row.path == path) {
             return;
         }
         window.focus(&self.focus_handle);
@@ -1909,10 +1994,23 @@ impl Browser {
     }
 
     fn rebuild_folder_rows_cache(&mut self) {
+        if let Some(tree) = self.folder_tree.as_ref() {
+            let visible_folder =
+                tree.nearest_visible_ancestor(&self.selected_folder, self.show_empty_folders);
+            if visible_folder != self.selected_folder {
+                self.selected_folder = visible_folder.clone();
+                if let Some(index) = self.active_source
+                    && let Some(session) = self.source_sessions.get_mut(index)
+                {
+                    session.selected_folder = visible_folder;
+                    session.selected_audio_id = None;
+                }
+            }
+        }
         self.folder_rows_cache = self
             .folder_tree
             .as_ref()
-            .map(|tree| tree.rows(&self.expanded_folders))
+            .map(|tree| tree.visible_rows(&self.expanded_folders, self.show_empty_folders))
             .unwrap_or_default();
         self.ensure_folder_keyboard();
     }
