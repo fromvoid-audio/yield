@@ -302,6 +302,23 @@ The source SQL owner is therefore a migration boundary, not a claim that current
 production callers are already routed. The owner contract does not add family adapters,
 filesystem writer calls, UI policy, or a second authority thread.
 
+## Competing-writer architecture guard
+
+`check_source_db_open_roles.sh` and its PowerShell counterpart run the same
+production open-site tripwire in local CI.
+It rejects a new `SourceDatabase` writable opener or raw `rusqlite::Connection` open
+outside reviewed owner, source-lease, journal, global-library, and snapshot-destination
+functions. The catalog registration path is the reviewed source owner open. Three
+path-only production compatibility calls (`SampleSource::open_db`, source-local
+recovery access, and `scan_in_background`) are named exceptions: their writable
+aliases return `ProfileOwnershipRequired` before source filesystem effects in normal
+builds. They do not grant a competing connection.
+
+The guard excludes explicit fixture files and `#[cfg(test)]` modules. Test-support
+source roles may construct fixtures, while `profile_admission` exercises the normal
+build's fail-closed role boundary. The lexical check catches new callsites; runtime
+profile, lease, database-binding, and revision checks remain the authority proof.
+
 ## Deferred implementation decisions and follow-ups
 
 | Follow-up | Required decision or implementation |
