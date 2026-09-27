@@ -167,10 +167,20 @@ if [[ -d "$logs_dir" ]]; then
   mkdir -p "${bundle_dir}/logs"
   logs=()
   while IFS= read -r log_file; do
-    logs+=("$log_file")
-  done < <(ls -1t "$logs_dir"/*.log 2>/dev/null | head -n "$MAX_LOGS" || true)
+    name="$(basename "$log_file")"
+    if [[ "$name" =~ ^yield_[[:xdigit:]]{16}_[[:xdigit:]]{8}_[[:xdigit:]]{8}_[[:xdigit:]]{8}\.log$ ]] && [[ -f "$log_file" ]] && [[ ! -L "$log_file" ]]; then
+      logs+=("$log_file")
+      (( ${#logs[@]} >= MAX_LOGS )) && break
+    fi
+  done < <(ls -1t "$logs_dir"/yield_*.log 2>/dev/null || true)
+  if (( ${#logs[@]} == 0 )); then
+    while IFS= read -r log_file; do
+      [[ -f "$log_file" && ! -L "$log_file" ]] || continue
+      logs+=("$log_file")
+      (( ${#logs[@]} >= MAX_LOGS )) && break
+    done < <(ls -1t "$logs_dir"/*.log 2>/dev/null || true)
+  fi
   for log_file in "${logs[@]}"; do
-    [[ -f "$log_file" ]] || continue
     cp "$log_file" "${bundle_dir}/logs/$(basename "$log_file")"
   done
 fi

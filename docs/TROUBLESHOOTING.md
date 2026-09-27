@@ -65,8 +65,11 @@ Use this when you need a richer reconstruction of runtime actions or DB work.
     `powershell -ExecutionPolicy Bypass -File scripts/run.ps1 bug-bundle -Sandbox`
   - macOS/Linux/WSL:
     `bash scripts/run.sh bug-bundle --sandbox`
-- the log file captures startup metadata plus structured debug events from the
-  run you reproduced with `--log`; it does not replace the manual reproduction
+- the profile's `logs/` directory keeps up to ten `yield_*.log` segments;
+  each rotates at 10 MiB before a whole event, with at most one whole-event
+  overshoot. Earlier oversized segments are left intact until count pruning.
+- the log captures the startup log location and events emitted during the run
+  you reproduced with `--log`; it does not replace the manual reproduction
   step for an incident that already happened in an earlier session
 - if you also set `RUST_LOG`, remember that it overrides the default filter;
   leave it unset for the standard debug contract unless you intentionally need a
